@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>ai.tabmail.sync</string>
+		<string>ai.tabmail.ai-processing</string>
+	</array>
+	<key>CFBundleDisplayName</key>
+	<string>TabMail</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>TabMail</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Google OAuth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(GOOGLE_REDIRECT_SCHEME)</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Microsoft OAuth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(MICROSOFT_REDIRECT_SCHEME)</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>TabMail Auth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>tabmail-ios</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Mail</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>mailto</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>GOOGLE_CLIENT_ID</key>
+	<string>$(GOOGLE_CLIENT_ID)</string>
+	<key>GOOGLE_REDIRECT_SCHEME</key>
+	<string>$(GOOGLE_REDIRECT_SCHEME)</string>
+	<key>MICROSOFT_CLIENT_ID</key>
+	<string>$(MICROSOFT_CLIENT_ID)</string>
+	<key>MICROSOFT_REDIRECT_SCHEME</key>
+	<string>$(MICROSOFT_REDIRECT_SCHEME)</string>
+	<key>DEMO_CLIENT_SECRET</key>
+	<string>$(DEMO_CLIENT_SECRET)</string>
+	<key>IMAP_CRED_ENCRYPTION_KEY_DEV</key>
+	<string>$(IMAP_CRED_ENCRYPTION_KEY_DEV)</string>
+	<key>IMAP_CRED_ENCRYPTION_KEY_PROD</key>
+	<string>$(IMAP_CRED_ENCRYPTION_KEY_PROD)</string>
+	<key>TabMailProtocolVersion</key>
+	<string>$(TABMAIL_PROTOCOL_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>TabMail uses calendar access to add event invitations from your emails to your calendar.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>TabMail uses the camera to capture photos for email attachments.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>TabMail uses your contacts to suggest recipients when composing emails.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>TabMail uses the microphone for voice dictation in the chat assistant.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>TabMail uses speech recognition to transcribe voice messages for the chat assistant.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+		<string>remote-notification</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+</dict>
+</plist>

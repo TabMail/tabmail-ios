@@ -1,0 +1,265 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import SwiftUI
+
+struct AddAccountGeneralView: View {
+    @Environment(\.dismiss) private var dismiss
+    private var manager = AccountManager.shared
+    @State private var selectedProvider: AccountProvider?
+    @State private var displayName = ""
+    @State private var email = ""
+    @State private var username = ""
+    @State private var password = ""
+    @State private var imapHost = ""
+    @State private var imapPort = "993"
+    @State private var smtpHost = ""
+    @State private var smtpPort = "587"
+    @State private var isConnecting = false
+    @State private var errorMessage: String?
+    @State private var includeCalendar = true
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                Spacer()
+                    .frame(height: 40)
+
+                Text("Add Account")
+                    .font(.largeTitle)
+                    .fontWeight(.bold)
+
+                Text("Choose your email provider")
+                    .foregroundStyle(.secondary)
+
+                VStack(spacing: 12) {
+                    providerButton(.gmail, label: "Gmail") {
+                        Image("GoogleLogo").renderingMode(.original).resizable().scaledToFit()
+                    }
+                    providerButton(.outlook, label: "Outlook") {
+                        Image("MicrosoftLogo").renderingMode(.original).resizable().scaledToFit()
+                    }
+                    providerButton(.icloud, label: "iCloud") {
+                        Image(systemName: "apple.logo")
+                    }
+                    providerButton(.imap, label: "Other (IMAP)") {
+                        Image(systemName: "envelope")
+                    }
+                }
+                .padding(.horizontal, 40)
+
+                if selectedProvider == .icloud {
+                    icloudForm
+                }
+
+                if selectedProvider == .imap {
+                    imapForm
+                }
+
+                if let error = errorMessage {
+                    Text(error)
+                        .foregroundStyle(Theme.errorFg)
+                        .font(.caption)
+                        .padding(.horizontal, 40)
+                }
+
+                Spacer()
+                    .frame(height: 40)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .background(Palette.previewPaneBg)
+        // No `.navigationTitle` — the inline `Text("Add Account")` is
+        // the canonical title for this screen. When this view is
+        // pushed via `NavigationLink` from Settings, dropping the
+        // navigationTitle keeps the system back chevron but avoids
+        // rendering a second "Add Account" in the toolbar.
+        .lockOrientation(.portrait)
+    }
+
+    private func providerButton<Icon: View>(_ provider: AccountProvider, label: String, @ViewBuilder icon: () -> Icon) -> some View {
+        Button {
+            selectedProvider = provider
+            errorMessage = nil
+            switch provider {
+            case .gmail: connectGmail()
+            case .outlook: connectOutlook()
+            case .icloud: break // Show iCloud form
+            case .imap: break
+            case .caldav: break
+            }
+        } label: {
+            HStack {
+                icon()
+                    .frame(width: 24, height: 16)
+                Text(label)
+                    .fontWeight(.medium)
+                Spacer()
+                if isConnecting && selectedProvider == provider {
+                    ProgressView()
+                } else {
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding()
+            .background(Theme.buttonBg)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .disabled(isConnecting)
+    }
+
+    private var imapForm: some View {
+        VStack(spacing: 12) {
+            TextField("Name", text: $displayName)
+                .textContentType(.name)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("Email", text: $email)
+                .textContentType(.emailAddress)
+                .keyboardType(.emailAddress)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("Username (if different from email)", text: $username)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .textFieldStyle(.roundedBorder)
+
+            SecureField("Password", text: $password)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("IMAP Server", text: $imapHost)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("SMTP Server", text: $smtpHost)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .textFieldStyle(.roundedBorder)
+
+            Button("Connect") {
+                connectIMAP()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(email.isEmpty || password.isEmpty || imapHost.isEmpty || isConnecting)
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private func connectGmail() {
+        isConnecting = true
+        Task {
+            do {
+                let _ = try await manager.addGmailAccount()
+                dismiss()
+            } catch {
+                errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Google sign-in failed: \(error.userFacingDescription)"
+            }
+            isConnecting = false
+        }
+    }
+
+    private func connectOutlook() {
+        isConnecting = true
+        Task {
+            do {
+                let _ = try await manager.addOutlookAccount()
+                dismiss()
+            } catch {
+                errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Microsoft sign-in failed: \(error.userFacingDescription)"
+            }
+            isConnecting = false
+        }
+    }
+
+    private var icloudForm: some View {
+        VStack(spacing: 12) {
+            TextField("Apple ID Email", text: $email)
+                .textContentType(.emailAddress)
+                .keyboardType(.emailAddress)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .textFieldStyle(.roundedBorder)
+
+            SecureField("App-Specific Password", text: $password)
+                .textFieldStyle(.roundedBorder)
+
+            Button {
+                if let url = URL(string: "https://appleid.apple.com/account/manage/section/security") {
+                    UIApplication.shared.open(url)
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "questionmark.circle")
+                    Text("How to get an app-specific password")
+                }
+                .font(.caption)
+            }
+
+            Toggle("Also connect iCloud Calendar", isOn: $includeCalendar)
+
+            Button("Connect") {
+                connectICloud()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(email.isEmpty || password.isEmpty || isConnecting)
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private func connectICloud() {
+        isConnecting = true
+        errorMessage = nil
+        Task {
+            do {
+                _ = try await manager.addICloudAccount(
+                    email: email,
+                    appSpecificPassword: password,
+                    includeCalendar: includeCalendar
+                )
+                dismiss()
+            } catch CalDAVError.authFailed {
+                errorMessage = "Calendar authentication failed. Check your app-specific password."
+            } catch {
+                if SyncEngine.isConnectionError(error) {
+                    errorMessage = "Connection failed. Please check your network and try again."
+                } else {
+                    errorMessage = "Connection failed: \(error.userFacingDescription)"
+                }
+            }
+            isConnecting = false
+        }
+    }
+
+    private func connectIMAP() {
+        isConnecting = true
+        errorMessage = nil
+        Task {
+            do {
+                let _ = try await manager.addIMAPAccount(
+                    displayName: displayName,
+                    email: email,
+                    username: username,
+                    password: password,
+                    imapHost: imapHost,
+                    imapPort: Int(imapPort) ?? 993,
+                    smtpHost: smtpHost.isEmpty ? imapHost.replacingOccurrences(of: "imap", with: "smtp") : smtpHost,
+                    smtpPort: Int(smtpPort) ?? 587
+                )
+                dismiss()
+            } catch {
+                if SyncEngine.isConnectionError(error) {
+                    errorMessage = "Connection failed. Please check your network and try again."
+                } else {
+                    errorMessage = "Connection failed: \(error.userFacingDescription)"
+                }
+            }
+            isConnecting = false
+        }
+    }
+}

@@ -1,0 +1,44 @@
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+# XcodeGen-generated project — sourced from project.yml. Run `xcodegen generate`
+# after a fresh clone or after changes to project.yml. The whole .xcodeproj is
+# regenerated, so none of it is tracked.
+TabMail.xcodeproj/
+DerivedData/
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+.build/
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+Pods/
+.DS_Store
+*.swp
+*~
+.idea/
+*.xcuserstate
+*.env
+credentials.json
+GoogleService-Info.plist
+Secrets.xcconfig
+*.log
+
+# Fastlane + release toolchain — kept locally for development, NOT published.
+# fastlane/ holds the App Store Connect AuthKey .p8 and account identifiers, so
+# the whole release toolchain is gitignored (release tooling is not part of the
+# public client). Run release lanes locally; they are intentionally absent from
+# the published repo.
+/fastlane/
+/Gemfile
+/Gemfile.lock
+/Scripts/fastlane-*.sh
+vendor/bundle
+Secrets.xcconfig.bak

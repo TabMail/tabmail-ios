@@ -1,0 +1,1234 @@
+# TabMail iOS - Architectural Decisions
+
+> **Check this file before proposing alternatives.** For cross-cutting decisions, see `../DECISIONS.md`.
+
+---
+
+## Foundational Principle: Never Drop User Intention
+
+The following ADRs (001, 003, 018, 019) form a unified system built on one principle: **user intention must never be lost.** When a user performs an action — archive, delete, send, tag — that intention is persisted to the database before the UI acknowledges success. Remote execution is deferred and retried until complete or provably unnecessary.
+
+**Key invariants across all queue-based systems:**
+
+- **Persist → Acknowledge → Execute** — database write happens before UI dismissal/animation. If persist fails, the user sees an error and retains their data (compose stays open, action is not animated).
+- **Remote state wins on conflict** — when sync reveals the server already reflects the desired state (message deleted by another client, tag set by TB addon), the queued operation is silently dropped. The server is the source of truth.
+- **Treat all instances equally** — IMAP keyword changes from another TabMail instance (e.g., TB addon setting `tm_archive`) are treated as equivalent to local user actions. When consolidating, the most recent writer wins regardless of which device originated the action. The queue is not privileged over remote state.
+- **Never silently discard user work** — failed operations remain visible for user action (retry/dismiss). Automatic cleanup only applies to provably-completed operations.
+
+---
+
+## ADR-IOS-001: Optimistic UI with Hardened Sync
+
+**Context:** Mobile apps operate in unreliable environments — connections drop, users close the app mid-operation, processes get killed by the OS. Email operations (archive, delete, move, sync) involve both local state and remote IMAP/provider state that must stay consistent.
+
+**Decision:**
+1. **Optimistic UI** — All user-initiated actions (archive, delete, move, mark read) update local database state (GRDB) and animate immediately using native iOS animations (swipe-to-zap). The user never waits for a server round-trip.
+2. **Verified state persistence** — Backend state markers (history IDs, sync cursors, IMAP UIDs) are only persisted after verified completion of the remote operation. Never write state ahead of confirmation.
+3. **Idempotent operations** — Every operation that touches remote state must be idempotent. Re-executing the same operation after a crash or disconnect must produce the same result without side effects.
+4. **Self-healing on launch** — On app launch and sync resume, detect incomplete operations (local state says "archived" but IMAP move never completed) and either retry the remote operation or roll back local state.
+
+**Rationale:**
+- Users expect instant responsiveness — waiting for IMAP round-trips feels broken on mobile
+- Connections are fundamentally unreliable on mobile (cellular handoffs, tunnels, airplane mode)
+- The OS can kill the app at any time (memory pressure, user swipe-to-close)
+- Pre-writing state markers before confirmation causes stale entries that corrupt future syncs
+- Idempotency + self-healing means the app always converges to a correct state
+
+**Consequences:**
+- Every sync operation needs a "pending" → "confirmed" state machine
+- Local database model needs fields to track operation completion status
+- Launch/resume path must include an incomplete-operation scan
+- Slightly more complex code, but dramatically more reliable UX
+- No "ghost" messages that were deleted locally but never synced
+
+---
+
+## ADR-IOS-002: User Activity Prioritization
+
+**Context:** `IMAPProvider` is a Swift actor with a single IMAP connection per account. All operations (sync, body fetching, message opening) are serialized through the actor's queue. Background body fetching and backfill can block user-initiated `fetchMessage` calls for extended periods — the user taps a message and nothing happens until all background work finishes.
+
+**Decision:**
+1. **Cancellable background tasks** — Backfill tasks are stored and cancellable. When the user opens a message, background tasks for that account are cancelled immediately.
+2. **Cooperative cancellation** — Background body fetch checks `Task.isCancelled` between each network call. On cancellation, it exits early, freeing the actor for user-initiated work.
+
+**Rationale:**
+- IMAP servers typically allow only one active command per connection
+- Actor serialization means background work directly delays user actions
+- Cancellation is cooperative in Swift — the loop must check and bail
+- Users expect message opens to be instant; background work can wait
+
+**Consequences:**
+- Any new background work on the IMAP actor must follow the same cancellation pattern
+- The cancel → action pattern applies to all user-initiated provider calls
+
+---
+
+## ADR-IOS-003: Pending Operation Queue for Crash Recovery
+
+**Context:** ADR-IOS-001 requires self-healing on launch — detecting and retrying incomplete operations. Operations like archive, delete, and move modify both remote (IMAP/Gmail) and local (GRDB) state. If the app crashes between the remote operation succeeding and the local state update, the states drift permanently.
+
+**Decision:**
+1. **PendingOperation GRDB model** — Before any remote state-changing operation, insert a `PendingOperation` record. After success, delete it. Leftover records indicate operations that started but didn't complete.
+2. **Launch reconciliation** — On app launch, before the first sync, query for `PendingOperation` records and retry them (up to 3 times). After max retries, discard the record.
+3. **Optimistic UI with rollback** — `toggleRead` and `toggleFlag` update local state immediately. If the remote operation fails, the optimistic change is reverted and an error is shown. Archive/delete/move show errors but don't need rollback (local state only updates after remote success).
+
+**Rationale:**
+- Without a pending queue, crashed operations are invisible to the system
+- Retry with a limit prevents infinite loops on permanently failing operations
+- Optimistic UI rollback prevents local/remote state drift for flag operations
+
+**Consequences:**
+- Slight overhead per operation (two GRDB writes: insert + delete)
+
+---
+
+## ADR-IOS-004: ~~First Compute Wins for Cross-Instance Action Tags~~ (SUPERSEDED by ADR-IOS-036)
+
+**Context:** Multiple TabMail instances (Thunderbird, iOS) can share the same IMAP account. When both instances process the same inbox message, both would independently compute the action via LLM, wasting tokens and potentially producing inconsistent results.
+
+**Decision (superseded):** iOS / TB wrote `tm_*` IMAP keywords / Gmail labels / Exchange categories to the server so the other instance could adopt the tag on next sync without re-running the LLM.
+
+**Why superseded:** Device Sync (the device-sync WSS relay) now exchanges `{summary, action, reply}` between connected peers via `ai_cache_probe` — this replaces the IMAP-keyword channel for the "both devices online" case. We accept losing async cross-device pickup (see ADR-IOS-036 tradeoff discussion). Removing the server-side label writes eliminates Gmail/Outlook/IMAP label-list pollution that users were seeing as `tm_reply` etc.
+
+**Migration:** On-server `tm_*` keywords/labels from prior versions are left alone; they age out as inboxes churn. The iOS code no longer reads or writes them.
+
+---
+
+## ADR-IOS-005: Progressive Background Backfill
+
+**Context:** Initial sync fetches only the latest N messages (50 inbox, 25 others) with a hardcoded 30-day age limit. Users with months of email history see a sparse mailbox. Opening a non-synced email could silently fail if the provider was disconnected.
+
+**Decision:**
+1. **Full sync depth** — Backfill always walks to completion: IMAP walks from UIDNEXT-1 to UID 1, Gmail/Exchange exhausts all pages. No date-based age cutoff — storage budget is the only gate.
+2. **Progressive backfill** — After each initial sync, a background task fetches older messages. Uses IMAP UID range walking or Gmail `nextPageToken` pagination. Follows the same cooperative cancellation pattern as snippet fetching (ADR-IOS-002).
+3. **Prioritized sync order** — Inbox first, then favorites, then secondary roles (sent/drafts/trash/archive/spam).
+4. **No silent failures** — `fetchBody` throws descriptive errors instead of silently returning when provider/account is missing. Attempts reconnection if provider is nil.
+
+**Rationale:**
+- Users expect to see their full mailbox history, not just the latest 50
+- Background backfill avoids blocking the initial sync/UI
+- Cancellable backfill ensures user actions (opening messages) take priority
+- Pure UID walk (no date-based cutoff) guarantees no messages are arbitrarily skipped — IMAP UIDs and message dates are not monotonically correlated
+
+**Consequences:**
+- Additional IMAP/API traffic after each sync cycle (one-time per folder until `backfillComplete`)
+- `Folder.backfillComplete` and `Folder.oldestSyncedDate` track per-folder progress
+- Backfill is cancelled alongside snippets before user-initiated provider calls
+
+---
+
+## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
+
+**Context:** ADR-IOS-005 used age-based message eviction — messages older than `maxSyncAgeDays` were actively deleted during sync. This caused emails to disappear after being fetched, wasting bandwidth and confusing users. Users expect their mail client to keep downloaded messages, similar to Apple Mail which stores ~2GB of data.
+
+**Decision:**
+1. **No age-based eviction** — Once a message is fetched, it stays in local storage. Storage budget is the only limiting factor.
+2. **Global storage budget** — `StorageEstimator.budgetMB` (UserDefaults, default 2048 = 2GB) is a global soft cap across all accounts. When exceeded, oldest messages are pruned across all accounts — bodies first (re-fetchable), then headers. Always keeps minimum 50 messages per folder.
+3. **Complete backfill** — Backfill walks to completion (UID 1 for IMAP, last page for Gmail/Exchange). Storage budget gates whether backfill proceeds, but never prematurely marks folders as complete.
+4. **Actual file size measurement** — `StorageEstimator` measures actual disk usage of GRDB database (`tabmail.sqlite` + WAL/SHM) and FTS files (`fts.db` + WAL/SHM) via recursive directory enumeration. No formula estimation.
+5. **Infinite scroll** — When users scroll to the bottom of a mailbox, older messages are fetched on-demand via `fetchOlderMessages` regardless of age settings.
+6. **50-message floor per folder** — Every folder always syncs at least 50 recent messages, regardless of age settings or storage budget.
+7. **No body duplication** — `MessageBody` stores only `htmlContent` (plain-text-only emails are wrapped in HTML on ingest). FTS stores stripped plain text for search. No `textContent` field.
+
+**Rationale:**
+- Users don't expect fetched emails to disappear
+- Apple Mail stores ~2GB — users accept this storage usage
+- Progressive crawling fills storage naturally without aggressive initial downloads
+- Actual file measurement is fast (3 `attributesOfItem` calls) and accurate
+- Global budget is simpler UX (one setting in app settings) and matches single-file SQLite reality
+- Eliminating `textContent` removes body duplication between main database and FTS
+- Infinite scroll makes any historical email accessible without configuration
+
+**Consequences:**
+- Storage UI in SettingsView (global) shows actual usage and limit picker
+- Pruning works globally across all accounts, oldest messages first
+- Deep backfill increases IMAP/API traffic but runs at low priority with throttling
+
+---
+
+## ADR-IOS-007: Hybrid FTS5 + Vector Search (Local)
+
+**Context:** Search was remote-first (IMAP SEARCH / Gmail API) with basic in-memory string matching for local results. This was slow, didn't search message bodies, had no stemming or synonyms, and required network connectivity. The Thunderbird extension had a mature Rust FTS library with FTS5, synonym expansion, and all-MiniLM-L6-v2 embeddings.
+
+**Decision:**
+1. **Separate SQLite FTS5 database** — `fts.db` in Application Support using GRDB, separate from the main app database (`tabmail.sqlite`).
+2. **Query parser with synonym expansion** — Ported from Rust `query.rs`. Handles field aliases (`from:`→`from_:`), auto-wildcards for tokens ≥4 chars, OR groups for synonym expansion (~65 email synonym groups).
+3. **CoreML embeddings** — all-MiniLM-L6-v2 converted to CoreML float16 (~45MB). Runs on Neural Engine when available. Bundled in app for offline support.
+4. **Hybrid merge** — 70% semantic / 30% keyword scoring with candidate multiplier (4×). Minimum score threshold (0.1) filters noise.
+5. **In-memory embedding matrix** — Loaded lazily on first semantic search. Uses Accelerate/vDSP for batch cosine similarity. Evicted on memory warnings.
+6. **Incremental indexing** — Headers indexed via SyncEngine hooks on insert. Body text + embedding generated in AccountManager.fetchBody(). Background rebuild catches up existing messages.
+7. **Graceful degradation** — If CoreML model/tokenizer not in bundle, falls back to FTS-only keyword search. If FTS index is empty, falls back to legacy string matching.
+
+**Rationale:**
+- Offline-capable search is essential for a mobile mail client
+- FTS5 with Porter stemmer handles English morphology (searching "meeting" finds "meetings")
+- Synonym expansion finds related concepts (searching "meeting" also finds "standup", "huddle", "sync")
+- Semantic search finds conceptually similar messages even without keyword overlap
+- CoreML + Neural Engine makes embedding inference practical on modern iPhones (~10ms per embedding)
+- Porting from proven Rust implementation reduces risk vs. designing from scratch
+
+**Consequences:**
+- ~45MB added to app bundle (CoreML model) — acceptable, comparable to other ML features
+- ~75MB additional on-device storage for embeddings (at 50K messages) — excluded from StorageEstimator
+- Embedding generation is CPU/NPU-intensive — throttled to low priority, cooperative cancellation
+- First-launch bulk indexing may take minutes for large mailboxes — runs in background
+- GRDB adds a new dependency — well-maintained, widely used in iOS ecosystem
+
+---
+
+## ADR-IOS-008: AI Processing Must Replicate TB Addon Architecture
+
+**Context:** The iOS app needs background AI processing (summary, action classification, cached reply generation). Rather than designing a new architecture, we must exactly replicate the Thunderbird addon's proven architecture, adapted to Swift/iOS idioms.
+
+**Decision:**
+1. **Exact replication** — All AI processing flows (summary, action, reply) must match the TB addon's architecture 1:1. The TB addon's `messageProcessorQueue.js`, `summaryGenerator.js`, `actionGenerator.js`, and `llm.js` are the authoritative reference implementations.
+2. **Persistent processing queue** — Messages awaiting AI processing are stored in a persistent queue (GRDB model) that survives app suspension/termination. Restored on launch.
+3. **Event-driven enqueue** — Messages are enqueued for processing on: new mail arrival (post-sync), message moved to inbox, and startup scan of recent untagged inbox messages.
+4. **Drain loop with watchdog** — A periodic timer (watchdog) drains the queue in batches. Processing failures trigger a retry timer with backoff. The queue is persisted on app backgrounding.
+5. **Per-message semaphores** — Prevent concurrent AI generation for the same message. If a summary is already being generated for message X, other requestors wait for the result.
+6. **Global LLM concurrency limit** — A semaphore limits total concurrent backend API calls (prevent overload). Priority/user-initiated requests can bypass the semaphore.
+7. **Caching with TTL** — AI results (summary, action) are cached in database fields with generation timestamps. Expired results can be recomputed. Cache is checked before any LLM call.
+8. **First-compute-wins** — Before LLM action generation, check IMAP keywords / Gmail labels (per ADR-IOS-004). If found, adopt without LLM.
+9. **Three-call action voting** — Action classification makes N parallel calls and takes the mode (most common action), matching TB's voting mechanism.
+
+**Rationale:**
+- TB's architecture is battle-tested in production with thousands of users
+- Consistent behavior across platforms reduces user confusion
+- Persistent queue ensures no messages are missed across app lifecycle events
+- Concurrency control prevents backend overload and duplicate work
+- Replicating rather than redesigning eliminates architectural risk
+
+**Consequences:**
+- iOS AI code must be kept in sync with TB addon changes (same flow, same edge cases)
+- When modifying AI flows, always check the TB reference implementation first
+- New AI features must be designed for both platforms simultaneously
+- Slightly more complex than a naive implementation, but dramatically more reliable
+
+---
+
+## ADR-IOS-009: Two-Tier Delta + Full Sync
+
+**Context:** Sync ran a full sync every 60 seconds — fetching all messages, diffing against local state, updating folders. This was slow and wasteful, especially for accounts with many folders. Gmail's `history.list` API was previously tried but abandoned because the `historyId` cursor expires after ~7 days. IMAP had no incremental sync at all.
+
+**Decision:**
+1. **Delta sync (frequent, every 60s)** — Lightweight check for changes since last sync. Gmail uses `history.list` with `lastHistoryId` cursor. IMAP uses `STATUS` command per folder to compare `uidNext` and `messageCount` against cached values.
+2. **Full sync (periodic, every 10 min)** — Safety net and self-healing. Runs the existing `fullSync()` with complete message diffing. Also captures fresh sync cursors (Gmail historyId, IMAP uidNext per folder).
+3. **Graceful fallback** — If delta sync fails for any reason (Gmail 404 expired cursor, IMAP errors, missing cursors), falls through to full sync automatically. The expired historyId is cleared so the next full sync captures a fresh one.
+4. **Cursor management** — Gmail: `Account.lastHistoryId` captured after full sync via `getCurrentHistoryId()`. IMAP: `Folder.lastKnownUidNext` captured from `FolderInfo.uidNext` during full sync.
+
+**Rationale:**
+- Full sync every 60s is unnecessarily expensive — most polls find zero changes
+- Gmail history expiry (~7 days) isn't catastrophic if handled as a fallback trigger
+- IMAP `STATUS` is cheap (no `SELECT` needed) and reliably detects new/deleted messages
+- Two-tier approach gives fast responsiveness (delta) with guaranteed consistency (periodic full)
+- Background tasks (snippets, backfill, AI) only run after full syncs — delta is fast-path only
+
+**Consequences:**
+- Delta sync skips background work (snippets, backfill, AI processing) — these run after full syncs
+- Gmail delta sync processes message adds/deletes/label changes individually (more API calls per changed message, but rare)
+- IMAP delta still runs `syncMessages()` for changed folders — STATUS only detects change, not what changed
+- New model fields: `Account.lastFullSyncAt`, `Folder.lastKnownUidNext`, `FolderInfo.uidNext`
+- `GmailProvider.fetchHistory` returns nil on 404 instead of throwing
+
+---
+
+## ADR-IOS-010: Device Always-On Sync with AI Cache Probe
+
+**Context:** Prompt settings (composition, action rules, knowledge base, templates) were manually synced between TB and iOS. AI processing (summary + action) ran independently on each device, duplicating LLM calls for the same emails. Backend KV cache was rejected per ADR-004 (zero server-side data retention).
+
+**Decision:**
+1. **Always-on Device Sync** — WebSocket connection to Cloudflare Durable Object relay. Auto-connects on launch, reconnects on foreground, disconnects on background. No manual send/receive buttons.
+2. **Per-field timestamp merge** — Each field (composition, action, kb, templates) has its own `updated_at` timestamp. Incoming field applied only if timestamp > local. Prevents newer edits from being overwritten.
+3. **AI cache probe before LLM** — Before running LLM for a message, probe connected peers for cached results via WebSocket relay. 2-second timeout. If hit, skip LLM entirely.
+4. **RFC 2822 Message-ID as probe key** — Both iOS and TB use the RFC Message-ID header (angle brackets stripped) as the device-independent cache key. iOS stores this in `MessageHeader.rfc822MessageId`.
+5. **Consecutive timeout optimization** — After 2 consecutive probe timeouts (no peer connected), skip future probes silently. Reset counter when any peer message is received.
+6. **Backup before merge** — Current state saved to UserDefaults ring buffer (max 10) before applying incoming sync.
+
+**Rationale:**
+- Pure sync relay — no user data stored on server (ADR-004 compliance)
+- DO with WebSocket Hibernation API costs ~$0.001/user/month
+- AI cache probe saves $6-75/user/month in LLM costs
+- RFC Message-ID is the only device-independent email identifier (UIDs, Gmail IDs are provider-specific)
+- Consecutive timeout optimization avoids 2s latency per message when no peer is connected
+
+**Consequences:**
+- `rfc822MessageId` may be nil for some messages (IMAP servers with no ENVELOPE Message-ID) — probe gracefully skipped
+- `rfc822MessageId` field on MessageHeader — existing messages get nil until re-synced
+- WebSocket connection adds minor battery/network overhead — mitigated by hibernation (idle pings auto-responded without waking DO)
+- Gmail metadata fetch now requests `Message-Id` header (one extra header per API call — negligible)
+
+---
+
+## ADR-IOS-011: ActionTag Raw Values Are Plain Names
+
+**Context:** See global ADR-022. ActionTag raw values were `"tm_delete"` (IMAP keyword format), causing Device Sync mismatches with TB which uses `"delete"` internally.
+
+**Decision:** Changed `ActionTag` raw values to plain names (`"delete"`, `"archive"`, `"reply"`, `"none"`). Added `imapKeyword` computed property and `fromIMAPKeyword()` for IMAP/Gmail boundary conversion.
+
+**Rationale:** Unifies internal storage format with TB. Eliminates transport-layer naming from application logic.
+
+**Consequences:**
+- `ActionTag.rawValue` is now the canonical format for Device Sync, database, and all internal use
+- Use `tag.imapKeyword` when writing IMAP flags or Gmail labels
+- Use `ActionTag.fromIMAPKeyword()` when reading IMAP flags or Gmail labels
+
+---
+
+## ADR-IOS-012: ~~Inbox Excluded from Stale Detection~~ (SUPERSEDED)
+
+**Status:** Superseded — inbox stale detection is now enabled for all folders.
+
+**Original context:** Concern that UIDVALIDITY changes could cause mass false-positive staleness, wiping AI state.
+
+**Why superseded:** `MessageAICache` already preserves AI state (summary, action) for re-inserted messages via `restoreIfCached()`. The overlap-window approach limits stale detection to the date range covered by fetched messages, preventing mass deletion. Without inbox stale detection, messages moved out of inbox on the server persisted locally indefinitely — IMAP delta sync detected the change but never cleaned up the stale local copies.
+
+**Current behavior:** All folders including inbox use the same stale detection logic (overlap-window when fetched count >= limit, full comparison otherwise).
+
+---
+
+## ADR-IOS-013: Direct Priority Path for Opened Emails
+
+**Context:** TB addon processes the currently-displayed email via a direct inline path (`onMessagesDisplayed` → `getSummary()` → `getAction()`), bypassing the background queue entirely. This ensures the user sees AI results immediately when opening an email, without waiting behind other queued messages.
+
+**Decision:** Added `processOpenedMessage()` public method to AccountManager. When the user opens a message in MessageDetailView and the body is already loaded, this direct path triggers AI processing immediately. It bypasses the background queue (matches TB's `processVisibleMessages` architecture). Per-message dedup in AIService prevents duplicate LLM calls if the queue also picks up the same message.
+
+**Rationale:**
+- ADR-IOS-008 requires exact replication of TB addon architecture
+- TB uses dual-path: direct for displayed email, queue for background batch
+- User should see AI results immediately when opening an email
+
+**Consequences:**
+- `processOpenedMessage()` runs outside the semaphore-gated queue
+- AIService's first-compute-wins dedup prevents duplicate processing
+- Body-fetch path (fetchBody → processMessage) still handles the case where body is fetched on open
+
+---
+
+## ADR-IOS-014: IMAP Connection Pool (supersedes serial lock)
+
+**Context:** IMAP operations were serialized by a single lock on one TCP connection. This prevented concurrent operations (e.g., a user archiving a message while backfill fetches headers) even though IMAP servers support multiple concurrent connections (e.g., 15 for Gmail). Move/tag/mark operations blocked behind background work despite using priority lock.
+
+**Decision:** Replaced the serial lock AND temporary connection infrastructure with `IMAPConnectionPool` — an actor managing a pool of logged-in IMAP connections. Operations checkout a connection via `withPoolConnection(priority:) { server in ... }`, SELECT their mailbox independently, and return the connection on completion. The pool handles:
+- **Priority checkout**: user ops jump the waiter queue (preserves ADR-IOS-002 intent)
+- **Adaptive concurrency**: detects server limits from `mail_max_userip_connections=N` rejections, cooldown on full failure, gradual recovery
+- **Connection reuse**: idle connections persist across operations (no create/destroy per batch)
+- **Liveness checks**: NOOP before reuse if idle > 2 minutes
+- **Batch checkout**: `checkoutBatch(count:)` for parallel body fetch (replaces `createTempConnections`)
+
+**Rationale:**
+- IMAP servers allow multiple concurrent connections — serialization was unnecessary overhead
+- Connection pool amortizes TCP+TLS+LOGIN cost across operations
+- Pool unifies the two separate concurrency mechanisms (serial lock + temp connections) into one
+- Actor isolation on the pool eliminates the race conditions that a class-based pool would have
+
+**Consequences:**
+- Multiple IMAP operations for an account can execute concurrently on separate connections
+- Background tasks no longer block user actions (each gets its own connection)
+- Body fetch connections return to pool for reuse instead of being destroyed after each batch
+- Pool actor + IMAPProvider actor = two actor hops per operation (negligible overhead — pool methods are microsecond-fast)
+
+---
+
+## ADR-IOS-015: Three-Tier Background Execution for AI Processing
+
+**Context:** AI processing calls (summary, action, future tool-enabled chat) can take 60+ seconds, especially with multi-turn tool execution loops. iOS suspends apps within ~5 seconds of backgrounding. Without protection, all in-flight AI work is lost (though idempotent design means messages re-queue on next sync, wasting LLM tokens). The existing `BGAppRefreshTask` (Tier 2) only provides ~15-60s — insufficient for long AI calls.
+
+**Decision:**
+1. **Tier 2 (existing):** `BGAppRefreshTask` (`ai.tabmail.sync`) — lightweight sync polling + embeddings (15-60s budget).
+2. **Tier 3 (new):** `BGProcessingTask` (`ai.tabmail.ai-processing`) — long-running AI processing (up to ~10 min). Requires network connectivity, no external power required. Scheduled on app background with 5 min earliest begin date. Runs: sync → AI processing for all accounts → embeddings → badge update.
+3. **`beginBackgroundTask`:** Wraps both `processMessagesForAccount` (queue path) and `processMessage` (priority path) to protect in-flight AI calls with ~30s grace period on backgrounding.
+4. **SSE streaming with tool execution loop:** `BackendClient.sendCompletionsWithTools()` implements multi-turn tool execution matching TB's architecture. Parses full SSE event stream, executes client-side tools via `ToolRegistry`, manages `conversation_state` across rounds.
+5. **Tool scaffold:** `AgentTool` protocol + `ToolRegistry` actor. No implementations yet — tools added incrementally.
+
+**Rationale:**
+- `BGProcessingTask` grants up to ~10 minutes — sufficient for batch AI processing with tool loops
+- `beginBackgroundTask` is a quick-win safety net (~30s) for single in-flight calls
+- Tool execution loop matches TB's proven architecture (ADR-IOS-008 compliance)
+- Existing summary/action pipeline untouched (still uses simpler `sendCompletions`)
+
+**Consequences:**
+- `processing` added to `UIBackgroundModes` in Info.plist
+- iOS decides when to run `BGProcessingTask` (not immediate — best-effort scheduling)
+- Tool-enabled features (chat, reply precompute) use `sendCompletionsWithTools`; summary/action use `sendCompletions`
+- When adding tools, register them in `ToolRegistry` at app startup
+
+---
+
+## ADR-IOS-016: ~~PersistenceGateway — Coalesced SwiftData Saves~~ (SUPERSEDED)
+
+**Status:** Superseded — no longer applicable after migration from SwiftData to GRDB.
+
+**Why superseded:** GRDB's `DatabasePool` writes are immediate and thread-safe. There is no `@Query` re-evaluation, no `autosaveEnabled`, and no `ModelContext` to manage. The "render storm" problem was SwiftData-specific (`@Query` change notifications on every `save()`). With GRDB, UI updates are explicit via `NavigationStore` (GRDB `ValueObservation`), which doesn't suffer from the same issue. The `PersistenceGateway` class, `setNeedsSave()`, `awaitSave()`, and `saveNow()` have all been removed.
+
+---
+
+## ADR-IOS-017: ~~Remove Folder→MessageHeader @Relationship~~ (SUPERSEDED)
+
+**Status:** Superseded — no longer applicable after migration from SwiftData to GRDB.
+
+**Why superseded:** GRDB uses explicit SQL foreign keys, not ORM-managed inverse relationships. The `messageHeader` table has a `folderId` foreign key with `ON DELETE CASCADE` — the database engine handles cascade deletes automatically. There is no inverse materialization problem because GRDB never eagerly loads related objects. Queries use `Column("folderId") == fid` directly.
+
+---
+
+## ADR-IOS-018: Persistent Offline Action Queue
+
+**Context:** Archive/delete/move actions previously updated local state only after remote success. If the user was offline or the connection dropped, actions failed with an error message and the user's intent was lost. This was inconsistent with ADR-IOS-001 (optimistic UI) which specifies immediate local updates.
+
+**Decision:**
+1. **All user actions are optimistic** — archive, delete, move, read, flag, and tag update local state immediately. The remote operation is queued in `PendingOperation` (GRDB) for async execution.
+2. **Persistent queue** — `PendingOperation` now tracks `status` (queued/inFlight) and supports `setTag`/`removeTag` operation types. Operations survive app kill and are drained on launch, network restore, foreground return, and after each sync poll.
+3. **Network monitoring** — `NetworkMonitor` (NWPathMonitor wrapper) detects connectivity changes and triggers queue drain on reconnect.
+4. **Conflict detection** — When executing a queued destructive op (archive/delete/move), if the server returns "message not found" (already moved/deleted by another client), the queued op is silently dropped (server wins).
+5. **Sync protection** — During delta/full sync, messages with pending operations are not re-inserted (prevents optimistic UI "flash" where archived messages temporarily reappear) and not deleted (lets queue execute first).
+6. **Tag queue** — AI background tag writes and manual tag overrides go through the same queue, replacing the fire-and-forget `writeActionTagWithRetry` pattern. FIFO ordering ensures tag removal happens before archive/delete.
+7. **Undo integration** — Undo first attempts to cancel the queued operation. If still queued, local state is restored directly. If already executed on server, a counter-operation (move-back) is queued.
+
+**Rationale:** Users expect actions to be instant and resilient. Queuing operations makes the app functional during airplane mode, poor connectivity, and IMAP connection drops (which happen after device sleep). The queue also provides crash recovery (supersedes the old trackPending/completePending pattern).
+
+**Consequences:**
+- Actions never fail from the user's perspective — worst case, they execute on next reconnect
+- AccountManager action methods are now synchronous (no async/throws) — simpler call sites
+- ViewModels no longer need error handling or rollback logic for message actions
+- Queue drain order matters: tag removals must precede archive/delete (FIFO guaranteed)
+- Stale pending ops (provider removed, message gone) are cleaned up within 5 retries
+
+---
+
+## ADR-IOS-019: Outbox — Persistent Offline Send Queue
+
+**Context:** Email sending was synchronous — `AccountManager.send()` directly called `provider.send(draft:)`. If offline, the send failed with an error and the user's composed message was lost. This was inconsistent with ADR-IOS-018 (all actions go through a persistent queue) and ADR-IOS-001 (optimistic UI). Users expected to compose and "send" even without connectivity.
+
+**Decision:**
+1. **OutboxMessage GRDB model** — `outboxMessage` table persists the full draft (recipients, subject, body, isHTML, inReplyTo, references) with status (queued/sending/failed) and `sentAt` timestamp. Attachments stored on disk under `Application Support/TabMail/outbox_attachments/{id}/` (not in DB — avoids blob bloat). v3 migration adds the table, v4 adds `sentAt`.
+2. **Always queue, never direct send** — `ComposeView.send()` calls `AccountManager.queueSend()` which persists to GRDB + disk, then fires `drainOutbox()` async. ComposeView dismisses only on success. If persistence fails, error is shown and compose stays open.
+3. **drainOutbox() pattern** — Mirrors `drainPendingQueue()`: isDrainingOutbox guard, NetworkMonitor gate, FIFO by createdAt, marks `sending` before attempt. Messages are sent in parallel — each gets its own Task, with provider-level concurrency managed by PriorityWorkQueue. A failure for one account does not block other accounts or messages. Only processes `.queued` messages — `.failed` requires explicit user Retry. Max 3 passes.
+4. **Drain triggers** — NetworkMonitor reconnect, app launch (reconcileOutbox), after queueSend, after discardOutboxMessage (so remaining queued messages proceed immediately), SyncScheduler foreground polling + after each poll.
+5. **Post-send: Sent folder append** — After `provider.send()` succeeds: (1) stamp `sentAt` timestamp, (2) attempt IMAP APPEND to Sent folder with dedup check, (3) on success: delete from DB + update isReplied/isForwarded + delete attachments. Gmail/Exchange auto-save to Sent — their `appendToSentFolder` is a no-op. IMAP requires explicit APPEND because SMTP only delivers; it does NOT store a copy on the sender's server.
+6. **Message-ID pre-generation** — Before SMTP send, a stable RFC822 Message-ID is generated and persisted to `outboxMessage.sentMessageId`. Both SMTP send and IMAP APPEND use this same ID (via `DraftMessage.messageId` → `Email.additionalHeaders["Message-Id"]`). On retry, the Sent folder is searched by `HEADER Message-ID <id>` to prevent duplicate appends.
+7. **Persistent Sent append** — If the IMAP APPEND fails (connection drop, app kill), the outbox message stays with `sentAt != nil` and `appendedToSent == false`. `drainPendingSentAppends()` retries on next drain cycle. The message is only finalized (deleted + flags updated) when BOTH send and append succeed. v18 migration adds `sentMessageId` and `appendedToSent` columns.
+8. **Crash recovery (reconcileOutbox)** — On launch: messages with `sentAt != nil` AND `appendedToSent == true` → delete (fully completed). Messages with `sentAt != nil` AND `appendedToSent == false` → keep for append retry (already sent, don't re-send). Messages with `sentAt == nil` and status `sending` → reset to `queued` (retry). Also cleans orphaned attachment dirs.
+9. **Auto-retry + escalation** — Transient failures (retryCount < 3) keep status as `queued` for automatic retry on next drain. Persistent failures (retryCount >= 3) mark as `failed` — user must tap Retry (which resets retryCount to 0 for a fresh set of attempts).
+8. **User actions** — Retry: resets failed→queued + retryCount→0, triggers drain. Discard: atomic fetch+delete in single write transaction, refused if status==sending.
+9. **Reactive UI** — `NavigationStore` observes `outboxMessage` table via GRDB `ValueObservation`. Sidebar shows "Outbox" in unified section + per-account sections, with count badge (red if failures). `OutboxView` hides discard button for sending messages.
+
+**Core reliability philosophy — a dropped send or double-send is near end-of-product:**
+
+- **Never drop a message.** `queueSend` throws on failure. ComposeView MUST show the error and NOT dismiss. The compose view is the user's last chance to preserve their message.
+- **Never `try?` on state transitions.** Every DB write that changes outbox status (queued→sending, sending→failed, success→delete) MUST use `do/catch` with retries (3 attempts, 100ms backoff). A silently swallowed failure leads to message loss or double-send via crash recovery.
+- **`sentAt` before delete.** After successful send, stamp `sentAt` BEFORE attempting the delete. If the app crashes between send-success and delete, `reconcileOutbox` sees `sentAt != nil` → deletes (not re-queues). Without this marker, the message would be re-sent.
+- **Prefer double-send over drop.** The two-generals problem is inherent. When in doubt (crash mid-send, no sentAt), we re-queue and retry. A rare duplicate email is vastly preferable to a silently lost message.
+- **No silent data corruption.** `loadAttachments()` throws if ANY file can't be read. Never send an email with missing attachments — mark as failed with a clear error instead.
+- **File I/O outside DB transactions.** Attachment disk operations (delete, cleanup) MUST happen outside write transactions. File I/O failure inside a transaction rolls back the DB changes.
+- **No auto-discard, ever.** Outbox messages are NEVER automatically deleted. Failed messages stay visible until the user explicitly discards. The user always has agency.
+
+**Rationale:** Matches the established pattern from ADR-IOS-018. Users expect "send" to succeed instantly regardless of connectivity. The outbox completes the "every user change is recorded and executed upon connection" guarantee. Attachments on disk avoid GRDB row size bloat. The reliability philosophy reflects that email sending is the single highest-stakes operation — a lost email can mean lost business, lost relationships, lost trust.
+
+**Consequences:**
+- Sends never fail from the user's perspective — worst case, they execute on next reconnect
+- ComposeView only dismisses after successful persistence — never before
+- Failed sends stay visible in Outbox UI with error + retry/discard options
+- Auto-retry handles transient errors (3 attempts) before bothering the user
+- `sentAt` marker closes the main double-send crash window (irreducible ~microsecond gap remains between provider.send() and sentAt write — inherent two-generals problem)
+- Orphaned attachment dirs cleaned on every app launch
+- Account deletion cascades via FK — attachment dirs cleaned before cascade
+
+---
+
+## ADR-IOS-020: Swift 6 BGTask Handler Isolation Pattern
+
+**Context:** `SyncScheduler` is a `@MainActor` class. `BGAppRefreshTask` and `BGProcessingTask` expiration handlers run on arbitrary Apple-internal threads. In Swift 6 strict concurrency, ALL local variables in a `@MainActor` method are main-actor-isolated — accessing them from `@Sendable` expiration handler closures triggers a dynamic isolation trap (`EXC_BREAKPOINT` at runtime), even for inherently thread-safe types like `Mutex<Bool>`. `nonisolated(unsafe)` on local variables does not prevent this (only works on stored properties per SE-0412). Additionally, `NWPathMonitor.pathUpdateHandler` can fire multiple times racing with `cancel()`, causing `CheckedContinuation` double-resume crashes.
+
+**Decision:**
+1. **`nonisolated func` on BGTask handler methods** — Strips actor isolation from ALL method locals, allowing them to be freely captured in `@Sendable` closures. The actual work runs inside `Task { @MainActor in }`.
+2. **`BGTaskContext` class (`@unchecked Sendable`)** — Holds shared state (expired flag, processing task reference) between the expiration handler and the processing Task. Uses `NSLock` for internal synchronization. `@unchecked Sendable` lets it be captured across isolation domains without triggering region-based sending errors.
+3. **`@preconcurrency import BackgroundTasks`** — Downgrades strict Sendable checking for `BGTask`/`BGProcessingTask` (ObjC types lacking proper annotations), preventing "sending risks causing data races" errors.
+4. **Use-then-send ordering** — Set `task.expirationHandler` BEFORE creating the `Task { @MainActor in }` closure that captures `task`. This satisfies Swift 6's region-based "no use after send" rule (SE-0414).
+5. **`Mutex<Bool>` guard in `isOnWiFi()`** — Prevents `CheckedContinuation` double-resume when `NWPathMonitor.pathUpdateHandler` fires multiple times racing with `cancel()`.
+6. **Only `Task { @MainActor in }` body calls `setTaskCompleted`** — The expiration handler NEVER calls BGTask methods directly. It only sets the expired flag and cancels the processing task. The processing task checks the flag and calls `setTaskCompleted` itself.
+
+**Rationale:**
+- Swift 6 runtime isolation checking is stricter than compile-time checks — code that compiles can still crash at runtime
+- `Mutex<Bool>` and `Task` are `Sendable`, but Swift 6 isolates them to the actor context of the enclosing method
+- `nonisolated(unsafe)` only prevents compile-time errors on stored properties, not runtime isolation traps on locals
+- `@unchecked Sendable` on a class with NSLock is the established pattern for cross-isolation shared state
+- BGTask's ObjC types don't conform to `Sendable` — `@preconcurrency` is the approved workaround
+
+**Consequences:**
+- All BGTask handler methods must be `nonisolated func` — never `@MainActor`
+- Shared state between expiration handler and processing task must go through `BGTaskContext` (or similar `@unchecked Sendable` class)
+- Any new `CheckedContinuation` with callback-based APIs needs a `Mutex<Bool>` resume guard
+- The pattern is more verbose but eliminates an entire class of runtime crashes
+
+---
+
+## ADR-IOS-021: Backfill Power Optimization
+
+**Context:** The backfill crawler aggressively syncs all historical email for AI processing and FTS. Unlike iOS Mail/Gmail/Outlook (which use push + on-demand fetch), TabMail needs all data locally. Profiling showed excessive CPU wakeups from small IMAP batches (50 UIDs) with inter-batch sleeps, redundant per-row SQL existence checks in write transactions, and no battery level awareness.
+
+**Decision:**
+1. **Batch existence check** — Replace N individual `fetchCount` queries in `insertBackfillBatch` with a single batch `fetchSet` at the start of the write transaction. O(N) → O(1) SQL round-trips.
+2. **Battery level gate** — Skip backfill entirely when battery < 20% and not charging. `shouldPauseBackfill` checks every 60s. Threshold matches iOS's Low Battery warning.
+3. **Larger batch sizes** — `backfillChunkSize` 200→500 (normal), 500→1000 (aggressive). `imapFetchBatchSize` 50→100 (normal), 100→200 (aggressive). Fewer write transactions and lock cycles.
+4. **Reduced delays** — `interFolderDelay` 1.0→0.5s, `deepCrawlInterWindowDelay` 1.0→0.5s, `imapInterWindowDelay` 0.5→0.3s (normal). `waitForIdle()` already gates responsiveness.
+5. **Cellular awareness** — `NetworkMonitor.isExpensive` (from `NWPath.isExpensive`). On metered connections, backfill only inbox-role folders.
+6. **Coalesced FTS indexing** — `insertBackfillBatch` returns FTS records instead of indexing inline. `backfillWindow` indexes once at end of window instead of per chunk.
+
+**Rationale:**
+- User actions (send, archive, fetchBody) are already disjoint: SMTP/HTTP for sends, priority IMAP lock for actions, GRDB WAL for DB writes. No contention with backfill.
+- Fewer, larger batches reduce CPU wakeups, lock cycles, and radio activity — completing backfill faster means less total wall-clock power usage.
+- Battery gate prevents draining the last 20% — the range users notice most.
+- Cellular gate is consistent with how iOS Mail handles metered connections.
+
+**Consequences:**
+- User action worst-case IMAP lock wait increases from ~500ms to ~1s (normal profile). Priority lock ensures this is bounded.
+- Cellular users won't have non-inbox folders backfilled until on WiFi. Inbox is always prioritized.
+- `insertBackfillBatch` return type changed to `(inserted: Int, ftsRecords: [FTSHeaderRecord])` — callers must handle FTS indexing.
+
+---
+
+## ADR-IOS-022: Agent Chat with Persistent History
+
+**Context:** The Thunderbird addon has a conversational AI assistant (`agentConverse`) that uses the `system_prompt_agent` system prompt, persistent chat history, and the completions API. The iOS app needed the same feature in the Dynamic Island chat pill, replicating TB's architecture per ADR-IOS-008.
+
+**Decision:**
+1. **Completions API** — Chat uses `AIService.sendChatMessage()` which sends `system_prompt_agent` (system) + history turns + `chat_converse` (user message) via `sendWithTools()`. Server-side tools (search_web, date_to_day, find_available_slots, time_delta) auto-execute in the backend — the iOS client just receives the final response.
+2. **GRDB persistence** — `ChatStore` actor with `chatTurn` table (v6 migration). `ChatTurn` model matches TB's `persistentChatStore.js` turn structure. Budget: 50 exchanges max, 25K chars max, FIFO eviction.
+3. **Backend templates** — iOS-specific `system_prompt_agent-v1.0.0.md` (simplified from TB: server-side tool instructions for search_web + date_to_day, no calendar/contacts/FSM, mobile-optimized formatting). Supporting templates: `chat_converse_user_message` (aliased to `chat_converse`), `chat_converse_history`, `chat_converse_reminders`.
+4. **History in UI** — `ChatHistoryView` accessible from Settings > AI. Searchable, clearable.
+5. **No client-side tools yet** — Server-side tools work out-of-the-box. Client-side tools (email search, memory search, etc.) will be added incrementally via `ToolRegistry`.
+
+**Rationale:**
+- ADR-IOS-008 requires exact replication of TB's architecture
+- TB's `system_prompt_agent` + `expandSystemPromptAgent()` expansion model is battle-tested
+- Persistent history enables cross-session context (prior session history, conversation continuity)
+- Server-side tools (search_web, date_to_day) auto-execute in the backend with no iOS code needed — the backend auto-loops and returns the final response
+
+**Consequences:**
+- Backend prompt templates must be maintained in sync between iOS and TB (shared intent, platform-specific content)
+- iOS agent is more limited than TB (no email operations, calendar, contacts) until client-side tools are implemented
+- `chat_converse` alias in `gen-registries.mjs` maps `chat_converse_user_message` filename → `chat_converse` registry key (critical for iOS code that sends `content: "chat_converse"`)
+- Budget enforcement is device-local — chat history is NOT synced via Device Sync (per design: stays per-device)
+
+---
+
+## ADR-IOS-023: Mobile-Native Chat UX (Exception to TB Parity)
+
+**Context:** ADR-IOS-008 requires exact replication of TB's architecture, and ADR-IOS-022 established the agent chat system matching TB's `agentConverse`. However, TB's desktop "infinite chat" paradigm — welcome-back messages, greyed-out old sessions, full history replay in the chat window — doesn't suit mobile UX. The iOS Dynamic Island chat pill has limited screen space and users expect a lightweight, focused interaction.
+
+**Decision:** The iOS chat departs from TB's UI presentation while keeping the backend architecture identical:
+
+1. **No welcome-back message** — TB shows a "Welcome back {name}" bubble with staged animation. iOS shows **reminder cards at the top of the chat** (same visual pattern as the email context card) instead. Reminders are loaded fresh on each expand.
+2. **Session history with swipe navigation** — TB greys out old-session messages inline. iOS stores a `sessionId` on each `ChatTurn` (GRDB migration v11) and presents past sessions as horizontally swipeable pages in a `TabView(.page)`. Users can swipe left to browse up to K most recent sessions (configurable via `maxChatSessions` in Settings, default 10). The rightmost page is always the current/newest session and is the default on open. **Resuming**: swiping to an old session and sending a message adopts that session's turns as the API conversation history, effectively "resuming" the conversation. The backend receives the same `history` array — no backend changes needed. Sessions reorder by last activity on close/reopen.
+3. **Multi-turn within session** — Current session IS multi-turn: prior user/assistant turns from `sessionTurns` (in-memory, in `ChatPillState.Session`) are sent as conversation history. When resuming an old session, that session's persisted turns become the `sessionTurns`. **30s idle timeout** — if the user hasn't interacted for 30s (and the agent is not working), the next expand starts a new session. KB refinement fires on the expiring session.
+4. **Nudges become reminder cards** — TB's proactive nudges insert a chat bubble. iOS shows nudge-worthy reminders (urgent/overdue) as **top-of-chat cards with accent highlighting**. Tap to expand, dismiss to snooze.
+5. **Compose edit mode is single-turn (atomic)** — Each edit instruction is independent. `editHistory` provides context for continuity, but the LLM does not receive prior conversation turns as messages.
+
+**What stays identical (ADR-IOS-008 compliance):**
+- System prompt construction (`system_prompt_agent` with `user_name`, `user_kb_content`, `user_reminders_json`)
+- KB refresh per turn, reminders refresh per turn
+- ChatIdTranslator (ID recycling, ref counting, pill rendering, eviction cleanup)
+- ChatStore persistence (turns still saved for Settings > Chat History, budget enforcement)
+- Tool execution (SSE events, server-side tools, client-side tools via ToolRegistry)
+- `renderedContent` generation for ChatHistoryView
+- Email context enrichment (`Regarding [Email](N):` prefix for LLM, hidden from user)
+
+**Rationale:**
+- Mobile users benefit from browsing recent conversations without infinite scrollback
+- Swipe-based session navigation is a natural iOS pattern (TabView with page style)
+- Resuming old sessions by swapping the conversation history is purely client-side — no backend changes
+- Reminder cards at the top are more actionable than a welcome-back bubble
+- Multi-turn within the active session is essential for natural conversation flow
+- The agent's tools (memory_search, inbox_read) supplement session context
+
+**Consequences:**
+- `ChatMessage` model is simplified (no `isHistory`, `isOldSession`, `isGreeting` flags)
+- `ChatBubble` is simplified (no greeting tint, no opacity/saturation modifiers)
+- Greeting builder functions (`buildGreeting`, `formatRemindersForGreeting`, `formatDueDateForGreeting`) are removed
+- `ChatTurn.sessionId` (nullable, GRDB v11) groups turns into sessions; pre-v11 turns have NULL
+- `ChatPillState.Session` holds multi-session state: `loadedSessions`, `activeSessionIndex`, `currentSessionId`
+- `ChatStore.loadSessions(limit:)` queries distinct sessions ordered by last activity
+- `DynamicIslandChatButton` uses `TabView(.page)` for horizontal swiping with custom dot indicators
+- Sending in a past session adopts its `sessionId` and turns as the API `history` parameter
+- ChatHistoryView and Settings Chat History are unaffected — full history accessible from Settings
+- Session state survives SwiftUI view recreation via `ChatPillState` singleton
+
+---
+
+## ADR-IOS-024: Destructive Tool Confirmation with ToolDeclinedError
+
+**Context:** Agent tools that perform destructive or irreversible actions (archive, delete, edit contacts) must get explicit user confirmation before executing. The tool suspends via `withCheckedContinuation` while a confirmation card is shown in the chat UI. If the user declines, the tool must signal failure to the LLM with `ok: false` so the LLM knows the action was NOT performed and can adjust its behavior (e.g., re-read the inbox to verify correct targets).
+
+**Decision:**
+
+1. Tool calls `AgentToolRouter.ActionConfirmation.awaitConfirmation()` which suspends via `withCheckedContinuation`
+2. `DynamicIslandChatButton` observes `pendingAction` and appends a confirmation card to the chat
+3. On accept: continuation resumes with `true`, tool executes the action and returns success JSON
+4. On decline: continuation resumes with `false`, tool throws `ToolDeclinedError(output:)` with structured JSON containing `cancelled: true` and a guidance message for the LLM
+5. `ToolRegistry.execute()` catches `ToolDeclinedError` specifically and returns `ToolExecutionResult(output:, ok: false)` — distinct from generic errors which also return `ok: false` but with a different error message
+6. Cancellation safety: `withTaskCancellationHandler` + `ContinuationGuard` (NSLock-based single-resume guard) prevents double-resume crashes when both task cancellation and user response fire
+
+**All tools requiring user confirmation MUST follow this exact pattern.**
+
+Currently applies to: `email_archive`, `email_delete`, `contacts_edit`, `contacts_delete`.
+
+**Consequences:**
+- LLM receives structured feedback on decline — can retry with correct targets
+- `ToolDeclinedError` is distinct from generic tool errors — allows different UX handling if needed
+- Confirmation cards become non-interactive after response (prevents double-tapping)
+- Task cancellation (Stop button) safely resumes pending confirmations as declined
+
+---
+
+## Template for New Decisions
+
+```markdown
+## ADR-XXX: [Title]
+
+**Context:** [What situation led to this decision?]
+
+**Decision:** [What did we decide?]
+
+**Rationale:** [Why?]
+
+**Consequences:**
+- [Trade-offs, both positive and negative]
+```
+
+---
+
+## ADR-IOS-025: Backfill Crawl Progress Must Not Use Date-Based Anchors From Unrelated Queries
+
+**Context:** In Feb 2026, we discovered that `fullSync` anchored `oldestSyncedDate` to `min(date)` across ALL messages in a folder, not just the sync batch. After a Smart Reindex (which resets `oldestSyncedDate` to nil), the next `fullSync` would re-anchor to the oldest message in the folder (potentially years old), causing backfill to start from that ancient date instead of from today. This created a massive unscanned gap between the latest-50 sync window and where backfill resumed.
+
+**Root cause bugs found (all fixed):**
+1. `fullSync` anchor used `min(date)` across entire folder — fixed to use the Nth most recent message
+2. Deep backfill missing 1-day overlap for IMAP date boundary messages — fixed
+3. Deep backfill terminated on `insertedCount == 0` instead of `found == 0` — fixed
+4. Shallow backfill `<=` instead of `<` at age cutoff boundary — lost messages on exact cutoff date — fixed
+5. `fetchOlderMessages` used `Calendar.current` instead of UTC — timezone-dependent gaps — fixed
+6. `todayMidnight` used hardcoded `86400` seconds instead of Calendar API — fixed
+
+**Decision:**
+- **NEVER derive crawl progress pointers from aggregate queries over the full message store.** The anchor must reflect only the current operation's scope (e.g., the oldest date from the just-synced batch, or the window boundary that backfill just completed).
+- **Date-based crawling is inherently fragile** — IMAP SINCE/BEFORE uses date-only granularity (no time component), sender dates can be wrong (clock skew), and midnight-aligned UTC windows can miss messages at boundaries. We mitigate with 1-day overlap between windows and self-healing (UID comparison), but this remains a known weakness.
+- **UID-based tracking is not a complete solution either** — UIDs are folder-specific, can change on UIDVALIDITY change (mailbox compaction), and are not available for Gmail/Exchange. UIDs are used for gap detection (self-heal) but not as the primary crawl pointer.
+- **Self-healing mechanism** (`SyncEngineSelfHeal.swift`) runs after full sync (rate-limited hourly) and on-demand folder refresh, comparing IMAP UIDs against GRDB and fetching any missing messages. This is the safety net for any crawl logic bugs.
+
+**Additional bugs found and fixed (same investigation):**
+7. **Duplicate backfill workers** — when `resetCrawlState()` cancels old tasks, the old task's `defer { headerBackfillTasks[accountId] = nil }` could fire AFTER a replacement task was placed in the dictionary, overwriting it. Next sync poll would see nil and spawn a duplicate. Fixed: defer only clears on non-cancelled exit.
+8. **FTS body fetch — missing UIDs get retry** — `fetchTextBodiesParallel` silently drops UIDs for some messages (e.g., Deleted Messages, attachment-only). Added one-retry for transient drops. Permanently missing UIDs are NOT marked as fetched (headers exist = messages are real). The existing `ftsStalled`/`ftsSkipOffset` mechanism handles these without data loss.
+
+**Consequences:**
+- Smart Reindex now works correctly — backfill starts from just below the sync window and crawls the full history
+- Self-heal catches any remaining gaps within the 90-day window
+- No more duplicate workers racing on the same account
+- FTS body retry catches transient IMAP FETCH drops; permanently missing UIDs handled by ftsStalled mechanism
+- The fundamental tension between date-based and UID-based progress tracking remains unresolved — both have failure modes
+
+---
+
+## ADR-IOS-026: Proactive Local Notifications (Replicating TB's Nudge System)
+
+**Context:** TB's `proactiveCheckin.js` delivers browser notifications for reminders via two deterministic triggers. iOS needs the same functionality using `UNUserNotificationCenter` local notifications, which work even when the app is killed (via `UNCalendarNotificationTrigger`).
+
+**Decision:**
+1. **Two triggers matching TB:**
+   - `new_reminder` — fired after AI message processing detects new reply-tagged reminders within the configured window. Debounced 1s.
+   - `due_approaching` — scheduled via `UNCalendarNotificationTrigger` N minutes before a reminder's due date/time. Reschedules on every reminder list change.
+2. **`ProactiveNotifyService` actor** — singleton orchestrator. Called from `AccountManagerAI.processMessagesForAccount()` (after drain) and `RootView` on foreground return.
+3. **`ReachedOutStore`** — UserDefaults-backed dedup keyed by `"{reminderHash}:{triggerType}"`. Prune splits on LAST colon (reminder hashes contain colons like `m:msgId`).
+4. **Separate `NotificationDelegate`** — `UNUserNotificationCenterDelegate` extracted from `AppDelegate` into its own class because `UIApplicationDelegate` makes `AppDelegate` implicitly `@MainActor`, conflicting with the delegate's arbitrary-thread callbacks in Swift 6.
+5. **Foreground return delivered-notification sync** — `onForegroundReturn()` syncs `deliveredNotifications()` to `ReachedOutStore` before checking for overdue reminders. Covers the case where `UNCalendarNotificationTrigger` fired while the app was killed (delegate never ran).
+6. **No LLM calls** — notification content is template-based string interpolation, matching TB.
+7. **Rate limiting** — 60s minimum between immediate notifications, matching TB's `MIN_INTERVAL`.
+
+**Consequences:**
+- Notifications work even when app is killed (calendar triggers are OS-managed)
+- Deep link on notification tap posts `.proactiveNotificationTapped` — observer not yet implemented (follow-up)
+- Settings: toggle, window days, advance minutes — all in TabMailSettingsView "Notifications" section
+
+---
+
+## ADR-IOS-027: Ever-Rolling FIFO Queues — Leave Only on Confirmed Success or Confirmed Stale
+
+**Context:** Background processing queues (ActiveBodyQueue, ActiveAIQueue, BackfillEmbeddingQueue) handle work items that represent real user data — message bodies, AI summaries, vector embeddings. Fire-and-forget patterns risk silent data loss: if a task fails (connectivity drop, timeout, crash), the item vanishes from the queue and is never retried. The consolidation/self-heal pass on next launch should be a safety net, not the primary recovery mechanism.
+
+**Decision — Ever-Rolling FIFO with In-Flight Safety:**
+
+1. **Items NEVER leave the queue until confirmed done.** An item is removed ONLY on:
+   - **Confirmed success** — the work completed and was persisted (FTS write, AI cache write, embedding stored).
+   - **Confirmed stale** — the source data no longer exists (account deleted, header deleted, content permanently gone e.g. HTTP 404/410).
+   - **Max retries exceeded** — transient failures exhausted the retry budget (`SyncConfig.maxQueueRetries`). Item is dropped from in-memory queue; `repopulateFromDatabase()` rediscovers it on next foreground.
+
+2. **Dispatch = copy to back + mark in-flight.** When dispatching an item:
+   - Move item from front to back of the FIFO array (item is always in the queue).
+   - Mark item in the `inFlight` set (dispatch skips in-flight items).
+   - Launch fire-and-forget task for the actual work.
+   - On success: remove from queue. On failure: clear in-flight flag — item stays at back, will naturally cycle to front for retry.
+   - **Candidate scan MUST skip past in-flight items** — use a `scanIdx` that advances past in-flight entries instead of breaking at the first one. Without this, newly-enqueued items get stuck behind wrapped-around in-flight items at the front of the queue, even when concurrency slots are available (dispatch starvation).
+
+3. **Two-phase dispatch (actor reentrancy safety).** Phase 1 collects candidates synchronously (no `await` — safe from actor reentrancy). Phase 2 resolves async dependencies (provider lookup, DB reads) and launches tasks. This prevents queue mutation during iteration.
+
+4. **Immediate dispatch on idle→active transition.** First item enqueued into an empty queue dispatches immediately (no debounce delay). Subsequent rapid enqueues are debounced (300ms body, 500ms embedding) to batch redundant dispatch calls.
+
+5. **Boot-time recovery for every queue.** Each queue has `repopulateFromDatabase()` that discovers incomplete work from GRDB/FTS state (e.g., inbox headers missing FTS body, messages with body but no embedding). Called from `SyncScheduler` on foreground return and in `BGProcessingTask`. The queue itself is ephemeral (in-memory); the database is the durable source of truth.
+
+6. **Failed items yield to others.** On failure, the item is already at the back of the FIFO — other items get their turn before the failed item cycles back to the front. This prevents one bad item from blocking the entire queue.
+
+**Queues implementing this pattern:**
+- `ActiveBodyQueue` — fetches message bodies from provider, writes plain text to FTS
+- `BodyRenderQueue` — renders FullMessageInfo → MessageBody (CID, ICS, attachments). Background pre-cache path uses INSERT OR IGNORE; user-open path uses save() (upsert) to always win over background.
+- `ActiveAIQueue` — generates summaries/actions/replies via backend LLM
+- `BackfillEmbeddingQueue` — generates vector embeddings via CoreML
+
+**Rationale:**
+- No item is ever in a state where it's "not in the queue AND not confirmed done"
+- Crash at any point loses only the in-memory queue — `repopulateFromDatabase()` rebuilds from durable state
+- The self-heal/consolidation pass should never need to do real work — it's purely a safety net
+- IMAP priority lock (`acquirePriorityLock()`) handles user-vs-background contention naturally — no pause mechanism needed
+
+**Consequences:**
+- Slightly more memory per queue (in-flight set, retry counts, dedup set)
+- `repopulateFromDatabase()` is idempotent — safe to call multiple times (dedup set prevents duplicates)
+- All four queues follow identical structure — any new processing queue must adopt the same pattern
+
+---
+
+## ADR-IOS-026: PendingOperation Uses Stable IDs (rfc822MessageId)
+
+**Context:** PendingOperation.messageIds stored numeric IMAP UIDs. If the server changes UIDVALIDITY (mailbox compaction, migration, backup restore), all UIDs are reassigned. Queued operations would reference stale UIDs — either failing silently or targeting wrong messages.
+
+**Decision:** PendingOperation.messageIds now stores `rfc822MessageId` (RFC 2822 Message-ID header) for IMAP messages instead of numeric UIDs. The `MessageHeader.stableId` computed property returns `rfc822MessageId` when the messageId is numeric (IMAP UID) and rfc822MessageId is available, otherwise returns messageId. Gmail/Exchange use non-numeric stable provider IDs, so `stableId` returns messageId unchanged for those.
+
+**Implementation:**
+- `MessageHeader.stableId` — computed property: if `UInt32(messageId) != nil` and `rfc822MessageId` is non-empty, returns `rfc822MessageId`; otherwise returns `messageId`
+- All PendingOperation queue sites use `stableId` instead of `messageId`
+- `queueTagWrite` accepts optional `rfc822MessageId` parameter for the same logic
+- `IMAPProvider.resolveUID()` already handles non-numeric IDs via IMAP `SEARCH` by Message-ID header — no provider changes needed
+- `SyncEngineFullSync` pending-op matching checks both `info.messageId` and `info.rfc822MessageId` against pending sets (dual-match)
+- Undo cancellation matching also checks both numeric and stable IDs
+
+**Rationale:** UIDVALIDITY changes are rare but catastrophic for queued operations. RFC 2822 Message-ID is immutable and server-independent. The undo path already used `rfc822MessageId` for IMAP move-back operations — this extends the same pattern to all operations.
+
+**Consequences:**
+- PendingOps for IMAP messages without rfc822MessageId still fall back to numeric UID (some drafts, system notifications)
+- Drain-time UID resolution does an extra IMAP SEARCH for non-numeric IDs — negligible cost since pending ops are low-volume
+- Dual-matching in sync adds minimal overhead (one extra set lookup per message)
+
+---
+
+## ADR-IOS-028: Background Execution Budget — Lightweight Refresh, Heavy Processing
+
+**Context:** iOS imposes strict time budgets on background execution. `BGAppRefreshTask` has ~30 seconds; silent push notifications have a similar budget. Exceeding these budgets causes iOS to penalize the app: throttling future `BGAppRefreshTask` scheduling AND rate-limiting silent push delivery. We observed that running full sync (which fires backfill, bulk FTS indexing, and embedding rebuild as fire-and-forget Tasks) during push/refresh was blowing the budget and causing iOS to stop delivering push notifications entirely.
+
+**Decision:** Split all background work into two tiers with a strict contract:
+
+### Tier A — Lightweight Refresh (BGAppRefreshTask + Silent Push)
+
+**Budget:** Must complete in <25 seconds. Enforced by BGTaskContext expiration handler.
+
+**Allowed work (exhaustive list):**
+1. `reconnectProviders()` — reconnect stale IMAP/API connections
+2. `backgroundDeltaSync()` — header-only delta sync (no full sync fallback). Per-account timeout of 15s.
+3. `drainPendingQueue()` + `drainOutbox()` — execute queued user actions (fast, bounded)
+4. `updateBadgeCount()` — recount unread from local DB
+5. `scheduleBackgroundProcessing()` — schedule Tier B to run next
+
+**Prohibited work (NEVER in Tier A):**
+- Full sync (`sync()` / `fullSync()`) — unbounded duration, fires background Tasks
+- `startBackfill()` — backward crawl, unbounded IMAP fetches
+- `bulkIndexIfNeeded()` — FTS indexing of all unindexed messages
+- `startEmbeddingRebuild()` — ML model inference
+- `ActiveBodyQueue.awaitDrain()` — fetches full message bodies via IMAP/API
+- `ActiveAIQueue.awaitDrain()` — LLM API calls
+- `BackfillEmbeddingQueue.awaitDrain()` — ML embedding generation
+- `repopulateFromDatabase()` — queue scan of entire message table
+- Any fire-and-forget `Task { }` that does unbounded work
+
+**Account scoping:**
+- **BGAppRefreshTask:** IMAP/iCloud accounts only (Gmail/Outlook have push).
+- **Silent push:** Only the pushed account (resolved from `accountEmail` in payload). Falls back to all active accounts if email can't be resolved.
+
+### Tier B — Background Processing (BGProcessingTask)
+
+**Budget:** Minutes of execution time. Requires network connectivity.
+
+**Work (in order):**
+1. `reconnectProviders()`
+2. Repopulate + drain body/AI/embedding queues
+3. `generateMissingEmbeddings()`
+4. Backfill (backward crawl) — WiFi-gated via `wifiOnlyKey` setting
+5. `drainPendingQueue()` (in case backfill queued tag writes)
+6. `updateBadgeCount()`
+
+**Scheduling:** Tier B is scheduled immediately after every Tier A completion (both BGAppRefreshTask and silent push). Also scheduled on app background as a periodic fallback.
+
+### Entry Points
+
+| Trigger | Tier | Method | Accounts |
+|---------|------|--------|----------|
+| BGAppRefreshTask | A | `handleBackgroundSync()` → `backgroundPoll()` | IMAP/iCloud only |
+| Silent push (APNs) | A | `handleSilentPush()` → `backgroundPollNow(accounts:)` | Pushed account only |
+| BGProcessingTask | B | `handleBackgroundAIProcessing()` | All active |
+| Foreground timer | Full | `poll()` → `sync()` | All active |
+| Foreground return | Full | `startForegroundPolling()` → `poll()` | All active |
+
+### Key Implementation Details
+
+- `backgroundDeltaSync()` is the Tier A counterpart to `sync()`. It calls `performDeltaSync()` directly — never falls back to `fullSync()`, never fires `startBackfill()` / `bulkIndexIfNeeded()` / `startEmbeddingRebuild()`.
+- `backgroundPoll()` defaults to IMAP/iCloud accounts when no override is provided. The push handler explicitly passes the resolved account(s).
+- IMAP delta uses STATUS UNSEEN to detect remote read/unread flag changes without full folder sync. When only unread count changed (no new/deleted messages), updates the folder count directly — avoids the cost of `syncMessages()`.
+- The push handler races sync against a deadline (`PushConfig.silentPushDeadlineSeconds`) with early return. Even on timeout, returns `.newData` to avoid iOS throttling.
+
+**Rationale:** iOS documentation and observed behavior confirm that exceeding background budgets causes compounding penalties: delayed BGAppRefreshTask scheduling, reduced silent push delivery rate, and eventual suspension of background execution privileges. The two-tier split ensures the time-critical path (Tier A) always completes within budget, while heavy work (Tier B) runs when iOS grants extended execution time.
+
+**Consequences:**
+- New messages appear as headers immediately (Tier A), but body/AI/snippets populate later (Tier B)
+- If iOS never grants Tier B time, queues drain on next foreground return (existing crash recovery path)
+- IMAP accounts without server-side push (pre-IMAP_CHECK_PUSH) rely on BGAppRefreshTask frequency, which iOS controls unpredictably (minutes to hours)
+
+---
+
+## ADR-IOS-029: Database Index Management — Purpose-Built Indexes, Drop What's Superseded
+
+**Context:** Two incidents shaped this ADR.
+
+**Incident 1 (v38, 2025):** Migration v38 added a `headerComplete` column and replaced the existing `(folderId)` and `(folderId, isRead)` indexes with composite indexes that included `headerComplete`. This broke every query that relied on the original column order — unread counts, folder listings, and basic folder lookups regressed to full table scans on 250K rows. Instant folder opens became sustained 0.1 GB/s disk reads.
+
+**Incident 2 (v50, 2026):** `BackfillEmbeddingQueue.repopulateFromDatabase` consistently took 1.4-4.2s for 0-row results despite a hand-tuned full index `messageHeader_embeddingStatus` existing. `EXPLAIN QUERY PLAN` revealed the planner was choosing `idx_messageHeader_bodyStatus` with `ANY(headerComplete)` + a temp-btree sort, scanning most of the table. The root cause: stale `ANALYZE` statistics, and too many overlapping indexes gave the planner a bad choice it took. Replacing the full index with a partial index (`WHERE embeddingComplete=0 AND bodyComplete=1 AND bodyEmptyConfirmed=0`) that holds ~0 rows at steady state, AND dropping the superseded full index, made it sub-ms.
+
+**Decision:** Indexes are load-bearing and must be designed for specific query patterns. Add purpose-built indexes for new queries. DROP indexes that are provably superseded by better ones — stale indexes actively mislead the query planner and are not free. But never drop an index that other queries still depend on just because one query no longer needs it.
+
+**Rules:**
+
+1. **New query patterns get new indexes** with descriptive names that describe the query, not the column list (`messageHeader_embeddingIncomplete`, `messageHeader_aiIncomplete`, `messageHeader_triage_display`).
+2. **Prefer partial indexes for queues that drain to empty.** If a query's predicate matches the desired row set (e.g., "messages that still need X"), a partial index on exactly that predicate holds ~0 rows at steady state. Seeks become free regardless of planner choices.
+3. **Before dropping an index, audit every query that could use it.** Grep for the column combination and all predicates it covers. Confirm each usage is served by another index at least as well. When in doubt, keep it and revisit later.
+4. **Never drop an index on the same PR as schema changes that reshape queries.** Do one at a time so regressions are easy to bisect.
+5. **Run `ANALYZE`** at the end of any migration that adds, changes, or drops indexes. Without it the planner uses default cost estimates and may pick badly. Stale stats on old indexes are a source of silent regressions.
+6. **Composite index column order matters.** `(folderId, isRead)` serves `WHERE folderId=? AND isRead=0`. Inserting a column between them (`folderId, headerComplete, isRead`) breaks every query that used the original prefix — SQLite can only use a contiguous leading prefix up to the first non-equality column. If you need a new order, add a new index — don't rearrange an existing one.
+7. **More reads is cheaper than more indexes; more indexes is cheaper than a single wrong-plan query.** Index write-amplification is bounded by `indexCount × log(N)`. A full-table scan is `O(N)`. The app is read-heavy — err on the side of more indexes, but only when each one earns its keep.
+8. **When a query stays slow after indexes exist, run `EXPLAIN QUERY PLAN` before adding more indexes.** The planner may be picking a wrong index. A partial index or pinning the right one (via query rewrite, not `INDEXED BY` hacks) is usually the fix.
+
+**Rationale:** SQLite indexes are B-trees. A query can only use a contiguous leading prefix of index columns with equality predicates, then one range/ORDER-BY column. Adding a separate index preserves existing query performance while enabling new query patterns. But an unused index is not inert: the planner considers it on every query and stale statistics (post-migration column changes, skewed data distribution) can make it look deceptively cheap. Dropping obsolete indexes is a perf fix, not a cleanup task.
+
+**Consequences:**
+- The `messageHeader` table may have 10+ indexes — acceptable for a read-heavy workload.
+- Write amplification per `INSERT/UPDATE` is bounded by `indexCount × log(N)`.
+- Index disk space is ~10-20% of table size per index — acceptable for a 250K row table.
+- Migrations that drop indexes must include the `ANALYZE` call and document what was superseded, so future readers understand why the index no longer exists.
+
+---
+
+## ADR-IOS-030: Agent Compose Tool FIFO Queue
+
+**Context:** Agent tools `email_compose`, `email_reply`, and `email_forward` set `AgentToolRouter.pendingCompose`, which `InboxView` and `MessageDetailView` observe via `onChange` and present as a `fullScreenCover`. There was no coordination with already-presented compose windows:
+
+- If the user had a compose window open (manually, or from a prior agent call), a new agent compose request was silently dropped — SwiftUI cannot stack two `fullScreenCover`s from the same source view, and the local `@State` set during `onChange` is not re-evaluated when the prior cover dismisses.
+- If two agent tools fired back-to-back, the second overwrote the first in the single-slot router state and was lost before any view captured it.
+- The LLM still received `"Opening compose window..."` as the tool result, so the model thought the operation succeeded — confidently wrong, no retry, no user-visible failure.
+
+**Decision:** Compose tool requests go through an in-memory FIFO queue on `AgentToolRouter`. Only one `ComposeView` is presented at a time. **A manually-opened compose window counts as the head of the queue** — agent requests wait until it dismisses, then play one after another with no gaps.
+
+**Mechanism:**
+
+1. Tools call `AgentToolRouter.shared.enqueueCompose(request)` (synchronous, fire-and-forget). The request is appended to `composeQueue`. Tools' return strings are unchanged — the LLM gets the same response it always did.
+2. `dispatchNextIfIdle()` runs synchronously after enqueue. The dispatch guard checks four conditions: `awaitingAppear == false`, `pendingCompose == nil`, `presentationCount == 0`, and `!composeQueue.isEmpty`. If all are satisfied, it pops the front of the queue, sets `awaitingAppear = true`, and assigns the request to `pendingCompose`.
+3. The existing `onChange(of: pendingCompose?.id)` in `InboxView`/`MessageDetailView` captures the request into local `@State` and presents the cover via the existing `.fullScreenCover(item:)` plumbing.
+4. `ComposeView.onAppear` calls `composePresentationDidBegin()` which increments `presentationCount` AND clears `awaitingAppear`. `ComposeView.onDisappear` calls `composePresentationDidEnd()` which decrements (clamped at 0) and dispatches the next queued request if count returns to 0.
+5. Because the lifecycle hook lives **inside `ComposeView` itself**, it fires for **every** presentation path automatically — manual compose toolbar button, contact compose, reply, replyAll, forward, agent compose, agent draft re-open via `DraftComposePresenter`. No per-cover-site instrumentation, no risk of forgetting one. (`DraftComposePresenter` also has the same hook on its body root — see "Loading wrapper race" below.)
+
+**The `awaitingAppear` flag closes the dispatch race.**
+
+Without it, there is a brief window between "router sets `pendingCompose = A`" and "the new `ComposeView`'s `onAppear` fires `composePresentationDidBegin`" during which:
+- The view's `onChange` handler has already captured `A` into local `@State` and synchronously nilled `pendingCompose` (the original pre-queue housekeeping pattern, preserved in this change).
+- The `fullScreenCover` is mid-presentation but `composePresentationDidBegin` hasn't yet fired.
+- `pendingCompose == nil` AND `presentationCount == 0` are both true.
+
+If a second `enqueueCompose(B)` arrived in this window, the dispatch guard would falsely succeed, set `pendingCompose = B`, and the view's `onChange` would fire again — replacing the in-flight `agentCompose` `@State` value from A to B mid-presentation. SwiftUI's `fullScreenCover(item:)` does not gracefully transition between two non-nil identifiable values (per Apple docs and observed behavior on iOS 18+), so A would be silently dropped.
+
+`awaitingAppear` is set to `true` at dispatch time and cleared in `composePresentationDidBegin`. The dispatch guard tests it. A second `enqueueCompose` during the race window finds `awaitingAppear == true` and queues instead. The window is microseconds in normal SwiftUI runloops, but the race is real when two LLM tool calls return in the same runloop tick.
+
+**Loading wrapper race (DraftComposePresenter).**
+
+`DraftComposePresenter` is a wrapper that loads a draft from GRDB before rendering `ComposeView`. It is presented in two places: (a) `InboxView`'s `showAgentDraft` cover, set by tapping an agent toast; (b) `ComposeToolbarButton`'s `showDraft` cover, set when re-opening an in-progress agent draft. During the brief loading state (synchronous GRDB read, microseconds), `ComposeView` has not yet rendered, so the queue's `presentationCount` is still 0. Without a hook on `DraftComposePresenter` itself, a queued agent compose could try to present from the same source view during this window — and SwiftUI would silently drop the second cover.
+
+Fix: `DraftComposePresenter` carries the same `composePresentationDidBegin/End` hook on its body root. When the cover presents, count increments immediately even before the inner `ComposeView` loads. When the cover dismisses, both `ComposeView.onDisappear` and `DraftComposePresenter.onDisappear` fire (inner first), decrementing the count from 2 → 1 → 0, with the dispatch trigger firing on the second decrement. `ServerDraftComposeLoader` (a navigation destination, not a cover) doesn't need this hook because it's not a `fullScreenCover` and an agent compose can present on top of it without conflict.
+
+**Lifecycle hooks are safe against ComposeView's internal modals.**
+
+ComposeView contains `.alert`, `.popover`, `.photosPicker`, `.fileImporter`, and a `.fullScreenCover` for the camera. Confirmed via Apple Developer Forums (thread 655338) that a parent view's `onAppear`/`onDisappear` do **not** fire when the parent itself presents any of these. The parent stays in the view hierarchy; only the inner presentation is layered on top. So `presentationCount` does not drift when the user opens the camera or picks a photo from inside `ComposeView`.
+
+**In-memory only.** App kill loses the queue. Agent compose requests are session-scoped UI intent, not durable user actions like outbox sends (ADR-IOS-019) or pending operations (ADR-IOS-018). Persistence would add complexity for negligible benefit — if the app dies, the agent task that produced the request is also gone.
+
+**Stop button is not relevant.** The user cannot tap Stop while a compose `fullScreenCover` is presented (the inbox/chat surface is hidden behind it). The queue therefore needs no cancellation semantics — by the time the user could possibly cancel, the compose window has already appeared and the request has already left the queue.
+
+**Consequences:**
+
+- Multiple back-to-back agent compose requests are presented in order, each waiting for the previous to dismiss. The user may be "bombarded" with compose confirmations — accepted as the lesser evil compared to silently losing requests.
+- A manually-opened compose window blocks queued agent compose requests until the user dismisses it. The agent waits patiently. When the user closes their compose, the queued agent compose appears immediately.
+- The InboxView/MessageDetailView observer race (both views observe `pendingCompose`; whichever wins captures and nils the slot) is unchanged — the queue layer is orthogonal to which view presents. Whichever view wins each dispatch round presents that round's request.
+- If neither `InboxView` nor `MessageDetailView` is alive when the queue dispatches (e.g., user is deep in Settings), `pendingCompose` stays set and the queue stalls. Acceptable — these are the only views that observe, and at least one is always alive when an agent runs from a chat surface.
+- The queue has no priority and no deduplication. If the agent fires three "compose to alice@x.com" requests in a row, the user sees three compose windows in sequence. By design — we can't second-guess the agent's intent.
+
+**Out of scope (deliberately):**
+
+- Persistence across app kill.
+- A user-visible queue indicator (e.g. "2 more compose drafts pending"). Easy follow-up if needed.
+- Queueing of `ActionConfirmation` (archive/delete/calendar prompts) — separate single-slot system, separate concern.
+- Coordinating with non-`ComposeView` UI surfaces.
+- Telling the LLM that a request is queued vs. dispatched. Tool return string is unchanged.
+
+**Files:**
+
+- `TabMail/Services/AI/AgentToolRouter.swift` — `composeQueue`, `presentationCount`, `awaitingAppear`, `enqueueCompose`, `composePresentationDidBegin/End`, `dispatchNextIfIdle`. New private fields are `@ObservationIgnored` so they don't create observation dependencies.
+- `TabMail/Services/AI/Tools/EmailComposeTool.swift`, `EmailReplyTool.swift`, `EmailForwardTool.swift` — call `enqueueCompose` instead of writing `pendingCompose` directly
+- `TabMail/Views/Compose/ComposeView.swift` — `onAppear`/`onDisappear` lifecycle hooks on the body root
+- `TabMail/Views/Compose/DraftComposePresenter.swift` — same hooks on its body root, to close the loading-window race before the inner `ComposeView` renders
+
+---
+
+## ADR-IOS-031: Background Tasks Touching GRDB MUST Use `.medium` Priority (Never `.low` / `.utility` / `.background`)
+
+**Context:** iOS Thread Performance Checker caught a priority inversion during a reported blank-inbox-during-rapid-nav symptom. Stack trace:
+
+```
+Thread Performance Checker: Thread running at User-initiated quality-of-service
+class waiting on a lower QoS thread running at Default quality-of-service class.
+Investigate ways to avoid priority inversions
+
+... GRDB.Pool.get
+... GRDB.DatabasePool.read
+... SearchIndex.headerIdsWithEmptyFolderId
+... SyncEngine.backfillFolderIdsIfNeeded  ← Task(priority: .low) { … }
+```
+
+MainActor (user-initiated QoS 25) was blocked waiting on a GRDB reader held by a `.low`-priority backfill task (= utility QoS 17). The 8-level QoS gap was large enough for iOS to stall MainActor's execution while the backfill read completed. Body evaluation produced the correct view tree (`normalListView body eval — OK loaded=50 groups=38 visible=38`) seconds before MainActor could actually commit the render. Visible symptom: stuck blank inbox until the reader released (self-recovery in 1–2 s). Same mechanism also manifests as lagged sync-status pill updates after foreground return — every `@Observable` state change and NotificationCenter handler hops through MainActor and queues up behind the same block.
+
+**Decision:** Any background `Task { … }` that touches GRDB (any `dbPool.read` / `dbPool.write` on the main DB OR the FTS DB OR any other `DatabasePool` we own) MUST use `priority: .medium` (= `.default` QoS 21) or higher. Never `.low`, never `.utility`, never `.background`. This is a hard invariant with no exceptions — the GRDB reader pool is a finite resource shared with MainActor, and any QoS gap of more than 4 levels below MainActor (`.userInitiated` == 25) triggers priority inversion that stalls the render thread.
+
+**QoS reference (Task.Priority → QoS numeric):**
+
+| TaskPriority | QoS            | QoS # | Use |
+|---|---|---|---|
+| `.userInitiated` / `.high` | userInitiated | 25 | User-triggered sync (pull-to-refresh, foreground poll) |
+| `.medium` (default) | default | 21 | **Background tasks that touch GRDB — FLOOR** |
+| `.low` / `.utility` | utility | 17 | ❌ NEVER for GRDB work |
+| `.background` | background | 9 | ❌ NEVER for GRDB work |
+
+`.medium` stays below `.userInitiated` so user-triggered operations retain priority, but only by 4 QoS levels — below iOS's priority-inversion detection threshold, and close enough that the scheduler won't stall MainActor waiting on it.
+
+**Rationale:**
+
+- GRDB's `DatabasePool` has a finite reader pool (default 5). When all readers are busy, additional readers — including MainActor — must wait.
+- iOS's Thread Performance Checker flags any situation where a higher-QoS thread waits on a lower-QoS thread's resource. The warning is not just noise: iOS's scheduler genuinely throttles the higher-priority thread's execution in this state (priority promotion *helps* but doesn't fully compensate for large QoS gaps).
+- The practical effect is indistinguishable from MainActor being frozen — SwiftUI body has produced the correct view tree, but the commit-to-screen phase waits on the blocked MainActor.
+- `.low` / `.utility` are superficially appealing for "low-priority background work", but their 8-level QoS gap below MainActor is exactly the range that triggers inversion. They're appropriate for CPU-only tasks with no shared resources, not for anything touching GRDB.
+- `.medium` is the minimum safe floor. Further bumping to `.userInitiated` is wrong — that matches MainActor priority and defeats the purpose of "background" designation; user-triggered syncs should still outrank background ones.
+
+**Consequences:**
+
+- All sync-engine background tasks (header backfill, FTS bulk index, folderId backfill) use `.medium`.
+- Any new Task created in the data layer must explicitly set `.medium` or higher when it will touch GRDB. Inheriting from the caller is NOT acceptable because the caller's QoS is often MainActor → inheriting creates a different problem (the task blocks the caller).
+- Pure CPU background work (e.g., in-memory threading heuristic, text processing with no DB access) may still use `.low` / `.utility` / `.background`. The rule is scoped to GRDB-touching code specifically.
+- PR review checklist item: grep `Task(priority:` on all new Tasks and verify none use `.low` / `.utility` / `.background` in files that touch GRDB.
+
+**Out of scope:**
+
+- Raising GRDB's `maximumReaderCount` as an alternative fix. Considered but rejected — more readers increase SQLite contention, and doesn't address the underlying rule that background work must not cause priority inversion.
+- Converting all MainActor sync GRDB reads to async. Worth doing for MainActor-specific hot paths independently, but doesn't address the root cause (the priority inversion would still fire if background tasks run at `.low`).
+- `DispatchQueue.global(qos:)` usage. The same rule applies: GRDB-touching dispatches must be at `.default` QoS or higher.
+
+**Files:**
+
+- `TabMail/Services/Sync/SyncEngineBackfill.swift:208` — header backfill (was `.low`, now `.medium`)
+- `TabMail/Services/Sync/SyncEngineFTS.swift:184` — FTS bulk index (was `.low`, now `.medium`)
+- `TabMail/Services/Sync/SyncEngineFTS.swift:270` — FTS folderId backfill (was `.low`, now `.medium`)
+
+## ADR-IOS-032: Memory Search Reuses iOS Swift Hybrid FTS Stack (No Rust FFI)
+
+> **Partial supersession:** the session-document data model described below was replaced by the per-turn model in **ADR-IOS-034** (2026-04-22). The Swift-vs-Rust-FFI decision in this ADR still holds — only the granularity / read-semantics parts are superseded.
+
+**Context:** The memory-search feature (replacing `ChatStore.search`'s LIKE-based SCAN with a hybrid FTS5 + vector pipeline) needs to match the LLM-observable behavior of Thunderbird's `memory_search` / `memory_read` tools under ADR-IOS-008 (AI processing must replicate TB addon architecture).
+
+A tempting framing was "reuse the Rust implementation in `tabmail-native-fts/src/fts/memory_db.rs` via FFI, to avoid drift from TB." That framing was stale. On inspection, **iOS does not link `tabmail-native-fts` at all.** Email FTS on iOS is independently implemented in Swift (`TabMail/Services/Search/SearchIndex.swift`), using GRDB + FTS5 + vendored `sqlite-vec`. The hybrid merge math is already ported in `HybridMerge.swift`, and the tuning constants (`vectorWeight=0.7`, `textWeight=0.3`, `vectorScoreThreshold=0.45`, `minScore=0.1`) are already in `SearchConfig.swift` with matching names to `tabmail-native-fts/src/config.rs`. The Rust crate ships solely with TB's native-messaging host.
+
+**Decision:** Memory search on iOS is implemented entirely in Swift, reusing the existing FTS pipeline (`HybridMerge`, `SearchConfig`, sqlite-vec registration pattern, actor-serialized `DatabasePool`). No FFI to `tabmail-native-fts` is added. A new `MemoryIndex` actor mirrors `SearchIndex`'s structure against a sibling DB file at `Application Support/TabMail/tabmail_memory/memory.db`.
+
+ADR-IOS-008 parity is measured at the **tool boundary** (args, result shape, ranking characteristics observed by the LLM), not at the storage-engine boundary. The TB addon itself runs in a separate process from the Rust native host, communicating over native messaging — the storage split is a TB architectural detail, not a portability mandate. Matching schema + constants + merge math in Swift achieves the same LLM-observable parity.
+
+**Rationale:**
+
+- **Consistency with existing iOS FTS.** Email search is already Swift-native. Making memory search Rust-FFI would create a split where two sibling features use two storage stacks for no user-facing reason.
+- **No new cross-language boundary.** Adding FFI for a feature that can be built on existing Swift infrastructure is net-new complexity (new C-visible exports, bridging header, Swift wrapper layer, Rust release-cadence coupling).
+- **Drift risk is bounded and managed.** `HybridMerge.swift` is ~90 lines. `SearchConfig` constants already mirror `config.rs` by name and value. A TB-side tuning change is a one-file mirror.
+- **Debuggability.** Swift stack traces + Xcode breakpoints end-to-end beat opaque FFI return codes for a feature that will need empirical tuning (ranking quality is inherently observational).
+- **Decoupled release cadence.** Memory-search tweaks don't require a `tabmail-native-fts` version bump + re-vendor cycle (`tabmail-release` skill).
+
+**Consequences:**
+
+- `MemoryIndex.swift` (new actor, single file) is the only new iOS module. It lives at `TabMail/Services/Search/MemoryIndex.swift` — next to `SearchIndex.swift` (its structural sibling), not in a separate `Services/Memory/` directory. No separate `MemoryIndexer.swift` — the simplification rounds folded all indexing logic into the single actor, and durability is handled by fire-and-forget `Task` at session-end + startup self-heal via set diff (no queue/drain).
+- `MemoryIndex` mirrors `SearchIndex`'s structure: `DatabasePool`, `sqlite-vec` registered via `tabmail_register_sqlite_vec_on_db` in `prepareDatabase`, schema self-managed (not via `AppDatabase` migrator), lazy `private func ensureReady()` on first public call. Schema: `memory_fts` (FTS5 on `content` only), `memory_meta` (rowid + memId UNIQUE + dateMs + sessionId + **`indexEpoch` monotonic race stamp** + `embeddingComplete` flag), `memory_vec` (vec0 FLOAT[384] cosine). Partial index on `embeddingComplete = 0` keeps repopulate probes O(pending).
+- Memory-specific constants are added to `SearchConfig.swift` (separate slots from email even when values match, per the global rule against reusing constants that upstream keeps split — `tabmail-native-fts/src/config.rs:78-82` maintains separate `EMAIL_*` and `MEMORY_*` weights even though values are identical today, so iOS matches slot-for-slot). Exception: tokenizer / candidate-multiplier / snippet-tokens are reused because TB also reuses them across email and memory. `SyncConfig` gets three memory-embedding constants sibling to email's (`memoryEmbeddingBatchSize`, `memoryEmbeddingRepopulateChunk`, `memoryEmbeddingDrainRepopulateLimit`) — split because email splits them (top-level `repopulateFromDatabase` chunk ≠ `repopulateOnDrain` safety net), same slot-for-slot rule.
+- Race stamp: the queue's mid-flight re-index detection uses `memory_meta.indexEpoch` (monotonic per-session counter), not `rowid`. SQLite's default rowid allocation can reuse a freshly-DELETEd rowid when it was the current max (e.g., rowids `{1,2,3,4,5}` → delete 5 → next INSERT picks 5 again), so a rowid-only stamp would be defeated in that narrow case. Epoch is strictly monotonic per-session — closes the hole deterministically.
+- `chatHistory` gets a **v52 migration** (next free slot — migrations v1–v51 are already registered, latest `v51_headerIncompletePartialIndex` at `AppDatabase.swift:1390`; do not collide with unrelated `v26_addMessageHeaderReferences`) adding a `type TEXT NOT NULL DEFAULT 'normal'` column + backfill from `chatTurn` (which has `type` since v6). Without v52, the self-heal path cannot apply the `type == "normal"` filter that `KBRefinementService.swift:33-35` enforces — non-normal assistant turns (greeting, welcome_back, session_break) would pollute FTS. Backfill uses a correlated subquery on `chatTurn.id` (TEXT PK, O(log N) per probe via implicit PK index, no scan) with `COALESCE(..., 'normal')` fallback for rows whose chatTurn was already evicted (chatTurn cap is ~100, chatHistory cap is ~5000 — divergence is expected and the default is pragmatic). The self-heal filter loads ~20 turns per session via the existing `chatHistory_sessionId` index and filters in memory — no new `type` index needed.
+- If TB's `memory_db.rs` merge math or tokenizer settings change, update `HybridMerge` / `SearchConfig` to match in the same PR. This is the ongoing coordination tax for this decision.
+- Tool contract (`memory_search` / `memory_read` args, paginated result shape with `[timestamp: ...]` prefix) is unchanged — the swap is transparent to the LLM. `MemoryReadTool`'s success output is corrected to raw string per TB (was JSON-dict-wrapped — a bug). `MemoryIndex.search` FTS-candidate query uses `ORDER BY rank ASC, meta.dateMs DESC LIMIT ?` per TB `memory_db.rs:586` for deterministic ordering.
+- `indexSession` short-circuits on empty content (zero surviving turns after the role/type filter) — no write transaction, no FTS row, no `memory_meta` entry. Mirrors TB `memoryIndexer.js:47-50`. Prevents empty sessions from polluting `knownSessionIds()` and causing repeated no-op self-heal passes.
+
+**Out of scope:**
+
+- Migrating email FTS to the Rust crate (opposite direction; not considered — email FTS is working and shipped).
+- Cross-device memory sync.
+- Making `tabmail-native-fts` linkable from iOS for some future feature. If such a feature appears (e.g., a large native-compute workload that's genuinely hard to replicate in Swift), revisit. Memory search is not that feature.
+
+**Files (will be created under this plan):**
+
+- `TabMail/Services/Search/MemoryIndex.swift` — actor + GRDB pool + FTS5 + sqlite-vec schema for `memory.db`. Owns FTS+meta writes, search, `readByTimestamp`, `knownSessionIds`, `ftsContentWithEpochs(sessionIds:)`, `pendingEmbeddingSessionIds(limit:)`, `storeEmbeddings(pairs:)` (with epoch-stamp check), and the role-aware session-text extractor. Does **not** own embedding — that's the queue's job.
+- `chatHistory` schema gains `type` column via **v52 migration** (minimal DDL + correlated-subquery backfill from `chatTurn` using its TEXT PK — O(log N) per probe, no scan).
+- `TabMail/Services/Search/BackfillMemoryEmbeddingQueue.swift` — clone of `BackfillEmbeddingQueue.swift` with `Item: { sessionId: String }` and memory.db-specific read/write methods. Cloned rather than genericized (keeps each queue focused, avoids polymorphic dispatch, follows CLAUDE.md "no premature abstraction"). Inherits all durability patterns (retry cap, foreground repopulate, drain-time self-repopulate, `EmbeddingService.shared != nil` gating, BGProcessingTask drain) from the email queue. Rationale: *"we should really not reinvent the system that's working well."*
+- Reused as-is: `TabMail/Services/Search/HybridMerge.swift`, `TabMail/Services/Search/SearchConfig.swift` (memory constants added alongside email's), `TabMail/Vendor/sqlite-vec/*`, `QueueStorage<Item>` generic.
+- New actor `TabMail/Services/Search/MemorySearchCache.swift` for per-user-turn pagination caching (mirrors TB's `memory_search.js` `searchSessions` map).
+
+**Related:** ADR-IOS-008 (TB parity scope), ADR-IOS-031 (GRDB-touching background tasks at `.medium` priority).
+
+---
+
+## ADR-IOS-034: Memory Index Moves to Per-Turn Granularity (Supersedes v2 Session-Document Model)
+
+**Context:** ADR-IOS-032 shipped a session-document model: one `memory_fts` + `memory_meta` + `memory_vec` row per chat session, with all user + assistant turns concatenated (`[USER]: …\n\n[AGENT]: …`) into a single searchable document.
+
+Observable issues surfaced in `logmain.log` 2026-04-22 against live data:
+
+- **BM25 dilution.** A 3000-char session with one "Kyle" mention ranks alongside — and often worse than — a 200-char session with one "Kyle" mention, because BM25 penalizes long documents. Users saw content they remembered clearly, and the agent couldn't find it.
+- **Embedding dilution.** Per-session vectors average over everything the user discussed in one sitting. A session that briefly touched Kyle during an otherwise-unrelated compose produces a near-useless vector for "Kyle"; cosine distances cluster in 0.7–1.0 near-uniformly across queries.
+- **Snippet fidelity.** `snippet()` highlights a range inside the concatenated blob, crossing turn boundaries. Output like `[USER]: …added Kyle…[AGENT]: Done!…` is noisy for both the LLM and the UI.
+- **Read semantics.** `memory_read(timestamp, tolerance_minutes, max_turns)` returned whole session documents inside the time window. TB's tool contract promises a contiguous window of turns centered on the matched turn within the matched session — we were returning the wrong shape.
+
+**Decision:** Supersede ADR-IOS-032's session-document model with a per-turn model. Every allowlisted chatHistory turn (`type = 'normal'`, role ∈ {user, assistant}) becomes one row in `memory_meta` / `memory_fts` / `memory_vec`, keyed by `chatHistoryId`. `memory_read` returns a session-bounded context window around the matched turn. The LLM-observable tool contract adjusts (per-turn hits, role tag on each result) — which is the TB-parity behavior we claimed in v2 but didn't achieve. Prompt-template update coordinated at rollout.
+
+memory.db remains an isolated sidecar file (no ATTACH, no cross-DB references) — same pattern as `SearchIndex`'s `fts.db`. Writes are orchestrated from a single Swift method: `ChatStore.appendTurn` commits to chatHistory, then calls `MemoryIndex.indexTurn` + enqueues embedding. Failures between the two are caught by Stage A self-heal's A−B direction on next launch.
+
+**Rationale:**
+
+- **Correct ranking unit.** BM25 operates on single-turn documents; each turn's relevance is independent. Embeddings are per-turn — semantic precision for fine-grained queries.
+- **Correct snippet unit.** FTS5 `snippet()` can't cross turn boundaries because each turn is its own row.
+- **TB parity actually achieved.** TB's `memory_db.rs` operates on turns (via the internal turn ordering implicit in its store). v3 matches — not just at the tool-contract args boundary, but at the returned-shape boundary too.
+- **Hardened persistence unchanged.** `indexEpoch` race stamp, `embeddingComplete = 0` partial index, bounded Stage A concurrency, epoch-stamp mid-flight detection — all inherited verbatim from v2. v3's novelty is granularity + read semantics; durability model is unchanged.
+- **Disposable index, authoritative truth elsewhere.** chatHistory stays the source of truth; memory.db is derivable. Future schema changes → bump `PRAGMA user_version`, delete the file on first launch, Stage A rebuilds from chatHistory in seconds.
+- **UI = single query path.** ChatHistoryView's default view and search both go through `MemoryIndex.listTurns` / `MemoryIndex.search`. No more mixed data source (chatHistory for the list, memory.db for search).
+
+**Consequences:**
+
+- **v2 session-level code is deleted in-place**, not feature-flagged. v2 ran only on dev devices, and memory.db is disposable — a clean cutover is simpler than carrying both paths. On first v3 launch, the schema-version gate (`PRAGMA user_version < 3`) drops any leftover v2 tables; Stage A refills memory.db from chatHistory. chatHistory itself is untouched across the transition — zero user data loss.
+- **Schema (all in memory.db, isolated):** `memory_meta(rowid PK, chatHistoryId TEXT UNIQUE NOT NULL, sessionId TEXT, role TEXT NOT NULL, dateMs INT NOT NULL, indexEpoch INT DEFAULT 1, embeddingComplete INT DEFAULT 0)`. Supporting indexes on `dateMs`, `sessionId`, `(sessionId, dateMs)` composite for read window walks, partial on `embeddingComplete = 0`. `memory_fts(content)` FTS5 and `memory_vec(embedding FLOAT[384] cosine)` share rowid with `memory_meta`.
+- **API surface** on `MemoryIndex`: `indexTurn(chatHistoryId:, sessionId:, role:, dateMs:, text:)`, `indexTurns(_:)` (bulk), `deleteTurns(chatHistoryIds:)`, `deleteAll()`, `listTurns(limit:)`, `search(query:, fromMs:, toMs:, limit:)`, `readByTimestamp(timestampMs:, toleranceMs:, maxTurns:)`, `knownChatHistoryIds()`, plus the queue-facing helpers `pendingEmbeddingChatHistoryIds(limit:)`, `ftsContentWithEpochs(chatHistoryIds:)`, `storeEmbeddings(pairs:)`. Shared extractor `MemoryIndex.memoryText(for:)` handles the user-turn `userMessage ?? content` guard for "chat_converse" template leak.
+- **`MemoryHit` shape** changes from `(sessionId, memId, dateMs, content, …)` to `(chatHistoryId, sessionId?, role, dateMs, content, …)`. `sessionId` becomes optional because pre-v11 chatHistory rows have NULL; `readByTimestamp` falls back to a pure time-window walk in that case.
+- **`BackfillMemoryEmbeddingQueue.Item` becomes `{ chatHistoryId }`** (was `{ sessionId }`). All embed pipeline semantics unchanged. Retry + epoch-stamp race + drain-time self-repopulate inherited verbatim.
+- **`MemorySelfHealDriver` grows the B−A orphan direction.** v2 only handled A−B (missing → index). v3 per-turn deletes open a crash window: chatHistory DELETE commits, memory.db cascade may fail, orphans linger. Stage A's B−A pass walks `knownChatHistoryIds - allHistoryTurnIds` and calls `deleteTurns`. The A−B direction uses `historyTurnIdsForSelfHeal(olderThan:)` (idle-cutoff-filtered); the B−A direction uses `allHistoryTurnIds()` so active sessions' memory.db rows aren't wrongly pruned.
+- **`DynamicIslandChatButton` session-end hook shrinks.** No more `indexSession(turns:)` fire-and-forget at idle timeout — per-turn indexing happens at `appendTurn` time. Session-end's remaining role: KB-refine trigger + `dereferenceSessionTurns`.
+- **`ChatHistoryView` queries memory.db only.** Default view → `MemoryIndex.listTurns(limit:)`; search → `MemoryIndex.search(...)`. `ChatStore.loadAllHistoryTurns()` is no longer called from the view but stays on `ChatStore` for debug/test access to the authoritative chatHistory.
+- **Tool output changes:** `memory_search` hits include `(USER)` / `(AGENT)` role tag; `memory_read` returns `--- <date> (USER|AGENT) ---\n<body>` per turn in the context window. Backend prompt template must be updated to reflect the new shape (coordinated in the same release).
+- **No tabmail.sqlite migration.** chatHistory schema (v25 + v52) is sufficient. `MemoryIndex.memoryText` is computed in Swift at index time.
+- **GRDB SQL-interpolation pitfall guards** on every map closure that builds tool output — explicit `let formatted: String` + `-> String in` return-type annotation. Regression test in `MemorySearchToolTests` asserts the output contains no `SQL(elements:` or `GRDB.SQL.Element` AST literals (caught on 2026-04-22 when v2 leaked type descriptions into LLM output).
+
+**Migration / rollout:**
+
+- Dev device with v2 memory.db: drop-and-rebuild triggers automatically via `PRAGMA user_version < 3` on first v3 launch. Stage A refills from chatHistory; users see a brief "memory catching up" window (seconds, bounded by `memorySelfHealChunkSize = 200` per transaction).
+- Production: same path. memory.db file is disposable; chatHistory carries the truth.
+- Future schema changes on memory.db: bump `schemaVersion` (currently 3) — existing dev-device data gets dropped and rebuilt. Zero migration code needed.
+
+**Related:** ADR-IOS-032 (superseded for granularity + read semantics; durability model preserved), ADR-IOS-008 (TB parity scope now extends to per-turn hit shape and role tagging), ADR-IOS-027 (ever-rolling FIFO queue invariants inherited by the new chatHistoryId-keyed item).
+
+---
+
+## ADR-IOS-036: Action Tags Are Local-Only (Supersedes ADR-IOS-004)
+
+**Context:** Since the original cross-instance tag-sync design (ADR-IOS-004), iOS and TB had been writing `tm_*` IMAP keywords, Gmail labels, and Exchange categories so the other instance could adopt the classification without re-running the LLM. Two problems accumulated:
+
+1. **User-visible pollution.** Gmail web/mobile showed `tm_reply` / `tm_archive` / `tm_delete` / `tm_none` in the label sidebar. Outlook desktop/web/mobile showed those same strings as colored category chips on every triaged message plus a master-category-list entry. Other IMAP clients (Apple Mail, plain TB) surfaced the strings as raw keyword flags. Users who paid attention to their label/category UI saw TabMail internals leaking through.
+2. **Redundant with Device Sync.** The device-sync WSS relay already exchanges `{summary, action, reply}` between connected peers via `ai_cache_probe` — this fully covers the "both devices online" case without any server-side label writes.
+
+The only gap Device Sync leaves uncovered is the *async* cross-device case: device A classifies a message, device B comes online hours later while device A is offline. Previously device B would pick up the classification via IMAP keyword / Gmail label. Now device B runs the LLM independently — one extra LLM call per miss.
+
+**Decision:**
+
+1. iOS no longer reads or writes `tm_*` IMAP keywords / Gmail labels / Exchange categories. All provider `setActionTag` methods are no-ops. All provider parse paths set `actionTag = nil`; the local `MessageAICache` restore + AI classification pipeline is the only populator of `MessageHeader.actionTag`.
+2. `GmailProvider.fetchFolders` no longer provisions `tm_*` labels via REST, does not build a `tagLabelMap`, and does not hide legacy `tm_*` labels. Legacy labels are filtered out of the folder list via `UserLabelStore.shouldExcludeLabel` (which already matched the `tm_` prefix for user-label visibility).
+3. `ExchangeProvider` drops `tagCategoryMap`. The category → ActionTag resolution in `parseGraphMessage` is removed.
+4. `IMAPProvider.buildMessageHeaderInfo` stops extracting ActionTag from IMAP keywords.
+5. `NSEDataBridge` stops mirroring the Gmail `tagLabelMap`. `resolveServerActionTag` returns nil unconditionally — the NSE merge falls through to the AI-computed tag on the staging row.
+6. `SyncEngineMaintenance.sweepStaleActionTags` keeps clearing local `actionTag` on non-inbox messages (inbox-scoped UX contract) but no longer issues server-side `setActionTag(nil)` calls.
+7. `AccountManagerQueue` `.setTag` / `.removeTag` drain branches become explicit no-ops — legacy queued ops flush cleanly, no provider call.
+8. **Inbox-exit cleanup for legacy pollution.** Whenever a message moves OUT of the inbox (archive, delete, user-initiated move), each provider strips any residual `tm_*` labels/keywords/categories inline with the move. This is the natural decay mechanism for pre-ADR pollution: as users triage, their on-server `tm_*` count drops to zero. Implementation per provider:
+   - **Gmail:** `fetchFolders` records `legacyTmLabelIds: Set<String>` (any label whose name starts with `tm_`). `move()` includes these IDs in the existing `messages.modify` `removeLabelIds` array when `source == "INBOX"`. Zero extra round-trip.
+   - **IMAP:** `idempotentMove` issues a `STORE -FLAGS (tm_reply tm_archive tm_delete tm_none)` on the source UIDs before the MOVE when `source.uppercased() == "INBOX"`. One extra round-trip. Best-effort — a STORE failure logs and continues (the move must not be blocked by cleanup).
+   - **Exchange:** `move()` calls `stripLegacyCategories(id:)` before `moveMessage` when `source == inboxFolderId`. That helper does a `$select=categories` GET, filters out `tm_*`, and PATCHes the message if anything changed. Two extra round-trips worst case, skipped entirely if no `tm_*` categories present. Best-effort — a strip failure logs and continues.
+9. ADR-IOS-004 is marked **superseded** by this ADR.
+
+**What still works:**
+
+- `MessageHeader.actionTag` continues to drive the UI chip everywhere it does today — inbox row chip, message detail, thread bubbles, tag sort order.
+- AIService classification still writes `MessageHeader.actionTag` + `MessageAICache.actionTag` via `AccountManagerAI.processSingleMessage` / `setManualTag`.
+- User manual override (long-press menu → pick action) still flows: `setManualTag` writes local state, queues a PendingOperation (which now drains to a no-op — intentional), and updates `MessageAICache` for persistence across delete/re-insert.
+- Device Sync probe (`DeviceSyncService.probeAICache`) still serves action/summary/reply between peers on cache miss.
+- `ActionTag.imapKeyword` / `fromIMAPKeyword` helpers are retained as **legacy stubs** for tests and any one-off migration reads.
+
+**Rationale:**
+
+- **No server-side mutation from a privacy-first email client.** Every user expects an email client to *read* their mailbox, not leave persistent tag/label breadcrumbs visible to other clients and other recipients who share the account.
+- **Device Sync is the right layer.** It's a first-class real-time channel between TabMail instances, not a piggyback on IMAP keywords. It doesn't leak TabMail internals into the user's mail provider.
+- **One extra LLM call per async-cross-device miss is acceptable.** A classification is ~cents of token cost. Orders of magnitude less than the "we're polluting your Gmail label list" trust cost.
+- **Verified no shortcut on TB side.** `nsImapMailFolder.cpp`'s `HandleCustomFlags` overwrites local `keywords` with server state on every folder resync when the server advertises user-flag support (Gmail, every modern IMAP) — so "write `keywords` locally via Experiment, skip IMAP STORE" does NOT work. TB's equivalent work requires a custom painter driven from IDB. (See the parallel work in the tabmail-thunderbird add-on.)
+
+**Consequences:**
+
+- **Async cross-device pickup is lost.** Device A tags, goes offline. Device B online hours later → re-runs LLM. For users who keep both clients open simultaneously, no change. For "phone morning, desktop evening" users, up to 2× LLM cost on overlapping inboxes + possible action-pick divergence (3-call vote is non-deterministic).
+- **Existing on-server `tm_*` keywords/labels/categories decay naturally** via inbox-exit cleanup (see point 8). We don't do a wholesale scrub (too risky — irreversible server writes on every message). Instead, cleanup is piggybacked on normal user triage: every archive/delete/move strips the message's `tm_*` residue on the way out. Over time, as users work through their inbox, on-server pollution trends to zero. Label *definitions* still exist in Gmail sidebar / Outlook "All Categories" list until the user manually deletes them (or until Gmail auto-hides unused labels, which varies).
+- **NSE `gmailTagLabelMaps` UserDefaults key becomes orphaned.** Old mirror data sits in the app group container; no one reads it. Cleanup is a non-goal (zero-cost to leave).
+- **Tests that verified server-side ActionTag resolution (`NSEMergeFullHeaderTests` server-tag-wins cases) are inverted** to pin the new local-only behavior: legacy `tm_*` labels in `providerLabels` are ignored; AI's `msg.actionTag` wins.
+
+**Migration path:**
+
+- On-server data: no proactive scrub. The chip reads from `MessageHeader.actionTag` (not from server labels), so the visual behavior is unchanged for end users; only the label-list pollution gradually fades as messages turn over.
+- Local data: no migration. `MessageAICache` and `MessageHeader.actionTag` already contained the canonical local state; we just stop feeding them from provider labels.
+- TB parallel work: the tabmail-thunderbird add-on removes TB's tag writes and adds an IDB-driven custom painter for the chip (TB has no single GRDB column for actionTag, so the painter is more involved than iOS).
+
+**Related:** ADR-IOS-004 (superseded), ADR-IOS-010 (Device Sync), ADR-IOS-018 (PendingOperation queue — `.setTag` drain is now a no-op).
+
+## ADR-IOS-037: NSE/Main-App AI Ownership Lease (Cross-Process Coordination)
+
+**Context:** APNs pushes with `mutable-content: 1` always dispatch to the Notification Service Extension in its own process, regardless of main-app state (foreground / background / suspended / terminated). There is no Apple API to suppress NSE when the main app is foreground. Historically the NSE unconditionally called backend `/completions/chat` for summary + action on every push, and the main-app `ActiveAIQueue` also ran summary + action for the same message seconds later — two identical backend calls per push. Additionally, the main-app privacy opt-out flag (`privacy_opt_out_all_ai`) lived in `UserDefaults.standard`, which is a different namespace in the NSE process, so the NSE silently bypassed the toggle and kept calling backend AI after the user opted out.
+
+**Decision:**
+
+1. **Opt-out flag moves to the App Group shared suite** (`group.ai.tabmail`). `AIService.optOutStore` is the single source of truth. All `@AppStorage` usages and any direct `UserDefaults.standard.bool(forKey: optOutAllAIKey)` reads now go through `AIService.optOutStore`. `NSEState.isAIDisabled()` reads the same store. A one-time `AppDelegate.migrateOptOutFlagToSharedSuite()` copies any pre-existing value from `.standard` on first launch.
+2. **AI ownership lease on `nse_processed_message`**. Two new columns — `aiOwner TEXT` (`"nse"` | `"mainApp"` | NULL) and `aiHeartbeatMs INTEGER` — added in staging-DB migration v5. The holder refreshes `aiHeartbeatMs` every `AIOwnershipLease.heartbeatIntervalMs` (1s) while AI runs. A gap > `staleMs` (4s) means the holder died and the other side may take over. Claim is atomic via conditional UPDATE (`WHERE aiOwner IS NULL OR aiOwner = :me OR (now - heartbeat) > staleMs`) with `db.changesCount` as the win check.
+3. **NSE gate + claim**. `NotificationService.process` step 6 is gated: skip if `NSEState.isAIDisabled()`; skip if main app holds a fresh claim; otherwise `tryClaim(owner: .nse)` + spawn heartbeat Task + run AI + cancel heartbeat + `release(owner: .nse)` (conditional on still owning).
+4. **Main-app poll + claim**. `ActiveAIQueue.executeJob` opens the NSE staging DB (via `NSEDataBridge.openStagingDB()`), checks `AIOwnershipLease.state`, and if NSE holds a fresh claim polls every `mainAppPollIntervalMs` (1s) up to `mainAppPollMaxMs` (28s). Once NSE publishes a result (`summaryBlurb` set or `aiCompleted=1`), main app triggers `NSEDataBridge.mergeNSEStagingData` and re-reads the `MessageHeader` — if the job's field is now populated, it returns without running the LLM. Otherwise main app `tryClaim(owner: .mainApp)` + heartbeat + runs AI + releases. Reply always runs on main-app side regardless of lease (NSE has no Reply pass).
+5. **Shared helper in `Shared/Persistence/AIOwnershipLease.swift`** so both targets use identical lock semantics without file-target duplication.
+
+**Rationale:**
+
+- **Staging DB as coordinator is the ground truth.** No process-state guessing (main-app heartbeat timestamps, Darwin notifications). Both sides inspect the same row; claim race is decided by SQLite's atomic UPDATE.
+- **Lease-with-heartbeat handles crash recovery for free.** If NSE is killed mid-AI (OOM, 30 s hard budget), the heartbeat goes stale after 4 s and main app takes over on its next dispatch tick. Symmetric for a main-app crash.
+- **1 s heartbeat is cheap at local-only scope.** Both reader and writer are the same on-device DB; the cost is a single conditional UPDATE per second per active message. At most one message is "active" in NSE at a time, and main-app AI queue processes serially per message.
+- **Max 28 s poll keeps main-app AI from deadlocking on a stuck NSE.** Ceiling is below NSE's 30 s iOS budget — if NSE hasn't produced a result in 28 s, main app takes over.
+- **Privacy gate separated from lease.** NSE can check opt-out before doing anything, including claiming. Main app also gates on opt-out as today — the lease just prevents duplicated work when opt-out is OFF.
+- **No protocol version bump required on the staging table.** Columns are additive (SQLite `ALTER TABLE ADD COLUMN`), default NULL — older main-app versions reading the staging DB just see nullable columns they ignore.
+
+**What still works:**
+
+- `NSEDataBridge.mergeNSEStagingData` still brings NSE-produced AI fields into `MessageHeader` + `MessageAICache` on next wake; the lease just ensures the NSE is the one producing them instead of both sides.
+- Device Sync probe (`DeviceSyncService.probeAICache`) still runs before the lease check, so TB peer results short-circuit both NSE and main-app work.
+- `MessageAICache` dedup still catches "already computed" cases at the field level after any cross-process race.
+
+**Consequences:**
+
+- **Existing opt-out users whose flag lived only in `.standard`** get auto-migrated to the shared suite on first launch. If the migration runs after some pushes, those pushes' NSE wakes briefly bypass opt-out (NSE can't see the flag until the main app runs). Migration is one-shot and idempotent via `guard shared.object(forKey:) == nil`.
+- **One schema migration** (staging DB v5). Additive; no data loss on downgrade (older app simply ignores the columns).
+- **Main-app wait up to 28 s for NSE results** on the very-first job per message. Typical NSE completion is ~9 s, so worst-case user-visible delay is bounded by NSE's own budget.
+
+**Tuning** (`AIOwnershipLease`):
+
+- `heartbeatIntervalMs = 1000`
+- `staleMs = 4000` (4 × interval, tolerates scheduling jitter)
+- `mainAppPollIntervalMs = 1000`
+- `mainAppPollMaxMs = 28000` (NSE's 30 s budget minus a safety margin)
+
+**Related:** ADR-IOS-008 (AI processing architecture), ADR-IOS-010 (Device Sync).
+
+
+## ADR-IOS-038: Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache
+
+**Status:** Accepted (2026-04-30)
+
+**Decision:** Add a "Try the demo without creating an account" entry on the
+login screen that lets a brand-new user explore TabMail with sample data
+without creating a Supabase user. Implemented in three layers:
+
+1. **Backend identity:** stateless HS256 demo JWT (`iss: 'tabmail-demo'`)
+   minted by new `POST /demo/start` endpoint. Backend's `gatewayHelpers`
+   peeks the issuer and short-circuits to a synthesized entitlement with
+   `user_id = '00000000-0000-4000-8000-44454d4f0000'` (fixed UUID
+   sentinel — hex `4d4f` mnemonic "DE-MO"). All demo cost rolls up to that
+   single sentinel row in `usage_events`. A per-token in-memory rate limit
+   defends against abuse; a per-IP rate limit on `/demo/start`
+   prevents mint flooding. Dual-key HMAC rotation (`PRIMARY` +
+   `PREV`) mirrors `INTERNAL_USAGE_SECRET`.
+
+2. **Local mock provider:** `DemoProvider` (EmailProvider) and
+   `DemoCalendarProvider` (CalendarProvider) answer entirely from GRDB —
+   no network. Demo account is `accountId == "demo-account"`. Demo
+   calendar events live in a new `demoCalendarEvent` table (table-prefix
+   scoping for clean wipes).
+
+3. **Pre-baked AI cache invariant:** every seeded inbox message
+   has `MessageHeader.summaryBlurb`, `actionTag`, and (where applicable)
+   `cachedReply` populated by `DemoSeed`, plus a corresponding
+   `MessageAICache` row. Opening any seeded message MUST NOT fire an LLM
+   round-trip. `AIService.process` carries a hard demo guard that
+   returns empty results rather than running the LLM, even if upstream
+   short-circuit logic ever changes.
+
+**LLM call accounting:** the user-visible 50-call cap lives
+on iOS (`DemoModeStore.callsConsumed` in UserDefaults, persisting per
+install). Counter is decremented at three chokepoints — and only there:
+`AIChat.sendChatMessage`, `AIInlineEdit.performInlineEdit`, and the
+`BackfillAIQueue.enqueueActionRefine` enqueue site driven from
+`AccountManagerAI.applyManualTag`. Tool rounds within one agent
+turn don't double-count. Refund matrix: `URLError`,
+`CancellationError`, 5xx, demo-token 429 refund; 4xx/parse failures don't.
+
+**Consent gates:** demo runs the production `ConsentGateView` and
+`AIConsentView` on entry, but writes to demo-prefixed `@AppStorage` keys
+(`demo.hasCompletedConsentGate`, `demo.hasSeenAIConsent`,
+`demo.aiEnabled`) so production gates run from scratch when the user
+later signs up. `AIConsentView` was refactored to remove its internal
+`AIService.writeOptOutFlag` call — caller now decides where to persist
+the AI choice. `PushConsentView` is skipped in demo (no real push).
+
+**AI-disabled demo:** when the user declines AI on the demo gate,
+seeded summaries / action chips / cached replies / chat pill / inline
+edit are all rendered as off (the data stays in GRDB, the views just
+gate on `DemoModeStore.aiEnabled`). The demo Settings page exposes an
+"Enable AI" button that re-runs the AI consent gate without re-seeding.
+
+**Cleanup:** `DemoModeService.exit()` wipes:
+- `accountId == "demo-account"` rows from `messageHeader`, `folder`,
+  `messageBody`, `messageAICache`, `outboxMessage`, `pendingOperation`,
+  `account`.
+- `chatTurn WHERE sessionId LIKE 'demo:%'`.
+- `demoCalendarEvent` (full table — demo only).
+- FTS demo entries via new `SearchIndex.purgeForAccount(_:)`.
+- memory.db demo entries via new `MemoryIndex.purgeForSessionPrefix(_:)`.
+
+The 50-call counter, demo gate flags, and TipKit shown-state all
+**persist** across exit. Only uninstall resets them.
+
+**Once user signs up (refined 2026-05-01):** the original plan used a
+sticky `demo.servedItsPurpose` UserDefault set on first non-demo account
+add. **Replaced with a state check**: `TabMailLoginView`'s demo button now
+gates on `navigationStore.hasAnyAccount` (a new field on `NavigationStore`
+that counts active rows in `account` including `calendarOnly == true`).
+Reactive on `.backgroundDataDidChange`, so adding any account hides the
+button on the next refresh and removing all accounts (sign-out + wipe)
+restores it — no sticky flag, no need to clear UserDefaults to recover.
+`connectAccount` still calls `DemoModeService.purgeOrphanedDemoData` to
+clean residual demo rows.
+
+**What we explicitly DO NOT do in demo:**
+- Push notifications (`PushNotificationService.subscribeAccount` is
+  guarded).
+- Device Sync (`DeviceSyncService.connect` is guarded).
+- Real EKEventStore writes (ICS imports route to `DemoCalendarProvider`
+  via guard in `ICSCalendarImporter.presentCalendarImport`).
+- Vector embeddings during seeding (FTS-only).
+
+**Related:**
+- The demo-auth mint/verify/throttle, the admin demo-stats readout, and the
+  HMAC secret-rotation tooling all live server-side.
+- ADR-IOS-008 (AI processing architecture — demo replicates the
+  short-circuit).
+- ADR-IOS-018 (PendingOperation queue — DemoProvider stubs the drain
+  side).

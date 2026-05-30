@@ -1,0 +1,893 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import SwiftUI
+import GRDB
+import TipKit
+
+/// Set to `true` to force both consent gate and AI consent to show on every launch (for UI testing).
+/// Resets the AppStorage flags at init so the real flow runs each time.
+/// Set to `false` (or remove) once testing is done.
+private let DEBUG_ALWAYS_SHOW_GATES = false
+
+struct RootView: View {
+    @Environment(NavigationStore.self) private var navigationStore
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var hasTabMailSession = ScreenshotMode.isActive || TabMailAuthService.hasSession()
+    @AppStorage("hasCompletedConsentGate") private var hasCompletedConsentGate = false
+    @AppStorage("hasSeenAIConsent") private var hasSeenAIConsent = false
+    @AppStorage("hasSeenPushConsent") private var hasSeenPushConsent = false
+    // Demo Mode gate persistence.
+    // Production gates above stay untouched while demo runs.
+    @AppStorage("demo.hasCompletedConsentGate") private var demoHasCompletedConsentGate = false
+    @AppStorage("demo.hasSeenAIConsent") private var demoHasSeenAIConsent = false
+    @AppStorage("demo.aiEnabled") private var demoAiEnabled = false
+    @State private var demoSeedingComplete = false
+    @State private var demoStartError: String?
+    @Bindable private var demoStore = DemoModeStore.shared
+    /// Stays false until one-time migrations finish.
+    /// Provider connections + sync run in the background after the UI is visible.
+    /// For returning users (system-kill restart), defaults to true so the inbox
+    /// appears immediately without a splash screen flash.
+    @State private var isStartupComplete: Bool
+    /// Pending account deletion state (checked on every launch)
+    @State private var pendingDeletionDate: String?
+    /// iCloud setup prompt state (Feature 2 — post-Apple sign-in)
+    @State private var showAccountGoneAlert = false
+    @State private var showSignedOutAlert = false
+    /// True while checking /whoami for prior consent — show splash instead of consent gate
+    @State private var isCheckingConsent = false
+
+    // MARK: - Undo-send toast state
+    /// Snapshot of the cancelled send's contents. PendingSendService.undo()
+    /// deletes the Draft row + discards the outbox row; this snapshot is what
+    /// RootView uses to present a fresh ComposeView with prefill args so the
+    /// user's content is restored. Because the Draft is gone, the reopened
+    /// compose's close-action runs through the normal save-draft prompt.
+    @State private var reopenSnapshot: PendingSendService.ReopenSnapshot?
+    private var pendingSendService: PendingSendService { PendingSendService.shared }
+
+    /// Sync status values — observed once here and published to descendants via
+    /// Environment. Centralising here keeps the observer alive across sidebar
+    /// unmounts and gives both InboxView and MailNavigationView the same feed.
+    @State private var syncStatusPhase: SyncPhase?
+    @State private var syncStatusLast: Date?
+    @State private var syncStatusFailed = false
+    @State private var syncStatusNow = Date()
+
+    private let syncScheduler = SyncScheduler.shared
+
+    private var dbPool: DatabasePool { AppDatabase.dbPool }
+
+    init() {
+        // Debug: reset gate flags on every launch so all gate screens show
+        if DEBUG_ALWAYS_SHOW_GATES {
+            UserDefaults.standard.set(false, forKey: "hasCompletedConsentGate")
+            UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
+            UserDefaults.standard.set(false, forKey: "hasSeenPushConsent")
+        }
+
+        // For returning users (system-kill restart), skip the splash screen entirely.
+        // The GRDB data is already on disk — show the inbox immediately with cached data.
+        // Fresh installs (no DB, no consent) will go through the normal gated flow.
+        let onboardingDone = UserDefaults.standard.bool(forKey: "hasCompletedConsentGate")
+            && UserDefaults.standard.bool(forKey: "hasSeenAIConsent")
+            && UserDefaults.standard.bool(forKey: "hasSeenPushConsent")
+            && !DEBUG_ALWAYS_SHOW_GATES
+        let isReturningUser = UserDefaults.standard.bool(forKey: "hasLaunchedBefore")
+            && onboardingDone
+        _isStartupComplete = State(initialValue: isReturningUser)
+
+    }
+
+    private var hasEmailAccounts: Bool {
+        navigationStore.isInitialLoadComplete && !navigationStore.accounts.isEmpty
+    }
+
+    @ViewBuilder
+    private var routedContent: some View {
+        // Demo mode wins over all other routing. Runs the SAME consent + AI
+        // gates as production but writes to demo-prefixed AppStorage so
+        // production flags survive demo entry/exit untouched.
+        if demoStore.isActive {
+            if !demoHasCompletedConsentGate {
+                ConsentGateView(persistsToBackend: false) {
+                    withAnimation { demoHasCompletedConsentGate = true }
+                }
+            } else if !demoHasSeenAIConsent {
+                AIConsentView { aiEnabled in
+                    demoAiEnabled = aiEnabled
+                    // Critical: NEVER write to AIService.optOutAllAIKey here.
+                    // Demo's AI choice lives entirely in demo.aiEnabled.
+                    withAnimation { demoHasSeenAIConsent = true }
+                }
+            } else if !demoSeedingComplete {
+                DemoSeedingSplash()
+                    .task(id: demoStore.isActive) {
+                        guard demoStore.isActive, !demoSeedingComplete else { return }
+                        do {
+                            try await DemoModeService.shared.completeSetup()
+                            withAnimation { demoSeedingComplete = true }
+                        } catch {
+                            print("[RootView] Demo setup failed: \(error)")
+                            demoStartError = error.localizedDescription
+                            await DemoModeService.shared.exit()
+                        }
+                    }
+            } else {
+                MailNavigationView()
+            }
+        } else if hasEmailAccounts && !hasTabMailSession {
+                // Email-only mode: accounts exist but no TabMail session (post-sign-out).
+                // Skip all TabMail gates (consent, AI consent) — go straight to sidebar.
+                // AI features are gated by hasTabMailSession in child views.
+                // nil selection shows sidebar (not auto-navigated into inbox content).
+                if !isStartupComplete {
+                    SplashView()
+                } else {
+                    VStack(spacing: 0) {
+                        if let deletionDate = pendingDeletionDate {
+                            DeletionBanner(deletionDate: deletionDate) {
+                                await cancelDeletion()
+                            }
+                        }
+                        MailNavigationView(initialSelection: nil)
+                    }
+                }
+            } else if !navigationStore.isInitialLoadComplete {
+                // Still loading accounts from GRDB — show splash (not login)
+                // to avoid a flash of LoginView when accounts exist but haven't loaded yet.
+                SplashView()
+            } else if !hasTabMailSession {
+                // No email accounts AND no session → onboarding login
+                TabMailLoginView {
+                    withAnimation { hasTabMailSession = true }
+                }
+            } else if !hasCompletedConsentGate {
+                if isCheckingConsent {
+                    SplashView()
+                } else {
+                    ConsentGateView {
+                        withAnimation { hasCompletedConsentGate = true }
+                    }
+                }
+            } else if let pending = PendingAccountAdd.shared.pending {
+                // Deferred Gmail/Outlook account-add gate. Set by
+                // `TabMailLoginView.signInMergedGoogle/Microsoft`,
+                // committed here on Connect, discarded on Later.
+                pendingAccountGate(pending)
+            } else if navigationStore.accounts.isEmpty {
+                AddAccountGeneralView()
+            } else if !hasSeenAIConsent {
+                AIConsentView { aiEnabled in
+                    // Persist the user's AI opt-out decision. Pre-refactor
+                    // the view called `AIService.writeOptOutFlag` internally;
+                    // we moved it here so demo mode can write to its own flag
+                    // instead.
+                    AIService.writeOptOutFlag(!aiEnabled)
+                    if !aiEnabled {
+                        UserDefaults.standard.set(false, forKey: "pending_plan_navigation")
+                    } else if !AISubscriptionGate.shared.isActive {
+                        // AI enabled but no subscription — go to plan page
+                        UserDefaults.standard.set(true, forKey: "pending_plan_navigation")
+                    }
+                    withAnimation { hasSeenAIConsent = true }
+                }
+            } else if !hasSeenPushConsent {
+                PushConsentView { _ in
+                    withAnimation { hasSeenPushConsent = true }
+                }
+        } else if !isStartupComplete {
+            SplashView()
+        } else {
+            VStack(spacing: 0) {
+                if let deletionDate = pendingDeletionDate {
+                    DeletionBanner(deletionDate: deletionDate) {
+                        await cancelDeletion()
+                    }
+                }
+                MailNavigationView()
+            }
+        }
+    }
+
+    /// True when the user has cleared every onboarding gate. Drives
+    /// `OnboardingTipGate.onboardingComplete` so TipKit tips stay
+    /// suppressed during the consent flow (each tip has a
+    /// `#Rule(OnboardingTipGate.$onboardingComplete) { $0 == true }`
+    /// rule). Mirrors the same conditions `routedContent` uses to
+    /// decide whether to show the inbox.
+    private var allOnboardingGatesPassed: Bool {
+        hasTabMailSession
+            && hasCompletedConsentGate
+            && PendingAccountAdd.shared.pending == nil
+            && !navigationStore.accounts.isEmpty
+            && hasSeenAIConsent
+            && hasSeenPushConsent
+    }
+
+    var body: some View {
+        routedContent
+        // Demo with AI enabled is treated as having a TabMail session so
+        // chat / inline-edit surfaces don't render "Sign in to TabMail" locks.
+        // Demo without AI keeps the env false, which cooperates with the
+        // AI-disabled rendering of those surfaces.
+        .environment(\.hasTabMailSession, hasTabMailSession || (demoStore.isActive && demoAiEnabled))
+        .publishSyncStatusEnvironment(phase: syncStatusPhase, last: syncStatusLast, failed: syncStatusFailed, now: syncStatusNow)
+        .observeSyncStatus(phase: $syncStatusPhase, last: $syncStatusLast, failed: $syncStatusFailed, now: $syncStatusNow, tag: "Root")
+        .task(id: allOnboardingGatesPassed) {
+            // Flip the global TipKit gate once all consent screens
+            // are cleared. Parameter writes are persisted by TipKit,
+            // so on subsequent launches the value stays `true` and
+            // tips behave normally. Setting `false` while gates are
+            // pending re-suppresses tips on a fresh install or after
+            // a sign-out that reset the gates.
+            // Tips fire normally during demo. The formula is
+            // `passed || isActive` so demo gets ambient discovery cues from
+            // the start without needing to clear production gates.
+            OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed || demoStore.isActive
+        }
+        .task(id: demoStore.isActive) {
+            // Demo entry/exit also flips the tip gate.
+            OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed || demoStore.isActive
+        }
+        // Undo-send toast (Gmail-style) — mounted at RootView so it persists
+        // across compose dismiss + navigation. Positioning matches the inbox
+        // undo chip (InboxView.swift:283-284): ignore the bottom safe area
+        // and use negative padding to sit where other app toasts sit.
+        .overlay(alignment: .bottom) {
+            if let pending = pendingSendService.current {
+                PendingSendToast(
+                    pending: pending,
+                    onUndo: {
+                        if let snapshot = pendingSendService.undo() {
+                            reopenSnapshot = snapshot
+                        }
+                    },
+                    onDismiss: { pendingSendService.dismiss() }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .ignoresSafeArea(.container, edges: .bottom)
+                .padding(.bottom, -12)
+            }
+        }
+        // Demo Mode banner — bottom overlay; persists across all in-app
+        // navigation. Compose's `fullScreenCover` covers it during edit;
+        // banner re-appears on dismiss.
+        .overlay(alignment: .bottom) {
+            if demoStore.isActive && demoSeedingComplete {
+                DemoBanner(aiEnabled: demoAiEnabled)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .ignoresSafeArea(.container, edges: .bottom)
+            }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.current?.id)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: demoStore.isActive)
+        .alert("Could not start demo", isPresented: Binding(
+            get: { demoStartError != nil },
+            set: { if !$0 { demoStartError = nil } }
+        )) {
+            Button("OK", role: .cancel) { demoStartError = nil }
+        } message: {
+            Text(demoStartError ?? "")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
+            demoSeedingComplete = false
+        }
+        // Undo-Send reopen: present a fresh ComposeView with prefill args.
+        // The Draft row has been deleted (see PendingSendService.undo) so the
+        // compose isn't bound to an existing draft — close → save prompt fires
+        // normally through saveDraftAndDismiss.
+        .fullScreenCover(item: $reopenSnapshot) { snapshot in
+            UndoReopenCompose(snapshot: snapshot)
+        }
+        // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)
+        // so isInitialLoadComplete is already true before the first render.
+        .task(id: navigationStore.accounts.isEmpty) {
+            // Re-trigger when accounts transition from empty → non-empty
+            guard !navigationStore.accounts.isEmpty else { return }
+
+            // Start lightweight setup immediately (these are fast and don't block UI).
+            KeychainHelper.migrateAccessibility()
+            NetworkMonitor.shared.start()
+            ReminderBuilder.setupCacheInvalidation()
+
+            // For returning users, isStartupComplete is already true from init —
+            // inbox is visible immediately with cached GRDB data.
+            // For new users, show inbox now (migrations run async before sync).
+            isStartupComplete = true
+
+            // In screenshot mode, skip all provider connections and sync —
+            // the seeded GRDB data is sufficient for rendering screenshots.
+            guard !ScreenshotMode.isActive else {
+                syncScheduler.signalMigrationsComplete()
+                return
+            }
+
+            let manager = AccountManager.shared
+            let accounts = navigationStore.accounts
+
+            // Run migrations + NSE merge in background, BEFORE sync starts.
+            // These are deferred from the splash path so the inbox appears instantly.
+            // Provider connections can proceed in parallel (they don't depend on migrations),
+            // but sync waits for migrations to complete.
+            Task {
+                // Run migrations and connect providers in parallel.
+                // Migrations touch GRDB (UserDefaults-gated, most are no-ops).
+                // Connections are TCP/TLS handshakes — independent of migrations.
+                // Signal SyncScheduler when migrations finish so NSE merge + sync
+                // can proceed (startForegroundPolling awaits this gate).
+                async let migrations: Void = {
+                    await Self.runStartupMigrations(dbPool: dbPool)
+                    await syncScheduler.signalMigrationsComplete()
+                }()
+                async let connections: Void = {
+                    for account in accounts where account.isActive {
+                        if await manager.provider(for: account) == nil {
+                            try? await manager.connectAccount(account)
+                        }
+                    }
+                }()
+                _ = await (migrations, connections)
+
+                // If any account failed auth, navigate to settings
+                if !AccountManagerState.shared.authFailedAccounts.isEmpty {
+                    NotificationCenter.default.post(name: .navigateToSettings, object: nil)
+                }
+
+                // iCloud setup is now handled inline in the consent
+                // flow (via `PendingAccountAdd` set in
+                // `TabMailLoginView` after Apple sign-in), so no
+                // post-onboarding sheet is needed here anymore.
+
+                await manager.reconcilePendingOperations()
+                await BackfillAIQueue.shared.repopulateFromDatabase()
+                // Notify UI before sync — background push may have already synced
+                // data while app was suspended. Reload from GRDB immediately so
+                // the user sees current state, then sync finds any remaining changes.
+                NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+                // Sync is handled by startForegroundPolling() (triggered by scenePhase → .active).
+                // Do NOT call foregroundSyncAll() here — it races with the poll's sync,
+                // causing every full sync to run twice (doubled API calls, IMAP connections, DB writes).
+            }
+
+            // Wire up AI cache probe handler (Device Sync: respond to peer probes with local GRDB cache)
+            // Probe keys are RFC 2822 Message-ID headers without angle brackets (device-independent)
+            DeviceSyncService.shared.aiCacheProbeHandler = { keys, fields in
+                let wantSummary = fields == nil || fields!.contains("summary")
+                let wantAction = fields == nil || fields!.contains("action")
+                let wantReply = fields == nil || fields!.contains("reply")
+                var results = [String: AICacheResult]()
+                let dbPool = AppDatabase.dbPool
+                for key in keys {
+                    print("[AIProbe] Looking up key: \"\(key)\" (fields=\(fields ?? ["all"]))")
+                    // Match by rfc822MessageId (stored normalized, no angle brackets).
+                    // Fetch ALL copies (inbox + all mail + etc.) because fetchLimit=1
+                    // could return the All Mail copy which has no AI data (AI is inbox-scoped).
+                    let headers: [MessageHeader]
+                    let normalizedKey = EmailFilter.normalizeMessageId(key)
+                    do {
+                        headers = try dbPool.read { db in
+                            try MessageHeader
+                                .filter(Column("rfc822MessageId") == normalizedKey)
+                                .limit(5)
+                                .fetchAll(db)
+                        }
+                    } catch {
+                        print("[AIProbe] Fetch error for key \"\(key)\": \(error)")
+                        continue
+                    }
+
+                    // Pick the best copy: prefer the one with the most AI data.
+                    // Gmail stores the same message in Inbox + All Mail; only the
+                    // inbox copy has AI data. Without this, fetchLimit=1 could
+                    // return the empty All Mail copy.
+                    var bestHeader: MessageHeader?
+                    var bestScore = 0
+                    for h in headers {
+                        var score = 0
+                        if h.summaryBlurb != nil { score += 1 }
+                        if h.actionTag != nil { score += 1 }
+                        if h.cachedReply != nil { score += 1 }
+                        if score > bestScore {
+                            bestScore = score
+                            bestHeader = h
+                        }
+                    }
+
+                    if let header = bestHeader, bestScore > 0 {
+                        let hasSummary = wantSummary && header.summaryBlurb != nil
+                        let hasAction = wantAction && header.actionTag != nil
+                        let hasReply = wantReply && header.cachedReply != nil
+                        print("[AIProbe] Found \(headers.count) match(es) for key \"\(key)\" — best: summary=\(hasSummary ? "present" : "nil"), action=\(header.actionTag?.rawValue ?? "nil"), reply=\(hasReply ? "present" : "nil")")
+
+                        var result = AICacheResult()
+                        if hasSummary {
+                            var summary = AICacheSummary(blurb: header.summaryBlurb ?? "")
+                            summary.todos = header.summaryTodos
+                            summary.reminderDate = header.reminderDate
+                            summary.reminderTime = header.reminderTime
+                            summary.reminderContent = header.reminderContent
+                            result.summary = summary
+                        }
+                        if hasAction, let action = header.actionTag {
+                            result.action = action.rawValue
+                        }
+                        if hasReply, let reply = header.cachedReply, !reply.isEmpty {
+                            result.reply = reply
+                        }
+                        if result.summary != nil || result.action != nil || result.reply != nil {
+                            results[key] = result
+                        } else {
+                            print("[AIProbe] Header matched but no requested fields populated for key \"\(key)\" — skipping")
+                        }
+                        continue
+                    }
+
+                    // No MessageHeader with AI data — fall through to MessageAICache
+                    // (survives header deletion from stale detection)
+                    print("[AIProbe] Found \(headers.count) header(s) but none with AI data for key \"\(key)\" — checking MessageAICache")
+                    do {
+                        if let cached = try dbPool.read({ db in
+                            try MessageAICache
+                                .filter(Column("rfc822MessageId") == normalizedKey)
+                                .fetchOne(db)
+                        }) {
+                            var result = AICacheResult()
+                            if wantSummary, let blurb = cached.summaryBlurb, !blurb.isEmpty {
+                                var summary = AICacheSummary(blurb: blurb)
+                                summary.todos = cached.summaryTodos
+                                summary.reminderDate = cached.reminderDate
+                                summary.reminderTime = cached.reminderTime
+                                summary.reminderContent = cached.reminderContent
+                                result.summary = summary
+                            }
+                            if wantAction, let action = cached.actionTag {
+                                result.action = action.rawValue
+                            }
+                            if wantReply, let reply = cached.cachedReply, !reply.isEmpty {
+                                result.reply = reply
+                            }
+                            if result.summary != nil || result.action != nil || result.reply != nil {
+                                results[key] = result
+                                print("[AIProbe] Cache hit for key \"\(key)\" (from MessageAICache)")
+                            } else {
+                                print("[AIProbe] Cache entry found but no matching fields for key \"\(key)\"")
+                            }
+                        } else {
+                            print("[AIProbe] No match for key \"\(key)\" in headers or cache")
+                        }
+                    } catch {
+                        print("[AIProbe] Cache lookup error for key \"\(key)\": \(error)")
+                    }
+                }
+                return results
+            }
+
+            // Auto-connect Device Sync (requires TabMail session for JWT auth)
+            if hasTabMailSession {
+                DeviceSyncService.shared.connect()
+            }
+        }
+        .task(id: hasTabMailSession) {
+            // Check if user already consented on web/TB — auto-skip consent gate
+            guard hasTabMailSession, !hasCompletedConsentGate, !DEBUG_ALWAYS_SHOW_GATES, !ScreenshotMode.isActive else { return }
+            isCheckingConsent = true
+            defer { isCheckingConsent = false }
+            do {
+                let accountInfo = try await BackendClient().fetchAccountInfo()
+                if accountInfo.consentRequired == false {
+                    print("[RootView] User already consented (web/TB) — skipping consent gate")
+                    withAnimation { hasCompletedConsentGate = true }
+                }
+            } catch BackendError.accountGone {
+                print("[RootView] Account no longer exists — showing account gone alert")
+                NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
+                return
+            } catch BackendError.unauthorized {
+                // Check if auth permanently failed (account deleted/token revoked)
+                let tokenState = await TabMailTokenCoordinator.shared.validToken()
+                if case .permanentFailure = tokenState {
+                    print("[RootView] Auth permanently failed — showing account gone alert")
+                    NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
+                    return
+                }
+                print("[RootView] /whoami unauthorized (transient) — showing consent gate")
+            } catch {
+                // Non-fatal — user will see the consent gate and can consent natively
+                print("[RootView] /whoami consent check failed: \(error) — showing consent gate")
+            }
+
+            // Check for pending account deletion (non-fatal)
+            do {
+                let status = try await BillingClient().checkDeletionStatus()
+                pendingDeletionDate = status.pending ? status.deletion_date : nil
+            } catch {
+                print("[RootView] Deletion status check failed: \(error)")
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignOut).receive(on: DispatchQueue.main)) { _ in
+            // Save consent gate state for the current user before clearing (per-account)
+            saveConsentStateForCurrentUser()
+            withAnimation {
+                hasTabMailSession = false
+                hasCompletedConsentGate = false
+                // AI consent (hasSeenAIConsent) is device-level — not cleared on sign-out.
+                // Apple 5.1.2(i) disclosure is about app behavior, not account identity.
+                pendingDeletionDate = nil
+            }
+            showSignedOutAlert = true
+        }
+        .alert("Signed Out", isPresented: $showSignedOutAlert) {
+            Button("OK") {}
+        } message: {
+            Text("You have been signed out of TabMail. Your email accounts and messages remain on this device. Sign in again to use AI features.")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .tabMailAccountGone).receive(on: DispatchQueue.main)) { _ in
+            showAccountGoneAlert = true
+        }
+        .alert("Account No Longer Available", isPresented: $showAccountGoneAlert) {
+            Button("OK") {
+                TabMailAuthService.clearSession()
+                NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
+            }
+        } message: {
+            Text("Your TabMail account no longer exists. You have been signed out. Your email accounts and messages remain on this device.")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignIn).receive(on: DispatchQueue.main)) { _ in
+            withAnimation { hasTabMailSession = true }
+            // Restore consent state for the signed-in user (avoids re-showing consent)
+            restoreConsentStateForCurrentUser()
+            // Reconnect Device Sync after re-authentication
+            DeviceSyncService.shared.connect()
+            // Reopen AI subscription gate — new login may have active subscription
+            Task { await Self.revalidateAISubscriptionGate() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                if !navigationStore.accounts.isEmpty {
+                    syncScheduler.startForegroundPolling()
+                }
+                // Reconnect Device Sync if needed (e.g., returning from background)
+                DeviceSyncService.shared.reconnectIfNeeded()
+                // Check for overdue reminders that may have been missed while backgrounded
+                Task { await ProactiveNotifyService.shared.onForegroundReturn() }
+                // Start task evaluation loop (fires every 5 min while in foreground)
+                // Also registers wake times with push worker for background execution
+                Task {
+                    await TaskEvaluationService.shared.startTimer()
+                    await TaskEvaluationService.shared.registerAlarmsWithPushWorker()
+                }
+                // Revalidate AI subscription gate if closed (user may have subscribed externally)
+                Task { await Self.revalidateAISubscriptionGate() }
+            case .background:
+                syncScheduler.stopPolling()
+                // Stop task evaluation loop (saves resources in background)
+                Task { await TaskEvaluationService.shared.stopTimer() }
+                // Give in-flight backfill ~30s to finish its current chunk
+                syncScheduler.requestBackgroundGracePeriod()
+                syncScheduler.scheduleBackgroundSync()
+                syncScheduler.scheduleBackgroundAIProcessing()
+                // Disconnect Device Sync to save resources in background
+                DeviceSyncService.shared.disconnect()
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    /// Revalidate AI subscription gate via whoami.
+    /// Opens the gate if subscription is active, closes it if not.
+    private static func revalidateAISubscriptionGate() async {
+        do {
+            let info = try await BackendClient().fetchAccountInfo()
+            if info.hasSubscription == true {
+                AISubscriptionGate.shared.openGate()
+            } else {
+                AISubscriptionGate.shared.closeGate()
+            }
+        } catch {
+            print("[AISubscriptionGate] Revalidation failed: \(error)")
+        }
+    }
+
+    @ViewBuilder
+    private func pendingAccountGate(_ pending: PendingAccountAdd.Pending) -> some View {
+        switch pending.provider {
+        case .gmail:
+            AddAccountGmailOutlookView(
+                provider: .gmail,
+                email: pending.email,
+                onConnect: { try await commitGmailOutlookAdd(provider: .gmail, email: pending.email) },
+                onLater: {
+                    withAnimation { PendingAccountAdd.shared.clear() }
+                }
+            )
+        case .outlook:
+            AddAccountGmailOutlookView(
+                provider: .outlook,
+                email: pending.email,
+                onConnect: { try await commitGmailOutlookAdd(provider: .outlook, email: pending.email) },
+                onLater: {
+                    withAnimation { PendingAccountAdd.shared.clear() }
+                }
+            )
+        case .icloud:
+            AddAccountICloudView(
+                detectedEmail: pending.email,
+                onConnected: {
+                    withAnimation { PendingAccountAdd.shared.clear() }
+                },
+                onLater: {
+                    withAnimation { PendingAccountAdd.shared.clear() }
+                }
+            )
+        }
+    }
+
+    /// Commit the deferred Gmail/Outlook add. Caller is the
+    /// **Connect** button on `AddAccountGmailOutlookView`. This is
+    /// where the *second* OAuth fires: the first one (in
+    /// `TabMailLoginView`) only requested identity scopes, so we now
+    /// run a full-scope OAuth (Gmail/Calendar) with `loginHint` set
+    /// to the user's email so they don't see an account picker.
+    ///
+    /// Throws on real failures (network, server, OAuth error) so the
+    /// gate can display them inline. Cancellations (ASWebAuth Code=1
+    /// or `CancellationError`) are also thrown — the view catches
+    /// them silently and keeps the gate visible. **Later** is the
+    /// only route to `AddAccountGeneralView`; failure does not
+    /// silently drop the user there.
+    private func commitGmailOutlookAdd(
+        provider: AddAccountGmailOutlookView.Provider,
+        email: String
+    ) async throws {
+        let oauth = await AccountManager.shared.oauthService
+        switch provider {
+        case .gmail:
+            let tokens = try await oauth.authenticateGoogle(loginHint: email)
+            _ = try await AccountManager.shared.addGmailAccountWithTokens(tokens)
+        case .outlook:
+            let tokens = try await oauth.authenticateMicrosoft(loginHint: email)
+            _ = try await AccountManager.shared.addOutlookAccountWithTokens(tokens)
+        }
+        // Success: clear pending; gate dismisses on next render.
+        withAnimation { PendingAccountAdd.shared.clear() }
+    }
+
+    // MARK: - Per-Account Consent Gate Persistence
+
+    /// Save consent gate state keyed by the signed-in user's ID.
+    /// Called before sign-out so re-signing in can restore it.
+    /// AI consent (hasSeenAIConsent) is device-level and not saved per-user.
+    private func saveConsentStateForCurrentUser() {
+        guard let userId = TabMailAuthService.getSession()?.userId else { return }
+        UserDefaults.standard.set(hasCompletedConsentGate, forKey: "consent_gate_\(userId)")
+    }
+
+    /// Restore consent gate state for the newly signed-in user.
+    /// If this user previously completed the consent gate, skip it.
+    private func restoreConsentStateForCurrentUser() {
+        guard let userId = TabMailAuthService.getSession()?.userId else { return }
+        let consentKey = "consent_gate_\(userId)"
+        if UserDefaults.standard.object(forKey: consentKey) != nil {
+            hasCompletedConsentGate = UserDefaults.standard.bool(forKey: consentKey)
+        }
+    }
+
+    /// Run one-time data migrations asynchronously.
+    /// Called after inbox is visible but before sync starts.
+    /// Each migration is gated by a UserDefaults flag — already-completed ones are no-ops.
+    private static func runStartupMigrations(dbPool: DatabasePool) async {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        if !UserDefaults.standard.bool(forKey: "didMigrateHeaderIds_v2") {
+            do {
+                try await dbPool.write { db in
+                    try db.execute(sql: "DELETE FROM messageHeader")
+                }
+                print("[Migration] Batch-deleted old-format MessageHeaders")
+                UserDefaults.standard.set(true, forKey: "didMigrateHeaderIds_v2")
+            } catch {
+                print("[Migration] didMigrateHeaderIds_v2 failed: \(error) — will retry next launch")
+            }
+        }
+
+        if !UserDefaults.standard.bool(forKey: "didClearBodiesForAttachmentEncoding_v1") {
+            do {
+                try await dbPool.write { db in
+                    try db.execute(sql: "DELETE FROM messageBody")
+                }
+                print("[Migration] Batch-deleted MessageBody entries for attachment encoding fix")
+                UserDefaults.standard.set(true, forKey: "didClearBodiesForAttachmentEncoding_v1")
+            } catch {
+                print("[Migration] didClearBodiesForAttachmentEncoding_v1 failed: \(error) — will retry next launch")
+            }
+        }
+
+        if !UserDefaults.standard.bool(forKey: "didResetImapDatesForInternalDate_v1") {
+            do {
+                try await dbPool.write { db in
+                    let imapAccountIds = try String.fetchAll(db,
+                        Account.select(Column("id")).filter(Column("provider") == AccountProvider.imap.rawValue)
+                    )
+                    guard !imapAccountIds.isEmpty else { return }
+                    try Folder.filter(imapAccountIds.contains(Column("accountId")))
+                        .updateAll(db,
+                            Column("backfillComplete").set(to: false),
+                            Column("oldestSyncedDate").set(to: nil as Date?),
+                            Column("backfillUidCursor").set(to: nil as Int?),
+                            Column("backfillPageToken").set(to: nil as String?)
+                        )
+                    try Account.filter(imapAccountIds.contains(Column("id")))
+                        .updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
+                    print("[Migration] Reset backfill state on IMAP folders for INTERNALDATE fix")
+                }
+                UserDefaults.standard.set(true, forKey: "didResetImapDatesForInternalDate_v1")
+            } catch {
+                print("[Migration] didResetImapDatesForInternalDate_v1 failed: \(error) — will retry next launch")
+            }
+        }
+
+        if !UserDefaults.standard.bool(forKey: "didCleanResetMessageData_v1") {
+            do {
+                try await dbPool.write { db in
+                    try db.execute(sql: "DELETE FROM messageBody")
+                    try db.execute(sql: "DELETE FROM messageHeader")
+                    try Folder.updateAll(db,
+                        Column("backfillComplete").set(to: false),
+                        Column("oldestSyncedDate").set(to: nil as Date?),
+                        Column("lastKnownUidNext").set(to: nil as Int?),
+                        Column("backfillUidCursor").set(to: nil as Int?),
+                        Column("backfillPageToken").set(to: nil as String?)
+                    )
+                    try Account.updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
+                }
+                print("[Migration] Clean reset: batch deleted all headers + bodies")
+
+                do {
+                    try await SearchIndex.shared.resetAll()
+                    print("[Migration] FTS database reset")
+                } catch {
+                    print("[Migration] FTS reset failed: \(error)")
+                }
+
+                UserDefaults.standard.set(true, forKey: "didCleanResetMessageData_v1")
+            } catch {
+                print("[Migration] didCleanResetMessageData_v1 failed: \(error) — will retry next launch")
+            }
+        }
+
+        let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        print("[Migration] Startup migrations completed in \(ms)ms")
+    }
+
+    private func cancelDeletion() async -> Bool {
+        do {
+            _ = try await BillingClient().cancelAccountDeletion()
+            pendingDeletionDate = nil
+            print("[RootView] Account deletion cancelled")
+            return true
+        } catch BackendError.requestFailed(let statusCode) where statusCode == 409 || statusCode == 404 {
+            // 409 = cron already processed; 404 = no pending deletion (cancelled elsewhere)
+            pendingDeletionDate = nil
+            print("[RootView] Cancel deletion: already resolved (status \(statusCode)) — dismissing banner")
+            return true
+        } catch {
+            print("[RootView] Cancel deletion failed: \(error)")
+            return false
+        }
+    }
+}
+
+/// Banner shown when user has a pending account deletion.
+private struct DeletionBanner: View {
+    let deletionDate: String
+    let onCancel: () async -> Bool
+    @State private var isCancelling = false
+    @State private var showError = false
+
+    private var formattedDate: String {
+        if let date = Date.fromISO8601(deletionDate) {
+            return date.formatted(date: .long, time: .omitted)
+        }
+        return deletionDate
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Account deletion scheduled")
+                    .font(.subheadline.bold())
+                Text("Your account will be deleted on \(formattedDate).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                isCancelling = true
+                showError = false
+                Task {
+                    let success = await onCancel()
+                    isCancelling = false
+                    if !success {
+                        showError = true
+                    }
+                }
+            } label: {
+                if isCancelling {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if showError {
+                    Text("Retry")
+                        .font(.subheadline.bold())
+                } else {
+                    Text("Cancel")
+                        .font(.subheadline.bold())
+                }
+            }
+            .buttonStyle(.bordered)
+            .tint(showError ? .red : .orange)
+            .disabled(isCancelling)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.1))
+    }
+}
+
+extension Notification.Name {
+    static let tabMailDidSignOut = Notification.Name("tabMailDidSignOut")
+    static let tabMailDidSignIn = Notification.Name("tabMailDidSignIn")
+    static let navigateToSettings = Notification.Name("navigateToSettings")
+    static let navigateToAccount = Notification.Name("navigateToAccount")
+    /// Posted after GRDB writes that affect visible UI (e.g., backfill inserts).
+    /// Views should reload data when receiving this notification.
+    /// Reserved for rare structural changes (account add/remove, outbox, app launch).
+    static let backgroundDataDidChange = Notification.Name("backgroundDataDidChange")
+    /// Posted when folder unread counts are updated (recount complete or optimistic write).
+    /// Sidebar refreshes folder badges; app badge updates. Lightweight — no message list reload.
+    static let unreadCountsDidChange = Notification.Name("unreadCountsDidChange")
+    /// Posted when inbox message list data changes (new headers from sync/backfill).
+    /// InboxViewModel reloads message list. NavigationStore refreshes folders.
+    static let inboxDataDidChange = Notification.Name("inboxDataDidChange")
+    /// Posted by `PushNotificationService.checkPushConsentStatusForForeground`
+    /// (and the consent-error notification-tap handler) when one or more push
+    /// accounts — Gmail **or** Outlook — have an `error`/`missing` state on
+    /// the server-side inbox-add classifier. `userInfo["emails"]` is a
+    /// `[String]` of affected addresses. UI layer (a settings banner / inbox
+    /// toast) uses this to surface a "Fix smart notifications" affordance
+    /// that, on tap, re-runs the appropriate per-provider consent flow.
+    static let pushConsentErrorsDetected = Notification.Name("pushConsentErrorsDetected")
+    /// Posted when a newly-added push-capable account (Gmail or Outlook)
+    /// needs the user to confirm metadata-scope consent (NSE toggle is ON;
+    /// primary OAuth just succeeded). `userInfo["email"]` is the address;
+    /// `userInfo["provider"]` is the raw provider string (`"gmail"` /
+    /// `"outlook"`) so the receiver can pick the right explainer alert.
+    /// The UI presents a modal alert; on Continue it runs the unified
+    /// `ensurePushConsentAfterAccountAdd`. Decoupled from AccountManagerSetup
+    /// so the alert can be presented from a stable view (MailNavigationView)
+    /// regardless of where account-add was initiated.
+    static let pushConsentExplainerNeeded = Notification.Name("pushConsentExplainerNeeded")
+    /// Posted when archive/delete/move is performed from the detail view.
+    /// Object is the message ID (String) so the list can dismiss it immediately.
+    static let messageDismissedFromDetail = Notification.Name("messageDismissedFromDetail")
+    /// Posted when a single message's data changes (AI processing, reply/forward flags, tag updates, etc.).
+    /// Object is the message ID (String) so observers can refresh that message in-place from GRDB.
+    static let messageDataDidChange = Notification.Name("messageDataDidChange")
+    /// Posted when AI processing fails for a message (network error, empty response, etc.).
+    /// Object is the header ID (String) so SummaryBubbleView can show failure state.
+    static let aiDidFailForMessage = Notification.Name("aiDidFailForMessage")
+    /// Posted when undo restores dismissed messages.
+    /// Object is [String] array of message IDs to un-dismiss.
+    static let messagesUndone = Notification.Name("messagesUndone")
+    /// Posted when the server confirms the user's account no longer exists (deleted or token permanently revoked).
+    /// RootView shows an explanatory alert and then signs out.
+    static let tabMailAccountGone = Notification.Name("tabMailAccountGone")
+}

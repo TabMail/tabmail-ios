@@ -1,0 +1,162 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import GRDB
+
+enum OperationType: String, Codable, Sendable {
+    case archive
+    case delete
+    case move
+    case markRead
+    case markUnread
+    case markFlagged
+    case markUnflagged
+    case setTag
+    case removeTag
+    case markReplied
+    case markForwarded
+    case saveDraft
+    case deleteDraft
+    case addUserLabel
+    case removeUserLabel
+}
+
+enum PendingStatus: String, Codable, Sendable {
+    case queued
+    case inFlight
+    case cancelled
+}
+
+struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
+    static let databaseTableName = "pendingOperation"
+
+    var id: String
+    var type: OperationType
+    var messageIdsJSON: String
+    var accountId: String
+    var folderPath: String
+    /// Destination folder for move operations
+    var destinationPath: String?
+    /// ActionTag rawValue for setTag/removeTag operations
+    var tagValue: String?
+    /// UserLabel ID for addUserLabel/removeUserLabel operations
+    var userLabelId: String?
+    var createdAt: Date
+    var retryCount: Int
+    /// PendingStatus rawValue — stored as String for GRDB compatibility
+    var status: String
+
+    /// Decoded message IDs from JSON storage
+    var messageIds: [String] {
+        get {
+            guard let data = messageIdsJSON.data(using: .utf8) else { return [] }
+            return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+        }
+        set {
+            messageIdsJSON = (try? String(data: JSONEncoder().encode(newValue), encoding: .utf8)) ?? "[]"
+        }
+    }
+
+    init(
+        type: OperationType,
+        messageIds: [String],
+        accountId: String,
+        folderPath: String,
+        destinationPath: String? = nil,
+        tagValue: String? = nil,
+        userLabelId: String? = nil
+    ) {
+        self.id = UUID().uuidString
+        self.type = type
+        self.messageIdsJSON = (try? String(data: JSONEncoder().encode(messageIds), encoding: .utf8)) ?? "[]"
+        self.accountId = accountId
+        self.folderPath = folderPath
+        self.destinationPath = destinationPath
+        self.tagValue = tagValue
+        self.userLabelId = userLabelId
+        self.createdAt = Date()
+        self.retryCount = 0
+        self.status = PendingStatus.queued.rawValue
+    }
+}
+
+// MARK: - Sync Filter Snapshot
+//
+// Pending-op IDs queued by `AccountManagerActions` are `MessageHeader.stableId`:
+// - Gmail/Exchange: stableId == messageId (provider-stable IDs)
+// - IMAP:           stableId == rfc822MessageId when UID is numeric, else UID
+//
+// Server-returned `MessageHeaderInfo` carries `messageId` plus optional
+// `rfc822MessageId`. A one-key check against `info.messageId` misses every IMAP
+// pending op (where the queued key is rfc822). A one-key check against rfc822
+// misses optimistic ops queued before the server assigned a Message-ID.
+//
+// The only safe check is two-key: `messageId` OR `rfc822MessageId`. Every sync
+// path (Gmail delta, Exchange delta, IMAP fullSync, BackfillDeep) must use the
+// same snapshot so the filter can't drift between them.
+
+/// Snapshot of pending operation IDs for the sync filter. Always load INSIDE
+/// a write transaction — a separate read creates a TOCTOU window where a user
+/// action inserts a `PendingOperation` between the snapshot and the sync write,
+/// leading to UNIQUE constraint violations or silent undo.
+struct PendingOperationSnapshot: Sendable {
+    /// IDs from `.archive`, `.delete`, `.move` ops. Used to skip inserting a
+    /// message into a folder the user is optimistically moving out of.
+    let destructive: Set<String>
+    /// IDs from flag/tag ops (`.markRead`, `.markUnread`, `.markFlagged`,
+    /// `.markUnflagged`, `.setTag`, `.removeTag`). Used to skip overwriting
+    /// flags/tags the user just toggled.
+    let flag: Set<String>
+    /// IDs from all queued ops (any type). Used to skip deletions of rows the
+    /// user has any pending action against.
+    let all: Set<String>
+
+    static let destructiveTypes: Set<OperationType> = [.archive, .delete, .move]
+    static let flagTypes: Set<OperationType> = [
+        .markRead, .markUnread, .markFlagged, .markUnflagged, .setTag, .removeTag
+    ]
+
+    /// Build from a pre-fetched list of ops. Callers load ops once inside the
+    /// write transaction and pass them here so the filter classification is
+    /// the only work duplicated — not the DB query.
+    init(ops: [PendingOperation]) {
+        var destructive = Set<String>()
+        var flag = Set<String>()
+        var all = Set<String>()
+        for op in ops {
+            let ids = op.messageIds
+            all.formUnion(ids)
+            if Self.destructiveTypes.contains(op.type) { destructive.formUnion(ids) }
+            if Self.flagTypes.contains(op.type) { flag.formUnion(ids) }
+        }
+        self.destructive = destructive
+        self.flag = flag
+        self.all = all
+    }
+
+    /// Load all pending ops for an account inside the current write transaction.
+    /// Delta sync paths use this scope — Gmail IDs are globally unique across
+    /// folders and Exchange uses folder IDs as routing info on the item.
+    static func load(accountId: String, db: Database) throws -> PendingOperationSnapshot {
+        let ops = try PendingOperation
+            .filter(Column("accountId") == accountId)
+            .fetchAll(db)
+        return PendingOperationSnapshot(ops: ops)
+    }
+}
+
+extension Set where Element == String {
+    /// Two-key membership check for sync filters. Returns true if this set
+    /// contains either `messageId` or a non-empty `rfc822MessageId`.
+    ///
+    /// Required because `PendingOperation.messageIds` is keyed by
+    /// `MessageHeader.stableId` which is rfc822 for IMAP and messageId for
+    /// Gmail/Exchange — a single-key check misses IMAP pending ops.
+    func containsAnyKey(messageId: String, rfc822MessageId: String?) -> Bool {
+        if contains(messageId) { return true }
+        if let rfc = rfc822MessageId, !rfc.isEmpty, contains(rfc) { return true }
+        return false
+    }
+}

@@ -1,0 +1,1364 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import GRDB
+import UserNotifications
+
+/// Bridges data between the main app and the Notification Service Extension.
+/// Main app writes to shared UserDefaults (prompts, account map, etc.).
+/// NSE writes to the staging DB. Main app merges staging data on every wake.
+enum NSEDataBridge {
+    private static let appGroupId = "group.ai.tabmail"
+    private static var suite: UserDefaults? { UserDefaults(suiteName: appGroupId) }
+
+    // MARK: - Mirror (Main App → Shared UserDefaults for NSE)
+
+    /// Mirror all current state to shared UserDefaults.
+    /// Call on app launch and whenever relevant state changes.
+    static func mirrorAllState() {
+        mirrorAccountMap()
+        mirrorIMAPAccounts()
+        mirrorPrompts()
+        mirrorUserName()
+        mirrorBackendConfig()
+        mirrorDeviceToken()
+        mirrorPushSettings()
+    }
+
+    /// Mirror account email→accountId mapping.
+    /// Call on account add/remove.
+    static func mirrorAccountMap() {
+        guard let suite else { return }
+        do {
+            let accounts = try AppDatabase.dbPool.read { db in
+                try Row.fetchAll(db, sql: "SELECT id, emailAddress FROM account")
+            }
+            var map: [String: String] = [:]
+            for row in accounts {
+                if let email: String = row["emailAddress"], let id: String = row["id"] {
+                    map[email] = id
+                }
+            }
+            let data = try JSONEncoder().encode(map)
+            suite.set(String(data: data, encoding: .utf8), forKey: "nse.accountMap")
+        } catch {
+            print("[NSEDataBridge] Failed to mirror account map: \(error)")
+        }
+    }
+
+    /// Mirror IMAP account connection info (host/port/username/useTLS) for
+    /// NSE one-shot fetches on `imap_new_mail` / `imap_reconnect` pushes.
+    /// The password is already in shared Keychain
+    /// (`KeychainHelper.passwordKey(accountId:)` reads/writes via the
+    /// app-group access group, so NSE reads it via `SharedKeychain`).
+    /// Call on account add / remove / IMAP-config edit.
+    static func mirrorIMAPAccounts() {
+        guard let suite else { return }
+        do {
+            let rows = try AppDatabase.dbPool.read { db in
+                try Row.fetchAll(
+                    db,
+                    sql: """
+                    SELECT id, imapHost, imapPort, imapUsername, emailAddress
+                    FROM account
+                    WHERE provider IN ('imap', 'icloud')
+                      AND imapHost IS NOT NULL
+                      AND imapHost != ''
+                    """
+                )
+            }
+            var map: [String: [String: Any]] = [:]
+            for row in rows {
+                guard let id: String = row["id"],
+                      let host: String = row["imapHost"] else { continue }
+                let username = (row["imapUsername"] as String?)
+                    ?? (row["emailAddress"] as String?)
+                    ?? ""
+                let port = (row["imapPort"] as Int?) ?? 993
+                let entry: [String: Any] = [
+                    "host": host,
+                    "port": port,
+                    "username": username,
+                ]
+                // Main app's IMAPProvider defaults useTLS to nil → SwiftMail
+                // picks based on port. We mirror that — only stash `useTLS`
+                // if the operator ever wires an override; otherwise omit.
+                // (Currently always omitted — present as a schema hook.)
+                _ = entry
+                map[id] = entry
+            }
+            let data = try JSONSerialization.data(withJSONObject: map, options: [.sortedKeys])
+            suite.set(String(data: data, encoding: .utf8), forKey: "nse.imapAccounts")
+        } catch {
+            print("[NSEDataBridge] Failed to mirror IMAP accounts: \(error)")
+        }
+    }
+
+    /// Mirror lastHistoryId per account for NSE's history.list calls.
+    /// Call after each sync that advances the cursor.
+    static func mirrorLastHistoryIds() {
+        guard let suite else { return }
+        do {
+            let accounts = try AppDatabase.dbPool.read { db in
+                try Row.fetchAll(db, sql: "SELECT id, lastHistoryId FROM account WHERE lastHistoryId IS NOT NULL")
+            }
+            var map: [String: String] = [:]
+            for row in accounts {
+                if let id: String = row["id"], let historyId: String = row["lastHistoryId"] {
+                    map[id] = historyId
+                }
+            }
+            let data = try JSONEncoder().encode(map)
+            suite.set(String(data: data, encoding: .utf8), forKey: "nse.lastHistoryIds")
+        } catch {
+            print("[NSEDataBridge] Failed to mirror lastHistoryIds: \(error)")
+        }
+    }
+
+    /// Mirror prompt store values.
+    /// Call from PromptStore.didSet and after Device Sync applies incoming state.
+    static func mirrorPrompts() {
+        guard let suite else { return }
+        let defaults = UserDefaults.standard
+        suite.set(defaults.string(forKey: "user_prompts:user_composition.md") ?? "", forKey: "nse.compositionPrompt")
+        suite.set(defaults.string(forKey: "user_prompts:user_action.md") ?? "", forKey: "nse.actionPrompt")
+        suite.set(defaults.string(forKey: "user_prompts:user_kb.md") ?? "", forKey: "nse.kbText")
+    }
+
+    /// Mirror user display name.
+    static func mirrorUserName() {
+        guard let suite else { return }
+        let name = UserDefaults.standard.string(forKey: "userName") ?? ""
+        suite.set(name, forKey: "nse.userName")
+    }
+
+    /// Mirror backend configuration.
+    /// Respects the Settings > Debug > "Use Dev Servers" toggle via BackendConfig.
+    static func mirrorBackendConfig() {
+        guard let suite else { return }
+        suite.set(BackendConfig.apiBaseURL.absoluteString, forKey: "nse.backendBaseURL")
+        // Mirror whatever the main-app PushClient actually points at. Until
+        // 2026-04-18 this was hardcoded to prod, which foot-gunned any dev
+        // test that wired a Debug iOS build up to a dev push-worker — the
+        // NSE reconnect flow would POST /subscribe-imap to prod instead.
+        // PushConfig.baseURL is the single source of truth; change that
+        // if you need dev routing and both sides stay in sync.
+        suite.set(PushConfig.baseURL, forKey: "nse.pushWorkerURL")
+        // Mirror Google client ID for token refresh in NSE
+        if let clientId = Bundle.main.infoDictionary?["GOOGLE_CLIENT_ID"] as? String {
+            suite.set(clientId, forKey: "nse.googleClientId")
+        }
+        // Mirror Microsoft client ID (primary mail-account client) for
+        // Outlook NSE token refresh — parallel to Gmail. See NSEAuthSource.
+        if let msClientId = Bundle.main.infoDictionary?["MICROSOFT_CLIENT_ID"] as? String {
+            suite.set(msClientId, forKey: "nse.microsoftClientId")
+        }
+    }
+
+    /// Mirror push notification and sync settings.
+    /// Call on launch and when user toggles settings.
+    ///
+    /// Note: there used to be an `nse.pushEnabled` mirror of `pushNotificationsEnabledKey`.
+    /// Removed — the NSE's deliverPassive now gates suppression solely on Apple's
+    /// filtering entitlement. The subscription endpoint choice (silent vs NSE) is
+    /// handled entirely by PushClient at registration time; nothing inside the NSE
+    /// process needs to read the opt-in state.
+    static func mirrorPushSettings() {
+        guard let suite else { return }
+        suite.set(PushConfig.nseFilteringApproved, forKey: "nse.filteringApproved")
+        let syncEnabled = UserDefaults.standard.object(forKey: "device_sync_auto_enabled") as? Bool ?? true
+        suite.set(syncEnabled, forKey: "nse.deviceSyncEnabled")
+        suite.set(BackendConfig.syncBaseURL, forKey: "nse.syncBaseURL")
+    }
+
+    /// Mirror device token so NSE can call /nse-done.
+    static func mirrorDeviceToken() {
+        guard let suite else { return }
+        if let token = UserDefaults.standard.string(forKey: "lastDeviceToken") {
+            suite.set(token, forKey: "nse.deviceToken")
+        }
+    }
+
+    // MARK: - Merge (NSE Staging DB → Main GRDB)
+
+    /// Merge all NSE-processed results into main GRDB.
+    /// Called FIRST on every wake path: foreground return, BGAppRefresh, BGProcessingTask, silent push.
+    /// MUST succeed independently of sync — if the staging DB is busy, retry with backoff.
+    /// Open the NSE staging DB for callers that need to coordinate with the
+    /// NSE (e.g. `AIOwnershipLease`) without performing a full merge. Returns
+    /// `nil` if the App Group container is unavailable or the staging DB
+    /// file hasn't been created yet (first launch before any push).
+    static func openStagingDB() -> DatabaseQueue? {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupId
+        ) else { return nil }
+        let stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
+        guard FileManager.default.fileExists(atPath: stagingPath) else { return nil }
+        var config = Configuration()
+        config.busyMode = .timeout(2.0)
+        return try? DatabaseQueue(path: stagingPath, configuration: config)
+    }
+
+    static func mergeNSEStagingData() {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[NSEDataBridge] mergeNSEStagingData: START")
+
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupId
+        ) else {
+            print("[NSEDataBridge] mergeNSEStagingData: no app group container")
+            return
+        }
+
+        let stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
+        guard FileManager.default.fileExists(atPath: stagingPath) else {
+            print("[NSEDataBridge] mergeNSEStagingData: no staging DB file — nothing to merge")
+            return
+        }
+
+        // Retry opening the staging DB with increasing timeouts.
+        // The NSE may be actively writing — wait rather than silently skip.
+        var nseDB: DatabaseQueue?
+        for timeout in [2.0, 5.0] {
+            var config = Configuration()
+            config.busyMode = .timeout(timeout)
+            if let db = try? DatabaseQueue(path: stagingPath, configuration: config) {
+                nseDB = db
+                break
+            }
+            print("[NSEDataBridge] Staging DB busy, retrying with \(timeout)s timeout")
+        }
+        guard let nseDB else {
+            print("[NSEDataBridge] Staging DB locked after retries — merge deferred to next wake")
+            return
+        }
+
+        // Track whether any merge step mutated main GRDB. Drives whether we
+        // bother recomputing the badge at the end.
+        var didMutate = false
+
+        // 1. Read all NSE-processed messages — only `populated=1` rows. Lease
+        // placeholders from AIOwnershipLease.ensureRow keep populated=0 and
+        // are invisible to merge until the orphan reap deletes them on age.
+        // (StagedMessage hoisted to type-level — see bottom of file — so tests
+        // can construct it and drive `insertNewHeaderFromStaging` against an
+        // in-memory GRDB without going through the App Group staging file.)
+
+        // Decode a JSON-array column, tolerating nil / malformed / non-array
+        // content (e.g. legacy rows written before the column existed).
+        func decodeJSONArray(_ s: String?) -> [String] {
+            guard let s, !s.isEmpty,
+                  let data = s.data(using: .utf8),
+                  let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+                return []
+            }
+            return arr
+        }
+
+        // Explicit do/catch on the staging read — log on failure, continue
+        // with an empty `processed`. The helper sub-paths
+        // (`mergeInboxRemovals`, `consumePendingTaskResults`, orphan reap)
+        // read different tables and may still succeed; failed rows in
+        // `nse_processed_message` simply stay in staging and retry next wake.
+        let processed: [StagedMessage]
+        do {
+            processed = try nseDB.read { db in
+                try Row.fetchAll(db, sql: "SELECT * FROM nse_processed_message WHERE populated = 1").map { row in
+                    StagedMessage(
+                        id: row["id"],
+                        accountId: row["accountId"],
+                        accountEmail: row["accountEmail"] ?? "",
+                        provider: row["provider"] ?? "",
+                        messageId: row["messageId"],
+                        rfc822MessageId: row["rfc822MessageId"],
+                        threadId: row["threadId"],
+                        // New `folderPath` column (AppDatabase migration v3); fall
+                        // back to the legacy `folderId` column for DBs that were
+                        // written before the rename landed. Either way, default
+                        // to "INBOX" so pre-migration rows that only had Gmail's
+                        // hardcoded value still merge correctly.
+                        folderPath: (row["folderPath"] as String?)
+                            ?? (row["folderId"] as String?)
+                            ?? "INBOX",
+                        subject: row["subject"] ?? "",
+                        senderName: row["senderName"] ?? "",
+                        senderEmail: row["senderEmail"] ?? "",
+                        snippet: row["snippet"] ?? "",
+                        date: row["date"],
+                        to: row["toRaw"] ?? "",
+                        cc: row["ccRaw"] ?? "",
+                        bcc: row["bccRaw"] ?? "",
+                        replyTo: row["replyToRaw"],
+                        inReplyTo: row["inReplyTo"],
+                        references: decodeJSONArray(row["referencesJSON"]),
+                        isRead: (row["isRead"] as Int? ?? 0) == 1,
+                        isFlagged: (row["isFlagged"] as Int? ?? 0) == 1,
+                        hasAttachments: (row["hasAttachments"] as Int? ?? 0) == 1,
+                        isReplied: (row["isReplied"] as Int? ?? 0) == 1,
+                        isForwarded: (row["isForwarded"] as Int? ?? 0) == 1,
+                        providerLabels: decodeJSONArray(row["providerLabelsJSON"]),
+                        summaryBlurb: row["summaryBlurb"],
+                        summaryTodos: row["summaryTodos"],
+                        actionTag: row["actionTag"],
+                        reminderDate: row["reminderDate"],
+                        reminderTime: row["reminderTime"],
+                        reminderContent: row["reminderContent"],
+                        processedAt: row["processedAt"],
+                        aiCompleted: row["aiCompleted"] == 1,
+                        notified: row["notified"] == 1,
+                        htmlContent: row["htmlContent"],
+                        textContent: row["textContent"],
+                        attachmentsJSON: row["attachmentsJSON"],
+                        icsText: row["icsText"],
+                        hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1
+                    )
+                }
+            }
+        } catch {
+            // Log + fall through with empty `processed`. The helpers below
+            // read different tables and may still succeed; the unread
+            // populated rows stay in staging and retry next wake.
+            print("[NSEDataBridge] mergeNSEStagingData: populated read failed: \(error) — skipping main loop, helpers continue")
+            processed = []
+        }
+
+        let aiCount = processed.filter { $0.aiCompleted }.count
+        print("[NSEDataBridge] mergeNSEStagingData: found \(processed.count) staged message(s) (\(aiCount) with AI)")
+
+        if !processed.isEmpty {
+            // Only delete from staging the rows that actually committed. A
+            // per-message savepoint failure leaves its row in staging for
+            // retry on the next wake. This replaces the historical pattern of
+            // deleting `processedIds` (the whole read set) regardless of
+            // commit outcome — a bug that dropped staging rows for
+            // savepoints that never committed.
+            var successfullyMergedIds: [String] = []
+            // Collect FTS pipeline work across ALL committed messages; flushed
+            // once after the main tx commits. Per-message ftsBatch is built
+            // INSIDE the savepoint and only merged into this batch after the
+            // savepoint commits — so a savepoint rollback doesn't leak stale
+            // entries that point at non-existent main-GRDB rows.
+            var ftsBatch: [(headerId: String, textContent: String)] = []
+
+            // Tracks whether the outer dbPool.write actually committed. Per-
+            // message savepoints can RELEASE successfully but if the outer
+            // commit later fails (SQLITE_FULL/IOERR/INTERRUPT), GRDB rolls
+            // back the entire transaction — including those releases — so
+            // nothing is durable in main GRDB. We must NOT delete the
+            // corresponding staging rows in that case.
+            var outerCommitted = false
+
+            do {
+                try AppDatabase.dbPool.write { db in
+                    for msg in processed {
+                        // Per-message savepoint: a single bad row (FK
+                        // violation, ThreadUtils throw, FTS contention, etc.)
+                        // rolls back JUST that row, not the entire batch. The
+                        // outer transaction stays alive so siblings still
+                        // commit. The failed row stays in staging because we
+                        // don't append its id to `successfullyMergedIds`.
+                        // GRDB's `inSavepoint` issues a real SQLite SAVEPOINT
+                        // when called inside an active transaction
+                        // (Database.swift:1625) and re-throws on closure
+                        // failure after rolling back the savepoint.
+                        //
+                        // Per-iteration ftsBatch is local and only merged into
+                        // the loop-level state after the savepoint commits, so
+                        // a rollback doesn't leak FTS entries pointing at
+                        // non-existent rows.
+                        var localFtsBatch: [(headerId: String, textContent: String)] = []
+                        do {
+                            try db.inSavepoint {
+                                // Find existing MessageHeader in main DB.
+                                //
+                                // Primary lookup: by provider messageId. Works for Gmail
+                                // (messageId is stable) and Outlook Graph (id is stable),
+                                // and for IMAP when UIDs haven't changed.
+                                //
+                                // Fallback lookup: by rfc822MessageId. Catches IMAP UID
+                                // remaps after server-side MOVE — e.g. user archives a
+                                // message, hits undo → our MOVE-BACK assigns a fresh UID
+                                // in INBOX; the push worker fires a notification with
+                                // that new UID as messageId; the primary lookup misses
+                                // because our header still has the pre-archive UID.
+                                // Without this fallback we'd insert a duplicate header
+                                // keyed on the new UID, which the user sees as two
+                                // copies of the same email.
+                                var existingRow = try Row.fetchOne(db, sql: """
+                                    SELECT id, folderPath, rfc822MessageId FROM messageHeader
+                                    WHERE accountId = ? AND messageId = ?
+                                    """, arguments: [msg.accountId, msg.messageId])
+                                if existingRow == nil,
+                                   let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
+                                    existingRow = try Row.fetchOne(db, sql: """
+                                        SELECT id, folderPath, rfc822MessageId FROM messageHeader
+                                        WHERE accountId = ? AND rfc822MessageId = ?
+                                        """, arguments: [msg.accountId, rfc822])
+                                }
+                                if let row = existingRow {
+                                    let headerId: String = row["id"]
+                                    // Use the existing header's folderPath (not the
+                                    // staged msg.folderPath) as the AI cache key's
+                                    // folder component. If sync raced ahead of our
+                                    // merge and moved the message, the main app's
+                                    // cache probes go through the CURRENT folderPath
+                                    // — we must write under the same key, not the
+                                    // one NSE captured at fetch time. For the common
+                                    // case (no drift) these are identical.
+                                    let existingFolderPath: String = row["folderPath"] ?? msg.folderPath
+                                    let existingRfc822: String? = row["rfc822MessageId"]
+
+                                    if msg.aiCompleted {
+                                        // Keep `tagSortOrder` paired with `actionTag` — the main app's
+                                        // triage view sorts by `ORDER BY tagSortOrder ASC, date DESC`,
+                                        // so a row with `actionTag='reply'` but the default
+                                        // `tagSortOrder=99` lands at the bottom of the list even
+                                        // though the UI tag is rendered correctly. (Caught via
+                                        // [TriageSortDiag] DESYNC detector; see InboxViewModel.)
+                                        let aiTagSortOrder: Int = {
+                                            guard let raw = msg.actionTag, let tag = ActionTag(rawValue: raw) else { return 99 }
+                                            return tag.sortOrder
+                                        }()
+                                        try db.execute(sql: """
+                                            UPDATE messageHeader SET
+                                                summaryBlurb = ?, summaryTodos = ?, actionTag = ?, tagSortOrder = ?,
+                                                reminderDate = ?, reminderTime = ?, reminderContent = ?,
+                                                notified = CASE WHEN ? THEN 1 ELSE notified END
+                                            WHERE id = ?
+                                            """, arguments: [
+                                                msg.summaryBlurb, msg.summaryTodos, msg.actionTag, aiTagSortOrder,
+                                                msg.reminderDate, msg.reminderTime, msg.reminderContent,
+                                                msg.notified, headerId
+                                            ])
+                                        markReachedOutIfNotified(
+                                            notified: msg.notified,
+                                            reminderContent: msg.reminderContent,
+                                            rfc822MessageId: msg.rfc822MessageId,
+                                            headerId: headerId
+                                        )
+                                        // Persist rendered body from NSE staging (if NSE rendered one).
+                                        // Main app's body queue skips bodyComplete=1 rows — no re-fetch
+                                        // for non-CID mail. CID-having mail stays bodyComplete=0.
+                                        try persistRenderedBodyFromStaging(
+                                            db: db, headerId: headerId,
+                                            htmlContent: msg.htmlContent, textContent: msg.textContent,
+                                            attachmentsJSON: msg.attachmentsJSON, icsText: msg.icsText,
+                                            hasUnresolvedCIDs: msg.hasUnresolvedCIDs,
+                                            ftsBatch: &localFtsBatch
+                                        )
+
+                                        // Update MessageAICache — use the shared key helper
+                                        // so NSE writes + main-app reads agree byte-for-byte.
+                                        // folderPath here is the EXISTING header's (current
+                                        // GRDB state) — avoids cache drift if sync moved
+                                        // the message between NSE fetch and merge.
+                                        let rfc = msg.rfc822MessageId ?? existingRfc822
+                                        if let cacheKey = MessageIdentity.aiCacheKey(
+                                            accountId: msg.accountId,
+                                            folderPath: existingFolderPath,
+                                            rfc822MessageId: rfc
+                                        ) {
+                                            try db.execute(sql: """
+                                                INSERT OR REPLACE INTO messageAICache
+                                                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
+                                                VALUES (?, ?, ?, ?, ?)
+                                                """, arguments: [
+                                                    cacheKey, msg.summaryBlurb, msg.summaryTodos,
+                                                    msg.actionTag, msg.processedAt
+                                                ])
+                                        }
+                                    } else if msg.notified {
+                                        // AI didn't complete but notification was delivered
+                                        try db.execute(sql: "UPDATE messageHeader SET notified = 1 WHERE id = ?",
+                                                       arguments: [headerId])
+                                        markReachedOutIfNotified(
+                                            notified: msg.notified,
+                                            reminderContent: msg.reminderContent,
+                                            rfc822MessageId: msg.rfc822MessageId,
+                                            headerId: headerId
+                                        )
+                                    }
+
+                                    // Queue IMAP tag write — idempotent via deterministic id.
+                                    try queueSetTagPendingOp(db: db, accountId: msg.accountId,
+                                                             messageId: msg.messageId, tag: msg.actionTag)
+                                } else {
+                                    // Header not in main DB yet — create it from NSE staging data
+                                    // so the message appears in inbox immediately (before sync).
+                                    // Body of the new-header insert lives in
+                                    // `insertNewHeaderFromStaging` so tests can drive it
+                                    // against an in-memory GRDB without the App Group
+                                    // staging file.
+                                    _ = try Self.insertNewHeaderFromStaging(
+                                        msg, db: db, ftsBatch: &localFtsBatch
+                                    )
+
+                                    // Queue IMAP tag write so the tag propagates to the server.
+                                    // Without this, the fresh-header branch would set header.actionTag
+                                    // locally but never sync it to the provider.
+                                    try queueSetTagPendingOp(db: db, accountId: msg.accountId,
+                                                             messageId: msg.messageId, tag: msg.actionTag)
+
+                                    // Also cache AI results for resilience.
+                                    // Same shared-helper key as the existing-header branch.
+                                    if msg.aiCompleted,
+                                       let cacheKey = MessageIdentity.aiCacheKey(
+                                        accountId: msg.accountId,
+                                        folderPath: msg.folderPath,
+                                        rfc822MessageId: msg.rfc822MessageId
+                                       ) {
+                                        try db.execute(sql: """
+                                            INSERT OR REPLACE INTO messageAICache
+                                            (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
+                                            VALUES (?, ?, ?, ?, ?)
+                                            """, arguments: [
+                                                cacheKey, msg.summaryBlurb, msg.summaryTodos,
+                                                msg.actionTag, msg.processedAt
+                                            ])
+                                    }
+                                }
+                                return .commit
+                            }
+                            // Savepoint committed — promote local FTS batch
+                            // and record id for post-tx delete.
+                            successfullyMergedIds.append(msg.id)
+                            ftsBatch.append(contentsOf: localFtsBatch)
+                        } catch {
+                            // inSavepoint already rolled back the savepoint
+                            // and re-threw the error; the outer transaction
+                            // is still alive. Skip recording this id so the
+                            // staging row stays for retry. Local deltas are
+                            // discarded with the rollback.
+                            print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
+                        }
+                    }
+                }
+                // Reaching this line means dbPool.write returned normally —
+                // GRDB has committed the outer tx and every released savepoint
+                // is durable. Set the flag so the post-tx staging delete and
+                // FTS flush + badge update can proceed.
+                outerCommitted = true
+                print("[NSEDataBridge] mergeNSEStagingData: \(successfullyMergedIds.count)/\(processed.count) committed")
+
+                // Trigger UI refresh only if at least one savepoint committed.
+                if !successfullyMergedIds.isEmpty {
+                    Task { @MainActor in
+                        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+                    }
+                }
+            } catch {
+                // Outer dbPool.write threw — usually a hard SQLite error
+                // (SQLITE_FULL/IOERR/INTERRUPT) at commit time. EVERY released
+                // savepoint is rolled back along with the outer tx, so no
+                // matter what successfullyMergedIds contains, nothing is
+                // durable in main GRDB. The post-tx staging delete is gated
+                // on `outerCommitted` and won't run, leaving all rows in
+                // staging for retry.
+                print("[NSEDataBridge] Merge failed (outer tx): \(error)")
+            }
+
+            // Drive `didMutate` off actual commits AND outer-tx success. If
+            // the outer commit failed, the per-msg savepoint releases got
+            // rolled back; successfullyMergedIds is misleading and we should
+            // not trigger a badge update.
+            if outerCommitted, !successfullyMergedIds.isEmpty {
+                didMutate = true
+            }
+
+            // Both the FTS flush and the staging-row delete are gated on the
+            // outer commit. If the outer tx rolled back at commit time, the
+            // per-msg savepoint releases are undone too — no rows are durable
+            // in main GRDB, so we mustn't index FTS for them and mustn't
+            // delete their staging rows.
+            if outerCommitted {
+                // Fire ONE batched FTS pipeline for all committed messages.
+                // No-op if ftsBatch is empty.
+                if !ftsBatch.isEmpty {
+                    let batchSnapshot = ftsBatch
+                    Task {
+                        await Self.flushNSEBatchToFTS(items: batchSnapshot)
+                    }
+                }
+
+                // Delete only the rows whose per-msg savepoint released AND
+                // whose outer tx committed. Failed rows stay in staging with
+                // populated=1 (the orphan reap only targets populated=0
+                // placeholders, so they stay visible for the next wake's
+                // retry; sync's update-existing path will also overwrite the
+                // corresponding main-GRDB row regardless).
+                do {
+                    try nseDB.write { db in
+                        for id in successfullyMergedIds {
+                            try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                        }
+                    }
+                } catch {
+                    print("[NSEDataBridge] Staging delete failed: \(error) — successfullyMergedIds may be re-merged next wake (idempotent)")
+                }
+            }
+        }
+
+        // 2. Process inbox removals — messages archived/deleted/moved while app was sleeping
+        if mergeInboxRemovals(from: nseDB) { didMutate = true }
+
+        // Consume pending task results
+        if consumePendingTaskResults(from: nseDB) { didMutate = true }
+
+        // Correct badge count only when the merge actually changed state.
+        // Delegates to UnreadCountManager — authoritative, index-covered query
+        // over folder.unreadCount WHERE role = .inbox (replaces an unindexable
+        // `folderId LIKE '%:INBOX'` scan of messageHeader).
+        if didMutate {
+            Task { await UnreadCountManager.shared.updateBadge() }
+        }
+
+        // Robustness: reap stale `populated=0` placeholders. NSE has a hard
+        // ~30 s OS budget; main-app ActiveAIQueue's lease goes stale at 4 s
+        // once the process dies. 60 s is well past both — any populated=0
+        // row older than that belongs to a process that was killed before
+        // persistProcessedMessage could flip populated=1. Safe even while a
+        // peer is mid-flight: ensureRow's INSERT OR IGNORE re-creates the row
+        // on the next tryClaim, costing at most one duplicate LLM call
+        // (lease state was already considered stale by then anyway).
+        let orphanThresholdSeconds: TimeInterval = 60
+        let orphanCutoff = Date().timeIntervalSince1970 - orphanThresholdSeconds
+        do {
+            var reaped = 0
+            try nseDB.write { db in
+                try db.execute(sql: """
+                    DELETE FROM nse_processed_message
+                    WHERE populated = 0 AND processedAt < ?
+                    """, arguments: [orphanCutoff])
+                reaped = db.changesCount
+            }
+            if reaped > 0 {
+                print("[NSEDataBridge] Orphan reap: deleted \(reaped) stale placeholder(s) older than \(Int(orphanThresholdSeconds))s")
+            }
+        } catch {
+            // Best-effort. A failed reap is benign — the placeholders stay
+            // populated=0 and remain invisible to merge; next wake retries.
+            print("[NSEDataBridge] Orphan reap failed: \(error)")
+        }
+
+        let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        print("[NSEDataBridge] mergeNSEStagingData: DONE in \(ms)ms (didMutate=\(didMutate))")
+    }
+
+    // MARK: - Inbox Removals
+
+    /// Merge inbox removal records from NSE staging DB.
+    /// Messages that lost their INBOX label (archive/delete/move from another device)
+    /// are removed from the inbox folder in main GRDB so the UI stays current on next wake.
+    /// Returns true if any header rows were removed from main GRDB.
+    /// Per-removal success tracking: failed rows stay in staging and retry
+    /// next wake; only committed removals are cleared.
+    private static func mergeInboxRemovals(from nseDB: DatabaseQueue) -> Bool {
+        struct Removal {
+            let id: String
+            let accountId: String
+            let messageId: String
+        }
+
+        let removals: [Removal]
+        do {
+            removals = try nseDB.read { db in
+                guard try db.tableExists("nse_inbox_removal") else { return [] }
+                return try Row.fetchAll(db, sql: "SELECT * FROM nse_inbox_removal").map { row in
+                    Removal(id: row["id"], accountId: row["accountId"], messageId: row["messageId"])
+                }
+            }
+        } catch {
+            print("[NSEDataBridge] Inbox removal read failed: \(error)")
+            return false
+        }
+
+        guard !removals.isEmpty else { return false }
+
+        // Per-removal success tracking — only delete from staging the rows
+        // whose main-GRDB write committed AND whose outer tx subsequently
+        // committed. Failed rows stay for the next wake's retry.
+        var successfullyConsumedIds: [String] = []
+        var deletedTotal = 0
+        var outerCommitted = false
+
+        do {
+            try AppDatabase.dbPool.write { db in
+                // Resolve inbox folder ids once per merge using the authoritative
+                // role marker. Replaces the old `folderId LIKE '%:INBOX'` scan,
+                // which was both unindexable and semantically wrong for accounts
+                // whose inbox path is not literally "INBOX" (localized/custom).
+                let inboxFolderIds = try String.fetchAll(db,
+                    sql: "SELECT id FROM folder WHERE role = ?",
+                    arguments: [FolderRole.inbox.rawValue]
+                )
+                guard !inboxFolderIds.isEmpty else { return }
+                let inboxPlaceholders = inboxFolderIds.map { _ in "?" }.joined(separator: ", ")
+
+                for removal in removals {
+                    // Each removal is one DELETE statement — atomic per
+                    // statement. Recoverable errors (constraint) leave the
+                    // outer tx alive and we move on; unrecoverable errors
+                    // (IOERR/FULL/INTERRUPT) abort the outer tx and bubble
+                    // out to the catch below.
+                    do {
+                        try db.execute(sql: """
+                            DELETE FROM messageHeader
+                            WHERE accountId = ? AND messageId = ?
+                              AND folderId IN (\(inboxPlaceholders))
+                            """, arguments: StatementArguments([removal.accountId, removal.messageId] + inboxFolderIds))
+                        deletedTotal += db.changesCount
+                        successfullyConsumedIds.append(removal.id)
+                    } catch {
+                        print("[NSEDataBridge] Per-removal failed for \(removal.id): \(error) — left in staging for retry")
+                    }
+                }
+            }
+            // dbPool.write returned normally → outer tx committed; the per-
+            // removal DELETEs are durable and we can safely clear staging.
+            outerCommitted = true
+            print("[NSEDataBridge] Merged \(successfullyConsumedIds.count)/\(removals.count) inbox removal(s), deleted \(deletedTotal) header row(s)")
+            if deletedTotal > 0 {
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+                }
+            }
+        } catch {
+            // Outer dbPool.write threw — even per-row DELETEs that we logged
+            // as committed got rolled back with the outer tx. Don't clear
+            // staging; let next wake retry the whole batch.
+            print("[NSEDataBridge] Inbox removal merge failed (outer tx): \(error)")
+        }
+
+        // Staging cleanup gated on outer-tx success. If the outer commit
+        // failed, every per-row DELETE was rolled back along with it, so the
+        // staging rows must NOT be cleared — next wake will retry.
+        guard outerCommitted else {
+            return false
+        }
+
+        // Clear only the removals that committed.
+        try? nseDB.write { db in
+            for id in successfullyConsumedIds {
+                try db.execute(sql: "DELETE FROM nse_inbox_removal WHERE id = ?", arguments: [id])
+            }
+        }
+
+        // Also remove any delivered notifications for committed removals.
+        // Best-effort UI hygiene — uncommitted removals will retry next wake
+        // and clear their notifications then.
+        let center = UNUserNotificationCenter.current()
+        let consumedSet = Set(successfullyConsumedIds)
+        for removal in removals where consumedSet.contains(removal.id) {
+            let notificationId = "email-\(removal.accountId)-\(removal.messageId)"
+            center.removeDeliveredNotifications(withIdentifiers: [notificationId])
+        }
+
+        return deletedTotal > 0
+    }
+
+    // MARK: - Task Results
+
+    /// Persist all NSE-staged task results into main-GRDB chatTurn.
+    /// Returns true if any task results were persisted.
+    /// Per-result success tracking: failed rows stay in staging and retry
+    /// next wake; only committed results are cleared.
+    private static func consumePendingTaskResults(from nseDB: DatabaseQueue) -> Bool {
+        let results: [(id: Int, taskName: String, result: String, timestamp: Double)]
+        do {
+            results = try nseDB.read { db in
+                try Row.fetchAll(db, sql: "SELECT * FROM nse_pending_task_result").map { row in
+                    (id: row["id"] as Int, taskName: row["taskName"] as String,
+                     result: row["result"] as String, timestamp: row["timestamp"] as Double)
+                }
+            }
+        } catch {
+            print("[NSEDataBridge] Task result read failed: \(error)")
+            return false
+        }
+
+        guard !results.isEmpty else { return false }
+
+        var successfullyConsumedIds: [Int] = []
+
+        for result in results {
+            // Each result already runs in its own dbPool.write — no savepoint
+            // plumbing needed. Just track per-result success for the staging
+            // delete below.
+            do {
+                try AppDatabase.dbPool.write { db in
+                    try db.execute(sql: """
+                        INSERT INTO chatTurn (id, timestamp, role, content, type, chars)
+                        VALUES (?, ?, 'assistant', ?, 'task', ?)
+                        """, arguments: [
+                            UUID().uuidString,
+                            result.timestamp,
+                            result.result,
+                            result.result.count
+                        ])
+                }
+                successfullyConsumedIds.append(result.id)
+                print("[NSEDataBridge] Persisted task result: \(result.taskName)")
+            } catch {
+                print("[NSEDataBridge] Failed to persist task result \(result.taskName): \(error) — left in staging for retry")
+            }
+        }
+
+        // Delete only the staging rows whose chatTurn committed.
+        try? nseDB.write { db in
+            for id in successfullyConsumedIds {
+                try db.execute(sql: "DELETE FROM nse_pending_task_result WHERE id = ?", arguments: [id])
+            }
+        }
+
+        return !successfullyConsumedIds.isEmpty
+    }
+
+    // MARK: - User-label filtering (merge-path parity)
+
+    /// Apply the provider-specific filter that `GmailProvider.extractUserLabelIds`,
+    /// `IMAPProvider.buildMessageHeaderInfo`, and `ExchangeProvider.parseGraphMessage`
+    /// each apply locally. Called inside the merge's GRDB write tx so the
+    /// Gmail path can query the main `userLabel` table synchronously.
+    ///
+    /// **Gmail** — since label IDs are opaque (`Label_N`), we can't tell user
+    /// vs system vs `tm_*` by the ID alone. Instead we take the path main-
+    /// app already walks: look up each ID in the `userLabel` table. Only
+    /// real user labels (rows with `isSystem=false`) are kept. tm_* labels
+    /// aren't in that table (main-app `extractUserLabelIds` filters them
+    /// out before insert). System labels are either absent or have
+    /// `isSystem=true`. Zero extra I/O — the transaction already has `db`.
+    /// Cold-start caveat: if this device's main-app hasn't yet called
+    /// `fetchFolders`, `userLabel` is empty and no user labels materialize
+    /// on the NSE row until sync runs. Push subscription normally follows
+    /// a sync, so this is mostly hypothetical.
+    ///
+    /// **IMAP** — plain custom-keyword names. Strip `tm_*` and every
+    /// exclusion `UserLabelStore.isExcludedKeyword` knows about.
+    ///
+    /// **Outlook** — Graph categories aren't surfaced as user labels yet
+    /// (see `ExchangeProvider.parseGraphMessage` → `userLabelIds: []`).
+    fileprivate static func filterUserLabels(
+        provider: String, rawLabels: [String],
+        accountId: String, db: GRDB.Database
+    ) throws -> [String] {
+        switch provider {
+        case "gmail":
+            // Query userLabel for known non-system user labels on this
+            // account. A single `IN` query covers all staged labelIds.
+            guard !rawLabels.isEmpty else { return [] }
+            let placeholders = rawLabels.map { _ in "?" }.joined(separator: ",")
+            let args: [DatabaseValueConvertible] = [accountId] + rawLabels
+            let known = try String.fetchAll(db, sql: """
+                SELECT id FROM userLabel
+                WHERE accountId = ? AND isSystem = 0 AND id IN (\(placeholders))
+                """, arguments: StatementArguments(args))
+            let knownSet = Set(known)
+            return rawLabels.filter { knownSet.contains($0) }
+        case "imap_new_mail", "imap", "icloud":
+            // IMAP: strip system flags + tm_* + any other excluded keyword.
+            return rawLabels.filter { !UserLabelStore.isExcludedKeyword($0) }
+                .map { $0.lowercased() }  // Matches IMAPProvider's lowercase normalization.
+        case "outlook":
+            // Graph user labels aren't supported yet — ExchangeProvider
+            // returns `userLabelIds: []` in parseGraphMessage. Match that.
+            return []
+        default:
+            return []
+        }
+    }
+
+    // MARK: - Clear Notification on Read
+
+    /// Remove the notification for a message from Notification Center.
+    /// Call when user reads a message in the app.
+    static func clearNotification(accountId: String, messageId: String) {
+        let notificationId = "email-\(accountId)-\(messageId)"
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [notificationId])
+    }
+
+    // MARK: - Pending op queue (idempotent)
+
+    /// Queue a `setTag` pending operation with a deterministic id, so re-runs
+    /// of the merge (e.g. after a crash between write + staging-row delete)
+    /// don't stack duplicate ops for the same message+tag. The deterministic
+    /// id + `INSERT OR IGNORE` makes dedup explicit — on collision the existing
+    /// queued op is preserved; other SQL errors surface via `throws`.
+    ///
+    /// Skips entirely when tag is nil, empty, or "none" (no IMAP write needed).
+    fileprivate static func queueSetTagPendingOp(
+        db: GRDB.Database, accountId: String, messageId: String, tag: String?
+    ) throws {
+        guard let tag, !tag.isEmpty, tag != "none" else { return }
+        let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: [messageId]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        // Deterministic id: (accountId, messageId, setTag, tag) tuple.
+        let id = "setTag:\(accountId):\(messageId):\(tag)"
+        try db.execute(sql: """
+            INSERT OR IGNORE INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, tagValue, createdAt, status, retryCount)
+            VALUES (?, 'setTag', ?, ?, 'INBOX', ?, ?, 'queued', 0)
+            """, arguments: [id, messageIdsJSON, accountId, tag, Date()])
+    }
+
+    // MARK: - NSE-rendered Body Persistence (merge path)
+
+    /// Persist a RenderedBody produced by the NSE into main GRDB's MessageBody +
+    /// messageHeader.bodyComplete + FTS. Called from mergeNSEStagingData inside
+    /// the same write transaction. Skips silently when NSE didn't render a body
+    /// (e.g. old NSE build, or body fetch failed at NSE time).
+    ///
+    /// bodyComplete = !hasUnresolvedCIDs. Non-CID mail (the majority) becomes
+    /// bodyComplete=true and the main app's body queue never re-fetches. CID-having
+    /// mail stays bodyComplete=false; the first user open triggers the existing
+    /// main-app fetch+render path which resolves CIDs into data URIs.
+    ///
+    /// Fully idempotent — re-running is safe:
+    ///   - MessageBody `insert(onConflict: .ignore)` preserves any earlier body.
+    ///   - UPDATE messageHeader is a deterministic write of the same values.
+    ///   - FTS write is fire-and-forget and the index is itself idempotent on id.
+    ///
+    /// IMPORTANT: we only insert `MessageBody` when `hasUnresolvedCIDs == false`.
+    /// Main-app `BodyFetchProcessor.process` uses `insert(onConflict: .ignore)`,
+    /// which would skip overwriting an NSE-persisted unresolved-CID body when
+    /// the re-fetch arrives. Not persisting placeholder bodies leaves the
+    /// re-render free to insert the fully-resolved version cleanly, and the UI
+    /// shows its "loading body..." state for the ~1s before re-fetch completes.
+    /// Snippet + FTS + bodyComplete flag are still updated because they don't
+    /// depend on CID resolution.
+    /// In-tx part of the NSE body persistence: inserts `MessageBody` (for fully-
+    /// resolved bodies only) and updates `snippet`. If the message has a non-empty
+    /// plain-text body and no unresolved CIDs, its `headerId` + text are appended
+    /// to `ftsBatch` so the caller can run ONE batched FTS pipeline after the main
+    /// transaction commits (see `flushNSEBatchToFTS`). This avoids spawning N
+    /// concurrent detached Tasks each doing small FTS writes — critical during
+    /// heavy catch-up wakes with many staged messages.
+    ///
+    /// Invariants `headerComplete=1 ⇒ FTS has header` and `bodyComplete=1 ⇒ FTS
+    /// has body` are enforced by the post-tx batch flush, NOT here. Neither flag
+    /// is ever touched inside the main tx.
+    fileprivate static func persistRenderedBodyFromStaging(
+        db: GRDB.Database,
+        headerId: String,
+        htmlContent: String?,
+        textContent: String?,
+        attachmentsJSON: String?,
+        icsText: String?,
+        hasUnresolvedCIDs: Bool,
+        ftsBatch: inout [(headerId: String, textContent: String)]
+    ) throws {
+        // Nothing to persist — NSE didn't render (old build / fetch failure).
+        guard htmlContent != nil || textContent != nil else { return }
+
+        // Insert MessageBody ONLY for fully-resolved bodies. Unresolved-CID
+        // bodies are dropped on the floor; main app re-fetches + re-renders.
+        if !hasUnresolvedCIDs {
+            var body = MessageBody.create(headerId: headerId, htmlBody: htmlContent, textBody: textContent)
+            body.attachmentsJSON = attachmentsJSON
+            body.icsText = icsText
+            try body.insert(db, onConflict: .ignore)
+        }
+
+        // Snippet computed from plain text via shared EmailFilter (matches main-app path).
+        let snippet = textContent.map { EmailFilter.snippetFromPlainText($0) } ?? ""
+        if !snippet.isEmpty {
+            try db.execute(sql: """
+                UPDATE messageHeader SET snippet = ? WHERE id = ?
+                """, arguments: [snippet, headerId])
+        }
+
+        // Queue up the FTS pipeline work. `flushNSEBatchToFTS` runs once per merge
+        // with the full batch of headerIds — amortizes FTS transaction overhead.
+        // Unresolved-CID and empty-text messages skip FTS (same as before) — they
+        // stay at headerComplete=0; recoverIncompleteHeaders catches them next wake.
+        if let text = textContent, !text.isEmpty, !hasUnresolvedCIDs {
+            ftsBatch.append((headerId: headerId, textContent: text))
+        }
+    }
+
+    /// Batched post-tx FTS pipeline for all NSE-merged messages in a single wake.
+    /// Runs after the main merge transaction commits, in a single detached Task.
+    /// Amortizes FTS and GRDB write overhead across the whole batch.
+    ///
+    /// Pipeline steps:
+    ///   1. Bulk read MessageHeaders → build FTSHeaderRecords.
+    ///   2. `SearchIndex.shared.indexHeaders(records)` — idempotent on known IDs.
+    ///   3. Bulk `UPDATE messageHeader SET headerComplete=1 WHERE id IN (...)`.
+    ///   4. `SearchIndex.shared.updateBodies(items)` — returns set of confirmed IDs.
+    ///   5. Bulk `UPDATE messageHeader SET bodyComplete=1 WHERE id IN (confirmed)`.
+    ///   6. Enqueue AI (inbox only) + embedding for confirmed items.
+    ///
+    /// On partial failure at any step, flags already set stay set and the rest
+    /// heal via `recoverIncompleteHeaders`, the body queue (`bodyComplete=0`
+    /// refetch), and drain-time self-repopulate.
+    fileprivate static func flushNSEBatchToFTS(
+        items: [(headerId: String, textContent: String)]
+    ) async {
+        guard !items.isEmpty else { return }
+
+        let headerIds = items.map(\.headerId)
+
+        // 1. Bulk read the headers.
+        let headersById: [String: MessageHeader]
+        do {
+            headersById = try await AppDatabase.dbPool.read { db in
+                let headers = try MessageHeader
+                    .filter(headerIds.contains(Column("id")))
+                    .fetchAll(db)
+                return Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0) })
+            }
+        } catch {
+            print("[NSEDataBridge] FTS batch: bulk header read failed: \(error) — next wake will recover")
+            return
+        }
+
+        // Filter to headers that actually exist (handle races where a header was
+        // deleted/moved between merge and flush).
+        let validItems = items.compactMap { item -> (headerId: String, textContent: String, header: MessageHeader)? in
+            guard let header = headersById[item.headerId] else { return nil }
+            return (item.headerId, item.textContent, header)
+        }
+        guard !validItems.isEmpty else { return }
+
+        // 2. Batch FTS header indexing. Idempotent — known IDs are skipped.
+        let records = validItems.map { item -> FTSHeaderRecord in
+            FTSHeaderRecord(
+                headerId: item.header.id,
+                messageId: item.header.messageId,
+                subject: item.header.subject,
+                from: "\(item.header.from) <\(item.header.fromAddress)>",
+                to: item.header.to,
+                cc: item.header.cc,
+                bcc: item.header.bcc,
+                dateMs: Int64(item.header.date.timeIntervalSince1970 * 1000),
+                folderId: item.header.folderId
+            )
+        }
+        do {
+            _ = try await SearchIndex.shared.indexHeaders(records)
+        } catch {
+            print("[NSEDataBridge] FTS batch: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
+            return
+        }
+
+        // 3. Batch flip headerComplete=1 for all indexed headers.
+        let indexedIds = validItems.map(\.headerId)
+        do {
+            try await AppDatabase.dbPool.write { db in
+                let placeholders = indexedIds.map { _ in "?" }.joined(separator: ",")
+                try db.execute(
+                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id IN (\(placeholders))",
+                    arguments: StatementArguments(indexedIds)
+                )
+            }
+        } catch {
+            print("[NSEDataBridge] FTS batch: headerComplete update failed: \(error)")
+            return
+        }
+
+        // 4. Batch FTS body write.
+        let ftsBodies = validItems.map { ($0.headerId, $0.textContent) }
+        let written: Set<String>
+        do {
+            written = try await SearchIndex.shared.updateBodies(ftsBodies)
+        } catch {
+            print("[NSEDataBridge] FTS batch: updateBodies failed: \(error) — body queue will retry")
+            return
+        }
+
+        let confirmedItems = validItems.filter { written.contains($0.headerId) }
+        guard !confirmedItems.isEmpty else {
+            print("[NSEDataBridge] FTS batch: no body writes confirmed (\(ftsBodies.count) attempted) — body queue will retry")
+            return
+        }
+
+        // 5. Batch flip bodyComplete=1 for confirmed writes.
+        let confirmedIds = confirmedItems.map(\.headerId)
+        do {
+            try await AppDatabase.dbPool.write { db in
+                let placeholders = confirmedIds.map { _ in "?" }.joined(separator: ",")
+                try db.execute(
+                    sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
+                    arguments: StatementArguments(confirmedIds)
+                )
+            }
+        } catch {
+            print("[NSEDataBridge] FTS batch: bodyComplete update failed: \(error)")
+            return
+        }
+
+        // 6. Enqueue downstream queues. `enqueue` dedups per-actor.
+        for item in confirmedItems {
+            if item.header.isInInbox {
+                await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.header.accountId)
+            }
+            await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
+        }
+
+        if confirmedItems.count > 1 {
+            print("[NSEDataBridge] FTS batch: wrote \(confirmedItems.count) headers + bodies in one pass")
+        }
+    }
+
+    /// When NSE delivered an active (reminder) notification, mark the same
+    /// reminder hash in ReachedOutStore so ProactiveNotifyService's dedup path
+    /// won't re-deliver a second notification for the same reminder.
+    ///
+    /// Must compute the hash the same way `ReminderBuilder` does — uses
+    /// `rfc822MessageId` when present, else falls back to the GRDB header id
+    /// (which `ReminderBuilder` passes as `uniqueId: msg.id`).
+    private static func markReachedOutIfNotified(
+        notified: Bool,
+        reminderContent: String?,
+        rfc822MessageId: String?,
+        headerId: String
+    ) {
+        guard notified,
+              let content = reminderContent,
+              !content.isEmpty else { return }
+        let hash = DisabledRemindersStore.hashReminder(
+            source: "message",
+            content: content,
+            uniqueId: headerId,
+            rfc822MessageId: rfc822MessageId
+        )
+        ReachedOutStore.markNotified(hash: hash)
+    }
+
+    // MARK: - Hoisted types and helpers (testable from TabMailTests)
+
+    /// One row from the NSE staging DB's `nse_processed_message` table.
+    ///
+    /// Hoisted to type-level (from its prior nested home inside
+    /// `mergeNSEStagingData`) so `TabMailTests` can construct it and drive
+    /// `insertNewHeaderFromStaging` end-to-end against an in-memory GRDB
+    /// instead of simulating the merge with duplicated inline SQL.
+    ///
+    /// Any change to this shape MUST also update:
+    ///   1. `NSEStagingDB.persistProcessedMessage` (writer, NSE target).
+    ///   2. `AppDatabase.createNSEStagingDBIfNeeded` (schema migration).
+    ///   3. The `Row.fetchAll` decoder inside `mergeNSEStagingData`.
+    struct StagedMessage: Equatable {
+        let id: String
+        let accountId: String
+        let accountEmail: String
+        /// Provider from the push payload (`gmail` / `outlook` / `imap_new_mail`).
+        /// Drives `filterUserLabels`'s per-provider behavior.
+        let provider: String
+        let messageId: String
+        let rfc822MessageId: String?
+        let threadId: String?
+        /// Provider-canonical folder path that NSE captured (Gmail: "INBOX";
+        /// Outlook/Graph: parentFolderId; IMAP: "INBOX"). Matches what
+        /// main-app sync uses so `MessageHeader.id` / `folderId` align.
+        let folderPath: String
+        let subject: String
+        let senderName: String
+        let senderEmail: String
+        let snippet: String
+        let date: Double?
+        // v4 (2026-04-19): full header — previously dropped, producing
+        // placeholder rows that violated CLAUDE.md Data Integrity Rule #1.
+        let to: String
+        let cc: String
+        let bcc: String
+        let replyTo: String?
+        let inReplyTo: String?
+        let references: [String]
+        let isRead: Bool
+        let isFlagged: Bool
+        let hasAttachments: Bool
+        /// IMAP-only: the `\Answered` / `$Forwarded` flags. Gmail/Graph
+        /// always stage false. Matches main-app sync's provider behavior.
+        let isReplied: Bool
+        let isForwarded: Bool
+        /// Raw provider-label list (Gmail labelIds / Outlook categories /
+        /// IMAP custom keywords). Filtered per-provider by `filterUserLabels`
+        /// before insertion as `MessageUserLabel` junction rows.
+        let providerLabels: [String]
+        let summaryBlurb: String?
+        let summaryTodos: String?
+        let actionTag: String?
+        let reminderDate: String?
+        let reminderTime: String?
+        let reminderContent: String?
+        let processedAt: Double
+        let aiCompleted: Bool
+        let notified: Bool
+        // v2: body persisted by NSE so merge can write MessageBody + FTS without re-fetch.
+        let htmlContent: String?
+        let textContent: String?
+        let attachmentsJSON: String?
+        let icsText: String?
+        let hasUnresolvedCIDs: Bool
+    }
+
+    /// Body of the "insert new MessageHeader from NSE staging" branch of
+    /// `mergeNSEStagingData`, extracted so tests can exercise it directly.
+    /// Runs inside an existing GRDB write transaction (`db`).
+    ///
+    /// Populates the new header with every field the staging row carries —
+    /// recipients, thread chain, flags, provider labels. No placeholder
+    /// values. On a collision with an existing row (sync raced ahead), the
+    /// INSERT is a no-op and the function returns `false`.
+    ///
+    /// Side effects on success:
+    ///   • MessageHeader INSERT OR IGNORE (all full-header fields).
+    ///   • `ThreadUtils.assignComputedThreadId` for subject-based threading
+    ///     fallback parity with sync.
+    ///   • `MessageBody` + FTS batching via `persistRenderedBodyFromStaging`
+    ///     (body is also staged in v2).
+    ///   • `MessageReference` junction rows for the references chain.
+    ///   • `MessageUserLabel` junction rows for `filterUserLabels`-filtered
+    ///     labels.
+    ///   • `ReachedOutStore.markNotified` if the NSE delivered an active
+    ///     reminder notification.
+    ///   • `pendingOperation` row for IMAP tag sync (via `queueSetTagPendingOp`).
+    ///   • `messageAICache` entry if AI completed.
+    ///
+    /// Returns `true` if the INSERT created a new row; `false` if sync raced
+    /// ahead and the INSERT OR IGNORE no-oped.
+    @discardableResult
+    static func insertNewHeaderFromStaging(
+        _ msg: StagedMessage,
+        db: GRDB.Database,
+        ftsBatch: inout [(headerId: String, textContent: String)]
+    ) throws -> Bool {
+        // CRITICAL: use the folderPath NSE captured from the provider
+        // (Gmail: "INBOX"; Outlook/Graph: parentFolderId; IMAP: "INBOX")
+        // — NOT a hardcoded "INBOX". Sync for Outlook constructs its
+        // header with folderPath=parentFolderId, so a hardcoded "INBOX"
+        // here produces a different MessageHeader.id and leaves two rows
+        // in GRDB. See historical bug 2b.
+        let folderId = MessageIdentity.folderId(
+            accountId: msg.accountId, folderPath: msg.folderPath
+        )
+        let msgDate = msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date()
+        var header = MessageHeader(
+            messageId: msg.messageId,
+            subject: msg.subject,
+            from: msg.senderName,
+            fromAddress: msg.senderEmail,
+            to: msg.to,
+            date: msgDate,
+            snippet: msg.snippet,
+            folderId: folderId,
+            accountId: msg.accountId,
+            folderPath: msg.folderPath,
+            isInInbox: true
+        )
+        header.rfc822MessageId = msg.rfc822MessageId
+        header.inReplyTo = msg.inReplyTo
+        header.referencesJSON = MessageHeader.encodeReferences(msg.references)
+        header.cc = msg.cc
+        header.bcc = msg.bcc
+        header.replyTo = msg.replyTo
+        header.isRead = msg.isRead
+        header.isFlagged = msg.isFlagged
+        header.hasAttachments = msg.hasAttachments
+        header.isReplied = msg.isReplied
+        header.isForwarded = msg.isForwarded
+        header.threadId = msg.threadId
+        // Subject-based thread-ID fallback parity with sync
+        // (SyncEngineFullSync computes this on insert). Without this, a
+        // pushed message sits in a singleton thread until sync materializes
+        // the row again.
+        try ThreadUtils.assignComputedThreadId(
+            to: &header, nativeThreadId: msg.threadId, db: db
+        )
+        header.notified = msg.notified
+        // headerComplete reflects "row exists in FTS". Stays false until
+        // `flushNSEBatchToFTS` indexes the FTS header row (and sets the flag).
+        // Inbox visibility does not depend on this flag — body queue's filter
+        // does, which is correct: we don't want body queue to refetch a body
+        // that NSE already rendered.
+        header.headerComplete = false
+
+        // Action tag (ADR-IOS-036): local-only. NSE writes its AI-computed
+        // value into MessageHeader; provider labels are not consulted.
+        if msg.aiCompleted {
+            header.summaryBlurb = msg.summaryBlurb
+            header.summaryTodos = msg.summaryTodos
+            header.reminderDate = msg.reminderDate
+            header.reminderTime = msg.reminderTime
+            header.reminderContent = msg.reminderContent
+        }
+        if let aiRaw = msg.actionTag, let aiTag = ActionTag(rawValue: aiRaw) {
+            header.actionTag = aiTag
+            header.tagSortOrder = aiTag.sortOrder
+        }
+        // INSERT OR IGNORE — if sync already created it, don't overwrite.
+        // Detect the no-op case so callers can skip the junction/body writes
+        // (which would still succeed but waste work).
+        let rowsBefore = try Int.fetchOne(
+            db, sql: "SELECT COUNT(*) FROM messageHeader WHERE id = ?",
+            arguments: [header.id]
+        ) ?? 0
+        try header.insert(db, onConflict: .ignore)
+        let rowsAfter = try Int.fetchOne(
+            db, sql: "SELECT COUNT(*) FROM messageHeader WHERE id = ?",
+            arguments: [header.id]
+        ) ?? 0
+        let didInsert = rowsAfter > rowsBefore
+
+        print("[NSEDataBridge] Created header for \(msg.messageId) from NSE staging (pre-sync), inserted=\(didInsert)")
+        markReachedOutIfNotified(
+            notified: msg.notified,
+            reminderContent: msg.reminderContent,
+            rfc822MessageId: msg.rfc822MessageId,
+            headerId: header.id
+        )
+
+        // Persist rendered body even on freshly-created headers.
+        let newHeaderId = try String.fetchOne(db, sql: """
+            SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?
+            """, arguments: [msg.accountId, msg.messageId]) ?? ""
+        if !newHeaderId.isEmpty {
+            try persistRenderedBodyFromStaging(
+                db: db, headerId: newHeaderId,
+                htmlContent: msg.htmlContent, textContent: msg.textContent,
+                attachmentsJSON: msg.attachmentsJSON, icsText: msg.icsText,
+                hasUnresolvedCIDs: msg.hasUnresolvedCIDs,
+                ftsBatch: &ftsBatch
+            )
+
+            // Thread-continuity junction — mirrors sync's insert path
+            // (SyncEngineFullSync.swift:654 etc). Without this, reply-chain
+            // walking + references-based thread detection miss the new
+            // message until sync re-runs.
+            var insertedHeader = header
+            insertedHeader.id = newHeaderId
+            try ThreadUtils.insertMessageReferences(for: insertedHeader, db: db)
+
+            // User-label junction — per-provider filter so system/tm_*
+            // labels don't pollute the Labels UI. See `filterUserLabels`
+            // for the per-provider contract. Gmail uses a main-GRDB
+            // userLabel lookup (Path A); IMAP uses UserLabelStore
+            // exclusions; Outlook stays empty (categories not surfaced
+            // as user labels yet — matches ExchangeProvider).
+            //
+            // For any id we keep, upsert a placeholder `UserLabel` row so
+            // the junction's foreign key holds (mirror of SyncEngineFullSync:
+            // 657-660). For Gmail the lookup already confirmed the row
+            // exists, so the upsert is a no-op; the upsert is still the
+            // safe path for IMAP where user labels can appear on new
+            // messages before the sync pass registers them.
+            let userLabelIds = try filterUserLabels(
+                provider: msg.provider, rawLabels: msg.providerLabels,
+                accountId: msg.accountId, db: db
+            )
+            for labelId in userLabelIds {
+                try UserLabel(
+                    id: labelId, accountId: msg.accountId,
+                    name: labelId, isSystem: false
+                ).insert(db, onConflict: .ignore)
+                try MessageUserLabel(messageId: newHeaderId, userLabelId: labelId)
+                    .insert(db, onConflict: .ignore)
+            }
+        }
+
+        // IMAP tag write + AI cache write are done by the caller (they're
+        // shared with the existing-header branch).
+        return didInsert
+    }
+}

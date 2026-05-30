@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+
+/// Shared ephemeral URLSession for all HTTP providers (Gmail, Exchange, backend calls).
+/// Ephemeral = no persistent connection cache, no cookies, no credential storage.
+/// When TCP connections die during iOS suspension, the session creates fresh sockets
+/// on the next request — no manual reset needed. Single instance avoids
+/// "Cannot allocate memory" from per-request session creation.
+let sharedEphemeralSession = URLSession(configuration: .ephemeral)
+
+/// Result of an HTTP request — success returns data, failure returns nil data + status code.
+struct HTTPRequestResult: Sendable {
+    let data: Data?
+    let statusCode: Int
+}
+
+/// Execute an HTTP request with Bearer token authentication.
+/// Shared by every REST provider (Gmail, Exchange, Google Calendar, Exchange Calendar, BackendClient).
+/// Handles URL construction, headers, Content-Type for JSON body, and optional error logging.
+func performHTTPRequest(
+    url urlString: String,
+    method: String,
+    body: Data?,
+    token: String,
+    extraHeaders: [String: String] = [:],
+    session: URLSession? = nil,
+    logLabel: String? = nil
+) async throws -> HTTPRequestResult {
+    let session = session ?? sharedEphemeralSession
+    guard let url = URL(string: urlString) else {
+        throw HTTPError.invalidURL(urlString)
+    }
+    var req = URLRequest(url: url)
+    req.httpMethod = method
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    // Timezone header — every shared API call carries this so prompts receive
+    // `client_timezone` variable automatically.
+    req.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-Client-Timezone")
+    for (key, value) in extraHeaders {
+        req.setValue(value, forHTTPHeaderField: key)
+    }
+    if let body {
+        req.httpBody = body
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    }
+
+    let (data, response) = try await session.data(for: req)
+    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+    if 200..<300 ~= statusCode {
+        return HTTPRequestResult(data: data, statusCode: statusCode)
+    }
+
+    if let logLabel, let errorBody = String(data: data, encoding: .utf8) {
+        print("[\(logLabel)] HTTP \(statusCode) \(method) \(url): \(errorBody.prefix(500))")
+    }
+
+    return HTTPRequestResult(data: nil, statusCode: statusCode)
+}
+
+/// Execute an HTTP request with automatic retry on rate-limiting status codes.
+/// Uses exponential backoff (initialDelay, 2×, 4×, ...) up to `maxAttempts` retries.
+/// Gmail uses `[429, 403]` (per-user rateLimitExceeded is 403); Graph uses `[429]`.
+func performHTTPRequestWithRetry(
+    url urlString: String,
+    method: String,
+    body: Data?,
+    token: String,
+    extraHeaders: [String: String] = [:],
+    retryableStatusCodes: Set<Int> = [429],
+    maxAttempts: Int = 3,
+    initialDelay: TimeInterval = 1.0,
+    session: URLSession? = nil,
+    logLabel: String? = nil
+) async throws -> HTTPRequestResult {
+    var result = try await performHTTPRequest(
+        url: urlString, method: method, body: body, token: token,
+        extraHeaders: extraHeaders, session: session, logLabel: logLabel
+    )
+
+    if result.data != nil || !retryableStatusCodes.contains(result.statusCode) {
+        return result
+    }
+
+    for attempt in 0..<maxAttempts {
+        let delay = initialDelay * Double(1 << attempt)
+        if let logLabel {
+            print("[\(logLabel)] Rate limited (\(result.statusCode)), retrying in \(delay)s (attempt \(attempt + 1)/\(maxAttempts))")
+        }
+        try await Task.sleep(for: .seconds(delay))
+        result = try await performHTTPRequest(
+            url: urlString, method: method, body: body, token: token,
+            extraHeaders: extraHeaders, session: session, logLabel: logLabel
+        )
+        if result.data != nil { return result }
+        if !retryableStatusCodes.contains(result.statusCode) { break }
+    }
+
+    return result
+}
+
+enum HTTPError: Error, Sendable {
+    case invalidURL(String)
+    case networkError(statusCode: Int)
+}
