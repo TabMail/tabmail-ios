@@ -72,15 +72,10 @@ enum BodyFetchProcessor {
             let fetchAttachment = buildAttachmentFetcher(
                 accountId: item.accountId, messageId: item.messageId, folderPath: item.folderPath
             )
-            let (renderedBody, hasUnresolvedICS) = await renderBody(
+            let (renderedBody, plainText, hasUnresolvedICS) = await renderBody(
                 headerId: item.headerId,
                 fullMessage: fullMessage,
                 fetchAttachment: fetchAttachment
-            )
-
-            let plainText = EmailFilter.extractPlainText(
-                htmlBody: renderedBody.htmlContent,
-                textBody: fullMessage.textBody
             )
 
             // Diagnostic: parser dropped raw content. If we got bytes from the
@@ -338,15 +333,10 @@ enum BodyFetchProcessor {
         let fetchAttachment = buildAttachmentFetcher(
             accountId: item.accountId, messageId: item.messageId, folderPath: item.folderPath
         )
-        let (renderedBody, hasUnresolvedICS) = await renderBody(
+        let (renderedBody, plainText, hasUnresolvedICS) = await renderBody(
             headerId: item.headerId,
             fullMessage: fullMessage,
             fetchAttachment: fetchAttachment
-        )
-
-        let plainText = EmailFilter.extractPlainText(
-            htmlBody: renderedBody.htmlContent,
-            textBody: fullMessage.textBody
         )
 
         let renderMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -393,7 +383,7 @@ enum BodyFetchProcessor {
         headerId: String,
         fullMessage: FullMessageInfo,
         fetchAttachment: (@Sendable (String, String?) async throws -> Data)? = nil
-    ) async -> (body: MessageBody, hasUnresolvedICS: Bool) {
+    ) async -> (body: MessageBody, plainText: String?, hasUnresolvedICS: Bool) {
         // Convert main-app FullMessageInfo → shared RawBodyIngredients.
         let sharedAttachments = fullMessage.attachments.map {
             AttachmentRef(
@@ -428,17 +418,20 @@ enum BodyFetchProcessor {
             inlineImageWriter: inlineImageWriter
         )
 
-        // Build MessageBody from the shared rendered output.
-        var body = MessageBody.create(
-            headerId: headerId,
-            htmlBody: rendered.htmlContent,
-            textBody: fullMessage.textBody
-        )
+        // `rendered.htmlContent` is already display-ready (BodyRenderer is the single
+        // conversion authority — plain-text bodies were converted to HTML there), so
+        // create() just stores it: no re-conversion, no double-escape. The canonical
+        // plain text for snippet/FTS is `rendered.textContent`, returned to the caller
+        // (NOT re-derived from htmlContent, which would round-trip plain→HTML→plain).
+        var body = MessageBody.create(headerId: headerId, htmlBody: rendered.htmlContent)
+        // Diagnostic (debug-gated, no-op in prod): flag if a double-escaped body ever
+        // reaches storage. Captured in body_render.log (DebugMenu › Logs).
+        BackgroundSyncLogger.diagnoseStoredBody(source: "BodyFetch", headerId: headerId, htmlContent: body.htmlContent)
         if !fullMessage.attachments.isEmpty {
             body.attachmentsJSON = String(data: (try? JSONEncoder().encode(fullMessage.attachments)) ?? Data(), encoding: .utf8)
         }
         body.icsText = rendered.icsText
-        return (body, rendered.hasUnresolvedICS)
+        return (body, rendered.textContent, rendered.hasUnresolvedICS)
     }
 
     // MARK: - Helpers

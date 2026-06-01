@@ -46,22 +46,21 @@ struct MessageBodyTests {
 
     @Test("create factory with HTML body")
     func createWithHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hello</p>", textBody: nil)
+        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hello</p>")
         #expect(body.id == "h1")
         #expect(body.htmlContent == "<p>Hello</p>")
     }
 
-    @Test("create factory with text body falls back to plainTextToHTML")
-    func createWithText() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: "Plain text")
-        #expect(body.id == "h1")
-        #expect(body.htmlContent != nil)
-        #expect(body.htmlContent!.contains("Plain text"))
+    @Test("plainTextToHTML converts plain text (conversion lives here / in BodyRenderer)")
+    func plainTextConversion() {
+        let html = MessageBody.plainTextToHTML("Plain text")
+        #expect(html.contains("Plain text"))
+        #expect(html.contains("white-space:pre-wrap"))
     }
 
-    @Test("create factory prefers HTML over text")
-    func createPrefersHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<b>Bold</b>", textBody: "Bold")
+    @Test("create factory stores html verbatim")
+    func createStoresHTML() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: "<b>Bold</b>")
         #expect(body.htmlContent == "<b>Bold</b>")
     }
 

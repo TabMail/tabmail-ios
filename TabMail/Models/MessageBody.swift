@@ -22,16 +22,17 @@ struct MessageBody: Codable, FetchableRecord, PersistableRecord, Identifiable, S
         self.fetchedAt = Date()
     }
 
-    /// Create a MessageBody, converting plain-text-only emails to basic HTML.
-    /// Use this when the provider returns textBody but no htmlBody.
-    static func create(headerId: String, htmlBody: String?, textBody: String?) -> MessageBody {
+    /// Build a MessageBody from already-rendered DISPLAY html. Body conversion —
+    /// including the single plain-text→HTML pass — is owned by `BodyRenderer` (the
+    /// single conversion authority), so this factory never re-converts. That
+    /// structurally removes the historic double-escape site (`plainTextToHTML`
+    /// applied to content that was already HTML). Pass the `RenderedBody.htmlContent`
+    /// produced by `BodyRenderer`.
+    static func create(headerId: String, htmlBody: String?) -> MessageBody {
         if let html = htmlBody, !html.isEmpty {
             return MessageBody(headerId: headerId, htmlContent: html)
-        } else if let text = textBody, !text.isEmpty {
-            return MessageBody(headerId: headerId, htmlContent: plainTextToHTML(text))
-        } else {
-            return MessageBody(headerId: headerId, htmlContent: nil)
         }
+        return MessageBody(headerId: headerId, htmlContent: nil)
     }
 
     /// Convert plain text email to HTML for WKWebView rendering.

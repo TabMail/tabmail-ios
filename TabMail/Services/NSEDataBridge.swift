@@ -953,7 +953,11 @@ enum NSEDataBridge {
         // Insert MessageBody ONLY for fully-resolved bodies. Unresolved-CID
         // bodies are dropped on the floor; main app re-fetches + re-renders.
         if !hasUnresolvedCIDs {
-            var body = MessageBody.create(headerId: headerId, htmlBody: htmlContent, textBody: textContent)
+            // `htmlContent` is the display-ready html the NSE's BodyRenderer produced
+            // (plain bodies already converted there) — store it as-is, no re-conversion.
+            var body = MessageBody.create(headerId: headerId, htmlBody: htmlContent)
+            // Diagnostic (debug-gated, no-op in prod): flag a double-escaped stored body.
+            BackgroundSyncLogger.diagnoseStoredBody(source: "NSEMerge", headerId: headerId, htmlContent: body.htmlContent)
             body.attachmentsJSON = attachmentsJSON
             body.icsText = icsText
             try body.insert(db, onConflict: .ignore)

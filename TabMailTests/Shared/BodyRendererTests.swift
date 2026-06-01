@@ -98,6 +98,165 @@ struct BodyRendererTests {
         #expect(r.hasUnresolvedCIDs == false)
     }
 
+    // MARK: - Display-HTML conversion (BodyRenderer is the single conversion authority)
+
+    @Test("plain-text-only body is converted to display HTML once (escaped + wrapped)")
+    func plainOnlyConvertedToHTML() async {
+        let ing = RawBodyIngredients(
+            rawHTML: nil, rawText: "A < B & C > D",
+            attachments: [], inlineImages: [], icsData: nil
+        )
+        let r = await BodyRenderer.render(ingredients: ing)
+        // htmlContent is display-ready: escaped exactly once + pre-wrap wrapper.
+        #expect(r.htmlContent?.contains("&lt;") == true)
+        #expect(r.htmlContent?.contains("&amp;") == true)
+        #expect(r.htmlContent?.contains("&gt;") == true)
+        #expect(r.htmlContent?.contains("white-space:pre-wrap") == true)
+        // No double-escape.
+        #expect(r.htmlContent?.contains("&amp;amp;") == false)
+        // textContent stays the raw plain text (for FTS/snippet), NOT html-derived.
+        #expect(r.textContent == "A < B & C > D")
+    }
+
+    @Test("HTML part present → htmlContent is the raw HTML, not re-converted")
+    func htmlPartUsedRaw() async {
+        let ing = RawBodyIngredients(
+            rawHTML: "<p>Tom &amp; Jerry &nbsp;hi</p>", rawText: "Tom & Jerry hi",
+            attachments: [], inlineImages: [], icsData: nil
+        )
+        let r = await BodyRenderer.render(ingredients: ing)
+        #expect(r.htmlContent == "<p>Tom &amp; Jerry &nbsp;hi</p>")
+        #expect(r.htmlContent?.contains("&amp;amp;") == false)
+    }
+
+    @Test("whitespace-only HTML part + real text/plain → display AND textContent come from text/plain")
+    func whitespaceOnlyHtmlFallsBackToPlain() async {
+        // A whitespace-only text/html alternative must NOT blank out snippet/FTS:
+        // textContent must come from the real text/plain sibling (the regression was
+        // extractPlainText stripping the whitespace html to "" and ignoring rawText).
+        let ing = RawBodyIngredients(
+            rawHTML: "   \n\t  ", rawText: "real content here",
+            attachments: [], inlineImages: [], icsData: nil
+        )
+        let r = await BodyRenderer.render(ingredients: ing)
+        #expect(r.htmlContent?.contains("real content here") == true)
+        #expect(r.htmlContent?.contains("white-space:pre-wrap") == true)
+        // The critical assertion: textContent is the real plain text, NOT empty.
+        #expect(r.textContent == "real content here")
+    }
+
+    @Test("ICS-only invite: inviteHtml is the display html and the source of textContent")
+    func icsOnlyInviteRendered() async {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Sync\nEND:VEVENT\nEND:VCALENDAR"
+        let ing = RawBodyIngredients(
+            rawHTML: nil, rawText: nil,
+            attachments: [AttachmentRef(filename: "invite.ics", contentType: "text/calendar", section: "2", size: 100, encoding: nil)],
+            inlineImages: [], icsData: ics.data(using: .utf8)
+        )
+        let r = await BodyRenderer.render(
+            ingredients: ing,
+            icsRenderer: { _ in "<div class=\"invite\">Meeting: Sync</div>" }
+        )
+        #expect(r.htmlContent == "<div class=\"invite\">Meeting: Sync</div>")
+        // textContent extracted from the synthetic invite html (for snippet) — not empty.
+        #expect(r.textContent?.contains("Meeting: Sync") == true)
+        #expect(r.icsText == ics)
+    }
+
+    @Test("plaintext containing code/tags is ESCAPED, never stored raw (no FP corruption)")
+    func plaintextWithCodeIsEscaped() async {
+        // The false-positive class the heuristic approach would corrupt: ordinary
+        // plaintext (code-review mail, git notifications) containing both `<X>` and a
+        // `</Y>`. It must be escaped + shown literally, NOT interpreted as HTML.
+        let cases = [
+            "Use Map<String,Int> and close </ul> tags",
+            "if a<b then write </div> at the end",
+            "compare vector<int> with the </footer> marker",
+        ]
+        for text in cases {
+            let ing = RawBodyIngredients(rawHTML: nil, rawText: text, attachments: [], inlineImages: [], icsData: nil)
+            let r = await BodyRenderer.render(ingredients: ing)
+            #expect(r.htmlContent?.contains("&lt;") == true)               // escaped
+            #expect(r.htmlContent?.contains("white-space:pre-wrap") == true)
+            #expect(r.htmlContent?.contains("<ul>") == false)              // not interpreted
+            #expect(r.htmlContent?.contains("</footer>") == false)
+        }
+    }
+
+    @Test("empty body → BOTH htmlContent and textContent nil")
+    func emptyBodyNilHtml() async {
+        let ing = RawBodyIngredients(rawHTML: nil, rawText: nil, attachments: [], inlineImages: [], icsData: nil)
+        let r = await BodyRenderer.render(ingredients: ing)
+        #expect(r.htmlContent == nil)
+        #expect(r.textContent == nil)
+    }
+
+    @Test("whitespace-only HTML with NO text → fully nil, never a space-only sentinel body")
+    func whitespaceOnlyHtmlNoText_yieldsNilNotSentinel() async {
+        // Guards the CLAUDE.md "never store body=\" \" sentinel" rule end-to-end:
+        // a whitespace-only html part with no text/plain must render to nil (→ the
+        // empty-fetch flag path), NOT a " " htmlContent that hasBody/bodyComplete
+        // would treat as real content and never re-fetch.
+        for ws in ["   ", "\n\t ", "\u{00A0}"] {  // ascii ws, tabs/newlines, non-breaking space
+            let ing = RawBodyIngredients(rawHTML: ws, rawText: nil, attachments: [], inlineImages: [], icsData: nil)
+            let r = await BodyRenderer.render(ingredients: ing)
+            #expect(r.htmlContent == nil)
+            #expect(r.textContent == nil)
+        }
+    }
+
+    @Test("plain-only textContent stays VERBATIM (not an HTML round-trip) — load-bearing for FTS/snippet")
+    func plainTextContentStaysVerbatim() async {
+        // textContent feeds snippet/FTS; for plain-only it must be the original bytes,
+        // not htmlToPlainText(plainTextToHTML(x)) which would collapse whitespace/unicode.
+        for text in [
+            "Line 1\n\nLine 2\twith tab",
+            "café résumé — naïve  (double space)",
+            "5 < 10 & x > 3 in code",
+        ] {
+            let ing = RawBodyIngredients(rawHTML: nil, rawText: text, attachments: [], inlineImages: [], icsData: nil)
+            let r = await BodyRenderer.render(ingredients: ing)
+            #expect(r.textContent == text)
+        }
+    }
+
+    @Test("render is idempotent for plain-text bodies (no UI/FTS churn from re-render)")
+    func renderIdempotentForPlainText() async {
+        // BodyRenderer now runs plainTextToHTML on every render (no storage-layer cache),
+        // so re-rendering the same message MUST be deterministic — otherwise htmlContent
+        // would differ between fetch and re-open, churning the body store / FTS / UI.
+        for text in [
+            "Hello\n\nWorld\twith tab",
+            "café — naïve  résumé",
+            "> quoted line\nreply text\n-- \nSig",
+            "5 < 10 & x > 3 </tag>",
+        ] {
+            let ing = RawBodyIngredients(rawHTML: nil, rawText: text, attachments: [], inlineImages: [], icsData: nil)
+            let r1 = await BodyRenderer.render(ingredients: ing)
+            let r2 = await BodyRenderer.render(ingredients: ing)
+            #expect(r1.htmlContent == r2.htmlContent)
+            #expect(r1.textContent == r2.textContent)
+            // And plainTextToHTML itself is idempotent input→output.
+            #expect(EmailFilter.plainTextToHTML(text) == EmailFilter.plainTextToHTML(text))
+        }
+    }
+
+    @Test("ICS renderer returning whitespace-only invite → no body stored (graceful, not blank-cached)")
+    func icsRendererWhitespaceYieldsNoBody() async {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nEND:VEVENT\nEND:VCALENDAR"
+        let ing = RawBodyIngredients(
+            rawHTML: nil, rawText: nil,
+            attachments: [AttachmentRef(filename: "x.ics", contentType: "text/calendar", section: "2", size: 10, encoding: nil)],
+            inlineImages: [], icsData: ics.data(using: .utf8)
+        )
+        let r = await BodyRenderer.render(ingredients: ing, icsRenderer: { _ in "   \n  " })
+        // Whitespace-only invite collapses to nil everywhere → no body to cache; the
+        // persist path skips it and the main app refetches. icsText is still captured.
+        #expect(r.htmlContent == nil)
+        #expect(r.textContent == nil)
+        #expect(r.icsText == ics)
+    }
+
     @Test("render extracts plain text from HTML when rawText is nil")
     func htmlToTextFallback() async {
         let ing = RawBodyIngredients(
@@ -328,8 +487,9 @@ struct BodyRendererTests {
             htmlBody: "<p>Body</p>", textBody: "Body",
             attachments: [], inlineImages: [], icsData: nil
         )
-        let (body, hasUnresolvedICS) = await BodyFetchProcessor.renderBody(headerId: "h1", fullMessage: full)
+        let (body, plainText, hasUnresolvedICS) = await BodyFetchProcessor.renderBody(headerId: "h1", fullMessage: full)
         #expect(body.htmlContent == "<p>Body</p>")
+        #expect(plainText == "Body")
         #expect(hasUnresolvedICS == false)
     }
 

@@ -128,17 +128,54 @@ enum BodyRenderer {
             }
             resolvedHtml = html
         }
+        // A whitespace-only HTML part counts as "no HTML part" EVERYWHERE — CID
+        // detection, plain-text extraction, AND display. Otherwise a real text/plain
+        // sibling is lost: `extractPlainText` prefers a non-empty htmlBody, so a
+        // whitespace-only `text/html` alternative (some mailing lists emit one) would
+        // strip to "" and blank out snippet/FTS even though the displayed body comes
+        // from the real text/plain. Collapsing to a single `effectiveHtml` keeps the
+        // html/text decision consistent across all three uses.
+        let effectiveHtml: String? = resolvedHtml.flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+
         // Ground truth: are there STILL cid: refs in the rendered HTML?
         // NSE path: empty inlineImages → any cid: ref stays → flagged true.
         // Main-app path: inlineImages supplied → most cid: refs resolved;
         //   if any leftover (e.g. image exceeded maxInlineImageBytes), also true.
-        let hasUnresolvedCIDs = resolvedHtml.map { containsCIDReference($0) } ?? false
+        let hasUnresolvedCIDs = effectiveHtml.map { containsCIDReference($0) } ?? false
 
         // 3. Plain text extraction — HTML wins when present (shared parser).
-        let textContent = EmailFilter.extractPlainText(htmlBody: resolvedHtml, textBody: ingredients.rawText)
+        let textContent = EmailFilter.extractPlainText(htmlBody: effectiveHtml, textBody: ingredients.rawText)
+
+        // 4. Final DISPLAY html — BodyRenderer is the SINGLE body-conversion authority.
+        //    When the message has an HTML part, use it. Otherwise convert the
+        //    plain-text body to HTML HERE (exactly once) so every consumer — main app
+        //    + NSE, all providers — receives a display-ready `htmlContent` and no
+        //    downstream layer (e.g. MessageBody.create) ever re-converts it. That
+        //    downstream re-conversion is what used to double-escape an HTML email
+        //    that arrived in a text/plain slot; centralizing the single plain→HTML
+        //    pass here removes that site entirely.
+        //
+        //    We deliberately do NOT try to guess whether a text/plain part "looks
+        //    like HTML" and store it raw: that heuristic corrupts ordinary plaintext
+        //    (code/notifications containing both `<X>` and `</Y>`). A genuinely
+        //    HTML-bearing message keeps its real HTML part present via the IMAP
+        //    dropped-part guard (IMAPProvider.fetchMessagesBatch) and the Gmail
+        //    attachment-body fetch (GmailAPI.messageFull) — so we never reach this
+        //    branch for a true HTML email. A message that truly has only text/plain
+        //    is plain text and is escaped exactly once (correct, and safe).
+        let displayHtml: String?
+        if let html = effectiveHtml {
+            displayHtml = html
+        } else if let text = ingredients.rawText, !text.isEmpty {
+            displayHtml = EmailFilter.plainTextToHTML(text)
+        } else {
+            displayHtml = nil
+        }
 
         return RenderedBody(
-            htmlContent: resolvedHtml,
+            htmlContent: displayHtml,
             textContent: textContent,
             attachments: ingredients.attachments,
             icsText: rawIcsText,

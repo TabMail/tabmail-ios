@@ -61,8 +61,8 @@ private func simulateFetchBody(
 
     let fullMessage = try await provider.fetchMessage(id: header.messageId, folder: header.folderPath)
 
-    // Determine HTML content using MessageBody.create logic
-    let body = MessageBody.create(headerId: header.id, htmlBody: fullMessage.htmlBody, textBody: fullMessage.textBody)
+    // Render via the real path (BodyRenderer owns plain-text→HTML conversion).
+    let (body, _, _) = await BodyFetchProcessor.renderBody(headerId: header.id, fullMessage: fullMessage)
     try await db.write { dbConn in try body.save(dbConn) }
 
     // Update snippet from body content

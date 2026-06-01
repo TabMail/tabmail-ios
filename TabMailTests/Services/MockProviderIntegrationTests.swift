@@ -308,12 +308,8 @@ struct FullMessageFetchDBTests {
 
         let result = try await mock.fetchMessage(id: "300", folder: "INBOX")
 
-        // Store body
-        var body = MessageBody.create(headerId: dbHeader.id, htmlBody: result.htmlBody, textBody: result.textBody)
-
-        // Store attachments JSON
-        let attachmentsData = try JSONEncoder().encode(result.attachments)
-        body.attachmentsJSON = String(data: attachmentsData, encoding: .utf8)
+        // Store body via the real render path (sets attachmentsJSON from the message).
+        let (body, _, _) = await BodyFetchProcessor.renderBody(headerId: dbHeader.id, fullMessage: result)
 
         let bodyToSave = body
         try await db.write { try bodyToSave.save($0) }
@@ -347,7 +343,7 @@ struct FullMessageFetchDBTests {
         await mock.setFetchMessageResult(fullMsg)
 
         let result = try await mock.fetchMessage(id: "301", folder: "INBOX")
-        let body = MessageBody.create(headerId: dbHeader.id, htmlBody: result.htmlBody, textBody: result.textBody)
+        let (body, _, _) = await BodyFetchProcessor.renderBody(headerId: dbHeader.id, fullMessage: result)
         try await db.write { try body.save($0) }
 
         let stored = try await db.read { try MessageBody.fetchOne($0, key: dbHeader.id) }
@@ -369,7 +365,7 @@ struct FullMessageFetchDBTests {
         await mock.setFetchMessageResult(fullMsg)
 
         let result = try await mock.fetchMessage(id: "302", folder: "INBOX")
-        let body = MessageBody.create(headerId: dbHeader.id, htmlBody: result.htmlBody, textBody: result.textBody)
+        let (body, _, _) = await BodyFetchProcessor.renderBody(headerId: dbHeader.id, fullMessage: result)
         try await db.write { try body.save($0) }
 
         let stored = try await db.read { try MessageBody.fetchOne($0, key: dbHeader.id) }
@@ -925,7 +921,7 @@ struct E2ESyncSimulationTests {
 
         // Step 4: Fetch body for first message
         let fullMsg = try await mock.fetchMessage(id: "m1", folder: "INBOX")
-        let body = MessageBody.create(headerId: "acc1:INBOX:m1", htmlBody: fullMsg.htmlBody, textBody: fullMsg.textBody)
+        let (body, _, _) = await BodyFetchProcessor.renderBody(headerId: "acc1:INBOX:m1", fullMessage: fullMsg)
         try await db.write { try body.save($0) }
 
         // Verify complete state

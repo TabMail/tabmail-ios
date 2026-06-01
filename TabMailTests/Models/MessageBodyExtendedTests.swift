@@ -130,62 +130,50 @@ struct PlainTextToHTMLExtendedTests {
 @Suite("MessageBody.create factory")
 struct MessageBodyCreateTests {
 
-    @Test("Prefers HTML over text")
-    func prefersHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>HTML</p>", textBody: "Plain text")
+    // `create` now just stores already-rendered DISPLAY html (BodyRenderer owns all
+    // conversion). It no longer takes a textBody or runs plainTextToHTML — see
+    // BodyRendererTests for the plain-text→HTML conversion coverage.
+
+    @Test("Stores the provided html verbatim")
+    func storesHTML() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>HTML</p>")
         #expect(body.htmlContent == "<p>HTML</p>")
     }
 
-    @Test("Converts text to HTML when no HTML body")
-    func convertsTextToHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: "Plain text")
-        #expect(body.htmlContent?.contains("Plain text") == true)
-        #expect(body.htmlContent?.contains("<div") == true)
-    }
-
-    @Test("Empty HTML falls back to text")
-    func emptyHTMLFallsBackToText() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "", textBody: "Fallback")
-        #expect(body.htmlContent?.contains("Fallback") == true)
-    }
-
-    @Test("Both nil results in nil htmlContent")
-    func bothNilResultsInNil() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: nil)
+    @Test("nil html → nil htmlContent")
+    func nilHTML() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: nil)
         #expect(body.htmlContent == nil)
     }
 
-    @Test("Both empty results in nil htmlContent")
-    func bothEmptyResultsInNil() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "", textBody: "")
+    @Test("empty html → nil htmlContent")
+    func emptyHTML() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: "")
         #expect(body.htmlContent == nil)
     }
 
     @Test("Sets headerId correctly")
     func setsHeaderId() {
-        let body = MessageBody.create(headerId: "custom-id-123", htmlBody: "<p>Hi</p>", textBody: nil)
+        let body = MessageBody.create(headerId: "custom-id-123", htmlBody: "<p>Hi</p>")
         #expect(body.id == "custom-id-123")
     }
 
     @Test("Sets fetchedAt to current time")
     func setsFetchedAt() {
         let before = Date()
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hi</p>", textBody: nil)
+        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hi</p>")
         #expect(body.fetchedAt >= before)
     }
 
-    @Test("Text body conversion wraps in pre-wrap div")
-    func textBodyWrapsInDiv() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: "Hello World")
-        #expect(body.htmlContent?.contains("white-space:pre-wrap") == true)
-    }
-
-    @Test("Text body with special characters escaped")
-    func textBodyEscapes() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: "A < B & C > D")
-        #expect(body.htmlContent?.contains("&lt;") == true)
-        #expect(body.htmlContent?.contains("&amp;") == true)
-        #expect(body.htmlContent?.contains("&gt;") == true)
+    @Test("Does NOT re-escape already-display html (no double-escape at storage)")
+    func doesNotReEscapeHTML() {
+        // Display html with correctly-encoded entities is stored verbatim — the
+        // factory must never run plainTextToHTML over it (that was the bug).
+        let html = "<p>Tom &amp; Jerry &nbsp;say hi</p>"
+        let body = MessageBody.create(headerId: "h1", htmlBody: html)
+        #expect(body.htmlContent == html)
+        #expect(body.htmlContent?.contains("&amp;amp;") == false)
+        #expect(body.htmlContent?.contains("&lt;p&gt;") == false)
     }
 }
 
@@ -305,13 +293,12 @@ struct MessageBodyDraftDisplayTests {
         #expect(html.contains("<div>John Doe</div>"))
     }
 
-    // MARK: - MessageBody.create for draft display
+    // MARK: - plain-text→HTML conversion (now via plainTextToHTML; BodyRenderer owns it for inbound bodies)
 
-    @Test("Text-only draft preserves newlines through create factory")
-    func textOnlyDraftPreservesNewlines() {
+    @Test("Text-only conversion preserves newlines")
+    func textOnlyConversionPreservesNewlines() {
         let text = "Hello\n\nWorld\nFoo"
-        let body = MessageBody.create(headerId: "draft1", htmlBody: nil, textBody: text)
-        let html = body.htmlContent!
+        let html = MessageBody.plainTextToHTML(text)
         #expect(html.contains("<div>Hello</div>"))
         #expect(html.contains("<div><br></div>"))
         #expect(html.contains("<div>World</div>"))
@@ -320,31 +307,20 @@ struct MessageBodyDraftDisplayTests {
 
     @Test("Raw text passed as htmlBody loses newlines — documents the pitfall")
     func rawTextAsHtmlBodyLosesNewlines() {
-        // If a provider accidentally puts plain text into htmlBody,
-        // newlines will be lost because HTML renders \n as whitespace.
-        // This test documents the pitfall — providers MUST set textBody
-        // for non-HTML content so plainTextToHTML conversion kicks in.
+        // If a provider accidentally puts plain text into htmlBody, newlines are
+        // lost because HTML renders \n as whitespace. Inbound bodies avoid this by
+        // going through BodyRenderer (which converts plain text via plainTextToHTML).
         let rawText = "Line 1\nLine 2\nLine 3"
-        let body = MessageBody.create(headerId: "draft1", htmlBody: rawText, textBody: rawText)
-        // htmlBody is preferred — used as-is without conversion
+        let body = MessageBody.create(headerId: "draft1", htmlBody: rawText)
         #expect(body.htmlContent == rawText)
-        // The raw text has \n which HTML will collapse — this is the pitfall
         #expect(body.htmlContent?.contains("<div>") == false)
     }
 
-    @Test("HTML draft body is used as-is without conversion")
-    func htmlDraftBodyUsedAsIs() {
+    @Test("HTML body is used as-is without conversion")
+    func htmlBodyUsedAsIs() {
         let htmlBody = "<div>Hello</div><div><br></div><div>World</div>"
-        let body = MessageBody.create(headerId: "draft1", htmlBody: htmlBody, textBody: "Hello\n\nWorld")
+        let body = MessageBody.create(headerId: "draft1", htmlBody: htmlBody)
         #expect(body.htmlContent == htmlBody)
-    }
-
-    @Test("Empty htmlBody falls through to text conversion for drafts")
-    func emptyHtmlFallsToText() {
-        let body = MessageBody.create(headerId: "draft1", htmlBody: "", textBody: "Line 1\nLine 2")
-        let html = body.htmlContent!
-        #expect(html.contains("<div>Line 1</div>"))
-        #expect(html.contains("<div>Line 2</div>"))
     }
 
     // MARK: - Whitespace-only content

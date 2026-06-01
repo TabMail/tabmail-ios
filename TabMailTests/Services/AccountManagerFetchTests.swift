@@ -16,28 +16,24 @@ struct AccountManagerFetchTests {
 
     // MARK: - MessageBody creation from FullMessageInfo
 
-    @Test("MessageBody.create prefers htmlBody over textBody")
-    func messageBodyCreatePrefersHtml() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hello</p>", textBody: "Hello")
+    // `create` stores already-rendered display html (BodyRenderer owns conversion).
+    // The plain-text→HTML fallback now lives in BodyRendererTests.
+
+    @Test("MessageBody.create stores the provided html")
+    func messageBodyCreateStoresHtml() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hello</p>")
         #expect(body.htmlContent == "<p>Hello</p>")
     }
 
-    @Test("MessageBody.create falls back to textBody when htmlBody is nil")
-    func messageBodyCreateFallsBackToText() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: "Hello world")
-        #expect(body.htmlContent != nil)
-        #expect(body.htmlContent?.contains("Hello world") == true)
-    }
-
-    @Test("MessageBody.create produces nil htmlContent when both are nil")
-    func messageBodyCreateNilWhenBothNil() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil, textBody: nil)
+    @Test("MessageBody.create produces nil htmlContent when html is nil")
+    func messageBodyCreateNilWhenNil() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: nil)
         #expect(body.htmlContent == nil)
     }
 
-    @Test("MessageBody.create produces nil htmlContent when both are empty")
-    func messageBodyCreateNilWhenBothEmpty() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "", textBody: "")
+    @Test("MessageBody.create produces nil htmlContent when html is empty")
+    func messageBodyCreateNilWhenEmpty() {
+        let body = MessageBody.create(headerId: "h1", htmlBody: "")
         #expect(body.htmlContent == nil)
     }
 
@@ -299,7 +295,7 @@ struct AccountManagerFetchTests {
 
         // Simulate fetchBody: fetch from provider then write
         let fetched = try await mock.fetchMessage(id: header.messageId, folder: header.folderPath)
-        let body = MessageBody.create(headerId: header.id, htmlBody: fetched.htmlBody, textBody: fetched.textBody)
+        let body = MessageBody.create(headerId: header.id, htmlBody: fetched.htmlBody)
         try await db.write { try body.save($0) }
 
         let stored = try await db.read { try MessageBody.fetchOne($0, key: header.id) }
@@ -341,7 +337,7 @@ struct AccountManagerFetchTests {
         await mock.setFetchMessageResult(fullMsg)
 
         let fetched = try await mock.fetchMessage(id: "200", folder: "INBOX")
-        let body = MessageBody.create(headerId: header.id, htmlBody: fetched.htmlBody, textBody: fetched.textBody)
+        let body = MessageBody.create(headerId: header.id, htmlBody: fetched.htmlBody)
         try await db.write { try body.save($0) }
 
         let stored = try await db.read { try MessageBody.fetchOne($0, key: header.id) }

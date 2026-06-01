@@ -163,13 +163,18 @@ struct IMAPFetchMappingTests {
         #expect(!text.contains("SOMETHING"))
     }
 
-    @Test("renderBody keeps text/plain verbatim when no HTML part exists")
-    func textOnlyKept() async {
+    @Test("renderBody converts text/plain to display HTML once; textContent stays verbatim")
+    func textOnlyConvertedToDisplayHTML() async {
+        // BodyRenderer is the single conversion authority: a text/plain-only message
+        // now yields display-ready htmlContent (escaped + wrapped) while textContent
+        // remains the verbatim plain text for snippet/FTS.
         let plain = "Just a plain email.\nMultiple lines."
         let msg = makeMessage(parts: [textPart(plain)])
         let rendered = await IMAPFetchMapping.renderBody(info: makeInfo(), message: msg)
 
-        #expect(rendered.htmlContent == nil)
+        #expect(rendered.htmlContent?.contains("white-space:pre-wrap") == true)
+        #expect(rendered.htmlContent?.contains("Just a plain email.") == true)
+        #expect(rendered.htmlContent?.contains("Multiple lines.") == true)
         #expect(rendered.textContent == plain)
     }
 
