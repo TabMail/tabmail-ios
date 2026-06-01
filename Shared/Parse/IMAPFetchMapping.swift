@@ -204,6 +204,45 @@ enum IMAPFetchMapping {
         )
     }
 
+    /// Section descriptions of the TOP-LEVEL `text/html` body parts in BODYSTRUCTURE
+    /// (`info.parts`) — those NOT nested inside an attached `message/rfc822`. Checks
+    /// structure only, mirroring the rfc822 section-prefix nesting rule used by
+    /// `renderBodyWithEmbeddedHeaders`.
+    static func topLevelHTMLSections(info: MessageInfo) -> [String] {
+        let rfc822Sections: [[Int]] = info.parts.compactMap {
+            $0.contentType.lowercased().hasPrefix("message/rfc822") ? $0.section.components : nil
+        }
+        return info.parts.compactMap { part in
+            guard part.contentType.lowercased().hasPrefix("text/html") else { return nil }
+            let comp = part.section.components
+            let nested = rfc822Sections.contains { rfc in
+                comp.count > rfc.count && Array(comp.prefix(rfc.count)) == rfc
+            }
+            return nested ? nil : part.section.description
+        }
+    }
+
+    /// True when BODYSTRUCTURE lists a top-level `text/html` body part. (Convenience
+    /// over `topLevelHTMLSections`.)
+    static func hasTopLevelHTMLBodyPart(info: MessageInfo) -> Bool {
+        return !topLevelHTMLSections(info: info).isEmpty
+    }
+
+    /// True when a top-level `text/html` section listed in BODYSTRUCTURE was NOT
+    /// returned by the pipelined part fetch (its section is absent from
+    /// `fetchedSections`) — i.e. the HTML content was silently DROPPED under NIO
+    /// buffer pressure. The batch fetch path throws on this so the message retries
+    /// rather than being cached as an HTML email rendered as plaintext.
+    ///
+    /// Crucially this distinguishes a true DROP (section absent) from a
+    /// GENUINELY-EMPTY top-level `text/html` part (section present but empty/
+    /// whitespace — some mailing-list systems emit one alongside a real
+    /// `text/plain`). The latter must NOT throw, or the batch would churn that
+    /// message forever; it renders as plain text and is cached normally.
+    static func hasDroppedTopLevelHTMLSection(info: MessageInfo, fetchedSections: Set<String>) -> Bool {
+        return topLevelHTMLSections(info: info).contains { !fetchedSections.contains($0) }
+    }
+
     /// Render a fetched `(info, message)` pair into our canonical
     /// `RenderedBody` via the shared `BodyRenderer` — the SAME pipeline
     /// `BodyFetchProcessor.renderBody` runs for main-app IMAP body

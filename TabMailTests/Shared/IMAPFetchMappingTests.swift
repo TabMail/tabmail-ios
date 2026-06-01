@@ -60,6 +60,157 @@ struct IMAPFetchMappingTests {
         )
     }
 
+    // MARK: - hasTopLevelHTMLBodyPart (batch dropped-html-part guard)
+
+    @Test("hasTopLevelHTMLBodyPart: true for a top-level text/html part")
+    func hasTopLevelHTMLPart() {
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "text/html; charset=utf-8"),
+        ]
+        #expect(IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("hasTopLevelHTMLBodyPart: false for a plain-text-only message")
+    func noHTMLPartForPlainOnly() {
+        var info = makeInfo()
+        info.parts = [MessagePart(sectionString: "1", contentType: "text/plain")]
+        #expect(!IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("hasTopLevelHTMLBodyPart: false when html exists ONLY inside an attached .eml")
+    func htmlOnlyNestedInRfc822IsNotTopLevel() {
+        // A plain-text message with an attached .eml whose body is HTML. The HTML
+        // is nested (section 2.1 under the rfc822 at 2), so it must NOT count as a
+        // top-level html body — otherwise we'd wrongly fail the batch for a
+        // legitimately-plaintext message that merely carries an HTML attachment.
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "message/rfc822"),
+            MessagePart(sectionString: "2.1", contentType: "text/html"),
+        ]
+        #expect(!IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("hasTopLevelHTMLBodyPart: true when both top-level AND nested html exist")
+    func topLevelHTMLAlongsideNestedEml() {
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/html"),
+            MessagePart(sectionString: "2", contentType: "message/rfc822"),
+            MessagePart(sectionString: "2.1", contentType: "text/html"),
+        ]
+        #expect(IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("hasTopLevelHTMLBodyPart: false for DEEPLY nested html inside an attached .eml")
+    func htmlDeeplyNestedInRfc822() {
+        // html at 2.1.1 nested under rfc822 at 2.1 (an .eml inside an .eml). Must not
+        // count as a top-level body.
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2.1", contentType: "message/rfc822"),
+            MessagePart(sectionString: "2.1.1", contentType: "text/html"),
+        ]
+        #expect(!IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("hasTopLevelHTMLBodyPart: false with MULTIPLE rfc822 parts, html only nested")
+    func htmlNestedAcrossMultipleRfc822() {
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "message/rfc822"),
+            MessagePart(sectionString: "2.1", contentType: "text/html"),
+            MessagePart(sectionString: "3", contentType: "message/rfc822"),
+            MessagePart(sectionString: "3.1", contentType: "text/html"),
+        ]
+        #expect(!IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("hasTopLevelHTMLBodyPart: true — section prefix is component-wise, not string")
+    func htmlSectionPrefixIsComponentWise() {
+        // rfc822 at [1]; html at [12] must NOT be considered nested under [1] (string
+        // prefix "1" of "12" would wrongly match — component-wise [1] vs [12] does not).
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "message/rfc822"),
+            MessagePart(sectionString: "12", contentType: "text/html"),
+        ]
+        #expect(IMAPFetchMapping.hasTopLevelHTMLBodyPart(info: info))
+    }
+
+    @Test("topLevelHTMLSections returns section ids of top-level html only")
+    func topLevelHTMLSectionsList() {
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "text/html"),
+            MessagePart(sectionString: "3", contentType: "message/rfc822"),
+            MessagePart(sectionString: "3.1", contentType: "text/html"),  // nested — excluded
+        ]
+        #expect(IMAPFetchMapping.topLevelHTMLSections(info: info) == ["2"])
+    }
+
+    // MARK: - hasDroppedTopLevelHTMLSection (true DROP vs genuinely-empty distinction)
+
+    @Test("hasDroppedTopLevelHTMLSection: TRUE when a top-level html section is ABSENT (dropped)")
+    func droppedHtmlSectionAbsent() {
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "text/html"),
+        ]
+        // Pipelined fetch returned only section 1 — section 2 (html) was dropped.
+        #expect(IMAPFetchMapping.hasDroppedTopLevelHTMLSection(info: info, fetchedSections: ["1"]))
+    }
+
+    @Test("hasDroppedTopLevelHTMLSection: FALSE when the html section is PRESENT (even if empty)")
+    func genuinelyEmptyHtmlNotDropped() {
+        // The D1 case: a genuinely-empty top-level text/html part. Its section DID come
+        // back (just empty), so it must NOT count as dropped — otherwise the batch would
+        // throw + churn this message forever. It should render as plaintext + cache.
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "text/html"),
+        ]
+        #expect(!IMAPFetchMapping.hasDroppedTopLevelHTMLSection(info: info, fetchedSections: ["1", "2"]))
+    }
+
+    @Test("hasDroppedTopLevelHTMLSection: TRUE if ANY of multiple top-level html sections is absent")
+    func droppedHtmlMultipleTopLevel() {
+        // Two top-level text/html parts; one section returned, one dropped → still a drop.
+        var info = makeInfo()
+        info.parts = [
+            MessagePart(sectionString: "1", contentType: "text/html"),
+            MessagePart(sectionString: "2", contentType: "text/html"),
+        ]
+        #expect(IMAPFetchMapping.hasDroppedTopLevelHTMLSection(info: info, fetchedSections: ["1"]))
+        // Both present → not a drop.
+        #expect(!IMAPFetchMapping.hasDroppedTopLevelHTMLSection(info: info, fetchedSections: ["1", "2"]))
+    }
+
+    @Test("hasDroppedTopLevelHTMLSection: FALSE for plain-only and for nested-only html")
+    func droppedHtmlNegatives() {
+        // Plain-only: no top-level html → never a drop.
+        var plain = makeInfo()
+        plain.parts = [MessagePart(sectionString: "1", contentType: "text/plain")]
+        #expect(!IMAPFetchMapping.hasDroppedTopLevelHTMLSection(info: plain, fetchedSections: ["1"]))
+
+        // html only nested inside an attached .eml → not top-level → not a drop even if absent.
+        var eml = makeInfo()
+        eml.parts = [
+            MessagePart(sectionString: "1", contentType: "text/plain"),
+            MessagePart(sectionString: "2", contentType: "message/rfc822"),
+            MessagePart(sectionString: "2.1", contentType: "text/html"),
+        ]
+        #expect(!IMAPFetchMapping.hasDroppedTopLevelHTMLSection(info: eml, fetchedSections: ["1", "2"]))
+    }
+
     // MARK: - messageIdString
 
     /// Sync's IMAPProvider uses UID as the canonical messageId. The NSE MUST

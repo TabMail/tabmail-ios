@@ -1026,6 +1026,31 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     failedCount += 1
                     continue
                 }
+                // Data-integrity guard (CLAUDE.md rule #1 — never cache unfetched content).
+                // A top-level text/html section listed in BODYSTRUCTURE was NOT returned
+                // by the pipelined fetch (its section is absent from `fetchedBySection`) —
+                // i.e. the HTML content was silently DROPPED under NIO buffer pressure.
+                // Rendering would fall back to the text/plain part — an HTML email FALSELY
+                // shown as plaintext — frozen by MessageBody.create's onConflict:.ignore
+                // until a manual pull-to-refresh. THROW so the body queue retries the batch
+                // on a fresh connection (same policy as PayloadTooLargeError). We must NOT
+                // omit the message from `results`: BackfillBodyQueue treats
+                // "missing from result" as confirmed-gone and can DELETE the header.
+                //
+                // We key on the section being ABSENT (a true drop), NOT on htmlBody being
+                // empty — a genuinely-empty top-level text/html part (section returned but
+                // empty/whitespace, as some mailing lists emit alongside a real text/plain)
+                // must render as plaintext and cache normally, else the batch would retry
+                // that message forever. Single-message fetch self-heals dropped parts.
+                if IMAPFetchMapping.hasDroppedTopLevelHTMLSection(
+                    info: entry.info, fetchedSections: Set(fetchedBySection.keys)
+                ) {
+                    print("[IMAP] fetchMessagesBatch: UID \(uidValue) — top-level text/html section dropped by pipelined fetch; failing batch for retry (not caching HTML as plaintext)")
+                    throw NSError(
+                        domain: "IMAPProvider.IncompleteBodyFetch", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "top-level text/html section dropped after pipelined fetch for UID \(uidValue)"]
+                    )
+                }
                 results[entry.id] = fullInfo
                 fetchedCount += 1
             }
