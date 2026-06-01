@@ -433,4 +433,77 @@ struct GmailParseTests {
         #expect(images[0].contentId == "case@h")
     }
 
+    // MARK: - bodyAttachmentId (large body parts returned as attachmentId)
+
+    @Test("bodyAttachmentId returns attachmentId for an attachment-only text/html body")
+    func bodyAttachmentIdHTML() {
+        // Gmail returns LARGE bodies as attachmentId, not inline data — so
+        // extractHTML (data-only) misses it and the NSE must fetch the attachment.
+        let json: [String: Any] = [
+            "payload": [
+                "parts": [
+                    ["mimeType": "text/plain", "body": ["data": base64URL("plain")]],
+                    ["mimeType": "text/html", "body": ["attachmentId": "att-html-1", "size": 2_000_000]],
+                ]
+            ]
+        ]
+        #expect(GmailParse.extractHTML(from: json) == nil)
+        #expect(GmailParse.bodyAttachmentId(from: json, wantedMime: "text/html") == "att-html-1")
+    }
+
+    @Test("bodyAttachmentId returns nil when the part is inline (data present)")
+    func bodyAttachmentIdInlineReturnsNil() {
+        // data present → use it; the attachmentId must be ignored.
+        let json: [String: Any] = [
+            "payload": [
+                "parts": [
+                    ["mimeType": "text/html",
+                     "body": ["data": base64URL("<p>hi</p>"), "attachmentId": "ignored"]],
+                ]
+            ]
+        ]
+        #expect(GmailParse.bodyAttachmentId(from: json, wantedMime: "text/html") == nil)
+        #expect(GmailParse.extractHTML(from: json) == "<p>hi</p>")
+    }
+
+    @Test("bodyAttachmentId returns nil when no matching part exists")
+    func bodyAttachmentIdAbsent() {
+        let json: [String: Any] = [
+            "payload": ["parts": [["mimeType": "text/plain", "body": ["data": base64URL("plain")]]]]
+        ]
+        #expect(GmailParse.bodyAttachmentId(from: json, wantedMime: "text/html") == nil)
+    }
+
+    @Test("bodyAttachmentId walks nested multipart")
+    func bodyAttachmentIdNested() {
+        let json: [String: Any] = [
+            "payload": [
+                "parts": [[
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        ["mimeType": "text/plain", "body": ["data": base64URL("plain")]],
+                        ["mimeType": "text/html", "body": ["attachmentId": "deep-html", "size": 3_000_000]],
+                    ]
+                ]]
+            ]
+        ]
+        #expect(GmailParse.bodyAttachmentId(from: json, wantedMime: "text/html") == "deep-html")
+    }
+
+    @Test("bodyAttachmentId returns nil for an empty attachmentId string")
+    func bodyAttachmentIdEmptyString() {
+        let json: [String: Any] = [
+            "payload": ["parts": [["mimeType": "text/html", "body": ["attachmentId": ""]]]]
+        ]
+        #expect(GmailParse.bodyAttachmentId(from: json, wantedMime: "text/html") == nil)
+    }
+
+    @Test("bodyAttachmentId resolves text/plain large body too")
+    func bodyAttachmentIdPlain() {
+        let json: [String: Any] = [
+            "payload": ["parts": [["mimeType": "text/plain", "body": ["attachmentId": "att-text-1"]]]]
+        ]
+        #expect(GmailParse.bodyAttachmentId(from: json, wantedMime: "text/plain") == "att-text-1")
+    }
+
 }

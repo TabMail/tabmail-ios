@@ -280,6 +280,36 @@ enum GmailParse {
         return nil
     }
 
+    /// Gmail attachment id for the FIRST part matching `wantedMime` whose body is
+    /// stored as an attachment (`body.attachmentId`, used by Gmail for large parts)
+    /// rather than inline `body.data`. Returns nil when the part is inline (data
+    /// present), absent, or has no attachment id.
+    ///
+    /// `extractHTML`/`extractTextPlain` (via `findPartBody`) only read inline
+    /// `body.data`, so a large `text/html` body comes back nil. NSE
+    /// `GmailAPI.messageFull` uses this to fetch the referenced bytes — matching
+    /// main-app `GmailProvider.extractBodyWithFallback` — so a large HTML email
+    /// isn't dropped and staged as plaintext on the push route.
+    static func bodyAttachmentId(from json: [String: Any], wantedMime: String) -> String? {
+        guard let payload = json["payload"] as? [String: Any] else { return nil }
+        return findPartAttachmentId(payload, wantedMime: wantedMime)
+    }
+
+    private static func findPartAttachmentId(_ part: [String: Any], wantedMime: String) -> String? {
+        if let mime = part["mimeType"] as? String, mime == wantedMime,
+           let body = part["body"] as? [String: Any],
+           (body["data"] as? String) == nil,
+           let attId = body["attachmentId"] as? String, !attId.isEmpty {
+            return attId
+        }
+        if let parts = part["parts"] as? [[String: Any]] {
+            for p in parts {
+                if let found = findPartAttachmentId(p, wantedMime: wantedMime) { return found }
+            }
+        }
+        return nil
+    }
+
     private static func walkParts(_ part: [String: Any], visit: ([String: Any]) -> Void) {
         visit(part)
         if let parts = part["parts"] as? [[String: Any]] {

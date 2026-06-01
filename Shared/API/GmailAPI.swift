@@ -103,9 +103,30 @@ enum GmailAPI {
         // `BodyRenderer.maxInlineImages`.
         let inlineImages = await fetchInlineImagesIfAny(http: http, messageId: id, json: json)
 
+        // Body parts. `extractHTML`/`extractTextPlain` read only inline `body.data`;
+        // Gmail returns LARGE parts as `body.attachmentId` instead. Fetch those —
+        // matching main-app `GmailProvider.extractBodyWithFallback` — so a large
+        // text/html body isn't dropped and the email staged as plaintext on the push
+        // route (the rare "HTML rendered as plaintext" divergence).
+        var rawHTML = GmailParse.extractHTML(from: json)
+        var rawText = GmailParse.extractTextPlain(from: json)
+        if rawHTML == nil, let attId = GmailParse.bodyAttachmentId(from: json, wantedMime: "text/html") {
+            // HTML is the display body — propagate on failure (caller returns nil →
+            // no degraded body staged → main app refetches). Never fall back to text.
+            let bytes = try await attachment(http: http, messageId: id, attachmentId: attId)
+            rawHTML = String(data: bytes, encoding: .utf8)
+        }
+        if rawText == nil, let attId = GmailParse.bodyAttachmentId(from: json, wantedMime: "text/plain") {
+            // Plain text is secondary (snippet/FTS) and BodyRenderer can derive it
+            // from the HTML, so a miss here is best-effort — don't fail the fetch.
+            if let bytes = try? await attachment(http: http, messageId: id, attachmentId: attId) {
+                rawText = String(data: bytes, encoding: .utf8)
+            }
+        }
+
         let ingredients = RawBodyIngredients(
-            rawHTML: GmailParse.extractHTML(from: json),
-            rawText: GmailParse.extractTextPlain(from: json),
+            rawHTML: rawHTML,
+            rawText: rawText,
             attachments: GmailParse.extractAttachmentRefs(from: json),
             inlineImages: inlineImages,
             icsData: nil
