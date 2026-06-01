@@ -100,6 +100,7 @@ struct DebugMenuView: View {
                 LogShareButton(title: "Backfill AI Refinement Logs", filename: "backfill_ai_logs.txt", readLog: { BackgroundSyncLogger.readBackfillAILog() }, clearLog: { BackgroundSyncLogger.clearBackfillAILog() })
                 LogShareButton(title: "Push Notification Logs", filename: "push_logs.txt", readLog: { BackgroundSyncLogger.readPushLog() }, clearLog: { BackgroundSyncLogger.clearPushLog() })
                 LogShareButton(title: "Inbox Logs", filename: "inbox_logs.txt", readLog: { BackgroundSyncLogger.readInboxLog() }, clearLog: { BackgroundSyncLogger.clearInboxLog() })
+                LogShareButton(title: "Body Render Logs", filename: "body_render_logs.txt", readLog: { BackgroundSyncLogger.readBodyRenderLog() }, clearLog: { BackgroundSyncLogger.clearBodyRenderLog() })
 
                 Button(role: .destructive) {
                     BackgroundSyncLogger.clearLog()
@@ -112,6 +113,7 @@ struct DebugMenuView: View {
                     BackgroundSyncLogger.clearBackfillAILog()
                     BackgroundSyncLogger.clearPushLog()
                     BackgroundSyncLogger.clearInboxLog()
+                    BackgroundSyncLogger.clearBodyRenderLog()
                 } label: {
                     Label("Clear All Logs", systemImage: "trash")
                 }

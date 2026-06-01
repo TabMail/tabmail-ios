@@ -328,4 +328,67 @@ enum BackgroundSyncLogger {
     static func clearInboxLog() {
         try? "".write(to: inboxFileURL, atomically: true, encoding: .utf8)
     }
+
+    // MARK: - Body Render / HTML double-escape Log
+
+    /// Dedicated diagnostic channel for the rare "HTML body shows literal `&amp;` /
+    /// `&nbsp;` / visible tags" bug. The symptom is `EmailFilter.plainTextToHTML`
+    /// escaping content that was ALREADY HTML. The clean fix makes `BodyRenderer`
+    /// the single conversion authority, so the storage factory no longer re-converts
+    /// — but we keep this channel to catch any double-escaped body that still reaches
+    /// storage (e.g. a sender that put HTML in a text/plain part with no html
+    /// alternative), via `diagnoseStoredBody`.
+    private static let bodyRenderFileName = "body_render.log"
+
+    private static var bodyRenderFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TabMail", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(bodyRenderFileName)
+    }
+
+    /// Append a body-render diagnostic line. Only writes when debug mode is
+    /// unlocked by an allowed user (CLAUDE.md rule 12). Prefer `diagnoseStoredBody`
+    /// at call sites — it gates on the dangerous condition before formatting.
+    static func logBodyRender(_ message: String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let entry = "[\(Date().iso8601String())] \(message)\n"
+        print("[BodyRenderLog] \(message)")
+        appendAsync(to: bodyRenderFileURL, entry: entry)
+    }
+
+    static func readBodyRenderLog() -> String {
+        flushPendingWrites()
+        return (try? String(contentsOf: bodyRenderFileURL, encoding: .utf8)) ?? "(no body render log)"
+    }
+
+    static func clearBodyRenderLog() {
+        try? "".write(to: bodyRenderFileURL, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - Body double-escape detector (pure / ungated — unit-testable)
+
+    /// True when `html` is ALREADY double-escaped — it contains `&amp;amp;`,
+    /// `&amp;lt;`, `&amp;nbsp;`, etc. These sequences essentially never occur in
+    /// legitimate HTML, so a hit means a `plainTextToHTML`/`escapeHTML` pass ran over
+    /// content that was already HTML — the exact "literal `&amp;`/`&nbsp;`/visible
+    /// tags" symptom.
+    static func htmlLooksDoubleEscaped(_ html: String) -> Bool {
+        return html.contains("&amp;amp;") || html.contains("&amp;lt;")
+            || html.contains("&amp;gt;") || html.contains("&amp;nbsp;")
+            || html.contains("&amp;quot;") || html.contains("&amp;#")
+    }
+
+    /// Inspect a body about to be STORED and log to `body_render.log` only if it is
+    /// already double-escaped. Path-agnostic — catches the bug no matter which route
+    /// produced the body. Debug-mode-gated; a no-op (allocates nothing) in production
+    /// / when locked.
+    static func diagnoseStoredBody(source: String, headerId: String, htmlContent: String?) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        guard let html = htmlContent, htmlLooksDoubleEscaped(html) else { return }
+        logBodyRender(
+            "⚠️ DOUBLE-ESCAPE in stored body [\(source)] headerId=\(headerId.prefix(48)) "
+            + "htmlLen=\(html.count) htmlHead=\(String(html.prefix(200)).debugDescription)"
+        )
+    }
 }

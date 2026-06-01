@@ -60,4 +60,26 @@ struct BackgroundSyncLoggerTests {
         let log = BackgroundSyncLogger.readErrorLog()
         _ = log // no crash = pass
     }
+
+    // MARK: - Body double-escape detector
+
+    @Test("htmlLooksDoubleEscaped flags doubly-escaped entities only")
+    func bodyHtmlDoubleEscapeDetection() {
+        // Correct HTML — must NOT flag (a single layer of &amp;/&nbsp; is normal).
+        #expect(!BackgroundSyncLogger.htmlLooksDoubleEscaped("<p>Tom &amp; Jerry &nbsp;</p>"))
+        #expect(!BackgroundSyncLogger.htmlLooksDoubleEscaped("<div>plain content</div>"))
+        // Doubly-escaped — the stored-body symptom.
+        #expect(BackgroundSyncLogger.htmlLooksDoubleEscaped("Tom &amp;amp; Jerry"))
+        #expect(BackgroundSyncLogger.htmlLooksDoubleEscaped("&amp;lt;div&amp;gt;"))
+        #expect(BackgroundSyncLogger.htmlLooksDoubleEscaped("space&amp;nbsp;here"))
+    }
+
+    @Test("Body render log read/clear never crashes")
+    func bodyRenderLogRoundTrip() {
+        // logBodyRender is debug-gated (no-op when locked), so we don't assert a
+        // write round-trip here — only that read/clear are crash-safe and return a String.
+        BackgroundSyncLogger.clearBodyRenderLog()
+        let log = BackgroundSyncLogger.readBodyRenderLog()
+        _ = log // no crash = pass
+    }
 }
