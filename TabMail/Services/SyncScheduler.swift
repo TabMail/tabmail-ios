@@ -387,6 +387,11 @@ final class SyncScheduler {
                 // Re-subscribe push on foreground return.
                 // subscribeAllAccounts() calls registerDeviceWithWorker() internally at the end,
                 // so no separate registerDeviceWithWorker() call needed here.
+                // This also keeps the nse-vs-silent registration in sync with iOS
+                // notification settings: subscribeAccount reads visualAlertsEnabled()
+                // live, and settings can only change while the app is backgrounded,
+                // so this foreground resub always re-registers with the current
+                // capability (worker upserts idempotently). See PLAN_NSE_ENHANCE §3.3.
                 await PushNotificationService.shared.subscribeAllAccounts()
                 // Non-interactive check: does the push worker have a pending
                 // classification error for any of our Gmail/Outlook accounts?

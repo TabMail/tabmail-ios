@@ -34,6 +34,7 @@ struct MailNavigationView: View {
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.hasTabMailSession) private var hasTabMailSession
+    @Environment(\.scenePhase) private var scenePhase
     var initialSelection: MailboxSelection? = .unified(.inbox)
     @State private var showSignInSheet = false
     /// Mirror of `AISubscriptionGate.shared.isActive`. `@Observable` tracking is
@@ -61,6 +62,16 @@ struct MailNavigationView: View {
     /// network is warm. See `PushNotificationService.checkPushConsentStatusForForeground`
     /// for the matching first-scan-safety logic on the service side.
     @State private var hasCompletedFirstConsentScan = false
+    /// True when the in-app push toggle is ON but iOS has no visual surface
+    /// enabled (Banners / Lock Screen / Notification Center all off), so
+    /// notifications can't present and the NSE can't run. Drives the "Turn On
+    /// Alerts" hint. Local check (reads `UNUserNotificationCenter`), independent
+    /// of the network-gated consent scan.
+    @State private var visualAlertsHintVisible = false
+    /// Gates the hint until `visualAlertsEnabled()` has returned at least once,
+    /// so it doesn't flash before the async settings read resolves. Mirrors the
+    /// `hasCompletedFirstConsentScan` boot-flash guard above.
+    @State private var hasCheckedVisualAlerts = false
     /// Serializes the re-consent sheet. Prevents double-taps from stacking
     /// multiple `ASWebAuthenticationSession` presentations.
     @State private var isFixingPushConsent = false
@@ -281,6 +292,16 @@ struct MailNavigationView: View {
                                 HStack {
                                     Label("Email Accounts", systemImage: "at")
                                     Spacer()
+                                    // Visual-alerts warning — push is ON but iOS
+                                    // has no visual surface enabled, so the NSE
+                                    // can't run. Trailing marker (before the
+                                    // chevron); the full warning + fix lives in
+                                    // Email Accounts settings.
+                                    if hasCheckedVisualAlerts && visualAlertsHintVisible {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.orange)
+                                            .font(.caption)
+                                    }
                                     if UserDefaults.standard.bool(forKey: "isLargeInbox") {
                                         Image(systemName: "exclamationmark.circle.fill")
                                             .foregroundStyle(.orange)
@@ -518,6 +539,20 @@ struct MailNavigationView: View {
             // the onReceive above populates the banner state.
             await PushNotificationService.shared.checkPushConsentStatusForForeground()
         }
+        // Separate task so the (local, fast) hint check is NOT blocked behind
+        // the network-gated consent scan above. See PLAN_NSE_ENHANCE §3.4.
+        .task { await refreshVisualAlertsHint() }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Returning from iOS Settings (where the user may have just toggled
+            // Banners / Lock Screen / Notification Center) comes back through
+            // scenePhase `.active`. Re-check so the Email Accounts warning icon
+            // reflects the current settings. Local + non-blocking. (The
+            // silent↔nse re-registration rides the foreground resub in
+            // SyncScheduler.startForegroundPolling — see PLAN_NSE_ENHANCE §3.3.)
+            if newPhase == .active {
+                Task { await refreshVisualAlertsHint() }
+            }
+        }
         .onChange(of: navigationStore.accounts.isEmpty) { _, isEmpty in
             // Sign-out (or last-account-removed) path: clear banner state.
             // Without this, a pending consent-error from before sign-out
@@ -562,6 +597,26 @@ struct MailNavigationView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Notification visibility hint
+
+    /// Refresh the visual-alerts warning state from the live iOS notification
+    /// settings. `visualAlertsHintVisible` is true when the in-app push toggle
+    /// is ON but no visual surface is enabled (so notifications can't present /
+    /// the NSE can't run) — it drives the warning icon on the Email Accounts
+    /// row. Local + cheap — safe to call on appear and on every foreground.
+    @MainActor
+    private func refreshVisualAlertsHint() async {
+        let toggleOn = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
+        guard toggleOn else {
+            visualAlertsHintVisible = false
+            hasCheckedVisualAlerts = true
+            return
+        }
+        let visualOn = await PushNotificationService.shared.visualAlertsEnabled()
+        visualAlertsHintVisible = !visualOn
+        hasCheckedVisualAlerts = true
     }
 
     // MARK: - Deep Link

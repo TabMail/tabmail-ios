@@ -37,8 +37,21 @@ actor PushNotificationService {
     func _resetConsentScanStateForTesting() {
         self.hasSucceededConsentScanOnce = false
     }
+
+    /// Test-only override for the iOS notification-settings read backing
+    /// `visualAlertsEnabled()`. When nil, the live `UNUserNotificationCenter`
+    /// is used. Lets tests drive the visible-vs-silent decision without a real
+    /// notification center (whose settings can't be set from a test).
+    private var settingsProviderOverride: (any NotificationSettingsProviding)?
+    private var settingsProvider: any NotificationSettingsProviding {
+        settingsProviderOverride ?? SystemNotificationSettingsProvider.shared
+    }
+    func _setNotificationSettingsProviderForTesting(_ provider: (any NotificationSettingsProviding)?) {
+        self.settingsProviderOverride = provider
+    }
     #else
     private var consentChecker: any PushConsentChecking { pushClient }
+    private var settingsProvider: any NotificationSettingsProviding { SystemNotificationSettingsProvider.shared }
     #endif
 
     /// Set to true after the first foreground consent-status scan that produced
@@ -250,11 +263,25 @@ actor PushNotificationService {
             if let deviceToken = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
                let deviceId = UserDefaults.standard.string(forKey: PushConfig.deviceIdKey) {
                 let nseEnabled = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
+                // Visible (nse) push needs a VISUAL surface enabled in iOS
+                // settings (Lock Screen / Notification Center / Banner) —
+                // otherwise iOS won't present it and won't run the NSE. When the
+                // in-app toggle is on but no visual surface is enabled, register
+                // SILENT (do NOT skip) so the app still wakes to sync + badge.
+                //
+                // Read LIVE here (no cached capability): iOS notification
+                // settings can only change in the Settings app, which requires
+                // backgrounding TabMail — so the foreground re-subscribe
+                // (`SyncScheduler.startForegroundPolling` → `subscribeAllAccounts`)
+                // always re-runs this with the current value after any change,
+                // and the worker upserts idempotently. No separate reconcile /
+                // stored-state needed. See PLAN_NSE_ENHANCE §3.2/§3.3.
+                let visualOn = await visualAlertsEnabled()
                 // iCloud routes through the IMAP IDLE proxy (app-password IMAP) —
                 // the droplet emits /imap-new-mail tagged provider="imap", so the
                 // device registration must match to receive visible push.
                 let providerTag = (account.provider == .icloud) ? "imap" : account.provider.rawValue
-                let nseCapable = nseEnabled && NSEProviderSupport.isReady(providerTag)
+                let nseCapable = nseEnabled && NSEProviderSupport.isReady(providerTag) && visualOn
                 do {
                     try await pushClient.registerDeviceAccount(
                         deviceToken: deviceToken,
@@ -326,6 +353,27 @@ actor PushNotificationService {
         }
 
         await registerDeviceWithWorker()
+    }
+
+    // MARK: - Notification visibility (presentation gate)
+
+    /// Whether iOS will present a notification on a VISUAL surface (Lock Screen,
+    /// Notification Center, or Banner). This is the NSE presentation gate — if no
+    /// visual surface is enabled, iOS won't run the NSE, so we must register
+    /// silent rather than visible.
+    ///
+    /// - Sound and Badge do NOT count: a sound/badge-only notification "cannot be
+    ///   modified", so the NSE is skipped.
+    /// - `.provisional` authorization DOES count: provisional notifications
+    ///   deliver quietly to Notification Center (a visual surface), so the NSE
+    ///   can still run.
+    func visualAlertsEnabled() async -> Bool {
+        let s = await settingsProvider.currentVisibility()
+        let authed = s.authorizationStatus == .authorized || s.authorizationStatus == .provisional
+        let visual = s.lockScreenSetting == .enabled
+            || s.notificationCenterSetting == .enabled
+            || s.alertSetting == .enabled
+        return authed && visual
     }
 
     // MARK: - Gmail Push-Consent (server-side inbox-add classifier)
@@ -931,5 +979,39 @@ actor PushNotificationService {
         }
 
         return .newData
+    }
+}
+
+// MARK: - Notification settings seam (test-injectable)
+
+/// Snapshot of the presentation-relevant notification settings. Abstracted from
+/// `UNNotificationSettings` (which has no public initializer) so the
+/// visible-vs-silent decision in `PushNotificationService.visualAlertsEnabled`
+/// is unit-testable without a real `UNUserNotificationCenter`.
+struct NotificationVisibilitySnapshot: Sendable {
+    let authorizationStatus: UNAuthorizationStatus
+    let alertSetting: UNNotificationSetting
+    let lockScreenSetting: UNNotificationSetting
+    let notificationCenterSetting: UNNotificationSetting
+}
+
+/// Narrow seam consumed by `PushNotificationService.visualAlertsEnabled`. The
+/// production conformance reads the live system settings; tests inject a mock
+/// via `_setNotificationSettingsProviderForTesting` (DEBUG-only).
+protocol NotificationSettingsProviding: Sendable {
+    func currentVisibility() async -> NotificationVisibilitySnapshot
+}
+
+/// Production provider — reads the live settings from `UNUserNotificationCenter`.
+struct SystemNotificationSettingsProvider: NotificationSettingsProviding {
+    static let shared = SystemNotificationSettingsProvider()
+    func currentVisibility() async -> NotificationVisibilitySnapshot {
+        let s = await UNUserNotificationCenter.current().notificationSettings()
+        return NotificationVisibilitySnapshot(
+            authorizationStatus: s.authorizationStatus,
+            alertSetting: s.alertSetting,
+            lockScreenSetting: s.lockScreenSetting,
+            notificationCenterSetting: s.notificationCenterSetting
+        )
     }
 }

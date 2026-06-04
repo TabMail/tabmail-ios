@@ -4,9 +4,11 @@
 
 import SwiftUI
 import GRDB
+import UIKit
 
 struct SettingsView: View {
     @Environment(NavigationStore.self) private var navigationStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var accountToDelete: Account?
     @AppStorage(SyncScheduler.wifiOnlyKey) private var backgroundSyncWiFiOnly = true
     @AppStorage("isLargeInbox") private var isLargeInbox = false
@@ -21,6 +23,13 @@ struct SettingsView: View {
     /// only re-read on explicit view invalidation.
     @AppStorage(PushConfig.pushNotificationsEnabledKey) private var pushEnabled: Bool = false
     @State private var showingPushEnableConfirm: Bool = false
+    /// True when iOS has no visual surface enabled (Banners / Lock Screen /
+    /// Notification Center) — visible push can't present and the NSE can't run.
+    /// Drives the warning shown under the push toggle. Local check; see
+    /// `refreshVisualAlertsWarning`. `hasCheckedVisualAlerts` gates the first
+    /// render so the warning doesn't flash before the async read resolves.
+    @State private var visualAlertsOff = false
+    @State private var hasCheckedVisualAlerts = false
     @State private var showFastSync = false
     @State private var showArchiveConfirm = false
     @State private var showArchiveFinalConfirm = false
@@ -157,6 +166,36 @@ struct SettingsView: View {
                     } message: {
                         Text("To enable smart push notifications, you need to grant access to email metadata (not bodies) to our servers. The token is stored encrypted.")
                     }
+
+                // Visual-alerts warning — push is ON but iOS won't present new
+                // mail because no visual surface (Banners / Lock Screen /
+                // Notification Center) is enabled, so the NSE can't run. Shown
+                // directly under the toggle; tap deep-links to the notification
+                // settings page. Local check (see refreshVisualAlertsWarning).
+                if pushEnabled && hasCheckedVisualAlerts && visualAlertsOff {
+                    Button {
+                        if let url = URL(string: UIApplication.openNotificationSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Alerts are turned off in iOS Settings")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Palette.textColor)
+                                Text("New email won't appear immediately because Banners, Lock Screen, and Notification Center are all off for TabMail. Turn on at least one — sound or badge alone isn't enough.")
+                                    .font(.footnote)
+                                    .foregroundStyle(Palette.textMuted)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Palette.textMuted)
+                        }
+                    }
+                }
 
                 Text("When enabled, new emails will be delivered immediately as push notifications — TabMail will still analyze and deliver non-important emails passively in your notification center and only buzz you for the important ones.")
                     .font(.footnote)
@@ -329,6 +368,16 @@ struct SettingsView: View {
         .scrollContentBackground(.hidden)
         .background(Palette.previewPaneBg)
         .navigationTitle("Email Accounts")
+        .task { await refreshVisualAlertsWarning() }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Returning from the deep-linked iOS Settings may have enabled a
+            // visual surface — re-check so the warning clears.
+            if newPhase == .active { Task { await refreshVisualAlertsWarning() } }
+        }
+        .onChange(of: pushEnabled) { _, _ in
+            // Toggling push on/off changes whether the warning is relevant.
+            Task { await refreshVisualAlertsWarning() }
+        }
         .alert("Remove Account", isPresented: Binding(
             get: { accountToDelete != nil },
             set: { if !$0 { accountToDelete = nil } }
@@ -412,6 +461,16 @@ struct SettingsView: View {
                     .scaleEffect(1.5)
             }
         }
+    }
+
+    /// Refresh the visual-alerts warning shown under the push toggle. True when
+    /// iOS has no visual surface enabled (Banners / Lock Screen / Notification
+    /// Center) — so visible push can't present and the NSE can't run. Local read.
+    @MainActor
+    private func refreshVisualAlertsWarning() async {
+        let visualOn = await PushNotificationService.shared.visualAlertsEnabled()
+        visualAlertsOff = !visualOn
+        hasCheckedVisualAlerts = true
     }
 
     private func wipeAttachments() async {
