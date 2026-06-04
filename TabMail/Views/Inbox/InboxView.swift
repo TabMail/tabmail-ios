@@ -168,13 +168,20 @@ struct InboxView: View {
                 if isInboxView {
                     TipView(archiveOldEmailsTip)
                         .padding(.horizontal)
-                    TipView(enableInboxPushTip) { action in
-                        if action.id == EnableInboxPushTip.openSettingsActionId {
-                            enableInboxPushTip.invalidate(reason: .actionPerformed)
-                            NotificationCenter.default.post(name: .navigateToSettings, object: nil)
+                    // Inbox push is a real-account feature with no meaning in
+                    // demo mode (no real push registration). Suppress the tip
+                    // there — otherwise it shows over the demo inbox AND burns
+                    // its single MaxDisplayCount(1) before the user ever has a
+                    // real inbox where the tip is actionable.
+                    if !DemoModeStore.shared.isActive {
+                        TipView(enableInboxPushTip) { action in
+                            if action.id == EnableInboxPushTip.openSettingsActionId {
+                                enableInboxPushTip.invalidate(reason: .actionPerformed)
+                                NotificationCenter.default.post(name: .navigateToSettings, object: nil)
+                            }
                         }
+                        .padding(.horizontal)
                     }
-                    .padding(.horizontal)
                 }
 
                 Group {
