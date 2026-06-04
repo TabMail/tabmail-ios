@@ -202,10 +202,15 @@ final class InboxViewModel {
                 BackgroundSyncLogger.logInbox("[\(tag)] resolveFoldersFromDB \(ms)ms")
             }
         }
+        // Demo scope: a unified mailbox aggregates folders by role across ALL
+        // accounts, so without this it would surface the live user's inbox while
+        // demo mode is active. `.folder` selections need no scope — the user can
+        // only select a demo folder while demo is active (the sidebar is filtered).
+        let demoActive = DemoModeStore.shared.isActive
         switch selection {
         case .unified(let role):
             return (try? dbPool.read { db in
-                try Folder.filter(Column("role") == role.rawValue).fetchAll(db)
+                try Folder.filter(Column("role") == role.rawValue && Folder.demoScope(demoActive: demoActive)).fetchAll(db)
             }) ?? []
         case .folder(let folder):
             return (try? dbPool.read { db in
@@ -285,11 +290,16 @@ final class InboxViewModel {
     /// GRDB's reader pool) — cheap on a 5–50 row table.
     private func startFolderObservation() {
         let selection = self.selection
+        // Snapshot the demo flag for the observation's lifetime. The VM (and thus
+        // this observation) is recreated when routing flips between the demo and
+        // real branches, so the snapshot always matches the current mode. Keeps the
+        // unified mailbox from aggregating the live user's folders during demo.
+        let demoActive = DemoModeStore.shared.isActive
         let observation = ValueObservation.tracking { db -> [Folder] in
             switch selection {
             case .unified(let role):
                 return try Folder
-                    .filter(Column("role") == role.rawValue)
+                    .filter(Column("role") == role.rawValue && Folder.demoScope(demoActive: demoActive))
                     .order(Column("accountId"))
                     .fetchAll(db)
             case .folder(let stored):

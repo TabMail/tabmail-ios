@@ -46,10 +46,11 @@ final class NavigationStore {
     /// - `.inboxDataDidChange` → folders only (counts may have changed with new headers)
     func loadInitialData() {
         let dbPool = AppDatabase.dbPool
+        let demoActive = DemoModeStore.shared.isActive
         do {
             try dbPool.read { db in
-                self.accounts = try Account.filter(Column("isActive") == true && Column("calendarOnly") == false).order(Column("createdAt")).fetchAll(db)
-                self.folders = try Folder.order(Column("name")).fetchAll(db)
+                self.accounts = try Account.sidebarRequest(demoActive: demoActive).fetchAll(db)
+                self.folders = try Folder.sidebarRequest(demoActive: demoActive).fetchAll(db)
                 self.outboxMessages = try OutboxMessage.order(Column("createdAt").desc).fetchAll(db)
                 self.hasAnyAccount = try Account.filter(Column("isActive") == true).fetchCount(db) > 0
             }
@@ -189,10 +190,11 @@ final class NavigationStore {
     /// and after user-initiated actions where freshness is required.
     private func refreshNow() {
         let dbPool = AppDatabase.dbPool
+        let demoActive = DemoModeStore.shared.isActive
         do {
             try dbPool.read { db in
-                let newAccounts = try Account.filter(Column("isActive") == true && Column("calendarOnly") == false).order(Column("createdAt")).fetchAll(db)
-                let newFolders = try Folder.order(Column("name")).fetchAll(db)
+                let newAccounts = try Account.sidebarRequest(demoActive: demoActive).fetchAll(db)
+                let newFolders = try Folder.sidebarRequest(demoActive: demoActive).fetchAll(db)
                 let newOutbox = try OutboxMessage.order(Column("createdAt").desc).fetchAll(db)
                 let newHasAny = try Account.filter(Column("isActive") == true).fetchCount(db) > 0
                 // Always assign — @Observable re-render cost is negligible since
