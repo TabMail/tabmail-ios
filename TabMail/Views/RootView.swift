@@ -58,8 +58,6 @@ struct RootView: View {
 
     private let syncScheduler = SyncScheduler.shared
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
-
     init() {
         // Debug: reset gate flags on every launch so all gate screens show
         if DEBUG_ALWAYS_SHOW_GATES {
@@ -295,41 +293,29 @@ struct RootView: View {
 
             // For returning users, isStartupComplete is already true from init —
             // inbox is visible immediately with cached GRDB data.
-            // For new users, show inbox now (migrations run async before sync).
+            // For new users, show inbox now (one-time data resets already ran
+            // synchronously in AppDatabase.init, so the DB is already migrated).
             isStartupComplete = true
 
             // In screenshot mode, skip all provider connections and sync —
             // the seeded GRDB data is sufficient for rendering screenshots.
             guard !ScreenshotMode.isActive else {
-                syncScheduler.signalMigrationsComplete()
                 return
             }
 
             let manager = AccountManager.shared
             let accounts = navigationStore.accounts
 
-            // Run migrations + NSE merge in background, BEFORE sync starts.
-            // These are deferred from the splash path so the inbox appears instantly.
-            // Provider connections can proceed in parallel (they don't depend on migrations),
-            // but sync waits for migrations to complete.
+            // Connect providers + reconcile, then let the foreground poll sync.
+            // Startup data resets already happened at DB-open (StartupMigrations
+            // runs in AppDatabase.init before the pool is exposed), so there's no
+            // migrate-vs-sync ordering to manage here anymore.
             Task {
-                // Run migrations and connect providers in parallel.
-                // Migrations touch GRDB (UserDefaults-gated, most are no-ops).
-                // Connections are TCP/TLS handshakes — independent of migrations.
-                // Signal SyncScheduler when migrations finish so NSE merge + sync
-                // can proceed (startForegroundPolling awaits this gate).
-                async let migrations: Void = {
-                    await Self.runStartupMigrations(dbPool: dbPool)
-                    await syncScheduler.signalMigrationsComplete()
-                }()
-                async let connections: Void = {
-                    for account in accounts where account.isActive {
-                        if await manager.provider(for: account) == nil {
-                            try? await manager.connectAccount(account)
-                        }
+                for account in accounts where account.isActive {
+                    if await manager.provider(for: account) == nil {
+                        try? await manager.connectAccount(account)
                     }
-                }()
-                _ = await (migrations, connections)
+                }
 
                 // If any account failed auth, navigate to settings
                 if !AccountManagerState.shared.authFailedAccounts.isEmpty {
@@ -677,93 +663,6 @@ struct RootView: View {
         if UserDefaults.standard.object(forKey: consentKey) != nil {
             hasCompletedConsentGate = UserDefaults.standard.bool(forKey: consentKey)
         }
-    }
-
-    /// Run one-time data migrations asynchronously.
-    /// Called after inbox is visible but before sync starts.
-    /// Each migration is gated by a UserDefaults flag — already-completed ones are no-ops.
-    private static func runStartupMigrations(dbPool: DatabasePool) async {
-        let t0 = CFAbsoluteTimeGetCurrent()
-
-        if !UserDefaults.standard.bool(forKey: "didMigrateHeaderIds_v2") {
-            do {
-                try await dbPool.write { db in
-                    try db.execute(sql: "DELETE FROM messageHeader")
-                }
-                print("[Migration] Batch-deleted old-format MessageHeaders")
-                UserDefaults.standard.set(true, forKey: "didMigrateHeaderIds_v2")
-            } catch {
-                print("[Migration] didMigrateHeaderIds_v2 failed: \(error) — will retry next launch")
-            }
-        }
-
-        if !UserDefaults.standard.bool(forKey: "didClearBodiesForAttachmentEncoding_v1") {
-            do {
-                try await dbPool.write { db in
-                    try db.execute(sql: "DELETE FROM messageBody")
-                }
-                print("[Migration] Batch-deleted MessageBody entries for attachment encoding fix")
-                UserDefaults.standard.set(true, forKey: "didClearBodiesForAttachmentEncoding_v1")
-            } catch {
-                print("[Migration] didClearBodiesForAttachmentEncoding_v1 failed: \(error) — will retry next launch")
-            }
-        }
-
-        if !UserDefaults.standard.bool(forKey: "didResetImapDatesForInternalDate_v1") {
-            do {
-                try await dbPool.write { db in
-                    let imapAccountIds = try String.fetchAll(db,
-                        Account.select(Column("id")).filter(Column("provider") == AccountProvider.imap.rawValue)
-                    )
-                    guard !imapAccountIds.isEmpty else { return }
-                    try Folder.filter(imapAccountIds.contains(Column("accountId")))
-                        .updateAll(db,
-                            Column("backfillComplete").set(to: false),
-                            Column("oldestSyncedDate").set(to: nil as Date?),
-                            Column("backfillUidCursor").set(to: nil as Int?),
-                            Column("backfillPageToken").set(to: nil as String?)
-                        )
-                    try Account.filter(imapAccountIds.contains(Column("id")))
-                        .updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
-                    print("[Migration] Reset backfill state on IMAP folders for INTERNALDATE fix")
-                }
-                UserDefaults.standard.set(true, forKey: "didResetImapDatesForInternalDate_v1")
-            } catch {
-                print("[Migration] didResetImapDatesForInternalDate_v1 failed: \(error) — will retry next launch")
-            }
-        }
-
-        if !UserDefaults.standard.bool(forKey: "didCleanResetMessageData_v1") {
-            do {
-                try await dbPool.write { db in
-                    try db.execute(sql: "DELETE FROM messageBody")
-                    try db.execute(sql: "DELETE FROM messageHeader")
-                    try Folder.updateAll(db,
-                        Column("backfillComplete").set(to: false),
-                        Column("oldestSyncedDate").set(to: nil as Date?),
-                        Column("lastKnownUidNext").set(to: nil as Int?),
-                        Column("backfillUidCursor").set(to: nil as Int?),
-                        Column("backfillPageToken").set(to: nil as String?)
-                    )
-                    try Account.updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
-                }
-                print("[Migration] Clean reset: batch deleted all headers + bodies")
-
-                do {
-                    try await SearchIndex.shared.resetAll()
-                    print("[Migration] FTS database reset")
-                } catch {
-                    print("[Migration] FTS reset failed: \(error)")
-                }
-
-                UserDefaults.standard.set(true, forKey: "didCleanResetMessageData_v1")
-            } catch {
-                print("[Migration] didCleanResetMessageData_v1 failed: \(error) — will retry next launch")
-            }
-        }
-
-        let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[Migration] Startup migrations completed in \(ms)ms")
     }
 
     private func cancelDeletion() async -> Bool {

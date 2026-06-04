@@ -79,32 +79,10 @@ final class SyncScheduler {
     /// Prevents duplicate subscribe/sync work when iOS delivers multiple .active transitions.
     private var isStartupInFlight = false
 
-    /// Gate that blocks NSE merge + sync until startup migrations complete.
-    /// RootView signals this after `runStartupMigrations()` finishes.
-    /// Required ordering: migrations → NSE merge → sync.
-    private var migrationContinuations: [CheckedContinuation<Void, Never>] = []
-    private var migrationsComplete = false
-
-    /// Signal that startup migrations have finished. Unblocks `startForegroundPolling`.
-    func signalMigrationsComplete() {
-        migrationsComplete = true
-        for continuation in migrationContinuations {
-            continuation.resume()
-        }
-        migrationContinuations.removeAll()
-    }
-
-    /// Wait until migrations are done. Returns immediately if already complete.
-    private func awaitMigrations() async {
-        if migrationsComplete { return }
-        await withCheckedContinuation { continuation in
-            if migrationsComplete {
-                continuation.resume()
-            } else {
-                migrationContinuations.append(continuation)
-            }
-        }
-    }
+    // Startup data resets (StartupMigrations) now run synchronously inside
+    // AppDatabase.init — before the pool is exposed — so there is no longer an
+    // async gate to wait on here. Ordering (resets → NSE merge → sync) is
+    // guaranteed by construction: nothing can touch the DB before init returns.
 
     // MARK: - Pending Sync Queue
     // Persists account emails that received a push but failed to sync (e.g., network dropped mid-sync).
@@ -181,6 +159,13 @@ final class SyncScheduler {
             BackgroundSyncLogger.log("syncStartup[+\(ms)ms]: \(label)")
         }
         stepLog("ENTER (inboxOnly=\(inboxOnly))")
+
+        // Pause sync while demo mode is active — real accounts must not sync or
+        // merge NSE data underneath the demo (incl. debug-menu demo while logged in).
+        if DemoModeStore.shared.isActive {
+            stepLog("SKIPPED — demo mode active")
+            return
+        }
 
         // 0. Merge NSE staging data FIRST — before any sync or AI processing.
         // This imports AI results computed by the NSE so the main app doesn't re-process them.
@@ -369,11 +354,8 @@ final class SyncScheduler {
                     BackgroundSyncLogger.log("fgReturn[+\(ms)ms]: \(label)")
                 }
                 fgStep("Task body start")
-                // Wait for startup migrations to complete before touching the DB.
-                // Migrations can DELETE FROM messageHeader/messageBody — running
-                // NSE merge or sync concurrently would lose freshly written data.
-                await awaitMigrations()
-                fgStep("awaitMigrations")
+                // Startup data resets already ran synchronously in AppDatabase.init
+                // (before the pool was exposed), so there's nothing to await here.
                 // Merge NSE staging data FIRST — before sync, before UI reload.
                 // This imports AI results and inbox removals so the UI shows them immediately.
                 NSEDataBridge.mergeNSEStagingData()
@@ -661,6 +643,13 @@ final class SyncScheduler {
 
     private func poll() async {
         if Self.syncDisabled { return }
+        // Pause all sync while demo mode is active — the user's real accounts must
+        // not sync or churn the DB/UI underneath the demo (incl. demo entered from
+        // the debug menu while logged in). Resumes on the next poll after exit.
+        if DemoModeStore.shared.isActive {
+            BackgroundSyncLogger.log("poll: SKIPPED — demo mode active")
+            return
+        }
         guard !isPollActive else {
             BackgroundSyncLogger.log("poll: SKIPPED — already polling")
             return

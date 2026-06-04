@@ -47,6 +47,13 @@ final class AppDatabase: Sendable {
         config.maximumReaderCount = 64
         dbPool = try DatabasePool(path: path, configuration: config)
         try Self.runMigrations(on: dbPool)
+        // One-time destructive cached-mail resets, synchronously, BEFORE the pool
+        // is exposed (`AppDatabase.shared` set in TabMailApp.init) or the inbox
+        // observer is wired. DB opens → schema migrates → data resets → only THEN
+        // can sync / NSE merge / demo+screenshot seed touch the DB. This is what
+        // lets us drop the old async "migrations complete" gate. NOT run in the
+        // test init below (tests must not touch global flags / the FTS directory).
+        StartupMigrations.run(dbPool)
         self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: dbPool)
     }
 
