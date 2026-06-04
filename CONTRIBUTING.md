@@ -52,8 +52,12 @@ Steps:
    `Secrets.xcconfig` is gitignored and never committed.
 4. Generate the Xcode project:
    ```bash
-   xcodegen generate
+   ./Scripts/xcodegen.sh
    ```
+   This wraps `xcodegen generate` and sources `DEVELOPMENT_TEAM` from your
+   `Secrets.xcconfig` so signing resolves for every target (the app **and** the
+   notification-service extension). If you leave `DEVELOPMENT_TEAM` empty, the
+   project still generates — just select your team in Xcode > Signing & Capabilities.
 5. Open `TabMail.xcodeproj` in Xcode and build the `TabMail` scheme.
 
 Run the test suite with `⌘U` in Xcode, or:

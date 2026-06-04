@@ -69,9 +69,12 @@ Steps:
    obtain each OAuth client ID and how to generate the keys.
 4. Generate and open the project:
    ```bash
-   xcodegen generate
+   ./Scripts/xcodegen.sh
    open TabMail.xcodeproj
    ```
+   Use `./Scripts/xcodegen.sh` rather than a bare `xcodegen generate` — it sources
+   your `DEVELOPMENT_TEAM` from `Secrets.xcconfig` and passes it to XcodeGen so code
+   signing resolves for every target, including the notification-service extension.
 5. Build and run the **TabMail** scheme on an iOS 26 simulator or device.
 
 Run the tests with `⌘U`, or:

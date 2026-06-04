@@ -18,10 +18,17 @@ configFiles:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    # DEVELOPMENT_TEAM is supplied by Secrets.xcconfig (gitignored) so the
-    # Apple Developer Team ID stays out of the public repo. See
-    # Secrets.xcconfig.example. Simulator + unit-test builds sign ad-hoc and
-    # do not need it.
+    # DEVELOPMENT_TEAM is sourced from Secrets.xcconfig (gitignored) by
+    # Scripts/xcodegen.sh and expanded here at generation time, so the Apple
+    # Developer Team ID stays out of the public repo. It MUST be referenced here
+    # (not only in the xcconfig) so XcodeGen writes DevelopmentTeam into
+    # TargetAttributes for ALL targets — including the Notification Service
+    # Extension, which otherwise ships with no resolved team and fails on-device
+    # code-sign validation (the NSE never launches). ALWAYS generate via
+    # ./Scripts/xcodegen.sh — a bare `xcodegen generate` with the var unset
+    # writes a literal "${DEVELOPMENT_TEAM}" and breaks signing. See
+    # Secrets.xcconfig.example. Simulator + unit-test builds sign ad-hoc.
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
     CODE_SIGN_IDENTITY: "Apple Development"
     CODE_SIGN_STYLE: Automatic
 
@@ -61,8 +68,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: TabMail/TabMail.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: ai.tabmail.ios
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.6.1"
-        CURRENT_PROJECT_VERSION: 273
+        MARKETING_VERSION: "1.6.2"
+        CURRENT_PROJECT_VERSION: 277
         TABMAIL_PROTOCOL_VERSION: "1.6.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_STRICT_CONCURRENCY: complete
@@ -89,10 +96,14 @@ targets:
         CODE_SIGN_ENTITLEMENTS: TabMailNotificationService/TabMailNotificationService.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: ai.tabmail.ios.NotificationService
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.6.1"
-        CURRENT_PROJECT_VERSION: 273
+        MARKETING_VERSION: "1.6.2"
+        CURRENT_PROJECT_VERSION: 277
         SWIFT_STRICT_CONCURRENCY: complete
         GENERATE_INFOPLIST_FILE: NO
+        # Build the extension as a normal Mach-O in Debug instead of Xcode 16's
+        # debug-dylib stub. Improves reliability when attaching to / debugging the
+        # NSE locally; no effect on Release builds (they don't use the debug dylib).
+        ENABLE_DEBUG_DYLIB: NO
     dependencies:
       - package: GRDB
         product: GRDB
