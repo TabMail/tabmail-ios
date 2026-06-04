@@ -242,6 +242,12 @@ struct TabMailApp: App {
         // exceeds 200ms — pinpoints UI hangs at the source (which main-actor
         // operation blocked). See MainActorStallDetector.swift for details.
         MainActorStallDetector.start()
+
+        #if DEBUG
+        // Re-activate the demo-video touch visualizer if it was left on (Debug
+        // builds only — compiled out of Release). Toggle: Settings → Debug.
+        TouchVisualizer.shared.activateIfEnabled()
+        #endif
     }
 
     var body: some Scene {
