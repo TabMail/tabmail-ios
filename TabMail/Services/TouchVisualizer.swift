@@ -2,19 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#if DEBUG
 import UIKit
 
-/// Debug-only on-screen touch visualizer for recording demo videos.
+/// On-screen touch visualizer for recording demo videos.
 ///
 /// Draws a translucent ring at every active touch point so taps and drags are
 /// visible in a screen recording (essential when recording on a physical device,
 /// where there's no cursor). Toggled from Settings → Debug → "Show Touch Rings";
 /// the choice is persisted so it survives a relaunch during a recording session.
 ///
-/// The entire file is wrapped in `#if DEBUG`, so it is compiled out of Release
-/// (App Store / Archive) builds entirely — it can never ship. A Cmd+R run from
-/// Xcode (or any Debug-config install on a device) is exactly where this lives.
+/// Intentionally NOT `#if DEBUG`-gated, so it ships in TestFlight/Release builds
+/// too (demos are recorded from those). It's still only reachable behind the
+/// hidden debug menu (10-tap unlock + allow-listed user via `DebugModeManager`),
+/// and the swizzle is installed lazily only when the toggle is switched on — so
+/// it is completely inert for normal users.
 ///
 /// Implementation: a one-time swizzle of `UIWindow.sendEvent(_:)` (installed
 /// lazily the first time rings are enabled) forwards every touch event here.
@@ -159,4 +160,3 @@ private extension UIWindow {
         TouchVisualizer.shared.handle(event, in: self)
     }
 }
-#endif

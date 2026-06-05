@@ -243,11 +243,11 @@ struct TabMailApp: App {
         // operation blocked). See MainActorStallDetector.swift for details.
         MainActorStallDetector.start()
 
-        #if DEBUG
-        // Re-activate the demo-video touch visualizer if it was left on (Debug
-        // builds only — compiled out of Release). Toggle: Settings → Debug.
+        // Re-activate the demo-recording touch visualizer if it was left on.
+        // Available in all builds (gated behind the hidden debug menu, not
+        // #if DEBUG) so demos can be recorded from a TestFlight build. Inert
+        // unless the toggle is on. Toggle: Settings → Debug.
         TouchVisualizer.shared.activateIfEnabled()
-        #endif
     }
 
     var body: some Scene {

@@ -9,21 +9,18 @@ struct DebugMenuView: View {
     @State private var useDevServers = BackendConfig.useDevServers
     @State private var pushTestResult: String?
     @State private var reminderTestStatus: String?
-    #if DEBUG
     @State private var showTouchRings = TouchVisualizer.shared.isEnabled
     @State private var demoEnterError: String?
-    #endif
     @Environment(NavigationStore.self) private var navigationStore
 
     var body: some View {
         List {
-            #if DEBUG
             Section("Demo Recording") {
                 Toggle("Show Touch Rings", isOn: $showTouchRings)
                     .onChange(of: showTouchRings) { _, newValue in
                         TouchVisualizer.shared.setEnabled(newValue)
                     }
-                Text("Draws a ring at every touch so taps are visible in screen recordings (e.g. on a physical device). Debug builds only — never present in App Store builds.")
+                Text("Draws a ring at every touch so taps are visible in screen recordings (e.g. on a physical device with a TestFlight build).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -45,11 +42,10 @@ struct DebugMenuView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
-                Text("Launches demo inboxes without logging out your live account. Demo data is namespaced (accountId 'demo-account'), real sync is paused, and everything is wiped on exit (tap the demo banner at the bottom). Your real accounts and data are untouched. Debug builds only.")
+                Text("Launches demo inboxes without logging out your live account. Demo data is namespaced (accountId 'demo-account'), real sync is paused, and everything is wiped on exit (tap the demo banner at the bottom). Your real accounts and data are untouched.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            #endif
 
             Section("Environment") {
                 Toggle("Use Dev Servers", isOn: $useDevServers)

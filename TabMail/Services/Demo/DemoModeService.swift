@@ -63,13 +63,15 @@ final class DemoModeService {
         print("[DemoMode] start(): demo mode active")
     }
 
-    #if DEBUG
-    /// Debug-only entry: enter demo mode WITHOUT logging out the live user.
-    /// Pre-sets the demo consent flags (the dev has already consented as a real
-    /// user) so RootView's demo branch skips the consent screens and goes straight
-    /// to the seeded inbox, then starts demo exactly like the login-screen path.
-    /// Demo data is namespaced (`accountId == "demo-account"`) and wiped on exit;
-    /// the live account, session, and real data are never touched.
+    /// Debug-menu entry: enter demo mode WITHOUT logging out the live user.
+    /// NOT `#if DEBUG`-gated (so it works in TestFlight/Release demo builds); it's
+    /// reachable only behind the hidden debug menu (10-tap unlock + allow-listed
+    /// user via `DebugModeManager`). Pre-sets the demo consent flags (the operator
+    /// has already consented as a real user) so RootView's demo branch skips the
+    /// consent screens and goes straight to the seeded inbox, then starts demo
+    /// exactly like the login-screen path. Demo data is namespaced
+    /// (`accountId == "demo-account"`) and wiped on exit; the live account,
+    /// session, and real data are never touched.
     func startFromDebugMenu() async throws {
         let store = DemoModeStore.shared
         store.hasCompletedConsentGate = true
@@ -77,7 +79,6 @@ final class DemoModeService {
         store.aiEnabled = true
         try await start()
     }
-    #endif
 
     /// Phase 2 of entry — runs AFTER the user passes the consent + AI gates
     /// (or declines AI). Seeds GRDB + FTS + calendar, registers providers
