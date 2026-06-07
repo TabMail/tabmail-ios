@@ -363,6 +363,67 @@ struct GmailProviderMockTests {
         let urls = FakeHTTP.recordedCalls().map { $0.url }
         #expect(urls.contains { $0.contains("/attachments/\(bodyAttachmentId)") })
     }
+
+    // MARK: - Test 4: single-part attachment-only message (DMARC report)
+
+    /// Regression: a DMARC aggregate report from Google arrives as a SINGLE-PART
+    /// message — the whole payload IS one `application/zip` (no `parts`, no text
+    /// body). The attachment lives on the top-level `payload` node, not inside
+    /// `payload.parts`. Before the fix, `fetchMessage` only walked `payload.parts`,
+    /// so it returned an empty body AND `attachments=0`; the message looked blank
+    /// and got stranded forever in the confirmed-empty → reply-retry loop. The body
+    /// is legitimately empty (no text part) — what matters is the attachment is
+    /// surfaced so `BodyFetchProcessor` routes it through the `[attachment]` path.
+    @Test("fetchMessage surfaces the attachment of a single-part (DMARC zip) message")
+    func singlePartAttachmentOnlyMessage() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        let messageId = "msg-dmarc"
+        let zipAttId = "dmarc-zip-att-id"
+        let zipFilename = "google.com!example.com!1700000000!1700086400.zip"
+
+        // Top-level payload IS the zip — note there is NO "parts" key.
+        let messageJSON = """
+        {
+          "id": "\(messageId)",
+          "internalDate": "1700000000000",
+          "labelIds": ["INBOX"],
+          "payload": {
+            "mimeType": "application/zip",
+            "filename": "\(zipFilename)",
+            "headers": [
+              {"name": "Subject", "value": "Report domain: example.com Submitter: google.com"},
+              {"name": "From", "value": "noreply-dmarc-support@google.com"},
+              {"name": "Date", "value": "Wed, 2 Oct 2025 01:50:00 +0000"},
+              {"name": "Content-Disposition", "value": "attachment; filename=\\"\(zipFilename)\\""}
+            ],
+            "body": {"size": 1234, "attachmentId": "\(zipAttId)"}
+          }
+        }
+        """
+        FakeHTTP.register(path: "/messages/\(messageId)", method: "GET", response: .json(raw: messageJSON))
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "tok" },
+            session: FakeHTTP.makeSession()
+        )
+
+        let info = try await provider.fetchMessage(id: messageId, folder: "INBOX")
+
+        // Body is legitimately empty (no text/html or text/plain part).
+        #expect(info.htmlBody == nil)
+        #expect((info.textBody ?? "").isEmpty)
+
+        // The attachment MUST be surfaced (this is the regression).
+        #expect(info.attachments.count == 1)
+        guard info.attachments.count == 1 else { return }
+        #expect(info.attachments[0].contentType == "application/zip")
+        #expect(info.attachments[0].section == zipAttId)
+        #expect(info.attachments[0].filename == zipFilename)
+        #expect(info.attachments[0].parentEmlSection == nil)
+    }
 }
 
 // MARK: - Fixture builder

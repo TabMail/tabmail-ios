@@ -170,9 +170,26 @@ actor GmailProvider: EmailProvider {
         let htmlBody = try await extractBodyWithFallback(from: msg, mimeType: "text/html")
         let textBody = try await extractBodyWithFallback(from: msg, mimeType: "text/plain")
 
-        // Extract attachment metadata from parts
+        // Extract attachment metadata. Walk from the TOP-LEVEL payload, not just
+        // `payload.parts`: a single-part message — e.g. a DMARC aggregate report that
+        // IS one `application/zip` with no text body — carries its attachment on the
+        // payload node itself, so `payload.parts` is nil. The shared NSE parser
+        // (`GmailParse.walkParts`) already visits the payload node (which is why the
+        // inbox `hasAttachments` paperclip is correct), but this body-fetch path did
+        // not — so the attachment came back as 0 AND the body as empty, the message
+        // looked completely blank, and it got stranded in the body/AI retry pipeline
+        // (confirmed-empty → reply job re-enqueued forever). Mirror walkParts here.
         let parts = msg.payload?.parts ?? []
-        var attachments = extractAttachments(from: parts)
+        let attachmentRoots: [GmailPart]
+        if let payload = msg.payload {
+            attachmentRoots = [GmailPart(
+                mimeType: payload.mimeType, filename: payload.filename,
+                headers: payload.headers, body: payload.body, parts: payload.parts
+            )]
+        } else {
+            attachmentRoots = []
+        }
+        var attachments = extractAttachments(from: attachmentRoots)
 
         // Surface attachments nested inside file-uploaded `.eml` parts — these
         // are opaque to the Gmail MIME tree (the server saw the upload as a
@@ -1560,9 +1577,25 @@ struct GmailMessage: Codable {
 // Visible to tests via @testable import.
 struct GmailPayload: Codable {
     let mimeType: String?
+    /// Attachment filename when the payload node IS itself an attachment — i.e. a
+    /// single-part message whose whole body is one file (e.g. a DMARC aggregate
+    /// report = one `application/zip`, no text body, no `parts`). Gmail populates
+    /// this on the top-level `payload` MessagePart in that case.
+    let filename: String?
     let headers: [GmailHeader]?
     let body: GmailBody?
     let parts: [GmailPart]?
+
+    // Explicit memberwise init with `filename` defaulted so existing call sites
+    // that don't set it keep compiling. Codable's synthesized `init(from:)` still
+    // decodes the JSON `filename` key independently of this init.
+    init(mimeType: String?, filename: String? = nil, headers: [GmailHeader]?, body: GmailBody?, parts: [GmailPart]?) {
+        self.mimeType = mimeType
+        self.filename = filename
+        self.headers = headers
+        self.body = body
+        self.parts = parts
+    }
 }
 
 struct GmailHeader: Codable {
