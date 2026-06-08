@@ -523,7 +523,10 @@ struct MessageCardView: View {
                     Text("This message has no content.")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.top, 40)
+                        // Symmetric 40pt above and below so the no-content line
+                        // (e.g. a DMARC report that is just an attachment) reads
+                        // as vertically centered rather than top-heavy.
+                        .padding(.vertical, 40)
                 }
             } else if viewModel.isLoading {
                 ProgressView("Loading message...")
