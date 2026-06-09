@@ -353,6 +353,10 @@ struct DynamicIslandChat: View {
                     }
             }
         }
+        // Keep the screen from auto-locking while the user is engaged with the
+        // agent: pill expanded, agent working (incl. background sessions — same
+        // scope as the wand glow), or dictation listening.
+        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || speechRecognizer.isRecording)
         .onChange(of: isExpanded) { _, expanded in
             autoStartTask?.cancel()
             autoStartTask = nil
@@ -496,7 +500,7 @@ struct DynamicIslandChat: View {
                             }
                         }
                         // Also load edit history from draft
-                        if let draft = try? await DraftStore.shared.load(id: did) {
+                        if let draft = try? DraftStore.shared.load(id: did) {
                             if editHistory.isEmpty {
                                 editHistory = draft.editHistory
                                 print("[DynamicIslandChat] Loaded edit history from draft (\(editHistory.count) turns)")
@@ -1343,13 +1347,13 @@ struct DynamicIslandChat: View {
 
         // Try to load existing draft — mutate in place to preserve all fields
         // (especially v24 server sync: serverDraftId, serverPushStatus, rfc822MessageId, attachmentsDirName)
-        if var existing = try? await DraftStore.shared.load(id: draftKey) {
+        if var existing = try? DraftStore.shared.load(id: draftKey) {
             existing.subject = subject
             existing.body = body
             existing.editHistoryJSON = editHistJSON
             existing.updatedAt = now
             savedAccountId = existing.accountId
-            do { try await DraftStore.shared.save(existing) }
+            do { try DraftStore.shared.save(existing) }
             catch { print("[DraftStore] Auto-save failed: \(error)"); return }
         } else {
             // First save — need accountId. Use sender email from context to find account.
@@ -1372,7 +1376,7 @@ struct DynamicIslandChat: View {
                 createdAt: now,
                 updatedAt: now
             )
-            do { try await DraftStore.shared.save(draft) }
+            do { try DraftStore.shared.save(draft) }
             catch { print("[DraftStore] Auto-save failed (first save): \(error)"); return }
         }
 
