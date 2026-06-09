@@ -44,8 +44,10 @@ enum SharedNSEData {
     static let deviceSyncEnabledKey = "nse.deviceSyncEnabled"
     static let syncBaseURLKey = "nse.syncBaseURL"
 
-    // NSE writes, main app reads + clears
-    static let badgeCountKey = "nse.unreadBadge"
+    // NSE writes, main app overwrites with the authoritative count.
+    // Canonical constant lives in the shared NSEBadge (visible to both
+    // targets) — this alias keeps existing NSE-side callers compiling.
+    static let badgeCountKey = NSEBadge.badgeCountKey
 
     /// Privacy opt-out flag. Shared so NSE and main app agree — otherwise main
     /// app's UserDefaults.standard is a separate namespace from the NSE process

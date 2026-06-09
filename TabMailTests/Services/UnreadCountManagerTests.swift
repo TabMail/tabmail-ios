@@ -97,7 +97,7 @@ struct UnreadCountManagerDatabaseTests {
         }
 
         // Verify initially 0 unread
-        var count = try db.read {
+        let count = try db.read {
             try MessageHeader.filter(
                 Column("folderId") == "acc1:INBOX" && Column("isRead") == false
             ).fetchCount($0)
@@ -165,7 +165,7 @@ struct UnreadCountManagerDatabaseTests {
         #expect(count == 3)
 
         // Simulate delta sync deletion: remove message "0"
-        try db.write {
+        _ = try db.write {
             try MessageHeader.filter(Column("messageId") == "0").deleteAll($0)
         }
 

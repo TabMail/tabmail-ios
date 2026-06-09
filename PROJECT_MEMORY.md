@@ -483,6 +483,19 @@
 
 ---
 
+### App Icon Badge Routine (NSE counter + main-app recount)
+
+- **Two mechanisms**: (1) NSE best-effort incremental counter in App Group key `nse.unreadBadge` (`NSEBadge.badgeCountKey`), attached as an *absolute* value via `c.badge` on each delivered push; (2) main app's `UnreadCountManager.updateBadge()` — authoritative `SUM(folder.unreadCount) WHERE role=inbox`, calls `setBadgeCount` and **overwrites the mirror**. The counter only has to stay reasonable between main-app wakes; every recount self-heals drift.
+- **All per-delivery badge values MUST go through `NSEBadge.badgeForDelivery`** (`Shared/Persistence/NSEBadge.swift`, compiled into app + NSE) — never raw increments. Two gates (fix for the 2026-06 double-increment bug):
+  - **Gate 1 (duplicate pushes)**: per-`(accountId, messageId)` idempotency arbitrated by atomic `INSERT OR IGNORE` into `nse_badge_counted` in the shared staging DB. Deliberately a separate table (NOT a column on `nse_processed_message` — those rows get `INSERT OR REPLACE`d by re-runs and deleted by the merge). Created lazily by `NSEBadge`; 7-day retention pruned opportunistically.
+  - **Gate 2 (main-app overlap)**: when the main app holds a *fresh* `AIOwnershipLease` on the message, the NSE delivers the current counter without bumping — the awake main app sets the badge authoritatively. Residual window (main app finished + slept before the push arrives) is accepted; wake-time recount heals it.
+- `NSEState.incrementBadgeCount`/`decrementBadgeCount` remain ONLY for the legacy Gmail history.list delta-adjust path (label flips on existing messages — disjoint from delivered-message counting).
+- **Foreground is safe by construction**: `NotificationDelegate.willPresent` returns `[]` for email pushes (badge never applied) and triggers merge + sync recount.
+- Push-worker sets **no `apns-collapse-id`** — a true APNs duplicate shows two banners; badge dedup is entirely client-side via Gate 1.
+- Tests: `TabMailTests/NSE/NSEBadgeTests.swift`.
+
+---
+
 ---
 
 ### Cron Reminders (ScheduledItem Architecture)

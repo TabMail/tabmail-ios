@@ -113,24 +113,24 @@ enum NSEState {
     // a temporary incremental counter in shared UserDefaults as a best-effort
     // badge approximation. This counter is NOT authoritative — it drifts.
     //
-    // The main app's correctBadgeCount() overwrites this on every wake with
-    // the real unread count from: SELECT COUNT(*) FROM messageHeader WHERE isRead=0 AND folderId LIKE '%:INBOX'
+    // The main app's UnreadCountManager.updateBadge() overwrites this on
+    // every recount with the authoritative inbox unread count
+    // (SUM(folder.unreadCount) WHERE role = inbox).
     //
     // The counter exists solely to give iOS a reasonable badge number between
-    // NSE runs and the next app wake.
+    // NSE runs and the next app wake. Counter logic lives in the shared
+    // `NSEBadge` — per-delivery badge values MUST go through
+    // `NSEBadge.badgeForDelivery` (idempotent per message, main-app-overlap
+    // aware), not these raw primitives. The raw increment/decrement below are
+    // only for the legacy history.list delta-adjust path, which counts label
+    // flips on EXISTING messages (disjoint from delivered-message counting).
 
     static func incrementBadgeCount() -> Int {
-        let current = suite.integer(forKey: SharedNSEData.badgeCountKey)
-        let next = current + 1
-        suite.set(next, forKey: SharedNSEData.badgeCountKey)
-        return next
+        NSEBadge.increment(suite: suite.defaults)
     }
 
     static func decrementBadgeCount(by count: Int) -> Int {
-        let current = suite.integer(forKey: SharedNSEData.badgeCountKey)
-        let next = max(0, current - count)
-        suite.set(next, forKey: SharedNSEData.badgeCountKey)
-        return next
+        NSEBadge.decrement(by: count, suite: suite.defaults)
     }
 
     /// Advance the historyId for an account after NSE processes history.list.

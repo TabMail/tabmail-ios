@@ -382,7 +382,9 @@ final class NotificationService: UNNotificationServiceExtension {
                 ),
                 accountId: accountId, messageId: msg.messageId
             )
-            c.badge = NSNumber(value: NSEState.incrementBadgeCount())
+            c.badge = NSNumber(value: NSEBadge.badgeForDelivery(
+                db: db, suite: SharedNSEData.suite.defaults,
+                accountId: accountId, messageId: msg.messageId))
             // Persist peer results + rendered body to staging DB for main app merge.
             // Body is persisted even on peer cache hit so merge writes MessageBody + FTS
             // and the main app's body queue doesn't re-fetch.
@@ -419,7 +421,11 @@ final class NotificationService: UNNotificationServiceExtension {
                 ),
                 accountId: accountId, messageId: msg.messageId
             )
-            c.badge = NSNumber(value: NSEState.incrementBadgeCount())
+            // Idempotent: a staging-cache hit means a previous NSE run already
+            // counted this message, so this returns the current value unbumped.
+            c.badge = NSNumber(value: NSEBadge.badgeForDelivery(
+                db: db, suite: SharedNSEData.suite.defaults,
+                accountId: accountId, messageId: msg.messageId))
             // NSE is terminal. Main-app post-notification work runs
             // on next natural wake via mergeNSEStagingData. No follow-up push.
             deliver(c); return
@@ -572,7 +578,13 @@ final class NotificationService: UNNotificationServiceExtension {
         // Unified layout: title = "New email - <sender>", subtitle = subject,
         // body = reminder-with-due-label | summary | "" (AI-failed). Active +
         // default sound only when reply-tagged; passive otherwise.
-        let newBadge = NSEState.incrementBadgeCount()
+        // Per-message idempotent (a duplicate push re-running the full path
+        // doesn't re-bump) and skipped when the main app holds a fresh AI
+        // lease (it sets the badge authoritatively from its own recount) —
+        // see NSEBadge.badgeForDelivery.
+        let newBadge = NSEBadge.badgeForDelivery(
+            db: db, suite: SharedNSEData.suite.defaults,
+            accountId: accountId, messageId: msg.messageId)
         EmailNotificationBuilder.fill(
             c, signal: signal,
             accountId: accountId, messageId: msg.messageId

@@ -136,8 +136,8 @@ actor UnreadCountManager {
 
             try await UNUserNotificationCenter.current().setBadgeCount(totalUnread)
             // Mirror to app-group suite so NSE can read the authoritative count
-            // as its increment/decrement base (see NSEState badge accessors).
-            UserDefaults(suiteName: "group.ai.tabmail")?.set(totalUnread, forKey: "nse.unreadBadge")
+            // as its increment/decrement base (see NSEBadge / NSEState).
+            UserDefaults(suiteName: "group.ai.tabmail")?.set(totalUnread, forKey: NSEBadge.badgeCountKey)
             print("[UnreadCount] Badge set to \(totalUnread)")
             BackgroundSyncLogger.log("badge: \(totalUnread)")
         } catch {
