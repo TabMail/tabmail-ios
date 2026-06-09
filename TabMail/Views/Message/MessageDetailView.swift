@@ -133,6 +133,10 @@ struct MessageDetailView: View {
             .onDisappear {
                 chatExpanded = false
                 ICSCalendarImporter.dismiss()
+                // Never leave the gate stuck frozen if the view goes away
+                // mid-scroll — it would freeze height application for every
+                // HTMLWebView process-wide.
+                ScrollFreezeGate.shared.end()
             }
     }
 
@@ -283,6 +287,18 @@ struct MessageDetailView: View {
                     await viewModel.refetchBody()
                 }
                 .coordinateSpace(name: "messageList")
+                // Drive ScrollFreezeGate: while the user pans/decelerates,
+                // AutoSizingHTMLView defers APPLYING changed WKWebView height
+                // measurements (a row resizing mid-gesture makes List
+                // self-sizing reposition rows under the finger → overlapping
+                // cards). Deferred heights flush on return to .idle.
+                .onScrollPhaseChange { _, newPhase in
+                    if newPhase == .idle {
+                        ScrollFreezeGate.shared.end()
+                    } else {
+                        ScrollFreezeGate.shared.begin()
+                    }
+                }
                 .background(GeometryReader { geo in Color.clear.onAppear { listHeight = geo.size.height }.onChange(of: geo.size.height) { _, h in listHeight = h } })
                 .onPreferenceChange(CardVisibilityKey.self) { cards in
                     // Pick the card with the most visible area in the viewport.

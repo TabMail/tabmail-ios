@@ -5,6 +5,7 @@
 import SwiftUI
 import WebKit
 import CryptoKit
+import Synchronization
 
 /// Auto-sizing WKWebView that reports its content height to SwiftUI.
 ///
@@ -16,12 +17,25 @@ struct AutoSizingHTMLView: View {
     let html: String
     let previewFilename: String?
     let headerId: String?
-    @State private var height: CGFloat = 1
+    @State private var height: CGFloat
 
     init(html: String, previewFilename: String? = nil, headerId: String? = nil) {
         self.html = html
         self.previewFilename = previewFilename
         self.headerId = headerId
+        // Seed the initial frame height from the last applied measurement for
+        // this message. SwiftUI List dismantles far-offscreen rows — when an
+        // expanded card scrolls back toward the viewport, the whole view
+        // (including @State) is recreated and the row would collapse to 1 pt,
+        // shifting every row below up by the card's height until the fresh
+        // WKWebView re-measures ~200–500 ms later, then shifting them back —
+        // visible as cards jumping/overlapping mid-scroll (logmain.log
+        // 2026-06-09: same message reloaded 5× with frameH=1 at onload).
+        // Seeding is safe ONLY because the fit pipeline is idempotent
+        // (ADR-IOS-039): same content + same width → identical re-measurement,
+        // which the `!=` guard in handleHeightMessage then drops, so a seeded
+        // row doesn't move at all.
+        _height = State(initialValue: headerId.flatMap { HeightSeedCache.shared[$0] } ?? 1)
     }
 
     var body: some View {
@@ -42,6 +56,91 @@ struct AutoSizingHTMLView: View {
             // inconsistent bubble-bottom gap across emails.
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
+    }
+}
+
+/// Process-wide gate raised while the user is actively scrolling the message
+/// detail List. While frozen, `HTMLWebView.Coordinator` defers APPLYING changed
+/// height measurements — the WKWebView keeps measuring; only the SwiftUI frame
+/// write waits. A row height change mid-pan makes the List's self-sizing
+/// reposition rows under the finger, which renders as overlapping cards.
+///
+/// Mirrors the buffer-and-flush shape of `PreviewFreezeGate`
+/// (SyncStatusSubtitle.swift) but is deliberately a separate gate:
+/// PreviewFreezeGate pauses env-driven refreshes for the QuickLook sheet, and
+/// coupling scroll phases into it would pause those unrelated consumers on
+/// every pan. Uses `Mutex` instead of `@MainActor` so the nonisolated
+/// `WKScriptMessageHandler` path can read it without isolation friction
+/// (Resilience rule 5).
+///
+/// Driver: `MessageDetailView`'s List via `.onScrollPhaseChange` — `begin()`
+/// on any non-idle phase, `end()` on idle AND in `onDisappear` (a stuck gate
+/// would freeze height application process-wide).
+final class ScrollFreezeGate: Sendable {
+    static let shared = ScrollFreezeGate()
+    private let frozen = Mutex(false)
+
+    var isFrozen: Bool { frozen.withLock { $0 } }
+
+    func begin() {
+        let changed = frozen.withLock { (v: inout Bool) -> Bool in
+            if v { return false }
+            v = true
+            return true
+        }
+        if changed, DebugModeManager.isLoggingEnabled() { print("[ScrollFreeze] begin") }
+    }
+
+    func end() {
+        let changed = frozen.withLock { (v: inout Bool) -> Bool in
+            guard v else { return false }
+            v = false
+            return true
+        }
+        guard changed else { return }
+        if DebugModeManager.isLoggingEnabled() { print("[ScrollFreeze] end — flushing deferred heights") }
+        NotificationCenter.default.post(name: .scrollFreezeReleased, object: nil)
+    }
+}
+
+extension Notification.Name {
+    /// Posted by `ScrollFreezeGate.end()`. `HTMLWebView.Coordinator`s apply
+    /// their buffered `pendingHeight` on receipt.
+    static let scrollFreezeReleased = Notification.Name("scrollFreezeReleased")
+}
+
+/// In-memory cache of the last APPLIED visual height per message
+/// (`headerId`). Read once in `AutoSizingHTMLView.init` to seed `@State
+/// height` so a List-recycled card re-enters the viewport at its real height
+/// instead of collapsing to 1 pt and re-inflating mid-scroll. Written by the
+/// Coordinator on every applied height (direct apply and scroll-freeze flush)
+/// — safe to overwrite unconditionally because the fit pipeline is idempotent
+/// (ADR-IOS-039), so values only change when content/width genuinely changed.
+///
+/// Deliberately NOT persisted to disk: the symptom is within-session scroll
+/// churn; a rendered-height-per-message table on disk would be derived data
+/// brushing against ADR-004's zero-retention posture for no benefit.
+///
+/// Width sensitivity: values are keyed by message only. After a rotation /
+/// split-view resize, a seed can be briefly wrong — the recreated WKWebView's
+/// idempotent re-measure corrects it in one snap (~200 ms), which is the
+/// pre-cache behavior. Not worth keying by width.
+final class HeightSeedCache: Sendable {
+    static let shared = HeightSeedCache()
+    /// Bound on retained entries — one per opened message per session, so the
+    /// cap exists only as a leak backstop. Crude clear-all on overflow is fine:
+    /// losing seeds merely restores pre-cache behavior for the next render.
+    private static let maxEntries = 512
+    private let store = Mutex<[String: CGFloat]>([:])
+
+    subscript(headerId: String) -> CGFloat? {
+        get { store.withLock { $0[headerId] } }
+        set {
+            store.withLock { dict in
+                if dict.count >= Self.maxEntries { dict.removeAll(keepingCapacity: true) }
+                dict[headerId] = newValue
+            }
+        }
     }
 }
 
@@ -117,6 +216,9 @@ private struct HTMLWebView: UIViewRepresentable {
             context.coordinator.loadedPreviewFilename = previewFilename
             context.coordinator.loadedHeaderId = headerId
             context.coordinator.lastMeasuredWidth = currentWidth
+            // New document — a height buffered during scroll for the OLD
+            // document must not flush onto the new one.
+            context.coordinator.pendingHeight = nil
             if DebugModeManager.isLoggingEnabled() {
                 print("[HTMLDebug] HTMLWebView.updateUIView: loading html len=\(html.count)")
             }
@@ -165,8 +267,12 @@ private struct HTMLWebView: UIViewRepresentable {
             // Frame width changed significantly (e.g. sheet animation settled) —
             // reset viewport to device-width and re-fit. ResizeObserver picks
             // up the resulting layout change and posts the new height.
+            // viewportResetJS clears window.__tmLayoutVp — REQUIRED, or
+            // fitViewportJS's idempotency guard would treat the re-fit as a
+            // re-entry and bail, and monitorHeightJS would keep scaling
+            // heights against the stale widened viewport.
             context.coordinator.lastMeasuredWidth = currentWidth
-            let resetJS = "document.querySelector('meta[name=\"viewport\"]').setAttribute('content','width=device-width,initial-scale=1,maximum-scale=5,user-scalable=yes')"
+            let resetJS = viewportResetJS(deviceWidth: Int(currentWidth.rounded()))
             webView.evaluateJavaScript(resetJS) { _, _ in
                 context.coordinator.fit()
             }
@@ -185,7 +291,13 @@ private struct HTMLWebView: UIViewRepresentable {
         var loadedHeaderId: String?
         var lastMeasuredWidth: CGFloat = 0
         weak var webView: WKWebView?
+        /// Latest measured height that arrived while `ScrollFreezeGate` was
+        /// frozen. Applied (and cleared) by the `.scrollFreezeReleased`
+        /// listener; overwritten by newer measurements during the same freeze
+        /// so only the final value flushes. Cleared on new-document load.
+        var pendingHeight: CGFloat?
         private nonisolated(unsafe) var foregroundObserver: NSObjectProtocol?
+        private nonisolated(unsafe) var scrollFreezeObserver: NSObjectProtocol?
         /// Per-Coordinator (i.e. per-WebView lifetime) random id. Stamped into
         /// every diag log line on both the Swift and JS sides so we can grep an
         /// entire email's render timeline out of mixed log streams (multiple
@@ -222,10 +334,32 @@ private struct HTMLWebView: UIViewRepresentable {
                     self.fit(webView)
                 }
             }
+            // Flush the height buffered during an active scroll once the
+            // List reports idle. Buffer-and-flush mirrors the
+            // PreviewFreezeGate pattern in MessageDetailViewModel.
+            scrollFreezeObserver = NotificationCenter.default.addObserver(
+                forName: .scrollFreezeReleased,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                // queue: .main guarantees delivery on the main thread; the
+                // Coordinator is MainActor-inferred (WKNavigationDelegate /
+                // WKScriptMessageHandler are @MainActor protocols), so assert
+                // the isolation rather than smuggling access past the checker.
+                MainActor.assumeIsolated {
+                    guard let self, let pending = self.pendingHeight else { return }
+                    self.pendingHeight = nil
+                    if pending > 0 && pending != self.height {
+                        self.height = pending
+                        if let hid = self.loadedHeaderId { HeightSeedCache.shared[hid] = pending }
+                    }
+                }
+            }
         }
 
         deinit {
             if let obs = foregroundObserver { NotificationCenter.default.removeObserver(obs) }
+            if let obs = scrollFreezeObserver { NotificationCenter.default.removeObserver(obs) }
             contentSizeObservation?.invalidate()
         }
 
@@ -244,12 +378,17 @@ private struct HTMLWebView: UIViewRepresentable {
             if DebugModeManager.isLoggingEnabled(), contentSizeObservation == nil {
                 let id = webViewId
                 contentSizeObservation = webView.scrollView.observe(\.contentSize, options: [.new, .old]) { [weak webView] sv, change in
-                    guard let webView, let new = change.newValue else { return }
-                    let zoom = sv.zoomScale
-                    let frameH = webView.bounds.height
-                    let oldH = change.oldValue?.height ?? 0
-                    print(String(format: "[ContentSizeKVO id=%@] contentH=%.0f (was %.0f) zoom=%.3f frameH=%.0f",
-                                 id, new.height, oldH, zoom, frameH))
+                    // UIScrollView.contentSize KVO for a WKWebView fires on
+                    // the main thread (layout-driven); assert rather than
+                    // bypass the isolation checker for the UIKit reads.
+                    MainActor.assumeIsolated {
+                        guard let webView, let new = change.newValue else { return }
+                        let zoom = sv.zoomScale
+                        let frameH = webView.bounds.height
+                        let oldH = change.oldValue?.height ?? 0
+                        print(String(format: "[ContentSizeKVO id=%@] contentH=%.0f (was %.0f) zoom=%.3f frameH=%.0f",
+                                     id, new.height, oldH, zoom, frameH))
+                    }
                 }
             }
             fit(webView)
@@ -262,7 +401,14 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `WKScriptMessageHandler`.
         func fit(_ webView: WKWebView? = nil) {
             guard let webView = webView ?? self.webView, webView.bounds.width > 50 else { return }
-            webView.evaluateJavaScript(fitViewportJS) { _, _ in
+            // Stamp the authoritative device-pt width BEFORE the fit script
+            // runs. At the device-width baseline 1 CSS px == 1 pt, so
+            // bounds.width IS the correct measurement baseline.
+            // window.innerWidth is not trustworthy after meta/bounds changes
+            // (WebKit bug 170595) — the same reason monitorHeightJS reads
+            // __tmLayoutVp instead of innerWidth after a widen.
+            let stampJS = "window.__tmDeviceWidth = \(Int(webView.bounds.width.rounded()));"
+            webView.evaluateJavaScript(stampJS + fitViewportJS) { _, _ in
                 // That's it. monitorHeightJS's ResizeObserver will fire
                 // after the viewport change settles, and
                 // handleHeightMessage will apply the result.
@@ -388,7 +534,29 @@ private struct HTMLWebView: UIViewRepresentable {
                 }
             }
             if visualHeight > 0 && visualHeight != height {
-                height = visualHeight
+                // Scroll freeze: applying a CHANGED height while the user is
+                // panning the detail List makes the row resize under the
+                // finger — List self-sizing repositions neighbors mid-gesture,
+                // which renders as overlapping cards. Defer the frame write;
+                // the .scrollFreezeReleased listener (init) flushes the latest
+                // pending value when scrolling idles. Equal heights never
+                // reach this branch (the != guard above), so now that
+                // fitViewportJS is idempotent, steady-state re-measurements
+                // are free regardless of the gate.
+                // Exception: height <= 1 means the row was never sized (fresh
+                // expand / first load) — an invisible 1pt row is worse than a
+                // mid-scroll layout shift, so the first real height applies
+                // immediately.
+                if ScrollFreezeGate.shared.isFrozen && height > 1 {
+                    pendingHeight = visualHeight
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MeasureHeight id=\(webViewId)] deferred during scroll: \(Int(visualHeight)) (frame stays \(Int(height)))")
+                    }
+                } else {
+                    pendingHeight = nil
+                    height = visualHeight
+                    if let hid = loadedHeaderId { HeightSeedCache.shared[hid] = visualHeight }
+                }
             }
         }
     }
@@ -1236,10 +1404,13 @@ private let monitorHeightJS = """
             var h = rect > 0 && rect < scroll ? rect : scroll;
             // Prefer the widened layout viewport stored by fitViewportJS —
             // window.innerWidth is unreliable in iOS WebKit after a runtime
-            // viewport-meta change (WebKit bug 170595). Fall back to
-            // window.innerWidth when fitViewportJS didn't widen (plain-text
-            // emails, responsive emails fitting at device width).
-            var vp = window.__tmLayoutVp || window.innerWidth;
+            // viewport-meta change (WebKit bug 170595). When not widened,
+            // prefer the Swift-stamped device width (__tmDeviceWidth, set by
+            // fit() from webView.bounds.width — at the device-width baseline
+            // 1 CSS px == 1 pt, so it IS the layout viewport). Fall back to
+            // window.innerWidth only before the first fit() has stamped it
+            // (initial documentEnd report).
+            var vp = window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth;
             if (h > 0 && h !== lastH) {
                 lastH = h;
                 try {
@@ -1807,6 +1978,17 @@ private var heightDiagnosticJS: String {
 /// identifies the culprit element so we can tighten the CSS.
 /// Internal accessor for unit tests to inspect the emitted JS (widening
 /// policy, STANDARD_MIN floor, window.__tmLayoutVp stamp, forced reflow).
+/// JS that returns the document to the device-width baseline before a re-fit
+/// (updateUIView's width-change path). Re-stamps `__tmDeviceWidth` with the
+/// new width, clears `__tmLayoutVp` — REQUIRED: fitViewportJS's idempotency
+/// guard bails while it's set, and monitorHeightJS would keep scaling heights
+/// against the stale widened viewport — then restores the width=device-width
+/// meta. Exposed as `internal` for unit tests (same pattern as `_fitViewportJS`).
+internal func viewportResetJS(deviceWidth: Int) -> String {
+    "window.__tmDeviceWidth = \(deviceWidth); window.__tmLayoutVp = 0; "
+        + "document.querySelector('meta[name=\"viewport\"]').setAttribute('content','width=device-width,initial-scale=1,maximum-scale=5,user-scalable=yes')"
+}
+
 internal var _fitViewportJS: String { fitViewportJS }
 private let fitViewportJS: String = {
     let debug = DebugModeManager.isLoggingEnabled()
@@ -1816,8 +1998,29 @@ private let fitViewportJS: String = {
     return """
     (function() {
         \(logPrefix)
-        var vw = window.innerWidth;
-        log('enter: innerWidth=' + vw + ' screenWidth=' + window.screen.width + ' devicePixelRatio=' + window.devicePixelRatio);
+        // IDEMPOTENCY GUARD — this function measures the document and then
+        // MUTATES it (meta widen, inline width strips, body padding zeroing).
+        // Running it again on an already-widened document re-measures widened
+        // CSS px against an unreliable window.innerWidth (WebKit bug 170595),
+        // so the overflow decision is garbage and the widen target / pageScale
+        // can drift — the width-arm sibling of the scrollHeight feedback loop
+        // that EmailHTMLWrapper's html/body CSS override closed. Observable
+        // symptom before this guard: fonts shrank a little more on every
+        // background→foreground cycle (the foreground observer re-runs fit()).
+        // Same document + same device width → same answer: if we already
+        // widened, there is nothing to re-derive. Re-fits for a REAL width
+        // change (rotation, sheet resize) go through updateUIView's
+        // viewportResetJS path, which restores width=device-width and clears
+        // this global before calling fit again.
+        if (window.__tmLayoutVp) { log('already fitted (layoutVp=' + window.__tmLayoutVp + ') — idempotent no-op'); return true; }
+        // Measure against the Swift-stamped device-pt width (fit() stamps
+        // __tmDeviceWidth from webView.bounds.width immediately before this
+        // script runs). At the device-width baseline 1 CSS px == 1 pt, so it
+        // IS the layout viewport. window.innerWidth is only the fallback for
+        // a hypothetical unstamped run — it is unreliable after meta/bounds
+        // changes (WebKit bug 170595).
+        var vw = window.__tmDeviceWidth || window.innerWidth;
+        log('enter: vw=' + vw + ' innerWidth=' + window.innerWidth + ' screenWidth=' + window.screen.width + ' devicePixelRatio=' + window.devicePixelRatio);
         if (vw < 100) { log('skip: viewport too small'); return false; }
         // Strip hardcoded widths from non-table block elements wider than
         // viewport. CSS max-width works fine on divs/p/sections, so this is

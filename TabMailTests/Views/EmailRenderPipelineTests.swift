@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
 
 /// Regression guards for the email rendering pipeline that lives in
@@ -211,5 +212,127 @@ struct EmailRenderPipelineTests {
         // should remain is the initial "fire report() shortly after load"
         // belt-and-suspenders. Forbid periodic polling intervals.
         #expect(!js.contains("setInterval"))
+    }
+
+    // MARK: - fitViewportJS idempotency (width-arm feedback loop)
+
+    @Test("fitViewportJS bails when __tmLayoutVp is already set (idempotent re-entry)")
+    func fitViewportIdempotentReEntry() {
+        let js = _fitViewportJS
+        // fitViewportJS measures the document and then MUTATES it (meta
+        // widen, inline width strips). Re-running it on an already-widened
+        // document re-measures widened CSS px against an unreliable
+        // innerWidth (WebKit bug 170595) — the width-arm feedback loop:
+        // fonts shrank a little more on every background→foreground cycle
+        // because the foreground observer re-runs fit(). Re-entry on a
+        // widened document must be a no-op; real width changes go through
+        // viewportResetJS which clears the global first.
+        #expect(js.contains("if (window.__tmLayoutVp)"))
+    }
+
+    @Test("fitViewportJS measures against the Swift-stamped device width")
+    func fitViewportUsesStampedWidth() {
+        let js = _fitViewportJS
+        // fit() stamps window.__tmDeviceWidth from webView.bounds.width
+        // immediately before running the script. At the device-width
+        // baseline 1 CSS px == 1 pt, so that IS the layout viewport —
+        // window.innerWidth is only a fallback (bug 170595 makes it
+        // untrustworthy after meta/bounds changes).
+        #expect(js.contains("window.__tmDeviceWidth || window.innerWidth"))
+    }
+
+    @Test("monitorHeightJS prefers stamped device width over innerWidth for vp")
+    func monitorHeightVpFallbackChain() {
+        let js = _monitorHeightJS
+        // Fallback chain: widened layout viewport (authoritative after a
+        // widen) → Swift-stamped device width (authoritative baseline) →
+        // innerWidth (only before the first fit() has stamped anything).
+        #expect(js.contains("window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth"))
+    }
+
+    @Test("viewportResetJS clears the layout-vp stamp so the next fit re-derives")
+    func viewportResetClearsStamp() {
+        let js = viewportResetJS(deviceWidth: 393)
+        // Without clearing __tmLayoutVp, fitViewportJS's idempotency guard
+        // would treat the post-width-change re-fit as a re-entry and bail,
+        // and monitorHeightJS would keep scaling against the stale widened
+        // viewport.
+        #expect(js.contains("window.__tmLayoutVp = 0"))
+        #expect(js.contains("window.__tmDeviceWidth = 393"))
+        #expect(js.contains("width=device-width"))
+        #expect(js.contains("initial-scale=1"))
+    }
+}
+
+// MARK: - ScrollFreezeGate
+
+/// `.serialized`: `end()` posts the global `.scrollFreezeReleased`
+/// notification, so two tests of this suite running in parallel would bump
+/// each other's observer counters.
+@Suite("ScrollFreezeGate", .serialized)
+struct ScrollFreezeGateTests {
+
+    @Test("begin/end transitions are idempotent")
+    func transitions() {
+        let gate = ScrollFreezeGate()
+        #expect(!gate.isFrozen)
+        gate.begin()
+        #expect(gate.isFrozen)
+        gate.begin() // double-begin stays frozen
+        #expect(gate.isFrozen)
+        gate.end()
+        #expect(!gate.isFrozen)
+        gate.end() // double-end stays released
+        #expect(!gate.isFrozen)
+    }
+
+    @Test("end posts scrollFreezeReleased exactly once per freeze")
+    func releaseNotification() {
+        let gate = ScrollFreezeGate()
+        let count = Mutex(0)
+        let obs = NotificationCenter.default.addObserver(
+            forName: .scrollFreezeReleased, object: nil, queue: nil
+        ) { _ in
+            count.withLock { $0 += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        gate.end() // not frozen — must not post
+        #expect(count.withLock { $0 } == 0)
+        gate.begin()
+        gate.end()
+        #expect(count.withLock { $0 } == 1)
+        gate.end() // already released — no double post
+        #expect(count.withLock { $0 } == 1)
+    }
+}
+
+// MARK: - HeightSeedCache
+
+@Suite("HeightSeedCache")
+struct HeightSeedCacheTests {
+
+    @Test("miss returns nil, set/get round-trips, overwrite wins")
+    func basicSemantics() {
+        let cache = HeightSeedCache()
+        #expect(cache["acct:INBOX:1"] == nil)
+        cache["acct:INBOX:1"] = 444
+        #expect(cache["acct:INBOX:1"] == 444)
+        cache["acct:INBOX:1"] = 1084 // re-measure after content change wins
+        #expect(cache["acct:INBOX:1"] == 1084)
+        #expect(cache["acct:INBOX:2"] == nil) // no cross-key bleed
+    }
+
+    @Test("overflow backstop clears rather than growing unbounded")
+    func overflowBackstop() {
+        let cache = HeightSeedCache()
+        // Push well past the cap. The exact eviction shape (clear-all) is an
+        // implementation detail; the contract is (a) no unbounded growth and
+        // (b) the most recent write is always retrievable — losing older
+        // seeds merely restores pre-cache behavior for those rows.
+        for i in 0..<1500 {
+            cache["msg:\(i)"] = CGFloat(i)
+        }
+        #expect(cache["msg:1499"] == 1499)
     }
 }
