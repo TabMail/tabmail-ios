@@ -321,6 +321,121 @@ struct InboxViewModelThreadEvictTests {
         #expect(vm.displayGroups[1].representative.id == ids[0]) // thread remnant m1 now second
     }
 
+    // MARK: - Stale expandedThreads pruning (non-evict removal pathways)
+
+    @Test("Removing a child outside evictAndRebuild prunes stale expandedThreads entry")
+    @MainActor func childRemovalPrunesExpandedThreads() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let ids = try insertMessages(pool, specs: [
+            ("m1", "Thread", baseDate, "thread-1", "alice@test.com"),
+            ("m2", "Thread", baseDate.addingTimeInterval(60), "thread-1", "bob@test.com"),
+        ], folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+
+        #expect(vm.displayGroups.count == 1)
+        guard vm.displayGroups.count == 1 else { return }
+        let groupId = vm.displayGroups[0].id
+        vm.toggleThreadExpansion(groupId)
+        #expect(vm.expandedThreads.contains(groupId))
+
+        // Remove the CHILD (m1, not the representative) directly from the DB —
+        // simulates detail-view archive, agent tool, or sync from another device:
+        // none of these go through evictAndRebuild.
+        _ = try await pool.writeWithoutTransaction { db in
+            try MessageHeader.deleteOne(db, key: ids[0])
+        }
+        await vm.reloadMessages()
+
+        // Thread shrank to a single message — the stale expansion entry must be
+        // pruned, otherwise the remaining row paints the expanded-thread
+        // background forever with no chevron to clear it.
+        #expect(vm.displayGroups.count == 1)
+        guard vm.displayGroups.count == 1 else { return }
+        #expect(vm.displayGroups[0].isThread == false)
+        #expect(!vm.expandedThreads.contains(groupId))
+    }
+
+    @Test("Removing an entire expanded thread prunes its expandedThreads entry")
+    @MainActor func threadRemovalPrunesExpandedThreads() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let ids = try insertMessages(pool, specs: [
+            ("m1", "Thread", baseDate, "thread-1", "alice@test.com"),
+            ("m2", "Thread", baseDate.addingTimeInterval(60), "thread-1", "bob@test.com"),
+            ("m3", "Solo", baseDate.addingTimeInterval(120), "solo-1", "carol@test.com"),
+        ], folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+
+        guard let group = vm.displayGroups.first(where: { $0.id == "thread-1" }) else {
+            Issue.record("thread-1 group missing")
+            return
+        }
+        vm.toggleThreadExpansion(group.id)
+        #expect(vm.expandedThreads.contains(group.id))
+
+        _ = try await pool.writeWithoutTransaction { db in
+            try MessageHeader.deleteOne(db, key: ids[0])
+        }
+        _ = try await pool.writeWithoutTransaction { db in
+            try MessageHeader.deleteOne(db, key: ids[1])
+        }
+        await vm.reloadMessages()
+
+        #expect(vm.expandedThreads.isEmpty)
+    }
+
+    @Test("Expanded thread that stays a thread after removal keeps its expansion")
+    @MainActor func survivingThreadKeepsExpansion() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let ids = try insertMessages(pool, specs: [
+            ("m1", "Thread", baseDate, "thread-1", "alice@test.com"),
+            ("m2", "Thread", baseDate.addingTimeInterval(60), "thread-1", "bob@test.com"),
+            ("m3", "Thread", baseDate.addingTimeInterval(120), "thread-1", "carol@test.com"),
+        ], folderId: folder.id)
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+
+        #expect(vm.displayGroups.count == 1)
+        guard vm.displayGroups.count == 1 else { return }
+        let groupId = vm.displayGroups[0].id
+        vm.toggleThreadExpansion(groupId)
+
+        // Remove one child — 2 members remain, still a thread.
+        _ = try await pool.writeWithoutTransaction { db in
+            try MessageHeader.deleteOne(db, key: ids[0])
+        }
+        await vm.reloadMessages()
+
+        #expect(vm.displayGroups.count == 1)
+        guard vm.displayGroups.count == 1 else { return }
+        #expect(vm.displayGroups[0].isThread == true)
+        #expect(vm.displayGroups[0].memberCount == 2)
+        // No over-pruning: the thread is still a thread and stays expanded.
+        #expect(vm.expandedThreads.contains(groupId))
+    }
+
     // MARK: - Grouped thread move (single undo entry)
 
     @Test("moveThread pushes ONE grouped undo entry covering all members")

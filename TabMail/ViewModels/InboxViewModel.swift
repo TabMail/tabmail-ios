@@ -1573,6 +1573,22 @@ final class InboxViewModel {
         }
         let newGroups = ThreadGroupBuilder.buildDisplayGroups(from: loadedMessages, mode: mode)
 
+        // Prune stale expansion state. Removal pathways that don't go through
+        // evictAndRebuild (child-row swipe, detail-view archive/delete, agent
+        // tools, sync from another device) can shrink an expanded thread to a
+        // single message or remove it entirely. A leftover id keeps painting
+        // the expanded-thread row background (looks like a stuck selection
+        // highlight) + hidden separators on the remaining row, and the chevron
+        // can no longer clear it — MessageRowView only renders the toggle for
+        // isThread rows. Prune here so every pathway self-heals on rebuild.
+        if !expandedThreads.isEmpty {
+            let threadIds = Set(newGroups.lazy.filter(\.isThread).map(\.id))
+            let pruned = expandedThreads.intersection(threadIds)
+            if pruned.count != expandedThreads.count {
+                expandedThreads = pruned
+            }
+        }
+
         // Fast path: first build or empty — just assign
         guard !displayGroups.isEmpty else {
             displayGroups = newGroups
