@@ -317,6 +317,115 @@ struct ProviderWorkQueueDynamicTests {
     }
 }
 
+@Suite("ProviderWorkQueue - Cancellation")
+struct ProviderWorkQueueCancellationTests {
+
+    @Test("Cancelled waiter throws CancellationError without running work")
+    func cancelledWaiterThrows() async throws {
+        let provider = WorkQueueMockProvider()
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+
+        let order = OrderTracker()
+
+        // Fill the single slot
+        let blocker = Task {
+            try? await queue.execute(priority: .bodyFetch) {
+                try? await Task.sleep(for: .milliseconds(300))
+                await order.record("blocker")
+            }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        // Queue a waiter, then cancel it while it waits for a slot.
+        // The closure returns a value to force the generic throwing overload —
+        // a bare Void closure resolves to the fire-and-forget variant, which is
+        // intentionally NOT cancellation-aware.
+        let waiter = Task {
+            do {
+                let _: Int = try await queue.execute(priority: .userAction) {
+                    await order.record("waiter-work")
+                    return 1
+                }
+                await order.record("waiter-completed")
+            } catch is CancellationError {
+                await order.record("waiter-cancelled")
+            } catch {
+                await order.record("waiter-other-error")
+            }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        waiter.cancel()
+        await waiter.value
+
+        // Cancellation must resolve BEFORE the blocker releases its slot —
+        // the waiter never gets a slot and its work never runs.
+        let early = await order.sequence
+        #expect(early == ["waiter-cancelled"], "Cancelled waiter should throw immediately, got \(early)")
+
+        await blocker.value
+        let sequence = await order.sequence
+        #expect(!sequence.contains("waiter-work"), "Cancelled waiter's work must not run")
+    }
+
+    @Test("Cancelled waiter does not corrupt slot accounting")
+    func cancelledWaiterSlotAccounting() async throws {
+        let provider = WorkQueueMockProvider()
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+
+        // Fill the single slot
+        let blocker = Task {
+            try? await queue.execute(priority: .bodyFetch) {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        // Queue and cancel a waiter (typed return forces the throwing overload)
+        let waiter = Task {
+            let _: Int = try await queue.execute(priority: .userAction) { 1 }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        waiter.cancel()
+        _ = try? await waiter.value
+
+        await blocker.value
+
+        // Queue must still grant slots normally after the cancelled waiter
+        let result = try await queue.execute(priority: .bodyFetch) { "alive" }
+        #expect(result == "alive")
+        #expect(await queue.activeOperations == 0)
+        #expect(await queue.waitingCount == 0)
+    }
+
+    @Test("Already-cancelled task throws before acquiring a slot")
+    func preCancelledTaskThrows() async throws {
+        let provider = WorkQueueMockProvider()
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 2)
+
+        let order = OrderTracker()
+        let task = Task {
+            // Ensure cancellation lands before execute is reached
+            try? await Task.sleep(for: .milliseconds(100))
+            do {
+                // Typed return forces the generic throwing (cancellation-aware) overload
+                let _: Int = try await queue.execute(priority: .userAction) {
+                    await order.record("work")
+                    return 1
+                }
+            } catch is CancellationError {
+                await order.record("cancelled")
+            }
+        }
+        task.cancel()
+        // The Task closure is throwing (queue.execute can rethrow non-cancellation
+        // errors past the CancellationError catch), so `.value` must be try'd.
+        _ = try? await task.value
+
+        let sequence = await order.sequence
+        #expect(sequence == ["cancelled"], "Pre-cancelled task must not run work, got \(sequence)")
+    }
+}
+
 /// Minimal mock provider for queue tests — no real network operations.
 private actor WorkQueueMockProvider: EmailProvider {
     func connect() async throws {}

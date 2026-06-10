@@ -315,6 +315,13 @@ enum ProviderError: LocalizedError {
     /// path increments a miss counter and after threshold deletes the local row,
     /// which would CASCADE delete the locally-cached body and lose user data.
     case syntheticPlaceholderId([String])
+    /// A TabMail-internal synthetic folder path (e.g. Gmail's `__GMAIL_ALL_MAIL__`)
+    /// leaked into a provider API request. Synthetic paths exist only in TabMail's
+    /// folder model and must be translated (or omitted) before reaching the wire —
+    /// the server rejects them anyway (Gmail: HTTP 400 "Invalid label"). Thrown at
+    /// the request boundary so the bug surfaces at its source, not as an opaque
+    /// network error.
+    case syntheticFolderPath(String)
 
     var errorDescription: String? {
         switch self {
@@ -325,6 +332,7 @@ enum ProviderError: LocalizedError {
         case .invalidURL(let url): return "Invalid URL: \(url)"
         case .uidResolutionFailed(let id): return "Could not resolve Message-ID '\(id)' to UID."
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
+        case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
         }
     }
 }

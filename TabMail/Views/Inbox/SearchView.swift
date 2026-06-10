@@ -24,8 +24,11 @@ struct SearchView: View {
     /// this at launch and discard results if the generation no longer matches,
     /// preventing stale results from a previous query leaking into the current one.
     @State private var searchGeneration: Int = 0
-    /// Current search window: remote search covers [searchAfter, searchBefore)
+    /// Current search window: remote search covers dates newer than this anchor
     @State private var searchAfter: Date?
+    /// True once the user has submitted a remote search for the current query text.
+    /// Lets a scope toggle re-run the remote search instead of requiring a re-submit.
+    @State private var hasSubmittedRemote = false
     @State private var navigationPath = NavigationPath()
     @FocusState private var isFieldFocused: Bool
 
@@ -253,12 +256,18 @@ struct SearchView: View {
             results = []
             hasSearched = false
             canLoadOlder = false
+            hasSubmittedRemote = false
             return
         }
 
         hasSearched = true
+        canLoadOlder = false
+        hasSubmittedRemote = false
         results = legacyLocalSearch(trimmed)
 
+        // Typing only searches locally (FTS). Remote search fires on submit
+        // (keyboard search key → triggerRemoteSearch) to avoid a network call
+        // per keystroke.
         debounceTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
@@ -271,10 +280,6 @@ struct SearchView: View {
             let searchResults = ftsResultsToSearchResults(ftsResults)
             let remoteResults = results.filter { $0.source == .remote }
             results = searchResults + remoteResults
-
-            try? await Task.sleep(for: .milliseconds(350))
-            guard !Task.isCancelled else { return }
-            triggerRemoteSearch()
         }
     }
 
@@ -282,7 +287,11 @@ struct SearchView: View {
     private func onScopeChanged() {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
+        let wasSubmitted = hasSubmittedRemote
         onQueryChanged(query)
+        // Scope toggle is an explicit tap, not a keystroke: if the user already
+        // submitted a remote search, re-run it against the new scope.
+        if wasSubmitted { triggerRemoteSearch() }
     }
 
     /// Fire time-scoped remote search for the current query
@@ -293,6 +302,10 @@ struct SearchView: View {
         searchTask?.cancel()
         pendingAccounts = 0
         hasSearched = true
+        hasSubmittedRemote = true
+        // Invalidate any in-flight wave (re-submit of the same query would otherwise
+        // share its generation, letting cancelled children corrupt pendingAccounts).
+        searchGeneration += 1
 
         let after = Calendar.current.date(byAdding: .day, value: -initialWindowDays, to: Date())!
         searchAfter = after
@@ -342,9 +355,19 @@ struct SearchView: View {
         pendingAccounts += searchFolders.count
         let generation = searchGeneration
 
+        // Cancelling searchTask (query change, dismiss, new submit) propagates to
+        // every per-folder child. Cancelled or failed folder searches resolve as
+        // empty results — whatever completed is merged. Children are unstructured
+        // Tasks with manual cancellation propagation because the Swift 6
+        // region-isolation checker rejects group.addTask closures capturing a
+        // SwiftUI view ("pattern that the region-based isolation checker does not
+        // understand").
         searchTask = Task {
-            for (account, folderPath) in searchFolders {
-                Task {
+            var children: [Task<Void, Never>] = []
+            for pair in searchFolders {
+                let account = pair.0
+                let folderPath = pair.1
+                children.append(Task { @MainActor in
                     let accountResults = await searchAccount(account, folder: folderPath, query: query, after: after, before: before)
                     guard searchGeneration == generation else { return }
                     if !accountResults.isEmpty {
@@ -355,19 +378,26 @@ struct SearchView: View {
                                 .map { ($0.messageId, $0.snippet) },
                             uniquingKeysWith: { first, _ in first }
                         )
+                        // Batch the GRDB snippet lookup: all results in this block
+                        // belong to `account`, so one async read covers every missing
+                        // snippet (was 2 blocking reads per result on the main actor).
+                        let needLookup = accountResults
+                            .filter { $0.snippet.isEmpty && localSnippets[$0.messageId] == nil }
+                            .map(\.messageId)
+                        let dbSnippets: [String: String] = needLookup.isEmpty ? [:] : (try? await AppDatabase.dbPool.read { db in
+                            let headers = try MessageHeader
+                                .filter(needLookup.contains(Column("messageId")) && Column("accountId") == account.id)
+                                .fetchAll(db)
+                            return Dictionary(headers.map { ($0.messageId, $0.snippet) },
+                                              uniquingKeysWith: { first, _ in first })
+                        }) ?? [:]
+                        // The async read suspended — re-check the wave is still current
+                        // before merging (query may have changed mid-lookup).
+                        guard searchGeneration == generation else { return }
                         let enriched: [SearchResult] = accountResults.map { result in
                             guard result.snippet.isEmpty else { return result }
-                            // Try local snippet first, then GRDB lookup scoped by account
-                            let snippet = localSnippets[result.messageId] ?? {
-                                let acct = try? AppDatabase.dbPool.read { db in
-                                    try Account.filter(Column("emailAddress") == result.accountEmail).fetchOne(db)
-                                }
-                                guard let accountId = acct?.id else { return "" }
-                                let header = try? AppDatabase.dbPool.read { db in
-                                    try MessageHeader.filter(Column("messageId") == result.messageId && Column("accountId") == accountId).fetchOne(db)
-                                }
-                                return header?.snippet ?? ""
-                            }()
+                            // Try local snippet first, then the batched GRDB lookup
+                            let snippet = localSnippets[result.messageId] ?? dbSnippets[result.messageId] ?? ""
                             guard !snippet.isEmpty else { return result }
                             return SearchResult(source: result.source, accountEmail: result.accountEmail,
                                 messageId: result.messageId, subject: result.subject, from: result.from,
@@ -384,7 +414,13 @@ struct SearchView: View {
                     if pendingAccounts == 0 {
                         isLoadingOlder = false
                     }
-                }
+                })
+            }
+            let kids = children
+            await withTaskCancellationHandler {
+                for child in kids { await child.value }
+            } onCancel: {
+                for child in kids { child.cancel() }
             }
         }
     }
@@ -495,16 +531,21 @@ struct SearchView: View {
             try await Task.sleep(for: perAccountTimeout)
             searchTask.cancel()
         }
+        defer { timeoutTask.cancel() }
 
         let infos: [MessageHeaderInfo]
         do {
-            infos = try await searchTask.value
-            timeoutTask.cancel()
+            // Forward caller cancellation (query change, dismiss, new submit) into
+            // the inner search task — a cancelled search resolves as empty results.
+            infos = try await withTaskCancellationHandler {
+                try await searchTask.value
+            } onCancel: {
+                searchTask.cancel()
+            }
         } catch is CancellationError {
-            print("[Search] Timeout searching \(email)")
+            print("[Search] Cancelled/timed out searching \(email) — treating as empty")
             return []
         } catch {
-            timeoutTask.cancel()
             print("[Search] Error searching \(email): \(error)")
             return []
         }

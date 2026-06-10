@@ -10,6 +10,12 @@ actor GmailProvider: EmailProvider {
     /// Synthetic folder path for Gmail's "All Mail" (archive). Gmail has no real archive label.
     static let archivePath = "__GMAIL_ALL_MAIL__"
 
+    /// Query-exclusion translation of the synthetic All Mail folder: messages not
+    /// in inbox, sent, trash, spam, or drafts. Every folder-scoped method MUST use
+    /// this (and omit `labelIds`) when `folder == archivePath` — the synthetic path
+    /// is not a real Gmail label ID and the API rejects it with 400 "Invalid label".
+    static let allMailExclusionQuery = "-in:inbox -in:sent -in:trash -in:spam -in:draft"
+
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let userEmail: String
     private let baseURL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -124,7 +130,7 @@ actor GmailProvider: EmailProvider {
         var path: String
         if folder == GmailProvider.archivePath {
             // "All Mail" archive: messages not in inbox, sent, trash, spam, or drafts
-            let q = "-in:inbox -in:sent -in:trash -in:spam -in:draft"
+            let q = GmailProvider.allMailExclusionQuery
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
             path = "/messages?q=\(encoded)&maxResults=\(limit)"
         } else {
@@ -347,21 +353,35 @@ actor GmailProvider: EmailProvider {
             let epoch = Int(before.timeIntervalSince1970)
             q += " before:\(epoch)"
         }
+        // Synthetic "All Mail" folder is NOT a valid Gmail label ID — passing it as
+        // labelIds returns HTTP 400 "Invalid label". Scope via query exclusions
+        // instead, same translation as fetchMessages/listBackfillMessageIds.
+        if folder == GmailProvider.archivePath {
+            q += " " + GmailProvider.allMailExclusionQuery
+        }
         let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
         // Scope to folder using labelIds parameter (works for both system and custom labels)
-        let labelParam = folder.isEmpty ? "" : "&labelIds=\(folder)"
+        let labelParam = (folder.isEmpty || folder == GmailProvider.archivePath) ? "" : "&labelIds=\(folder)"
         let data = try await request(path: "/messages?q=\(encoded)&maxResults=20\(labelParam)")
         let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
 
         guard let messageRefs = listResponse.messages else { return [] }
 
-        var headers: [MessageHeaderInfo] = []
-        for ref in messageRefs {
-            let msgData = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
-            let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-            if let header = parseGmailMessage(msg) {
-                headers.append(header)
+        // Fetch headers concurrently — same pattern as fetchMessages. Sequential
+        // gets (20 × ~400ms) approached the search UI's per-account timeout.
+        let headers: [MessageHeaderInfo] = try await withThrowingTaskGroup(of: MessageHeaderInfo?.self) { group in
+            for ref in messageRefs {
+                group.addTask {
+                    let msgData = try await self.request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
+                    let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
+                    return await self.parseGmailMessage(msg)
+                }
             }
+            var result: [MessageHeaderInfo] = []
+            for try await header in group {
+                if let header { result.append(header) }
+            }
+            return result
         }
 
         return headers
@@ -559,7 +579,7 @@ actor GmailProvider: EmailProvider {
             var query = "after:\(sinceEpoch)"
             if let before { query += " before:\(Int(before.timeIntervalSince1970))" }
             if folder == GmailProvider.archivePath {
-                query += " -in:inbox -in:sent -in:trash -in:spam -in:draft"
+                query += " " + GmailProvider.allMailExclusionQuery
             }
             let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
             var path: String
@@ -688,7 +708,7 @@ actor GmailProvider: EmailProvider {
         let beforeEpoch = Int(before.timeIntervalSince1970)
         let requestPath: String
         if folder == GmailProvider.archivePath {
-            let q = "-in:inbox -in:sent -in:trash -in:spam -in:draft before:\(beforeEpoch)"
+            let q = GmailProvider.allMailExclusionQuery + " before:\(beforeEpoch)"
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
             requestPath = "/messages?maxResults=\(limit)&q=\(encoded)"
         } else {
@@ -712,7 +732,7 @@ actor GmailProvider: EmailProvider {
 
         var path: String
         if folder == GmailProvider.archivePath {
-            let q = "-in:inbox -in:sent -in:trash -in:spam -in:draft"
+            let q = GmailProvider.allMailExclusionQuery
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
             path = "/messages?maxResults=\(pageSize)&q=\(encoded)"
         } else {
@@ -732,7 +752,7 @@ actor GmailProvider: EmailProvider {
         let beforeEpoch = Int(before.timeIntervalSince1970)
         let requestPath: String
         if folder == GmailProvider.archivePath {
-            let q = "-in:inbox -in:sent -in:trash -in:spam -in:draft before:\(beforeEpoch)"
+            let q = GmailProvider.allMailExclusionQuery + " before:\(beforeEpoch)"
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
             requestPath = "/messages?maxResults=\(limit)&q=\(encoded)"
         } else {
@@ -872,6 +892,14 @@ actor GmailProvider: EmailProvider {
     /// inline 401-retry + rate-limit logic deleted — that's the shared
     /// `AuthedHTTP` path now.
     private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+        // Boundary guard: TabMail's synthetic "All Mail" path is not a real Gmail
+        // label ID. Callers must translate it (query exclusions, no labelIds) before
+        // building a request — Gmail returns HTTP 400 "Invalid label" otherwise.
+        // Mirrors the syntheticPlaceholderId guard in fetchMessagesBatch.
+        if path.contains(GmailProvider.archivePath) {
+            print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)")
+            throw ProviderError.syntheticFolderPath(path)
+        }
         let url = baseURL + path
         do {
             switch method {

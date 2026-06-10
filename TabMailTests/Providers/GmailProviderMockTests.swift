@@ -424,6 +424,136 @@ struct GmailProviderMockTests {
         #expect(info.attachments[0].filename == zipFilename)
         #expect(info.attachments[0].parentEmlSection == nil)
     }
+
+    // MARK: - search() folder scoping
+
+    @Test("search with synthetic All Mail folder omits labelIds and uses exclusion query")
+    func searchAllMailUsesExclusionQuery() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        FakeHTTP.register(
+            path: "/messages?q=",
+            method: "GET",
+            response: .json(raw: #"{"messages": []}"#)
+        )
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        let results = try await provider.search(
+            query: "hello", folder: GmailProvider.archivePath,
+            after: nil, before: nil, from: nil, to: nil
+        )
+        #expect(results.isEmpty)
+
+        let calls = FakeHTTP.recordedCalls()
+        #expect(calls.count == 1)
+        guard let url = calls.first?.url else { return }
+        // The synthetic path must never reach the API (Gmail: 400 "Invalid label")
+        #expect(!url.contains("labelIds"), "All Mail search must not send labelIds: \(url)")
+        #expect(!url.contains(GmailProvider.archivePath), "Synthetic path leaked into URL: \(url)")
+        // Scoped via query exclusions instead (percent-encoded "-in:inbox" etc.)
+        #expect(url.contains("-in:inbox") || url.contains("-in%3Ainbox"), "Missing exclusion query: \(url)")
+    }
+
+    @Test("search fetches and parses headers for returned refs (parallel path)")
+    func searchFetchesHeaders() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        FakeHTTP.register(
+            path: "/messages?q=",
+            method: "GET",
+            response: .json(raw: #"{"messages": [{"id": "s-1", "threadId": "t-1"}, {"id": "s-2", "threadId": "t-2"}]}"#)
+        )
+        for (id, subject) in [("s-1", "First hit"), ("s-2", "Second hit")] {
+            FakeHTTP.register(
+                path: "/messages/\(id)",
+                method: "GET",
+                response: .json(raw: makeGmailMessageJSON(
+                    id: id,
+                    internalDateMs: "1700000000000",
+                    topLevelMimeType: "multipart/alternative",
+                    payloadHeaders: [
+                        ("Subject", subject),
+                        ("From", "sender@example.com"),
+                        ("Date", "Wed, 2 Oct 2025 01:50:00 +0000")
+                    ],
+                    parts: [.html(body: "<p>body</p>")]
+                ))
+            )
+        }
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        let results = try await provider.search(
+            query: "hit", folder: "INBOX",
+            after: nil, before: nil, from: nil, to: nil
+        )
+
+        #expect(results.count == 2)
+        let subjects = Set(results.map(\.subject))
+        #expect(subjects == ["First hit", "Second hit"])
+        // 1 list call + 2 per-message gets
+        #expect(FakeHTTP.recordedCalls().count == 3)
+    }
+
+    @Test("search with real label passes labelIds")
+    func searchRealLabelPassesLabelIds() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        FakeHTTP.register(
+            path: "/messages?q=",
+            method: "GET",
+            response: .json(raw: #"{"messages": []}"#)
+        )
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        _ = try await provider.search(
+            query: "hello", folder: "INBOX",
+            after: nil, before: nil, from: nil, to: nil
+        )
+
+        let calls = FakeHTTP.recordedCalls()
+        #expect(calls.count == 1)
+        guard let url = calls.first?.url else { return }
+        #expect(url.contains("labelIds=INBOX"), "Real label must be passed as labelIds: \(url)")
+    }
+
+    @Test("request boundary guard rejects leaked synthetic folder path without network call")
+    func syntheticFolderPathGuard() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        // A folder string that bypasses exact-match translation but still carries
+        // the sentinel — simulates a future call site forgetting the translation.
+        await #expect(throws: ProviderError.self) {
+            _ = try await provider.fetchMessages(
+                folder: "\(GmailProvider.archivePath)/sub", limit: 5, offset: 0
+            )
+        }
+        #expect(FakeHTTP.recordedCalls().isEmpty, "Guard must reject before any network call")
+    }
 }
 
 // MARK: - Fixture builder

@@ -39,6 +39,16 @@
 - **Batch checkout**: `pool.checkoutBatch(count:)` for parallel body fetch — replaces `createTempConnections`
 - Gmail/Exchange HTTP providers unaffected — URLSession handles connection pooling natively
 
+### ProviderWorkQueue Cancellation Semantics (2026-06-09)
+- The **throwing** `execute<T>` overload is cancellation-aware: a task cancelled while waiting for a slot throws `CancellationError` immediately — the waiter entry is removed, no slot is consumed, and `work` never runs. Before this, cancelled waiters (e.g. abandoned remote searches) queued up in tier 0 ahead of real user actions and still executed doomed network calls — the cause of the 2026-06 search-mode hang.
+- The **non-throwing** (fire-and-forget) `execute` overload intentionally keeps the old behavior: always waits, always runs.
+- **Overload-resolution gotcha:** a non-throwing `Void` closure resolves to the fire-and-forget overload even when written with `try await`. To get the cancellation-aware path, the closure must throw or return a value (tests force this with `let _: Int = try await queue.execute { ...; return 1 }`).
+
+### Remote Search (SearchView)
+- Typing only searches locally (legacy string match + FTS after 150 ms debounce). **Remote search fires only on keyboard submit** (`triggerRemoteSearch`) — never per keystroke.
+- The per-folder remote fan-out runs as child tasks whose cancellation is propagated manually from `searchTask` (the Swift 6 region-isolation checker rejects `group.addTask` closures capturing a SwiftUI view). Cancelled/failed/timed-out folder searches resolve as empty results; whatever completed is merged.
+- `triggerRemoteSearch` bumps `searchGeneration` so a re-submit of the same query invalidates the previous wave (otherwise stale children corrupt the `pendingAccounts` counter).
+
 ### GRDB Persistence
 - All persistence via GRDB `DatabasePool` (`AppDatabase.swift`) — thread-safe concurrent readers, serialized writers via WAL journal mode
 - `dbPool.write { db in ... }` for mutations, `dbPool.read { db in ... }` for queries
@@ -166,6 +176,7 @@
 - `Account.lastHistoryId` stores the Gmail history cursor; captured after each full sync via `getCurrentHistoryId()`
 - **Gmail IMAP keywords ≠ Gmail REST API labels**: Gmail does NOT create REST API labels from IMAP keywords set via `STORE +FLAGS`. (Historical context — iOS no longer writes either; see ADR-IOS-036.)
 - **Action tags are local-only (ADR-IOS-036).** iOS does NOT write `tm_*` Gmail labels / IMAP keywords / Exchange categories. `MessageHeader.actionTag` is populated by `MessageAICache.restoreIfCached` + AIService only; never from provider labels. Cross-instance state is served by Device Sync `ai_cache_probe` when peers are online, and iOS re-runs the LLM when they're not. Any `tm_*` labels still present on user servers from prior TabMail versions are treated as residue and filtered by `UserLabelStore.shouldExcludeLabel` (which matches the `tm_` prefix).
+- **Synthetic `__GMAIL_ALL_MAIL__` must NEVER reach the Gmail API** — it is TabMail's internal All Mail/archive folder path (`GmailProvider.archivePath`), not a real label ID; Gmail returns 400 "Invalid label". Every method that scopes by folder must translate it: omit `labelIds` and add `GmailProvider.allMailExclusionQuery` to `q` (see `fetchMessages`, `search`, `listBackfillMessageIds`, `listOlderMessageIds`, `listMessageIdsPage`, `fetchOlderMessages`). `GmailProvider.request()` has a boundary guard that throws `ProviderError.syntheticFolderPath` if the sentinel leaks into an API path (caught a real bug 2026-06-09: `search()` was missing the translation, breaking remote search and contributing to a search-mode hang).
 
 ### SwiftUI Observable Array Mutation Safety
 - **NEVER remove items from an `@Observable` array synchronously during a lifecycle callback (`onAppear`/`onDisappear`) when that array feeds the same `ForEach`** — SwiftUI is mid-layout and will crash
