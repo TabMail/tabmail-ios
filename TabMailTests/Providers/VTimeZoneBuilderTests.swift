@@ -9,6 +9,29 @@ import Foundation
 @Suite("VTimeZoneBuilder")
 struct VTimeZoneBuilderTests {
 
+    /// First IANA zone whose tzdata still has a regular cadence of future DST
+    /// transitions (≥2 upcoming). Hardcoding a single zone breaks when tzdata
+    /// adopts permanent-time legislation — America/Vancouver went permanent-PDT
+    /// in 2026 (no future transitions, fixed -0700) and broke the hardcoded
+    /// version of these tests. Returns nil if every candidate has gone
+    /// fixed-offset; callers then return early — the two-component VTIMEZONE
+    /// path is unreachable for such a world, in production too.
+    private static func zoneObservingDST() -> TimeZone? {
+        let candidates = [
+            "America/New_York", "America/Chicago", "America/Vancouver",
+            "Europe/Berlin", "Europe/Paris", "Europe/London",
+            "Australia/Sydney", "Pacific/Auckland",
+        ]
+        for id in candidates {
+            guard let tz = TimeZone(identifier: id),
+                  let first = tz.nextDaylightSavingTimeTransition(after: Date()),
+                  tz.nextDaylightSavingTimeTransition(after: first) != nil
+            else { continue }
+            return tz
+        }
+        return nil
+    }
+
     @Test("formatOffset renders RFC 5545 ±HHMM")
     func formatOffset() {
         #expect(VTimeZoneBuilder.formatOffset(0) == "+0000")
@@ -20,17 +43,24 @@ struct VTimeZoneBuilderTests {
 
     @Test("a DST zone produces both DAYLIGHT and STANDARD components with yearly RRULEs")
     func dstZone() throws {
-        let tz = try #require(TimeZone(identifier: "America/Vancouver"))
+        guard let tz = Self.zoneObservingDST() else { return }
         let block = try #require(VTimeZoneBuilder.vtimezone(for: tz))
         let text = block.joined(separator: "\n")
         #expect(block.first == "BEGIN:VTIMEZONE")
         #expect(block.last == "END:VTIMEZONE")
-        #expect(text.contains("TZID:America/Vancouver"))
+        #expect(text.contains("TZID:\(tz.identifier)"))
         #expect(text.contains("BEGIN:DAYLIGHT"))
         #expect(text.contains("BEGIN:STANDARD"))
-        // Pacific time: standard -0800, daylight -0700.
-        #expect(text.contains("TZOFFSETTO:-0800"))
-        #expect(text.contains("TZOFFSETTO:-0700"))
+        // The two TZOFFSETTO values are the zone's offsets just after each of
+        // the next two transitions — derived from the TimeZone API, not from
+        // the builder's own logic.
+        let first = try #require(tz.nextDaylightSavingTimeTransition(after: Date()))
+        let second = try #require(tz.nextDaylightSavingTimeTransition(after: first))
+        let expected = Set([
+            "TZOFFSETTO:" + VTimeZoneBuilder.formatOffset(tz.secondsFromGMT(for: first.addingTimeInterval(1))),
+            "TZOFFSETTO:" + VTimeZoneBuilder.formatOffset(tz.secondsFromGMT(for: second.addingTimeInterval(1))),
+        ])
+        #expect(Set(block.filter { $0.hasPrefix("TZOFFSETTO:") }) == expected)
         // Recurring transition rules.
         #expect(text.contains("RRULE:FREQ=YEARLY;BYMONTH="))
         // Every BEGIN has a matching END.
@@ -66,7 +96,7 @@ struct VTimeZoneBuilderTests {
         // (future) transition, an event earlier than it would have no
         // resolvable offset — an RRULE only generates instances forward from
         // DTSTART. Every STANDARD/DAYLIGHT DTSTART must therefore be in the past.
-        let tz = try #require(TimeZone(identifier: "America/New_York"))
+        guard let tz = Self.zoneObservingDST() else { return }
         let block = try #require(VTimeZoneBuilder.vtimezone(for: tz))
         let dtstarts = block
             .filter { $0.hasPrefix("DTSTART:") }
@@ -83,7 +113,7 @@ struct VTimeZoneBuilderTests {
     func dtstartMatchesRRule() throws {
         // RFC 5545: DTSTART must be synchronized with the RRULE. The anchored
         // onset date must actually fall on the weekday + month the rule names.
-        let tz = try #require(TimeZone(identifier: "America/New_York"))
+        guard let tz = Self.zoneObservingDST() else { return }
         let block = try #require(VTimeZoneBuilder.vtimezone(for: tz))
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -110,12 +140,12 @@ struct VTimeZoneBuilderTests {
     func transitionsAreConsistent() throws {
         // For a 2-transition zone, the DAYLIGHT's FROM is the STANDARD's TO and
         // vice versa — the offsets must be internally consistent.
-        let tz = try #require(TimeZone(identifier: "America/New_York"))
+        guard let tz = Self.zoneObservingDST() else { return }
         let block = try #require(VTimeZoneBuilder.vtimezone(for: tz))
         let froms = block.filter { $0.hasPrefix("TZOFFSETFROM:") }.map { String($0.dropFirst("TZOFFSETFROM:".count)) }
         let tos = block.filter { $0.hasPrefix("TZOFFSETTO:") }.map { String($0.dropFirst("TZOFFSETTO:".count)) }
         #expect(froms.count == 2 && tos.count == 2)
         #expect(Set(froms) == Set(tos), "the two components' FROM/TO offsets must be the same pair, swapped")
-        #expect(Set(tos) == Set(["-0500", "-0400"]), "US Eastern is EST -0500 / EDT -0400")
+        #expect(Set(tos).count == 2, "standard and daylight offsets must be distinct")
     }
 }
