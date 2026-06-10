@@ -100,14 +100,18 @@ enum EmailFilter {
     }
 
     /// Matches TB's isNoReplyAddress() in messagePrefilter.js — same pattern list.
+    /// When adding patterns, add tests — but NEVER with real-world sender
+    /// addresses (real companies/orgs/domains); use generic placeholder domains.
     static func isNoReply(_ address: String) -> Bool {
         let lower = address.lowercased()
         // TB checks: noreply, no-reply, no_reply, donotreply, do-not-reply, do_not_reply,
+        // auto-confirm, auto_confirm, autoconfirm,
         // notifications, automated, invitations, announcements, updates, newsletters,
         // newsletter, digests, digest
         let patterns = [
             "noreply", "no-reply", "no_reply",
             "donotreply", "do-not-reply", "do_not_reply",
+            "auto-confirm", "auto_confirm", "autoconfirm",
             "notifications", "automated", "invitations",
             "announcements", "updates", "newsletters",
             "newsletter", "digests", "digest",

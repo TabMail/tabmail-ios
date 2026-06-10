@@ -24,6 +24,18 @@ struct EmailFilterTests {
         #expect(EmailFilter.isNoReply("newsletters@company.com") == true)
     }
 
+    // NEVER use real-world sender addresses (real companies/orgs/domains) in
+    // tests — generic placeholder domains only (company.com, example.com).
+    @Test("isNoReply detects auto-confirm and embedded-noreply senders")
+    func isNoReplyAutoConfirm() {
+        #expect(EmailFilter.isNoReply("auto-confirm@company.com") == true)
+        #expect(EmailFilter.isNoReply("auto_confirm@company.com") == true)
+        #expect(EmailFilter.isNoReply("autoconfirm@company.com") == true)
+        // Embedded noreply substrings — caught by the existing "noreply" pattern
+        #expect(EmailFilter.isNoReply("noreply-dmarc-report@company.com") == true)
+        #expect(EmailFilter.isNoReply("payments-noreply@company.com") == true)
+    }
+
     @Test("isNoReply passes normal addresses")
     func isNoReplyPassesNormal() {
         #expect(EmailFilter.isNoReply("user@company.com") == false)
