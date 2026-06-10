@@ -84,6 +84,24 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// Epoch zero — used for new devices that have no per-field timestamps yet.
     private static let epochZero = "1970-01-01T00:00:00.000Z"
 
+    /// Log-safe rendering of a transport error. URLSession errors carry the
+    /// failing URL in userInfo (`NSErrorFailingURLStringKey`) — for this
+    /// service that URL embeds the auth token as a query parameter
+    /// (`ws?token=JWT`), so interpolating the raw error leaked a live
+    /// credential into the console capture (observed 2026-06-09). Render only
+    /// domain + code + description, with any query string stripped
+    /// defensively. Use this for EVERY error originating from the WebSocket /
+    /// URLSession layer; never interpolate those errors raw.
+    nonisolated static func redactedTransportError(_ error: any Error) -> String {
+        let ns = error as NSError
+        let redactedDescription = ns.localizedDescription.replacingOccurrences(
+            of: #"\?[^\s"'\)]+"#,
+            with: "?<redacted>",
+            options: .regularExpression
+        )
+        return "\(ns.domain) code=\(ns.code) \(redactedDescription)"
+    }
+
     private override init() {
         super.init()
     }
@@ -117,8 +135,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         didCompleteWithError error: (any Error)?
     ) {
         if let error {
-            DeviceSyncLogger.log("WS_ERROR \(error.localizedDescription)")
-            print("[DeviceSync] Task completed with error: \(error)")
+            let redacted = Self.redactedTransportError(error)
+            DeviceSyncLogger.log("WS_ERROR \(redacted)")
+            print("[DeviceSync] Task completed with error: \(redacted)")
             if let httpResponse = task.response as? HTTPURLResponse {
                 print("[DeviceSync] HTTP status: \(httpResponse.statusCode)")
                 print("[DeviceSync] HTTP headers: \(httpResponse.allHeaderFields)")
@@ -444,7 +463,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let data = try? JSONSerialization.data(withJSONObject: msg),
            let text = String(data: data, encoding: .utf8) {
             ws.send(.string(text)) { error in
-                if let error { print("[DeviceSync] request_state send failed: \(error)") }
+                if let error { print("[DeviceSync] request_state send failed: \(Self.redactedTransportError(error))") }
             }
         }
         print("[DeviceSync] Requested state from peers for fields: \(fields)")
@@ -528,7 +547,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             let payload = try encoder.encode(msg)
             let text = String(data: payload, encoding: .utf8) ?? "{}"
             ws.send(.string(text)) { error in
-                if let error { print("[DeviceSync] Failed to send: \(error)") }
+                if let error { print("[DeviceSync] Failed to send: \(Self.redactedTransportError(error))") }
             }
         } catch {
             print("[DeviceSync] Failed to encode state: \(error)")
@@ -556,7 +575,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 // awaiting, this error is from a stale connection — don't touch state.
                 guard webSocket === ws else { return }
                 if !intentionalDisconnect {
-                    print("[DeviceSync] WebSocket receive error: \(error)")
+                    print("[DeviceSync] WebSocket receive error: \(Self.redactedTransportError(error))")
                 }
                 isConnecting = false
                 isConnected = false
@@ -953,7 +972,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let data = try? JSONSerialization.data(withJSONObject: probe),
            let text = String(data: data, encoding: .utf8) {
             ws.send(.string(text)) { error in
-                if let error { print("[DeviceSync] AI cache probe send failed: \(error)") }
+                if let error { print("[DeviceSync] AI cache probe send failed: \(Self.redactedTransportError(error))") }
             }
         }
         DeviceSyncLogger.log("PROBE_SEND WSS keys=[\(keys.joined(separator: ", "))] probeId=\(probeId.prefix(8)) timeout=\(timeoutMs)ms")
@@ -1002,7 +1021,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             if let data = try? JSONSerialization.data(withJSONObject: response),
                let text = String(data: data, encoding: .utf8) {
                 ws.send(.string(text)) { error in
-                    if let error { print("[DeviceSync] AI cache response send failed: \(error)") }
+                    if let error { print("[DeviceSync] AI cache response send failed: \(Self.redactedTransportError(error))") }
                 }
             }
             let hitKeys = Array(results.keys)
@@ -1029,7 +1048,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         guard let ws = webSocket else { return }
         let msg = #"{"type":"ping"}"#
         ws.send(.string(msg)) { error in
-            if let error { print("[DeviceSync] Ping failed: \(error)") }
+            if let error { print("[DeviceSync] Ping failed: \(Self.redactedTransportError(error))") }
         }
     }
 

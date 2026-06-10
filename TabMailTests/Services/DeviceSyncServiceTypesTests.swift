@@ -223,3 +223,44 @@ struct AICacheResultExtendedTests {
         #expect(decoded.reply == nil)
     }
 }
+
+// MARK: - Transport error redaction
+
+/// URLSession errors carry the failing URL in userInfo, and the DeviceSync
+/// WebSocket URL embeds the auth token as a query parameter — interpolating
+/// the raw error leaked a live Supabase JWT into the console capture
+/// (observed 2026-06-09). Every WS-layer log site must go through
+/// `redactedTransportError`.
+@Suite("DeviceSync transport error redaction")
+struct DeviceSyncErrorRedactionTests {
+
+    @Test("Failing-URL token query never reaches the log string")
+    func tokenStrippedFromFailingURL() {
+        let leakyURL = "wss://sync.tabmail.ai/ws?token=eyJhbGciOiJFUzI1NiJ9.SECRET.SIG"
+        let error = NSError(
+            domain: NSURLErrorDomain,
+            code: NSURLErrorCancelled,
+            userInfo: [
+                NSURLErrorFailingURLStringErrorKey: leakyURL,
+                NSLocalizedDescriptionKey: "cancelled \(leakyURL)",
+            ]
+        )
+
+        let rendered = DeviceSyncService.redactedTransportError(error)
+
+        #expect(!rendered.contains("token="))
+        #expect(!rendered.contains("SECRET"))
+        #expect(rendered.contains(NSURLErrorDomain))
+        #expect(rendered.contains("\(NSURLErrorCancelled)"))
+    }
+
+    @Test("Plain errors render domain, code, and description")
+    func plainErrorRendered() {
+        let error = NSError(
+            domain: "TestDomain", code: 42,
+            userInfo: [NSLocalizedDescriptionKey: "something broke"]
+        )
+        let rendered = DeviceSyncService.redactedTransportError(error)
+        #expect(rendered == "TestDomain code=42 something broke")
+    }
+}
