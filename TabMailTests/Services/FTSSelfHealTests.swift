@@ -195,3 +195,67 @@ struct FTSSelfHealTests {
         try await index.removeMessages(headerIds: [header.id])
     }
 }
+
+// MARK: - Candidate scope (non-inbox coverage)
+
+/// Locks the heal's candidate contract. Pre-rekeyHeaders UID remaps produced
+/// the stuck state (bodyComplete=1, missing from FTS) on MOVED — i.e.
+/// non-inbox — messages; the heal was originally inbox-scoped and silently
+/// skipped exactly those rows.
+@Suite("FTS Self-Heal candidate scope")
+struct FTSSelfHealCandidateScopeTests {
+
+    @Test("Candidate query includes non-inbox stuck rows (UID-remap ghosts)")
+    func candidateQueryCoversNonInbox() async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        let archived = try TestDatabase.insertMessageHeader(
+            db, messageId: "nonbox_1",
+            folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive",
+            isInInbox: false
+        )
+        let inboxed = try TestDatabase.insertMessageHeader(
+            db, messageId: "inbox_1",
+            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX",
+            isInInbox: true
+        )
+        try await db.write { conn in
+            for id in [archived.id, inboxed.id] {
+                try conn.execute(
+                    sql: "UPDATE messageHeader SET bodyComplete = 1, headerComplete = 1 WHERE id = ?",
+                    arguments: [id]
+                )
+            }
+        }
+
+        // The EXACT SQL the heal runs — shared constant, not a copy.
+        let candidates: [String] = try await db.read { conn in
+            try String.fetchAll(conn, sql: SyncEngine.ftsBodyMembershipCandidateSQL)
+        }
+        #expect(candidates.contains(archived.id))
+        #expect(candidates.contains(inboxed.id))
+    }
+
+    @Test("Candidate query excludes rows without bodyComplete")
+    func candidateQueryExcludesIncomplete() async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        let pending = try TestDatabase.insertMessageHeader(db, messageId: "pending_1")
+        try await db.write { conn in
+            try conn.execute(
+                sql: "UPDATE messageHeader SET bodyComplete = 0, headerComplete = 1 WHERE id = ?",
+                arguments: [pending.id]
+            )
+        }
+
+        let candidates: [String] = try await db.read { conn in
+            try String.fetchAll(conn, sql: SyncEngine.ftsBodyMembershipCandidateSQL)
+        }
+        #expect(!candidates.contains(pending.id))
+    }
+}

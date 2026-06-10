@@ -118,7 +118,8 @@ struct SelfHealBackfillFTSTests {
     func skipsRowsOutOfScope_bodyComplete() async throws {
         // The backfill self-heal scope is deliberately narrow: `headerComplete=1
         // AND bodyComplete=0 AND !bodyEmptyConfirmed`. Rows with bodyComplete=1
-        // are handled by the INBOX-scoped `selfHealFTSBodyMembership` instead.
+        // are handled by `selfHealFTSBodyMembership` instead (all folders,
+        // most-recent-first — see FTSSelfHealCandidateScopeTests).
         // This test pins the scope — if someone broadens the SQL it'll catch it.
         let engine = SyncEngine()
         let headerId = try await insertHeaderMissingFromFTS(

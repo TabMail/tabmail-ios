@@ -69,6 +69,23 @@ extension SyncEngine {
     /// Fix: re-index the header via `indexHeadersForFTS`, reset `bodyComplete=0`
     /// so the body queue re-fetches and writes the FTS body row. Runs once per
     /// startup. Cheap in the steady state (0 orphans).
+    ///
+    /// NOT inbox-scoped: pre-rekeyHeaders UID remaps produced this exact state
+    /// on MOVED (non-inbox) messages — the header was re-keyed while its FTS
+    /// entry stayed under the dead old id. New occurrences are prevented by
+    /// `SearchIndex.rekeyHeaders`; this sweep heals the leftovers. The bound
+    /// samples most-recent-first so each launch covers the rows users actually
+    /// search, converging over a few launches for large mailboxes.
+    ///
+    /// The SQL is a shared constant so `FTSSelfHealTests` locks the exact
+    /// candidate contract (a reintroduced `isInInbox` filter must fail a test).
+    static let ftsBodyMembershipCandidateSQL = """
+        SELECT id FROM messageHeader
+        WHERE bodyComplete = 1 AND headerComplete = 1
+        ORDER BY date DESC
+        LIMIT 2000
+        """
+
     func selfHealFTSBodyMembership() async {
         do {
             // Fetch only IDs first. The steady state has 0 missing from FTS, so
@@ -76,11 +93,7 @@ extension SyncEngine {
             // to extract `.id` is wasted allocation on every launch. Full rows
             // are loaded lazily below only for the missing subset.
             let candidateIds: [String] = try await dbPool.read { db in
-                try String.fetchAll(db, sql: """
-                    SELECT id FROM messageHeader
-                    WHERE bodyComplete = 1 AND headerComplete = 1 AND isInInbox = 1
-                    LIMIT 2000
-                    """)
+                try String.fetchAll(db, sql: Self.ftsBodyMembershipCandidateSQL)
             }
             guard !candidateIds.isEmpty else { return }
 
