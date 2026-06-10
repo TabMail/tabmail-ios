@@ -229,8 +229,14 @@ extension AccountManager {
     }
 
     func move(_ messages: [MessageHeader], to destinationPath: String) async {
+        // Same-folder move is a no-op. Drop those messages here — the single
+        // choke point for every surface (swipe, detail view, agent tools) —
+        // so we never queue a pointless PendingOperation whose server-side
+        // MOVE has provider-dependent effects (e.g. archive-from-Archive).
+        let movable = messages.filter { $0.folderPath != destinationPath }
+        guard !movable.isEmpty else { return }
 
-        let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
+        let grouped = Dictionary(grouping: movable) { "\($0.accountId)|\($0.folderPath)" }
         let affectedFolderIds: Set<String>
         do {
             affectedFolderIds = try await dbPool.write { db in
@@ -278,8 +284,26 @@ extension AccountManager {
         Task { await drainPendingQueue() }
     }
 
+    /// Drop messages whose CURRENT folder already has `role` — same-role moves
+    /// (archive-from-Archive, delete-from-Trash) are no-ops. Accounts can carry
+    /// more than one folder per role (e.g. iCloud "Trash" + "Deleted Messages"),
+    /// so the path-equality filter in `move()` alone can't catch these: the
+    /// canonical `fetchOne` destination may be the OTHER same-role folder.
+    private func messagesNotInRole(_ messages: [MessageHeader], role: FolderRole) async -> [MessageHeader] {
+        let folderIds = Set(messages.map(\.folderId))
+        let roleFolderIds: Set<String> = (try? await dbPool.read { db in
+            let rows = try Folder
+                .filter(folderIds.contains(Column("id")) && Column("role") == role.rawValue)
+                .fetchAll(db)
+            return Set(rows.map(\.id))
+        }) ?? []
+        guard !roleFolderIds.isEmpty else { return messages }
+        return messages.filter { !roleFolderIds.contains($0.folderId) }
+    }
+
     func archive(_ messages: [MessageHeader]) async {
-        guard let first = messages.first else { return }
+        let movable = await messagesNotInRole(messages, role: .archive)
+        guard let first = movable.first else { return }
         let archivePath: String? = try? await dbPool.read { db in
             try Folder.filter(Column("accountId") == first.accountId && Column("role") == FolderRole.archive.rawValue)
                 .fetchOne(db)?.path
@@ -288,21 +312,23 @@ extension AccountManager {
             print("[Queue] ERROR: no archive folder found for account \(first.accountId)")
             return
         }
-        await move(messages, to: archivePath)
+        await move(movable, to: archivePath)
     }
 
     func delete(_ messages: [MessageHeader]) async {
         guard let first = messages.first else { return }
         AccountManager.logDeleteTrace(accountId: first.accountId, messages: messages, callSite: "AccountManager.delete")
+        let movable = await messagesNotInRole(messages, role: .trash)
+        guard let firstMovable = movable.first else { return }
         let trashPath: String? = try? await dbPool.read { db in
-            try Folder.filter(Column("accountId") == first.accountId && Column("role") == FolderRole.trash.rawValue)
+            try Folder.filter(Column("accountId") == firstMovable.accountId && Column("role") == FolderRole.trash.rawValue)
                 .fetchOne(db)?.path
         }
         guard let trashPath else {
-            print("[Queue] ERROR: no trash folder found for account \(first.accountId)")
+            print("[Queue] ERROR: no trash folder found for account \(firstMovable.accountId)")
             return
         }
-        await move(messages, to: trashPath)
+        await move(movable, to: trashPath)
     }
 
     /// Diagnostic-only: log the trash-folder lookup result and the message(s) being deleted

@@ -476,14 +476,20 @@ final class MessageDetailViewModel {
         }
     }
 
-    func archive() {
-        guard let message else { return }
-        archiveMessage(message)
+    /// Returns false when the archive was a no-op (no archive folder, or the
+    /// message is already in it) — callers must not dismiss/flash in that case.
+    @discardableResult
+    func archive() -> Bool {
+        guard let message else { return false }
+        return archiveMessage(message)
     }
 
-    func delete() {
-        guard let message else { return }
-        deleteMessage(message)
+    /// Returns false when the delete was a no-op (no trash folder, or the
+    /// message is already in it) — callers must not dismiss/flash in that case.
+    @discardableResult
+    func delete() -> Bool {
+        guard let message else { return false }
+        return deleteMessage(message)
     }
 
     func toggleRead() {
@@ -502,11 +508,23 @@ final class MessageDetailViewModel {
         }}
     }
 
-    func archiveMessage(_ msg: MessageHeader) {
+    /// Returns false when the archive was a no-op (no archive folder, or the
+    /// message is already in it) — callers must not dismiss/flash in that case.
+    @discardableResult
+    func archiveMessage(_ msg: MessageHeader) -> Bool {
+        // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — accounts can carry more than one folder of
+        // the same role (e.g. iCloud "Trash" + "Deleted Messages") and the
+        // canonical lookup below is fetchOne-arbitrary among them.
+        guard lookupFolderRole(msg.folderId) != .archive else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] detail archiveMessage suppressed — already archived: \(msg.id)")
+            return false
+        }
         guard let archiveFolder = lookupFolder(accountId: msg.accountId, role: .archive) else {
             print("[Queue] ERROR: no archive folder for account \(msg.accountId)")
-            return
+            return false
         }
+        guard msg.folderPath != archiveFolder.path else { return false }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: msg.folderPath, toPath: archiveFolder.path), messages: [msg],
             originalFolderId: msg.folderId,
@@ -519,14 +537,25 @@ final class MessageDetailViewModel {
             manager.removeOverlayEntries(ids: [msg.id])
         }}
         updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
+        return true
     }
 
-    func deleteMessage(_ msg: MessageHeader) {
+    /// Returns false when the delete was a no-op (no trash folder, or the
+    /// message is already in it) — callers must not dismiss/flash in that case.
+    @discardableResult
+    func deleteMessage(_ msg: MessageHeader) -> Bool {
         AccountManager.logDeleteTrace(accountId: msg.accountId, messages: [msg], callSite: "MessageDetailViewModel.deleteMessage")
+        // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see archiveMessage for why.
+        guard lookupFolderRole(msg.folderId) != .trash else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] detail deleteMessage suppressed — already in trash: \(msg.id)")
+            return false
+        }
         guard let trashFolder = lookupFolder(accountId: msg.accountId, role: .trash) else {
             print("[Queue] ERROR: no trash folder for account \(msg.accountId)")
-            return
+            return false
         }
+        guard msg.folderPath != trashFolder.path else { return false }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: msg.folderPath, toPath: trashFolder.path), messages: [msg],
             originalFolderId: msg.folderId,
@@ -539,6 +568,7 @@ final class MessageDetailViewModel {
             manager.removeOverlayEntries(ids: [msg.id])
         }}
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
+        return true
     }
 
     /// Update a thread message's folder info in-place after a move operation.
@@ -606,6 +636,10 @@ final class MessageDetailViewModel {
         try? dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId && Column("role") == role.rawValue).fetchOne(db)
         }
+    }
+
+    private func lookupFolderRole(_ folderId: String) -> FolderRole? {
+        try? dbPool.read { db in try Folder.fetchOne(db, key: folderId)?.role }
     }
 
     // MARK: - Thread Messages

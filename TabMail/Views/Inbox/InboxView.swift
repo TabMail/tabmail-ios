@@ -103,6 +103,55 @@ struct InboxView: View {
         }
     }
 
+    /// Trash/archive folder contexts: the same-role swipe button stays VISIBLE
+    /// but renders grayed out; tapping it no-ops (guards in the handlers) and
+    /// just closes the swipe-reveal menu. The Trash button must additionally
+    /// drop its `.destructive` role in trash contexts: SwiftUI plays its
+    /// automatic row-removal animation for destructive buttons when activated
+    /// even if the action body does nothing — in the Trash view this yanked
+    /// the row and snapped it back, leaving ghost selection/expansion
+    /// artifacts (2026-06-09 report). Archive never showed it because its
+    /// button carries no destructive role.
+    private var isTrashContext: Bool {
+        switch selection {
+        case .unified(let role):
+            return role == .trash
+        case .folder(let f):
+            return f.role == .trash
+        default:
+            return false
+        }
+    }
+
+    private var isArchiveContext: Bool {
+        switch selection {
+        case .unified(let role):
+            return role == .archive
+        case .folder(let f):
+            return f.role == .archive
+        default:
+            return false
+        }
+    }
+
+    /// Disabled-look background tint for a same-role no-op swipe button.
+    private var disabledSwipeTint: Color { Color(.systemGray3) }
+
+    /// Label for a same-role no-op swipe button. Swipe actions force white
+    /// symbol rendering and ignore `foregroundStyle` on the label (verified on
+    /// device 2026-06-09), so the disabled gray must be baked into the image
+    /// itself via `withTintColor(_:renderingMode: .alwaysOriginal)` — the one
+    /// rendering path the system can't re-tint. Force-unwrap: the symbol names
+    /// are compile-time constants; a typo should fail loudly.
+    private func disabledSwipeLabel(_ title: String, systemImage: String) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(uiImage: UIImage(systemName: systemImage)!
+                .withTintColor(.systemGray, renderingMode: .alwaysOriginal))
+        }
+    }
+
     /// Wraps `$selectedMessageId` so a tap inside the Drafts folder is
     /// redirected to `draftIdToOpen` (which drives a fullScreenCover),
     /// leaving `selectedMessageId` nil so the detail pane does NOT push.
@@ -822,6 +871,9 @@ struct InboxView: View {
                     }
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    // Same-role no-op buttons stay visible but gray out; the tap
+                    // no-ops (handler guards) and just closes the swipe menu.
+                    // See isTrashContext for why the destructive role is dropped.
                     Button {
                         if group.isThread && !isExpanded {
                             swipeAndArchiveThread(group)
@@ -829,18 +881,27 @@ struct InboxView: View {
                             swipeAndArchive(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
                         }
                     } label: {
-                        Label("Archive", systemImage: "archivebox")
+                        if isArchiveContext {
+                            disabledSwipeLabel("Archive", systemImage: "archivebox")
+                        } else {
+                            Label("Archive", systemImage: "archivebox")
+                        }
                     }
-                    .tint(Theme.archive)
-                    Button(role: .destructive) {
+                    .tint(isArchiveContext ? disabledSwipeTint : Theme.archive)
+                    Button(role: isTrashContext ? nil : .destructive) {
                         if group.isThread && !isExpanded {
                             swipeAndDeleteThread(group)
                         } else {
                             swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
                         }
                     } label: {
-                        Label("Trash", systemImage: "trash")
+                        if isTrashContext {
+                            disabledSwipeLabel("Trash", systemImage: "trash")
+                        } else {
+                            Label("Trash", systemImage: "trash")
+                        }
                     }
+                    .tint(isTrashContext ? disabledSwipeTint : .red)
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                     Button {
@@ -900,17 +961,27 @@ struct InboxView: View {
                         .tag(child.id)
                         .onAppear { viewModel.requestSnippetIfNeeded(for: child) }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            // Gray no-op buttons — see head-row swipe actions.
                             Button {
                                 swipeAndArchive(child)
                             } label: {
-                                Label("Archive", systemImage: "archivebox")
+                                if isArchiveContext {
+                                    disabledSwipeLabel("Archive", systemImage: "archivebox")
+                                } else {
+                                    Label("Archive", systemImage: "archivebox")
+                                }
                             }
-                            .tint(Theme.archive)
-                            Button(role: .destructive) {
+                            .tint(isArchiveContext ? disabledSwipeTint : Theme.archive)
+                            Button(role: isTrashContext ? nil : .destructive) {
                                 swipeAndDelete(child)
                             } label: {
-                                Label("Trash", systemImage: "trash")
+                                if isTrashContext {
+                                    disabledSwipeLabel("Trash", systemImage: "trash")
+                                } else {
+                                    Label("Trash", systemImage: "trash")
+                                }
                             }
+                            .tint(isTrashContext ? disabledSwipeTint : .red)
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
                             Button {
@@ -997,17 +1068,27 @@ struct InboxView: View {
                                         prevTag: prevTag, nextTag: nextTag)
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    // Gray no-op buttons — see head-row swipe actions.
                     Button {
                         swipeAndArchive(snapshot)
                     } label: {
-                        Label("Archive", systemImage: "archivebox")
+                        if isArchiveContext {
+                            disabledSwipeLabel("Archive", systemImage: "archivebox")
+                        } else {
+                            Label("Archive", systemImage: "archivebox")
+                        }
                     }
-                    .tint(Theme.archive)
-                    Button(role: .destructive) {
+                    .tint(isArchiveContext ? disabledSwipeTint : Theme.archive)
+                    Button(role: isTrashContext ? nil : .destructive) {
                         swipeAndDelete(snapshot)
                     } label: {
-                        Label("Trash", systemImage: "trash")
+                        if isTrashContext {
+                            disabledSwipeLabel("Trash", systemImage: "trash")
+                        } else {
+                            Label("Trash", systemImage: "trash")
+                        }
                     }
+                    .tint(isTrashContext ? disabledSwipeTint : .red)
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                     Button {
@@ -1158,6 +1239,11 @@ struct InboxView: View {
     // MARK: - Dismiss animation helpers
 
     private func dismissAndArchive(_ snapshot: MessageSnapshot, markRead: Bool = false, expandedGroup: ThreadGroup? = nil) {
+        // Archive-from-Archive is a no-op — never hide the row.
+        guard !viewModel.archiveIsNoOp(snapshot.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndArchive suppressed — already archived: \(snapshot.id)")
+            return
+        }
         withAnimation(.easeIn(duration: 0.25)) {
             _ = dismissedMessages.insert(snapshot.id)
         }
@@ -1176,6 +1262,11 @@ struct InboxView: View {
     }
 
     private func dismissAndDelete(_ snapshot: MessageSnapshot, markRead: Bool = false, expandedGroup: ThreadGroup? = nil) {
+        // Delete-from-Trash is a no-op — never hide the row.
+        guard !viewModel.deleteIsNoOp(snapshot.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndDelete suppressed — already in trash: \(snapshot.id)")
+            return
+        }
         withAnimation(.easeIn(duration: 0.25)) {
             _ = dismissedMessages.insert(snapshot.id)
         }
@@ -1235,6 +1326,11 @@ struct InboxView: View {
     }
 
     private func dismissAndArchiveThread(_ group: ThreadGroup) {
+        // Archive-from-Archive is a no-op — never hide the rows.
+        guard !viewModel.archiveIsNoOp(group.representative.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndArchiveThread suppressed — already archived: \(group.representative.id)")
+            return
+        }
         let allIds = group.members.map(\.id)
         withAnimation(.easeIn(duration: 0.25)) {
             dismissedMessages.formUnion(allIds)
@@ -1246,6 +1342,11 @@ struct InboxView: View {
     }
 
     private func dismissAndDeleteThread(_ group: ThreadGroup) {
+        // Delete-from-Trash is a no-op — never hide the rows.
+        guard !viewModel.deleteIsNoOp(group.representative.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndDeleteThread suppressed — already in trash: \(group.representative.id)")
+            return
+        }
         let allIds = group.members.map(\.id)
         withAnimation(.easeIn(duration: 0.25)) {
             dismissedMessages.formUnion(allIds)
@@ -1257,6 +1358,11 @@ struct InboxView: View {
     }
 
     private func swipeAndArchiveThread(_ group: ThreadGroup) {
+        // Archive-from-Archive is a no-op — never hide the rows.
+        guard !viewModel.archiveIsNoOp(group.representative.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndArchiveThread suppressed — already archived: \(group.representative.id)")
+            return
+        }
         let allIds = group.members.map(\.id)
 
         viewModel.beginInteraction()
@@ -1272,6 +1378,11 @@ struct InboxView: View {
     }
 
     private func swipeAndDeleteThread(_ group: ThreadGroup) {
+        // Delete-from-Trash is a no-op — never hide the rows.
+        guard !viewModel.deleteIsNoOp(group.representative.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndDeleteThread suppressed — already in trash: \(group.representative.id)")
+            return
+        }
         let allIds = group.members.map(\.id)
 
         viewModel.beginInteraction()
@@ -1290,6 +1401,11 @@ struct InboxView: View {
     // then defer row removal to the next run-loop tick so the collapse
     // animation plays in a clean transaction (not batched with the opacity change).
     private func swipeAndArchive(_ snapshot: MessageSnapshot, expandedGroup: ThreadGroup? = nil) {
+        // Archive-from-Archive is a no-op — never hide the row.
+        guard !viewModel.archiveIsNoOp(snapshot.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndArchive suppressed — already archived: \(snapshot.id)")
+            return
+        }
 
         viewModel.beginInteraction()
         swipeFadingMessages.insert(snapshot.id)
@@ -1309,6 +1425,11 @@ struct InboxView: View {
     }
 
     private func swipeAndDelete(_ snapshot: MessageSnapshot, expandedGroup: ThreadGroup? = nil) {
+        // Delete-from-Trash is a no-op — never hide the row.
+        guard !viewModel.deleteIsNoOp(snapshot.id) else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndDelete suppressed — already in trash: \(snapshot.id)")
+            return
+        }
 
         viewModel.beginInteraction()
         swipeFadingMessages.insert(snapshot.id)

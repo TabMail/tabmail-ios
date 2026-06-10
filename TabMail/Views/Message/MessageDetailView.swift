@@ -488,21 +488,25 @@ struct MessageDetailView: View {
     // MARK: - Action Handlers
 
     private func handleArchive(_ msg: MessageHeader) {
+        // archive()/archiveMessage() return false for a no-op (e.g. the message
+        // is already in the archive folder) — don't dismiss or flash then.
         if msg.id == viewModel.message?.id {
-            viewModel.archive()
-            dismissMessage()
-        } else {
-            viewModel.archiveMessage(msg)
+            if viewModel.archive() {
+                dismissMessage()
+            }
+        } else if viewModel.archiveMessage(msg) {
             flashedCardId = msg.id
         }
     }
 
     private func handleDelete(_ msg: MessageHeader) {
+        // delete()/deleteMessage() return false for a no-op (e.g. the message
+        // is already in the trash folder) — don't dismiss or flash then.
         if msg.id == viewModel.message?.id {
-            viewModel.delete()
-            dismissMessage()
-        } else {
-            viewModel.deleteMessage(msg)
+            if viewModel.delete() {
+                dismissMessage()
+            }
+        } else if viewModel.deleteMessage(msg) {
             flashedCardId = msg.id
         }
     }

@@ -1197,12 +1197,44 @@ final class InboxViewModel {
 
     // MARK: - Message Actions
 
+    /// True when archiving `messageId` would be a same-folder move — the message
+    /// already lives in an archive-role folder. Callers MUST treat the
+    /// archive as a no-op and must NOT dismiss/hide the row.
+    ///
+    /// Role-based check FIRST: an account can carry more than one folder with
+    /// the same role (e.g. iCloud "Trash" + "Deleted Messages"), and the
+    /// canonical-path lookup below is `fetchOne`-arbitrary among them — a
+    /// path-only comparison can miss the folder the user is actually viewing.
+    /// Being IN any folder of the destination role makes the action a no-op.
+    func archiveIsNoOp(_ messageId: String) -> Bool {
+        guard let message = lookupMessage(messageId) else { return false }
+        if lookupFolderRole(message.folderId) == .archive { return true }
+        guard let archivePath = lookupFolderPath(accountId: message.accountId, role: .archive) else { return false }
+        return message.folderPath == archivePath
+    }
+
+    /// True when deleting `messageId` would be a same-folder move — the message
+    /// already lives in a trash-role folder. Callers MUST treat the
+    /// delete as a no-op and must NOT dismiss/hide the row. Drafts are not
+    /// affected: they delete via the draft-specific path, not move-to-trash.
+    /// See `archiveIsNoOp` for why the role check comes first.
+    func deleteIsNoOp(_ messageId: String) -> Bool {
+        guard let message = lookupMessage(messageId) else { return false }
+        if lookupFolderRole(message.folderId) == .trash { return true }
+        guard let trashPath = lookupFolderPath(accountId: message.accountId, role: .trash) else { return false }
+        return message.folderPath == trashPath
+    }
+
     func archive(_ messageId: String) {
         guard let message = lookupMessage(messageId) else { return }
+        // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see archiveIsNoOp.
+        guard lookupFolderRole(message.folderId) != .archive else { return }
         guard let archivePath = lookupFolderPath(accountId: message.accountId, role: .archive) else {
             print("[Queue] ERROR: no archive folder for account \(message.accountId)")
             return
         }
+        guard message.folderPath != archivePath else { return }
         let destFolderId = "\(message.accountId):\(archivePath)"
         manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
         UndoService.shared.push(UndoableAction(
@@ -1220,10 +1252,14 @@ final class InboxViewModel {
     func archiveThread(_ messageIds: [String]) {
         let messages = messageIds.compactMap { lookupMessage($0) }
         guard let first = messages.first else { return }
+        // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see archiveIsNoOp.
+        guard lookupFolderRole(first.folderId) != .archive else { return }
         guard let archivePath = lookupFolderPath(accountId: first.accountId, role: .archive) else {
             print("[Queue] ERROR: no archive folder for account \(first.accountId)")
             return
         }
+        guard first.folderPath != archivePath else { return }
         let destFolderId = "\(first.accountId):\(archivePath)"
         let compositeIds = messages.map(\.id)
         for id in compositeIds { manager.registerMutation(id: id, mutation: .init(folderId: destFolderId)) }
@@ -1249,10 +1285,14 @@ final class InboxViewModel {
             return
         }
         AccountManager.logDeleteTrace(accountId: message.accountId, messages: [message], callSite: "InboxViewModel.delete")
+        // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see deleteIsNoOp.
+        if folderRole == .trash { return }
         guard let trashPath = lookupFolderPath(accountId: message.accountId, role: .trash) else {
             print("[Queue] ERROR: no trash folder for account \(message.accountId)")
             return
         }
+        guard message.folderPath != trashPath else { return }
         let destFolderId = "\(message.accountId):\(trashPath)"
         manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
         UndoService.shared.push(UndoableAction(
@@ -1279,10 +1319,14 @@ final class InboxViewModel {
             return
         }
         AccountManager.logDeleteTrace(accountId: first.accountId, messages: messages, callSite: "InboxViewModel.deleteThread")
+        // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see deleteIsNoOp.
+        if folderRole == .trash { return }
         guard let trashPath = lookupFolderPath(accountId: first.accountId, role: .trash) else {
             print("[Queue] ERROR: no trash folder for account \(first.accountId)")
             return
         }
+        guard first.folderPath != trashPath else { return }
         let destFolderId = "\(first.accountId):\(trashPath)"
         let compositeIds = messages.map(\.id)
         for id in compositeIds { manager.registerMutation(id: id, mutation: .init(folderId: destFolderId)) }

@@ -16,17 +16,25 @@ extension MessageDetailView {
         case .reply:
             replyAllMessage = message
         case .archiveAndDismiss:
-            viewModel.archive()
-            dismissMessage()
+            // archive() returns false for a no-op (already in the archive
+            // folder) — don't dismiss the row/detail then.
+            if viewModel.archive() {
+                dismissMessage()
+            }
         case .archiveInPlace:
-            viewModel.archiveMessage(message)
-            flashedCardId = message.id
+            if viewModel.archiveMessage(message) {
+                flashedCardId = message.id
+            }
         case .deleteAndDismiss:
-            viewModel.delete()
-            dismissMessage()
+            // delete() returns false for a no-op (already in the trash
+            // folder) — don't dismiss the row/detail then.
+            if viewModel.delete() {
+                dismissMessage()
+            }
         case .deleteInPlace:
-            viewModel.deleteMessage(message)
-            flashedCardId = message.id
+            if viewModel.deleteMessage(message) {
+                flashedCardId = message.id
+            }
         case .noop:
             break
         }
