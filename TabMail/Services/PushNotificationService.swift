@@ -929,6 +929,18 @@ actor PushNotificationService {
                 inboxOnly: true,
                 drain: .budget(PushConfig.silentPushDeadlineSeconds)
             )
+            // One-time FTS tokenizer migration (ADR-024) — small post-sync slice,
+            // bounded by BOTH the slice budget AND the remaining push envelope so
+            // the fetch completion is never delayed past the deadline race. Sync
+            // always comes first; the race cancels this task on deadline win and
+            // GRDB rolls back any mid-shard write.
+            let envelopeRemaining = PushConfig.silentPushDeadlineSeconds
+                - (CFAbsoluteTimeGetCurrent() - pushT0)
+            let slice = min(SearchConfig.retokenizeShortWindowBudgetSec, envelopeRemaining)
+            if slice > 1 {
+                await SearchIndex.shared.rebuildStaleTokenizerShards(
+                    deadline: Date().addingTimeInterval(slice))
+            }
             await MainActor.run { SyncScheduler.shared.scheduleBackgroundProcessing() }
         }
         inFlightSyncTask = syncTask
@@ -961,6 +973,10 @@ actor PushNotificationService {
         if deadlineHit {
             syncTask.cancel()
             await SyncScheduler.cancelAllInFlightQueues(inboxOnly: true)
+            // The happy path schedules BGProcessing at the end of syncTask —
+            // cancelled here, so schedule it ourselves or the queued work (and
+            // any pending tokenizer-migration shards) loses this follow-up.
+            await MainActor.run { SyncScheduler.shared.scheduleBackgroundProcessing() }
             BackgroundSyncLogger.logPush("Silent push DEADLINE — cancelled in-flight sync + queues")
         }
         inFlightSyncTask = nil

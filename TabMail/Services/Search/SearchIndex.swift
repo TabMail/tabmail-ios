@@ -173,6 +173,13 @@ actor SearchIndex {
         let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
         print("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
 
+        // Tokenizer migration: rebuild shards created with an outdated tokenize=
+        // string, in the background. Init is NOT blocked — searches keep working
+        // against old shards until each one is atomically swapped.
+        let stale = (try? dbPool!.read { db in try Self.staleTokenizerYears(db: db) }) ?? []
+        if !stale.isEmpty {
+            Task { await self.rebuildStaleTokenizerShards() }
+        }
     }
 
     private func createSchema() throws {
@@ -274,21 +281,29 @@ actor SearchIndex {
             // v5: Migrate FTS shards from 5-column (msgId, subject, from_, to_, body) to
             // 7-column schema (+ cc, bcc) matching TB. FTS5 virtual tables can't be ALTERed,
             // so we must drop and recreate. hasBody reset triggers bulkIndexIfNeeded re-index.
+            // NOTE: the LIKE pattern also matches FTS5 SHADOW tables
+            // (messages_fts_2026_data/_idx/_config/…), which must never be probed
+            // or dropped directly (SQLite: "table … may not be dropped"). Filter
+            // to real shards: the suffix after "messages_fts_" must be a year.
+            let realShardTables = { (names: [String]) -> [String] in
+                names.filter { Int($0.dropFirst("messages_fts_".count)) != nil }
+            }
             let hasCcColumn = try { () -> Bool in
                 // Check if any existing FTS shard has 7 columns (cc, bcc present)
-                let tables = try String.fetchAll(db, sql: """
+                let tables = realShardTables(try String.fetchAll(db, sql: """
                     SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'messages\\_fts\\_%' ESCAPE '\\'
-                    """)
+                    """))
                 guard let firstTable = tables.first else { return true } // no shards yet, skip migration
                 let cols = try Row.fetchAll(db, sql: "PRAGMA table_info(\(firstTable))")
                 let colNames = Set(cols.map { $0["name"] as String })
                 return colNames.contains("cc")
             }()
             if !hasCcColumn {
-                // Drop all existing FTS shard tables (they have the old 5-column schema)
-                let shardTables = try String.fetchAll(db, sql: """
+                // Drop all existing FTS shard tables (they have the old 5-column
+                // schema). Shadow tables drop automatically with their parent.
+                let shardTables = realShardTables(try String.fetchAll(db, sql: """
                     SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'messages\\_fts\\_%' ESCAPE '\\'
-                    """)
+                    """))
                 for table in shardTables {
                     try db.execute(sql: "DROP TABLE IF EXISTS \(table)")
                     print("[SearchIndex] Dropped old 5-column FTS shard: \(table)")
@@ -407,6 +422,210 @@ actor SearchIndex {
 
         let elapsed = Date().timeIntervalSince(startTime)
         print("[SearchIndex] Migration complete — \(totalMigrated) rows across \(years.count) years in \(String(format: "%.1f", elapsed))s")
+    }
+
+    // MARK: - Tokenizer Migration (one-time shard rebuild)
+
+    /// Year shards created with an outdated `tokenize=` string, detected from the
+    /// stored CREATE statement in sqlite_master. Current marker: the old scheme
+    /// used `tokenchars '-_.@'` (glued addresses into single tokens); the current
+    /// `SearchConfig.ftsTokenize` has no tokenchars. A future tokenizer change
+    /// needs its own predicate here (or a switch to PRAGMA user_version).
+    private static func staleTokenizerYears(db: Database) throws -> [Int] {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT name, sql FROM sqlite_master
+            WHERE type='table' AND name LIKE 'messages\\_fts\\_%' ESCAPE '\\'
+            """)
+        return rows.compactMap { row in
+            let name: String = row["name"]
+            let sql: String = row["sql"] ?? ""
+            guard sql.contains("tokenchars") else { return nil }
+            return Int(name.dropFirst("messages_fts_".count))
+        }
+    }
+
+    /// True while a rebuild loop is in flight — makes concurrent entry points
+    /// (post-init Task, BGProcessing window) no-op instead of double-converting.
+    private var isRebuildingTokenizerShards = false
+
+    /// Whether any shard still awaits tokenizer conversion. Used by the BG
+    /// scheduler to decide if a BGProcessing task should be (re)queued.
+    func hasStaleTokenizerShards() async -> Bool {
+        ensureReady()
+        guard let dbPool else { return false }
+        let stale = (try? await dbPool.read { db in try Self.staleTokenizerYears(db: db) }) ?? []
+        return !stale.isEmpty
+    }
+
+    /// Rebuild every stale-tokenizer shard, newest year first (most-searched mail
+    /// converts first). Runs behind the scenes (post-init Task, or background
+    /// windows after their sync work); searches keep working against
+    /// not-yet-converted shards. Resumable and idempotent: detection is stateless
+    /// (sqlite_master) and each shard converts atomically, so a kill or
+    /// cancellation mid-migration just leaves the remaining shards for the next
+    /// run. Checks Task cancellation between shards so a BG expiration winds
+    /// down at the next shard boundary.
+    /// - Parameter deadline: stop before STARTING a new shard past this instant
+    ///   (short background windows pass a small post-sync budget so the
+    ///   migration doesn't hog the window; nil = run until done/cancelled).
+    func rebuildStaleTokenizerShards(deadline: Date? = nil) async {
+        guard let dbPool else { return }
+        guard !isRebuildingTokenizerShards else { return }
+        isRebuildingTokenizerShards = true
+        defer { isRebuildingTokenizerShards = false }
+
+        let stale = ((try? await dbPool.read { db in try Self.staleTokenizerYears(db: db) }) ?? [])
+            .sorted(by: >)
+        guard !stale.isEmpty else { return }
+
+        print("[SearchIndex] Tokenizer migration: \(stale.count) shard(s) to rebuild: \(stale)")
+        let startTime = Date()
+
+        for year in stale {
+            guard self.dbPool != nil else { return } // closed for nuke mid-run
+            guard !Task.isCancelled else {
+                print("[SearchIndex] Tokenizer migration cancelled — resuming on next run")
+                return
+            }
+            if let deadline, Date() >= deadline {
+                print("[SearchIndex] Tokenizer migration window budget reached — resuming later")
+                return
+            }
+            do {
+                try await rebuildShardForTokenizer(year: year)
+            } catch is CancellationError {
+                // BG expiration / push-deadline watchdog cancelled us mid-shard.
+                // GRDB aborts the write at the next statement boundary and ROLLS
+                // BACK, so the shard stays old and is redone next run — wind down.
+                print("[SearchIndex] Tokenizer migration cancelled mid-shard \(year) (rolled back) — resuming on next run")
+                return
+            } catch {
+                print("[SearchIndex] ERROR: tokenizer rebuild failed for shard \(year): \(error)")
+            }
+        }
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        print("[SearchIndex] Tokenizer migration complete in \(String(format: "%.1f", elapsed))s")
+    }
+
+    /// Rebuild a single year shard with the current tokenizer. ONE write
+    /// transaction: WAL readers (search) see the old shard until commit; writers
+    /// queue behind it for the seconds the copy takes. rowids are preserved —
+    /// message_meta / messages_vec alignment is untouched. Reads are chunked
+    /// (keyset pagination) per the bounded-memory rule.
+    private func rebuildShardForTokenizer(year: Int) async throws {
+        guard let dbPool else { return }
+        let table = ftsTableName(year: year)
+        let tmpTable = "\(table)_retok"
+        let start = Date()
+        let copied = try await dbPool.write { db -> Int in
+            try db.execute(sql: "DROP TABLE IF EXISTS \(tmpTable)") // leftover from a crashed run
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE \(tmpTable) USING fts5(
+                    msgId, subject, from_, to_, cc, bcc, body,
+                    tokenize = "\(SearchConfig.ftsTokenize)",
+                    prefix = '\(SearchConfig.ftsPrefixes)')
+                """)
+            var lastRowid: Int64 = -1
+            var copied = 0
+            while true {
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT rowid, msgId, subject, from_, to_, cc, bcc, body
+                    FROM \(table) WHERE rowid > ? ORDER BY rowid LIMIT ?
+                    """, arguments: [lastRowid, SearchConfig.shardMigrationChunkSize])
+                guard !rows.isEmpty else { break }
+                for row in rows {
+                    try db.execute(sql: """
+                        INSERT INTO \(tmpTable)(rowid, msgId, subject, from_, to_, cc, bcc, body)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, arguments: [
+                            row["rowid"] as Int64,
+                            row["msgId"] as String,
+                            row["subject"] as String,
+                            row["from_"] as String,
+                            row["to_"] as String,
+                            row["cc"] as String,
+                            row["bcc"] as String,
+                            row["body"] as String
+                        ])
+                }
+                copied += rows.count
+                lastRowid = rows.last!["rowid"]
+            }
+            try db.execute(sql: "DROP TABLE \(table)")
+            try db.execute(sql: "ALTER TABLE \(tmpTable) RENAME TO \(table)")
+            // Re-apply the write tuning ensureShard sets on creation
+            try? db.execute(sql: "INSERT INTO \(table)(\(table), rank) VALUES('automerge', \(SearchConfig.ftsAutomerge))")
+            try? db.execute(sql: "INSERT INTO \(table)(\(table), rank) VALUES('usermerge', 2)")
+            return copied
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        print("[SearchIndex] Re-tokenized \(table): \(copied) rows in \(String(format: "%.1f", elapsed))s")
+    }
+
+    // MARK: - Test Support (tokenizer migration)
+
+    /// TEST ONLY: seed a year shard created with an arbitrary (legacy) tokenizer,
+    /// with one row aligned across message_ids / shard / message_meta exactly the
+    /// way indexHeaders writes them. Returns the rowid.
+    func testSeedLegacyShard(year: Int, tokenize: String, headerId: String, msgId: String,
+                             subject: String, from: String, body: String, dateMs: Int64) async throws -> Int64 {
+        ensureReady()
+        guard let dbPool else { return -1 }
+        let table = ftsTableName(year: year)
+        let rowid = try await dbPool.write { db -> Int64 in
+            try db.execute(sql: "INSERT OR IGNORE INTO message_ids (headerId) VALUES (?)",
+                           arguments: [headerId])
+            let rowid = try Int64.fetchOne(db, sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
+                                           arguments: [headerId])!
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE IF NOT EXISTS \(table) USING fts5(
+                    msgId, subject, from_, to_, cc, bcc, body,
+                    tokenize = "\(tokenize)",
+                    prefix = '\(SearchConfig.ftsPrefixes)')
+                """)
+            try db.execute(
+                sql: "INSERT INTO \(table) (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?, ?, ?, ?, '', '', '', ?)",
+                arguments: [rowid, msgId, subject, from, body]
+            )
+            let accountId = String(headerId.prefix(while: { $0 != ":" }))
+            try db.execute(
+                sql: "INSERT OR IGNORE INTO message_meta (rowid, headerId, dateMs, accountId, shardYear, folderId) VALUES (?, ?, ?, ?, ?, '')",
+                arguments: [rowid, headerId, dateMs, accountId, year]
+            )
+            return rowid
+        }
+        knownYears.insert(year)
+        return rowid
+    }
+
+    /// TEST ONLY: the stored CREATE statement for a year shard.
+    func testShardCreateSQL(year: Int) async throws -> String? {
+        guard let dbPool else { return nil }
+        let table = ftsTableName(year: year)
+        return try await dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+                                arguments: [table])
+        }
+    }
+
+    /// TEST ONLY: message_meta rowid for a headerId.
+    func testRowidForHeader(_ headerId: String) async throws -> Int64? {
+        guard let dbPool else { return nil }
+        return try await dbPool.read { db in
+            try Int64.fetchOne(db, sql: "SELECT rowid FROM message_meta WHERE headerId = ?",
+                               arguments: [headerId])
+        }
+    }
+
+    /// TEST ONLY: drop a year shard table and forget the year.
+    func testDropShard(year: Int) async throws {
+        guard let dbPool else { return }
+        let table = ftsTableName(year: year)
+        try await dbPool.write { db in
+            try db.execute(sql: "DROP TABLE IF EXISTS \(table)")
+        }
+        knownYears.remove(year)
     }
 
     // MARK: - Document Count

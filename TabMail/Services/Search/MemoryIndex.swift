@@ -44,7 +44,9 @@ actor MemoryIndex {
     /// Schema version stored in `PRAGMA user_version`. Bumping this triggers a
     /// drop-and-rebuild of all memory_* tables on next launch. memory.db is a
     /// derived index — Stage A refills from chatHistory.
-    private static let schemaVersion: Int32 = 3
+    /// v4: tokenizer drops tokenchars '-_.@' (lockstep with SearchConfig.ftsTokenize)
+    /// so email-ish text indexes as matchable parts.
+    private static let schemaVersion: Int32 = 4
 
     // MARK: - Init
 
@@ -154,7 +156,7 @@ actor MemoryIndex {
             try db.execute(sql: """
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                     content,
-                    tokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'",
+                    tokenize = "\(SearchConfig.ftsTokenize)",
                     prefix = '2 3 4'
                 )
                 """)

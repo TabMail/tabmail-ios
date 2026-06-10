@@ -278,11 +278,11 @@ struct SearchView: View {
             guard !Task.isCancelled else { return }
 
             let searchResults = ftsResultsToSearchResults(ftsResults)
-            // Union, don't replace (ADR-IOS-007 graceful degradation): FTS misses
-            // matches the substring scan catches — e.g. "dmarc-" mid-token inside
-            // "noreply-dmarc-support@…" (tokenchars glue addresses into single
-            // tokens; prefix queries only match from the token start). Show FTS's
-            // ranked hits first, then any legacy hits FTS missed.
+            // Union, don't replace (ADR-IOS-007 graceful degradation): the
+            // substring scan can still catch what token-based FTS misses — e.g.
+            // a mid-fragment like "marc-sup" inside "dmarc-support", or content
+            // beyond FTS's ranked cutoff. Show FTS's ranked hits first, then any
+            // legacy hits FTS missed.
             let ftsIds = Set(searchResults.compactMap(\.headerId))
             let legacyExtras = results.filter { result in
                 result.source == .local && (result.headerId.map { !ftsIds.contains($0) } ?? true)

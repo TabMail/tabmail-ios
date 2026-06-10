@@ -86,12 +86,13 @@ enum SearchQueryParser {
                 let finalToken: String
                 if needsQuote {
                     let escaped = escapedCore.replacingOccurrences(of: "\"", with: "\"\"")
-                    // Prefix star is REQUIRED here: the tokenizer (tokenchars '-_.@')
-                    // glues email-ish text into single index tokens (e.g.
-                    // "dmarc-support@tabmail.ai"), so an exact quoted partial like
-                    // "dmarc-support" can never match. `"..."*` keeps phrase semantics
-                    // and prefix-matches the glued token; exact input still matches
-                    // (prefix includes exact).
+                    // Quoted phrase-prefix: with no tokenchars (ADR-024) the
+                    // tokenizer treats - _ . @ like any other separator, so
+                    // "dmarc-supp" becomes the phrase [dmarc, supp*] —
+                    // adjacency-matching partial AND full addresses mid-typing.
+                    // Without the trailing star, a partial's last fragment would
+                    // need to be a complete token and mid-typing queries would
+                    // return nothing.
                     finalToken = "\"\(escaped)\"*"
                 } else {
                     // Auto-add wildcard for tokens >= 4 chars, but avoid if OR groups exist

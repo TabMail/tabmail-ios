@@ -800,6 +800,10 @@ final class SyncScheduler {
             task.setTaskCompleted(success: false)
             Task { @MainActor in
                 SyncScheduler.shared.scheduleBackgroundSync()
+                // The success path always schedules BGProcessing (drains queued
+                // work + finishes the FTS tokenizer migration); expiration must
+                // too, or repeated expirations orphan that follow-up work.
+                SyncScheduler.shared.scheduleBackgroundProcessing()
             }
             print("[SyncScheduler] SYNC expiration handler done")
         }
@@ -834,6 +838,13 @@ final class SyncScheduler {
             }
 
             await self.syncStartup(inboxOnly: true, drain: .budget(Self.bgAppRefreshBudgetSeconds))
+
+            // One-time FTS tokenizer migration (ADR-024) — small post-sync slice
+            // only, so the refresh window's primary purpose (sync) is never
+            // starved. No-op when nothing is stale; cancellation/expiration
+            // winds down at a shard boundary.
+            await SearchIndex.shared.rebuildStaleTokenizerShards(
+                deadline: Date().addingTimeInterval(SearchConfig.retokenizeShortWindowBudgetSec))
 
             let success = !ctx.expired
             BackgroundSyncLogger.log("BGAppRefresh COMPLETED (success=\(success))")
@@ -899,6 +910,12 @@ final class SyncScheduler {
             // queues whose actor-owned Tasks ctx.expire() doesn't reach.
             Task { await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false) }
             task.setTaskCompleted(success: false)
+            // Expiration means work remained (queues and/or tokenizer-migration
+            // shards) — reschedule so it gets another window. The success path
+            // reschedules conditionally; expiration is unconditional by definition.
+            Task { @MainActor in
+                SyncScheduler.shared.scheduleBackgroundProcessing()
+            }
             print("[SyncScheduler] PROCESSING expiration handler done")
         }
         print("[SyncScheduler] PROCESSING expirationHandler set")
@@ -919,6 +936,13 @@ final class SyncScheduler {
             // Full startup: sync + drain all queues + backfill + notification refresh
             await self.syncStartup(inboxOnly: false, drain: .full)
 
+            // One-time FTS tokenizer migration (ADR-024) — AFTER sync so it never
+            // steals resources from push/sync work. No-op when no stale shards
+            // remain; resumes at the next unconverted shard; ctx.expire()
+            // cancellation winds it down at a shard boundary (each shard is one
+            // transaction). No deadline — BGProcessing has minutes of budget.
+            await SearchIndex.shared.rebuildStaleTokenizerShards()
+
             let totalElapsed = Int((CFAbsoluteTimeGetCurrent() - taskT0) * 1000)
             let success = !ctx.expired
             BackgroundSyncLogger.log("BGProcessing COMPLETED in \(totalElapsed)ms (success=\(success))")
@@ -928,10 +952,13 @@ final class SyncScheduler {
             if !ctx.expired {
                 task.setTaskCompleted(success: true)
             }
-            // Only reschedule if queues still have work — prevents unconditional rescheduling.
+            // Only reschedule if queues still have work — prevents unconditional
+            // rescheduling. Pending tokenizer-shard conversions count as work so
+            // an interrupted migration gets another BG window.
             let bodyIdle = await ActiveBodyQueue.shared.isIdle
             let aiIdle = await ActiveAIQueue.shared.isIdle
-            if !bodyIdle || !aiIdle {
+            let staleShards = await SearchIndex.shared.hasStaleTokenizerShards()
+            if !bodyIdle || !aiIdle || staleShards {
                 self.scheduleBackgroundProcessing()
             }
             print("[SyncScheduler] PROCESSING Task body done")

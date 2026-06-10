@@ -99,7 +99,7 @@ struct SearchIndexFolderScopeTests {
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_nil:FolderB"),
         ]
-        try await index.indexHeaders(records)
+        _ = try await index.indexHeaders(records)
 
         let allResults = try await index.keywordSearch(
             query: "uniquenilfolder", folderIds: nil)
@@ -122,7 +122,7 @@ struct SearchIndexFolderScopeTests {
             dateMs: Int64(Date().timeIntervalSince1970 * 1000),
             folderId: "\(prefix)_empty:INBOX"
         )
-        try await index.indexHeaders([record])
+        _ = try await index.indexHeaders([record])
 
         // Empty array = no folders match = zero results
         let results = try await index.keywordSearch(
@@ -154,7 +154,7 @@ struct SearchIndexFolderScopeTests {
                 from: "e@e.com", to: "f@f.com", dateMs: now,
                 folderId: "\(prefix)_multi:Sent"),
         ]
-        try await index.indexHeaders(records)
+        _ = try await index.indexHeaders(records)
 
         // Unified inbox = both inbox folders, exclude Sent
         let results = try await index.keywordSearch(
@@ -183,7 +183,7 @@ struct SearchIndexFolderScopeTests {
             dateMs: Int64(Date().timeIntervalSince1970 * 1000),
             folderId: "\(prefix)_update:INBOX"
         )
-        try await index.indexHeaders([record])
+        _ = try await index.indexHeaders([record])
 
         // Verify in INBOX scope
         var inboxResults = try await index.keywordSearch(
@@ -232,7 +232,7 @@ struct SearchIndexFolderScopeTests {
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_backfill:INBOX"),  // already set
         ]
-        try await index.indexHeaders(records)
+        _ = try await index.indexHeaders(records)
 
         let emptyIds = try await index.headerIdsWithEmptyFolderId(limit: 100)
         #expect(emptyIds.contains(hidEmpty))

@@ -358,10 +358,13 @@ struct SearchConfigExtendedTests {
         #expect(SearchConfig.snippetTokens == 16)
     }
 
-    @Test("FTS tokenize includes special chars '-_.@'")
-    func ftsTokenizeSpecialChars() {
-        #expect(SearchConfig.ftsTokenize.contains("tokenchars"))
-        #expect(SearchConfig.ftsTokenize.contains("@"))
+    @Test("FTS tokenize has NO tokenchars (ADR-024: addresses index as parts)")
+    func ftsTokenizeNoTokenchars() {
+        // tokenchars '-_.@' glued addresses into single tokens that could only be
+        // prefix-matched from the token start — "dmarc-" never matched
+        // "noreply-dmarc-support@…". Do not reintroduce without ADR-024 revisit.
+        #expect(!SearchConfig.ftsTokenize.contains("tokenchars"))
+        #expect(SearchConfig.ftsTokenize.contains("porter"))
     }
 
     @Test("FTS prefix lengths include 2, 3, 4")

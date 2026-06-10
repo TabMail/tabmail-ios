@@ -506,6 +506,37 @@ struct GmailProviderMockTests {
         #expect(FakeHTTP.recordedCalls().count == 3)
     }
 
+    @Test("search with empty folder is account-wide: no labelIds, no exclusion terms")
+    func searchAccountWideOmitsScoping() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        FakeHTTP.register(
+            path: "/messages?q=",
+            method: "GET",
+            response: .json(raw: #"{"messages": []}"#)
+        )
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        _ = try await provider.search(
+            query: "hello", folder: "",
+            after: nil, before: nil, from: nil, to: nil
+        )
+
+        let calls = FakeHTTP.recordedCalls()
+        #expect(calls.count == 1)
+        guard let url = calls.first?.url else { return }
+        // Account-wide (search-all fan-out passes folder: "") — whole account,
+        // distinct from the All Mail case which adds -in: exclusions.
+        #expect(!url.contains("labelIds"), "account-wide search must not send labelIds: \(url)")
+        #expect(!url.contains("-in:") && !url.contains("-in%3A"), "account-wide search must not add exclusions: \(url)")
+    }
+
     @Test("search with real label passes labelIds")
     func searchRealLabelPassesLabelIds() async throws {
         FakeHTTP.reset()

@@ -535,10 +535,10 @@ struct MemoryIndexTests {
     func schemaVersion_stamped() async throws {
         let dir = try await makeIndex()
         defer { Task { await cleanup(dir) } }
-        #expect(await MemoryIndex.shared._testSchemaVersion() == 3)
+        #expect(await MemoryIndex.shared._testSchemaVersion() == 4)  // v4: tokenizer drops tokenchars
     }
 
-    @Test("v2→v3 gate: pre-v3 schema with data is dropped and rebuilt as v3")
+    @Test("Schema gate: pre-current schema with data is dropped and rebuilt at the current version")
     func v2ToV3SchemaUpgrade_dropsAndRebuilds() async throws {
         await MemoryIndex.shared._testReset()
         let (pool, dir) = try makePool()
@@ -581,7 +581,7 @@ struct MemoryIndexTests {
             try db.execute(sql: "PRAGMA user_version = 2")
         }
 
-        // Run the v3 gate (mirrors production `initialize()`).
+        // Run the schema gate (current version) (mirrors production `initialize()`).
         try await MemoryIndex.shared._testInstallPoolWithGate(pool)
 
         // The v2 row must be gone (memory_meta was DROPped).
@@ -593,10 +593,32 @@ struct MemoryIndexTests {
         #expect(row != nil)
         // `role` is v3-only — v2 memory_meta didn't have it. This assertion proves the schema was rebuilt.
         #expect(row?.role == "user")
-        #expect(await MemoryIndex.shared._testSchemaVersion() == 3)
+        #expect(await MemoryIndex.shared._testSchemaVersion() == 4)  // v4: tokenizer drops tokenchars
     }
 
-    @Test("v3→v3 gate no-op: already-v3 pool is not touched")
+    @Test("memory_fts tokenizer matches SearchConfig.ftsTokenize (lockstep pin)")
+    func memoryFtsUsesSearchConfigTokenizer() async throws {
+        await MemoryIndex.shared._testReset()
+        let (pool, dir) = try makePool()
+        defer {
+            Task { await MemoryIndex.shared._testReset() }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        try await MemoryIndex.shared._testInstallPoolWithGate(pool)
+
+        let sql = try await pool.read { db in
+            try String.fetchOne(db, sql: "SELECT sql FROM sqlite_master WHERE name = 'memory_fts'")
+        }
+        let createSQL = try #require(sql)
+        // memory_fts shares the email index's tokenizer via SearchConfig —
+        // a divergence would make memory search behave differently (ADR-024).
+        #expect(createSQL.contains(SearchConfig.ftsTokenize),
+                "memory_fts must use SearchConfig.ftsTokenize, got: \(createSQL)")
+        #expect(!createSQL.contains("tokenchars"),
+                "tokenchars must not reappear (ADR-024), got: \(createSQL)")
+    }
+
+    @Test("Schema gate no-op: already-current pool is not touched")
     func v3GateNoOpOnCurrentSchema() async throws {
         await MemoryIndex.shared._testReset()
         let (pool, dir) = try makePool()
@@ -605,12 +627,12 @@ struct MemoryIndexTests {
             try? FileManager.default.removeItem(at: dir)
         }
 
-        // First install stamps v3.
+        // First install stamps the current schema version.
         try await MemoryIndex.shared._testInstallPoolWithGate(pool)
         await MemoryIndex.shared.indexTurn(chatHistoryId: "keep", sessionId: "s", role: "user", dateMs: 1000, text: "preserve me")
         #expect(await MemoryIndex.shared._testMetaRowCount() == 1)
 
-        // Second install: gate should see user_version == 3 and do nothing.
+        // Second install: gate should see the current user_version and do nothing.
         await MemoryIndex.shared._testReset()
         try await MemoryIndex.shared._testInstallPoolWithGate(pool)
 

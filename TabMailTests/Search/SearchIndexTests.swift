@@ -148,33 +148,128 @@ struct SearchIndexCRUDTests {
 
     @Test("Partial and full email-address queries match the sender (tokenchars regression)")
     func emailAddressSearch() async throws {
-        // Regression: tokenchars '-_.@' index the whole address as ONE token.
-        // The query builder used to emit an exact quoted phrase for special-char
-        // tokens, so typing "dmarc-helper" (or any partial address) matched nothing.
+        // Regression: the old tokenchars '-_.@' scheme indexed the whole address
+        // as ONE token, so partial-address queries matched nothing. With the
+        // splitting tokenizer, any address PART is matchable too.
         let hid = "test_email_q:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "<emailq1@test.com>",
-            subject: "Aggregate report", from: "dmarc-helper@domain.com",
+            subject: "Aggregate report", from: "noreply-dmarc-helper@domain.com",
             to: "admin@domain.com", dateMs: 1_700_000_000_000
         )
+
+        // The test-host's persistent fts.db may carry shards from older runs that
+        // the background tokenizer migration hasn't converted yet — convert them
+        // now so the insert below lands in a new-tokenizer shard (idempotent).
+        await index.rebuildStaleTokenizerShards()
 
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        // Partial local part (what a user types before finishing the address)
-        let partial = try await index.keywordSearch(query: "dmarc-helper")
-        #expect(partial.contains { $0.headerId == hid }, "partial local-part must match")
+        // Mid-address part (could never match under glued tokenchars indexing)
+        let part = try await index.keywordSearch(query: "dmarc")
+        #expect(part.contains { $0.headerId == hid }, "mid-address part must match")
 
-        // Mid-typing partial with trailing hyphen segment
+        // Partial with trailing hyphen, as typed mid-flight
         let midway = try await index.keywordSearch(query: "dmarc-help")
         #expect(midway.contains { $0.headerId == hid }, "mid-typing partial must match")
 
-        // Full address
-        let full = try await index.keywordSearch(query: "dmarc-helper@domain.com")
+        // Multi-part partial from the start
+        let partial = try await index.keywordSearch(query: "noreply-dmarc-")
+        #expect(partial.contains { $0.headerId == hid }, "partial local-part must match")
+
+        // Full address (adjacency phrase under the splitting tokenizer)
+        let full = try await index.keywordSearch(query: "noreply-dmarc-helper@domain.com")
         #expect(full.contains { $0.headerId == hid }, "full address must match")
 
         try await index.removeMessages(headerIds: [hid])
+    }
+
+    @Test("Tokenizer migration rebuilds old-tokenchars shards in place, preserving rowids")
+    func tokenizerShardRebuild() async throws {
+        // Seed a fake old-tokenizer shard for a year no real data uses (2001),
+        // aligned with message_meta/message_ids the way indexHeaders would write,
+        // then run the migration and verify: new tokenizer in sqlite_master,
+        // rowids preserved, and part-queries match.
+        let hid = "test_retok:INBOX:1"
+        try await index.removeMessages(headerIds: [hid])
+        let oldTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
+        let rowid: Int64 = try await index.testSeedLegacyShard(
+            year: 2001, tokenize: oldTokenize,
+            headerId: hid, msgId: "<retok1@test.com>",
+            subject: "Weekly digest", from: "billing-alerts@domain.com",
+            body: "full body text here", dateMs: 980_000_000_000 // 2001 epoch ms
+        )
+
+        await index.rebuildStaleTokenizerShards()
+
+        let sql = try await index.testShardCreateSQL(year: 2001)
+        #expect(!(sql?.contains("tokenchars") ?? true), "shard must use the new tokenizer, got: \(sql ?? "nil")")
+
+        // rowid alignment with message_meta must survive the rebuild
+        let newRowid = try await index.testRowidForHeader(hid)
+        #expect(newRowid == rowid, "rowid must be preserved across rebuild")
+
+        // Part-query now matches content indexed under the old scheme
+        let hits = try await index.keywordSearch(query: "billing")
+        #expect(hits.contains { $0.headerId == hid }, "address part must match after rebuild")
+        let bodyHits = try await index.keywordSearch(query: "\"full body text\"")
+        #expect(bodyHits.contains { $0.headerId == hid }, "body must survive rebuild")
+
+        try await index.removeMessages(headerIds: [hid])
+        try await index.testDropShard(year: 2001)
+    }
+
+    @Test("Tokenizer migration honors the deadline and resumes; hasStaleTokenizerShards tracks it")
+    func tokenizerRebuildDeadline() async throws {
+        let hid = "test_retok_dl:INBOX:1"
+        try await index.removeMessages(headerIds: [hid])
+        let oldTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
+        _ = try await index.testSeedLegacyShard(
+            year: 2002, tokenize: oldTokenize,
+            headerId: hid, msgId: "<retokdl@test.com>",
+            subject: "Deadline test", from: "alerts@domain.com",
+            body: "body", dateMs: 1_010_000_000_000 // 2002 epoch ms
+        )
+        #expect(await index.hasStaleTokenizerShards(), "seeded legacy shard must read as stale")
+
+        // Past deadline: no shard may start — shard stays stale (short BG windows
+        // rely on this to never hog the window).
+        await index.rebuildStaleTokenizerShards(deadline: Date(timeIntervalSinceNow: -1))
+        let sqlAfterPast = try await index.testShardCreateSQL(year: 2002)
+        #expect(sqlAfterPast?.contains("tokenchars") == true, "past deadline must not convert anything")
+        #expect(await index.hasStaleTokenizerShards(), "still stale after budget-exhausted run")
+
+        // Future deadline: converts (resume semantics — same call, later window)
+        await index.rebuildStaleTokenizerShards(deadline: Date(timeIntervalSinceNow: 60))
+        let sqlAfterFuture = try await index.testShardCreateSQL(year: 2002)
+        #expect(sqlAfterFuture?.contains("tokenchars") == false, "future deadline must convert")
+        #expect(!(await index.hasStaleTokenizerShards()), "no stale shards after full run")
+
+        try await index.removeMessages(headerIds: [hid])
+        try await index.testDropShard(year: 2002)
+    }
+
+    @Test("Tokenizer migration converts an EMPTY legacy shard")
+    func tokenizerRebuildEmptyShard() async throws {
+        let hid = "test_retok_empty:INBOX:1"
+        let oldTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
+        _ = try await index.testSeedLegacyShard(
+            year: 2003, tokenize: oldTokenize,
+            headerId: hid, msgId: "<retokempty@test.com>",
+            subject: "Empty test", from: "x@domain.com",
+            body: "body", dateMs: 1_041_400_000_000 // 2003 epoch ms
+        )
+        // Empty the shard — removeMessages deletes the FTS row but leaves the table
+        try await index.removeMessages(headerIds: [hid])
+
+        await index.rebuildStaleTokenizerShards()
+
+        let sql = try await index.testShardCreateSQL(year: 2003)
+        #expect(sql?.contains("tokenchars") == false, "empty shard must still convert, got: \(sql ?? "nil")")
+
+        try await index.testDropShard(year: 2003)
     }
 
     @Test("updateBody writes body text to FTS")

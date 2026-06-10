@@ -11,7 +11,17 @@ enum SearchConfig {
 
     // MARK: - FTS5
 
-    static let ftsTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
+    /// No tokenchars (ADR-024): unicode61 treats ALL non-alphanumeric characters
+    /// as separators by default; the old `tokenchars '-_.@'` option made exactly
+    /// those four token-INTERNAL, gluing addresses into single tokens that could
+    /// only be prefix-matched from the token start — "dmarc-" never matched
+    /// "noreply-dmarc-support@…". Without it, addresses index as parts
+    /// (noreply / dmarc / support / domain / com) and any part is matchable;
+    /// full-address queries are adjacency phrases.
+    /// Changing this string triggers a background shard rebuild (SearchIndex
+    /// detects stale shards via their CREATE statement in sqlite_master).
+    /// Keep in lockstep with tabmail-native-fts config.rs FTS_TOKENIZE.
+    static let ftsTokenize = "porter unicode61 remove_diacritics 2"
     static let ftsPrefixes = "2 3 4"
 
     /// BM25 column weights: msgId=0, subject=5, from_=3, to_=2, cc=1, bcc=1, body=1
@@ -49,6 +59,13 @@ enum SearchConfig {
 
     /// Chunk size for one-time FTS shard migration (rows per transaction).
     static let shardMigrationChunkSize = 500
+
+    /// Post-sync time budget for tokenizer shard conversion inside SHORT
+    /// background windows (BGAppRefresh / silent push, ~30s total). Bounds how
+    /// much of the window the migration may take after sync work completes;
+    /// remaining shards resume in later windows or foreground. BGProcessing
+    /// (minutes-scale) runs without this budget.
+    static let retokenizeShortWindowBudgetSec: TimeInterval = 8
 
     // MARK: - FTS5 Write Tuning
 
