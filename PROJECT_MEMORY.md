@@ -44,8 +44,14 @@
 - The **non-throwing** (fire-and-forget) `execute` overload intentionally keeps the old behavior: always waits, always runs.
 - **Overload-resolution gotcha:** a non-throwing `Void` closure resolves to the fire-and-forget overload even when written with `try await`. To get the cancellation-aware path, the closure must throw or return a value (tests force this with `let _: Int = try await queue.execute { ...; return 1 }`).
 
+### FTS Query Gotcha — tokenchars vs auto-quoting (fixed 2026-06-09, lockstep with Rust crate)
+- The FTS tokenizer (`tokenchars '-_.@'`, `SearchConfig.ftsTokenize`, mirrors `config.rs`) glues email-ish text into SINGLE index tokens (`dmarc-helper@domain.com` is one token). `SearchQueryParser.buildFTSMatch` auto-quotes tokens containing `- @ . : +` — these MUST be emitted as prefix queries (`"..."*`), never exact quoted phrases, or any partial address ("dmarc-helper") matches nothing. Same fix applied to `tabmail-native-fts/src/fts/query.rs` (commit bd5ab1e) — keep the two in lockstep.
+- `extractColumnScopeFilter` (SearchIndex.swift) and `extract_column_scope_filter` (db.rs) must consume the trailing `*` after a quoted field value so the hybrid vector prefilter keeps the main query's prefix semantics.
+
 ### Remote Search (SearchView)
-- Typing only searches locally (legacy string match + FTS after 150 ms debounce). **Remote search fires only on keyboard submit** (`triggerRemoteSearch`) — never per keystroke.
+- Typing only searches locally (legacy string match + FTS after 150 ms debounce). **Remote search fires only on keyboard submit** (`triggerRemoteSearch`) — never per keystroke. Scope toggle re-runs an already-submitted remote search (`hasSubmittedRemote`).
+- The FTS debounce UNIONS with the legacy substring hits (FTS ranked first, deduped by headerId) — never replaces. FTS prefix queries can't match mid-token ("dmarc-" inside "noreply-dmarc-support@…" — tokenchars glue addresses into single tokens), so the substring scan catches what FTS misses (graceful degradation, ADR-IOS-007).
+- **Search-all fan-out**: Gmail/Outlook accounts get ONE account-wide search (`folder: ""` — Gmail omits labelIds, Graph hits `/me/messages`; both exclude spam/trash by default). Per-folder fan-out is IMAP-only (no account-wide IMAP SEARCH). Per-folder Graph fan-out trips the MailboxConcurrency throttle (429) — don't reintroduce it.
 - The per-folder remote fan-out runs as child tasks whose cancellation is propagated manually from `searchTask` (the Swift 6 region-isolation checker rejects `group.addTask` closures capturing a SwiftUI view). Cancelled/failed/timed-out folder searches resolve as empty results; whatever completed is merged.
 - `triggerRemoteSearch` bumps `searchGeneration` so a re-submit of the same query invalidates the previous wave (otherwise stale children corrupt the `pendingAccounts` counter).
 

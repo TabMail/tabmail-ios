@@ -146,6 +146,37 @@ struct SearchIndexCRUDTests {
         #expect(count == 0)
     }
 
+    @Test("Partial and full email-address queries match the sender (tokenchars regression)")
+    func emailAddressSearch() async throws {
+        // Regression: tokenchars '-_.@' index the whole address as ONE token.
+        // The query builder used to emit an exact quoted phrase for special-char
+        // tokens, so typing "dmarc-helper" (or any partial address) matched nothing.
+        let hid = "test_email_q:INBOX:1"
+        let record = FTSHeaderRecord(
+            headerId: hid, messageId: "<emailq1@test.com>",
+            subject: "Aggregate report", from: "dmarc-helper@domain.com",
+            to: "admin@domain.com", dateMs: 1_700_000_000_000
+        )
+
+        try await index.removeMessages(headerIds: [hid])
+        let inserted = try await index.indexHeaders([record])
+        #expect(inserted == 1)
+
+        // Partial local part (what a user types before finishing the address)
+        let partial = try await index.keywordSearch(query: "dmarc-helper")
+        #expect(partial.contains { $0.headerId == hid }, "partial local-part must match")
+
+        // Mid-typing partial with trailing hyphen segment
+        let midway = try await index.keywordSearch(query: "dmarc-help")
+        #expect(midway.contains { $0.headerId == hid }, "mid-typing partial must match")
+
+        // Full address
+        let full = try await index.keywordSearch(query: "dmarc-helper@domain.com")
+        #expect(full.contains { $0.headerId == hid }, "full address must match")
+
+        try await index.removeMessages(headerIds: [hid])
+    }
+
     @Test("updateBody writes body text to FTS")
     func updateBodyWritesToFTS() async throws {
         let hid = "test_body_1:INBOX:1"

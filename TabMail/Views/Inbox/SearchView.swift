@@ -278,8 +278,17 @@ struct SearchView: View {
             guard !Task.isCancelled else { return }
 
             let searchResults = ftsResultsToSearchResults(ftsResults)
+            // Union, don't replace (ADR-IOS-007 graceful degradation): FTS misses
+            // matches the substring scan catches — e.g. "dmarc-" mid-token inside
+            // "noreply-dmarc-support@…" (tokenchars glue addresses into single
+            // tokens; prefix queries only match from the token start). Show FTS's
+            // ranked hits first, then any legacy hits FTS missed.
+            let ftsIds = Set(searchResults.compactMap(\.headerId))
+            let legacyExtras = results.filter { result in
+                result.source == .local && (result.headerId.map { !ftsIds.contains($0) } ?? true)
+            }
             let remoteResults = results.filter { $0.source == .remote }
-            results = searchResults + remoteResults
+            results = searchResults + legacyExtras + remoteResults
         }
     }
 
@@ -341,14 +350,23 @@ struct SearchView: View {
                 return (account, folder.path)
             }
         } else {
-            // Search all: every folder except Trash/Spam
+            // Search all: API providers (Gmail/Graph) support account-wide search —
+            // one call with folder="" covers everything (both APIs exclude
+            // spam/trash by default). Per-folder fan-out there wasted calls and
+            // tripped Graph's MailboxConcurrency throttle. IMAP has no
+            // account-wide SEARCH, so it keeps the per-folder fan-out.
             let accountMap = Dictionary(uniqueKeysWithValues: navigationStore.accounts.map { ($0.id, $0) })
-            searchFolders = navigationStore.folders
-                .filter { $0.role != .trash && $0.role != .spam }
+            let accountWide: [(Account, String)] = navigationStore.accounts
+                .filter { $0.provider == .gmail || $0.provider == .outlook }
+                .map { ($0, "") }
+            let accountWideIds = Set(accountWide.map(\.0.id))
+            let perFolder: [(Account, String)] = navigationStore.folders
+                .filter { $0.role != .trash && $0.role != .spam && !accountWideIds.contains($0.accountId) }
                 .compactMap { folder in
                     guard let account = accountMap[folder.accountId] else { return nil }
                     return (account, folder.path)
                 }
+            searchFolders = accountWide + perFolder
         }
         guard !searchFolders.isEmpty else { return }
 
@@ -548,6 +566,10 @@ struct SearchView: View {
         } catch {
             print("[Search] Error searching \(email): \(error)")
             return []
+        }
+
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Search] \(email) \(folder.isEmpty ? "account-wide" : "folder=\(folder)") returned \(infos.count) results")
         }
 
         return infos.map { info in

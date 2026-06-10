@@ -60,6 +60,18 @@ struct SearchQueryParserTests {
         #expect(result.contains("\""))  // should be quoted due to @, .
     }
 
+    @Test("Quoted special-char tokens carry a prefix star (email-ish partial match)")
+    func quotedSpecialCharsArePrefixQueries() {
+        // tokenchars '-_.@' glue full addresses into single index tokens, so the
+        // auto-quoted form MUST be a prefix query — an exact quoted partial like
+        // "dmarc-helper" can never match the indexed "dmarc-helper@domain.com".
+        #expect(SearchQueryParser.buildFTSMatch("dmarc-helper") == "\"dmarc-helper\"*")
+        #expect(SearchQueryParser.buildFTSMatch("user@example.com") == "\"user@example.com\"*")
+        // Field-scoped special-char value gets the same prefix form
+        let scoped = SearchQueryParser.buildFTSMatch("from:user@example.com")
+        #expect(scoped.contains("from_:\"user@example.com\"*"))
+    }
+
     @Test("Synonym expansion for known word")
     func synonymExpansion() {
         let result = SearchQueryParser.buildFTSMatch("meeting")

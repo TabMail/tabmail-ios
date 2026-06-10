@@ -1180,13 +1180,17 @@ actor SearchIndex {
                 i = ftsQuery.index(i, offsetBy: prefix.count)
 
                 if i < ftsQuery.endIndex && ftsQuery[i] == "\"" {
-                    // Quoted value: field:"value"
+                    // Quoted value: field:"value" or prefix form field:"value"*
                     i = ftsQuery.index(after: i)
                     while i < ftsQuery.endIndex && ftsQuery[i] != "\"" {
                         i = ftsQuery.index(after: i)
                     }
                     if i < ftsQuery.endIndex {
                         i = ftsQuery.index(after: i) // closing quote
+                    }
+                    if i < ftsQuery.endIndex && ftsQuery[i] == "*" {
+                        i = ftsQuery.index(after: i) // prefix star — keep so the
+                        // filter query preserves the main query's prefix semantics
                     }
                 } else {
                     // Unquoted value: field:value*
