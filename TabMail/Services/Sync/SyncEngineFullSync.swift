@@ -620,8 +620,11 @@ extension SyncEngine {
                 (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
             }
             let staleFiltered = stale.filter { !isProtected($0) && !uidMigratedSet.contains($0.messageId) }
-            // Append — the UID-remap loop above already routed re-keyed old ids
-            // into staleIds; assignment would clobber them.
+            // Append, never assign — re-keyed old ids ride ftsRekeys (the FTS
+            // entry MOVES, it must not be removed), but staleIds may already
+            // carry entries from earlier loop passes and the canonicalizer in
+            // the upsert loop appends merge-loser ids later. An assignment
+            // here would clobber the accumulation contract.
             staleIds.append(contentsOf: staleFiltered.map(\.id))
             for msg in staleFiltered {
                 if folder.role == .drafts || folder.role == .sent {

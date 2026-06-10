@@ -220,6 +220,11 @@ enum SyncConfig {
     /// Failed items move to back of FIFO, yielding to others. After max retries,
     /// item is removed from in-memory queue; repopulateFromDatabase catches it on next foreground.
     static let maxQueueRetries = 3
+    /// FTS orphan prune (one-time sweep): entries paged per FTS read.
+    static let ftsOrphanPruneChunk = 500
+    /// FTS orphan prune: delay before re-verifying candidates against GRDB —
+    /// kills in-flight insert races without holding any lock.
+    static let ftsOrphanPruneRecheckMs = 100
 
     // MARK: - BackfillAIQueue
 

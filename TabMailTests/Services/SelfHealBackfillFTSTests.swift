@@ -114,6 +114,36 @@ struct SelfHealBackfillFTSTests {
         await cleanup(headerId: headerId)
     }
 
+    @Test("Full-history heal re-indexes stuck rows regardless of date rank")
+    func fullHistoryHealReindexesOldStuckRows() async throws {
+        // The recurring heal samples only the most-recent 2000 by date; the
+        // one-time full-history walk must reach stuck rows at ANY date rank.
+        // Use a years-old date (dynamically derived — no hardcoded dates).
+        let engine = SyncEngine()
+        let oldDate = Calendar.current.date(byAdding: .year, value: -8, to: Date())!
+        let headerId = try await insertHeaderMissingFromFTS(
+            accountId: "fullheal-old", folderPath: "Archive", messageId: "m1",
+            headerComplete: true, bodyComplete: true, bodyEmptyConfirmed: false
+        )
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET date = ? WHERE id = ?",
+                           arguments: [oldDate, headerId])
+        }
+        #expect(await isMissingFromFTS(headerId: headerId) == true, "precondition")
+
+        let healed = try await engine.healAllFTSBodyMembership(scopePrefix: "fullheal-old:")
+
+        #expect(healed == 1)
+        #expect(await isMissingFromFTS(headerId: headerId) == false, "full sweep must re-index regardless of age")
+        // bodyComplete reset so the body pipeline re-fetches + re-indexes the body.
+        let bodyComplete: Bool = try await AppDatabase.dbPool.read { db in
+            try Bool.fetchOne(db, sql: "SELECT bodyComplete FROM messageHeader WHERE id = ?",
+                              arguments: [headerId]) ?? true
+        }
+        #expect(bodyComplete == false)
+        await cleanup(headerId: headerId)
+    }
+
     @Test("Out of scope: bodyComplete=1 header is NOT re-indexed by backfill self-heal")
     func skipsRowsOutOfScope_bodyComplete() async throws {
         // The backfill self-heal scope is deliberately narrow: `headerComplete=1
@@ -198,5 +228,108 @@ struct SelfHealBackfillFTSTests {
         await cleanup(headerId: h1)
         await cleanup(headerId: h2)
         await cleanup(headerId: h3)
+    }
+}
+
+// MARK: - One-time FTS orphan prune (FTS→GRDB direction)
+
+/// `pruneFTSOrphans` removes FTS entries whose header id no longer exists in
+/// GRDB — the inverse direction of the self-heals above. Uses the production
+/// `AppDatabase.dbPool` + `SearchIndex.shared` (what the function operates on)
+/// with unique prefixes + cleanup, mirroring the suites above.
+@Suite("SyncEngine.pruneFTSOrphans — dead FTS entry removal", .serialized)
+struct FTSOrphanPruneTests {
+
+    private func makeRecord(_ headerId: String) -> FTSHeaderRecord {
+        FTSHeaderRecord(
+            headerId: headerId, messageId: "m-\(headerId.suffix(6))",
+            subject: "orphanprune test", from: "a@x", to: "b@x",
+            dateMs: Int64(Date().timeIntervalSince1970 * 1000),
+            folderId: "orphanprune:INBOX"
+        )
+    }
+
+    /// Insert a GRDB header whose PK is exactly `headerId` (account/folder
+    /// created on demand), so the prune sees it as live.
+    private func insertLiveHeader(headerId: String) async throws {
+        let accountId = "orphanprune-acct"
+        let folderPath = "INBOX"
+        let messageId = String(headerId.split(separator: ":").last ?? "m1")
+        try await AppDatabase.dbPool.write { db in
+            if try Account.fetchOne(db, key: accountId) == nil {
+                var account = Account(emailAddress: "op@example.com", displayName: "T", provider: .gmail)
+                account.id = accountId
+                try account.insert(db)
+            }
+            let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+            if try Folder.fetchOne(db, key: folderId) == nil {
+                let folder = Folder(name: folderPath, path: folderPath, role: .inbox, accountId: accountId)
+                try folder.insert(db)
+            }
+            var header = MessageHeader(
+                messageId: messageId,
+                subject: "live", from: "a@x", fromAddress: "a@x", to: "b@x",
+                date: Date(), snippet: "",
+                folderId: folderId, accountId: accountId, folderPath: folderPath,
+                isInInbox: true
+            )
+            try header.insert(db)
+        }
+    }
+
+    private func cleanupGRDB(accountId: String) async {
+        try? await AppDatabase.dbPool.write { db in
+            _ = try Account.deleteOne(db, key: accountId) // cascades headers/folders
+        }
+    }
+
+    @Test("Dead FTS entries are pruned; live entries survive")
+    func prunesDeadKeepsLive() async throws {
+        let liveId = "orphanprune-acct:INBOX:op-live-1"
+        let deadId = "orphanprune-acct:INBOX:op-dead-1"
+        try? await SearchIndex.shared.removeMessages(headerIds: [liveId, deadId])
+
+        try await insertLiveHeader(headerId: liveId)
+        _ = try await SearchIndex.shared.indexHeaders([makeRecord(liveId), makeRecord(deadId)])
+
+        let engine = SyncEngine()
+        // Scoped to this suite's prefix — parallel suites share SearchIndex.shared
+        // and an unscoped sweep would remove their fixtures.
+        _ = try await engine.pruneFTSOrphans(scopePrefix: "orphanprune-acct:")
+
+        let missing = try await SearchIndex.shared.headerIdsMissingFromFTS([liveId, deadId])
+        #expect(!missing.contains(liveId), "live entry must survive the prune")
+        #expect(missing.contains(deadId), "dead entry must be pruned")
+
+        try? await SearchIndex.shared.removeMessages(headerIds: [liveId, deadId])
+        await cleanupGRDB(accountId: "orphanprune-acct")
+    }
+
+    @Test("Gate: oneTimeFTSReconciliation runs once, sets the flag, then no-ops")
+    func gateRunsOnce() async throws {
+        // UserDefaults isn't Sendable — sending one instance into the actor
+        // twice trips the region checker. Fresh same-suite instances share the
+        // backing store, so each call gets its own throwaway reference.
+        let suiteName = "orphanprune-\(UUID().uuidString)"
+        defer { UserDefaults(suiteName: suiteName)!.removePersistentDomain(forName: suiteName) }
+        let deadA = "orphanprune-acct:INBOX:op-gate-a"
+        let deadB = "orphanprune-acct:INBOX:op-gate-b"
+        try? await SearchIndex.shared.removeMessages(headerIds: [deadA, deadB])
+
+        _ = try await SearchIndex.shared.indexHeaders([makeRecord(deadA)])
+
+        let engine = SyncEngine()
+        await engine.oneTimeFTSReconciliation(defaults: UserDefaults(suiteName: suiteName)!, scopePrefix: "orphanprune-acct:")
+        #expect(UserDefaults(suiteName: suiteName)!.bool(forKey: SyncEngine.ftsReconcileDoneKey) == true)
+        let missingA = try await SearchIndex.shared.headerIdsMissingFromFTS([deadA])
+        #expect(missingA.contains(deadA), "first run prunes")
+
+        // Second run is gated — a fresh dead entry must survive untouched.
+        _ = try await SearchIndex.shared.indexHeaders([makeRecord(deadB)])
+        await engine.oneTimeFTSReconciliation(defaults: UserDefaults(suiteName: suiteName)!, scopePrefix: "orphanprune-acct:")
+        let missingB = try await SearchIndex.shared.headerIdsMissingFromFTS([deadB])
+        #expect(!missingB.contains(deadB), "gated second run must not prune")
+
+        try? await SearchIndex.shared.removeMessages(headerIds: [deadA, deadB])
     }
 }

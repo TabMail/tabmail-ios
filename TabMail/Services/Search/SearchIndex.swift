@@ -556,6 +556,30 @@ actor SearchIndex {
         }
     }
 
+    /// One page entry for the orphan-prune cursor walk. A struct (not a
+    /// labeled tuple) — tuple arrays crossing the actor boundary trip the
+    /// Swift 6 region-isolation checker ("pattern that the region-based
+    /// isolation checker does not understand", surfacing as a compile error
+    /// in unrelated call sites of this actor).
+    struct HeaderIdPageEntry: Sendable {
+        let rowid: Int64
+        let headerId: String
+    }
+
+    /// Cursor page of (rowid, headerId) entries from message_ids, ordered by
+    /// rowid — pagination for the one-time FTS→GRDB orphan prune. OFFSET-free
+    /// so cost stays O(page) regardless of position in a large index.
+    func headerIdPage(afterRowid: Int64, limit: Int) throws -> [HeaderIdPageEntry] {
+        guard let dbPool else { return [] }
+        return try dbPool.read { db in
+            try Row.fetchAll(
+                db,
+                sql: "SELECT rowid, headerId FROM message_ids WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                arguments: [afterRowid, limit]
+            ).map { HeaderIdPageEntry(rowid: $0["rowid"] as Int64, headerId: $0["headerId"] as String) }
+        }
+    }
+
     /// Returns headerIds from the input that are NOT in FTS message_meta.
     /// Used by backfill self-heal to find GRDB headers missing from FTS.
     func headerIdsMissingFromFTS(_ headerIds: [String]) throws -> [String] {
@@ -693,14 +717,21 @@ actor SearchIndex {
         try dbPool.write { [self] db in
             for headerId in headerIds {
                 guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
-                let table = ftsTableName(year: resolved.year)
-
-                try db.execute(sql: "DELETE FROM \(table) WHERE rowid = ?", arguments: [resolved.rowid])
-                try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [resolved.rowid])
-                try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [resolved.rowid])
-                try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [headerId])
+                try deleteEntry(headerId: headerId, rowid: resolved.rowid, year: resolved.year, db: db)
             }
         }
+    }
+
+    /// Delete one message's full FTS footprint (FTS row + meta + embedding +
+    /// id mapping). The single source of truth for removal — used by
+    /// `removeMessages` and `rekeyHeaders`' collision branch so the statement
+    /// set can't drift between them.
+    private func deleteEntry(headerId: String, rowid: Int64, year: Int, db: Database) throws {
+        let table = ftsTableName(year: year)
+        try db.execute(sql: "DELETE FROM \(table) WHERE rowid = ?", arguments: [rowid])
+        try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [rowid])
+        try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [rowid])
+        try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [headerId])
     }
 
     /// Re-key FTS entries to a new header id IN PLACE — the FTS rowid (and
@@ -727,10 +758,7 @@ actor SearchIndex {
                 ) ?? false
                 if newExists {
                     print("[SearchIndex] rekeyHeaders: \(rekey.newId.prefix(40)) already indexed — removing old entry \(rekey.oldId.prefix(40))")
-                    try db.execute(sql: "DELETE FROM \(table) WHERE rowid = ?", arguments: [resolved.rowid])
-                    try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [resolved.rowid])
-                    try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [resolved.rowid])
-                    try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [rekey.oldId])
+                    try deleteEntry(headerId: rekey.oldId, rowid: resolved.rowid, year: resolved.year, db: db)
                     continue
                 }
                 try db.execute(sql: "UPDATE message_ids SET headerId = ? WHERE headerId = ?",

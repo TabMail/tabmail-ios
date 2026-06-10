@@ -27,6 +27,14 @@ actor SyncEngine {
     /// FTS bulk-indexing tasks, keyed by account ID (one per account).
     var bulkIndexTasks: [String: Task<Void, Never>] = [:]
 
+    /// In-flight guard for the one-time FTS reconciliation. `syncStartup` can
+    /// spawn multiple +5s heal tasks (foreground return, push, BGRefresh) and
+    /// the UserDefaults gate is only written on completion, so two overlapping
+    /// reconciliations were possible — idempotent but wasteful. Actor-isolated;
+    /// the check-and-set in `oneTimeFTSReconciliation` is synchronous (no
+    /// suspension point), so it is race-free under actor reentrancy.
+    var ftsReconcileInFlight = false
+
     /// Embedding rebuild task (one at a time).
 
     /// One-shot flag so the `recoverIncompleteHeaders` EXPLAIN QUERY PLAN probe

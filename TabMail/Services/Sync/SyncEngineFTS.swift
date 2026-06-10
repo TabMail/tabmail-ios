@@ -73,9 +73,10 @@ extension SyncEngine {
     /// NOT inbox-scoped: pre-rekeyHeaders UID remaps produced this exact state
     /// on MOVED (non-inbox) messages — the header was re-keyed while its FTS
     /// entry stayed under the dead old id. New occurrences are prevented by
-    /// `SearchIndex.rekeyHeaders`; this sweep heals the leftovers. The bound
-    /// samples most-recent-first so each launch covers the rows users actually
-    /// search, converging over a few launches for large mailboxes.
+    /// `SearchIndex.rekeyHeaders`; this recurring pass covers the most-recent
+    /// 2000 rows (the ones users actually search). Rows older than that rank
+    /// are NEVER sampled here — the one-time `healAllFTSBodyMembership` sweep
+    /// (part of `oneTimeFTSReconciliation`) walks the full history instead.
     ///
     /// The SQL is a shared constant so `FTSSelfHealTests` locks the exact
     /// candidate contract (a reintroduced `isInInbox` filter must fail a test).
@@ -103,27 +104,35 @@ extension SyncEngine {
             print("[FTS] Self-heal: \(missingIds.count) headers with bodyComplete=1 missing from FTS — re-indexing")
             BackgroundSyncLogger.log("[FTS] Self-heal: re-indexing \(missingIds.count) orphaned headers")
 
-            let toReindex: [MessageHeader] = try await dbPool.read { db in
-                let placeholders = missingIds.map { _ in "?" }.joined(separator: ",")
-                return try MessageHeader.fetchAll(
-                    db,
-                    sql: "SELECT * FROM messageHeader WHERE id IN (" + placeholders + ")",
-                    arguments: StatementArguments(missingIds)
-                )
-            }
-            await indexHeadersForFTS(toReindex)
-
-            try await dbPool.write { db in
-                for chunk in missingIds.chunked(into: 500) {
-                    let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
-                    try db.execute(
-                        sql: "UPDATE messageHeader SET bodyComplete = 0 WHERE id IN (\(placeholders))",
-                        arguments: StatementArguments(chunk)
-                    )
-                }
-            }
+            try await reindexAndRequeueBodies(missingIds: missingIds)
         } catch {
             print("[FTS] Self-heal failed: \(error)")
+        }
+    }
+
+    /// Shared heal tail: re-index the headers under their ids and reset
+    /// `bodyComplete = 0` so the body pipeline re-fetches and re-indexes the
+    /// body text. Used by the recurring recent-window heal and the one-time
+    /// full-history sweep.
+    private func reindexAndRequeueBodies(missingIds: [String]) async throws {
+        let toReindex: [MessageHeader] = try await dbPool.read { db in
+            let placeholders = missingIds.map { _ in "?" }.joined(separator: ",")
+            return try MessageHeader.fetchAll(
+                db,
+                sql: "SELECT * FROM messageHeader WHERE id IN (" + placeholders + ")",
+                arguments: StatementArguments(missingIds)
+            )
+        }
+        await indexHeadersForFTS(toReindex)
+
+        try await dbPool.write { db in
+            for chunk in missingIds.chunked(into: 500) {
+                let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+                try db.execute(
+                    sql: "UPDATE messageHeader SET bodyComplete = 0 WHERE id IN (\(placeholders))",
+                    arguments: StatementArguments(chunk)
+                )
+            }
         }
     }
 
@@ -169,6 +178,147 @@ extension SyncEngine {
             await indexHeadersForFTS(toReindex)
         } catch {
             print("[FTS] Backfill self-heal failed: \(error)")
+        }
+    }
+
+    /// UserDefaults gate for the one-time FTS reconciliation. Versioned so a
+    /// future re-sweep only needs a key bump. (v1 covered the orphan prune
+    /// alone under `ftsOrphanPrune.v1.done`; the reconcile key supersedes it
+    /// and adds the full-history GRDB→FTS membership sweep — devices that ran
+    /// v1 re-run once, which is idempotent.)
+    static let ftsReconcileDoneKey = "ftsReconcile.v1.done"
+
+    /// One-time full FTS↔GRDB reconciliation, both directions:
+    /// 1. `pruneFTSOrphans` — remove FTS entries whose header id no longer
+    ///    exists in GRDB (FTS→GRDB). Orphans were produced by the
+    ///    pre-`rekeyHeaders` era: UID remaps re-keyed headers without touching
+    ///    FTS, and deletions could race their FTS removal. They surface as
+    ///    stale search hits that render without subject/sender and cannot open.
+    /// 2. `healAllFTSBodyMembership` — full-history walk of `bodyComplete=1`
+    ///    headers missing from FTS (GRDB→FTS). The recurring
+    ///    `selfHealFTSBodyMembership` only samples the most-recent 2000 rows
+    ///    per launch; stuck rows older than that rank would never be reached.
+    ///
+    /// Neither state can form anymore (rekeyHeaders moves entries in place;
+    /// `bodyComplete` is only set after a confirmed FTS write), so one clean
+    /// completion suffices — the gate is set only then; an interrupted or
+    /// failed sweep resumes on the next launch.
+    ///
+    /// Non-blocking: runs in the detached startup heal task (utility, +5s),
+    /// cursor-paged (both pools are WAL — readers never block writers), FTS
+    /// writes only for confirmed work, chunked.
+    func oneTimeFTSReconciliation(defaults: UserDefaults = .standard, scopePrefix: String? = nil) async {
+        guard !defaults.bool(forKey: Self.ftsReconcileDoneKey) else { return }
+        // Overlap guard — see `ftsReconcileInFlight`. Check-and-set is
+        // synchronous, so actor reentrancy can't interleave two claims.
+        guard !ftsReconcileInFlight else { return }
+        ftsReconcileInFlight = true
+        defer { ftsReconcileInFlight = false }
+        do {
+            let pruned = try await pruneFTSOrphans(scopePrefix: scopePrefix)
+            let healed = try await healAllFTSBodyMembership(scopePrefix: scopePrefix)
+            defaults.set(true, forKey: Self.ftsReconcileDoneKey)
+            if pruned > 0 || healed > 0 {
+                print("[FTS] Reconciliation complete: pruned \(pruned) dead entries, healed \(healed) missing entries")
+                BackgroundSyncLogger.log("[FTS] Reconciliation complete: pruned \(pruned), healed \(healed)")
+            }
+        } catch {
+            // Gate NOT set — the sweep restarts from the beginning next launch.
+            print("[FTS] Reconciliation failed: \(error) — resuming next launch")
+        }
+    }
+
+    /// Full-history GRDB→FTS membership sweep: rowid-cursor walk over ALL
+    /// `bodyComplete = 1 AND headerComplete = 1` headers (no date window),
+    /// re-indexing + re-queueing any missing from FTS. Returns healed count.
+    /// `scopePrefix` restricts to a header-id prefix — test isolation only.
+    @discardableResult
+    func healAllFTSBodyMembership(scopePrefix: String? = nil) async throws -> Int {
+        var cursor: Int64 = 0
+        var healed = 0
+        while true {
+            // Hoist — capturing the mutable cursor in the Sendable read
+            // closure is a Swift 6 error.
+            let pageCursor = cursor
+            let page: [(rowid: Int64, id: String)] = try await dbPool.read { db in
+                try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT rowid, id FROM messageHeader
+                        WHERE rowid > ? AND bodyComplete = 1 AND headerComplete = 1
+                        ORDER BY rowid LIMIT ?
+                        """,
+                    arguments: [pageCursor, SyncConfig.ftsOrphanPruneChunk]
+                ).map { (rowid: $0["rowid"] as Int64, id: $0["id"] as String) }
+            }
+            guard let last = page.last else { break }
+            cursor = last.rowid
+
+            var ids = page.map(\.id)
+            if let scopePrefix {
+                ids = ids.filter { $0.hasPrefix(scopePrefix) }
+            }
+            guard !ids.isEmpty else { continue }
+
+            let missingIds = try await SearchIndex.shared.headerIdsMissingFromFTS(ids)
+            guard !missingIds.isEmpty else { continue }
+
+            try await reindexAndRequeueBodies(missingIds: missingIds)
+            healed += missingIds.count
+            print("[FTS] Full-history heal: re-indexed \(missingIds.count) (cursor \(cursor))")
+        }
+        return healed
+    }
+
+    /// The sweep body — separated from the gate so tests can drive it directly.
+    /// Returns the number of pruned entries. `scopePrefix` restricts the sweep
+    /// to header ids with that prefix — test isolation only (parallel test
+    /// suites share SearchIndex.shared and an unscoped sweep would remove
+    /// their fixtures); production passes nil.
+    @discardableResult
+    func pruneFTSOrphans(scopePrefix: String? = nil) async throws -> Int {
+        var cursor: Int64 = 0
+        var pruned = 0
+        while true {
+            let page = try await SearchIndex.shared.headerIdPage(
+                afterRowid: cursor, limit: SyncConfig.ftsOrphanPruneChunk)
+            guard let last = page.last else { break }
+            cursor = last.rowid
+
+            var ids = page.map(\.headerId)
+            if let scopePrefix {
+                ids = ids.filter { $0.hasPrefix(scopePrefix) }
+            }
+            guard !ids.isEmpty else { continue }
+            let existing = try await fetchExistingHeaderIds(ids)
+            var candidates = ids.filter { !existing.contains($0) }
+            guard !candidates.isEmpty else { continue }
+
+            // Re-verify after a beat. FTS entries are written only AFTER their
+            // GRDB row commits, so a row still missing on the second look is a
+            // true orphan, not an insert in flight.
+            try await Task.sleep(for: .milliseconds(SyncConfig.ftsOrphanPruneRecheckMs))
+            let stillExisting = try await fetchExistingHeaderIds(candidates)
+            candidates = candidates.filter { !stillExisting.contains($0) }
+            guard !candidates.isEmpty else { continue }
+
+            try await SearchIndex.shared.removeMessages(headerIds: candidates)
+            pruned += candidates.count
+            print("[FTS] Orphan prune: removed \(candidates.count) dead entries (cursor \(cursor))")
+        }
+        return pruned
+    }
+
+    /// Which of `ids` exist as messageHeader PKs — single indexed IN query.
+    private func fetchExistingHeaderIds(_ ids: [String]) async throws -> Set<String> {
+        guard !ids.isEmpty else { return [] }
+        return try await dbPool.read { db in
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            return try Set(String.fetchAll(
+                db,
+                sql: "SELECT id FROM messageHeader WHERE id IN (\(placeholders))",
+                arguments: StatementArguments(ids)
+            ))
         }
     }
 
