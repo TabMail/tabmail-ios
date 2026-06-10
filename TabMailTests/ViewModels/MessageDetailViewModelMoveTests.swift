@@ -49,8 +49,8 @@ struct MessageDetailViewModelMoveTests {
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
             try acc.insert(db)
-            var inbox = Folder(name: "INBOX", path: Self.inboxPath, role: .inbox, accountId: "acc1")
-            var archive = Folder(name: "Archive", path: Self.archivePath, role: .archive, accountId: "acc1")
+            let inbox = Folder(name: "INBOX", path: Self.inboxPath, role: .inbox, accountId: "acc1")
+            let archive = Folder(name: "Archive", path: Self.archivePath, role: .archive, accountId: "acc1")
             try inbox.insert(db)
             try archive.insert(db)
         }

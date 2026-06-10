@@ -497,7 +497,7 @@ struct ReconcileRespectsHeldRowsTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let future = Date().addingTimeInterval(5)
-        var msg = makeMessage(holdUntil: future, draftId: "d1")
+        let msg = makeMessage(holdUntil: future, draftId: "d1")
         try db.write { try msg.insert($0) }
 
         try runReconcileForTest(db)
@@ -518,7 +518,7 @@ struct ReconcileRespectsHeldRowsTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let past = Date().addingTimeInterval(-10)
-        var msg = makeMessage(holdUntil: past, draftId: "d1")
+        let msg = makeMessage(holdUntil: past, draftId: "d1")
         try db.write { try msg.insert($0) }
 
         try runReconcileForTest(db)
@@ -532,7 +532,7 @@ struct ReconcileRespectsHeldRowsTests {
     func sendingMidCrashStillResets() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
-        var msg = makeMessage(status: .sending)
+        let msg = makeMessage(status: .sending)
         // sentAt stays nil (simulating mid-send crash)
         try db.write { try msg.insert($0) }
 
@@ -673,7 +673,7 @@ struct DraftSurvivesDiscardTests {
         try TestDatabase.insertAccount(db)
 
         try insertDraftForTest(db, id: "drft-keep")
-        var outbox = makeMessage(
+        let outbox = makeMessage(
             holdUntil: Date().addingTimeInterval(6),
             draftId: "drft-keep",
             status: .queued
@@ -697,7 +697,7 @@ struct DraftSurvivesDiscardTests {
         try TestDatabase.insertAccount(db)
 
         try insertDraftForTest(db, id: "drft-sending")
-        var outbox = makeMessage(draftId: "drft-sending", status: .sending)
+        let outbox = makeMessage(draftId: "drft-sending", status: .sending)
         try db.write { try outbox.insert($0) }
 
         let discarded = try runDiscardForTest(db, outboxId: outbox.id)
@@ -716,7 +716,7 @@ struct DraftSurvivesDiscardTests {
         try TestDatabase.insertAccount(db)
 
         try insertDraftForTest(db, id: "drft-claim")
-        var outbox = makeMessage(
+        let outbox = makeMessage(
             holdUntil: Date().addingTimeInterval(-1),  // ready
             draftId: "drft-claim",
             status: .queued
@@ -769,7 +769,7 @@ struct PostLoopWakeUpQueryTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let hold = Date().addingTimeInterval(5)
-        var msg = makeMessage(id: "only", holdUntil: hold)
+        let msg = makeMessage(id: "only", holdUntil: hold)
         try db.write { try msg.insert($0) }
 
         let earliest = try runEarliestPendingQuery(db)
@@ -781,8 +781,8 @@ struct PostLoopWakeUpQueryTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let now = Date()
-        var soon = makeMessage(id: "soon", holdUntil: now.addingTimeInterval(5))
-        var later = makeMessage(id: "later", holdUntil: now.addingTimeInterval(10))
+        let soon = makeMessage(id: "soon", holdUntil: now.addingTimeInterval(5))
+        let later = makeMessage(id: "later", holdUntil: now.addingTimeInterval(10))
         // Insert `later` first to confirm order is by holdUntil, not insert order.
         try db.write {
             try later.insert($0)
@@ -800,8 +800,8 @@ struct PostLoopWakeUpQueryTests {
         // One past-hold (drain loop just picked it up and failed transiently
         // — it's still .queued but with past hold) and one future-hold.
         let now = Date()
-        var past = makeMessage(id: "past", holdUntil: now.addingTimeInterval(-1))
-        var future = makeMessage(id: "future", holdUntil: now.addingTimeInterval(5))
+        let past = makeMessage(id: "past", holdUntil: now.addingTimeInterval(-1))
+        let future = makeMessage(id: "future", holdUntil: now.addingTimeInterval(5))
         try db.write {
             try past.insert($0)
             try future.insert($0)
@@ -829,9 +829,9 @@ struct PostLoopWakeUpQueryTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         let now = Date()
-        var sending = makeMessage(id: "sending", holdUntil: now.addingTimeInterval(1), status: .sending)
-        var failed = makeMessage(id: "failed", holdUntil: now.addingTimeInterval(2), status: .failed)
-        var queued = makeMessage(id: "queued", holdUntil: now.addingTimeInterval(10), status: .queued)
+        let sending = makeMessage(id: "sending", holdUntil: now.addingTimeInterval(1), status: .sending)
+        let failed = makeMessage(id: "failed", holdUntil: now.addingTimeInterval(2), status: .failed)
+        let queued = makeMessage(id: "queued", holdUntil: now.addingTimeInterval(10), status: .queued)
         try db.write {
             try sending.insert($0)
             try failed.insert($0)
