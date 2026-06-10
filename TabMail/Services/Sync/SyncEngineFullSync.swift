@@ -110,6 +110,11 @@ extension SyncEngine {
         // Extracted to avoid duplication between initial sync and connection-error retry.
         @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
             ReplyParentResolver.postParentNotifications(result.replyDetectIds)
+            if !result.ftsRekeys.isEmpty {
+                // In-place FTS re-key (UID remap / remnant canonicalization) —
+                // preserves the indexed body text + embedding under the new id.
+                try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys)
+            }
             if !result.staleIds.isEmpty {
                 try? await SearchIndex.shared.removeMessages(headerIds: result.staleIds)
             }
@@ -269,6 +274,11 @@ extension SyncEngine {
         // (read→unread) without producing newHeaders or staleIds.
         await UnreadCountManager.shared.requestRecount(folderId: folder.id)
 
+        if !result.ftsRekeys.isEmpty {
+            // In-place FTS re-key (UID remap / remnant canonicalization) —
+            // preserves the indexed body text + embedding under the new id.
+            try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys)
+        }
         if !result.staleIds.isEmpty {
             removeHeadersFromFTS(result.staleIds)
         }
@@ -287,6 +297,135 @@ extension SyncEngine {
         let staleIds: [String]
         let replyDetectIds: [String]
         let uidMigratedOldIds: [String]
+        /// Header re-keys (UID remap, remnant canonicalization) — callers must
+        /// apply via `SearchIndex.rekeyHeaders` so the FTS rowid (indexed body
+        /// text + messages_vec embedding) moves to the new id IN PLACE.
+        /// `newMessageId` refreshes the FTS msgId column on UID remaps.
+        let ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]
+    }
+
+    /// Canonicalize the local rows for one remote message in one folder.
+    ///
+    /// `optimisticMoveToFolder` updates folderId/folderPath but keeps the
+    /// original PK ("accountId:<oldPath>:<messageId>"). For providers with
+    /// stable message ids (Gmail) the remnant's messageId stays in the remote
+    /// set forever, so it never reaches the stale/UID-remap path that re-keys
+    /// IMAP rows — the stale PK survives indefinitely, and historical insert
+    /// paths could leave BOTH the remnant AND a canonical-PK row for the same
+    /// message (observed in the field 2026-06-09 as phantom 2-member
+    /// self-threads in Trash; see PROJECT_MEMORY).
+    ///
+    /// Merges any duplicates into one survivor (preferring the canonical-PK
+    /// row, preserving AI fields and the richest cached body) and re-keys the
+    /// survivor to the canonical PK. Returns the canonical row (nil when the
+    /// message has no local row yet), the header ids of merge-loser rows
+    /// deleted along the way (callers must drop them from FTS via staleIds),
+    /// and the (oldId, newId) pair when a re-key happened (callers must
+    /// re-key the FTS entry IN PLACE via `SearchIndex.rekeyHeaders` — this
+    /// preserves the FTS rowid, the indexed body text, and the messages_vec
+    /// embedding; the re-keyed old id must NOT ride the staleIds channel).
+    ///
+    /// `bodyComplete` stays truthful per row: the survivor keeps its OWN flag
+    /// (no OR-merge from losers — that would claim an FTS body the survivor's
+    /// row doesn't have, the PLAN_FTS_BODY_LOSS class). A survivor with
+    /// `bodyComplete = 0` re-enters the standard body pipeline naturally.
+    nonisolated static func canonicalizeLocalRows(
+        accountId: String,
+        folderPath: String,
+        folderId: String,
+        messageId: String,
+        isInInbox: Bool,
+        db: Database
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
+        let rows = try MessageHeader
+            .filter(Column("messageId") == messageId && Column("folderId") == folderId)
+            .fetchAll(db)
+        guard !rows.isEmpty else { return (nil, [], nil) }
+
+        let canonicalId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
+        // Fast path — a single row already under the canonical PK is the
+        // overwhelmingly common case. Return before ANY extra query so the
+        // per-message cost of the upsert loop is identical to the plain
+        // fetchOne this replaced (ADR-IOS-029 hot-path discipline).
+        if rows.count == 1 && rows[0].id == canonicalId {
+            return (rows[0], [], nil)
+        }
+
+        var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
+        var removedIds: [String] = []
+
+        // Preserve the richest cached body across all rows BEFORE any delete —
+        // MessageBody is keyed 1:1 by header id and CASCADE-deletes with it.
+        var bestBody: MessageBody?
+        for row in rows {
+            if let body = try MessageBody.fetchOne(db, key: row.id),
+               bestBody == nil || (bestBody?.htmlContent?.isEmpty ?? true) {
+                bestBody = body
+            }
+        }
+
+        // Merge AI/local state from duplicates into the survivor, then drop them.
+        for row in rows where row.id != survivor.id {
+            if survivor.actionTag == nil, let tag = row.actionTag {
+                survivor.actionTag = tag
+                survivor.tagSortOrder = row.tagSortOrder
+            }
+            if survivor.summaryBlurb == nil { survivor.summaryBlurb = row.summaryBlurb }
+            if survivor.summaryTodos == nil { survivor.summaryTodos = row.summaryTodos }
+            if survivor.reminderDate == nil { survivor.reminderDate = row.reminderDate }
+            if survivor.reminderTime == nil { survivor.reminderTime = row.reminderTime }
+            if survivor.reminderContent == nil { survivor.reminderContent = row.reminderContent }
+            if survivor.cachedReply == nil { survivor.cachedReply = row.cachedReply }
+            survivor.isReplied = survivor.isReplied || row.isReplied
+            survivor.isForwarded = survivor.isForwarded || row.isForwarded
+            survivor.isRead = survivor.isRead || row.isRead
+            // Deliberately NOT merging bodyComplete/bodyEmptyConfirmed — the
+            // survivor's flags must describe its OWN FTS row, and the losers'
+            // FTS rows leave via staleIds.
+            try row.delete(db)
+            removedIds.append(row.id)
+            print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
+        }
+
+        let willRekey = survivor.id != canonicalId
+        if willRekey || !removedIds.isEmpty {
+            // Normalize folder-derived state while we're writing anyway.
+            survivor.isInInbox = isInInbox
+        }
+
+        var ftsRekey: (oldId: String, newId: String)?
+        if willRekey {
+            // Defensive — the canonical PK can be held by a row in ANOTHER
+            // folder (a message optimistically moved OUT of this folder keeps
+            // its PK). Don't steal it; keep the remnant PK and retry on a
+            // later sync once that row has been canonicalized in its own folder.
+            guard try MessageHeader.fetchOne(db, key: canonicalId) == nil else {
+                print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
+                if !removedIds.isEmpty { try survivor.update(db) }
+                return (survivor, removedIds, nil)
+            }
+            // Re-key the optimistic-move remnant to the canonical PK. The PK
+            // can't be UPDATEd in place (messageBody references it with
+            // ON DELETE CASCADE), so delete + reinsert, body reattached below.
+            let oldId = survivor.id
+            try survivor.delete(db)
+            survivor.id = canonicalId
+            survivor.folderPath = folderPath
+            try survivor.insert(db)
+            ftsRekey = (oldId: oldId, newId: canonicalId)
+            print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
+        } else if !removedIds.isEmpty {
+            try survivor.update(db)
+        }
+
+        // Reattach the preserved body under the final id if none is present.
+        if let body = bestBody, try MessageBody.fetchOne(db, key: survivor.id) == nil {
+            var rekeyedBody = body
+            rekeyedBody.id = survivor.id
+            try rekeyedBody.insert(db)
+        }
+
+        return (survivor, removedIds, ftsRekey)
     }
 
     /// Core message sync logic — runs entirely off the main thread.
@@ -311,7 +450,7 @@ extension SyncEngine {
         // Pending ops are loaded INSIDE the write transaction to prevent TOCTOU races
         // (a user action inserting a PendingOperation between a separate read and this write
         // would cause the pendingDestructiveIds set to be stale, leading to UNIQUE constraint violations).
-        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String]) = try await dbPool.write { db in
+        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]) = try await dbPool.write { db in
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
             // IMAP UIDs are per-folder — UID "500" in INBOX and UID "500" in Archive are different
@@ -348,6 +487,7 @@ extension SyncEngine {
             }
             var newHeaders: [MessageHeader] = []
             var staleIds: [String] = []
+            var ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
             // Remove stale local messages.
             // Uses date-bounded query to load only the overlap window, not all 8000+ messages.
             // MessageAICache preserves AI state for re-inserted messages.
@@ -463,6 +603,11 @@ extension SyncEngine {
                     body.id = newId
                     try body.insert(db)
                 }
+                // Move the FTS entry to the new id IN PLACE (preserves the
+                // indexed body text + the messages_vec embedding). Previously
+                // the old FTS row ghosted forever (search hits deep-linking to
+                // a deleted header id) and the new id was invisible to search.
+                ftsRekeys.append((oldId: oldId, newId: newId, newMessageId: newMsgId))
                 uidMigratedRemoteIds.insert(newMsgId)
                 uidMigratedOldMsgIds.append(staleMsg.messageId)
             }
@@ -475,7 +620,9 @@ extension SyncEngine {
                 (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
             }
             let staleFiltered = stale.filter { !isProtected($0) && !uidMigratedSet.contains($0.messageId) }
-            staleIds = staleFiltered.map(\.id)
+            // Append — the UID-remap loop above already routed re-keyed old ids
+            // into staleIds; assignment would clobber them.
+            staleIds.append(contentsOf: staleFiltered.map(\.id))
             for msg in staleFiltered {
                 if folder.role == .drafts || folder.role == .sent {
                     print("[Sync] DraftStaleDelete: removing \(msg.id) msgId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") snippet=\(String(msg.snippet.prefix(60)))")
@@ -502,9 +649,32 @@ extension SyncEngine {
                 print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByRecentIds.count) msgs recently completed: \(skippedByRecentIds)")
             }
             for info in messages where !allSkippedIds.contains(info.messageId) && !uidMigratedRemoteIds.contains(info.messageId) {
-                if var existing = try MessageHeader
-                    .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
-                    .fetchOne(db) {
+                // Canonicalize PKs + merge duplicate rows (optimistic-move
+                // remnants keep their old "accountId:<oldPath>:<msgId>" PK
+                // forever for stable-id providers — see canonicalizeLocalRows).
+                // Drafts/Sent are exempt: DraftStore's push migration manages
+                // their row identity.
+                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?)
+                if folder.role == .drafts || folder.role == .sent {
+                    recon = (try MessageHeader
+                        .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
+                        .fetchOne(db), [], nil)
+                } else {
+                    recon = try Self.canonicalizeLocalRows(
+                        accountId: accountId, folderPath: folderPath,
+                        folderId: folderId, messageId: info.messageId,
+                        isInInbox: isInInbox, db: db
+                    )
+                }
+                if !recon.removedIds.isEmpty {
+                    staleIds.append(contentsOf: recon.removedIds)
+                }
+                if let rekey = recon.ftsRekey {
+                    // FTS entry moves to the new id in place — body text and
+                    // embedding ride along. messageId is unchanged here.
+                    ftsRekeys.append((oldId: rekey.oldId, newId: rekey.newId, newMessageId: nil))
+                }
+                if var existing = recon.row {
                     // Drafts/Sent special case: the server's drafts.list / equivalent
                     // summary metadata (date, snippet, to, rfc822) lags behind the
                     // actual message resource right after a local push. We already
@@ -892,14 +1062,15 @@ extension SyncEngine {
             // MainActor user actions. TTL is now refreshed lazily after AI queue drains
             // (see ActiveAIQueue.onDrainComplete).
 
-            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds)
+            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys)
         }
 
         return SyncMessagesResult(
             newHeaders: syncResult.newHeaders,
             staleIds: syncResult.staleIds,
             replyDetectIds: syncResult.replyDetectIds,
-            uidMigratedOldIds: syncResult.uidMigratedOldIds
+            uidMigratedOldIds: syncResult.uidMigratedOldIds,
+            ftsRekeys: syncResult.ftsRekeys
         )
     }
 }

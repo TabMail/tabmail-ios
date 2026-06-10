@@ -703,6 +703,48 @@ actor SearchIndex {
         }
     }
 
+    /// Re-key FTS entries to a new header id IN PLACE — the FTS rowid (and
+    /// with it the indexed body text and the messages_vec embedding) stays;
+    /// only the id mapping moves. Used when sync re-keys a messageHeader PK:
+    /// UID remap after IMAP moves, and optimistic-move remnant
+    /// canonicalization. `newMessageId` optionally refreshes the FTS msgId
+    /// column (UID remaps change the provider message id).
+    ///
+    /// If the new id already exists in FTS (e.g. a leftover orphan or a
+    /// concurrent index), the old entry is removed instead — two rows must
+    /// never share a headerId (`message_ids.headerId` is the primary key).
+    func rekeyHeaders(_ rekeys: [(oldId: String, newId: String, newMessageId: String?)]) throws {
+        ensureReady()
+        guard let dbPool, !rekeys.isEmpty else { return }
+        try dbPool.write { [self] db in
+            for rekey in rekeys {
+                guard let resolved = try resolveRowidAndYear(rekey.oldId, db: db) else { continue }
+                let table = ftsTableName(year: resolved.year)
+                let newExists = try Bool.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) > 0 FROM message_ids WHERE headerId = ?",
+                    arguments: [rekey.newId]
+                ) ?? false
+                if newExists {
+                    print("[SearchIndex] rekeyHeaders: \(rekey.newId.prefix(40)) already indexed — removing old entry \(rekey.oldId.prefix(40))")
+                    try db.execute(sql: "DELETE FROM \(table) WHERE rowid = ?", arguments: [resolved.rowid])
+                    try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [resolved.rowid])
+                    try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [resolved.rowid])
+                    try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [rekey.oldId])
+                    continue
+                }
+                try db.execute(sql: "UPDATE message_ids SET headerId = ? WHERE headerId = ?",
+                               arguments: [rekey.newId, rekey.oldId])
+                try db.execute(sql: "UPDATE message_meta SET headerId = ? WHERE rowid = ?",
+                               arguments: [rekey.newId, resolved.rowid])
+                if let newMessageId = rekey.newMessageId {
+                    try db.execute(sql: "UPDATE \(table) SET msgId = ? WHERE rowid = ?",
+                                   arguments: [newMessageId, resolved.rowid])
+                }
+            }
+        }
+    }
+
     // MARK: - Folder ID Updates
 
     /// Batch-update folderId for messages (used by backfill and move sync).

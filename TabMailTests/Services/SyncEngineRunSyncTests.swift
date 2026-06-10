@@ -964,3 +964,73 @@ struct RunSyncPendingOpProtectionTests {
         #expect(msg77 != nil)
     }
 }
+
+// MARK: - Suite: UID remap ftsRekeys emission (real runSyncMessages)
+
+/// Drives the REAL `SyncEngine.runSyncMessages` (not the replicated sim above
+/// — the real function needs a `DatabasePool`) against `MockEmailProvider` to
+/// lock the UID-remap contract introduced with `SearchIndex.rekeyHeaders`:
+/// a re-keyed row must ride `ftsRekeys` (its FTS entry MOVES in place,
+/// preserving indexed body + embedding) and must NOT ride `staleIds` (which
+/// would delete that entry) nor `newHeaders` (header-only re-index).
+@Suite("runSyncMessages — UID remap ftsRekeys emission", .serialized)
+struct RunSyncUIDRemapFtsRekeyTests {
+
+    @Test("Remap emits ftsRekeys with new messageId; old id avoids staleIds/newHeaders")
+    func remapEmitsFtsRekey() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "remap@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc")
+            try folder.insert(db)
+            var header = MessageHeader(
+                messageId: "100", subject: "Remap target", from: "a@x", fromAddress: "a@x",
+                to: "b@x", date: date, snippet: "s",
+                folderId: "racc:INBOX", accountId: "racc", folderPath: "INBOX", isInInbox: true
+            )
+            header.rfc822MessageId = "remap-x@example.com"
+            header.headerComplete = true
+            header.bodyComplete = true
+            try header.insert(db)
+            try MessageBody(headerId: "racc:INBOX:100", htmlContent: "<p>kept</p>").insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }
+        let mock = MockEmailProvider()
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "200", rfc822MessageId: "remap-x@example.com",
+                           subject: "Remap target", date: date)
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 50, dbPool: pool)
+
+        // ftsRekeys carries the move, with the new provider message id.
+        #expect(result.ftsRekeys.count == 1)
+        #expect(result.ftsRekeys.first?.oldId == "racc:INBOX:100")
+        #expect(result.ftsRekeys.first?.newId == "racc:INBOX:200")
+        #expect(result.ftsRekeys.first?.newMessageId == "200")
+        // The old id must NOT be removed from FTS or header-only re-indexed.
+        #expect(!result.staleIds.contains("racc:INBOX:100"))
+        #expect(!result.newHeaders.contains { $0.id == "racc:INBOX:200" })
+        #expect(result.uidMigratedOldIds == ["100"])
+
+        // GRDB row re-keyed in place, body preserved, bodyComplete untouched
+        // (its FTS entry rides the rekey — no refetch churn).
+        let migrated = try await pool.read { try MessageHeader.fetchOne($0, key: "racc:INBOX:200") }
+        #expect(migrated != nil)
+        #expect(migrated?.bodyComplete == true)
+        let old = try await pool.read { try MessageHeader.fetchOne($0, key: "racc:INBOX:100") }
+        #expect(old == nil)
+        let body = try await pool.read { try MessageBody.fetchOne($0, key: "racc:INBOX:200") }
+        #expect(body?.htmlContent == "<p>kept</p>")
+    }
+}

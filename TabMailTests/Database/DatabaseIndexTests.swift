@@ -22,6 +22,23 @@ struct DatabaseIndexTests {
         #expect(!indexes.isEmpty)
     }
 
+    @Test("Canonicalize upsert lookup (messageId + folderId) uses an index, not a scan")
+    func canonicalizeLookupUsesIndex() throws {
+        // canonicalizeLocalRows runs once per remote message in every folder
+        // sync — it MUST seek via messageHeader_messageId_accountId (v40),
+        // never scan (ADR-IOS-029).
+        let db = try TestDatabase.make()
+        let details: [String] = try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM messageHeader WHERE messageId = 'x' AND folderId = 'acc1:INBOX'
+                """).map { row in row["detail"] as String }
+        }
+        let plan = details.joined(separator: " | ")
+        #expect(plan.contains("USING INDEX"), "expected index seek, got: \(plan)")
+        #expect(!plan.contains("SCAN messageHeader"), "full scan on hot upsert path: \(plan)")
+    }
+
     @Test("Query by folderId + isRead uses index effectively")
     func queryByFolderIdAndIsRead() throws {
         let db = try TestDatabase.make()
