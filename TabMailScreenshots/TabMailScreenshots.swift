@@ -67,6 +67,31 @@ final class TabMailScreenshots: XCTestCase {
         Thread.sleep(forTimeInterval: 0.5)
     }
 
+    /// Scroll the plan picker all the way down so the full Apple disclosure +
+    /// Terms/Privacy links are visible. One fixed swipe is not enough since the
+    /// Zero card + cost-note footnote lengthened the page; anchor on the
+    /// "Restore Purchases" button — the last element in the scroll content.
+    private func scrollPlanPickerToBottom() {
+        let restoreButton = app.buttons["Restore Purchases"]
+        for _ in 0..<8 {
+            if restoreButton.exists && restoreButton.isHittable { break }
+            app.scrollViews.firstMatch.swipeUp()
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        Thread.sleep(forTimeInterval: 1)
+    }
+
+    /// Scroll the plan picker back to the top (Monthly/Yearly toggle visible).
+    private func scrollPlanPickerToTop() {
+        let monthlyTab = app.buttons["Monthly"]
+        for _ in 0..<8 {
+            if monthlyTab.exists && monthlyTab.isHittable { break }
+            app.scrollViews.firstMatch.swipeDown()
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        Thread.sleep(forTimeInterval: 1)
+    }
+
     // MARK: - 01. Splash / Login Screen
     // Named test00 so it runs BEFORE other tests (alphabetical order).
     // Erase simulator ensures no persisted data.
@@ -234,14 +259,11 @@ final class TabMailScreenshots: XCTestCase {
             snapshot("12_PlanMonthly")
 
             // 14. Scroll to bottom to show Apple disclosure + links (monthly)
-            app.scrollViews.firstMatch.swipeUp()
-            Thread.sleep(forTimeInterval: 1)
+            scrollPlanPickerToBottom()
             snapshot("14_PlanMonthlyDisclosure")
 
             // Scroll back to top for yearly tab
-            app.scrollViews.firstMatch.swipeDown()
-            app.scrollViews.firstMatch.swipeDown()
-            Thread.sleep(forTimeInterval: 1)
+            scrollPlanPickerToTop()
 
             // 13. Switch to Yearly and capture
             let yearlyTab = app.buttons["Yearly"]
@@ -251,8 +273,7 @@ final class TabMailScreenshots: XCTestCase {
                 snapshot("13_PlanYearly")
 
                 // 15. Scroll to bottom to show Apple disclosure + links (yearly)
-                app.scrollViews.firstMatch.swipeUp()
-                Thread.sleep(forTimeInterval: 1)
+                scrollPlanPickerToBottom()
                 snapshot("15_PlanYearlyDisclosure")
             }
         }

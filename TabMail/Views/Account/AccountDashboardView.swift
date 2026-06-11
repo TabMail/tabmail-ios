@@ -88,7 +88,7 @@ struct AccountDashboardView: View {
                     if let downgrade = accountInfo?.pendingDowngrade, let toPlan = downgrade.toPlan {
                         StatusBanner(
                             icon: "arrow.down.circle",
-                            text: "Downgrading to \(toPlan) on \(downgrade.effectiveAtFormatted ?? downgrade.effectiveAt.map { formatTimestamp($0) } ?? "")",
+                            text: "Downgrading to \(StoreKitManager.displayPlanName(forTier: toPlan)) on \(downgrade.effectiveAtFormatted ?? downgrade.effectiveAt.map { formatTimestamp($0) } ?? "")",
                             color: .yellow
                         )
                         .listRowInsets(EdgeInsets())
@@ -110,7 +110,7 @@ struct AccountDashboardView: View {
                     // Plan & Status
                     HStack {
                         Label {
-                            Text(accountInfo?.planTier ?? "None")
+                            Text(accountInfo?.planTier.map { StoreKitManager.displayPlanName(forTier: $0) } ?? "None")
                                 .foregroundStyle(Palette.textColor)
                         } icon: {
                             Image(systemName: "crown")
@@ -132,21 +132,28 @@ struct AccountDashboardView: View {
                     }
                     .listRowBackground(Palette.boxBg)
 
-                    // Quota
+                    // Quota — Zero (BYOK) has no priority AI budget, so a percentage
+                    // is meaningless; show N/A instead (site dashboard precedent).
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Label("Quota Used", systemImage: "gauge")
                                 .foregroundStyle(.primary)
                             Spacer()
-                            Text(String(format: "%.1f%%", accountInfo?.quotaPercentage ?? 0))
+                            Text(isZeroPlan ? "N/A" : String(format: "%.1f%%", accountInfo?.quotaPercentage ?? 0))
                                 .foregroundStyle(Palette.textMuted)
                         }
-                        ProgressView(value: min((accountInfo?.quotaPercentage ?? 0) / 100, 1.0))
-                            .tint(quotaTint)
-                        if let resetLabel = quotaResetLabel {
-                            Text(resetLabel)
+                        if isZeroPlan {
+                            Text("Zero includes no priority AI budget — AI runs on your own keys, or via the slower shared queue.")
                                 .font(.caption2)
                                 .foregroundStyle(Palette.textMuted)
+                        } else {
+                            ProgressView(value: min((accountInfo?.quotaPercentage ?? 0) / 100, 1.0))
+                                .tint(quotaTint)
+                            if let resetLabel = quotaResetLabel {
+                                Text(resetLabel)
+                                    .font(.caption2)
+                                    .foregroundStyle(Palette.textMuted)
+                            }
                         }
                     }
                     .listRowBackground(Palette.boxBg)
@@ -409,6 +416,11 @@ struct AccountDashboardView: View {
                 errorMessage = "Failed to load usage stats"
             }
         }
+    }
+
+    /// Zero (BYOK) plan — internal tier string stays "BYOK"; only display maps to "Zero".
+    private var isZeroPlan: Bool {
+        accountInfo?.planTier == "BYOK"
     }
 
     private var quotaTint: Color {

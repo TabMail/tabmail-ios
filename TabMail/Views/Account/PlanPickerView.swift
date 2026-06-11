@@ -31,7 +31,7 @@ struct PlanPickerView: View {
                 if let downgrade = accountInfo?.pendingDowngrade, let toPlan = downgrade.toPlan {
                     StatusBanner(
                         icon: "arrow.down.circle",
-                        text: "Downgrading to \(toPlan) on \(downgrade.effectiveAtFormatted ?? downgrade.effectiveAt.map { formatTimestamp($0) } ?? "")",
+                        text: "Downgrading to \(StoreKitManager.displayPlanName(forTier: toPlan)) on \(downgrade.effectiveAtFormatted ?? downgrade.effectiveAt.map { formatTimestamp($0) } ?? "")",
                         color: .yellow
                     )
                 }
@@ -55,7 +55,10 @@ struct PlanPickerView: View {
                         savingsPercent: savingsPercent(for: product),
                         isCurrentPlan: isCurrentPlan(product),
                         hasAnyAppleSub: storeKit.isAppleSubscriber || (accountInfo?.hasSubscription == true && accountInfo?.subscriptionProvider == "apple"),
-                        backendTier: accountInfo?.planTier,
+                        // Backend tier preferred; StoreKit-local plan covers the
+                        // window where /whoami hasn't loaded (offline, fresh launch)
+                        // so upgrade/downgrade labels stay rank-correct.
+                        backendTier: accountInfo?.planTier ?? storeKit.activePlan,
                         isPurchasing: isPurchasing,
                         isEligibleForTrial: storeKit.isEligibleForTrial
                     ) {
@@ -105,6 +108,9 @@ struct PlanPickerView: View {
                         Text("* After using your priority quota, AI agent requests continue at a slower pace to ensure fair access for all users.")
                         Text("** Priority AI agent requests may be throttled during peak usage to ensure quality of service.")
                         Text("*** Prices exclude taxes. Taxes will be added at checkout where applicable.")
+                        // Zero plan cost disclosure (D7 — parity with the site's "What is the Zero plan?" FAQ)
+                        Text("Zero plan: the subscription covers TabMail's email infrastructure only — AI runs on your own provider account using your own API keys. Depending on your provider and model choice, TabMail's AI features can consume a significant API bill on your account. Running on TabMail's own AI infrastructure (the Basic and Pro plans) is generally 10–100× cheaper for the same usage.")
+                            .padding(.top, 8)
                     }
                     .font(.caption2)
                     .foregroundStyle(Palette.textMuted)
@@ -229,7 +235,7 @@ struct PlanPickerView: View {
     /// Determine if this product is the user's current active plan.
     /// Uses backend tier for quick "is this the right tier?" check, then StoreKit for monthly/yearly distinction.
     private func isCurrentPlan(_ product: Product) -> Bool {
-        let productTier = product.id.contains("pro") ? "Pro" : "Basic"
+        let productTier = StoreKitManager.planName(for: product.id)
         // Backend tier check (faster than StoreKit local — no transaction verification lag)
         if let backendTier = accountInfo?.planTier,
            accountInfo?.hasSubscription == true,
@@ -256,7 +262,7 @@ struct PlanPickerView: View {
 
     private func savingsPercent(for product: Product) -> Int? {
         guard product.id.contains("yearly") else { return nil }
-        let tier = product.id.contains("pro") ? "pro" : "basic"
+        let tier = StoreKitManager.planName(for: product.id).lowercased()
         guard let monthlyProduct = storeKit.products.first(where: {
             $0.id.contains(tier) && $0.id.contains("monthly")
         }) else { return nil }
@@ -369,27 +375,48 @@ private struct PlanCard: View {
     let savingsPercent: Int?
     let isCurrentPlan: Bool   // This exact product is the user's active plan
     let hasAnyAppleSub: Bool  // User has any active subscription (Apple or backend)
-    let backendTier: String?  // Current plan tier from backend (e.g. "Pro", "Basic")
+    let backendTier: String?  // Current plan tier ("Pro"/"Basic"/"BYOK") — backend, or StoreKit while backend unloaded
     let isPurchasing: Bool
     let isEligibleForTrial: Bool
     let onPurchase: () async -> Void
 
     private var isPro: Bool { product.id.contains("pro") }
+    private var isZero: Bool { product.id.contains("byok") }
     private var isYearly: Bool { product.id.contains("yearly") }
 
-    private var planTier: String {
-        isPro ? "Pro" : "Basic"
-    }
+    /// Backend-facing tier of this card's product ("BYOK"/"Basic"/"Pro").
+    private var tierKey: String { StoreKitManager.planName(for: product.id) }
+
+    /// User-facing tier label ("Zero"/"Basic"/"Pro") — display-only mapping (D6).
+    private var planTier: String { StoreKitManager.displayPlanName(forTier: tierKey) }
+
+    /// Whether this product carries an introductory offer (Zero has none —
+    /// `isEligibleForTrial` is group-level, so it alone would wrongly badge Zero).
+    private var hasIntroOffer: Bool { product.subscription?.introductoryOffer != nil }
+
+    private var showsTrialBadge: Bool { isEligibleForTrial && !hasAnyAppleSub && hasIntroOffer }
 
     private var buttonLabel: String {
-        if isEligibleForTrial && !hasAnyAppleSub { return "Start Free Trial" }
+        if showsTrialBadge { return "Start Free Trial" }
         guard hasAnyAppleSub else { return "Subscribe" }
-        if isPro { return "Upgrade" }
-        if backendTier == "Pro" { return "Downgrade" }
+        let currentRank = StoreKitManager.tierRank(forTier: backendTier)
+        let cardRank = StoreKitManager.tierRank(for: product.id)
+        guard currentRank > 0 else { return "Switch" }
+        if cardRank > currentRank { return "Upgrade" }
+        if cardRank < currentRank { return "Downgrade" }
         return "Switch"
     }
 
     private var features: [String] {
+        if isZero {
+            return [
+                "Email content not stored",
+                "Bring your own AI keys (OpenAI, Anthropic, Google)",
+                "AI runs on your own provider account",
+                "Limited access to TabMail AI",
+                "Full access to TabMail client features",
+            ]
+        }
         if isPro {
             return [
                 "Email content not stored",
@@ -428,7 +455,7 @@ private struct PlanCard: View {
             }
 
             // Trial badge
-            if isEligibleForTrial && !hasAnyAppleSub {
+            if showsTrialBadge {
                 Text("2 weeks free")
                     .font(.caption.bold())
                     .foregroundStyle(.white)
@@ -479,7 +506,7 @@ private struct PlanCard: View {
                 }
             }
 
-            if isEligibleForTrial && !hasAnyAppleSub {
+            if showsTrialBadge {
                 Text("Free for 2 weeks, then \(product.displayPrice)/\(isYearly ? "year" : "month"). Cancel before the trial ends to avoid being charged.")
                     .font(.caption)
                     .foregroundStyle(Palette.textMuted)

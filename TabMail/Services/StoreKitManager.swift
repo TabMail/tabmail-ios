@@ -22,6 +22,8 @@ final class StoreKitManager {
     var isEligibleForTrial = false
 
     private static let productIDs: Set<String> = [
+        "ai.tabmail.byok.monthly",
+        "ai.tabmail.byok.yearly",
         "ai.tabmail.basic.monthly",
         "ai.tabmail.basic.yearly",
         "ai.tabmail.pro.monthly",
@@ -54,7 +56,14 @@ final class StoreKitManager {
         print("[StoreKit] Loading products for IDs: \(Self.productIDs)")
         do {
             let storeProducts = try await Product.products(for: Self.productIDs)
-            products = storeProducts.sorted { $0.price < $1.price }
+            // Explicit tier-order sort (Zero → Basic → Pro) so the plan picker
+            // shows the lowest tier first regardless of regional pricing.
+            products = storeProducts.sorted {
+                let lhs = Self.tierRank(for: $0.id)
+                let rhs = Self.tierRank(for: $1.id)
+                if lhs != rhs { return lhs < rhs }
+                return $0.price < $1.price
+            }
             if products.isEmpty {
                 print("[StoreKit] Product.products returned empty — products may not be configured in App Store Connect")
                 productsLoadError = "No plans available. Products may not be configured in App Store Connect yet."
@@ -123,7 +132,7 @@ final class StoreKitManager {
                 restoreResult = "No active subscriptions found for this Apple ID."
                 print("[StoreKit] Restore completed — no entitlements found")
             } else {
-                restoreResult = "Restored: \(activePlan ?? "subscription")"
+                restoreResult = "Restored: \(activePlan.map { Self.displayPlanName(forTier: $0) } ?? "subscription")"
                 print("[StoreKit] Restore completed — found: \(purchasedProductIDs)")
             }
         } catch {
@@ -148,11 +157,11 @@ final class StoreKitManager {
                 continue
             }
             purchased.insert(transaction.productID)
-            // Prefer highest tier: Pro (2) > Basic (1)
-            let rank = transaction.productID.contains("pro") ? 2 : 1
+            // Prefer highest tier: Pro (3) > Basic (2) > BYOK/Zero (1)
+            let rank = Self.tierRank(for: transaction.productID)
             if rank > bestRank {
                 bestRank = rank
-                bestPlan = planName(for: transaction.productID)
+                bestPlan = Self.planName(for: transaction.productID)
             }
             if let token = transaction.appAccountToken {
                 ownerUserId = token.uuidString.lowercased()
@@ -186,9 +195,11 @@ final class StoreKitManager {
     // MARK: - Trial Eligibility
 
     /// Check if the user is eligible for the introductory offer (2-week free trial).
-    /// Uses any product in the group — eligibility is per subscription group, not per product.
+    /// Eligibility is per subscription group, but it must be read from a product that
+    /// actually HAS an intro offer — Zero (BYOK) has none and sorts first, so
+    /// `products.first` would wrongly report ineligible.
     func checkTrialEligibility() async {
-        guard let product = products.first,
+        guard let product = products.first(where: { $0.subscription?.introductoryOffer != nil }),
               let subscription = product.subscription else {
             isEligibleForTrial = false
             return
@@ -212,10 +223,38 @@ final class StoreKitManager {
 
     // MARK: - Helpers
 
-    private func planName(for productId: String) -> String {
+    /// Backend-facing tier name — must match `AccountInfo.planTier` values ("BYOK", not "Zero").
+    nonisolated static func planName(for productId: String) -> String {
         if productId.contains("pro") { return "Pro" }
         if productId.contains("basic") { return "Basic" }
+        if productId.contains("byok") { return "BYOK" }
         return "Unknown"
+    }
+
+    /// Tier ranking for upgrade/downgrade direction: Unknown 0 < BYOK/Zero 1 < Basic 2 < Pro 3.
+    /// Matches the worker-side ranks (billing-worker planInfo, apple-webhook PRODUCT_MAP).
+    nonisolated static func tierRank(for productId: String) -> Int {
+        if productId.contains("pro") { return 3 }
+        if productId.contains("basic") { return 2 }
+        if productId.contains("byok") { return 1 }
+        return 0
+    }
+
+    /// Rank for a backend tier string ("Pro"/"Basic"/"BYOK"), nil/unknown → 0.
+    nonisolated static func tierRank(forTier tier: String?) -> Int {
+        switch tier {
+        case "Pro": return 3
+        case "Basic": return 2
+        case "BYOK": return 1
+        default: return 0
+        }
+    }
+
+    /// User-facing display name for a backend tier string. DISPLAY-ONLY mapping —
+    /// internal ids/tier strings stay "BYOK" everywhere (KV, planQuotas, product IDs).
+    /// Site precedent: PLAN_DISPLAY (pricing.js), PLAN_TIER_DISPLAY (dashboard.js).
+    nonisolated static func displayPlanName(forTier tier: String) -> String {
+        tier == "BYOK" ? "Zero" : tier
     }
 
     func monthlyProducts() -> [Product] {

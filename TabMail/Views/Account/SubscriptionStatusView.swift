@@ -10,8 +10,8 @@ struct SubscriptionStatusView: View {
     var body: some View {
         if let info = accountInfo, info.hasSubscription == true {
             HStack(spacing: 8) {
-                // Plan pill
-                Text(info.planTier ?? "Plan")
+                // Plan pill (display-mapped: backend "BYOK" renders as "Zero")
+                Text(info.planTier.map { StoreKitManager.displayPlanName(forTier: $0) } ?? "Plan")
                     .font(.caption.bold())
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)

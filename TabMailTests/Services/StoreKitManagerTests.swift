@@ -16,6 +16,8 @@ struct StoreKitManagerProductIDTests {
         // The product IDs are private, but we can verify the patterns used
         // in the filtering and ranking logic match what's expected
         let expectedIDs = [
+            "ai.tabmail.byok.monthly",
+            "ai.tabmail.byok.yearly",
             "ai.tabmail.basic.monthly",
             "ai.tabmail.basic.yearly",
             "ai.tabmail.pro.monthly",
@@ -25,14 +27,14 @@ struct StoreKitManagerProductIDTests {
         for id in expectedIDs {
             #expect(id.hasPrefix("ai.tabmail."))
             #expect(id.contains("monthly") || id.contains("yearly"))
-            #expect(id.contains("basic") || id.contains("pro"))
+            #expect(id.contains("basic") || id.contains("pro") || id.contains("byok"))
         }
     }
 
     @Test("Product ID contains check distinguishes monthly vs yearly")
     func monthlyYearlyDistinction() {
-        let monthlyIDs = ["ai.tabmail.basic.monthly", "ai.tabmail.pro.monthly"]
-        let yearlyIDs = ["ai.tabmail.basic.yearly", "ai.tabmail.pro.yearly"]
+        let monthlyIDs = ["ai.tabmail.byok.monthly", "ai.tabmail.basic.monthly", "ai.tabmail.pro.monthly"]
+        let yearlyIDs = ["ai.tabmail.byok.yearly", "ai.tabmail.basic.yearly", "ai.tabmail.pro.yearly"]
 
         for id in monthlyIDs {
             #expect(id.contains("monthly"))
@@ -44,18 +46,26 @@ struct StoreKitManagerProductIDTests {
         }
     }
 
-    @Test("Product ID contains check distinguishes basic vs pro")
-    func basicProDistinction() {
+    @Test("Product ID contains check distinguishes tiers")
+    func tierDistinction() {
+        let byokIDs = ["ai.tabmail.byok.monthly", "ai.tabmail.byok.yearly"]
         let basicIDs = ["ai.tabmail.basic.monthly", "ai.tabmail.basic.yearly"]
         let proIDs = ["ai.tabmail.pro.monthly", "ai.tabmail.pro.yearly"]
 
+        for id in byokIDs {
+            #expect(id.contains("byok"))
+            #expect(!id.contains("basic"))
+            #expect(!id.contains("pro"))
+        }
         for id in basicIDs {
             #expect(id.contains("basic"))
             #expect(!id.contains("pro"))
+            #expect(!id.contains("byok"))
         }
         for id in proIDs {
             #expect(id.contains("pro"))
             #expect(!id.contains("basic"))
+            #expect(!id.contains("byok"))
         }
     }
 }
@@ -65,52 +75,80 @@ struct StoreKitManagerProductIDTests {
 @Suite("StoreKitManager Plan Ranking")
 struct StoreKitManagerPlanRankingTests {
 
-    @Test("Pro rank is higher than Basic rank")
-    func proHigherThanBasic() {
-        // From updateCurrentEntitlements: pro -> rank 2, basic -> rank 1
-        let proID = "ai.tabmail.pro.monthly"
-        let basicID = "ai.tabmail.basic.monthly"
-
-        let proRank = proID.contains("pro") ? 2 : 1
-        let basicRank = basicID.contains("pro") ? 2 : 1
-
-        #expect(proRank > basicRank)
+    @Test("Tier ranks order Unknown < BYOK < Basic < Pro")
+    func tierRankOrdering() {
+        // Matches worker-side ranks: Unknown=0, BYOK=1, Basic=2, Pro=3
+        #expect(StoreKitManager.tierRank(for: "ai.tabmail.byok.monthly") == 1)
+        #expect(StoreKitManager.tierRank(for: "ai.tabmail.byok.yearly") == 1)
+        #expect(StoreKitManager.tierRank(for: "ai.tabmail.basic.monthly") == 2)
+        #expect(StoreKitManager.tierRank(for: "ai.tabmail.pro.yearly") == 3)
+        #expect(StoreKitManager.tierRank(for: "com.other.app") == 0)
+        #expect(StoreKitManager.tierRank(for: "") == 0)
     }
 
-    @Test("Plan ranking picks pro over basic")
-    func rankingPicksProOverBasic() {
+    @Test("Tier ranks for backend tier strings")
+    func tierRankForTierString() {
+        #expect(StoreKitManager.tierRank(forTier: "Pro") == 3)
+        #expect(StoreKitManager.tierRank(forTier: "Basic") == 2)
+        #expect(StoreKitManager.tierRank(forTier: "BYOK") == 1)
+        #expect(StoreKitManager.tierRank(forTier: "Unknown") == 0)
+        #expect(StoreKitManager.tierRank(forTier: nil) == 0)
+        // Display name must NOT be accepted — internal tier strings only
+        #expect(StoreKitManager.tierRank(forTier: "Zero") == 0)
+    }
+
+    @Test("Plan ranking picks pro over basic and byok")
+    func rankingPicksProOverOthers() {
         // Simulate the ranking logic from updateCurrentEntitlements
-        let productIDs = ["ai.tabmail.basic.monthly", "ai.tabmail.pro.yearly"]
+        let productIDs = ["ai.tabmail.byok.monthly", "ai.tabmail.basic.monthly", "ai.tabmail.pro.yearly"]
         var bestRank = 0
         var bestPlan: String?
 
         for id in productIDs {
-            let rank = id.contains("pro") ? 2 : 1
+            let rank = StoreKitManager.tierRank(for: id)
             if rank > bestRank {
                 bestRank = rank
-                bestPlan = planName(for: id)
+                bestPlan = StoreKitManager.planName(for: id)
             }
         }
 
         #expect(bestPlan == "Pro")
-        #expect(bestRank == 2)
+        #expect(bestRank == 3)
     }
 
-    @Test("Plan ranking with only basic returns Basic")
-    func rankingOnlyBasic() {
-        let productIDs = ["ai.tabmail.basic.monthly"]
+    @Test("Plan ranking picks basic over byok")
+    func rankingPicksBasicOverByok() {
+        let productIDs = ["ai.tabmail.byok.monthly", "ai.tabmail.basic.monthly"]
         var bestRank = 0
         var bestPlan: String?
 
         for id in productIDs {
-            let rank = id.contains("pro") ? 2 : 1
+            let rank = StoreKitManager.tierRank(for: id)
             if rank > bestRank {
                 bestRank = rank
-                bestPlan = planName(for: id)
+                bestPlan = StoreKitManager.planName(for: id)
             }
         }
 
         #expect(bestPlan == "Basic")
+        #expect(bestRank == 2)
+    }
+
+    @Test("Plan ranking with only byok returns BYOK")
+    func rankingOnlyByok() {
+        let productIDs = ["ai.tabmail.byok.monthly"]
+        var bestRank = 0
+        var bestPlan: String?
+
+        for id in productIDs {
+            let rank = StoreKitManager.tierRank(for: id)
+            if rank > bestRank {
+                bestRank = rank
+                bestPlan = StoreKitManager.planName(for: id)
+            }
+        }
+
+        #expect(bestPlan == "BYOK")
         #expect(bestRank == 1)
     }
 
@@ -121,10 +159,10 @@ struct StoreKitManagerPlanRankingTests {
         var bestPlan: String?
 
         for id in productIDs {
-            let rank = id.contains("pro") ? 2 : 1
+            let rank = StoreKitManager.tierRank(for: id)
             if rank > bestRank {
                 bestRank = rank
-                bestPlan = planName(for: id)
+                bestPlan = StoreKitManager.planName(for: id)
             }
         }
 
@@ -132,29 +170,12 @@ struct StoreKitManagerPlanRankingTests {
         #expect(bestRank == 0)
     }
 
-    @Test("Plan ranking multiple pro picks first pro encountered")
-    func rankingMultiplePro() {
-        let productIDs = ["ai.tabmail.pro.monthly", "ai.tabmail.pro.yearly"]
-        var bestRank = 0
-        var bestPlan: String?
-
-        for id in productIDs {
-            let rank = id.contains("pro") ? 2 : 1
-            if rank > bestRank {
-                bestRank = rank
-                bestPlan = planName(for: id)
-            }
-        }
-
-        // Both are rank 2, first one wins since > not >=
-        #expect(bestPlan == "Pro")
-    }
-
-    // Helper matching StoreKitManager.planName(for:)
-    private func planName(for productId: String) -> String {
-        if productId.contains("pro") { return "Pro" }
-        if productId.contains("basic") { return "Basic" }
-        return "Unknown"
+    @Test("Tier-order product sort places byok before basic before pro")
+    func tierOrderSort() {
+        // Mirrors loadProducts' sort comparator (rank ascending)
+        let ids = ["ai.tabmail.pro.monthly", "ai.tabmail.basic.monthly", "ai.tabmail.byok.monthly"]
+        let sorted = ids.sorted { StoreKitManager.tierRank(for: $0) < StoreKitManager.tierRank(for: $1) }
+        #expect(sorted == ["ai.tabmail.byok.monthly", "ai.tabmail.basic.monthly", "ai.tabmail.pro.monthly"])
     }
 }
 
@@ -163,35 +184,44 @@ struct StoreKitManagerPlanRankingTests {
 @Suite("StoreKitManager Plan Name Mapping")
 struct StoreKitManagerPlanNameTests {
 
-    private func planName(for productId: String) -> String {
-        if productId.contains("pro") { return "Pro" }
-        if productId.contains("basic") { return "Basic" }
-        return "Unknown"
-    }
-
     @Test("Pro product IDs return Pro plan name")
     func proNames() {
-        #expect(planName(for: "ai.tabmail.pro.monthly") == "Pro")
-        #expect(planName(for: "ai.tabmail.pro.yearly") == "Pro")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.pro.monthly") == "Pro")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.pro.yearly") == "Pro")
     }
 
     @Test("Basic product IDs return Basic plan name")
     func basicNames() {
-        #expect(planName(for: "ai.tabmail.basic.monthly") == "Basic")
-        #expect(planName(for: "ai.tabmail.basic.yearly") == "Basic")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.basic.monthly") == "Basic")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.basic.yearly") == "Basic")
+    }
+
+    @Test("BYOK product IDs return backend-facing BYOK plan name (not Zero)")
+    func byokNames() {
+        // planName must match AccountInfo.planTier values — display mapping is separate
+        #expect(StoreKitManager.planName(for: "ai.tabmail.byok.monthly") == "BYOK")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.byok.yearly") == "BYOK")
     }
 
     @Test("Unknown product ID returns Unknown")
     func unknownName() {
-        #expect(planName(for: "ai.tabmail.enterprise.monthly") == "Unknown")
-        #expect(planName(for: "com.other.app") == "Unknown")
-        #expect(planName(for: "") == "Unknown")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.enterprise.monthly") == "Unknown")
+        #expect(StoreKitManager.planName(for: "com.other.app") == "Unknown")
+        #expect(StoreKitManager.planName(for: "") == "Unknown")
     }
 
     @Test("planName checks contain, not exact match")
     func containCheck() {
         // Edge case: a product ID with both "pro" and "basic" would match "pro" first
-        #expect(planName(for: "ai.tabmail.pro.basic") == "Pro")
+        #expect(StoreKitManager.planName(for: "ai.tabmail.pro.basic") == "Pro")
+    }
+
+    @Test("displayPlanName maps BYOK to Zero, passes other tiers through")
+    func displayMapping() {
+        #expect(StoreKitManager.displayPlanName(forTier: "BYOK") == "Zero")
+        #expect(StoreKitManager.displayPlanName(forTier: "Basic") == "Basic")
+        #expect(StoreKitManager.displayPlanName(forTier: "Pro") == "Pro")
+        #expect(StoreKitManager.displayPlanName(forTier: "Unknown") == "Unknown")
     }
 }
 
@@ -283,13 +313,14 @@ struct StoreKitManagerStateTests {
     func monthlyFilter() {
         // monthlyProducts and yearlyProducts filter by ID containing "monthly"/"yearly"
         // Since we can't create Product objects in tests, we verify the filter logic
-        let ids = ["ai.tabmail.basic.monthly", "ai.tabmail.basic.yearly",
+        let ids = ["ai.tabmail.byok.monthly", "ai.tabmail.byok.yearly",
+                    "ai.tabmail.basic.monthly", "ai.tabmail.basic.yearly",
                     "ai.tabmail.pro.monthly", "ai.tabmail.pro.yearly"]
         let monthly = ids.filter { $0.contains("monthly") }
         let yearly = ids.filter { $0.contains("yearly") }
 
-        #expect(monthly.count == 2)
-        #expect(yearly.count == 2)
+        #expect(monthly.count == 3)
+        #expect(yearly.count == 3)
         #expect(monthly.allSatisfy { $0.contains("monthly") })
         #expect(yearly.allSatisfy { $0.contains("yearly") })
     }
