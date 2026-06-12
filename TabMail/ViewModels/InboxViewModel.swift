@@ -1044,7 +1044,10 @@ final class InboxViewModel {
                     if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 htmlBody len=\(html.count) snippet=\(snippet.prefix(50))") }
                 }
                 if snippet.isEmpty, let text = fullMessage.textBody, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    snippet = EmailFilter.snippetFromPlainText(text)
+                    // Guard against HTML documents mislabeled as text/plain (same
+                    // check as EmailFilter.extractPlainText, which this inlines).
+                    let plain = EmailFilter.looksLikeHTMLDocument(text) ? EmailFilter.htmlToPlainText(text) : text
+                    snippet = EmailFilter.snippetFromPlainText(plain)
                     if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 textBody len=\(text.count) snippet=\(snippet.prefix(50))") }
                 }
                 if snippet.isEmpty {

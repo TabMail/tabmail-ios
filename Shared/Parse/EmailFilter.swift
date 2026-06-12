@@ -200,9 +200,30 @@ enum EmailFilter {
             return htmlToPlainText(html)
         }
         if let text = textBody, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return text
+            // Guard: don't trust the declared content type — some senders put the
+            // full HTML document into the text/plain part (the snippet/FTS would
+            // otherwise index tag soup). Display path is unaffected (BodyRenderer).
+            return looksLikeHTMLDocument(text) ? htmlToPlainText(text) : text
         }
         return nil
+    }
+
+    /// True when a "plain text" body is actually a full HTML document — some
+    /// senders put the entire HTML document into the text/plain MIME part.
+    /// Only a document marker at the very start counts (`<!DOCTYPE` / `<html`):
+    /// that is never legitimate prose, so ordinary plain text containing angle
+    /// brackets (`<user@example.com>`, `List<String>`, `a < b`) can never match.
+    /// Deliberately narrower than a generic "looks like HTML" tag heuristic —
+    /// see BodyRenderer's display-path comment for why broad guessing is unsafe.
+    /// Mirrors `looksLikeHtmlDocument` in the TB addon's fts/bodyExtract.js.
+    static func looksLikeHTMLDocument(_ text: String) -> Bool {
+        let trimmed = text.drop(while: { $0.isWhitespace })
+        if trimmed.prefix(9).lowercased() == "<!doctype" { return true }
+        if trimmed.prefix(5).lowercased() == "<html" {
+            let next = trimmed.dropFirst(5).first
+            return next == ">" || next?.isWhitespace == true
+        }
+        return false
     }
 
     /// Strips HTML to plain text suitable for FTS indexing.

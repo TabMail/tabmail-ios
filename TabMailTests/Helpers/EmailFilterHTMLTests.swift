@@ -711,3 +711,98 @@ struct EmailFilterDecodeHTMLEntitiesTests {
         #expect(result == "A & B < C > D")
     }
 }
+
+@Suite("EmailFilter.looksLikeHTMLDocument")
+struct EmailFilterHTMLDocumentGuardTests {
+
+    @Test("Detects DOCTYPE marker")
+    func detectsDoctype() {
+        #expect(EmailFilter.looksLikeHTMLDocument("<!DOCTYPE html><html><body>x</body></html>"))
+    }
+
+    @Test("Detects lowercase doctype with leading whitespace")
+    func detectsLowercaseDoctype() {
+        #expect(EmailFilter.looksLikeHTMLDocument("  \n<!doctype html>\n<html>x</html>"))
+    }
+
+    @Test("Detects <html> marker")
+    func detectsHtmlElement() {
+        #expect(EmailFilter.looksLikeHTMLDocument("<html><body>x</body></html>"))
+    }
+
+    @Test("Detects <html with attributes")
+    func detectsHtmlWithAttributes() {
+        #expect(EmailFilter.looksLikeHTMLDocument("<html lang=\"en\" xmlns:o=\"urn:schemas-microsoft-com:office:office\"><body>x</body></html>"))
+    }
+
+    @Test("Detects uppercase <HTML>")
+    func detectsUppercaseHtml() {
+        #expect(EmailFilter.looksLikeHTMLDocument("<HTML><BODY>x</BODY></HTML>"))
+    }
+
+    @Test("Rejects ordinary plain text")
+    func rejectsPlainText() {
+        #expect(!EmailFilter.looksLikeHTMLDocument("Hello, this is a normal email body."))
+    }
+
+    @Test("Rejects quoted address in angle brackets")
+    func rejectsQuotedAddress() {
+        #expect(!EmailFilter.looksLikeHTMLDocument("<user@example.com> wrote:\nThanks!"))
+    }
+
+    @Test("Rejects code with generics and comparisons")
+    func rejectsCode() {
+        #expect(!EmailFilter.looksLikeHTMLDocument("Use List<String> when x < 10."))
+    }
+
+    @Test("Rejects html marker mid-text")
+    func rejectsHtmlMidText() {
+        #expect(!EmailFilter.looksLikeHTMLDocument("The <html> tag opens a document."))
+    }
+
+    @Test("Rejects tag that merely starts with html")
+    func rejectsHtmlPrefixTag() {
+        #expect(!EmailFilter.looksLikeHTMLDocument("<htmlish>not a document</htmlish>"))
+    }
+
+    @Test("Rejects empty string")
+    func rejectsEmpty() {
+        #expect(!EmailFilter.looksLikeHTMLDocument(""))
+    }
+}
+
+@Suite("EmailFilter.extractPlainText HTML-document guard")
+struct EmailFilterExtractPlainTextGuardTests {
+
+    @Test("Strips HTML document mislabeled as text/plain (no HTML part)")
+    func stripsMislabeledHTML() {
+        let htmlDoc = "<!DOCTYPE html><html lang=\"en\"><head><style>body { margin: 0; }</style></head><body><p>Dear Customer,</p><p>Thank you for your purchase!</p></body></html>"
+        let result = EmailFilter.extractPlainText(htmlBody: nil, textBody: htmlDoc)
+        #expect(result != nil)
+        guard let result else { return }
+        #expect(result.contains("Dear Customer,"))
+        #expect(result.contains("Thank you for your purchase!"))
+        #expect(!result.contains("<"))
+        #expect(!result.contains("margin"))
+    }
+
+    @Test("Returns genuine plain text with angle brackets verbatim")
+    func keepsPlainTextWithAngleBrackets() {
+        let body = "Kwang <user@example.com> wrote:\nUse List<String> when x < 10."
+        let result = EmailFilter.extractPlainText(htmlBody: nil, textBody: body)
+        #expect(result == body)
+    }
+
+    @Test("HTML part still wins over text part")
+    func htmlPartWins() {
+        let result = EmailFilter.extractPlainText(htmlBody: "<p>HTML version</p>", textBody: "Plain version")
+        #expect(result?.contains("HTML version") == true)
+        #expect(result?.contains("Plain version") == false)
+    }
+
+    @Test("Whitespace-only text body still returns nil when no HTML")
+    func whitespaceTextReturnsNil() {
+        let result = EmailFilter.extractPlainText(htmlBody: nil, textBody: "  \n  ")
+        #expect(result == nil)
+    }
+}
