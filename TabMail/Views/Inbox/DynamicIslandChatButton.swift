@@ -1030,7 +1030,7 @@ struct DynamicIslandChat: View {
                         HStack(spacing: 6) {
                             ProgressView()
                                 .controlSize(.small)
-                            Text(isComposeMode ? "Editing..." : workingStatus.isEmpty ? "Thinking..." : workingStatus)
+                            Text(workingStatus.isEmpty ? "Thinking..." : workingStatus)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -1227,7 +1227,7 @@ struct DynamicIslandChat: View {
                 context: ctx,
                 instruction: instruction,
                 chatHistory: editHistory,
-                onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Editing...")
+                onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking...")
             )
         }
         let timeoutTask = Task {
@@ -1437,8 +1437,9 @@ struct DynamicIslandChat: View {
     /// Build the SSE event handler closure used by all completions calls in this view.
     /// Centralizes label resolution, throttle handling, and the "between tools" idle
     /// status so compose-edit and agent chat can never drift apart on event handling.
-    /// The only intentional difference between call sites is `idleLabel` (e.g.,
-    /// "Thinking..." for agent chat, "Editing..." for compose chat-edit).
+    /// Both call sites use the same `idleLabel` ("Thinking...") so the working
+    /// indicator — tool-call labels + idle status + throttle banner — renders
+    /// identically in compose-edit mode and agent chat.
     private func makeCompletionsSSEHandler(
         idleLabel: String
     ) -> BackendClient.SSEEventHandler {
