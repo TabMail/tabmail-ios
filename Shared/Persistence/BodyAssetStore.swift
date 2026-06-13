@@ -90,6 +90,12 @@ enum BodyAssetStore {
         let dbURL = container.appendingPathComponent(manifestDBName)
         var config = Configuration()
         config.busyMode = .timeout(5)
+        // 0xdead10cc defense in the MAIN APP (ADR-IOS-041): DatabaseSuspension
+        // posts GRDB's suspend notification before process suspension so the
+        // 1.6.x crash class (pruneOrphans/deleteAllAssets mid-write at suspend)
+        // aborts cleanly instead. Inert in the NSE process — nothing posts the
+        // notification there, and the NSE is terminated, not suspended.
+        config.observesSuspensionNotifications = true
         let queue: DatabaseQueue
         do {
             queue = try DatabaseQueue(path: dbURL.path, configuration: config)

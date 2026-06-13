@@ -280,9 +280,16 @@ extension AccountManager {
             // the append/delete below, reconcileOutbox sees sentAt != nil and
             // retries the append (not re-sends).
             do {
-                try await dbPool.write { db in
+                // Outbox rule 2: state transitions retry, never single-shot.
+                // This stamp is the double-send firewall — a transient failure
+                // (busy timeout, suspension abort) that goes unretried leaves
+                // status=sending + sentAt=nil, which reconcileOutbox re-queues
+                // as a full re-send.
+                let sentDate = Date()
+                let outboxId = current.id
+                try await retryWrite(dbPool, retryDelay: .milliseconds(200), label: "Outbox.sentAt") { db in
                     try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?",
-                                   arguments: [Date(), current.id])
+                                   arguments: [sentDate, outboxId])
                 }
             } catch {
                 // sentAt write failed — proceed anyway. sentAt is a safety net.

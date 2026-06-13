@@ -45,6 +45,11 @@ final class AppDatabase: Sendable {
         // footprint and one-time connection setup (~2ms each, amortized
         // as the pool grows under load).
         config.maximumReaderCount = 64
+        // 0xdead10cc defense: release/refuse SQLite locks when DatabaseSuspension
+        // posts Database.suspendNotification just before process suspension.
+        // WAL reads keep working while suspended; lock-acquiring accesses throw
+        // SQLITE_ABORT/SQLITE_INTERRUPT and retry on next wake. See ADR-IOS-041.
+        config.observesSuspensionNotifications = true
         dbPool = try DatabasePool(path: path, configuration: config)
         try Self.runMigrations(on: dbPool)
         // One-time destructive cached-mail resets, synchronously, BEFORE the pool
@@ -106,6 +111,10 @@ final class AppDatabase: Sendable {
         let path = url.appendingPathComponent("nse_staging.sqlite").path
         var config = Configuration()
         config.busyMode = .timeout(2)
+        // 0xdead10cc defense (ADR-IOS-041). Non-WAL queue: ALL accesses abort
+        // while suspended — schema setup is launch-time-only, so this is inert
+        // in practice but keeps every main-app connection covered.
+        config.observesSuspensionNotifications = true
         guard let db = try? DatabaseQueue(path: path, configuration: config) else {
             print("[AppDatabase] Failed to open NSE staging DB")
             return

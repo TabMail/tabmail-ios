@@ -1374,3 +1374,30 @@ no priority AI budget, AI via the user's own keys or the throttled queue.
    (e.g. sandbox-verifying group-level upgrade/downgrade direction).
 
 **Related:** global DECISIONS.md ADR-025; PLAN_BYOK_PRICING_PAGES.md §6/§7.
+
+---
+
+## ADR-IOS-041: GRDB Database Suspension — 0xdead10cc Defense
+
+**Date:** 2026-06-12
+**Status:** Accepted
+
+**Context:** TestFlight crash reports from 1.6.3 and 1.6.5 showed `RUNNINGBOARD 0xdead10cc` kills: iOS terminated the app at suspension time because SQLite file locks were still held. Implicated paths: `SyncEngine.scheduleMaintenanceInBackground` (`BodyAssetMaintenance.pruneOrphans`, `deleteAllAssets`), `refreshAICacheTTLAndPurge` (post-`jobCompleted`), and `selfHealFTSBodyMembership` (startup self-heal) — all background DB work on detached tasks with no lifecycle protection. Per-call-site `beginBackgroundTask` wrapping (the existing `backfill-grace` / `ai-job-*` pattern) cannot fully solve this: cooperative cancellation is asynchronous and cannot guarantee no lock is held at the suspension deadline, and every new code path must remember to wrap itself.
+
+**Decision:** Enforce the OS invariant ("no file locks while suspended") mechanically at the database layer, with `DatabaseSuspension` deciding *when*:
+
+1. **Every main-app GRDB connection sets `Configuration.observesSuspensionNotifications = true`** — `AppDatabase` (tabmail.sqlite), `SearchIndex` (fts.db), `MemoryIndex` (memory.db), `BodyAssetStore` manifest queue, NSE staging queues (`NSEDataBridge`, `createNSEStagingDBIfNeeded`). While suspended, GRDB releases/refuses locks; lock-acquiring accesses throw `DatabaseError` `SQLITE_ABORT`/`SQLITE_INTERRUPT` — **except reads on WAL databases, which keep working** (GRDB checks the actual `PRAGMA journal_mode`). The flag is inert in the NSE process (nothing posts the notification there; the NSE is terminated, not suspended).
+2. **`DatabaseSuspension` (Services/DatabaseSuspension.swift)** posts `Database.suspendNotification` from the **expiration handler** of a `db-quiesce` `beginBackgroundTask` armed at `didEnterBackground` — NOT at backgrounding itself. iOS expires all of an app's assertions together at the app-wide background deadline, so every in-flight grace-window pattern (`backfill-grace`, `ai-job-*`) keeps its full window; behavior changes only in the final instant, where previously the process was SIGKILLed mid-write.
+3. **Every background execution entry point resumes** (`Database.resumeNotification`) and re-arms the quiesce window on completion via `beginBackgroundWork`/`endBackgroundWork` (work-unit counter): silent push (`AppDelegate.didReceiveRemoteNotification`), BGAppRefresh + BGProcessing task bodies (`SyncScheduler`), background notification actions (MARK_READ/ARCHIVE/DELETE in `NotificationDelegate` — these run WITHOUT foregrounding; missing this would abort user-intention writes), and foreground return (`willEnterForeground`).
+4. **BGTask expiration handlers additionally call `DatabaseSuspension.postSuspendImmediately`** — the mechanical backstop for the wind-down race where cancelled work straddles the deadline.
+
+**Why aborted transactions are safe here:** the entire codebase already requires every operation to survive dying at any instant (Resilience Rule 3, ADR-IOS-001/003): maintenance is idempotent and re-runs, self-heals re-walk, PendingOperation/Outbox drains retry. A suspension-abort (atomic rollback, process survives) is strictly better than the prior failure mode (whole process SIGKILLed mid-write). Double work is accepted; double-SEND is not — the `sentAt` stamp (the double-send firewall) was hardened from single-attempt to `retryWrite` (3 attempts) per Outbox rule 2, and `reconcileOutbox`'s `sending`+`sentAt==nil` → re-queue path is unchanged (same window as the pre-existing crash case, gentler failure).
+
+**Alternatives considered:** (a) wrapping every DB-touching path in `beginBackgroundTask` — rejected: per-call-site convention, structurally cannot guarantee the deadline; (b) full quiescence coordinator + moving maintenance to BGProcessingTask — rejected for now as over-engineering: the mechanical layer alone removes the crash class, and the existing schedulers already cancel work on expiration.
+
+**Consequences:**
+- Writes attempted in the suspended instant throw `SQLITE_ABORT`/`SQLITE_INTERRUPT` — callers must treat as retryable-later (all audited paths already do; see tests).
+- Non-WAL queues (BodyAssetStore manifest, NSE staging) abort reads too while suspended — acceptable (only maintenance/merge touch them in background, both retryable).
+- GRDB marks the suspension API 🔥 EXPERIMENTAL (v7.10.0) — pin behavior with `DatabaseSuspensionTests` on any GRDB upgrade.
+
+**Tests:** `TabMailTests/Database/DatabaseSuspensionTests.swift` (suspend→write aborts / WAL reads survive / resume restores; straddling transaction rolls back atomically; non-WAL queue abort; unflagged DB unaffected; interrupted-maintenance retry). Outbox recovery state pinned by `OutboxIntegrationTests` ("sentAt nil + status sending → reset to queued").

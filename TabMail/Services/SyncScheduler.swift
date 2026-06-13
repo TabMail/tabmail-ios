@@ -794,6 +794,11 @@ final class SyncScheduler {
             // but actor-owned inFlightTasks aren't its children — cancel them
             // explicitly via the unified helper.
             Task { await SyncScheduler.cancelAllInFlightQueues(inboxOnly: true) }
+            // Mechanical 0xdead10cc backstop (ADR-IOS-041): suspend GRDB
+            // databases NOW — cooperative cancellation above is asynchronous
+            // and can't guarantee no lock is held when the process freezes.
+            // Stragglers get SQLITE_ABORT and retry on next wake.
+            DatabaseSuspension.postSuspendImmediately(reason: "BGAppRefresh expired")
             // Safety net: complete the task and reschedule even if the sync Task
             // never executed. Without this, iOS counts incomplete tasks as failures
             // and permanently throttles BGAppRefresh.
@@ -811,6 +816,10 @@ final class SyncScheduler {
 
         // BGAppRefreshTask: unified sync startup with budget-limited drain.
         let syncTask = Task { @MainActor in
+            // Resume databases (may be suspended from a previous quiesce) for
+            // the duration of this BGTask; re-arm quiesce on exit (ADR-IOS-041).
+            DatabaseSuspension.shared.beginBackgroundWork("bg-app-refresh")
+            defer { DatabaseSuspension.shared.endBackgroundWork("bg-app-refresh") }
             print("[SyncScheduler] SYNC Task body start")
             let pollActive = self.isPollActive
             BackgroundSyncLogger.logBGAppRefresh("Task body start (pollActive=\(pollActive), network=\(NetworkMonitor.checkConnected()))")
@@ -909,6 +918,9 @@ final class SyncScheduler {
             // cancel inboxOnly: false to also reach BackfillAIQueue / embedding
             // queues whose actor-owned Tasks ctx.expire() doesn't reach.
             Task { await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false) }
+            // Mechanical 0xdead10cc backstop (ADR-IOS-041) — see the
+            // BGAppRefresh expiration handler for rationale.
+            DatabaseSuspension.postSuspendImmediately(reason: "BGProcessing expired")
             task.setTaskCompleted(success: false)
             // Expiration means work remained (queues and/or tokenizer-migration
             // shards) — reschedule so it gets another window. The success path
@@ -924,6 +936,10 @@ final class SyncScheduler {
         // by the preceding BGAppRefreshTask or silent push delta sync.
         // Has minutes of execution time (vs 30s for BGAppRefreshTask).
         let processingTask = Task { @MainActor in
+            // Resume databases (may be suspended from a previous quiesce) for
+            // the duration of this BGTask; re-arm quiesce on exit (ADR-IOS-041).
+            DatabaseSuspension.shared.beginBackgroundWork("bg-processing")
+            defer { DatabaseSuspension.shared.endBackgroundWork("bg-processing") }
             let taskT0 = CFAbsoluteTimeGetCurrent()
             print("[SyncScheduler] PROCESSING Task body start")
             BackgroundSyncLogger.logBGProcessing("Task body start")

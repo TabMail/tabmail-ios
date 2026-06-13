@@ -639,6 +639,18 @@ NOT GRDB schema migrations (those are in `AppDatabase.runMigrations`, the `Datab
 
 ---
 
+## GRDB Database Suspension — 0xdead10cc Defense (ADR-IOS-041, 2026-06-12)
+
+- TestFlight 1.6.3/1.6.5 crashed with `RUNNINGBOARD 0xdead10cc` (suspended holding SQLite locks: `BodyAssetMaintenance.pruneOrphans`, `refreshAICacheTTLAndPurge`, `selfHealFTSBodyMembership`). Fix = GRDB suspension, mechanically enforced at the DB layer.
+- **Rule: every main-app GRDB `Configuration` MUST set `observesSuspensionNotifications = true`.** Currently 6 sites: `AppDatabase` (×2 incl. NSE staging schema setup), `SearchIndex`, `MemoryIndex`, `BodyAssetStore.manifestQueue`, `NSEDataBridge` (×2). Inert in the NSE process (nothing posts the notification there).
+- **Rule: every background execution entry point MUST bracket with `DatabaseSuspension.shared.beginBackgroundWork`/`endBackgroundWork`** (resumes DBs, re-arms the quiesce window on exit). Covered today: silent push (`AppDelegate.didReceiveRemoteNotification`), BGAppRefresh/BGProcessing task bodies (`SyncScheduler`), background notification actions (MARK_READ/ARCHIVE/DELETE — they run WITHOUT foregrounding), foreground return. A new BGTask/push/action handler that skips this gets `SQLITE_ABORT` on every write.
+- Suspend is posted from the `db-quiesce` assertion's **expiration handler** (app-wide deadline, same instant as `backfill-grace`/`ai-job-*` expirations) — never at `didEnterBackground` — so in-flight work keeps its full grace window. BGTask expiration handlers also call `DatabaseSuspension.postSuspendImmediately` as the wind-down backstop.
+- While suspended: WAL reads keep working (GRDB checks actual `PRAGMA journal_mode` — SearchIndex/MemoryIndex set WAL via pragma, still exempt); writes throw `DatabaseError` `SQLITE_ABORT`/`SQLITE_INTERRUPT` (treat as retryable-later, never permanent). Non-WAL queues (BodyAssetStore manifest, NSE staging) abort reads too.
+- GRDB suspension API is 🔥 EXPERIMENTAL (pinned v7.10.0) — `DatabaseSuspensionTests` pins the semantics; re-check on GRDB upgrades.
+- Same change hardened the outbox `sentAt` stamp (double-send firewall) from single-attempt to `retryWrite` 3 attempts (Outbox rule 2).
+
+---
+
 ## Knowledge Gaps
 
 (none currently)

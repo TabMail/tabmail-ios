@@ -119,6 +119,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 return
             }
             Task { @MainActor in
+                // Notification actions run the app in the BACKGROUND (no
+                // .foreground option) — databases may still be suspended from
+                // the last quiesce (ADR-IOS-041). Resume or the user's action
+                // write would abort: NEVER DROP USER INTENTION.
+                DatabaseSuspension.shared.beginBackgroundWork("notification-action")
+                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
                 let header: MessageHeader?
                 do {
                     header = try await AppDatabase.dbPool.read { db -> MessageHeader? in
@@ -162,6 +168,10 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                let accountId = userInfo["accountId"] as? String {
                 // Queue PendingOperation — drain loop processes on next sync (ADR-IOS-018)
                 Task { @MainActor in
+                    // Background notification action — same resume rationale as
+                    // MARK_READ above (ADR-IOS-041).
+                    DatabaseSuspension.shared.beginBackgroundWork("notification-action")
+                    defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
                     do {
                         try AppDatabase.dbPool.write { db in
                             let opType: String
@@ -311,6 +321,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
         registerNotificationCategories()
+        // 0xdead10cc defense: suspend GRDB databases just before process
+        // suspension, resume on foreground/push/BGTask (ADR-IOS-041).
+        DatabaseSuspension.shared.start()
         // Create NSE staging DB schema + mirror initial state
         AppDatabase.createNSEStagingDBIfNeeded()
         NSEDataBridge.mirrorAllState()
@@ -369,6 +382,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didReceiveRemoteNotification userInfo: [AnyHashable: Any]
     ) async -> UIBackgroundFetchResult {
+        // Databases may be suspended from a previous quiesce (ADR-IOS-041) —
+        // resume for the duration of the push handling, then re-arm the
+        // quiesce window if we're still backgrounded when done.
+        DatabaseSuspension.shared.beginBackgroundWork("silent-push")
+        defer { DatabaseSuspension.shared.endBackgroundWork("silent-push") }
+
         let appState = application.applicationState
         let stateStr = appState == .active ? "active" : appState == .background ? "background" : "inactive"
         // Copy to Sendable dict — [AnyHashable: Any] is not Sendable across isolation

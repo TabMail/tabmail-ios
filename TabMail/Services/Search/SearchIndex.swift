@@ -142,6 +142,9 @@ actor SearchIndex {
         // bulk index check) and hit priority inversion under foreground
         // load. Raised from GRDB default (5). See AppDatabase.swift.
         config.maximumReaderCount = 64
+        // 0xdead10cc defense (ADR-IOS-041). GRDB checks the ACTUAL journal mode
+        // (PRAGMA WAL set below), so reads stay available while suspended.
+        config.observesSuspensionNotifications = true
         config.prepareDatabase { db in
             // Register sqlite-vec vec0 module on this connection (belt-and-suspenders
             // alongside sqlite3_auto_extension — ensures vec0 is available on every

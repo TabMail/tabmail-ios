@@ -73,6 +73,9 @@ actor MemoryIndex {
         // Smaller reader pool than SearchIndex (email) — memory search has much
         // lower read volume. 16 is plenty.
         config.maximumReaderCount = 16
+        // 0xdead10cc defense (ADR-IOS-041). WAL (PRAGMA below) → reads stay
+        // available while suspended; aborted writes self-heal via Stage A.
+        config.observesSuspensionNotifications = true
         config.prepareDatabase { db in
             // Register sqlite-vec vec0 module on this connection.
             // tabmail_register_sqlite_vec_on_db is idempotent per-connection

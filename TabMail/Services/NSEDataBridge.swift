@@ -198,6 +198,9 @@ enum NSEDataBridge {
         guard FileManager.default.fileExists(atPath: stagingPath) else { return nil }
         var config = Configuration()
         config.busyMode = .timeout(2.0)
+        // 0xdead10cc defense (ADR-IOS-041) — App Group DB, the highest-risk
+        // lock for cross-process suspension kills.
+        config.observesSuspensionNotifications = true
         return try? DatabaseQueue(path: stagingPath, configuration: config)
     }
 
@@ -224,6 +227,8 @@ enum NSEDataBridge {
         for timeout in [2.0, 5.0] {
             var config = Configuration()
             config.busyMode = .timeout(timeout)
+            // 0xdead10cc defense (ADR-IOS-041) — see openStagingDB().
+            config.observesSuspensionNotifications = true
             if let db = try? DatabaseQueue(path: stagingPath, configuration: config) {
                 nseDB = db
                 break
