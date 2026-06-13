@@ -35,9 +35,9 @@ enum KBReminderParser {
 
     // MARK: - Public API
 
-    /// Parse [Reminder] entries from KB text. Filters out reminders > 1 day overdue.
+    /// Parse [Reminder] entries from KB text. Returns ALL reminders, including
+    /// overdue ones — no expiry (see `filterActiveReminders`).
     /// Regex results are cached keyed on kbText hash — repeated calls with the same text skip regex.
-    /// `filterActiveReminders` (cheap date comparisons) runs on every call since it's date-sensitive.
     /// Matches TB's `parseRemindersFromKB()` + `filterActiveReminders()`.
     static func parse(_ kbText: String) -> [KBReminder] {
         guard !kbText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -106,39 +106,16 @@ enum KBReminderParser {
 
     // MARK: - Filtering
 
-    /// Filter out past-due reminders (more than 1 day old).
-    /// Matches TB's `filterActiveReminders()`.
+    /// Returns all parsed reminders unchanged. Overdue reminders are
+    /// intentionally retained — they must stay visible in the reminders menu
+    /// and chat cards rather than silently vanish a day after their due date
+    /// (changed 2026-06-13; previously dropped reminders more than 1 day
+    /// overdue). Over-notification is guarded independently downstream:
+    /// `ProactiveNotifyService` only fires an overdue reminder that is still
+    /// `isWithinWindow`, `enabled`, and not already in `ReachedOutStore`.
+    /// Kept as a named policy seam in lockstep with TB's
+    /// `kbReminderGenerator.js` `filterActiveReminders()` (ADR-IOS-008 parity).
     private static func filterActiveReminders(_ reminders: [KBReminder]) -> [KBReminder] {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let cutoffDate = calendar.date(byAdding: .day, value: -1, to: today)!
-
-        return reminders.filter { reminder in
-            guard let dueDateStr = reminder.dueDate else {
-                // No due date = always active
-                return true
-            }
-
-            // Parse YYYY-MM-DD
-            let parts = dueDateStr.split(separator: "-")
-            guard parts.count == 3,
-                  let year = Int(parts[0]),
-                  let month = Int(parts[1]),
-                  let day = Int(parts[2]) else {
-                // Invalid date = keep it
-                return true
-            }
-
-            var components = DateComponents()
-            components.year = year
-            components.month = month
-            components.day = day
-            guard let dueDate = calendar.date(from: components) else {
-                return true
-            }
-
-            // Keep if due date is after cutoff (today - 1 day)
-            return dueDate >= cutoffDate
-        }
+        reminders
     }
 }

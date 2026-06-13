@@ -115,16 +115,16 @@ struct KBReminderParserTests {
         #expect(reminders.count == 1)
     }
 
-    @Test("Very old reminder is filtered out")
-    func oldReminderFiltered() {
+    @Test("Very old reminder is retained (no expiry)")
+    func oldReminderRetained() {
         let dt = dateString(daysFromNow: -30)
         let kb = "- [Reminder] Due \(dt.slash), Ancient task"
         let reminders = KBReminderParser.parse(kb)
-        #expect(reminders.isEmpty)
+        #expect(reminders.count == 1)
     }
 
-    @Test("Reminder due yesterday is still active (within 1 day grace)")
-    func yesterdayStillActive() {
+    @Test("Reminder due yesterday is retained")
+    func yesterdayRetained() {
         let dt = dateString(daysFromNow: -1)
         let kb = "- [Reminder] Due \(dt.slash), Yesterday's task"
         let reminders = KBReminderParser.parse(kb)
@@ -168,25 +168,25 @@ struct KBReminderParserTests {
         #expect(reminders.count == 1)
     }
 
-    @Test("Two days ago reminder is filtered out")
-    func twoDaysAgoFiltered() {
+    @Test("Two days ago reminder is retained (no expiry)")
+    func twoDaysAgoRetained() {
         let dt = dateString(daysFromNow: -2)
         let kb = "- [Reminder] Due \(dt.slash), Old task"
         let reminders = KBReminderParser.parse(kb)
-        #expect(reminders.isEmpty)
+        #expect(reminders.count == 1)
     }
 
-    @Test("Mixed active and expired reminders")
-    func mixedActiveExpired() {
-        let dtExpired = dateString(daysFromNow: -30)
+    @Test("Mixed overdue, future, and dateless reminders are all retained")
+    func mixedOverdueFutureRetained() {
+        let dtOverdue = dateString(daysFromNow: -30)
         let dtFuture = dateString(daysFromNow: 30)
         let kb = """
-        - [Reminder] Due \(dtExpired.slash), Expired task
+        - [Reminder] Due \(dtOverdue.slash), Overdue task
         - [Reminder] Due \(dtFuture.slash), Future task
         - [Reminder] Always active
         """
         let reminders = KBReminderParser.parse(kb)
-        #expect(reminders.count == 2)
+        #expect(reminders.count == 3)
     }
 
     @Test("Reminder with date, time, and timezone all present")
