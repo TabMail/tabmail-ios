@@ -742,7 +742,7 @@ extension AccountManager {
         // with its exact contents; once SMTP + Sent-append both succeed, it's
         // safe to remove. Fire-and-forget — non-critical cleanup.
         if let did = msg.draftId {
-            Task { try? await DraftStore.shared.delete(id: did) }
+            Task { try? DraftStore.shared.delete(id: did) }
         }
 
         // Queue server draft deletion via PendingOperation (crash-safe, retried on failure).
@@ -903,7 +903,7 @@ extension AccountManager {
 
         // Delete local Draft rows for fully-completed crash-recovered messages.
         for did in localDraftsToDelete {
-            try? await DraftStore.shared.delete(id: did)
+            try? DraftStore.shared.delete(id: did)
         }
 
         // Clean up orphaned attachment directories (crash during queueSend between

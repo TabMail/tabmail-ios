@@ -70,16 +70,15 @@ actor BackfillEmbeddingQueue {
             explainLogged = true
             let probeT0 = CFAbsoluteTimeGetCurrent()
             do {
-                let rows = try await AppDatabase.dbPool.read { db in
-                    try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql)
+                let rows: [(id: Int64, parent: Int64, detail: String)] = try await AppDatabase.dbPool.read { db in
+                    try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).map { row in
+                        ((row["id"] as? Int64) ?? -1, (row["parent"] as? Int64) ?? -1, (row["detail"] as? String) ?? "?")
+                    }
                 }
                 let probeMs = Int((CFAbsoluteTimeGetCurrent() - probeT0) * 1000)
                 print("[BackfillEmbeddingQueue:EXPLAIN] probe \(probeMs)ms — plan:")
                 for row in rows {
-                    let id = (row["id"] as? Int64) ?? -1
-                    let parent = (row["parent"] as? Int64) ?? -1
-                    let detail = (row["detail"] as? String) ?? "?"
-                    print("[BackfillEmbeddingQueue:EXPLAIN]   id=\(id) parent=\(parent) \(detail)")
+                    print("[BackfillEmbeddingQueue:EXPLAIN]   id=\(row.id) parent=\(row.parent) \(row.detail)")
                 }
             } catch {
                 print("[BackfillEmbeddingQueue:EXPLAIN] failed: \(error)")

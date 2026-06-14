@@ -60,6 +60,7 @@
 ### GRDB Persistence
 - All persistence via GRDB `DatabasePool` (`AppDatabase.swift`) — thread-safe concurrent readers, serialized writers via WAL journal mode
 - `dbPool.write { db in ... }` for mutations, `dbPool.read { db in ... }` for queries
+- **`read`/`write` overload selection depends on the closure's return type being `Sendable`.** `try await dbPool.read { ... }` only picks the *async* (non-blocking) overload when the closure returns a `Sendable` value. Returning a non-`Sendable` type — most commonly `[Row]` (GRDB `Row` is not `Sendable`) — silently falls back to the *synchronous, thread-blocking* overload, which surfaces as the compiler warning `no 'async' operations occur within 'await' expression` AND violates the never-block rule. **Fix: map to a `Sendable` type inside the closure** (e.g. `try Row.fetchAll(db, sql: …).map { $0["id"] as String }` → `[String]`) so the async overload is chosen. Do NOT "fix" the warning by deleting `await` — that keeps the blocking overload. (Cleared 4 such sites 2026-06-12.)
 - No background `DispatchQueue` needed — GRDB handles thread safety internally
 - Stale detection runs for **all folders including inbox** — `MessageAICache` preserves AI state for re-inserted messages
 - `NavigationStore` provides reactive UI updates (replaces SwiftUI `@Query`)

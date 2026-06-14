@@ -555,13 +555,13 @@ struct HeaderCompleteFullPipelineTests {
         #expect(results.contains { $0.headerId == header.id })
 
         // 8. Verify this header is now excluded from repopulate query
-        let repopItems: [Row] = try await db.read { dbConn in
+        let repopIds: [String] = try await db.read { dbConn in
             try Row.fetchAll(dbConn, sql: """
                 SELECT id FROM messageHeader
                 WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """)
+                """).map { $0["id"] as String }
         }
-        let found = repopItems.contains { ($0["id"] as String) == header.id }
+        let found = repopIds.contains(header.id)
         #expect(!found, "Completed header should be excluded from repopulate")
 
         // Cleanup

@@ -339,13 +339,13 @@ struct EndToEndPipelineTests {
         #expect(results.contains { $0.headerId == header.id }, "Body should be FTS-searchable")
 
         // 7. Verify excluded from repopulate query
-        let repopItems: [Row] = try await db.read { dbConn in
+        let repopIds: [String] = try await db.read { dbConn in
             try Row.fetchAll(dbConn, sql: """
                 SELECT id FROM messageHeader
                 WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
-                """)
+                """).map { $0["id"] as String }
         }
-        let found = repopItems.contains { ($0["id"] as String) == header.id }
+        let found = repopIds.contains(header.id)
         #expect(!found, "Completed message should be excluded from repopulate")
 
         // Cleanup

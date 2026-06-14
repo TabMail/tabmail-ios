@@ -54,7 +54,7 @@ extension AccountManager {
             // If the timeout fired first, drop the still-pending continuation
             // so the drain doesn't try to resume a stale waiter.
             if case .timedOut = outcome {
-                await self.dropCalendarOpAwaiter(opId: opId)
+                self.dropCalendarOpAwaiter(opId: opId)
             }
             return outcome
         }
