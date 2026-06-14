@@ -82,7 +82,7 @@ private func seedFailed(
     let scenario = PreviewMocks.seedInbox()
     let navStore = PreviewMocks.navigationStore()
     try? seedHeld(account: scenario.account, subject: "Weekly team sync notes", secondsFromNow: 5)
-    navStore.refreshOutbox()
+    Task { await navStore.refreshOutbox() }
     return NavigationStack {
         OutboxView(accountId: nil)
     }
@@ -94,7 +94,7 @@ private func seedFailed(
     let scenario = PreviewMocks.seedInbox()
     let navStore = PreviewMocks.navigationStore()
     try? seedHeld(account: scenario.account, subject: "Q3 planning review", secondsFromNow: 2)
-    navStore.refreshOutbox()
+    Task { await navStore.refreshOutbox() }
     return NavigationStack {
         OutboxView(accountId: nil)
     }
@@ -133,7 +133,7 @@ private func seedFailed(
         subject: "Failed — bad recipient",
         error: "SMTP: invalid recipient address"
     )
-    navStore.refreshOutbox()
+    Task { await navStore.refreshOutbox() }
     return NavigationStack {
         OutboxView(accountId: nil)
     }

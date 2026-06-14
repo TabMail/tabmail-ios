@@ -144,3 +144,68 @@ struct NavigationStoreTests {
     }
 
 }
+
+/// Characterizes the actual `NavigationStore.refresh()` / `refreshFolders()`
+/// methods (not just their query patterns) against a real `AppDatabase` so the
+/// sync→async conversion (Half A / PLAN_HANG_FIX) can be verified before/after.
+/// `.serialized` because it swaps the `AppDatabase.shared` singleton.
+@Suite("NavigationStore refresh behavior", .serialized)
+struct NavigationStoreRefreshTests {
+
+    @MainActor
+    private func withTestDB(_ body: @MainActor (DatabasePool) async throws -> Void) async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current
+            current = appDb
+            return prev
+        }
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        try await body(pool)
+    }
+
+    private static func insertFolders(_ db: Database, _ specs: [(String, String, FolderRole)], accountId: String) throws {
+        for (name, path, role) in specs {
+            var f = Folder(name: name, path: path, role: role, accountId: accountId)
+            try f.insert(db)
+        }
+    }
+
+    @Test("refresh() populates accounts + folders + hasAnyAccount from GRDB")
+    @MainActor func refreshPopulatesState() async throws {
+        try await withTestDB { pool in
+            try await pool.write { db in
+                var a1 = Account(emailAddress: "a@b.com", displayName: "A", provider: .gmail); a1.id = "acc1"; try a1.insert(db)
+                var a2 = Account(emailAddress: "c@d.com", displayName: "C", provider: .gmail); a2.id = "acc2"; try a2.insert(db)
+                try Self.insertFolders(db, [("INBOX", "INBOX", .inbox), ("Archive", "Archive", .archive), ("Trash", "Trash", .trash)], accountId: "acc1")
+            }
+            let store = NavigationStore()
+            #expect(store.accounts.isEmpty)            // not loaded until refresh
+            await store.refresh()
+            #expect(store.hasAnyAccount == true)
+            #expect(store.accounts.count == 2)
+            #expect(store.folders.count == 3)
+        }
+    }
+
+    @Test("refreshFolders() loads folders ordered by name from GRDB")
+    @MainActor func refreshFoldersOrdered() async throws {
+        try await withTestDB { pool in
+            try await pool.write { db in
+                var a = Account(emailAddress: "a@b.com", displayName: "A", provider: .gmail); a.id = "acc1"; try a.insert(db)
+                try Self.insertFolders(db, [("Trash", "Trash", .trash), ("Archive", "Archive", .archive), ("INBOX", "INBOX", .inbox)], accountId: "acc1")
+            }
+            let store = NavigationStore()
+            await store.refreshFolders()
+            #expect(store.folders.map(\.name) == ["Archive", "INBOX", "Trash"])
+        }
+    }
+}

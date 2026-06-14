@@ -71,7 +71,7 @@ final class NavigationStore {
                     self?.refreshDebounceTask = Task { @MainActor in
                         try? await Task.sleep(for: .milliseconds(100))
                         guard !Task.isCancelled else { return }
-                        self?.refresh()
+                        await self?.refresh()
                     }
                 }
             }
@@ -85,7 +85,7 @@ final class NavigationStore {
                 queue: .main
             ) { [weak self] _ in
                 Task { @MainActor in
-                    self?.refreshFolders()
+                    await self?.refreshFolders()
                 }
             }
         }
@@ -98,16 +98,16 @@ final class NavigationStore {
                 queue: .main
             ) { [weak self] _ in
                 Task { @MainActor in
-                    self?.refreshFolders()
+                    await self?.refreshFolders()
                 }
             }
         }
     }
 
     /// Refresh all data from GRDB. Always safe to call — overlay guarantees correctness.
-    func refresh() {
+    func refresh() async {
         let t0 = CFAbsoluteTimeGetCurrent()
-        refreshNow()
+        await refreshNow()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         if ms >= 50 {
             BackgroundSyncLogger.logInbox("[NavStore] refresh \(ms)ms (accounts=\(accounts.count) folders=\(folders.count) outbox=\(outboxMessages.count))")
@@ -116,7 +116,12 @@ final class NavigationStore {
 
     /// Refresh only folders (lightweight — skips accounts/outbox).
     /// Adjusts unreadCount using the optimistic overlay for pending mutations.
-    func refreshFolders() {
+    /// Async + single read: folders AND the overlay-relevant message headers are
+    /// fetched in ONE off-main GRDB read. Previously this was a synchronous
+    /// folder read followed by an N+1 per-overlay-message header read, all on the
+    /// main thread — a warm-foreground UI-hang source (Half A / PLAN_HANG_FIX).
+    /// The overlay unread-count adjustment then runs on the main actor.
+    func refreshFolders() async {
         let t0 = CFAbsoluteTimeGetCurrent()
         defer {
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -124,23 +129,28 @@ final class NavigationStore {
                 BackgroundSyncLogger.logInbox("[NavStore] refreshFolders \(ms)ms (folders=\(folders.count))")
             }
         }
+        let overlay = AccountManager.shared.snapshotOverlay()
+        let overlayMsgIds = Array(overlay.keys)
         do {
-            var freshFolders = try AppDatabase.dbPool.read { db in
-                try Folder.order(Column("name")).fetchAll(db)
-            }
-            // Apply overlay-adjusted unread counts
-            let overlay = AccountManager.shared.snapshotOverlay()
+            let (freshFolders, headersById): ([Folder], [String: MessageHeader]) =
+                try await AppDatabase.dbPool.read { db in
+                    let folders = try Folder.order(Column("name")).fetchAll(db)
+                    var headers: [String: MessageHeader] = [:]
+                    if !overlayMsgIds.isEmpty {
+                        for h in try MessageHeader.filter(overlayMsgIds.contains(Column("id"))).fetchAll(db) {
+                            headers[h.id] = h
+                        }
+                    }
+                    return (folders, headers)
+                }
+            var adjusted = freshFolders
+            // Apply overlay-adjusted unread counts (in-memory, main actor).
             if !overlay.isEmpty {
-                // Build folder ID lookup for quick access
                 var folderIndex: [String: Int] = [:]
-                for (i, f) in freshFolders.enumerated() { folderIndex[f.id] = i }
+                for (i, f) in adjusted.enumerated() { folderIndex[f.id] = i }
 
                 for (msgId, mutation) in overlay {
-                    // Determine the message's current DB folder by reading the header
-                    guard let header = try? AppDatabase.dbPool.read({ db in
-                        try MessageHeader.fetchOne(db, key: msgId)
-                    }) else { continue }
-
+                    guard let header = headersById[msgId] else { continue }
                     let dbFolderId = header.folderId
                     let dbIsRead = header.isRead
 
@@ -148,9 +158,9 @@ final class NavigationStore {
                     if let overlayRead = mutation.isRead, overlayRead != dbIsRead, mutation.folderId == nil {
                         if let idx = folderIndex[dbFolderId] {
                             if overlayRead && !dbIsRead {
-                                freshFolders[idx].unreadCount = max(0, freshFolders[idx].unreadCount - 1)
+                                adjusted[idx].unreadCount = max(0, adjusted[idx].unreadCount - 1)
                             } else if !overlayRead && dbIsRead {
-                                freshFolders[idx].unreadCount += 1
+                                adjusted[idx].unreadCount += 1
                             }
                         }
                     }
@@ -160,50 +170,62 @@ final class NavigationStore {
                         let isUnread = mutation.isRead.map { !$0 } ?? !dbIsRead
                         if isUnread {
                             if let srcIdx = folderIndex[dbFolderId] {
-                                freshFolders[srcIdx].unreadCount = max(0, freshFolders[srcIdx].unreadCount - 1)
+                                adjusted[srcIdx].unreadCount = max(0, adjusted[srcIdx].unreadCount - 1)
                             }
                             if let dstIdx = folderIndex[newFolderId] {
-                                freshFolders[dstIdx].unreadCount += 1
+                                adjusted[dstIdx].unreadCount += 1
                             }
                         }
                     }
                 }
             }
-            self.folders = freshFolders
+            self.folders = adjusted
         } catch {
             print("[NavigationStore] Folder refresh error: \(error)")
         }
     }
 
-    /// Refresh only outbox messages.
-    func refreshOutbox() {
+    /// Refresh only outbox messages. Async read — never blocks the main thread.
+    func refreshOutbox() async {
         do {
-            self.outboxMessages = try AppDatabase.dbPool.read { db in
+            let outbox = try await AppDatabase.dbPool.read { db in
                 try OutboxMessage.order(Column("createdAt").desc).fetchAll(db)
             }
+            self.outboxMessages = outbox
         } catch {
             print("[NavigationStore] Outbox refresh error: \(error)")
         }
     }
 
+    /// Sendable bundle for the async sidebar read (GRDB's async `read` overload
+    /// requires a Sendable return).
+    private struct SidebarBundle: Sendable {
+        let accounts: [Account]
+        let folders: [Folder]
+        let outbox: [OutboxMessage]
+        let hasAny: Bool
+    }
+
     /// Immediate refresh without RenderGate check. Used for initial load
     /// and after user-initiated actions where freshness is required.
-    private func refreshNow() {
-        let dbPool = AppDatabase.dbPool
+    /// The GRDB read runs off the main thread (async) so it can't block the UI
+    /// during the foreground catch-up burst (Half A / PLAN_HANG_FIX); the
+    /// @Observable assignments happen on the main actor after it resolves.
+    private func refreshNow() async {
         let demoActive = DemoModeStore.shared.isActive
         do {
-            try dbPool.read { db in
-                let newAccounts = try Account.sidebarRequest(demoActive: demoActive).fetchAll(db)
-                let newFolders = try Folder.sidebarRequest(demoActive: demoActive).fetchAll(db)
-                let newOutbox = try OutboxMessage.order(Column("createdAt").desc).fetchAll(db)
-                let newHasAny = try Account.filter(Column("isActive") == true).fetchCount(db) > 0
-                // Always assign — @Observable re-render cost is negligible since
-                // refreshNow() only runs on backgroundDataDidChange.
-                self.accounts = newAccounts
-                self.folders = newFolders
-                self.outboxMessages = newOutbox
-                self.hasAnyAccount = newHasAny
+            let bundle = try await AppDatabase.dbPool.read { db -> SidebarBundle in
+                SidebarBundle(
+                    accounts: try Account.sidebarRequest(demoActive: demoActive).fetchAll(db),
+                    folders: try Folder.sidebarRequest(demoActive: demoActive).fetchAll(db),
+                    outbox: try OutboxMessage.order(Column("createdAt").desc).fetchAll(db),
+                    hasAny: try Account.filter(Column("isActive") == true).fetchCount(db) > 0
+                )
             }
+            self.accounts = bundle.accounts
+            self.folders = bundle.folders
+            self.outboxMessages = bundle.outbox
+            self.hasAnyAccount = bundle.hasAny
         } catch {
             print("[NavigationStore] Refresh error: \(error)")
         }
@@ -216,7 +238,7 @@ final class NavigationStore {
         try? AppDatabase.dbPool.write { db in
             try db.execute(sql: "UPDATE folder SET isFavorite = NOT isFavorite WHERE id = ?", arguments: [folder.id])
         }
-        refreshFolders()
+        Task { [weak self] in await self?.refreshFolders() }
     }
 
     /// Set favorite status for a folder.
@@ -225,7 +247,7 @@ final class NavigationStore {
         try? AppDatabase.dbPool.write { db in
             try db.execute(sql: "UPDATE folder SET isFavorite = ? WHERE id = ?", arguments: [isFavorite, folder.id])
         }
-        refreshFolders()
+        Task { [weak self] in await self?.refreshFolders() }
     }
 
     /// Set an account as primary (only one at a time).
@@ -235,7 +257,7 @@ final class NavigationStore {
             try db.execute(sql: "UPDATE account SET isPrimary = 0 WHERE isPrimary = 1")
             try db.execute(sql: "UPDATE account SET isPrimary = 1 WHERE id = ?", arguments: [account.id])
         }
-        refresh()
+        Task { [weak self] in await self?.refresh() }
     }
 
 }
