@@ -820,6 +820,11 @@ final class SyncScheduler {
             // the duration of this BGTask; re-arm quiesce on exit (ADR-IOS-041).
             DatabaseSuspension.shared.beginBackgroundWork("bg-app-refresh")
             defer { DatabaseSuspension.shared.endBackgroundWork("bg-app-refresh") }
+            // A BGTask can cold-launch a terminated app into the BACKGROUND,
+            // where the SwiftUI scene `.task` never runs — so the DB may not be
+            // built yet. Build/await it before any `AppDatabase.dbPool` access
+            // (which force-unwraps `AppDatabase.shared`) → otherwise crash.
+            await AppStartup.shared.awaitReady()
             print("[SyncScheduler] SYNC Task body start")
             let pollActive = self.isPollActive
             BackgroundSyncLogger.logBGAppRefresh("Task body start (pollActive=\(pollActive), network=\(NetworkMonitor.checkConnected()))")
@@ -940,6 +945,11 @@ final class SyncScheduler {
             // the duration of this BGTask; re-arm quiesce on exit (ADR-IOS-041).
             DatabaseSuspension.shared.beginBackgroundWork("bg-processing")
             defer { DatabaseSuspension.shared.endBackgroundWork("bg-processing") }
+            // A BGTask can cold-launch a terminated app into the BACKGROUND,
+            // where the SwiftUI scene `.task` never runs — so the DB may not be
+            // built yet. Build/await it before any `AppDatabase.dbPool` access
+            // (which force-unwraps `AppDatabase.shared`) → otherwise crash.
+            await AppStartup.shared.awaitReady()
             let taskT0 = CFAbsoluteTimeGetCurrent()
             print("[SyncScheduler] PROCESSING Task body start")
             BackgroundSyncLogger.logBGProcessing("Task body start")

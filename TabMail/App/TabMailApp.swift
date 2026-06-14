@@ -319,7 +319,18 @@ struct TabMailApp: App {
 /// multi-version jump. Doing that synchronously in init froze the app with no UI
 /// ("hang on boot").
 ///
-/// Startup runs in two phases on a background task:
+/// The build (`ensureDatabaseReady`) is `navigationStore`-independent and driven
+/// from TWO launch paths so it runs no matter how the process starts:
+///   • `AppDelegate.didFinishLaunchingWithOptions` — fires on EVERY launch,
+///     including cold BACKGROUND launches (silent push / BGTask / notification
+///     action) where the SwiftUI scene `.task` never runs.
+///   • `TabMailApp.body.task` (via `runIfNeeded`) — the foreground path, which
+///     additionally runs the UI-only sidebar load and flips `isReady`.
+/// Relying solely on `body.task` was a regression: background launches left
+/// `AppDatabase.shared` nil → BGTask handlers crashed and push/notification
+/// handlers hung on `awaitReady()`.
+///
+/// It runs in two phases on a background task:
 ///   1. **Probe** — open the pool and cheaply check for pending migration work
 ///      (`AppDatabase.hasPendingMigrationWork`). While this runs the UI shows a
 ///      blank launch screen (matching the empty `UILaunchScreen`).
@@ -329,11 +340,11 @@ struct TabMailApp: App {
 ///      blank launch screen holds until `isReady` flips straight to the inbox.
 ///      This keeps the migration splash from flashing on every normal launch.
 ///
-/// CRITICAL invariant: while `isReady == false`, `AppDatabase.shared` is nil and
-/// `AppDatabase.dbPool` (which force-unwraps it) MUST NOT be touched. The UI is
-/// gated by the launch screen / splash; background / UIKit entry points that can
-/// fire during this window (silent push, notification actions) gate via
-/// `awaitReady()`.
+/// CRITICAL invariant: until `ensureDatabaseReady()` completes, `AppDatabase.shared`
+/// is nil and `AppDatabase.dbPool` (which force-unwraps it) MUST NOT be touched.
+/// The UI is gated by the launch screen / splash; background / UIKit entry points
+/// that can fire during this window (silent push, notification actions, BGTask
+/// sync/AI) gate via `awaitReady()`.
 @MainActor
 @Observable
 final class AppStartup {
@@ -353,20 +364,40 @@ final class AppStartup {
     /// Set on a catastrophic DB open/migration failure; drives the failure view.
     private(set) var failureMessage: String?
 
-    /// Guards against `runIfNeeded` re-entry (the gating view's `.task` can
-    /// re-fire on identity changes).
+    /// Guards against re-entry into the database build (the gating view's `.task`
+    /// and the AppDelegate launch trigger can both call in).
     private var hasStarted = false
 
-    /// Continuations parked by `awaitReady()` while the DB is still building.
-    private var readyWaiters: [CheckedContinuation<Void, Never>] = []
+    /// True once the database pool is built, migrated, and published
+    /// (`AppDatabase.shared`) and the non-UI DB-dependent launch steps have run.
+    /// This — NOT `isReady` — is what background entry points wait on, because a
+    /// cold BACKGROUND launch (silent push / BGTask / notification action) never
+    /// runs `loadInitialData`/`isReady` (no UI), yet still needs a usable DB.
+    private var dbReady = false
+
+    /// Continuations parked by `ensureDatabaseReady()` while the DB is building.
+    private var dbWaiters: [CheckedContinuation<Void, Never>] = []
 
     private init() {}
 
-    /// Builds + migrates the database (once), then runs the DB-dependent launch
-    /// steps that previously lived in `TabMailApp.init` /
-    /// `AppDelegate.didFinishLaunchingWithOptions`. Idempotent.
-    func runIfNeeded(navigationStore: NavigationStore) async {
-        guard !hasStarted else { return }
+    /// Builds + migrates the database (once) and runs the non-UI DB-dependent
+    /// launch steps (screenshot seed, orphan demo wipe, NSE staging + mirror).
+    /// Idempotent and `navigationStore`-independent so it can be driven from ANY
+    /// launch path — the foreground `body.task` (via `runIfNeeded`) AND
+    /// `AppDelegate.didFinishLaunchingWithOptions` (which always runs, including
+    /// cold BACKGROUND launches where the SwiftUI scene `.task` never fires).
+    /// Concurrent callers while a build is in flight park on `dbWaiters` rather
+    /// than starting a second build.
+    func ensureDatabaseReady() async {
+        if dbReady { return }
+        if hasStarted {
+            // A build is already running (started by another launch path).
+            // Park until it finishes — don't start a second one.
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                if dbReady { cont.resume() } else { dbWaiters.append(cont) }
+            }
+            return
+        }
         hasStarted = true
 
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -394,6 +425,7 @@ final class AppStartup {
 
         guard let probe else {
             failureMessage = "TabMail couldn’t open its local database. Please relaunch the app."
+            resumeDBWaiters()
             return
         }
 
@@ -423,16 +455,18 @@ final class AppStartup {
 
         guard built else {
             failureMessage = "TabMail couldn’t open its local database. Please relaunch the app."
+            resumeDBWaiters()
             return
         }
         BackgroundSyncLogger.log("AppStartup: database ready in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
 
-        // DB-dependent launch steps, in the same spirit/order as before, now
-        // safely after migration (all touch AppDatabase / shared UserDefaults):
+        // DB-dependent NON-UI launch steps, in the same spirit/order as before
+        // (all touch AppDatabase / shared UserDefaults). These previously lived
+        // in `didFinishLaunchingWithOptions` (NSE staging + mirror) and run on
+        // every launch type — restoring that by living here behind the trigger:
         //   • screenshot seeding (only under --screenshot-mode)
         //   • orphan demo-row wipe (demo state never persists across launches)
-        //   • NSE staging DB creation + state mirror (moved from didFinishLaunching)
-        //   • initial sidebar load (accounts / folders / outbox)
+        //   • NSE staging DB creation + state mirror
         ScreenshotMode.seedIfNeeded()
         ScreenshotMode.seedChatSessionsIfNeeded()
         if let db = AppDatabase.shared.withLock({ $0 }) {
@@ -445,28 +479,37 @@ final class AppStartup {
         }
         AppDatabase.createNSEStagingDBIfNeeded()
         NSEDataBridge.mirrorAllState()
-        navigationStore.loadInitialData()
 
-        // Flip the gate — unblocks the splash → inbox transition and any
-        // background callers parked in `awaitReady()`.
-        isReady = true
-        let waiters = readyWaiters
-        readyWaiters.removeAll()
+        // DB is usable — unblock everything parked in `awaitReady()` (background
+        // push / notification-action / BGTask handlers, detached startup tasks).
+        dbReady = true
+        resumeDBWaiters()
+    }
+
+    /// Resume + clear all `ensureDatabaseReady` waiters. Called on success AND on
+    /// catastrophic-failure exits so background callers never hang indefinitely.
+    private func resumeDBWaiters() {
+        let waiters = dbWaiters
+        dbWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
     }
 
-    /// Suspends until the database is ready. Used by UIKit push / notification
-    /// handlers that can fire during the migration window — see `AppDelegate`.
+    /// Foreground entry: build the DB (if not already) then run the UI-only step
+    /// — the initial sidebar load — and flip `isReady` to route splash → inbox.
+    /// Called from `TabMailApp.body.task`. Idempotent.
+    func runIfNeeded(navigationStore: NavigationStore) async {
+        await ensureDatabaseReady()
+        // Build failed (failureMessage shown) or the sidebar already loaded.
+        guard dbReady, !isReady else { return }
+        navigationStore.loadInitialData()
+        isReady = true
+    }
+
+    /// Suspends until the database is usable, kicking off the build if no launch
+    /// path has yet. Used by UIKit push / notification / BGTask handlers that can
+    /// fire on a cold BACKGROUND launch (where `body.task` never runs) or during
+    /// the migration window — see `AppDelegate` / `SyncScheduler`.
     func awaitReady() async {
-        if isReady { return }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            // Re-check under the actor in case readiness flipped between the
-            // guard above and enqueueing.
-            if isReady {
-                cont.resume()
-            } else {
-                readyWaiters.append(cont)
-            }
-        }
+        await ensureDatabaseReady()
     }
 }

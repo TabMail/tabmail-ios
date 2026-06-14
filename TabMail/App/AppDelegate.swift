@@ -334,10 +334,17 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // 0xdead10cc defense: suspend GRDB databases just before process
         // suspension, resume on foreground/push/BGTask (ADR-IOS-041).
         DatabaseSuspension.shared.start()
-        // NSE staging DB creation + state mirror MOVED to `AppStartup.runIfNeeded`.
-        // They touch `AppDatabase`, which is now built asynchronously behind the
-        // migration splash (RC2 fix, PLAN_HANG_FIX); running them here would hit a
-        // nil `AppDatabase.shared` (force-unwrapped in `dbPool`) → crash.
+        // Build the database OFF the synchronous launch path, on EVERY launch
+        // type. `didFinishLaunching` always runs — including cold BACKGROUND
+        // launches (silent push / BGTask / notification action) where the
+        // SwiftUI `WindowGroup` body (and its `.task`, the foreground trigger)
+        // never fires. Without this, those background handlers would touch a nil
+        // `AppDatabase.shared` (force-unwrapped in `dbPool`) → crash/hang.
+        // Async so it doesn't refreeze launch (RC2 fix, PLAN_HANG_FIX); it's
+        // idempotent with `body.task`'s `runIfNeeded`. NSE staging DB creation +
+        // state mirror live inside `ensureDatabaseReady` (they touch AppDatabase),
+        // so they still run on every launch as they did before the splash work.
+        Task { await AppStartup.shared.ensureDatabaseReady() }
         migrateOptOutFlagToSharedSuite()
         return true
     }
