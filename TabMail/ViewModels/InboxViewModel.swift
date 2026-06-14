@@ -97,11 +97,13 @@ final class InboxViewModel {
 
     /// Called when the list reappears (e.g., user pops back from detail).
     /// With the overlay, reloadMessages is always safe — just trigger a refresh.
-    /// Also calls selfHealFolders() synchronously in case the folder ValueObservation
-    /// hasn't emitted yet and VM.folders is partial/stale — belt-and-suspenders.
+    /// Folder self-heal now happens inside `reloadMessages` via the async
+    /// `selfHealFoldersAsync()` (Half A / PLAN_HANG_FIX). The previous
+    /// SYNCHRONOUS `selfHealFolders()` call here did a GRDB read on the main
+    /// thread during foreground return — the warm-foreground hang — so it was
+    /// removed; `reloadMessages` below heals off-main (and was already healing).
     func listDidAppear() {
         BackgroundSyncLogger.logInbox("[\(instanceTag)] listDidAppear hasLoaded=\(hasLoadedInitialPage) loadedCount=\(loadedMessages.count) folders=\(folders.count)")
-        selfHealFolders()
         Task { @MainActor [weak self] in
             guard let self else { return }
             let t0 = CFAbsoluteTimeGetCurrent()
@@ -214,6 +216,29 @@ final class InboxViewModel {
             }) ?? []
         case .folder(let folder):
             return (try? dbPool.read { db in
+                if let fresh = try Folder.fetchOne(db, key: folder.id) {
+                    return [fresh]
+                }
+                return [folder]
+            }) ?? [folder]
+        default:
+            return []
+        }
+    }
+
+    /// Async mirror of `resolveFoldersFromDB`: the GRDB read runs off the main
+    /// thread (suspends, never blocks), so a slow/contended/locked read on the
+    /// warm-foreground path can't freeze the UI (Half A / PLAN_HANG_FIX). Same
+    /// query and fallbacks as the synchronous version.
+    private func resolveFoldersFromDBAsync() async -> [Folder] {
+        let demoActive = DemoModeStore.shared.isActive
+        switch selection {
+        case .unified(let role):
+            return (try? await dbPool.read { db in
+                try Folder.filter(Column("role") == role.rawValue && Folder.demoScope(demoActive: demoActive)).fetchAll(db)
+            }) ?? []
+        case .folder(let folder):
+            return (try? await dbPool.read { db in
                 if let fresh = try Folder.fetchOne(db, key: folder.id) {
                     return [fresh]
                 }
@@ -563,7 +588,10 @@ final class InboxViewModel {
     }
 
     func reloadMessages(animated: Bool = false) async {
-        selfHealFolders()
+        // Heal folders OFF the main thread — the synchronous selfHealFolders()
+        // here blocked the UI on a GRDB read during warm-foreground return
+        // (the warm-foreground hang; Half A / PLAN_HANG_FIX).
+        await selfHealFoldersAsync()
         let folderNames = folders.map { "\($0.name)(\($0.id))" }.joined(separator: ", ")
         print("[MoveTrace] reloadMessages — folders=[\(folderNames)] prevCount=\(loadedMessages.count)")
 
@@ -648,8 +676,23 @@ final class InboxViewModel {
 
     // MARK: - Shared reload helpers
 
+    /// Synchronous self-heal. Kept for the non-foreground paths that must be
+    /// synchronous (`resetMessages`, which `init` calls and so cannot await).
     private func selfHealFolders() {
-        let resolved = resolveFoldersFromDB()
+        applyResolvedFolders(resolveFoldersFromDB())
+    }
+
+    /// Async self-heal for the warm-foreground path (`reloadMessages`): resolves
+    /// folders OFF the main thread so the GRDB read suspends rather than blocks
+    /// the UI (Half A / PLAN_HANG_FIX). Identical healing behavior to
+    /// `selfHealFolders` — only the threading differs.
+    private func selfHealFoldersAsync() async {
+        applyResolvedFolders(await resolveFoldersFromDBAsync())
+    }
+
+    /// Heal `folders` to `resolved` when membership+role differs. Shared by the
+    /// sync and async self-heal paths; runs on the main actor.
+    private func applyResolvedFolders(_ resolved: [Folder]) {
         guard !resolved.isEmpty else { return }
         // Set-based comparison — order differences between NavigationStore and
         // DB query don't count as a mismatch, only membership + role.
@@ -1144,7 +1187,7 @@ final class InboxViewModel {
 
         // Self-heal: if folders are empty, try resolving from GRDB before bailing.
         if folders.isEmpty {
-            let resolved = resolveFoldersFromDB()
+            let resolved = await resolveFoldersFromDBAsync()
             if !resolved.isEmpty {
                 folders = resolved
                 print("[Sync] performSync self-healed folders from GRDB: \(resolved.count)")

@@ -1003,4 +1003,41 @@ struct InboxViewModelDiffTests {
             #expect(vm.displayGroups[i - 1].representative.date >= vm.displayGroups[i].representative.date)
         }
     }
+
+    // MARK: - Folder self-heal on reload (warm-foreground hang fix characterization)
+
+    /// Characterizes the behavior of `selfHealFolders` as invoked by
+    /// `reloadMessages` on a warm-foreground return: when the VM's folder list
+    /// is stale relative to GRDB (NavigationStore lagging the DB), the reload
+    /// resolves the real folder from the DB and loads its messages. This MUST
+    /// hold identically whether the folder resolve is synchronous (pre-fix) or
+    /// asynchronous (Half A) — the only thing changing is that the read no
+    /// longer blocks the main thread.
+    @Test("reloadMessages self-heals stale folders from GRDB (unified inbox)")
+    @MainActor func reloadSelfHealsStaleFolders() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        // One message in the REAL inbox folder ("acc1:INBOX").
+        let ids = try insertMessages(pool, specs: [
+            ("m1", "Hello", baseDate, "s1", "alice@test.com"),
+        ], folderId: folder.id)
+
+        // Construct the VM with a STALE inbox folder ("acc1:STALE") not present in
+        // the DB — simulates NavigationStore's folder list lagging the DB on a
+        // foreground return. `resolveFoldersFromDB` (unified .inbox) should heal
+        // it to the real DB inbox folder, and the reload should then load m1.
+        let staleFolder = Folder(name: "Stale", path: "STALE", role: .inbox, accountId: "acc1")
+        #expect(staleFolder.id != folder.id)
+
+        let vm = InboxViewModel(folders: [staleFolder])   // selection defaults to .unified(.inbox)
+        await vm.reloadMessages()
+
+        #expect(vm.folders.contains { $0.id == folder.id }, "folders should self-heal to the DB inbox folder")
+        #expect(!vm.folders.contains { $0.id == staleFolder.id }, "stale folder should be replaced")
+        #expect(vm.loadedMessages.contains { $0.id == ids[0] }, "message in the healed folder should load")
+    }
 }
