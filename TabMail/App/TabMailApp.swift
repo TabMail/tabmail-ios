@@ -7,12 +7,17 @@ import BackgroundTasks
 import UserNotifications
 import WebKit
 import TipKit
+import GRDB
 
 @main
 struct TabMailApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var navigationStore = NavigationStore()
     @State private var storeKitManager = StoreKitManager()
+    /// Drives the one-time "Updating…" migration splash. The DB (schema +
+    /// data-repair migrations) is built here, off the synchronous init path,
+    /// so a long migration no longer freezes launch (RC2 fix, PLAN_HANG_FIX).
+    @State private var startup = AppStartup.shared
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -71,44 +76,28 @@ struct TabMailApp: App {
         // instances on AppDatabase's reader connections where vec0 is never used,
         // wasting resources and risking vtab lifecycle crashes).
 
-        // Initialize GRDB database
-        do {
-            let db = try AppDatabase()
-            AppDatabase.shared.withLock { $0 = db }
-            print("[TabMailApp] AppDatabase created successfully")
-        } catch {
-            fatalError("[TabMailApp] Failed to create AppDatabase: \(error)")
-        }
-
-        // Seed demo data for App Store screenshots (only when launched with --screenshot-mode)
-        // MUST be after AppDatabase init since it writes to GRDB.
-        ScreenshotMode.seedIfNeeded()
-        ScreenshotMode.seedChatSessionsIfNeeded()
-
-        // Demo state never persists across launches.
-        // If the previous session was force-quit during demo (or otherwise
-        // failed to call DemoModeService.exit), demo rows linger in GRDB
-        // and would make navigationStore think a real account exists,
-        // routing past the login screen. Wipe synchronously before
-        // navigationStore reads. Idempotent — no-op when no demo rows exist.
-        if let db = AppDatabase.shared.withLock({ $0 }) {
-            do {
-                try db.dbPool.write { conn in try DemoSeed.wipe(conn) }
-            } catch {
-                print("[TabMailApp] Orphan demo wipe failed: \(error)")
-            }
-        }
-
-        // Eagerly load accounts/folders from GRDB so RootView's first render
-        // skips the splash (isInitialLoadComplete is true before body evaluates).
-        // This is a fast synchronous read (~20-50ms) — safe in init.
-        navigationStore.loadInitialData()
+        // DATABASE STARTUP MOVED OFF THE SYNCHRONOUS INIT PATH (RC2 fix,
+        // PLAN_HANG_FIX). Constructing `AppDatabase` runs the GRDB schema
+        // migrator + one-time data resets, and the O(mailbox-size) thread-repair
+        // migrations (v9/v27/v47/v53/v54) can take minutes after a multi-version
+        // jump — doing that here froze launch with no UI ("hang on boot"). It
+        // now runs in `AppStartup.runIfNeeded` behind a gating "Updating…"
+        // splash (see `body`). Everything that touches `AppDatabase` —
+        // construction, demo wipe, NSE staging + mirror, `loadInitialData`, and
+        // the detached FTS/tool/embedding tasks below — must wait for that:
+        // `AppDatabase.dbPool` force-unwraps `AppDatabase.shared`, so any access
+        // before the coordinator sets it would crash. UI is gated by the splash;
+        // background entry points gate via `AppStartup.shared.awaitReady()`.
 
 
         // Register client-side tools for AI agent chat (matching TB's core.js TOOL_IMPL).
         // Task.detached avoids inheriting main actor context — eliminates 26 main-actor
         // round-trips that compete with post-splash UI layout. registerAll does a single actor hop.
         Task.detached {
+            // Wait for the DB to finish migrating before any tool can touch it
+            // (tools query GRDB when invoked; registration itself doesn't, but
+            // gating here is cheap and keeps all DB-adjacent startup uniform).
+            await AppStartup.shared.awaitReady()
             let registry = ToolRegistry.shared
             await registry.registerAll([
                 InboxReadTool(),
@@ -162,6 +151,10 @@ struct TabMailApp: App {
         // Task.detached avoids inheriting main actor context — prevents FTS completion
         // callback from competing for main actor time right after splash dismissal.
         Task.detached {
+            // FTS init reads from the main DB to seed/reconcile the index —
+            // wait for migrations to finish (AppDatabase.dbPool is force-
+            // unwrapped, see AppStartup).
+            await AppStartup.shared.awaitReady()
             do {
                 try await SearchIndex.shared.initialize()
             } catch {
@@ -169,6 +162,7 @@ struct TabMailApp: App {
             }
         }
         Task.detached(priority: .utility) {
+            await AppStartup.shared.awaitReady()
             EmbeddingService.initialize()
         }
 
@@ -252,24 +246,227 @@ struct TabMailApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(navigationStore)
-                .environment(storeKitManager)
-                .preferredColorScheme(ScreenshotMode.isDarkMode ? .dark : nil)
-                .task { storeKitManager.start() }
-                .onOpenURL { url in
-                    guard let request = MailtoRequest.parse(url) else { return }
-                    NotificationCenter.default.post(
-                        name: .contactPillComposeTapped,
-                        object: nil,
-                        userInfo: request.toUserInfo()
-                    )
-                }
-                .onChange(of: scenePhase) { _, newPhase in
-                    if newPhase == .active {
-                        Task { await NotificationCleanupService.sweepOnForeground() }
+            Group {
+                if let failure = startup.failureMessage {
+                    // Catastrophic DB open/migration failure (rare). Relaunch
+                    // retries — migrations are idempotent / flag-gated — so we
+                    // surface a message instead of crashing.
+                    VStack(spacing: 16) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.largeTitle)
+                            .foregroundStyle(.orange)
+                        Text("Couldn’t start TabMail")
+                            .font(.headline)
+                        Text(failure)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
                     }
+                    .padding(40)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if startup.isReady {
+                    RootView()
+                        .environment(navigationStore)
+                        .environment(storeKitManager)
+                        .task { storeKitManager.start() }
+                        .onOpenURL { url in
+                            guard let request = MailtoRequest.parse(url) else { return }
+                            NotificationCenter.default.post(
+                                name: .contactPillComposeTapped,
+                                object: nil,
+                                userInfo: request.toUserInfo()
+                            )
+                        }
+                        .onChange(of: scenePhase) { _, newPhase in
+                            if newPhase == .active {
+                                Task { await NotificationCleanupService.sweepOnForeground() }
+                            }
+                        }
+                } else if startup.isMigrating {
+                    // ONLY shown once we've confirmed real (and potentially slow)
+                    // migration work on an existing database. The gating splash
+                    // reads as honest progress, not a frozen launch (RC2 fix,
+                    // PLAN_HANG_FIX).
+                    SplashView(mode: .migrating)
+                } else {
+                    // Probing for pending migrations (fast) or running an instant
+                    // already-migrated / fresh-install startup. Match the iOS
+                    // launch screen (empty UILaunchScreen = system background) so
+                    // there's no flash of the "Updating…" splash when nothing is
+                    // actually migrating.
+                    Color(.systemBackground)
+                        .ignoresSafeArea()
                 }
+            }
+            .preferredColorScheme(ScreenshotMode.isDarkMode ? .dark : nil)
+            .task {
+                // Build + migrate the DB OFF the main thread, then flip to the
+                // inbox. Gating entry until this completes means there is no
+                // window of half-repaired derived data (the app doesn't operate
+                // mid-migration).
+                await startup.runIfNeeded(navigationStore: navigationStore)
+            }
+        }
+    }
+}
+
+/// Coordinates the one-time, potentially-slow database startup so it runs OFF
+/// the synchronous launch path, instead of freezing `TabMailApp.init` (RC2 fix —
+/// see PLAN_HANG_FIX).
+///
+/// The GRDB schema migrator + one-time data resets include O(mailbox-size)
+/// thread-repair migrations (v9/v27/v47/v53/v54) that can take minutes after a
+/// multi-version jump. Doing that synchronously in init froze the app with no UI
+/// ("hang on boot").
+///
+/// Startup runs in two phases on a background task:
+///   1. **Probe** — open the pool and cheaply check for pending migration work
+///      (`AppDatabase.hasPendingMigrationWork`). While this runs the UI shows a
+///      blank launch screen (matching the empty `UILaunchScreen`).
+///   2. **Migrate + load** — run the migrations/resets and the DB-dependent
+///      launch steps. ONLY if Phase 1 found real work on an existing DB do we
+///      flip `isMigrating` to show `SplashView(mode: .migrating)`; otherwise the
+///      blank launch screen holds until `isReady` flips straight to the inbox.
+///      This keeps the migration splash from flashing on every normal launch.
+///
+/// CRITICAL invariant: while `isReady == false`, `AppDatabase.shared` is nil and
+/// `AppDatabase.dbPool` (which force-unwraps it) MUST NOT be touched. The UI is
+/// gated by the launch screen / splash; background / UIKit entry points that can
+/// fire during this window (silent push, notification actions) gate via
+/// `awaitReady()`.
+@MainActor
+@Observable
+final class AppStartup {
+    static let shared = AppStartup()
+
+    /// True once the database is built + migrated and the initial sidebar load
+    /// has run. Drives the splash → inbox transition.
+    private(set) var isReady = false
+
+    /// True once we've confirmed there is real, potentially-slow migration work
+    /// to run on an EXISTING database — drives the one-time "Updating…" splash.
+    /// Stays false on the common path (already-migrated DB) and on fresh
+    /// installs, so the launch screen shows blank until the inbox is ready
+    /// instead of flashing the migration splash on every launch.
+    private(set) var isMigrating = false
+
+    /// Set on a catastrophic DB open/migration failure; drives the failure view.
+    private(set) var failureMessage: String?
+
+    /// Guards against `runIfNeeded` re-entry (the gating view's `.task` can
+    /// re-fire on identity changes).
+    private var hasStarted = false
+
+    /// Continuations parked by `awaitReady()` while the DB is still building.
+    private var readyWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private init() {}
+
+    /// Builds + migrates the database (once), then runs the DB-dependent launch
+    /// steps that previously lived in `TabMailApp.init` /
+    /// `AppDelegate.didFinishLaunchingWithOptions`. Idempotent.
+    func runIfNeeded(navigationStore: NavigationStore) async {
+        guard !hasStarted else { return }
+        hasStarted = true
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Whether the DB file pre-exists THIS launch — captured BEFORE
+        // `makePool()` creates it. A fresh/empty DB migrates instantly, so we
+        // never show the migration splash on first install (it would falsely
+        // read "Updating…" with nothing to update).
+        let dbExisted = FileManager.default.fileExists(atPath: AppDatabase.databaseURL.path)
+
+        // Phase 1 (off main): open the pool + cheaply probe for pending migration
+        // work. Fast — opens the connection and reads the migrator's applied set
+        // + the one-time-reset flags. The heavy migration passes are Phase 2.
+        let probe: (pool: DatabasePool, pending: Bool)? =
+            await Task.detached(priority: .userInitiated) {
+                do {
+                    let pool = try AppDatabase.makePool()
+                    let pending = try AppDatabase.hasPendingMigrationWork(pool)
+                    return (pool, pending)
+                } catch {
+                    BackgroundSyncLogger.log("AppStartup: pool open/probe FAILED: \(error)")
+                    return nil
+                }
+            }.value
+
+        guard let probe else {
+            failureMessage = "TabMail couldn’t open its local database. Please relaunch the app."
+            return
+        }
+
+        // Only NOW — knowing there is real (and potentially slow) migration work
+        // on an existing mailbox — switch from the blank launch screen to the
+        // "Updating…" splash. The common case (already-migrated DB) skips this
+        // and stays blank until `isReady` flips straight to the inbox.
+        if probe.pending && dbExisted {
+            isMigrating = true
+            BackgroundSyncLogger.log("AppStartup: pending migration work on existing DB — showing migration splash")
+        }
+
+        // Phase 2 (off main): run schema + data-repair migrations + one-time
+        // resets on the probed pool, then publish it. This is the work that used
+        // to freeze launch; it now runs behind the gating splash (when shown).
+        let pool = probe.pool
+        let built = await Task.detached(priority: .userInitiated) { () -> Bool in
+            do {
+                let db = try AppDatabase(pool: pool, runStartupResets: true)
+                AppDatabase.shared.withLock { $0 = db }
+                return true
+            } catch {
+                BackgroundSyncLogger.log("AppStartup: AppDatabase build FAILED: \(error)")
+                return false
+            }
+        }.value
+
+        guard built else {
+            failureMessage = "TabMail couldn’t open its local database. Please relaunch the app."
+            return
+        }
+        BackgroundSyncLogger.log("AppStartup: database ready in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+
+        // DB-dependent launch steps, in the same spirit/order as before, now
+        // safely after migration (all touch AppDatabase / shared UserDefaults):
+        //   • screenshot seeding (only under --screenshot-mode)
+        //   • orphan demo-row wipe (demo state never persists across launches)
+        //   • NSE staging DB creation + state mirror (moved from didFinishLaunching)
+        //   • initial sidebar load (accounts / folders / outbox)
+        ScreenshotMode.seedIfNeeded()
+        ScreenshotMode.seedChatSessionsIfNeeded()
+        if let db = AppDatabase.shared.withLock({ $0 }) {
+            do {
+                // Async context → GRDB's async `write` overload (non-blocking).
+                try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+            } catch {
+                print("[AppStartup] Orphan demo wipe failed: \(error)")
+            }
+        }
+        AppDatabase.createNSEStagingDBIfNeeded()
+        NSEDataBridge.mirrorAllState()
+        navigationStore.loadInitialData()
+
+        // Flip the gate — unblocks the splash → inbox transition and any
+        // background callers parked in `awaitReady()`.
+        isReady = true
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Suspends until the database is ready. Used by UIKit push / notification
+    /// handlers that can fire during the migration window — see `AppDelegate`.
+    func awaitReady() async {
+        if isReady { return }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            // Re-check under the actor in case readiness flipped between the
+            // guard above and enqueueing.
+            if isReady {
+                cont.resume()
+            } else {
+                readyWaiters.append(cont)
+            }
         }
     }
 }

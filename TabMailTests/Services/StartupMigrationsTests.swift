@@ -159,4 +159,61 @@ struct StartupMigrationsTests {
         #expect(try await Self.count(queue, "messageHeader") == 1)
         #expect(ftsResets == 1)
     }
+
+    // MARK: - Migration-detection (drives the "Updating…" splash gate)
+
+    /// `resetFlagKeys` is the single source of truth that `allResetsComplete`
+    /// reads; if it drifts from the keys `run(_:)` actually checks, the splash
+    /// gate would mis-fire. Pin it to this test's independently-maintained list.
+    @Test("StartupMigrations.resetFlagKeys matches the keys run() gates on")
+    func resetFlagKeysMatchCanonicalList() {
+        #expect(StartupMigrations.resetFlagKeys == Self.flagKeys)
+    }
+
+    @Test("allResetsComplete is true only when every reset flag is set")
+    func allResetsCompleteReflectsFlags() {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        #expect(StartupMigrations.allResetsComplete == true)
+
+        // Any single unset flag flips it back to "pending".
+        UserDefaults.standard.set(false, forKey: Self.flagKeys[2])
+        #expect(StartupMigrations.allResetsComplete == false)
+    }
+
+    @Test("hasPendingMigrationWork: unmigrated schema is pending even with all reset flags set")
+    func pendingWhenSchemaIncomplete() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        // Rule out the reset path so a true result can only be the schema check.
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        let fresh = try DatabaseQueue()  // in-memory, NO migrations applied
+        #expect(try AppDatabase.hasPendingMigrationWork(fresh) == true)
+    }
+
+    @Test("hasPendingMigrationWork: fully migrated + all resets done is NOT pending (common launch)")
+    func notPendingWhenFullyMigratedAndResetsDone() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        let migrated = try TestDatabase.make()  // runs the full migration chain
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == false)
+    }
+
+    @Test("hasPendingMigrationWork: fully migrated but a reset still pending IS pending")
+    func pendingWhenResetOutstanding() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        // One destructive reset hasn't run yet (e.g. a newly-shipped reset on an
+        // existing install) — that's slow on a populated mailbox, so it counts.
+        UserDefaults.standard.set(false, forKey: "didCleanResetMessageData_v1")
+
+        let migrated = try TestDatabase.make()
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == true)
+    }
 }

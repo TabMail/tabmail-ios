@@ -20,6 +20,24 @@ import GRDB
 /// gate anymore.
 enum StartupMigrations {
 
+    /// `UserDefaults` flags gating the one-time resets, in run order. Keep this
+    /// in sync with the `bool(forKey:)` checks in `run(_:resetFTS:)` — it's the
+    /// single source of truth for `allResetsComplete`.
+    static let resetFlagKeys = [
+        "didMigrateHeaderIds_v2",
+        "didClearBodiesForAttachmentEncoding_v1",
+        "didResetImapDatesForInternalDate_v1",
+        "didCleanResetMessageData_v1",
+    ]
+
+    /// True once every one-time reset has run (all flags set). Lets startup tell
+    /// — without opening or scanning the mailbox — whether `run(_:)` will do
+    /// (possibly slow, destructive) work, so it can decide to show the migration
+    /// splash. See `AppStartup` / `AppDatabase.hasPendingMigrationWork`.
+    static var allResetsComplete: Bool {
+        resetFlagKeys.allSatisfy { UserDefaults.standard.bool(forKey: $0) }
+    }
+
     /// Run all pending one-time resets. Already-completed ones (flag set) are
     /// no-ops, so this is cheap on every launch after the first.
     ///

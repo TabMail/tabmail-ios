@@ -77,6 +77,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // Fan-out chain stops naturally — app's sync discovers all new messages.
         if let provider, ["gmail", "outlook", "imap_new_mail", "task_alarm"].contains(provider) {
             Task { @MainActor in
+                // A push can arrive during the one-time migration window; wait
+                // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
+                await AppStartup.shared.awaitReady()
                 NSEDataBridge.mergeNSEStagingData()
                 await SyncScheduler.shared.syncStartup(inboxOnly: true)
             }
@@ -125,6 +128,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // write would abort: NEVER DROP USER INTENTION.
                 DatabaseSuspension.shared.beginBackgroundWork("notification-action")
                 defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                // A notification action can fire during the one-time migration
+                // window; wait for the DB before touching it (AppStartup).
+                await AppStartup.shared.awaitReady()
                 let header: MessageHeader?
                 do {
                     header = try await AppDatabase.dbPool.read { db -> MessageHeader? in
@@ -172,8 +178,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                     // MARK_READ above (ADR-IOS-041).
                     DatabaseSuspension.shared.beginBackgroundWork("notification-action")
                     defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                    // Can fire during the one-time migration window — wait for
+                    // the DB before touching it (AppStartup).
+                    await AppStartup.shared.awaitReady()
                     do {
-                        try AppDatabase.dbPool.write { db in
+                        // Async context (awaitReady above) → GRDB async write overload.
+                        try await AppDatabase.dbPool.write { db in
                             let opType: String
                             switch actionId {
                             case "ARCHIVE": opType = "archive"
@@ -324,9 +334,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // 0xdead10cc defense: suspend GRDB databases just before process
         // suspension, resume on foreground/push/BGTask (ADR-IOS-041).
         DatabaseSuspension.shared.start()
-        // Create NSE staging DB schema + mirror initial state
-        AppDatabase.createNSEStagingDBIfNeeded()
-        NSEDataBridge.mirrorAllState()
+        // NSE staging DB creation + state mirror MOVED to `AppStartup.runIfNeeded`.
+        // They touch `AppDatabase`, which is now built asynchronously behind the
+        // migration splash (RC2 fix, PLAN_HANG_FIX); running them here would hit a
+        // nil `AppDatabase.shared` (force-unwrapped in `dbPool`) → crash.
         migrateOptOutFlagToSharedSuite()
         return true
     }
@@ -387,6 +398,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // quiesce window if we're still backgrounded when done.
         DatabaseSuspension.shared.beginBackgroundWork("silent-push")
         defer { DatabaseSuspension.shared.endBackgroundWork("silent-push") }
+        // A silent push can arrive during the one-time migration window; wait
+        // for the DB to finish building before any handler touches it
+        // (AppDatabase.dbPool force-unwraps AppDatabase.shared). See AppStartup.
+        await AppStartup.shared.awaitReady()
 
         let appState = application.applicationState
         let stateStr = appState == .active ? "active" : appState == .background ? "background" : "inactive"

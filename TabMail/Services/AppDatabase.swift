@@ -17,12 +17,24 @@ final class AppDatabase: Sendable {
     /// at `.observerLifetime`.
     let inboxNotificationObserver: InboxNotificationObserver
 
-    init() throws {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// Application Support directory that holds the production database.
+    static var directoryURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TabMail", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("tabmail.sqlite").path
+    }
 
+    /// Production database file URL.
+    static var databaseURL: URL {
+        directoryURL.appendingPathComponent("tabmail.sqlite")
+    }
+
+    /// Opens the production `DatabasePool` (creating the directory + file if
+    /// needed) WITHOUT running migrations. Split from migration so startup can
+    /// cheaply probe for pending migration work (`hasPendingMigrationWork`) and
+    /// decide whether to show the "Updating…" splash BEFORE paying for the
+    /// (possibly slow) migration passes. See `AppStartup`.
+    static func makePool() throws -> DatabasePool {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         var config = Configuration()
         config.journalMode = .wal
         config.busyMode = .timeout(5)
@@ -50,24 +62,52 @@ final class AppDatabase: Sendable {
         // WAL reads keep working while suspended; lock-acquiring accesses throw
         // SQLITE_ABORT/SQLITE_INTERRUPT and retry on next wake. See ADR-IOS-041.
         config.observesSuspensionNotifications = true
-        dbPool = try DatabasePool(path: path, configuration: config)
-        try Self.runMigrations(on: dbPool)
-        // One-time destructive cached-mail resets, synchronously, BEFORE the pool
-        // is exposed (`AppDatabase.shared` set in TabMailApp.init) or the inbox
-        // observer is wired. DB opens → schema migrates → data resets → only THEN
-        // can sync / NSE merge / demo+screenshot seed touch the DB. This is what
-        // lets us drop the old async "migrations complete" gate. NOT run in the
-        // test init below (tests must not touch global flags / the FTS directory).
-        StartupMigrations.run(dbPool)
-        self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: dbPool)
+        return try DatabasePool(path: databaseURL.path, configuration: config)
     }
 
-    /// Test-only initializer: accepts an already-configured DatabasePool (e.g. in-memory)
-    /// and runs all migrations on it. Not for production use.
-    init(dbPool: DatabasePool) throws {
-        self.dbPool = dbPool
-        try Self.runMigrations(on: dbPool)
-        self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: dbPool)
+    /// True if migrating `pool` will do real work: pending GRDB schema
+    /// migrations OR pending one-time data resets. Cheap + read-only (checks the
+    /// migrator's applied set + the reset flags); `pool` must be freshly opened
+    /// and not yet migrated. Callers gate the migration splash on this AND on the
+    /// DB pre-existing — a fresh/empty DB migrates instantly so it never warrants
+    /// the splash (see `AppStartup`). On a brand-new file the migrator reports
+    /// "not completed", which is why the caller's pre-existing check matters.
+    static func hasPendingMigrationWork(_ reader: some DatabaseReader) throws -> Bool {
+        var migrator = DatabaseMigrator()
+        registerAllMigrations(on: &migrator)
+        let schemaComplete = try reader.read { try migrator.hasCompletedMigrations($0) }
+        if !schemaComplete { return true }
+        return !StartupMigrations.allResetsComplete
+    }
+
+    /// Designated initializer. Wraps an already-open `pool`, runs schema
+    /// migrations, and — production only — the one-time destructive cached-mail
+    /// resets. Migrations run BEFORE the pool is exposed (`AppDatabase.shared`)
+    /// or the inbox observer is wired: DB opens → schema migrates → data resets
+    /// → only THEN can sync / NSE merge / demo+screenshot seed touch it.
+    /// `runStartupResets` is false for tests so they never mutate global
+    /// UserDefaults flags or the FTS directory.
+    init(pool: DatabasePool, runStartupResets: Bool) throws {
+        self.dbPool = pool
+        // Migration timing breadcrumb (RC2 / PLAN_HANG_FIX): the O(mailbox-size)
+        // thread-repair migrations (v9/v27/v47/v53/v54) run here. A multi-second
+        // value on a large mailbox after a multi-version jump IS the "hang on
+        // boot" — log it so the field can confirm/deny. The gating splash
+        // (AppStartup) keeps the UI honest while this runs.
+        let migrateT0 = CFAbsoluteTimeGetCurrent()
+        try Self.runMigrations(on: pool)
+        BackgroundSyncLogger.log("AppDatabase: schema migrations completed in \(Int((CFAbsoluteTimeGetCurrent() - migrateT0) * 1000))ms")
+        if runStartupResets {
+            StartupMigrations.run(pool)
+        }
+        self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: pool)
+    }
+
+    /// Test-only initializer: accepts an already-configured DatabasePool (e.g.
+    /// temp-file) and runs schema migrations only — no destructive resets, so no
+    /// global flag / FTS side effects. Not for production use.
+    convenience init(dbPool: DatabasePool) throws {
+        try self.init(pool: dbPool, runStartupResets: false)
     }
 
     /// Wires production-flavored `InboxNotificationObserver` to the pool.

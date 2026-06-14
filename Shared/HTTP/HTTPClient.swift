@@ -4,12 +4,35 @@
 
 import Foundation
 
+/// Module config for the shared HTTP layer. Lives here (Shared/) because this
+/// file is compiled into BOTH the main app and the NSE and therefore cannot
+/// reference the main-target-only `SyncConfig`.
+enum HTTPConfig {
+    /// Hard ceiling on total transfer time for `sharedEphemeralSession`,
+    /// regardless of bytes received. `URLSessionConfiguration.ephemeral`
+    /// defaults this to **7 days** — a stalled REST/OAuth/sync call whose
+    /// connection trickles partial bytes keeps resetting the 60s per-request
+    /// timer (`timeoutIntervalForRequest`) and would otherwise hang for that
+    /// long. That is the "hang on boot after long disuse" class: on first
+    /// foreground the app refreshes deeply-expired tokens / runs a large sync,
+    /// and a slow-trickle endpoint stalls with no effective ceiling. 300s is
+    /// generous for large attachment downloads on slow links while bounding any
+    /// stall to 5 minutes. The LLM stream uses a SEPARATE session
+    /// (`BackendClient.llmSession`, `SyncConfig.llmResourceTimeoutSeconds`) and
+    /// is unaffected.
+    static let sharedResourceTimeoutSeconds: TimeInterval = 300
+}
+
 /// Shared ephemeral URLSession for all HTTP providers (Gmail, Exchange, backend calls).
 /// Ephemeral = no persistent connection cache, no cookies, no credential storage.
 /// When TCP connections die during iOS suspension, the session creates fresh sockets
 /// on the next request — no manual reset needed. Single instance avoids
 /// "Cannot allocate memory" from per-request session creation.
-let sharedEphemeralSession = URLSession(configuration: .ephemeral)
+let sharedEphemeralSession: URLSession = {
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForResource = HTTPConfig.sharedResourceTimeoutSeconds
+    return URLSession(configuration: config)
+}()
 
 /// Result of an HTTP request — success returns data, failure returns nil data + status code.
 struct HTTPRequestResult: Sendable {
