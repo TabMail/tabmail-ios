@@ -611,12 +611,13 @@ enum NSEDataBridge {
         // Consume pending task results
         if consumePendingTaskResults(from: nseDB) { didMutate = true }
 
-        // Correct badge count only when the merge actually changed state.
-        // Delegates to UnreadCountManager — authoritative, index-covered query
-        // over folder.unreadCount WHERE role = .inbox (replaces an unindexable
-        // `folderId LIKE '%:INBOX'` scan of messageHeader).
+        // Whenever the merge changed state, RECOMPUTE inbox unread counts (the merge
+        // writes messageHeader but does NOT maintain folder.unreadCount). The merge
+        // only ever touches inbox folders, so a blanket inbox recount is correct and
+        // self-healing; it also sets the badge and refreshes the sidebar. A plain
+        // updateBadge() here would just re-sum a stale counter (the desync bug).
         if didMutate {
-            Task { await UnreadCountManager.shared.updateBadge() }
+            Task { await UnreadCountManager.shared.recountInboxFolders() }
         }
 
         // Robustness: reap stale `populated=0` placeholders. NSE has a hard

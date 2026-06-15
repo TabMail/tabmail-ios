@@ -355,7 +355,7 @@ extension SyncEngine {
 
         // Recount unread once after ALL header mutations (deletes + upserts + flag changes)
         // are committed to GRDB — before FTS/body queue which can take seconds.
-        await requestUnreadRecount(folderIds: Set(folders.map(\.id)))
+        await UnreadCountManager.shared.requestRecount(folderIds: Set(folders.map(\.id)))
 
         if !newHeaders.isEmpty {
             await indexHeadersForFTS(newHeaders)
@@ -668,7 +668,7 @@ extension SyncEngine {
 
         // Recount unread once after ALL header mutations (deletes + upserts + flag changes)
         // are committed to GRDB — before FTS/body queue which can take seconds.
-        await requestUnreadRecount(folderIds: Set(folders.map(\.id)))
+        await UnreadCountManager.shared.requestRecount(folderIds: Set(folders.map(\.id)))
 
         if !exNewHeaders.isEmpty {
             await indexHeadersForFTS(exNewHeaders)

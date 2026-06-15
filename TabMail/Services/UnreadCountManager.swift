@@ -114,6 +114,21 @@ actor UnreadCountManager {
         Task { await updateBadge() }
     }
 
+    /// Recompute unread counts for ALL inbox-role folders, then update the badge.
+    /// Use after a batch mutation whose exact affected folders aren't worth
+    /// tracking (e.g. the NSE staging merge): that merge only ever changes inbox
+    /// membership and the badge sums inbox folders, so a blanket inbox recount is
+    /// both sufficient and self-healing — no per-message bookkeeping needed.
+    func recountInboxFolders() async {
+        let inboxFolderIds: Set<String> = (try? await dbPool.read { db in
+            try Set(String.fetchAll(db,
+                sql: "SELECT id FROM folder WHERE role = ?",
+                arguments: [FolderRole.inbox.rawValue]))
+        }) ?? []
+        guard !inboxFolderIds.isEmpty else { return }
+        requestRecount(folderIds: inboxFolderIds)
+    }
+
     /// Update app icon badge from current inbox unread counts.
     func updateBadge() async {
         do {

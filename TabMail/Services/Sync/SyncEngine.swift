@@ -50,15 +50,6 @@ actor SyncEngine {
         await MainActor.run { AccountManagerState.shared.fastSyncModeActive }
     }
 
-    /// Notify UI + trigger unread recount after sync modifies messageHeader rows.
-    /// Called at the end of each provider's delta/full sync.
-    /// folderIds: the folders whose headers were modified (for targeted recount).
-    /// Request unread recount for affected folders. UnreadCountManager handles
-    /// debouncing, DB recount, badge update, and posts .backgroundDataDidChange.
-    func requestUnreadRecount(folderIds: Set<String>) async {
-        await UnreadCountManager.shared.requestRecount(folderIds: folderIds)
-    }
-
     /// Compute current backfill profile from device power state.
     /// Four tiers:
     ///   .turbo      — user-triggered fast sync. Max throughput, UI may lag.
