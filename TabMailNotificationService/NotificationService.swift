@@ -384,7 +384,8 @@ final class NotificationService: UNNotificationServiceExtension {
             )
             c.badge = NSNumber(value: NSEBadge.badgeForDelivery(
                 db: db, suite: SharedNSEData.suite.defaults,
-                accountId: accountId, messageId: msg.messageId))
+                accountId: accountId, messageId: msg.messageId,
+                rfc822MessageId: msg.rfc822MessageId))
             // Persist peer results + rendered body to staging DB for main app merge.
             // Body is persisted even on peer cache hit so merge writes MessageBody + FTS
             // and the main app's body queue doesn't re-fetch.
@@ -425,7 +426,8 @@ final class NotificationService: UNNotificationServiceExtension {
             // counted this message, so this returns the current value unbumped.
             c.badge = NSNumber(value: NSEBadge.badgeForDelivery(
                 db: db, suite: SharedNSEData.suite.defaults,
-                accountId: accountId, messageId: msg.messageId))
+                accountId: accountId, messageId: msg.messageId,
+                rfc822MessageId: msg.rfc822MessageId))
             // NSE is terminal. Main-app post-notification work runs
             // on next natural wake via mergeNSEStagingData. No follow-up push.
             deliver(c); return
@@ -584,7 +586,8 @@ final class NotificationService: UNNotificationServiceExtension {
         // see NSEBadge.badgeForDelivery.
         let newBadge = NSEBadge.badgeForDelivery(
             db: db, suite: SharedNSEData.suite.defaults,
-            accountId: accountId, messageId: msg.messageId)
+            accountId: accountId, messageId: msg.messageId,
+            rfc822MessageId: msg.rfc822MessageId)
         EmailNotificationBuilder.fill(
             c, signal: signal,
             accountId: accountId, messageId: msg.messageId

@@ -155,8 +155,52 @@ actor UnreadCountManager {
             UserDefaults(suiteName: "group.ai.tabmail")?.set(totalUnread, forKey: NSEBadge.badgeCountKey)
             print("[UnreadCount] Badge set to \(totalUnread)")
             BackgroundSyncLogger.log("badge: \(totalUnread)")
+            // Record the recently-arrived unread inbox messages this count
+            // already includes into the NSE's dedup table, so a concurrent NSE
+            // delivery for the same message doesn't increment on top (the
+            // main-app-overlap "+2 for one email"). See NSEBadge.markCounted.
+            if totalUnread > 0 { await recordRecentUnreadForNSE() }
         } catch {
             print("[UnreadCount] Badge update error: \(error)")
         }
+    }
+
+    /// Stamp the most-recent unread inbox messages into the NSE's
+    /// `nse_badge_counted` dedup table (keyed by `NSEBadge.countedId`, rfc822-
+    /// preferred so it matches the NSE side for all providers). Bounded to
+    /// `SyncConfig.nseBadgeDedupRecentLimit` — only recently-arrived unread can
+    /// race a concurrent NSE delivery. Best-effort: any read/open failure just
+    /// skips the optimization (the NSE then over-counts transiently and the
+    /// next recount corrects it).
+    private func recordRecentUnreadForNSE() async {
+        let ids: [String]
+        do {
+            ids = try await dbPool.read { db -> [String] in
+                let inboxFolderIds = try String.fetchAll(db,
+                    sql: "SELECT id FROM folder WHERE role = ?",
+                    arguments: [FolderRole.inbox.rawValue])
+                guard !inboxFolderIds.isEmpty else { return [] }
+                let placeholders = inboxFolderIds.map { _ in "?" }.joined(separator: ", ")
+                // LIMIT is a trusted compile-time Int constant (not user input),
+                // inlined to avoid mixing String + Int statement arguments.
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT accountId, messageId, rfc822MessageId
+                    FROM messageHeader
+                    WHERE folderId IN (\(placeholders)) AND isRead = 0
+                    ORDER BY date DESC
+                    LIMIT \(SyncConfig.nseBadgeDedupRecentLimit)
+                    """, arguments: StatementArguments(inboxFolderIds))
+                return rows.map { row in
+                    NSEBadge.countedId(
+                        accountId: row["accountId"],
+                        messageId: row["messageId"],
+                        rfc822MessageId: row["rfc822MessageId"])
+                }
+            }
+        } catch {
+            return
+        }
+        guard !ids.isEmpty, let stagingDB = NSEDataBridge.openStagingDB() else { return }
+        NSEBadge.markCounted(db: stagingDB, ids: ids)
     }
 }

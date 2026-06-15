@@ -65,6 +65,7 @@ enum GmailNSEClient {
         let addedIds = delta.added
             .filter { $0.providerLabels.contains("INBOX") }
             .map { $0.providerMessageId }
+        let addedSet = Set(addedIds)
 
         var removedIds: [String] = []
         var unreadRemovedCount = 0
@@ -80,7 +81,14 @@ enum GmailNSEClient {
 
         var markedUnreadCount = 0
         for change in delta.labelsAdded {
-            if change.labelIds.contains("UNREAD") && change.currentLabels.contains("INBOX") {
+            // Exclude messages that ALSO appear as new arrivals (messageAdded):
+            // a brand-new message is badge-counted on delivery (badgeForDelivery
+            // on the head) or by the main app's sync (the tail) — counting it
+            // here too would double-bump. labelsAdded(UNREAD) should only move
+            // the badge for messages that were ALREADY in the inbox and got
+            // re-marked unread on another client.
+            if change.labelIds.contains("UNREAD") && change.currentLabels.contains("INBOX")
+                && !addedSet.contains(change.providerMessageId) {
                 markedUnreadCount += 1
             }
         }

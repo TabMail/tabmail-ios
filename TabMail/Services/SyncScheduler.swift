@@ -640,6 +640,16 @@ final class SyncScheduler {
         // Revalidate AI subscription gate if closed
         await Self.revalidateAISubscriptionGate()
 
+        // Stamp the sync-status timestamp so the "Updated N min ago" subtitle
+        // reflects background / push / startup (NSE-coalesce) delta syncs too —
+        // not just pull-to-refresh (InboxViewModel.performSync) and the
+        // foreground poll tier (poll()). This is the only sync tier that never
+        // stamped, which left the subtitle stale after a silent-push / NSE wake.
+        // Stamp on completion-with-connectivity even when nothing changed (the
+        // no-network case returns false earlier and is correctly skipped).
+        AccountManagerState.shared.lastSyncFailed = false
+        AccountManagerState.shared.lastSyncCompletedAt = Date()
+
         return true
     }
 

@@ -335,6 +335,12 @@ enum SyncConfig {
     static let backfillBodyMissThreshold = 5
     /// Debounce interval for unread count recounts (seconds). Rapid actions coalesce into one DB query.
     static let unreadRecountDebounceSeconds: TimeInterval = 0.2
+    /// Max recent unread inbox messages the main app records into the NSE's
+    /// `nse_badge_counted` dedup table per authoritative recount (see
+    /// `UnreadCountManager.updateBadge`). Bounds the write for users with large
+    /// unread inboxes — only RECENTLY-arrived unread can race a concurrent NSE
+    /// delivery, so the most-recent-by-date slice is both sufficient and capped.
+    static let nseBadgeDedupRecentLimit = 200
     /// TTL for recently completed action protection (seconds). After a pending operation
     /// completes and is deleted, the sync engine skips overwriting optimistic state
     /// (flag changes, move re-insertions) for this duration to absorb server-side lag.

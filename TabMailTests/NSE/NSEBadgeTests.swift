@@ -194,15 +194,79 @@ struct NSEBadgeTests {
 
     // MARK: - Degradation + primitives
 
-    @Test("nil staging DB falls back to legacy unconditional increment")
-    func nilDBFallsBackToIncrement() {
+    @Test("nil staging DB dedups via the suite fallback (no double-count on duplicate)")
+    func nilDBSuiteFallbackDedups() {
         let (suite, name) = makeSuite()
         defer { wipe(name) }
 
+        // First delivery with no staging DB increments via the suite fallback.
         #expect(NSEBadge.badgeForDelivery(db: nil, suite: suite, accountId: accountId, messageId: "msg-a") == 1)
-        // Legacy behavior: no arbiter, so a duplicate does bump (accepted —
-        // main-app recount overwrites the drift on next wake).
-        #expect(NSEBadge.badgeForDelivery(db: nil, suite: suite, accountId: accountId, messageId: "msg-a") == 2)
+        // Duplicate delivery of the SAME message is deduped by the suite map —
+        // no bump (previously this fail-open path double-counted).
+        #expect(NSEBadge.badgeForDelivery(db: nil, suite: suite, accountId: accountId, messageId: "msg-a") == 1)
+        // A distinct message still counts.
+        #expect(NSEBadge.badgeForDelivery(db: nil, suite: suite, accountId: accountId, messageId: "msg-b") == 2)
+        #expect(NSEBadge.currentCount(suite: suite) == 2)
+    }
+
+    // MARK: - Cross-process dedup key + main-app recording
+
+    @Test("countedId prefers normalized rfc822, falls back to messageId")
+    func countedIdKeying() {
+        #expect(NSEBadge.countedId(accountId: "a", messageId: "uid-1", rfc822MessageId: "<m@x>") == "a:rfc:m@x")
+        #expect(NSEBadge.countedId(accountId: "a", messageId: "uid-1", rfc822MessageId: nil) == "a:uid-1")
+        #expect(NSEBadge.countedId(accountId: "a", messageId: "uid-1", rfc822MessageId: "") == "a:uid-1")
+    }
+
+    @Test("Main-app markCounted suppresses the NSE increment — matches across IMAP UID/Message-ID divergence")
+    func mainAppMarkCountedSuppressesIncrement() throws {
+        let db = try makeStagingDB()
+        let (suite, name) = makeSuite()
+        defer { wipe(name) }
+
+        let rfc = "<abc123@mail.example.com>"
+        // Main app's authoritative recount: badge already includes the message,
+        // and it records the rfc822-keyed dedup row.
+        suite.set(3, forKey: NSEBadge.badgeCountKey)
+        let id = NSEBadge.countedId(accountId: accountId, messageId: "imap-uid-42", rfc822MessageId: rfc)
+        NSEBadge.markCounted(db: db, ids: [id])
+
+        // The NSE delivers the SAME message. For IMAP the NSE's provider
+        // messageId is the Message-ID from the payload (NOT the UID the main app
+        // stored as messageId) — deliberately different here — but the rfc822
+        // key matches, so no bump.
+        let badge = NSEBadge.badgeForDelivery(
+            db: db, suite: suite, accountId: accountId,
+            messageId: "msgid-from-payload", rfc822MessageId: rfc)
+        #expect(badge == 3)
+        #expect(NSEBadge.currentCount(suite: suite) == 3)
+    }
+
+    @Test("NSE delivery then main-app markCounted: no double count (order-independent)")
+    func nseThenMainAppNoDouble() throws {
+        let db = try makeStagingDB()
+        let (suite, name) = makeSuite()
+        defer { wipe(name) }
+
+        let rfc = "<x@y.com>"
+        // NSE delivers first → bumps to 1 and inserts the rfc822-keyed row.
+        #expect(NSEBadge.badgeForDelivery(db: db, suite: suite, accountId: accountId, messageId: "m1", rfc822MessageId: rfc) == 1)
+        // Main app's recount records the same id — INSERT OR IGNORE no-op.
+        NSEBadge.markCounted(db: db, ids: [NSEBadge.countedId(accountId: accountId, messageId: "m1", rfc822MessageId: rfc)])
+        // A duplicate NSE delivery still doesn't bump.
+        #expect(NSEBadge.badgeForDelivery(db: db, suite: suite, accountId: accountId, messageId: "m1", rfc822MessageId: rfc) == 1)
+        #expect(NSEBadge.currentCount(suite: suite) == 1)
+    }
+
+    @Test("markCounted([]) and empty ids are no-ops")
+    func markCountedEmptyNoOp() throws {
+        let db = try makeStagingDB()
+        let (suite, name) = makeSuite()
+        defer { wipe(name) }
+
+        NSEBadge.markCounted(db: db, ids: [])
+        // Nothing recorded → the next delivery counts normally.
+        #expect(NSEBadge.badgeForDelivery(db: db, suite: suite, accountId: accountId, messageId: "m1", rfc822MessageId: "<z@z>") == 1)
     }
 
     @Test("Decrement floors at zero")

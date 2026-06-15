@@ -1209,6 +1209,13 @@ final class InboxViewModel {
         guard !uniqueAccounts.isEmpty else { return }
 
         isRefreshing = true
+        // `defer` guarantees the in-progress guard clears on EVERY exit — including
+        // task cancellation mid-sync (user navigated away) or a throw from
+        // reloadMessages below. Without it, a torn-down sync could leave
+        // `isRefreshing` stuck true, which makes refreshSync() silently no-op
+        // (wait-then-return) for all future pull-to-refreshes — a stuck-stale
+        // "Updated N min ago" subtitle with no way to refresh it.
+        defer { isRefreshing = false }
         error = nil
         do {
             // Ensure providers are connected
@@ -1233,7 +1240,6 @@ final class InboxViewModel {
                 self.error = error.localizedDescription
             }
         }
-        isRefreshing = false
 
         // Refresh loaded messages to pick up changes from sync.
         // Badge + unread counts already updated by UnreadCountManager during syncFolders.
