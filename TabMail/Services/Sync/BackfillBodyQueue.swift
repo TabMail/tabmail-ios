@@ -444,7 +444,12 @@ actor BackfillBodyQueue {
                 return (toDelete, toRetry)
             }
         } catch {
-            print("[BackfillBody] missFetchCount update failed: \(error) — treating all as retry")
+            // Treat-all-as-retry is the right idempotent fallback for ANY failure
+            // (incl. a benign ADR-IOS-041 suspension abort — retries next wake).
+            // Only the LOG is gated: a suspension abort isn't a real failure.
+            if !error.isDatabaseSuspensionAbort {
+                print("[BackfillBody] missFetchCount update failed: \(error) — treating all as retry")
+            }
             for item in missedItems { self.batchItemDone(item: item, shouldRetry: true) }
             return
         }

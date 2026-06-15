@@ -243,7 +243,11 @@ actor MemoryIndex {
             let head = String(text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
             print("[MemoryIndex] indexTurn WRITE id=\(chatHistoryId.prefix(20)) sid=\(sessionId?.prefix(30) ?? "nil") role=\(role) chars=\(text.count) head=\(head)")
         } catch {
-            print("[MemoryIndex] indexTurn(\(chatHistoryId.prefix(20))) failed: \(error)")
+            // Suspension abort (ADR-IOS-041) is benign — Stage A re-indexes the
+            // missing turn on the next wake's set-diff. Don't log it as a failure.
+            if !error.isDatabaseSuspensionAbort {
+                print("[MemoryIndex] indexTurn(\(chatHistoryId.prefix(20))) failed: \(error)")
+            }
         }
     }
 
@@ -259,7 +263,9 @@ actor MemoryIndex {
             }
             print("[MemoryIndex] indexTurns WRITE count=\(entries.count)")
         } catch {
-            print("[MemoryIndex] indexTurns(count=\(entries.count)) failed: \(error)")
+            if !error.isDatabaseSuspensionAbort {
+                print("[MemoryIndex] indexTurns(count=\(entries.count)) failed: \(error)")
+            }
         }
     }
 
@@ -328,7 +334,11 @@ actor MemoryIndex {
             }
             print("[MemoryIndex] deleteTurns requested=\(chatHistoryIds.count) deleted=\(deletedCount)")
         } catch {
-            print("[MemoryIndex] deleteTurns failed: \(error)")
+            // Background-reachable (Stage A orphan prune). A suspension abort
+            // (ADR-IOS-041) is benign — the prune re-runs on the next wake.
+            if !error.isDatabaseSuspensionAbort {
+                print("[MemoryIndex] deleteTurns failed: \(error)")
+            }
         }
     }
 
@@ -503,7 +513,11 @@ actor MemoryIndex {
             }
             print("[MemoryIndex] storeEmbeddings pairs=\(pairs.count) committed=\(committed.count) skippedRace=\(skippedRace.count) missing=\(missing.count)")
         } catch {
-            print("[MemoryIndex] storeEmbeddings failed: \(error)")
+            // Background embedding write. A suspension abort (ADR-IOS-041) is
+            // benign — these turns stay embeddingComplete=0 and re-embed next wake.
+            if !error.isDatabaseSuspensionAbort {
+                print("[MemoryIndex] storeEmbeddings failed: \(error)")
+            }
         }
         return (committed, skippedRace)
     }

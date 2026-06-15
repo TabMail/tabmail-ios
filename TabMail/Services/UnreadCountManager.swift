@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import UIKit
 import UserNotifications
 
 /// Centralized, debounced unread count manager.
@@ -101,7 +102,13 @@ actor UnreadCountManager {
                 }
             }
         } catch {
-            print("[UnreadCount] Recount failed: \(error)")
+            // A write aborted by GRDB database suspension (ADR-IOS-041) is
+            // EXPECTED at the background-suspension instant and benign — the
+            // counts recompute on the next wake's recount. Don't log it as a
+            // failure; only log genuine recount failures.
+            if !error.isDatabaseSuspensionAbort {
+                print("[UnreadCount] Recount failed: \(error)")
+            }
             return
         }
 
@@ -161,7 +168,11 @@ actor UnreadCountManager {
             // main-app-overlap "+2 for one email"). See NSEBadge.markCounted.
             if totalUnread > 0 { await recordRecentUnreadForNSE() }
         } catch {
-            print("[UnreadCount] Badge update error: \(error)")
+            // Suspension aborts (ADR-IOS-041) are benign — the badge re-syncs on
+            // the next wake's recount; don't surface them as errors.
+            if !error.isDatabaseSuspensionAbort {
+                print("[UnreadCount] Badge update error: \(error)")
+            }
         }
     }
 
@@ -173,6 +184,18 @@ actor UnreadCountManager {
     /// skips the optimization (the NSE then over-counts transiently and the
     /// next recount corrects it).
     private func recordRecentUnreadForNSE() async {
+        // Foreground-only. The main-app/NSE badge overlap this guards against
+        // can only happen while the app is actively counting (foreground) as an
+        // NSE delivery lands. When backgrounded/suspended there's no such race,
+        // AND opening a fresh staging connection to write here would either
+        // abort under GRDB suspension or — worse, if the connection is opened
+        // after the suspend notification and misses it — write while suspended
+        // and risk a 0xdead10cc kill (ADR-IOS-041). So skip unless active.
+        let isActive = await MainActor.run {
+            UIApplication.shared.applicationState == .active
+        }
+        guard isActive else { return }
+
         let ids: [String]
         do {
             ids = try await dbPool.read { db -> [String] in

@@ -600,7 +600,11 @@ enum NSEDataBridge {
                         }
                     }
                 } catch {
-                    print("[NSEDataBridge] Staging delete failed: \(error) — successfullyMergedIds may be re-merged next wake (idempotent)")
+                    // Already idempotent across wakes. A suspension abort
+                    // (ADR-IOS-041) is benign — don't log it as a failure.
+                    if !error.isDatabaseSuspensionAbort {
+                        print("[NSEDataBridge] Staging delete failed: \(error) — successfullyMergedIds may be re-merged next wake (idempotent)")
+                    }
                 }
             }
         }
@@ -645,7 +649,10 @@ enum NSEDataBridge {
         } catch {
             // Best-effort. A failed reap is benign — the placeholders stay
             // populated=0 and remain invisible to merge; next wake retries.
-            print("[NSEDataBridge] Orphan reap failed: \(error)")
+            // (Includes ADR-IOS-041 suspension aborts; don't log those at all.)
+            if !error.isDatabaseSuspensionAbort {
+                print("[NSEDataBridge] Orphan reap failed: \(error)")
+            }
         }
 
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)

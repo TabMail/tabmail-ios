@@ -51,7 +51,10 @@ actor BackfillAIQueue {
             try await dbPool.write { db in try row.insert(db) }
             BackgroundSyncLogger.logBackfillAI("enqueue actionRefine dedupKey=\(snapshot.dedupKey)")
         } catch {
-            BackgroundSyncLogger.logBackfillAI("enqueue actionRefine FAILED dedupKey=\(snapshot.dedupKey) error=\(error)")
+            // Suspension abort (ADR-IOS-041) is benign — re-enqueued on next wake.
+            if !error.isDatabaseSuspensionAbort {
+                BackgroundSyncLogger.logBackfillAI("enqueue actionRefine FAILED dedupKey=\(snapshot.dedupKey) error=\(error)")
+            }
             return
         }
         storage.forgetCompleted(snapshot.dedupKey)
@@ -68,7 +71,10 @@ actor BackfillAIQueue {
             try await dbPool.write { db in try row.insert(db) }
             BackgroundSyncLogger.logBackfillAI("enqueue kbRefine dedupKey=\(snapshot.dedupKey) turns=\(snapshot.turns.count)")
         } catch {
-            BackgroundSyncLogger.logBackfillAI("enqueue kbRefine FAILED dedupKey=\(snapshot.dedupKey) error=\(error)")
+            // Suspension abort (ADR-IOS-041) is benign — re-enqueued on next wake.
+            if !error.isDatabaseSuspensionAbort {
+                BackgroundSyncLogger.logBackfillAI("enqueue kbRefine FAILED dedupKey=\(snapshot.dedupKey) error=\(error)")
+            }
             return
         }
         storage.forgetCompleted(snapshot.dedupKey)
@@ -95,7 +101,9 @@ actor BackfillAIQueue {
                 return db.changesCount
             }
         } catch {
-            BackgroundSyncLogger.logBackfillAI("repopulate TTL sweep FAILED error=\(error)")
+            if !error.isDatabaseSuspensionAbort {
+                BackgroundSyncLogger.logBackfillAI("repopulate TTL sweep FAILED error=\(error)")
+            }
         }
 
         // 2. Load remaining rows FIFO into QueueStorage.
@@ -372,7 +380,9 @@ actor BackfillAIQueue {
                 )
             }
         } catch {
-            BackgroundSyncLogger.logBackfillAI("delete FAILED dedupKey=\(dedupKey) error=\(error)")
+            if !error.isDatabaseSuspensionAbort {
+                BackgroundSyncLogger.logBackfillAI("delete FAILED dedupKey=\(dedupKey) error=\(error)")
+            }
         }
     }
 

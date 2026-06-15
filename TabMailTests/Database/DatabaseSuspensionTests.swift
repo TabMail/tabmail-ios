@@ -178,6 +178,83 @@ struct DatabaseSuspensionTests {
         #expect(count == 1)
     }
 
+    @Test("Error.isDatabaseSuspensionAbort: true for a suspended write, false for real failures")
+    func suspensionAbortClassification() throws {
+        let (pool, dir) = try Self.makeSuspendablePool()
+        defer {
+            Self.postResume()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        // (1) A write aborted by suspension classifies as a suspension abort.
+        Self.postSuspend()
+        var suspendErr: (any Error)?
+        do {
+            try pool.write { db in try db.execute(sql: "INSERT INTO item (value) VALUES ('x')") }
+            Issue.record("write should have aborted while suspended")
+        } catch {
+            suspendErr = error
+        }
+        #expect(suspendErr?.isDatabaseSuspensionAbort == true)
+        Self.postResume()
+
+        // (2) A genuine DatabaseError (constraint violation) is NOT a suspension abort.
+        var constraintErr: (any Error)?
+        do {
+            try pool.write { db in
+                try db.execute(sql: "INSERT INTO item (id, value) VALUES (1, 'a')")
+                try db.execute(sql: "INSERT INTO item (id, value) VALUES (1, 'b')") // PK clash
+            }
+            Issue.record("constraint write should have thrown")
+        } catch {
+            constraintErr = error
+        }
+        #expect(constraintErr?.isDatabaseSuspensionAbort == false)
+
+        // (3) Non-DatabaseError errors are never suspension aborts.
+        #expect((URLError(.notConnectedToInternet) as any Error).isDatabaseSuspensionAbort == false)
+        #expect((CancellationError() as any Error).isDatabaseSuspensionAbort == false)
+    }
+
+    @Test("NSEBadge.markCounted on a suspended staging connection is a graceful no-op")
+    func markCountedSuspendedIsNoOp() throws {
+        // Mirrors the fresh staging connection the main app writes through
+        // (UnreadCountManager.recordRecentUnreadForNSE → NSEBadge.markCounted).
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nsebadge-susp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let suiteName = "nse-badge-susp-\(UUID().uuidString)"
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer {
+            Self.postResume()
+            suite.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        var config = Configuration()
+        config.busyMode = .timeout(5)
+        config.observesSuspensionNotifications = true
+        let db = try DatabaseQueue(
+            path: dir.appendingPathComponent("staging.sqlite").path,
+            configuration: config
+        )
+        let id = NSEBadge.countedId(accountId: "acct", messageId: "uid-1", rfc822MessageId: "<m@x>")
+
+        // While suspended: the markCounted write aborts internally — must be
+        // swallowed (no throw, no crash), recording nothing.
+        Self.postSuspend()
+        NSEBadge.markCounted(db: db, ids: [id])
+        Self.postResume()
+
+        // After resume: recording works, and a subsequent NSE delivery for the
+        // same message is deduped (no bump) — proving the suspended call was a
+        // clean no-op, not a corrupting partial write.
+        NSEBadge.markCounted(db: db, ids: [id])
+        let badge = NSEBadge.badgeForDelivery(
+            db: db, suite: suite, accountId: "acct",
+            messageId: "different-uid", rfc822MessageId: "<m@x>")
+        #expect(badge == 0)
+    }
+
     @Test("Suspension abort mid-maintenance leaves prior committed data intact and retryable")
     func abortedMaintenanceIsRetryable() throws {
         // Models the SyncEngine.scheduleMaintenanceInBackground pattern: each

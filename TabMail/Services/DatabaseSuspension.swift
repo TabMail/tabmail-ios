@@ -152,3 +152,16 @@ final class DatabaseSuspension {
         NotificationCenter.default.post(name: Database.resumeNotification, object: nil)
     }
 }
+
+extension Error {
+    /// True when this is a GRDB write aborted by database suspension
+    /// (ADR-IOS-041) — a `DatabaseError` with `SQLITE_ABORT` / `SQLITE_INTERRUPT`
+    /// ("Database is suspended"). Such an abort is EXPECTED at the
+    /// background-suspension instant and benign: the operation retries on the
+    /// next wake (every store is crash-tolerant/idempotent by design). Catch
+    /// handlers in background-reachable write paths use this to AVOID logging it
+    /// as a failure — it is not one. Genuine write failures still log normally.
+    var isDatabaseSuspensionAbort: Bool {
+        (self as? DatabaseError)?.isInterruptionError ?? false
+    }
+}
