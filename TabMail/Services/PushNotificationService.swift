@@ -137,6 +137,14 @@ actor PushNotificationService {
             return
         }
 
+        // APNs can deliver the device token on a cold/background launch BEFORE
+        // AppStartup has built the database. Touching AppDatabase.dbPool (a force-
+        // unwrap) before then traps (EXC_BREAKPOINT crash on boot) — and after an
+        // app update the DB build is delayed by migrations, so this path wins the
+        // race. Gate on readiness like every other dbPool entry point. (Cheap once
+        // ready; the no-session / no-token early returns above already skipped it.)
+        await AppStartup.shared.awaitReady()
+
         do {
             let emails = try await dbPool.read { db in
                 try String.fetchAll(db,
