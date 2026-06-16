@@ -332,4 +332,103 @@ struct FTSOrphanPruneTests {
 
         try? await SearchIndex.shared.removeMessages(headerIds: [deadA, deadB])
     }
+
+    @Test("Moved Gmail message: orphan is RE-KEYED to current id (body preserved), not deleted")
+    func rekeysMovedGmailOrphan() async throws {
+        let accountId = "driftheal-gmail"
+        let msgId = "drift-msg-1"
+        let oldId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: msgId)
+        let newId = MessageIdentity.headerId(accountId: accountId, folderPath: "Archive", messageId: msgId)
+        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, newId])
+
+        // GRDB has the message ONLY at its current (Archive) location — a Gmail archive.
+        try await AppDatabase.dbPool.write { db in
+            if try Account.fetchOne(db, key: accountId) == nil {
+                var account = Account(emailAddress: "drift@example.com", displayName: "T", provider: .gmail)
+                account.id = accountId
+                try account.insert(db)
+            }
+            let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: "Archive")
+            if try Folder.fetchOne(db, key: folderId) == nil {
+                try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
+            }
+            var header = MessageHeader(
+                messageId: msgId, subject: "moved", from: "a@x", fromAddress: "a@x", to: "b@x",
+                date: Date(), snippet: "", folderId: folderId, accountId: accountId,
+                folderPath: "Archive", isInInbox: false)
+            try header.insert(db)
+        }
+
+        // FTS still carries the STALE INBOX entry WITH its indexed body — the drift.
+        _ = try await SearchIndex.shared.indexHeaders([
+            FTSHeaderRecord(headerId: oldId, messageId: msgId, subject: "moved", from: "a@x", to: "b@x",
+                dateMs: Int64(Date().timeIntervalSince1970 * 1000),
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"))
+        ])
+        _ = try await SearchIndex.shared.updateBodies([(headerId: oldId, body: "secret body phrase")])
+        #expect(try await SearchIndex.shared.headerIdsMissingFromFTS([newId]).contains(newId),
+                "precondition: current id not yet indexed")
+
+        let engine = SyncEngine()
+        _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
+
+        // Re-keyed, not deleted: current id is indexed, the body survived, old id is gone.
+        let missing = try await SearchIndex.shared.headerIdsMissingFromFTS([oldId, newId])
+        #expect(missing.contains(oldId), "stale INBOX id must be re-keyed away")
+        #expect(!missing.contains(newId), "moved message must now resolve under its current id")
+        let body = try await SearchIndex.shared.bodyText(headerId: newId)
+        #expect(body == "secret body phrase", "re-key must preserve the indexed body, not discard it")
+
+        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, newId])
+        try? await AppDatabase.dbPool.write { db in _ = try Account.deleteOne(db, key: accountId) }
+    }
+
+    @Test("IMAP orphan is NOT re-keyed by UID (would be a different message) — pruned as dead")
+    func imapOrphanNotRecoveredByUid() async throws {
+        // IMAP messageId is a per-folder UID: the same number in another folder is
+        // a DIFFERENT message. Recovery must skip non-Gmail/Graph and let the entry
+        // prune (the sync-side UID re-key owns IMAP moves).
+        let accountId = "driftheal-imap"
+        let uid = "42"
+        let oldId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: uid)
+        let collidingId = MessageIdentity.headerId(accountId: accountId, folderPath: "Archive", messageId: uid)
+        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, collidingId])
+
+        // GRDB: an IMAP account + a DIFFERENT message carrying the same UID in Archive.
+        try await AppDatabase.dbPool.write { db in
+            if try Account.fetchOne(db, key: accountId) == nil {
+                var account = Account(emailAddress: "imap@example.com", displayName: "T", provider: .imap)
+                account.id = accountId
+                try account.insert(db)
+            }
+            let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: "Archive")
+            if try Folder.fetchOne(db, key: folderId) == nil {
+                try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
+            }
+            var header = MessageHeader(
+                messageId: uid, subject: "a totally different message", from: "a@x", fromAddress: "a@x", to: "b@x",
+                date: Date(), snippet: "", folderId: folderId, accountId: accountId,
+                folderPath: "Archive", isInInbox: false)
+            try header.insert(db)
+        }
+
+        // FTS has the stale INBOX orphan (no GRDB INBOX header).
+        _ = try await SearchIndex.shared.indexHeaders([
+            FTSHeaderRecord(headerId: oldId, messageId: uid, subject: "original", from: "a@x", to: "b@x",
+                dateMs: Int64(Date().timeIntervalSince1970 * 1000),
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"))
+        ])
+
+        let engine = SyncEngine()
+        _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
+
+        // IMAP must NOT be recovered by UID — the orphan is pruned, the unrelated
+        // Archive message is never pulled into FTS.
+        let missing = try await SearchIndex.shared.headerIdsMissingFromFTS([oldId, collidingId])
+        #expect(missing.contains(oldId), "IMAP orphan must be pruned, not re-keyed onto a UID-colliding message")
+        #expect(missing.contains(collidingId), "the unrelated Archive message must not be pulled into FTS")
+
+        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, collidingId])
+        try? await AppDatabase.dbPool.write { db in _ = try Account.deleteOne(db, key: accountId) }
+    }
 }
