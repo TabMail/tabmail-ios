@@ -126,7 +126,105 @@ struct EmailRenderPipelineTests {
         #expect(js.contains("document.documentElement.offsetHeight"))
     }
 
+    @Test("img height:auto is scoped to images with an explicit width attribute")
+    func imgHeightAutoScopedToWidthAttr() {
+        let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
+        // The bug: `img { max-width: 100%; height: auto; }` overrode the
+        // `height="29"` presentational attribute on the Apple Support survey's
+        // logo (which has NO width attr), so the logo lost its height cap and
+        // ballooned to the container's full width (~29px logo rendered ~420px),
+        // overflowing 288pt → fitViewport widened the whole email → right edge
+        // clipped. Apple Mail / Thunderbird keep the logo small by honoring the
+        // height attribute. Fix: cap all images with max-width:100% but force
+        // height:auto ONLY for images that carry an explicit width attribute
+        // (where capping the width must scale height to avoid distortion).
+        #expect(out.contains("img { max-width: 100%; }"))
+        #expect(out.contains("img[width] { height: auto; }"))
+        // The unscoped form that stripped width-less images' height must be gone.
+        #expect(!out.contains("img { max-width: 100%; height: auto; }"))
+    }
+
+    @Test("fitViewportJS re-measures and widens again after a breakpoint flip")
+    func fitViewportIterativeWiden() {
+        let js = _fitViewportJS
+        // Widening the layout viewport can cross the email's own
+        // `@media (max-width:N)` breakpoint and reveal a WIDER layout (fixed-px
+        // buttons, no-wrap rows) than the width we just set — a single
+        // measure-then-widen clips the right edge ("still cut on the right a
+        // bit", Apple survey: 288→420 crosses its max-width:415 query). The
+        // widen loop must re-measure after a forced reflow and widen again,
+        // bounded by a pass cap and the 1200px ceiling.
+        #expect(js.contains("function measureMaxRight()"))
+        #expect(js.contains("MAX_PASSES"))
+        // Re-measures INSIDE the widen loop, not just once before widening.
+        #expect(js.contains("re = measureMaxRight()"))
+    }
+
+    @Test("fitViewportJS widen loop terminates — bounded, monotonic, capped")
+    func fitViewportWidenTerminates() {
+        let js = _fitViewportJS
+        // The widen loop must not be able to run away (this view has a history
+        // of width/height feedback loops — ADR-IOS-039). Three independent
+        // stops, verified structurally:
+        //  (1) hard pass cap,
+        //  (2) monotonic non-decreasing target with a no-progress break,
+        //  (3) absolute 1200px ceiling with an explicit break.
+        #expect(js.contains("pass < MAX_PASSES"))           // (1) bounded
+        #expect(js.contains("if (want <= targetWidth)"))     // (2) no-progress break
+        #expect(js.contains("targetWidth = want"))           // (2) only grows
+        #expect(js.contains("if (targetWidth >= 1200)"))     // (3) ceiling break
+    }
+
     // MARK: - monitorHeightJS regressions
+
+    @Test("monitorHeightJS gates the first height post until fit() runs (no load flicker)")
+    func monitorGatesUntilFit() {
+        let js = _monitorHeightJS
+        // Before fit() decides whether to widen, body is laid out at the
+        // un-widened device width; posting that height applies a too-tall frame
+        // that snaps smaller once fit() widens — the 1→881→466 load flicker.
+        // report() must suppress posts until fit() opens the __tmFitDone gate.
+        #expect(js.contains("if (!window.__tmFitDone) return;"))
+        // Liveness fallback so a fit() that never runs can't strand the frame
+        // at its seed height. Must be a one-shot timeout, never a polling loop.
+        #expect(js.contains("window.__tmFitDone = true"))
+        #expect(!js.contains("setInterval"))
+    }
+
+    @Test("fitViewportJS opens the __tmFitDone gate on every exit and re-reports")
+    func fitOpensGate() {
+        let js = _fitViewportJS
+        // fit() must set the gate (so suppressed reports can flow) and trigger a
+        // fresh report so the FINAL height applies immediately rather than
+        // waiting on monitorHeightJS's settling timers.
+        #expect(js.contains("window.__tmFitDone = true"))
+        #expect(js.contains("window.__tmReportHeight()"))
+    }
+
+    // MARK: - Anti-blink: never show the un-scaled paint
+
+    @Test("EmailHTMLWrapper starts the document hidden (opacity:0)")
+    func wrapperStartsHidden() {
+        let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
+        // WebKit paints a runtime viewport-meta widen at scale 1.0 for ~one
+        // frame before committing the shrink — showing that un-scaled frame is
+        // the "blink". The document must start invisible and be revealed only
+        // after the scale commits (fitViewportJS.reveal()).
+        #expect(out.contains("html { overflow-x: hidden !important; opacity: 0;"))
+    }
+
+    @Test("fitViewportJS reveals only AFTER the page-scale commit on the widen path")
+    func fitRevealsPostCommit() {
+        let js = _fitViewportJS
+        // reveal() flips opacity to 1 (inline+important beats the stylesheet).
+        #expect(js.contains("function reveal()"))
+        #expect(js.contains("setProperty('opacity', '1', 'important')"))
+        // The widen path must defer reveal past WebKit's async page-scale commit
+        // via a DOUBLE requestAnimationFrame, so the un-scaled widen frame is
+        // painted while still opacity:0 and never seen. A single rAF (one frame)
+        // can land mid-commit; two cannot.
+        #expect(js.contains("requestAnimationFrame(function() { requestAnimationFrame("))
+    }
 
     @Test("monitorHeightJS uses ResizeObserver as the primary trigger")
     func monitorUsesResizeObserver() {

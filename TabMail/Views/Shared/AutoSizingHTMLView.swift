@@ -1394,6 +1394,16 @@ private let monitorHeightJS = """
     (function() {
         var lastH = 0;
         function report() {
+            // Gate the FIRST height post on fit() completing. Before fit()
+            // decides whether to widen, body is laid out at the un-widened
+            // device width; posting that height applies a too-tall frame that
+            // then snaps smaller the instant fit() widens — a visible flicker
+            // (frame 1→881→466 for the Apple survey). fitViewportJS sets
+            // __tmFitDone on EVERY exit (widen or not) and then calls this, so
+            // the first applied height is already the final one. The fallback
+            // timer below force-opens the gate if fit() never runs (e.g. webView
+            // bounds<50 at load) so the frame can't stay stuck at its seed.
+            if (!window.__tmFitDone) return;
             var scroll = document.body.scrollHeight;
             var rect = Math.ceil(document.body.getBoundingClientRect().height);
             // Prefer bounding rect (actual rendered height) over scrollHeight
@@ -1471,9 +1481,23 @@ private let monitorHeightJS = """
         }
         // Report current size once immediately, and again shortly after
         // in case body hasn't been laid out yet when this script runs.
+        // (These are no-ops until fit() opens the __tmFitDone gate; the
+        // post-fit re-fires below + fit()'s own report() call apply the height.)
         report();
         setTimeout(report, 100);
         setTimeout(report, 500);
+        // Liveness fallback: if fit() never runs (webView too small at load,
+        // never laid out, etc.), open the gate after a grace period so the
+        // frame still gets a height instead of staying at its seed. One-shot,
+        // NOT a polling interval.
+        setTimeout(function() {
+            if (!window.__tmFitDone) { window.__tmFitDone = true; report(); }
+            // Failsafe reveal: EmailHTMLWrapper starts the document at opacity:0
+            // and fitViewportJS.reveal() normally un-hides it. If fit() never ran
+            // (webView never laid out, etc.), un-hide here so content can never
+            // be stranded invisible. Idempotent with reveal().
+            try { document.documentElement.style.setProperty('opacity', '1', 'important'); } catch(_){}
+        }, 700);
     })();
     """
 
@@ -1998,6 +2022,14 @@ private let fitViewportJS: String = {
     return """
     (function() {
         \(logPrefix)
+        // Reveal the document (EmailHTMLWrapper starts it at opacity:0). Called
+        // at EVERY exit so content is never stranded invisible: synchronously on
+        // the no-widen / skip paths (their first paint is already correctly
+        // scaled), and via a double-rAF on the widen path so the reveal lands
+        // AFTER WebKit's page-scale commit — the un-scaled widen frame is painted
+        // while still opacity:0 and never seen. Inline+important beats the
+        // stylesheet's opacity:0.
+        function reveal() { try { document.documentElement.style.setProperty('opacity', '1', 'important'); } catch(_){} }
         // IDEMPOTENCY GUARD — this function measures the document and then
         // MUTATES it (meta widen, inline width strips, body padding zeroing).
         // Running it again on an already-widened document re-measures widened
@@ -2012,7 +2044,13 @@ private let fitViewportJS: String = {
         // change (rotation, sheet resize) go through updateUIView's
         // viewportResetJS path, which restores width=device-width and clears
         // this global before calling fit again.
-        if (window.__tmLayoutVp) { log('already fitted (layoutVp=' + window.__tmLayoutVp + ') — idempotent no-op'); return true; }
+        if (window.__tmLayoutVp) { log('already fitted (layoutVp=' + window.__tmLayoutVp + ') — idempotent no-op'); reveal(); return true; }
+        // Mark fit() as having run for THIS document before any early return.
+        // monitorHeightJS's report() suppresses height posts until this is set,
+        // so the pre-widen (un-widened, scale-1.0) height is never applied —
+        // killing the 1→881→466 load flicker. Set here (not at the bottom) so
+        // every exit path below — including the vw<100 skip — opens the gate.
+        window.__tmFitDone = true;
         // Measure against the Swift-stamped device-pt width (fit() stamps
         // __tmDeviceWidth from webView.bounds.width immediately before this
         // script runs). At the device-width baseline 1 CSS px == 1 pt, so it
@@ -2021,7 +2059,7 @@ private let fitViewportJS: String = {
         // changes (WebKit bug 170595).
         var vw = window.__tmDeviceWidth || window.innerWidth;
         log('enter: vw=' + vw + ' innerWidth=' + window.innerWidth + ' screenWidth=' + window.screen.width + ' devicePixelRatio=' + window.devicePixelRatio);
-        if (vw < 100) { log('skip: viewport too small'); return false; }
+        if (vw < 100) { log('skip: viewport too small'); reveal(); return false; }
         // Strip hardcoded widths from non-table block elements wider than
         // viewport. CSS max-width works fine on divs/p/sections, so this is
         // mostly belt-and-suspenders. Tables/cells are EXCLUDED: many email
@@ -2059,13 +2097,25 @@ private let fitViewportJS: String = {
         // HTML emails.
 
         // Measure the rightmost edge across every descendant of body.
-        var maxRight = 0;
-        var culprit = null;
-        var els = document.body.getElementsByTagName('*');
-        for (var i = 0; i < els.length; i++) {
-            var r = els[i].getBoundingClientRect().right;
-            if (r > maxRight) { maxRight = r; culprit = els[i]; }
+        // Factored into a helper so it can be RE-RUN after a widen: widening the
+        // layout viewport can cross one of the email's OWN `@media (max-width:N)`
+        // breakpoints (e.g. 288→420 crosses a `max-width:415` query), flipping it
+        // into a wider layout that overflows the width we just picked — the
+        // "still cut on the right a bit" symptom (Apple-survey: mobile content
+        // min-width 420 > its own 415 breakpoint, so any widen reveals the
+        // desktop layout). We re-measure post-reflow and widen again until stable.
+        function measureMaxRight() {
+            var mr = 0, cp = null;
+            var all = document.body.getElementsByTagName('*');
+            for (var k = 0; k < all.length; k++) {
+                var rr = all[k].getBoundingClientRect().right;
+                if (rr > mr) { mr = rr; cp = all[k]; }
+            }
+            return { maxRight: mr, culprit: cp };
         }
+        var measured = measureMaxRight();
+        var maxRight = measured.maxRight;
+        var culprit = measured.culprit;
         log('maxRight=' + Math.round(maxRight) + ' vs vw=' + vw);
         if (culprit && maxRight > vw + 10) {
             var culpritInfo = (culprit.tagName + '.' + (culprit.className || '') + ' w=' + Math.round(culprit.getBoundingClientRect().width)
@@ -2074,6 +2124,23 @@ private let fitViewportJS: String = {
             var txt = (culprit.innerText || '').substring(0, 120).replace(/\\s+/g, ' ');
             log('  culprit text: "' + txt + '"');
             log('  culprit outerHTML[0:300]: ' + (culprit.outerHTML || '').substring(0, 300));
+            // DIAGNOSTIC (2026-06-16): when the culprit is an image, dump its
+            // intrinsic vs attribute vs computed size. Distinguishes a
+            // GENUINELY-wide banner (naturalWidth >= rendered, email really is
+            // desktop-width → widen is correct) from one BALLOONED by our
+            // `img{height:auto}` wrapper rule stripping its height attr (small
+            // natural size, but height:auto + no width lets it fill the
+            // container → false overflow). The IMAGE AUDIT line is from a
+            // different (earlier) script pass, so it can show complete=false
+            // while THIS measurement sees a loaded image — log the state HERE.
+            if (culprit.tagName === 'IMG') {
+                var ccs = window.getComputedStyle(culprit);
+                log('  culprit IMG natural=' + culprit.naturalWidth + 'x' + culprit.naturalHeight
+                    + ' complete=' + culprit.complete
+                    + ' attrW=' + (culprit.getAttribute('width') || '-') + ' attrH=' + (culprit.getAttribute('height') || '-')
+                    + ' offset=' + culprit.offsetWidth + 'x' + culprit.offsetHeight
+                    + ' computedW=' + ccs.width + ' computedH=' + ccs.height + ' maxW=' + ccs.maxWidth);
+            }
             var nowrap = culprit.querySelectorAll('[style*="nowrap"]');
             if (nowrap.length > 0) {
                 log('  culprit has ' + nowrap.length + ' nowrap descendants');
@@ -2101,15 +2168,69 @@ private let fitViewportJS: String = {
         var contentWidth = Math.ceil(maxRight);
         if (contentWidth <= vw) {
             log('no overflow — viewport stays at ' + vw + 'px (content fits)');
+            // Gate is now open; post the (scale-1.0) height immediately so a
+            // no-widen email applies its height without waiting on the timers.
+            if (window.__tmReportHeight) window.__tmReportHeight();
+            // No scale change on this path — the first paint is already correct,
+            // so reveal immediately (no commit to wait for).
+            reveal();
             return false;
         }
-        var targetWidth = Math.min(Math.max(contentWidth, STANDARD_MIN), 1200);
+        var meta = document.querySelector('meta[name="viewport"]');
+        // Iteratively widen until the layout stops overflowing the width we set.
+        // Each widen can cross a responsive @media breakpoint and reveal wider
+        // content (fixed-px buttons, no-wrap rows), so a single measure-then-
+        // widen undershoots and clips the right edge. Re-measure after a forced
+        // synchronous reflow and widen to the new content width.
+        //
+        // TERMINATION (why this cannot run away — see the prior width/height
+        // feedback loops in ADR-IOS-039): the loop is a plain synchronous `for`
+        // with three independent stops, ALL of which must be true to continue:
+        //   (1) bounded pass count — `pass < MAX_PASSES` (hard cap);
+        //   (2) monotonic non-decreasing target — `targetWidth` is only ever
+        //       assigned a strictly larger `want`; the moment a pass asks for
+        //       `want <= targetWidth` (no progress) it breaks. A width:100%
+        //       element fills whatever viewport we set, so its remeasure equals
+        //       targetWidth → immediate break; only FIXED-px content (which does
+        //       not grow with the viewport) drives another pass, and it
+        //       converges in one more pass;
+        //   (3) absolute ceiling — clamped to 1200, with an explicit break.
+        // It never calls fit() (no re-entry), runs entirely between paints (no
+        // ResizeObserver/Swift feedback mid-loop), and once it sets
+        // __tmLayoutVp the idempotency guard at the top blocks any future
+        // fitViewportJS re-entry. So the worst case is "widen to 1200 once."
+        var MAX_PASSES = 4;
+        var targetWidth = 0;
+        for (var pass = 0; pass < MAX_PASSES; pass++) {
+            var want = Math.min(Math.max(Math.ceil(maxRight), STANDARD_MIN), 1200);
+            if (want <= targetWidth) {
+                log('widen stable at ' + targetWidth + 'px after ' + pass + ' pass(es)');
+                break;
+            }
+            targetWidth = want;
+            if (meta) {
+                // initial-scale pins the visual page scale to the fit scale
+                // (vw/targetWidth) from the FIRST paint. Without it WebKit paints
+                // the widened layout once at scale 1.0 — content overflowing /
+                // clipped to the frame — and commits the shrink ~one frame later
+                // (zoom 1.0→0.56), which reads as a brief blink. Recomputed each
+                // pass since targetWidth grows.
+                var initScale = (vw / targetWidth).toFixed(3);
+                meta.setAttribute('content', 'width=' + targetWidth + ', initial-scale=' + initScale + ', maximum-scale=5, user-scalable=yes');
+            }
+            // Force a synchronous reflow so the new viewport meta takes effect,
+            // then re-measure. If a breakpoint flipped, maxRight now exceeds
+            // targetWidth and the next pass widens to cover the revealed content.
+            void document.documentElement.offsetHeight;
+            var re = measureMaxRight();
+            maxRight = re.maxRight;
+            culprit = re.culprit;
+            log('WIDEN pass ' + pass + ': set ' + targetWidth + 'px → remeasured maxRight=' + Math.round(maxRight)
+                + (culprit ? ' culprit=' + culprit.tagName + '.' + (culprit.className || '') : ''));
+            if (targetWidth >= 1200) { log('widen hit 1200px cap'); break; }
+        }
         var scaleFactor = (vw / targetWidth).toFixed(2);
         log('WIDENING viewport to ' + targetWidth + 'px → CONTENT WILL RENDER AT ' + scaleFactor + 'x SCALE');
-        var meta = document.querySelector('meta[name="viewport"]');
-        if (meta) {
-            meta.setAttribute('content', 'width=' + targetWidth + ', maximum-scale=5, user-scalable=yes');
-        }
         // Stash the widened layout viewport width in a global. window.innerWidth
         // is unreliable in iOS WebKit after a runtime viewport-meta change
         // (WebKit bug 170595: innerWidth is bogus after resize in WKWebView),
@@ -2128,6 +2249,20 @@ private let fitViewportJS: String = {
         // too-tall frame that snaps smaller on the next pass — visible
         // as a brief flicker during load.
         void document.documentElement.offsetHeight;
+        // Gate is open (set at the top); post the FINAL widened height now so the
+        // frame snaps straight from its seed to the scaled height (1→466), never
+        // through the un-widened height (the 1→881→466 flicker).
+        if (window.__tmReportHeight) window.__tmReportHeight();
+        // Reveal AFTER the page-scale commit. The meta widen sets the layout
+        // width synchronously, but WebKit applies the VISUAL scale ~one frame
+        // later (zoom 1.0→0.56); a double rAF lands after that commit, so the
+        // content (held at opacity:0 since load) is never painted on screen
+        // un-scaled. WebKit ignores initial-scale on a runtime meta change, so
+        // this opacity hold is what actually kills the blink, not the meta.
+        requestAnimationFrame(function() { requestAnimationFrame(function() {
+            reveal();
+            log('revealed post-widen (rAF2)');
+        }); });
         // Schedule re-measurement reports anchored to the WIDEN event,
         // not to document end. ResizeObserver can fire once mid-reflow
         // with a stale body.scrollHeight (Fireworks repro: RO reports

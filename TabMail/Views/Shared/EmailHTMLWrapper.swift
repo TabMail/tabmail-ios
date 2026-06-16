@@ -107,7 +107,17 @@ enum EmailHTMLWrapper {
                viewport widening in fitViewportJS, making WebKit lay out
                content at 288 CSS px instead of 400, which then combines
                disastrously with our scale math. */
-            html { overflow-x: hidden !important; }
+            /* Start invisible; revealed by fitViewportJS's reveal() only AFTER
+               the final layout-viewport width + page scale are applied. WebKit
+               paints a runtime viewport-meta widen at scale 1.0 for ~one frame
+               before committing the shrink (zoom 1.0→0.56) — showing that
+               un-scaled/clipped frame reads as an amateur "blink". Holding
+               opacity:0 until post-commit guarantees the user never sees it; the
+               0.07s fade makes the reveal a deliberate fade-in rather than a pop
+               and masks any sub-frame scale-commit residual. A 700ms fallback in
+               monitorHeightJS reveals even if fit() never runs, so content can
+               never strand invisible. */
+            html { overflow-x: hidden !important; opacity: 0; transition: opacity 0.07s linear; }
             body {
                 font-family: -apple-system, sans-serif;
                 font-size: 16px;
@@ -128,7 +138,20 @@ enum EmailHTMLWrapper {
             /* Force transparent background on email's converted wrapper divs.
                Prevents full-document emails (Exchange/Outlook) from covering the card bubble. */
             body > div:not(.tm-quote-wrapper), .tm-email-body { background: transparent !important; background-color: transparent !important; }
-            img { max-width: 100%; height: auto; }
+            /* Responsive image cap. `height: auto` is SCOPED to images that
+               carry an explicit `width` attribute — there, capping the width via
+               max-width:100% must let height scale proportionally to avoid
+               distortion. It must NOT be forced on width-less images: a logo
+               sized only by `height="29"` (e.g. the Apple Support survey header)
+               would otherwise lose its height constraint and balloon to the
+               container's full width (a ~29px logo rendered ~420px tall+wide),
+               which then drives a bogus fitViewport widen and right-edge
+               clipping. Apple Mail / Thunderbird keep such logos small by
+               honoring the height attribute — so do we. A width-less image keeps
+               height:auto behavior implicitly anyway (height defaults to auto
+               when only width or neither is specified). */
+            img { max-width: 100%; }
+            img[width] { height: auto; }
             a { color: #0060df; word-break: break-all; overflow-wrap: anywhere; }
             pre, code { overflow-x: auto; max-width: 100%; white-space: pre-wrap; word-break: break-all; }
             table, div, p { max-width: 100% !important; box-sizing: border-box !important; }
