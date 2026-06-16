@@ -142,10 +142,15 @@ extension SyncEngine {
             // Scoped to this account — Gmail IDs are globally unique so cross-folder collision
             // isn't possible, but accountId scoping prevents loading unrelated IMAP ops.
             let accountIdCapture = account.id
-            let writeResult: (headers: [MessageHeader], discoveredParents: [String]) = try await dbPool.write { db in
+            let writeResult: (headers: [MessageHeader], discoveredParents: [String], removedIds: [String]) = try await dbPool.write { db in
                 let snapshot = try PendingOperationSnapshot.load(accountId: accountIdCapture, db: db)
                 var headers: [MessageHeader] = []
                 var discoveredParents: [String] = []
+                // Header ids removed from a folder by a label change (Gmail
+                // archive/trash = INBOX label dropped). These must be pulled from
+                // FTS too — otherwise the entry survives under its old folder-bearing
+                // id, drifts from GRDB, and search re-hydration silently drops it.
+                var removedIds: [String] = []
                 for detail in details {
                     let info = detail.header
                     let labelIds = detail.labelIds
@@ -165,7 +170,10 @@ extension SyncEngine {
                         if existsLocally && !belongsInFolder && !isPendingAny {
                             // Message was removed from this folder (e.g., archived from inbox)
                             print("[MoveTrace] deltaSync — removing \(info.messageId) from \(folder.name)(\(folder.id)) — not in labels \(labelIds)")
-                            if let existing { try existing.delete(db) }
+                            if let existing {
+                                removedIds.append(existing.id)
+                                try existing.delete(db)
+                            }
                         } else if existsLocally && !belongsInFolder && isPendingAny {
                             print("[MoveTrace] deltaSync — SKIPPING removal of \(info.messageId) from \(folder.name) — has pending op")
                         } else if !existsLocally && belongsInFolder && isPendingDestructive {
@@ -283,6 +291,7 @@ extension SyncEngine {
                                         try MessageBody.deleteOne(db, key: oldId)
                                         deferredSentBody = newBody
                                     }
+                                    removedIds.append(oldId)
                                     try optimistic.delete(db)
                                     print("[Sync] Gmail delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
                                 }
@@ -346,10 +355,16 @@ extension SyncEngine {
                         }
                     }
                 }
-                return (headers, discoveredParents)
+                return (headers, discoveredParents, removedIds)
             }
             newHeaders = writeResult.headers
             ReplyParentResolver.postParentNotifications(writeResult.discoveredParents)
+            // Keep FTS aligned with GRDB: drop entries for messages that left a
+            // folder via label change. Mirrors the messages-deleted path above.
+            if !writeResult.removedIds.isEmpty {
+                removeHeadersFromFTS(writeResult.removedIds)
+                print("[Sync] Gmail delta: removed \(writeResult.removedIds.count) FTS entries for folder-departed messages")
+            }
 
         }
 
@@ -473,10 +488,13 @@ extension SyncEngine {
             let details = try await provider.fetchMessageDetails(ids: Array(toFetch))
 
             let exchangeAccountId = account.id
-            let writeResult: (headers: [MessageHeader], discoveredParents: [String]) = try await dbPool.write { db in
+            let writeResult: (headers: [MessageHeader], discoveredParents: [String], removedIds: [String]) = try await dbPool.write { db in
                 let snapshot = try PendingOperationSnapshot.load(accountId: exchangeAccountId, db: db)
                 var headers: [MessageHeader] = []
                 var discoveredParents: [String] = []
+                // Header ids deleted by sent-dedup — must be pulled from FTS too,
+                // or the optimistic entry survives as a stale orphan.
+                var removedIds: [String] = []
                 for detail in details {
                     let info = detail.header
                     let folderId = detail.parentFolderId
@@ -627,6 +645,7 @@ extension SyncEngine {
                                     try MessageBody.deleteOne(db, key: oldId)
                                     deferredSentBody = newBody
                                 }
+                                removedIds.append(oldId)
                                 try optimistic.delete(db)
                                 print("[Sync] Exchange delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
                             }
@@ -659,10 +678,14 @@ extension SyncEngine {
                         }
                     }
                 }
-                return (headers, discoveredParents)
+                return (headers, discoveredParents, removedIds)
             }
             exNewHeaders = writeResult.headers
             ReplyParentResolver.postParentNotifications(writeResult.discoveredParents)
+            // Keep FTS aligned with GRDB: drop entries for sent-dedup-replaced headers.
+            if !writeResult.removedIds.isEmpty {
+                removeHeadersFromFTS(writeResult.removedIds)
+            }
 
         }
 

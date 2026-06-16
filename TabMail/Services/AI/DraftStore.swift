@@ -158,7 +158,14 @@ actor DraftStore {
         let rfc822 = draft.rfc822MessageId
         let draftIdForUpdate = draft.id
         let accountId = draft.accountId
-        try await AppDatabase.dbPool.write { db in
+        // FTS ops collected inside the write, applied after commit (SearchIndex is
+        // a separate actor/DB). A draft placeholder header's id is folder+messageId
+        // based; migrating it to the server id re-keys the GRDB row, so FTS must
+        // follow or the entry orphans. (No-ops harmlessly if the draft was never indexed.)
+        let draftFtsOps: (removals: [String], rekeys: [(oldId: String, newId: String, newMessageId: String?)])
+        draftFtsOps = try await AppDatabase.dbPool.write { db in
+            var draftFtsRemovals: [String] = []
+            var draftFtsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
             try db.execute(
                 sql: """
                     UPDATE draft SET serverDraftId = ?, serverPushStatus = ?, rfc822MessageId = ?
@@ -245,11 +252,13 @@ actor DraftStore {
                             try newBody.insert(db)
                         }
                         _ = try? MessageBody.deleteOne(db, key: header.id)
+                        draftFtsRemovals.append(header.id)
                         try header.delete(db)
                         if DebugModeManager.isLoggingEnabled() { print("[DraftStore] Migration: MERGED fresh content from \(header.id) onto existing \(newHeaderId) (snippet=\(String(header.snippet.prefix(60))))") }
                         continue
                     }
 
+                    draftFtsRekeys.append((oldId: header.id, newId: newHeaderId, newMessageId: realMessageId))
                     try header.delete(db)
                     var migrated = header
                     migrated.id = newHeaderId
@@ -267,6 +276,15 @@ actor DraftStore {
                     print("[DraftStore] Migrated header \(header.id) → \(newHeaderId) (messageId \(header.messageId) → \(realMessageId), rfc822 \(header.rfc822MessageId ?? "nil") → \(freshRfc822))")
                 }
             }
+            return (draftFtsRemovals, draftFtsRekeys)
+        }
+        // Keep FTS aligned with the migrated GRDB ids: re-key migrated placeholders
+        // (preserves the indexed body), remove merged-away ones. After the write.
+        if !draftFtsOps.removals.isEmpty {
+            try? await SearchIndex.shared.removeMessages(headerIds: draftFtsOps.removals)
+        }
+        if !draftFtsOps.rekeys.isEmpty {
+            try? await SearchIndex.shared.rekeyHeaders(draftFtsOps.rekeys)
         }
         // Notify list to reload after header migration so the snapshot PK is current.
         // Without this, the list has the old placeholder PK which no longer resolves.

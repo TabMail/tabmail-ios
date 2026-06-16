@@ -186,7 +186,11 @@ extension SyncEngine {
     /// alone under `ftsOrphanPrune.v1.done`; the reconcile key supersedes it
     /// and adds the full-history GRDB→FTS membership sweep — devices that ran
     /// v1 re-run once, which is idempotent.)
-    static let ftsReconcileDoneKey = "ftsReconcile.v1.done"
+    /// v2: `pruneFTSOrphans` now RE-KEYS recoverable orphans (moved Gmail/Graph
+    /// messages) to their current id instead of deleting them — preserving the
+    /// indexed body and repairing drift for every consumer (search/AI/embeddings).
+    /// Bumped so devices re-run the sweep once with the heal-not-delete behavior.
+    static let ftsReconcileDoneKey = "ftsReconcile.v2.done"
 
     /// One-time full FTS↔GRDB reconciliation, both directions:
     /// 1. `pruneFTSOrphans` — remove FTS entries whose header id no longer
@@ -302,11 +306,60 @@ extension SyncEngine {
             candidates = candidates.filter { !stillExisting.contains($0) }
             guard !candidates.isEmpty else { continue }
 
-            try await SearchIndex.shared.removeMessages(headerIds: candidates)
-            pruned += candidates.count
-            print("[FTS] Orphan prune: removed \(candidates.count) dead entries (cursor \(cursor))")
+            // Drift recovery: an orphan whose (accountId, messageId) still exists
+            // in GRDB under a NEW id is a MOVED message (Gmail archive/trash etc.),
+            // not a dead one. Re-key the FTS entry to the current id — preserving
+            // its indexed body — instead of deleting it. This repairs drift for
+            // EVERY consumer (search, AI, embeddings), not just on-search.
+            var rekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
+            var deadIds: [String] = []
+            for orphan in candidates {
+                if let newId = try await recoverMovedHeaderId(forOrphan: orphan) {
+                    rekeys.append((oldId: orphan, newId: newId, newMessageId: nil))
+                } else {
+                    deadIds.append(orphan)
+                }
+            }
+            if !rekeys.isEmpty {
+                try await SearchIndex.shared.rekeyHeaders(rekeys)
+                print("[FTS] Orphan reconcile: re-keyed \(rekeys.count) moved messages (cursor \(cursor))")
+            }
+            if !deadIds.isEmpty {
+                try await SearchIndex.shared.removeMessages(headerIds: deadIds)
+                print("[FTS] Orphan prune: removed \(deadIds.count) dead entries (cursor \(cursor))")
+            }
+            pruned += deadIds.count
         }
         return pruned
+    }
+
+    /// Resolve an orphan FTS headerId to the message's CURRENT GRDB id, if the
+    /// message merely moved folders. Returns nil for genuinely-dead messages or
+    /// when recovery isn't safe.
+    ///
+    /// Only Gmail/Graph are recoverable by `(accountId, messageId)`: their
+    /// messageId is globally unique AND survives folder moves. The headerId
+    /// `accountId:folder:messageId` splits into exactly 3 components for them
+    /// (no ':' in account UUID, folder, or the hex/opaque messageId); a different
+    /// component count means a folder path with ':' (IMAP) — skip, since IMAP's
+    /// per-folder UID changes on move and repeats across folders.
+    private func recoverMovedHeaderId(forOrphan headerId: String) async throws -> String? {
+        let parts = headerId.components(separatedBy: ":")
+        guard parts.count == 3 else { return nil }
+        let accountId = parts[0]
+        let messageId = parts[2]
+        return try await dbPool.read { db -> String? in
+            guard let provider = try Account.fetchOne(db, key: accountId)?.provider,
+                  provider == .gmail || provider == .outlook else { return nil }
+            let matches = try MessageHeader
+                .filter(Column("accountId") == accountId && Column("messageId") == messageId)
+                .fetchAll(db)
+            guard !matches.isEmpty else { return nil }
+            // Same message can live in several folders; any current id works (the
+            // body rides along in the re-key). Prefer a non-trash/spam copy.
+            let preferred = matches.first { !$0.folderPath.contains("TRASH") && !$0.folderPath.contains("SPAM") }
+            return (preferred ?? matches.first)?.id
+        }
     }
 
     /// Which of `ids` exist as messageHeader PKs — single indexed IN query.

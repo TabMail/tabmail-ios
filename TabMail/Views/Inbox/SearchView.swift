@@ -289,6 +289,9 @@ struct SearchView: View {
             }
             let remoteResults = results.filter { $0.source == .remote }
             results = searchResults + legacyExtras + remoteResults
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Search] debounce merge: fts=\(ftsResults.count) →searchResults=\(searchResults.count) +legacyExtras=\(legacyExtras.count) +remote=\(remoteResults.count) ⇒ results=\(results.count) query='\(trimmed.prefix(40))'")
+            }
         }
     }
 
@@ -389,10 +392,23 @@ struct SearchView: View {
                     let accountResults = await searchAccount(account, folder: folderPath, query: query, after: after, before: before)
                     guard searchGeneration == generation else { return }
                     if !accountResults.isEmpty {
+                        let accountEmail = account.emailAddress
                         let remoteIds = Set(accountResults.map(\.messageId))
-                        // Preserve snippets from local results when remote has none
+                        // Identifies a prior row that is the SAME message as one of this
+                        // batch's results. messageId is only unique within (account, folder)
+                        // for IMAP (per-folder UID), so per-folder searches must match the
+                        // folder too. Provider account-wide searches use folderPath="" and a
+                        // globally-unique messageId, so they match on messageId alone — which
+                        // also collapses the local row (folderPath="INBOX") against the
+                        // account-wide remote row (folderPath="").
+                        let isSameMessage: (SearchResult) -> Bool = { r in
+                            r.accountEmail == accountEmail
+                                && remoteIds.contains(r.messageId)
+                                && (folderPath.isEmpty || r.folderPath == folderPath)
+                        }
+                        // Preserve snippets from local results when remote has none.
                         let localSnippets = Dictionary(
-                            results.filter { remoteIds.contains($0.messageId) && !$0.snippet.isEmpty }
+                            results.filter { isSameMessage($0) && !$0.snippet.isEmpty }
                                 .map { ($0.messageId, $0.snippet) },
                             uniquingKeysWith: { first, _ in first }
                         )
@@ -403,9 +419,15 @@ struct SearchView: View {
                             .filter { $0.snippet.isEmpty && localSnippets[$0.messageId] == nil }
                             .map(\.messageId)
                         let dbSnippets: [String: String] = needLookup.isEmpty ? [:] : (try? await AppDatabase.dbPool.read { db in
-                            let headers = try MessageHeader
+                            var request = MessageHeader
                                 .filter(needLookup.contains(Column("messageId")) && Column("accountId") == account.id)
-                                .fetchAll(db)
+                            // Per-folder IMAP search: constrain to the folder so a colliding
+                            // UID in another folder can't lend its snippet. Account-wide
+                            // search (folderPath="") needs no folder constraint.
+                            if !folderPath.isEmpty {
+                                request = request.filter(Column("folderPath") == folderPath)
+                            }
+                            let headers = try request.fetchAll(db)
                             return Dictionary(headers.map { ($0.messageId, $0.snippet) },
                                               uniquingKeysWith: { first, _ in first })
                         }) ?? [:]
@@ -418,12 +440,16 @@ struct SearchView: View {
                             let snippet = localSnippets[result.messageId] ?? dbSnippets[result.messageId] ?? ""
                             guard !snippet.isEmpty else { return result }
                             return SearchResult(source: result.source, accountEmail: result.accountEmail,
-                                messageId: result.messageId, subject: result.subject, from: result.from,
+                                messageId: result.messageId, folderPath: result.folderPath,
+                                subject: result.subject, from: result.from,
                                 fromAddress: result.fromAddress, date: result.date, snippet: snippet,
                                 isRead: result.isRead, isFlagged: result.isFlagged, headerId: result.headerId)
                         }
                         var merged = results
-                        merged.removeAll { remoteIds.contains($0.messageId) }
+                        // Replace only the prior rows that are the SAME message (account +
+                        // folder + messageId). A bare-messageId removeAll would evict a
+                        // different account's — or different IMAP folder's — colliding UID.
+                        merged.removeAll(where: isSameMessage)
                         merged.append(contentsOf: enriched)
                         merged.sort { $0.date > $1.date }
                         results = merged
@@ -450,17 +476,73 @@ struct SearchView: View {
     /// exclude it from results and correct the FTS entry in the background.
     private func ftsResultsToSearchResults(_ ftsResults: [FTSSearchResult]) -> [SearchResult] {
         var staleCorrections: [(headerId: String, correctFolderId: String)] = []
+        // Drift heal: stale FTS headerId → current GRDB id (+ folderId). The FTS
+        // key embeds the folder ("accountId:folder:messageId"); a folder move
+        // (Gmail archive/trash, any re-key) re-keys the GRDB header but can leave
+        // the FTS entry pointing at a dead id. Re-keying here repairs the index
+        // for EVERY consumer (search, AI, embeddings), not just this query.
+        var rekeyHeals: [(old: String, new: String, newMessageId: String?, newFolderId: String)] = []
+
+        // Diagnostics: count *why* FTS hits get dropped on the way to the UI.
+        var droppedNoHeader = 0
+        var droppedOutOfScope = 0
+        var healedDrift = 0
+        var noHeaderSamples: [String] = []
+        let logging = DebugModeManager.isLoggingEnabled()
+        let scope = activeFolderIds
 
         let results: [SearchResult] = ftsResults.compactMap { ftsResult in
             let headerId = ftsResult.headerId
-            guard let header = try? dbPool.read({ db in
+            // 1. Exact lookup by the FTS-stored id.
+            var header = (try? dbPool.read { db in
                 try MessageHeader.fetchOne(db, key: headerId)
-            }) else { return nil }
+            }).flatMap { $0 }
+            var recovered = false
+
+            // 2. Drift recovery: the id missed. The message likely changed folder
+            //    (Gmail archive/trash) — GRDB re-keyed it, FTS kept the old id.
+            //    Recover by (accountId, messageId), which is only safe where
+            //    messageId is move-STABLE and globally unique: Gmail/Graph. IMAP's
+            //    messageId is a per-folder UID that changes on move and repeats
+            //    across folders, so a match could be a DIFFERENT message — skip it
+            //    (the sync-side re-key + delta-sync source fix own IMAP).
+            if header == nil {
+                let accountId = String(headerId.prefix(while: { $0 != ":" }))
+                let moved = (try? dbPool.read { db -> MessageHeader? in
+                    guard let provider = try Account.fetchOne(db, key: accountId)?.provider,
+                          provider == .gmail || provider == .outlook else { return nil }
+                    let matches = try MessageHeader
+                        .filter(Column("accountId") == accountId && Column("messageId") == ftsResult.messageId)
+                        .fetchAll(db)
+                    // Same Gmail message can live in several folders (INBOX + All
+                    // Mail + labels); any is the same message. Prefer one in scope.
+                    return matches.first(where: { h in scope.map { $0.contains(h.folderId) } ?? true }) ?? matches.first
+                }).flatMap { $0 }
+                if let moved, moved.id != headerId {
+                    rekeyHeals.append((old: headerId, new: moved.id, newMessageId: moved.messageId, newFolderId: moved.folderId))
+                    healedDrift += 1
+                    header = moved
+                    recovered = true
+                }
+            }
+
+            guard let header else {
+                droppedNoHeader += 1
+                if logging && noHeaderSamples.count < 5 {
+                    noHeaderSamples.append("ftsId=\(headerId) msgId=\(ftsResult.messageId)")
+                }
+                return nil
+            }
 
             // Self-healing: check if GRDB folderId matches the active scope.
             // If the message moved out of the scoped folder, FTS is stale — exclude and correct.
-            if let scopeIds = activeFolderIds, !scopeIds.contains(header.folderId) {
-                staleCorrections.append((headerId: headerId, correctFolderId: header.folderId))
+            if let scopeIds = scope, !scopeIds.contains(header.folderId) {
+                // Recovered hits re-key below (which also realigns folderId); don't
+                // also queue a folderId-only fix against the about-to-be-replaced id.
+                if !recovered {
+                    staleCorrections.append((headerId: header.id, correctFolderId: header.folderId))
+                }
+                droppedOutOfScope += 1
                 return nil
             }
 
@@ -472,6 +554,7 @@ struct SearchView: View {
                 source: .local,
                 accountEmail: accountEmail,
                 messageId: header.messageId,
+                folderPath: header.folderPath,
                 subject: header.subject,
                 from: header.from,
                 fromAddress: header.fromAddress,
@@ -489,6 +572,27 @@ struct SearchView: View {
                 for (headerId, correctFolderId) in staleCorrections {
                     try? await SearchIndex.shared.updateFolderIds(headerIds: [headerId], newFolderId: correctFolderId)
                 }
+            }
+        }
+
+        // Fire-and-forget: re-key drifted FTS entries to the current GRDB id so the
+        // index self-repairs for all consumers. Re-key first, THEN realign the
+        // scoping folderId (rekeyHeaders only moves the id, not meta.folderId).
+        if !rekeyHeals.isEmpty {
+            let heals = rekeyHeals
+            Task {
+                try? await SearchIndex.shared.rekeyHeaders(
+                    heals.map { (oldId: $0.old, newId: $0.new, newMessageId: $0.newMessageId) })
+                for heal in heals {
+                    try? await SearchIndex.shared.updateFolderIds(headerIds: [heal.new], newFolderId: heal.newFolderId)
+                }
+            }
+        }
+
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Search] ftsResultsToSearchResults: in=\(ftsResults.count) out=\(results.count) healedDrift=\(healedDrift) droppedNoHeader=\(droppedNoHeader) droppedOutOfScope=\(droppedOutOfScope) scope=\(activeFolderIds == nil ? "ALL" : "\(activeFolderIds!.count) folders")")
+            if !noHeaderSamples.isEmpty {
+                print("[Search]   noHeader sample FTS headerIds: \(noHeaderSamples)")
             }
         }
 
@@ -525,6 +629,7 @@ struct SearchView: View {
                     source: .local,
                     accountEmail: accountEmails[msg.accountId] ?? "",
                     messageId: msg.messageId,
+                    folderPath: msg.folderPath,
                     subject: msg.subject,
                     from: msg.from,
                     fromAddress: msg.fromAddress,
@@ -577,6 +682,11 @@ struct SearchView: View {
                 source: .remote,
                 accountEmail: email,
                 messageId: info.messageId,
+                // The folder this result was searched in. Empty for provider
+                // account-wide search (Gmail/Graph), where `messageId` is already
+                // globally unique. For IMAP this is the real folder path, which is
+                // required to disambiguate per-folder UIDs that collide across folders.
+                folderPath: folder,
                 subject: info.subject,
                 from: info.from,
                 fromAddress: info.fromAddress,
@@ -597,21 +707,25 @@ struct SearchView: View {
         let now = Date()
         results = [
             SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg008",
+                         folderPath: "INBOX",
                          subject: "Re: Partnership Proposal — Next Steps", from: "Emily Torres",
                          fromAddress: "emily.torres@client.com", date: now.addingTimeInterval(-45 * 60),
                          snippet: "Thanks for the detailed proposal, Alex. Our team has reviewed it and we'd like to move forward with a pilot program...",
                          isRead: false, isFlagged: false, headerId: "screenshot-account:INBOX:msg008"),
             SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg-old-1",
+                         folderPath: "INBOX",
                          subject: "Partnership Proposal — Draft for Review", from: "Alex Morgan",
                          fromAddress: "alex@gmail.com", date: now.addingTimeInterval(-3 * 86400),
                          snippet: "Hi Emily, attached is the partnership proposal we discussed. The pilot would cover 3 enterprise accounts starting April...",
                          isRead: true, isFlagged: false, headerId: nil),
             SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg-old-2",
+                         folderPath: "INBOX",
                          subject: "Re: Partnership Discussion — Follow Up", from: "Emily Torres",
                          fromAddress: "emily.torres@client.com", date: now.addingTimeInterval(-5 * 86400),
                          snippet: "Great meeting today! I'll share the proposal with our leadership team and get back to you by end of week...",
                          isRead: true, isFlagged: true, headerId: nil),
             SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg-old-3",
+                         folderPath: "INBOX",
                          subject: "Partnership Opportunity — Initial Inquiry", from: "Emily Torres",
                          fromAddress: "emily.torres@client.com", date: now.addingTimeInterval(-12 * 86400),
                          snippet: "Hi Alex, I came across TabMail and I think there's a great opportunity for our companies to partner...",
@@ -625,10 +739,28 @@ struct SearchView: View {
 struct SearchResult: Identifiable {
     enum Source { case local, remote }
 
-    let id = UUID()
+    /// Stable, content-derived identity. NEVER use a fresh `UUID()` here: the
+    /// results array is rebuilt and re-sorted on every keystroke/FTS merge/remote
+    /// merge, so a random id would change for the same message on each rebuild.
+    /// SwiftUI's `List`/`ForEach` would then tear down and recycle row views with
+    /// churning identities and render the wrong subject on a row (the row's bound
+    /// data — used on tap — stays correct, so the message opens fine).
+    ///
+    /// `messageId` ALONE is not unique: for IMAP it is the per-folder UID (see
+    /// `IMAPFetchMapping.messageIdString`), so two *different* messages in two
+    /// folders of the same account share a UID. A search-all that hits several
+    /// folders would then mint duplicate identities → wrong subjects again. The
+    /// key must include the folder: `accountEmail + folderPath + messageId`
+    /// mirrors the local headerId ("accountId:folderPath:messageId") and is the
+    /// same composite dedup uses.
+    var id: String { "\(accountEmail)\u{1}\(folderPath)\u{1}\(messageId)" }
     let source: Source
     let accountEmail: String
     let messageId: String
+    /// Folder the result came from. Local: the message's GRDB `folderPath`.
+    /// Remote: the folder searched (empty string for provider account-wide
+    /// search, where `messageId` is already globally unique).
+    let folderPath: String
     let subject: String
     let from: String
     let fromAddress: String
