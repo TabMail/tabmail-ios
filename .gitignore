@@ -42,3 +42,9 @@ Secrets.xcconfig
 /Scripts/fastlane-*.sh
 vendor/bundle
 Secrets.xcconfig.bak
+
+# Internal planning / design scratch docs — kept locally, NOT published.
+# These are working notes on in-progress architecture (including proprietary
+# backend internals) and are not part of the public client. One slipped in
+# once (PLAN_NSE_ENHANCE.md); this rule prevents a recurrence.
+PLAN_*.md
