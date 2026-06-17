@@ -602,4 +602,27 @@ actor SyncEngine {
             || msg.contains("connection appears to be offline") // URLSession offline description
             || msg.contains("max_userip_connections") // Server rejected — too many IMAP connections (handled by adaptive concurrency)
     }
+
+    /// True when `error` is a *transient* HTTP response from a reachable provider —
+    /// HTTP 5xx (500/502/503/504/…) or 429 (rate limited). Unlike `isConnectionError`
+    /// (transport-level failure), here the request completed and the server answered,
+    /// just with a status that will likely clear on its own (e.g. Microsoft Graph
+    /// returning 503 "Error making HTTP request" during connect). These are NOT a real
+    /// sync failure — the next sync cycle retries — so callers use this to keep momentary
+    /// provider blips from surfacing as a failed-sync indicator or error banner in the UI.
+    ///
+    /// Matches both wrapping shapes used in the codebase: `ProviderError.networkError`
+    /// around our `HTTPError.networkError(statusCode:)` enum, and around the
+    /// `NSError(domain: "Gmail"/"Exchange", code: statusCode)` form that the HTTP
+    /// providers throw (mirrors the unwrap in `isHttpGoneStatus`).
+    nonisolated static func isTransientError(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error else { return false }
+        let status: Int
+        if case HTTPError.networkError(let statusCode) = underlying {
+            status = statusCode
+        } else {
+            status = (underlying as NSError).code
+        }
+        return status == 429 || (status >= 500 && status <= 599)
+    }
 }

@@ -138,6 +138,74 @@ struct IsConnectionErrorTests {
     }
 }
 
+@Suite("SyncEngine.isTransientError")
+struct IsTransientErrorTests {
+
+    // MARK: - True cases (transient — must NOT surface as a sync failure)
+
+    @Test("HTTPError(503) wrapped in ProviderError.networkError is transient — the reported Graph-503 bug")
+    func httpError503() {
+        // Exactly the shape logged: networkError(underlying: HTTPError.networkError(statusCode: 503))
+        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503))
+        #expect(SyncEngine.isTransientError(error) == true)
+    }
+
+    @Test("HTTPError(500/502/504) wrapped in ProviderError.networkError is transient")
+    func httpError5xx() {
+        for code in [500, 502, 504] {
+            let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: code))
+            #expect(SyncEngine.isTransientError(error) == true, "HTTP \(code) should be transient")
+        }
+    }
+
+    @Test("HTTPError(429) wrapped in ProviderError.networkError is transient (rate limited)")
+    func httpError429() {
+        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 429))
+        #expect(SyncEngine.isTransientError(error) == true)
+    }
+
+    @Test("NSError(code: 503) wrapped in ProviderError.networkError is transient (Gmail/Exchange shape)")
+    func nsError503() {
+        // GmailProvider/ExchangeProvider throw ProviderError.networkError(underlying: NSError(domain:"Gmail"/"Exchange", code: statusCode))
+        let error = ProviderError.networkError(underlying: NSError(domain: "Exchange", code: 503, userInfo: nil))
+        #expect(SyncEngine.isTransientError(error) == true)
+    }
+
+    // MARK: - False cases (must still surface)
+
+    @Test("HTTPError(404) is NOT transient (permanent — handled by gone/not-found classifiers)")
+    func httpError404() {
+        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 404))
+        #expect(SyncEngine.isTransientError(error) == false)
+    }
+
+    @Test("HTTPError(400/401/403) is NOT transient")
+    func httpError4xx() {
+        for code in [400, 401, 403] {
+            let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: code))
+            #expect(SyncEngine.isTransientError(error) == false, "HTTP \(code) should NOT be transient")
+        }
+    }
+
+    @Test("ProviderError.notConnected is NOT transient (it's a connection error, classified separately)")
+    func notConnected() {
+        // isTransientError is intentionally narrow (HTTP-only) so it does not change the
+        // existing connection-error behavior (offline still flips the failed indicator).
+        #expect(SyncEngine.isTransientError(ProviderError.notConnected) == false)
+    }
+
+    @Test("URLError is NOT transient (transport failure → isConnectionError owns it)")
+    func urlError() {
+        #expect(SyncEngine.isTransientError(URLError(.timedOut)) == false)
+    }
+
+    @Test("A non-ProviderError is NOT transient")
+    func unrelatedError() {
+        let error = TestError(description: "Something completely unrelated happened")
+        #expect(SyncEngine.isTransientError(error) == false)
+    }
+}
+
 @Suite("SyncEngine.isSelectFailedError")
 struct IsSelectFailedErrorTests {
 

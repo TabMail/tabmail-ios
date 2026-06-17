@@ -104,6 +104,12 @@ extension AccountManager {
         } catch is TimeoutError {
             print("[SyncScheduler] Sync timed out for \(account.emailAddress) after \(SyncConfig.perAccountSyncTimeoutSeconds)s")
             return SyncResult(hadChanges: false, failed: true)
+        } catch let error where SyncEngine.isTransientError(error) {
+            // Transient provider blip (HTTP 5xx/429 from a reachable server) — not a
+            // real sync failure. Report `failed: false` so the foreground poll doesn't
+            // flip the sync-status subtitle to "failed"; the next cycle retries.
+            print("[SyncScheduler] Transient error for \(account.emailAddress) (not surfaced): \(error)")
+            return SyncResult(hadChanges: false, failed: false)
         } catch {
             print("[SyncScheduler] Sync failed for \(account.emailAddress): \(error)")
             if !SyncEngine.isConnectionError(error) && !(error is CancellationError) {

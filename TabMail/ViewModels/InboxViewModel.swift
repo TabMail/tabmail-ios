@@ -1233,6 +1233,12 @@ final class InboxViewModel {
             AccountManagerState.shared.lastSyncCompletedAt = Date()
         } catch is CancellationError {
             // Task cancelled (e.g., user navigated away) — not user-facing
+        } catch let error where SyncEngine.isTransientError(error) {
+            // Transient provider blip — HTTP 5xx/429 from a reachable server (e.g. a
+            // momentary Microsoft Graph 503 during connect). NOT a real sync failure:
+            // the next poll/refresh retries. Leave lastSyncFailed unchanged and show
+            // no error banner so a single server hiccup doesn't surface to the user.
+            print("[Sync] Transient error (not surfaced): \(error)")
         } catch {
             print("[Sync] Error: \(error)")
             AccountManagerState.shared.lastSyncFailed = true
