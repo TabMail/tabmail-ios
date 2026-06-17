@@ -51,6 +51,50 @@ enum EmailHTMLWrapper {
             of: #"\s+loading\s*=\s*"lazy""#, with: "", options: .regularExpression
         )
 
+        // Strip external render-blocking <link rel="stylesheet"> (e.g. Google
+        // Fonts). WebKit blocks the FIRST PAINT until every external stylesheet
+        // loads — a slow remote CSS leaves the email a correctly-SIZED but EMPTY
+        // box until it resolves, then paints all at once. Diagnosed on a 107KB
+        // newsletter (logmain.log 2026-06-17): frame sized at +196ms but the
+        // first compositor frame (`first rAF`) didn't fire until +2771ms,
+        // matching readyState=complete — gated on a `fonts.googleapis.com`
+        // <link> taking ~2.6s; the opacity reveal (rAF-based) was starved the
+        // whole time. These links are virtually always web-font imports, so
+        // dropping them lets the email paint immediately with fallback fonts
+        // (layout is inline/`<style>`). Also a privacy win: external CSS is a
+        // remote-tracking vector, same as remote images. Matches the <link> in
+        // <head>, <body>, or revealed inside an mso conditional comment, both
+        // attribute orderings. `<style>` blocks are NOT touched.
+        let stylesheetLinkPattern = #"<link\b[^>]*\brel\s*=\s*["']?stylesheet[^>]*>"#
+        content = content.replacingOccurrences(
+            of: stylesheetLinkPattern, with: "", options: [.regularExpression, .caseInsensitive]
+        )
+
+        // Defer REMOTE <img> loading so it doesn't block the first paint. WebKit
+        // holds the first compositor frame until readyState=complete, which waits
+        // on EVERY pending subresource — the Vancouver Sun newsletter had 28 remote
+        // images (incl. tracking pixels) that took ~2.7s, leaving the email a
+        // correctly-SIZED but EMPTY box (logmain.log 2026-06-17: IMAGE AUDIT
+        // total=28 pending=28; `first rAF` == readyState=complete == +2732ms).
+        // Rewriting remote http(s) src/srcset → data-tmsrc(set) leaves the initial
+        // document with NO pending image loads → complete fires at ~DOMContentLoaded
+        // → text/layout paints immediately (Apple-Mail-like). `deferredImageLoadJS`
+        // swaps the real URLs back in AFTER the first paint, so images stream in and
+        // the frame grows via the ResizeObserver. Only http/https is touched —
+        // cid:/data:/local scheme-handler images (fast, load-bearing) are left alone.
+        // (NOTE: we deliberately AUTO-load, not block-with-banner — block-with-banner
+        // was smoke-tested 2026-06-17 and broke too many messages; deferred load
+        // keeps every message rendering normally, just text-first.)
+        let imgSrcDouble = #"(<img\b[^>]*?)\ssrc(\s*=\s*)"(https?://[^"]*)""#
+        let imgSrcSingle = #"(<img\b[^>]*?)\ssrc(\s*=\s*)'(https?://[^']*)'"#
+        let imgSrcsetDouble = #"(<img\b[^>]*?)\ssrcset(\s*=\s*)"([^"]*https?://[^"]*)""#
+        let imgSrcsetSingle = #"(<img\b[^>]*?)\ssrcset(\s*=\s*)'([^']*https?://[^']*)'"#
+        let imgOpts: NSString.CompareOptions = [.regularExpression, .caseInsensitive]
+        content = content.replacingOccurrences(of: imgSrcDouble, with: "$1 data-tmsrc$2\"$3\"", options: imgOpts)
+        content = content.replacingOccurrences(of: imgSrcSingle, with: "$1 data-tmsrc$2'$3'", options: imgOpts)
+        content = content.replacingOccurrences(of: imgSrcsetDouble, with: "$1 data-tmsrcset$2\"$3\"", options: imgOpts)
+        content = content.replacingOccurrences(of: imgSrcsetSingle, with: "$1 data-tmsrcset$2'$3'", options: imgOpts)
+
         let viewModeCSS: String
         let bodyClass: String
         if let filename = previewFilename {

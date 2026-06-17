@@ -78,15 +78,26 @@ struct EmailRenderPipelineTests {
 
     // MARK: - fitViewportJS regressions
 
-    @Test("fitViewportJS widens only when content actually overflows")
+    @Test("fitViewportJS widens only when content overflows beyond the slop")
     func fitViewportOnlyOnOverflow() {
         let js = _fitViewportJS
-        // Plain-text and responsive emails that fit at device width must
-        // keep the native 1.0× scale. The widening check is the guard —
-        // if someone removes the `contentWidth <= vw` early return,
-        // text-only emails render at 0.72× (16 px → 11.5 px visual).
-        #expect(js.contains("if (contentWidth <= vw)"))
+        // Plain-text and responsive emails that fit at device width must keep
+        // the native 1.0x scale. The guard is the early return; if someone
+        // removes it, text-only emails render at 0.72x (16px -> 11.5px).
+        #expect(js.contains("if (maxRight <= vw + OVERFLOW_SLOP)"))
         #expect(js.contains("return false"))
+    }
+
+    @Test("fitViewportJS ignores sub-pixel overflow (OVERFLOW_SLOP)")
+    func fitViewportSubPixelSlop() {
+        let js = _fitViewportJS
+        // WebKit reports fractional layout widths (e.g. a column at 288.2 in a
+        // 288 viewport). `Math.ceil` turned that into 289 > 288 -> a FALSE
+        // overflow that floored to STANDARD_MIN (400) and shrank a fitting
+        // 107KB newsletter to 0.72x on a second fit. A few-px slop absorbs the
+        // jitter (and stops the widen loop creeping ~1px/pass on width:100%
+        // content). Genuine desktop emails overflow far past the slop.
+        #expect(js.contains("OVERFLOW_SLOP = 8"))
     }
 
     @Test("fitViewportJS floors widening to STANDARD_MIN = 400")
@@ -169,13 +180,26 @@ struct EmailRenderPipelineTests {
         //  (1) hard pass cap,
         //  (2) monotonic non-decreasing target with a no-progress break,
         //  (3) absolute 1200px ceiling with an explicit break.
-        #expect(js.contains("pass < MAX_PASSES"))           // (1) bounded
-        #expect(js.contains("if (want <= targetWidth)"))     // (2) no-progress break
-        #expect(js.contains("targetWidth = want"))           // (2) only grows
-        #expect(js.contains("if (targetWidth >= 1200)"))     // (3) ceiling break
+        #expect(js.contains("pass < MAX_PASSES"))                       // (1) bounded
+        #expect(js.contains("if (want <= targetWidth + OVERFLOW_SLOP)")) // (2) no-progress break
+        #expect(js.contains("targetWidth = want"))                      // (2) only grows
+        #expect(js.contains("if (targetWidth >= 1200)"))                // (3) ceiling break
     }
 
     // MARK: - monitorHeightJS regressions
+
+    @Test("monitorHeightJS requests an early fit on first layout (not blocked on didFinish)")
+    func monitorRequestsEarlyFit() {
+        let js = _monitorHeightJS
+        // A big newsletter's body lays out (~100ms) long before didFinish, which
+        // waits on external images (~500ms+). Leaving the frame at 1px (gated)
+        // until didFinish-driven fit() is the "still slow" blank. Instead,
+        // report() asks Swift to fit on the FIRST real layout so the frame is
+        // sized + revealed as soon as the width is known. Once only.
+        #expect(js.contains("requestFit: true"))
+        #expect(js.contains("__tmFitRequested"))
+        #expect(js.contains("document.body.scrollHeight > 1"))
+    }
 
     @Test("monitorHeightJS gates the first height post until fit() runs (no load flicker)")
     func monitorGatesUntilFit() {
@@ -183,8 +207,9 @@ struct EmailRenderPipelineTests {
         // Before fit() decides whether to widen, body is laid out at the
         // un-widened device width; posting that height applies a too-tall frame
         // that snaps smaller once fit() widens — the 1→881→466 load flicker.
-        // report() must suppress posts until fit() opens the __tmFitDone gate.
-        #expect(js.contains("if (!window.__tmFitDone) return;"))
+        // report() must suppress HEIGHT posts until fit() opens the __tmFitDone
+        // gate (the early-fit request is the only thing that goes out before it).
+        #expect(js.contains("if (!window.__tmFitDone) {"))
         // Liveness fallback so a fit() that never runs can't strand the frame
         // at its seed height. Must be a one-shot timeout, never a polling loop.
         #expect(js.contains("window.__tmFitDone = true"))
@@ -203,6 +228,62 @@ struct EmailRenderPipelineTests {
 
     // MARK: - Anti-blink: never show the un-scaled paint
 
+    @Test("EmailHTMLWrapper strips render-blocking external stylesheet links")
+    func wrapperStripsExternalStylesheets() {
+        // WebKit blocks first paint until external stylesheets load; a slow
+        // Google Fonts <link> left a 107KB newsletter an empty box for ~2.6s
+        // (first compositor frame didn't fire until readyState=complete). These
+        // are web-font imports — drop them so the email paints immediately with
+        // fallback fonts. Also a privacy win (external CSS = remote tracking).
+        let gfont = "<link href=\"https://fonts.googleapis.com/css2?family=Playfair+Display&display=swap\" rel=\"stylesheet\" type=\"text/css\">"
+        let out = EmailHTMLWrapper.wrapHTML("<html><head>\(gfont)</head><body><p>Hi</p></body></html>")
+        #expect(!out.contains("fonts.googleapis.com"))
+        #expect(!out.contains("rel=\"stylesheet\""))
+        // Inline <style> must be preserved (only external <link> is stripped).
+        let withStyle = EmailHTMLWrapper.wrapHTML("<html><head><style>p{color:red}</style>\(gfont)</head><body><p>Hi</p></body></html>")
+        #expect(withStyle.contains("color:red"))
+        #expect(!withStyle.contains("fonts.googleapis.com"))
+    }
+
+    @Test("EmailHTMLWrapper defers remote <img> src so they don't block first paint")
+    func wrapperDefersRemoteImages() {
+        // WebKit holds the first paint until readyState=complete, which waits on
+        // every pending remote image; the Vancouver Sun newsletter's 28 remote
+        // images blocked paint for ~2.7s. Rewriting remote src → data-tmsrc means
+        // the initial document has no pending image loads → instant paint; the real
+        // URLs are auto-swapped back after first paint (deferredImageLoadJS).
+        let html = "<html><body><img src=\"https://cdn.example.com/banner.png\" width=\"600\"><p>Hi</p></body></html>"
+        let out = EmailHTMLWrapper.wrapHTML(html)
+        #expect(out.contains("data-tmsrc=\"https://cdn.example.com/banner.png\""))
+        // Leading space: the original ` src="…"` must be gone. (Can't check
+        // `src="…"` without the space — `data-tmsrc="…"` contains that substring.)
+        #expect(!out.contains(" src=\"https://cdn.example.com/banner.png\""))
+        // Auto-load approach — NO blocking banner (smoke-tested block-with-banner
+        // broke too many messages, 2026-06-17).
+        #expect(!out.contains("tm-remote-banner"))
+    }
+
+    @Test("EmailHTMLWrapper leaves local/cid/data images alone (only remote deferred)")
+    func wrapperKeepsLocalImages() {
+        // cid:, data:, and local scheme-handler images are fast and load-bearing.
+        let html = "<html><body><img src=\"cid:logo123\"><img src=\"data:image/png;base64,AAAA\"></body></html>"
+        let out = EmailHTMLWrapper.wrapHTML(html)
+        #expect(out.contains("src=\"cid:logo123\""))
+        #expect(out.contains("src=\"data:image/png;base64,AAAA\""))
+        #expect(!out.contains("data-tmsrc"))
+    }
+
+    @Test("deferredImageLoadJS auto-swaps data-tmsrc back to src after first paint")
+    func deferredImageSwapScript() {
+        let js = _deferredImageLoadJS
+        // Restores the real URL automatically, only AFTER a paint cycle (double
+        // rAF) so the remote loads can't re-block the first paint. Failsafe timeout.
+        #expect(js.contains("img[data-tmsrc]"))
+        #expect(js.contains("setAttribute('src'"))
+        #expect(js.contains("requestAnimationFrame(function() { requestAnimationFrame(swap)"))
+        #expect(js.contains("setTimeout(swap, 1500)"))
+    }
+
     @Test("EmailHTMLWrapper starts the document hidden (opacity:0)")
     func wrapperStartsHidden() {
         let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
@@ -213,17 +294,22 @@ struct EmailRenderPipelineTests {
         #expect(out.contains("html { overflow-x: hidden !important; opacity: 0;"))
     }
 
-    @Test("fitViewportJS reveals only AFTER the page-scale commit on the widen path")
+    @Test("fitViewportJS reveals only AFTER a paint cycle (no empty-box, no un-scaled blink)")
     func fitRevealsPostCommit() {
         let js = _fitViewportJS
         // reveal() flips opacity to 1 (inline+important beats the stylesheet).
         #expect(js.contains("function reveal()"))
         #expect(js.contains("setProperty('opacity', '1', 'important')"))
-        // The widen path must defer reveal past WebKit's async page-scale commit
-        // via a DOUBLE requestAnimationFrame, so the un-scaled widen frame is
-        // painted while still opacity:0 and never seen. A single rAF (one frame)
-        // can land mid-commit; two cannot.
-        #expect(js.contains("requestAnimationFrame(function() { requestAnimationFrame("))
+        // revealAfterPaint defers the un-hide past WebKit's next compositor frame
+        // via a DOUBLE requestAnimationFrame. This serves both arms: the widen
+        // path's async page-scale commit (never show un-scaled), AND a big doc
+        // revealed early via requestFit whose visible content hasn't painted yet
+        // (never show an empty box). A single rAF can land mid-commit; two can't.
+        #expect(js.contains("function revealAfterPaint()"))
+        #expect(js.contains("requestAnimationFrame(function() { requestAnimationFrame(reveal)"))
+        // Both the no-overflow and widen exits must use the paint-deferred reveal.
+        // (Two call sites; reveal() also called directly on the idempotent/skip exits.)
+        #expect(js.components(separatedBy: "revealAfterPaint();").count - 1 >= 2)
     }
 
     @Test("monitorHeightJS uses ResizeObserver as the primary trigger")

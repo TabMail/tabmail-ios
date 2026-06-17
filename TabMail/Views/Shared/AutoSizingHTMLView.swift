@@ -181,6 +181,7 @@ private struct HTMLWebView: UIViewRepresentable {
         let emlCleanup = WKUserScript(source: cleanupEmlBodyJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let quoteCollapse = WKUserScript(source: collapseQuotesJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let deferImages = WKUserScript(source: deferredImageLoadJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
@@ -191,6 +192,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(emlCleanup)
         config.userContentController.addUserScript(quoteCollapse)
         config.userContentController.addUserScript(icsCollapse)
+        config.userContentController.addUserScript(deferImages)
         config.userContentController.addUserScript(heightMonitor)
         config.userContentController.addUserScript(debugReport)
         config.userContentController.addUserScript(heightDiag)
@@ -492,6 +494,15 @@ private struct HTMLWebView: UIViewRepresentable {
             var rectForLog: CGFloat = 0
             var sourceForLog: String = "RO"
             if let dict = body as? [String: Any] {
+                // First-layout fit request from monitorHeightJS: the body is laid
+                // out (width known) but fit() hasn't run. Run it NOW rather than
+                // waiting for didFinish (which waits on external images), so the
+                // frame is sized + revealed as soon as the width is known. fit()
+                // sets __tmFitDone and re-posts the final height through here.
+                if dict["requestFit"] as? Bool == true {
+                    fit(webView)
+                    return
+                }
                 h = (dict["h"] as? NSNumber).map { CGFloat(truncating: $0) } ?? 0
                 vp = (dict["vp"] as? NSNumber).map { CGFloat(truncating: $0) } ?? 0
                 scrollForLog = (dict["scroll"] as? NSNumber).map { CGFloat(truncating: $0) } ?? h
@@ -1389,6 +1400,40 @@ private let collapseICSJS = """
 /// Exposed as `internal var` (via `_monitorHeightJS` below) for unit tests
 /// to verify the expected JS patterns (ResizeObserver primary, window.__tmLayoutVp
 /// read, payload shape) haven't regressed.
+/// Swap deferred remote images back in AFTER the first paint. `EmailHTMLWrapper`
+/// rewrites remote `<img src/srcset>` → `data-tmsrc/data-tmsrcset` so the initial
+/// document has NO pending image loads — WebKit then paints the text/layout
+/// immediately instead of blocking the first compositor frame on dozens of remote
+/// fetches (the Vancouver Sun 2.7s empty-box; 28 pending images). This restores
+/// the real URLs once the first paint has happened, so images stream in and the
+/// frame grows via the ResizeObserver. (We AUTO-load rather than block-with-banner
+/// — banner-blocking was smoke-tested 2026-06-17 and broke too many messages.)
+/// Exposed for unit tests via `_deferredImageLoadJS`.
+internal var _deferredImageLoadJS: String { deferredImageLoadJS }
+private let deferredImageLoadJS = """
+    (function() {
+        function swap() {
+            var imgs = document.querySelectorAll('img[data-tmsrc],img[data-tmsrcset]');
+            for (var i = 0; i < imgs.length; i++) {
+                var im = imgs[i];
+                var ss = im.getAttribute('data-tmsrcset');
+                if (ss) { im.removeAttribute('data-tmsrcset'); im.setAttribute('srcset', ss); }
+                var s = im.getAttribute('data-tmsrc');
+                if (s) { im.removeAttribute('data-tmsrc'); im.setAttribute('src', s); }
+            }
+        }
+        // Kick off remote loads only AFTER the first paint, so they can't
+        // re-block it. readyState reaches 'complete' fast now (no pending
+        // images); a double rAF lands after the first compositor frame.
+        function arm() { requestAnimationFrame(function() { requestAnimationFrame(swap); }); }
+        if (document.readyState === 'complete') arm();
+        else window.addEventListener('load', arm, { once: true });
+        // Failsafe: images must load even if 'load'/rAF are starved (offscreen
+        // throttling, etc.). swap() is idempotent.
+        setTimeout(swap, 1500);
+    })();
+    """
+
 internal var _monitorHeightJS: String { monitorHeightJS }
 private let monitorHeightJS = """
     (function() {
@@ -1403,7 +1448,22 @@ private let monitorHeightJS = """
             // the first applied height is already the final one. The fallback
             // timer below force-opens the gate if fit() never runs (e.g. webView
             // bounds<50 at load) so the frame can't stay stuck at its seed.
-            if (!window.__tmFitDone) return;
+            if (!window.__tmFitDone) {
+                // Body is laid out (width known) but fit() hasn't run yet. fit()
+                // is normally driven by didFinish, which waits on external
+                // images/subresources — far too late for a big newsletter whose
+                // body lays out in ~100ms but whose images push didFinish to
+                // ~500ms+, leaving the frame stuck at 1px (invisible) the whole
+                // time. Ask Swift to fit NOW, on this first real layout, so the
+                // frame is sized + revealed as soon as the width is known. fit()
+                // then re-posts the final height through this same function
+                // (with __tmFitDone set). Once only — guarded by __tmFitRequested.
+                if (document.body.scrollHeight > 1 && !window.__tmFitRequested) {
+                    window.__tmFitRequested = true;
+                    try { window.webkit.messageHandlers.heightChanged.postMessage({ requestFit: true }); } catch(e) {}
+                }
+                return;
+            }
             var scroll = document.body.scrollHeight;
             var rect = Math.ceil(document.body.getBoundingClientRect().height);
             // Prefer bounding rect (actual rendered height) over scrollHeight
@@ -2029,7 +2089,20 @@ private let fitViewportJS: String = {
         // AFTER WebKit's page-scale commit — the un-scaled widen frame is painted
         // while still opacity:0 and never seen. Inline+important beats the
         // stylesheet's opacity:0.
-        function reveal() { try { document.documentElement.style.setProperty('opacity', '1', 'important'); } catch(_){} }
+        function reveal() {
+            try { document.documentElement.style.setProperty('opacity', '1', 'important'); } catch(_){}
+        }
+        // Reveal AFTER a paint cycle. Setting opacity:1 synchronously at
+        // layout-time shows the box before WebKit has rasterized the visible
+        // content — on a huge/complex doc (Vancouver Sun: 16003px Outlook
+        // newsletter, revealed early via requestFit at readyState=interactive)
+        // that is a visible "empty box at the right height, content paints in
+        // later". A double rAF lands after the next compositor frame, so the
+        // visible tiles are painted before we un-hide. (Offscreen tiles still
+        // paint lazily on scroll — unavoidable and fine.)
+        function revealAfterPaint() {
+            requestAnimationFrame(function() { requestAnimationFrame(reveal); });
+        }
         // IDEMPOTENCY GUARD — this function measures the document and then
         // MUTATES it (meta widen, inline width strips, body padding zeroing).
         // Running it again on an already-widened document re-measures widened
@@ -2165,15 +2238,29 @@ private let fitViewportJS: String = {
         // renders at a consistent scale rather than 0.94× vs 0.80×.
         // Cap at 1200 to avoid extreme shrink on pathologically wide pages.
         var STANDARD_MIN = 400;
-        var contentWidth = Math.ceil(maxRight);
-        if (contentWidth <= vw) {
-            log('no overflow — viewport stays at ' + vw + 'px (content fits)');
+        // Overflow must exceed the viewport by more than a few px to count.
+        // WebKit reports sub-pixel layout widths (e.g. a column at 288.2 in a
+        // 288 viewport), and `Math.ceil` turned 288.2 into 289 > 288 — a FALSE
+        // overflow that then floored to STANDARD_MIN (400) and shrank a
+        // perfectly-fitting email to 0.72x (observed: a 107KB newsletter that
+        // `overflowingDescendants: none` confirmed fits at 288 was widened to
+        // 403 on a second fit and visibly shrank). The slop also stops the
+        // widen loop from creeping ~1px/pass on width:100% content. Genuine
+        // desktop-width emails overflow by 50-130px, far above this slop, so
+        // they still widen; a <=8px overflow clips harmlessly under
+        // html{overflow-x:hidden} instead of over-shrinking the whole email.
+        var OVERFLOW_SLOP = 8;
+        if (maxRight <= vw + OVERFLOW_SLOP) {
+            log('no overflow (maxRight=' + Math.round(maxRight) + ' within ' + OVERFLOW_SLOP + 'px slop of vw=' + vw + ') — staying at 1.0x');
             // Gate is now open; post the (scale-1.0) height immediately so a
             // no-widen email applies its height without waiting on the timers.
             if (window.__tmReportHeight) window.__tmReportHeight();
-            // No scale change on this path — the first paint is already correct,
-            // so reveal immediately (no commit to wait for).
-            reveal();
+            // Reveal AFTER a paint cycle, not synchronously. We reach here as
+            // early as the first layout (requestFit), often at
+            // readyState=interactive — opacity:1 right now shows the box before
+            // WebKit has painted the visible content of a big doc (Vancouver Sun
+            // empty-then-appears). revealAfterPaint waits one compositor frame.
+            revealAfterPaint();
             return false;
         }
         var meta = document.querySelector('meta[name="viewport"]');
@@ -2189,11 +2276,11 @@ private let fitViewportJS: String = {
         //   (1) bounded pass count — `pass < MAX_PASSES` (hard cap);
         //   (2) monotonic non-decreasing target — `targetWidth` is only ever
         //       assigned a strictly larger `want`; the moment a pass asks for
-        //       `want <= targetWidth` (no progress) it breaks. A width:100%
-        //       element fills whatever viewport we set, so its remeasure equals
-        //       targetWidth → immediate break; only FIXED-px content (which does
-        //       not grow with the viewport) drives another pass, and it
-        //       converges in one more pass;
+        //       `want <= targetWidth + OVERFLOW_SLOP` (no material progress) it
+        //       breaks. A width:100% element fills whatever viewport we set, so
+        //       its remeasure is within slop of targetWidth → immediate break;
+        //       only FIXED-px content (which does not grow with the viewport)
+        //       drives another pass, and it converges in one more pass;
         //   (3) absolute ceiling — clamped to 1200, with an explicit break.
         // It never calls fit() (no re-entry), runs entirely between paints (no
         // ResizeObserver/Swift feedback mid-loop), and once it sets
@@ -2203,8 +2290,12 @@ private let fitViewportJS: String = {
         var targetWidth = 0;
         for (var pass = 0; pass < MAX_PASSES; pass++) {
             var want = Math.min(Math.max(Math.ceil(maxRight), STANDARD_MIN), 1200);
-            if (want <= targetWidth) {
-                log('widen stable at ' + targetWidth + 'px after ' + pass + ' pass(es)');
+            // Stop once we're not asking for materially more than already set.
+            // The slop absorbs sub-pixel/ceil creep on width:100% content, which
+            // otherwise re-measures ~1px wider every pass and runs out the whole
+            // pass budget instead of converging in one widen.
+            if (want <= targetWidth + OVERFLOW_SLOP) {
+                if (targetWidth > 0) log('widen stable at ' + targetWidth + 'px after ' + pass + ' pass(es)');
                 break;
             }
             targetWidth = want;
@@ -2259,10 +2350,7 @@ private let fitViewportJS: String = {
         // content (held at opacity:0 since load) is never painted on screen
         // un-scaled. WebKit ignores initial-scale on a runtime meta change, so
         // this opacity hold is what actually kills the blink, not the meta.
-        requestAnimationFrame(function() { requestAnimationFrame(function() {
-            reveal();
-            log('revealed post-widen (rAF2)');
-        }); });
+        revealAfterPaint();
         // Schedule re-measurement reports anchored to the WIDEN event,
         // not to document end. ResizeObserver can fire once mid-reflow
         // with a stale body.scrollHeight (Fireworks repro: RO reports
