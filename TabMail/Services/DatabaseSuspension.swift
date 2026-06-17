@@ -4,6 +4,7 @@
 
 import UIKit
 import GRDB
+import Synchronization
 
 /// Guards against RUNNINGBOARD `0xdead10cc` kills (app suspended while holding
 /// a SQLite file lock) by posting GRDB's `Database.suspendNotification` just
@@ -42,11 +43,25 @@ final class DatabaseSuspension {
     /// quiesce window — the last one out arms it.
     private var backgroundWorkCount = 0
 
+    /// Thread-safe mirror of "is the app foreground/active?", maintained by the
+    /// main-actor lifecycle observers. Read from the **off-main** BGTask
+    /// expiration handlers (`postSuspendImmediately`), which must not touch
+    /// main-thread-only `UIApplication.applicationState`. 0xdead10cc only
+    /// threatens a backgrounded app, so the suspend backstop is gated on this.
+    /// `nonisolated` (a `Sendable` `Mutex`) so the off-main expiration handler
+    /// can read it without hopping to the main actor.
+    private nonisolated static let appActive = Mutex<Bool>(true)
+
     private init() {}
 
     /// Install app lifecycle observers. Call once from
     /// `application(_:didFinishLaunchingWithOptions:)`.
     func start() {
+        // Seed the foreground flag from the actual launch state. A BGTask can
+        // cold-launch a terminated app into `.background`; a normal launch is
+        // `.inactive` transitioning to `.active`. Treat anything but `.background`
+        // as active — `didBecomeActive`/`didEnterBackground` keep it accurate after.
+        Self.appActive.withLock { $0 = UIApplication.shared.applicationState != .background }
         let nc = NotificationCenter.default
         nc.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
@@ -64,11 +79,25 @@ final class DatabaseSuspension {
                 DatabaseSuspension.shared.appWillEnterForeground()
             }
         }
+        // Safety net: resume on activation too. A suspend posted during a
+        // transition (or a BGTask that expired just as the app came forward)
+        // could otherwise strand the database — `willEnterForeground` only fires
+        // on a background→foreground transition, but `didBecomeActive` fires on
+        // every activation (incl. returning from a brief interruption).
+        nc.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                DatabaseSuspension.shared.appDidBecomeActive()
+            }
+        }
     }
 
     // MARK: - App lifecycle
 
     private func appDidEnterBackground() {
+        Self.appActive.withLock { $0 = false }
         // If background work (push/BGTask) is in flight, its endBackgroundWork
         // will arm the window when the last unit finishes.
         guard backgroundWorkCount == 0 else { return }
@@ -76,8 +105,15 @@ final class DatabaseSuspension {
     }
 
     private func appWillEnterForeground() {
+        Self.appActive.withLock { $0 = true }
         cancelQuiesceWindow()
         resumeDatabases(reason: "foreground")
+    }
+
+    private func appDidBecomeActive() {
+        Self.appActive.withLock { $0 = true }
+        cancelQuiesceWindow()
+        resumeDatabases(reason: "didBecomeActive")
     }
 
     // MARK: - Background work units (silent push, BGTasks)
@@ -108,6 +144,18 @@ final class DatabaseSuspension {
     /// it internally. Main-actor bookkeeping follows asynchronously (it only
     /// affects the redundant-post optimization, and posts are idempotent).
     nonisolated static func postSuspendImmediately(reason: String) {
+        // 0xdead10cc only threatens a BACKGROUNDED app — iOS freezes the process
+        // (possibly mid-SQLite-lock) only when it is not active. A BGTask can run
+        // or EXPIRE while the app is in the foreground (user reopened it; debug
+        // simulate; foreground-scheduled task). Suspending then would STRAND the
+        // database: resume fires only on a foreground TRANSITION (willEnterForeground
+        // / didBecomeActive) or the next beginBackgroundWork — none of which happen
+        // if the app never left the foreground — so every later write throws
+        // "Database is suspended" (ADR-IOS-041). Skip the backstop when active.
+        guard !appActive.withLock({ $0 }) else {
+            BackgroundSyncLogger.log("DatabaseSuspension SUSPEND skipped (\(reason)) — app is active")
+            return
+        }
         BackgroundSyncLogger.log("DatabaseSuspension SUSPEND (\(reason))")
         NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
         Task { @MainActor in

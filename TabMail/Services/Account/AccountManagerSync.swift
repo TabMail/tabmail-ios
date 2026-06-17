@@ -110,6 +110,11 @@ extension AccountManager {
             // flip the sync-status subtitle to "failed"; the next cycle retries.
             print("[SyncScheduler] Transient error for \(account.emailAddress) (not surfaced): \(error)")
             return SyncResult(hadChanges: false, failed: false)
+        } catch let error where error.isDatabaseSuspensionAbort {
+            // GRDB write aborted by database suspension (ADR-IOS-041) — benign,
+            // retried on the next wake. Not a sync failure; don't flip the subtitle.
+            print("[SyncScheduler] DB suspended for \(account.emailAddress) (not surfaced): \(error)")
+            return SyncResult(hadChanges: false, failed: false)
         } catch {
             print("[SyncScheduler] Sync failed for \(account.emailAddress): \(error)")
             if !SyncEngine.isConnectionError(error) && !(error is CancellationError) {

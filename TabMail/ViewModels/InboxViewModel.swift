@@ -1239,6 +1239,11 @@ final class InboxViewModel {
             // the next poll/refresh retries. Leave lastSyncFailed unchanged and show
             // no error banner so a single server hiccup doesn't surface to the user.
             print("[Sync] Transient error (not surfaced): \(error)")
+        } catch let error where error.isDatabaseSuspensionAbort {
+            // GRDB write aborted because the database is suspended (ADR-IOS-041).
+            // Benign and expected at a background-suspension instant — retries on
+            // the next wake — so it must NOT surface as a failed sync.
+            print("[Sync] Database suspended (not surfaced): \(error)")
         } catch {
             print("[Sync] Error: \(error)")
             AccountManagerState.shared.lastSyncFailed = true

@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 /// Simple error type for testing string-based error classification.
@@ -203,6 +204,51 @@ struct IsTransientErrorTests {
     func unrelatedError() {
         let error = TestError(description: "Something completely unrelated happened")
         #expect(SyncEngine.isTransientError(error) == false)
+    }
+}
+
+@Suite("Error.isDatabaseSuspensionAbort")
+struct IsDatabaseSuspensionAbortTests {
+
+    // MARK: - True cases (benign — must NOT surface as a sync failure)
+
+    @Test("DatabaseError SQLITE_ABORT (\"Database is suspended\") is a suspension abort — the reported error")
+    func sqliteAbort() {
+        // Mirrors the logged error: "SQLite error 4: Database is suspended" (SQLITE_ABORT = 4).
+        let error = DatabaseError(resultCode: .SQLITE_ABORT, message: "Database is suspended")
+        #expect(error.isDatabaseSuspensionAbort == true)
+    }
+
+    @Test("DatabaseError SQLITE_INTERRUPT is a suspension abort")
+    func sqliteInterrupt() {
+        let error = DatabaseError(resultCode: .SQLITE_INTERRUPT)
+        #expect(error.isDatabaseSuspensionAbort == true)
+    }
+
+    // MARK: - False cases (genuine failures — must still surface)
+
+    @Test("DatabaseError SQLITE_CONSTRAINT is NOT a suspension abort")
+    func sqliteConstraint() {
+        let error = DatabaseError(resultCode: .SQLITE_CONSTRAINT, message: "UNIQUE constraint failed")
+        #expect(error.isDatabaseSuspensionAbort == false)
+    }
+
+    @Test("DatabaseError SQLITE_ERROR is NOT a suspension abort")
+    func sqliteError() {
+        let error = DatabaseError(resultCode: .SQLITE_ERROR, message: "no such table")
+        #expect(error.isDatabaseSuspensionAbort == false)
+    }
+
+    @Test("A non-DatabaseError with a lookalike message is NOT a suspension abort (type-checked, not string-matched)")
+    func nonDatabaseErrorLookalike() {
+        let error = TestError(description: "Database is suspended")
+        #expect(error.isDatabaseSuspensionAbort == false)
+    }
+
+    @Test("ProviderError.networkError(503) is NOT a suspension abort")
+    func providerNetworkError() {
+        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503))
+        #expect(error.isDatabaseSuspensionAbort == false)
     }
 }
 
