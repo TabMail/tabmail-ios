@@ -80,7 +80,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // A push can arrive during the one-time migration window; wait
                 // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
                 await AppStartup.shared.awaitReady()
-                NSEDataBridge.mergeNSEStagingData()
+                await NSEDataBridge.mergeNSEStagingData()
                 await SyncScheduler.shared.syncStartup(inboxOnly: true)
             }
             return []  // Suppress — user is already in the app

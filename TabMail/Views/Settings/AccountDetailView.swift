@@ -107,7 +107,7 @@ struct AccountDetailView: View {
                         }
                     } else {
                         Button {
-                            navigationStore.setPrimaryAccount(account)
+                            Task { await navigationStore.setPrimaryAccount(account) }
                             account.isPrimary = true
                         } label: {
                             Text("Make Primary")

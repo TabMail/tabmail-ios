@@ -204,18 +204,25 @@ enum NSEDataBridge {
         return try? DatabaseQueue(path: stagingPath, configuration: config)
     }
 
-    static func mergeNSEStagingData() {
+    static func mergeNSEStagingData(stagingPathOverride: String? = nil) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         print("[NSEDataBridge] mergeNSEStagingData: START")
 
-        guard let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroupId
-        ) else {
-            print("[NSEDataBridge] mergeNSEStagingData: no app group container")
-            return
+        // Production reads the App Group staging DB. Tests inject a path: the
+        // unit-test host has no app-group entitlement, so `containerURL` returns
+        // nil and the real merge would otherwise bail before exercising anything.
+        let stagingPath: String
+        if let stagingPathOverride {
+            stagingPath = stagingPathOverride
+        } else {
+            guard let containerURL = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: appGroupId
+            ) else {
+                print("[NSEDataBridge] mergeNSEStagingData: no app group container")
+                return
+            }
+            stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
         }
-
-        let stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
         guard FileManager.default.fileExists(atPath: stagingPath) else {
             print("[NSEDataBridge] mergeNSEStagingData: no staging DB file — nothing to merge")
             return
@@ -253,7 +260,8 @@ enum NSEDataBridge {
 
         // Decode a JSON-array column, tolerating nil / malformed / non-array
         // content (e.g. legacy rows written before the column existed).
-        func decodeJSONArray(_ s: String?) -> [String] {
+        // @Sendable: captured by the (now async) `nseDB.read` closure.
+        @Sendable func decodeJSONArray(_ s: String?) -> [String] {
             guard let s, !s.isEmpty,
                   let data = s.data(using: .utf8),
                   let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else {
@@ -269,7 +277,7 @@ enum NSEDataBridge {
         // `nse_processed_message` simply stay in staging and retry next wake.
         let processed: [StagedMessage]
         do {
-            processed = try nseDB.read { db in
+            processed = try await nseDB.read { db in
                 try Row.fetchAll(db, sql: "SELECT * FROM nse_processed_message WHERE populated = 1").map { row in
                     StagedMessage(
                         id: row["id"],
@@ -356,7 +364,17 @@ enum NSEDataBridge {
             var outerCommitted = false
 
             do {
-                try AppDatabase.dbPool.write { db in
+                // Async overload (foreground-hang fix): SUSPENDS the caller
+                // instead of BLOCKING the thread, so a foreground-return merge no
+                // longer freezes the @MainActor caller while this write waits
+                // behind concurrent sync/backfill writes on GRDB's single writer
+                // connection (the writer-serialization wait is uncapped by
+                // busyMode). The @Sendable closure can't capture mutable outer
+                // state, so the per-message accumulators are built INSIDE and
+                // returned, then assigned to successfullyMergedIds/ftsBatch below.
+                let writeResult: (ids: [String], fts: [(headerId: String, textContent: String)]) = try await AppDatabase.dbPool.write { db in
+                    var localMergedIds: [String] = []
+                    var localFtsAccumulator: [(headerId: String, textContent: String)] = []
                     for msg in processed {
                         // Per-message savepoint: a single bad row (FK
                         // violation, ThreadUtils throw, FTS contention, etc.)
@@ -528,8 +546,8 @@ enum NSEDataBridge {
                             }
                             // Savepoint committed — promote local FTS batch
                             // and record id for post-tx delete.
-                            successfullyMergedIds.append(msg.id)
-                            ftsBatch.append(contentsOf: localFtsBatch)
+                            localMergedIds.append(msg.id)
+                            localFtsAccumulator.append(contentsOf: localFtsBatch)
                         } catch {
                             // inSavepoint already rolled back the savepoint
                             // and re-threw the error; the outer transaction
@@ -539,11 +557,15 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
+                    return (ids: localMergedIds, fts: localFtsAccumulator)
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
-                // is durable. Set the flag so the post-tx staging delete and
-                // FTS flush + badge update can proceed.
+                // is durable. Assign the returned accumulators, then set the flag
+                // so the post-tx staging delete + FTS flush + badge update can
+                // proceed.
+                successfullyMergedIds = writeResult.ids
+                ftsBatch = writeResult.fts
                 outerCommitted = true
                 print("[NSEDataBridge] mergeNSEStagingData: \(successfullyMergedIds.count)/\(processed.count) committed")
 
@@ -594,8 +616,11 @@ enum NSEDataBridge {
                 // retry; sync's update-existing path will also overwrite the
                 // corresponding main-GRDB row regardless).
                 do {
-                    try nseDB.write { db in
-                        for id in successfullyMergedIds {
+                    // Immutable copy so the (now async) @Sendable write closure
+                    // doesn't capture the mutable `successfullyMergedIds`.
+                    let idsToDelete = successfullyMergedIds
+                    try await nseDB.write { db in
+                        for id in idsToDelete {
                             try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
                         }
                     }
@@ -635,13 +660,14 @@ enum NSEDataBridge {
         let orphanThresholdSeconds: TimeInterval = 60
         let orphanCutoff = Date().timeIntervalSince1970 - orphanThresholdSeconds
         do {
-            var reaped = 0
-            try nseDB.write { db in
+            // Return the count from the (now async) @Sendable write closure
+            // rather than mutating a captured outer var.
+            let reaped = try await nseDB.write { db -> Int in
                 try db.execute(sql: """
                     DELETE FROM nse_processed_message
                     WHERE populated = 0 AND processedAt < ?
                     """, arguments: [orphanCutoff])
-                reaped = db.changesCount
+                return db.changesCount
             }
             if reaped > 0 {
                 print("[NSEDataBridge] Orphan reap: deleted \(reaped) stale placeholder(s) older than \(Int(orphanThresholdSeconds))s")

@@ -260,7 +260,7 @@ struct MailNavigationView: View {
                                 }
                                 .contextMenu {
                                     Button {
-                                        navigationStore.setFavorite(folder, isFavorite: false)
+                                        Task { await navigationStore.setFavorite(folder, isFavorite: false) }
                                     } label: {
                                         Label("Remove from Favorites", systemImage: "star.slash")
                                     }
@@ -373,7 +373,7 @@ struct MailNavigationView: View {
                                 }
                                 .contextMenu {
                                     Button {
-                                        navigationStore.toggleFavorite(folder)
+                                        Task { await navigationStore.toggleFavorite(folder) }
                                     } label: {
                                         if folder.isFavorite {
                                             Label("Remove from Favorites", systemImage: "star.slash")
@@ -649,7 +649,7 @@ struct MailNavigationView: View {
         // messageId can exist in multiple folders under Gmail's label model
         // — the tap always means "open the inbox row".
         Task { @MainActor in
-            NSEDataBridge.mergeNSEStagingData()
+            await NSEDataBridge.mergeNSEStagingData()
             let compositeId: String? = try? await AppDatabase.dbPool.read { db in
                 try MessageHeader
                     .filter(Column("messageId") == messageId && Column("isInInbox") == true)

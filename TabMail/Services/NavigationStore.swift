@@ -231,33 +231,35 @@ final class NavigationStore {
         }
     }
 
-    /// Toggle favorite status for a folder.
-    // Sync write on MainActor — intentional. Rare settings operation (single-row UPDATE),
-    // negligible contention risk. Async would risk UI state desync if user navigates away.
-    func toggleFavorite(_ folder: Folder) {
-        try? AppDatabase.dbPool.write { db in
+    /// Toggle favorite status for a folder. Async: the write runs OFF the main
+    /// actor (the `await` overload suspends, never blocks) so it can't freeze the
+    /// UI when a sync / backfill / merge write is in flight on GRDB's single
+    /// writer connection. The UPDATE is a single atomic row write (the toggle
+    /// happens in SQL), so there is no read-decide-write race across the suspension.
+    func toggleFavorite(_ folder: Folder) async {
+        try? await AppDatabase.dbPool.write { db in
             try db.execute(sql: "UPDATE folder SET isFavorite = NOT isFavorite WHERE id = ?", arguments: [folder.id])
         }
-        Task { [weak self] in await self?.refreshFolders() }
+        await refreshFolders()
     }
 
-    /// Set favorite status for a folder.
-    // Sync write on MainActor — intentional. See toggleFavorite comment.
-    func setFavorite(_ folder: Folder, isFavorite: Bool) {
-        try? AppDatabase.dbPool.write { db in
+    /// Set favorite status for a folder. Async — see `toggleFavorite`.
+    func setFavorite(_ folder: Folder, isFavorite: Bool) async {
+        try? await AppDatabase.dbPool.write { db in
             try db.execute(sql: "UPDATE folder SET isFavorite = ? WHERE id = ?", arguments: [isFavorite, folder.id])
         }
-        Task { [weak self] in await self?.refreshFolders() }
+        await refreshFolders()
     }
 
-    /// Set an account as primary (only one at a time).
-    // Sync write on MainActor — intentional. See toggleFavorite comment.
-    func setPrimaryAccount(_ account: Account) {
-        try? AppDatabase.dbPool.write { db in
+    /// Set an account as primary (only one at a time). Async — see `toggleFavorite`.
+    /// Both UPDATEs run in ONE write transaction, so "clear all, then set one"
+    /// stays atomic — there is never a committed state with zero or two primaries.
+    func setPrimaryAccount(_ account: Account) async {
+        try? await AppDatabase.dbPool.write { db in
             try db.execute(sql: "UPDATE account SET isPrimary = 0 WHERE isPrimary = 1")
             try db.execute(sql: "UPDATE account SET isPrimary = 1 WHERE id = ?", arguments: [account.id])
         }
-        Task { [weak self] in await self?.refresh() }
+        await refresh()
     }
 
 }

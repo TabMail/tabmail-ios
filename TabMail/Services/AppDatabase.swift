@@ -148,7 +148,15 @@ final class AppDatabase: Sendable {
             print("[AppDatabase] App Group container not available — NSE staging DB not created")
             return
         }
-        let path = url.appendingPathComponent("nse_staging.sqlite").path
+        createNSEStagingDB(atPath: url.appendingPathComponent("nse_staging.sqlite").path)
+    }
+
+    /// Schema-creation core, parameterized by path. Production resolves the App
+    /// Group container path via `createNSEStagingDBIfNeeded`; the NSE-merge unit
+    /// tests (whose host has no app-group entitlement, so the container path is
+    /// unavailable) build a real staging DB at a temp path so they can drive the
+    /// real `NSEDataBridge.mergeNSEStagingData`.
+    static func createNSEStagingDB(atPath path: String) {
         var config = Configuration()
         config.busyMode = .timeout(2)
         // 0xdead10cc defense (ADR-IOS-041). Non-WAL queue: ALL accesses abort

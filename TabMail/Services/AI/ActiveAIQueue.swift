@@ -707,7 +707,7 @@ actor ActiveAIQueue {
             }
             // Phase 2 — if NSE finished, merge and see if our job is now done.
             if AIOwnershipLease.hasResult(db: nseDB, accountId: accountId, messageId: messageId) {
-                NSEDataBridge.mergeNSEStagingData()
+                await NSEDataBridge.mergeNSEStagingData()
                 if let updated = try? await dbPool.read({ db in
                     try MessageHeader.fetchOne(db, key: job.headerId)
                 }) {

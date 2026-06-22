@@ -899,7 +899,7 @@ actor PushNotificationService {
             print("[Push] Task alarm wake — evaluating tasks")
             BackgroundSyncLogger.log("SilentPush TASK_ALARM — evaluating tasks then delta sync")
             BackgroundSyncLogger.logPush("TASK_ALARM — evaluating tasks then delta sync")
-            NSEDataBridge.mergeNSEStagingData()
+            await NSEDataBridge.mergeNSEStagingData()
             await TaskEvaluationService.shared.evaluate()
             await SyncScheduler.shared.backgroundPoll()
             return .newData
@@ -910,7 +910,7 @@ actor PushNotificationService {
             print("[Push] NSE follow-up — merging staging data + heavy AI work")
             BackgroundSyncLogger.log("SilentPush NSE_FOLLOWUP — merge + reply precompute + FTS + tags")
             BackgroundSyncLogger.logPush("NSE_FOLLOWUP — heavy AI work")
-            NSEDataBridge.mergeNSEStagingData()
+            await NSEDataBridge.mergeNSEStagingData()
             // Sync first to persist MessageHeaders, then AI queue picks up reply precomputation
             await SyncScheduler.shared.syncStartup(
                 inboxOnly: true,

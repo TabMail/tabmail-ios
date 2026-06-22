@@ -16,6 +16,18 @@
 
 ---
 
+## Foreground-return UI freeze — main-actor DB ops must not block (2026-06-21)
+
+**Symptom:** multi-second-to-~20s UI freeze on foreground-return for users who open the app rarely. **Root-cause class:** a *synchronous* GRDB op on the `@MainActor` blocks the main thread for the full duration of whatever is in flight on `DatabasePool`'s contended connection — when background maintenance (multi-account sync + backfill + FTS reindex + AI) over the EXISTING mailbox saturates the connection at foreground return. The new-mail catch-up is only hundreds of rows; the contention is maintenance over the archive.
+
+- **Writes are the unmitigated hazard.** ONE serialized writer connection — no pool. A synchronous `@MainActor` `dbPool.write` waits behind any in-flight write, **uncapped by `busyMode`**. The op's own row work is trivial (5k rows ≈ 163ms); the freeze is the contention wait transmitted 1:1 to the main thread. **Fix: the async `await dbPool.write` overload** — it suspends the caller (main actor stays live) while the write runs on GRDB's own writer queue. Validated RED→GREEN in `NSEMergeMainActorBlockTests` (sync: 0 `@MainActor` heartbeats during a 2.9s merge under a real 18k-row maintenance write; async: ~149).
+- **Reads are mitigated by `maximumReaderCount = 64`** (vs observed concurrent-reader ceiling ~15; raised from 10 after a 6.7s `fetchPage` block — see the `makePool` comment). A synchronous `@MainActor` `dbPool.read` only blocks if all 64 readers are held. The 64-pool is the *workaround*; async reads are the *root fix* (suspend, not block, regardless of pool size). **Keep the 64-pool as a backstop** even after converting reads.
+- **Converted (off-main async writes):** `NSEDataBridge.mergeNSEStagingData` (fg-return write — now `async`, 7 callers `await`) and `NavigationStore.toggleFavorite/setFavorite/setPrimaryAccount` (sidebar writes — now `async`, 3 SwiftUI callers `Task { await }`). Each is an atomic single-transaction write (no read-decide-write across the suspension → no TOCTOU). **Data-integrity note:** GRDB transactions stay atomic whether sync or async — async NEVER splits a transaction. The only new surface is main-actor reentrancy during the suspension, safe when read-decide-write stays inside one `write {}` and callers `await` to preserve ordering (e.g. merge-before-sync).
+- **Deliberately NOT converted (cost/risk > benefit):** `InboxViewModel.fetchPage` (hot inbox path under the SwiftUI mutation-safety rules — converting risks inbox crashes; already pool-mitigated), `NavigationStore.loadInitialData` (runs pre-contention on cold launch), `ComposeView.optimisticDeleteDraftHeader` (would need `send()` async → double-send risk on the outbox-critical path + delete-before-dismiss ordering). Convert these only with device-log evidence of a real block.
+- **Test seam:** `NSEDataBridge.mergeNSEStagingData(stagingPathOverride:)` + `AppDatabase.createNSEStagingDB(atPath:)` let unit tests (host has no app-group entitlement) drive the REAL merge against a temp staging DB. Freeze probe: count `@MainActor` heartbeat ticks during the op — a max-gap *duration* metric has a resume race (post-unblock heartbeat resume vs the test reading it → false negatives). NB: an `await clock.measure { }` wrapper hops execution off the main actor and masks the freeze; call the op DIRECTLY.
+
+---
+
 ## OAuth / Google Cloud
 
 - **iOS OAuth client ID**: iOS type, bundle ID `ai.tabmail.ios`, stored in `Secrets.xcconfig`

@@ -170,7 +170,7 @@ final class SyncScheduler {
         // 0. Merge NSE staging data FIRST — before any sync or AI processing.
         // This imports AI results computed by the NSE so the main app doesn't re-process them.
         // Also mirror lastHistoryIds so subsequent NSE invocations have fresh cursors.
-        NSEDataBridge.mergeNSEStagingData()
+        await NSEDataBridge.mergeNSEStagingData()
         NSEDataBridge.mirrorLastHistoryIds()
         stepLog("step0 NSE merge + mirror")
 
@@ -363,7 +363,7 @@ final class SyncScheduler {
                 // (before the pool was exposed), so there's nothing to await here.
                 // Merge NSE staging data FIRST — before sync, before UI reload.
                 // This imports AI results and inbox removals so the UI shows them immediately.
-                NSEDataBridge.mergeNSEStagingData()
+                await NSEDataBridge.mergeNSEStagingData()
                 fgStep("outer NSE merge")
                 // Reload UI immediately — NSE merge + background push may have new data.
                 // Don't wait for reconnect+poll (can take 60s+).
