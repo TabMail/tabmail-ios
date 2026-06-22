@@ -477,7 +477,20 @@ final class AppStartup {
                 print("[AppStartup] Orphan demo wipe failed: \(error)")
             }
         }
-        AppDatabase.createNSEStagingDBIfNeeded()
+        // The NSE staging DB is a SEPARATE App-Group `DatabaseQueue` (not the main
+        // pool — the 64-reader backstop does nothing for it), and creating it runs a
+        // write transaction (CREATE TABLE + additive ALTERs) on EVERY launch.
+        // `busyMode = .timeout(2)` (AppDatabase.createNSEStagingDB) means that write
+        // can block up to 2s on the cross-process file lock if the NSE is mid-write
+        // on a push at the moment we foreground — a hard main-thread block behind the
+        // splash. Run it off the main actor (same posture as the pool build and the
+        // `DemoSeed.wipe` above) so the lock wait never lands on the UI thread. Still
+        // `await`ed so it completes before `dbReady` — push / NSE-merge waiters resume
+        // there and read this DB. `mirrorAllState` stays on the main actor: it's
+        // pool-mitigated reads in the pre-contention window, deliberately not converted.
+        await Task.detached(priority: .userInitiated) {
+            AppDatabase.createNSEStagingDBIfNeeded()
+        }.value
         NSEDataBridge.mirrorAllState()
 
         // DB is usable — unblock everything parked in `awaitReady()` (background
