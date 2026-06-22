@@ -827,11 +827,22 @@ enum NSEDataBridge {
             // delete below.
             do {
                 try AppDatabase.dbPool.write { db in
+                    // Deterministic id + INSERT OR IGNORE (data-integrity fix).
+                    // A background `task_alarm` merge (`actor PushNotificationService`,
+                    // off the main actor) can run CONCURRENTLY with a foreground
+                    // merge; both read THIS staging row before either deletes it.
+                    // A fresh `UUID()` would write TWO identical task-result turns
+                    // into chat history (this is the only non-idempotent write in
+                    // the merge). A stable id from the (AUTOINCREMENT, never-reused)
+                    // staging-row id + firing timestamp makes the second writer's
+                    // insert a no-op, so exactly one turn lands. The staging DB and
+                    // chatTurn DB are wiped together on uninstall, so the row id
+                    // can't collide with a turn from a prior install.
                     try db.execute(sql: """
-                        INSERT INTO chatTurn (id, timestamp, role, content, type, chars)
+                        INSERT OR IGNORE INTO chatTurn (id, timestamp, role, content, type, chars)
                         VALUES (?, ?, 'assistant', ?, 'task', ?)
                         """, arguments: [
-                            UUID().uuidString,
+                            "nse-task-\(result.id)-\(result.timestamp)",
                             result.timestamp,
                             result.result,
                             result.result.count

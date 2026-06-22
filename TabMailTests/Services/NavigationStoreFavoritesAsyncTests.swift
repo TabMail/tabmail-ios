@@ -41,9 +41,9 @@ struct NavigationStoreFavoritesAsyncTests {
             return prev
         }
         try pool.writeWithoutTransaction { db in
-            var a1 = Account(emailAddress: "a1@gmail.com", displayName: "A1", provider: .gmail); a1.id = "acc1"
+            var a1 = Account(emailAddress: "a1@example.com", displayName: "A1", provider: .gmail); a1.id = "acc1"
             try a1.insert(db)
-            var a2 = Account(emailAddress: "a2@gmail.com", displayName: "A2", provider: .gmail); a2.id = "acc2"
+            var a2 = Account(emailAddress: "a2@example.com", displayName: "A2", provider: .gmail); a2.id = "acc2"
             try a2.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
         }

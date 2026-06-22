@@ -84,7 +84,7 @@ struct NSEMergeMainActorBlockTests {
         // Seed the account + INBOX folder the merge's insert path expects
         // (FK accountId -> account; inbox detection for the recount).
         try pool.writeWithoutTransaction { db in
-            var acc = Account(emailAddress: "user@gmail.com", displayName: "Test", provider: .gmail)
+            var acc = Account(emailAddress: "user@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
             try acc.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
@@ -105,7 +105,7 @@ struct NSEMergeMainActorBlockTests {
                         (id, accountId, accountEmail, provider, messageId, rfc822MessageId,
                          folderPath, subject, senderName, senderEmail, snippet, date,
                          processedAt, populated)
-                    VALUES (?, 'acc1', 'user@gmail.com', 'gmail', ?, ?, 'INBOX', ?,
+                    VALUES (?, 'acc1', 'user@example.com', 'gmail', ?, ?, 'INBOX', ?,
                             'Alice', 'alice@example.com', 'snippet preview', ?, ?, 1)
                     """, arguments: [
                         "acc1:msg-\(i)", "msg-\(i)", "rfc-\(i)@example.com",
@@ -196,16 +196,82 @@ struct NSEMergeMainActorBlockTests {
         }
         #expect(merged == stagedCount, "merge should insert all \(stagedCount) staged headers, got \(merged)")
 
+        // Guard the test actually created contention — the merge must have WAITED
+        // behind the maintenance write (else mergeWallMs is tiny and the
+        // responsiveness check is vacuous). 18k header+body rows reliably hold the
+        // writer >0.5s on the simulator.
+        #expect(mergeWallMs > 500, "test did not create writer contention (merge wall \(mergeWallMs)ms)")
+
         // The merge's write still WAITS behind the maintenance write (GRDB's
         // writer is serial — unavoidable; see merge wall-clock). What must NOT
-        // happen is the MAIN ACTOR being frozen for that wait. `maxFreezeMs` is
-        // the longest the UI was unresponsive: ≈ the maintenance duration with
-        // the synchronous (buggy) merge, ~tens of ms with the async fix. The
-        // freeze tracks the writer-hold 1:1, so device-class contention (slower
-        // I/O + a larger archive) freezes the UI proportionally longer.
+        // happen is the MAIN ACTOR being frozen for that wait. A responsive main
+        // actor ticks the ~20ms heartbeat ~mergeWallMs/20 times during the merge
+        // (~140 over ~2.9s); a frozen one ticks ~0. A fixed floor of 10 (=200ms of
+        // responsiveness) cleanly separates the two without the expectedTicks/4
+        // degenerate-to-0 window when mergeWallMs is small.
         #expect(
-            ticksDuringMerge > expectedTicks / 4,
-            "main actor was STARVED: only \(ticksDuringMerge) heartbeats during a \(mergeWallMs)ms merge (expected ~\(expectedTicks)) — the merge blocked the UI"
+            ticksDuringMerge > 10,
+            "main actor was STARVED: only \(ticksDuringMerge) heartbeats during a \(mergeWallMs)ms merge (~\(expectedTicks) expected if responsive) — the merge blocked the UI"
         )
+
+        // Drain the merge's fire-and-forget side-effect Tasks (recountInboxFolders,
+        // .inboxDataDidChange) against the TEST database BEFORE `defer` restores
+        // AppDatabase.shared. Otherwise a late recount reads AppDatabase.dbPool
+        // (force-unwraps `shared!`) after it's been restored to nil and crashes the
+        // whole test process (CLAUDE.md Testing Rule 9).
+        try? await Task.sleep(for: .milliseconds(300))
+    }
+
+    /// Data-integrity regression: a background `task_alarm` merge can run
+    /// concurrently with a foreground merge and both read the same
+    /// `nse_pending_task_result` row before either deletes it. The pre-fix code
+    /// inserted the result turn with a fresh `UUID()`, so the two writers produced
+    /// TWO identical `chatTurn` rows. The fix uses a deterministic id derived from
+    /// the staging row + `INSERT OR IGNORE`. This test simulates the overlap by
+    /// consuming the SAME staging row twice and asserts exactly ONE turn lands.
+    @Test("Task-result consumption dedups to ONE chatTurn (deterministic id, not UUID)")
+    func taskResultConsumptionIsIdempotent() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let stagingPath = dir.appendingPathComponent("nse_staging.sqlite").path
+        AppDatabase.createNSEStagingDB(atPath: stagingPath)
+
+        // Stage the SAME task-result row (explicit id=1 + fixed timestamp) so both
+        // merge passes see identical content — exactly what two concurrent merges
+        // reading the row before either deletes it would see.
+        func stageTaskResult() throws {
+            let q = try DatabaseQueue(path: stagingPath)
+            try q.write { db in
+                try db.execute(sql: """
+                    INSERT INTO nse_pending_task_result (id, taskName, taskInstruction, result, timestamp)
+                    VALUES (1, 'Daily digest', 'summarize inbox', 'Your daily digest is ready.', ?)
+                    """, arguments: [1_710_000_000.0])
+            }
+        }
+
+        func taskTurnCount() async throws -> Int {
+            try await pool.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM chatTurn WHERE type = 'task'") ?? 0
+            }
+        }
+
+        // First merge: consumes the row -> one turn, staging row deleted.
+        try stageTaskResult()
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: stagingPath)
+        let after1 = try await taskTurnCount()
+        #expect(after1 == 1, "first merge should write exactly one task chatTurn, got \(after1)")
+
+        // Re-stage the identical row and merge again (the "second concurrent merge"
+        // that read the same row). With the UUID bug this produced a 2nd turn;
+        // with the deterministic id + INSERT OR IGNORE it must stay at one.
+        try stageTaskResult()
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: stagingPath)
+        let after2 = try await taskTurnCount()
+        #expect(after2 == 1, "re-consuming the same task result must dedup to ONE chatTurn, got \(after2)")
+
+        try? await Task.sleep(for: .milliseconds(300))   // drain fire-and-forget tasks before teardown
     }
 }
