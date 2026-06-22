@@ -160,4 +160,20 @@ struct RFC5322ParseTests {
         let decoded = RFC5322Parse.decodeRFC2047("Hello =?UTF-8?B?5pel5pys?= World")
         #expect(decoded == "Hello 日本 World")
     }
+
+    @Test("decodeRFC2047 merges adjacent encoded-words, dropping fold whitespace")
+    func rfc2047AdjacentWordsMerge() {
+        // RFC 2047 §6.2: linear whitespace between two adjacent encoded-words is
+        // removed. Covers both a plain space and a CRLF+SPACE fold (the form our
+        // own RFC2047 encoder emits for long subjects).
+        #expect(RFC5322Parse.decodeRFC2047("=?UTF-8?B?5pel?= =?UTF-8?B?5pys?=") == "日本")
+        #expect(RFC5322Parse.decodeRFC2047("=?UTF-8?B?5pel?=\r\n =?UTF-8?B?5pys?=") == "日本")
+    }
+
+    @Test("decodeRFC2047 keeps whitespace between an encoded-word and plain text")
+    func rfc2047WhitespaceWithPlainTextPreserved() {
+        // Only inter-encoded-word whitespace is dropped; spacing around plain
+        // text must survive.
+        #expect(RFC5322Parse.decodeRFC2047("=?UTF-8?B?5pel?= and =?UTF-8?B?5pys?=") == "日 and 本")
+    }
 }

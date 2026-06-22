@@ -33,7 +33,13 @@ enum GmailParse {
             return nil
         }
 
-        let subject = header("Subject") ?? ""
+        // RFC 2047-decode the Subject. The Gmail REST API does not document
+        // whether it decodes encoded-words in `payload.headers[].value`, so we
+        // decode defensively: this is a no-op when the value is already plain
+        // text (no `=?…?=`), and it keeps our own RFC 2047-encoded sent subjects
+        // (see RFC2047.encodeHeaderValue) — and any encoded incoming subject —
+        // rendering correctly instead of as literal `=?UTF-8?B?…?=`.
+        let subject = RFC5322Parse.decodeRFC2047(header("Subject") ?? "")
         let fromRaw = header("From") ?? ""
         let toRaw = header("To") ?? ""
         let ccRaw = header("Cc") ?? ""

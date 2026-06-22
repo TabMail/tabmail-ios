@@ -124,9 +124,19 @@ enum RFC5322Parse {
 
         var out = ""
         var cursor = 0
+        var prevWasEncodedWord = false
         for m in matches {
             if m.range.location > cursor {
-                out += ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+                let between = ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+                // RFC 2047 §6.2: linear whitespace separating two adjacent
+                // encoded-words is removed on decode (it only existed to allow
+                // folding). Whitespace between an encoded-word and plain text is
+                // preserved.
+                let isInterWordFold = prevWasEncodedWord
+                    && between.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if !isInterWordFold {
+                    out += between
+                }
             }
             let charsetName = ns.substring(with: m.range(at: 1))
             let enc = ns.substring(with: m.range(at: 2)).uppercased()
@@ -146,6 +156,7 @@ enum RFC5322Parse {
                 out += payload
             }
             cursor = m.range.location + m.range.length
+            prevWasEncodedWord = true
         }
         if cursor < ns.length {
             out += ns.substring(with: NSRange(location: cursor, length: ns.length - cursor))

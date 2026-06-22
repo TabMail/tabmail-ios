@@ -1416,7 +1416,7 @@ actor GmailProvider: EmailProvider {
         }
     }
 
-    private func buildRFC822(draft: DraftMessage) -> String {
+    func buildRFC822(draft: DraftMessage) -> String {
         var lines: [String] = []
         // Include Message-ID so Gmail preserves our rfc822MessageId. Without this,
         // Gmail assigns its own, breaking rfc822MessageId-based UID remap detection
@@ -1427,7 +1427,7 @@ actor GmailProvider: EmailProvider {
         }
         lines.append("To: \(draft.to.joined(separator: ", "))")
         if !draft.cc.isEmpty { lines.append("Cc: \(draft.cc.joined(separator: ", "))") }
-        lines.append("Subject: \(draft.subject)")
+        lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
             lines.append("In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")")
         }
@@ -1461,7 +1461,7 @@ actor GmailProvider: EmailProvider {
     /// Build a MIME multipart message with attachments for Gmail API.
     /// Calendar invitations (isAlternative=true) use multipart/alternative structure
     /// so Gmail/Outlook render Accept/Decline buttons instead of a generic .ics attachment.
-    private func buildMIMEMessage(draft: DraftMessage) -> Data {
+    func buildMIMEMessage(draft: DraftMessage) -> Data {
         let boundary = "TabMail-Boundary-\(UUID().uuidString)"
         let hasAlternative = draft.attachments.contains { $0.isAlternative }
         let regularAttachments = draft.attachments.filter { !$0.isAlternative }
@@ -1475,7 +1475,7 @@ actor GmailProvider: EmailProvider {
         }
         message += "To: \(draft.to.joined(separator: ", "))\r\n"
         if !draft.cc.isEmpty { message += "Cc: \(draft.cc.joined(separator: ", "))\r\n" }
-        message += "Subject: \(draft.subject)\r\n"
+        message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
             message += "In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")\r\n"
         }
