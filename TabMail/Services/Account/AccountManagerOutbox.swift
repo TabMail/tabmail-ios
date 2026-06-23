@@ -14,11 +14,81 @@ extension AccountManager {
     /// then fires off a drain attempt. Throws if persistence fails — caller MUST
     /// surface the error to the user so the message is not silently lost.
     /// Returns the created outboxId so the caller can pass it to PendingSendService.
-    /// Nonisolated: GRDB write is thread-safe; callers don't need an actor hop.
+    ///
+    /// `async`: the persistence runs through the ASYNC `dbPool.write` overload (in
+    /// `persistQueuedSend`), so the `@MainActor` caller (`ComposeView.send`) is
+    /// SUSPENDED — not blocked — while the single serialized writer is busy with a
+    /// background write. A *synchronous* write here was the compose-dismiss freeze:
+    /// the writer-serialization wait was transmitted 1:1 to the main thread (2–3 s
+    /// on a contended writer). See PROJECT_MEMORY "Foreground-return UI freeze".
+    ///
+    /// Double-send firewall: if an in-flight (`.queued`/`.sending`) outbox row for
+    /// this `draftId` already exists — a rapid double-tap, or async reentrancy
+    /// during the now-suspended dismiss window — NO second row is created; the
+    /// existing id is returned. (This is the persistence-layer guarantee; the UI
+    /// `isSending` guard in ComposeView is the first line of defense.)
     @discardableResult
-    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftId: String) throws -> String {
-        var outbox = OutboxMessage(
+    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftId: String) async throws -> String {
+        let result = try await Self.persistQueuedSend(
+            draft: draft,
             accountId: account.id,
+            replyToHeaderId: replyToHeaderId,
+            isForward: isForward,
+            serverDraftId: serverDraftId,
+            draftId: draftId
+        )
+        if DebugModeManager.isLoggingEnabled() {
+            if result.deduped {
+                print("[Outbox] Deduped duplicate send for draftId=\(draftId) → existing outbox id=\(result.outboxId)")
+            } else {
+                print("[Outbox] Queued send to \(draft.to.joined(separator: ", ")) (id: \(result.outboxId))")
+            }
+        }
+
+        NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+        if let resolvedOriginalId = result.resolvedOriginalId {
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+            // Notify MessageDetailViewModel so reply/forward indicator updates immediately
+            NotificationCenter.default.post(name: .messageDataDidChange, object: resolvedOriginalId)
+        }
+        Task { await self.drainOutbox() }
+        return result.outboxId
+    }
+
+    /// In-flight outbox row id for `draftId`, or nil. The double-send firewall
+    /// predicate: dedup ONLY against non-terminal (`.queued`/`.sending`) rows. A
+    /// `.failed` row does NOT block — re-sending an explicitly-failed draft is
+    /// legitimate user intention, not a duplicate. MUST be called inside the same
+    /// write transaction as the insert so two concurrent sends can't both pass it
+    /// (GRDB serializes writers → the 2nd transaction sees the 1st's row).
+    nonisolated static func inFlightOutboxId(forDraftId draftId: String, db: Database) throws -> String? {
+        try OutboxMessage
+            .filter(Column("draftId") == draftId)
+            .filter([OutboxStatus.queued.rawValue, OutboxStatus.sending.rawValue].contains(Column("status")))
+            .fetchOne(db)?
+            .id
+    }
+
+    /// Pure persistence step of a queued send — the SINGLE SOURCE OF TRUTH for
+    /// "turn this draft into (at most) one outbox row", with NO drain side effects
+    /// (so tests can drive it deterministically). Saves attachments to disk
+    /// (outside the txn), then in ONE async write transaction either dedups against
+    /// an existing in-flight row (the firewall) or inserts the new row and applies
+    /// optimistic isReplied/isForwarded to the original message.
+    ///
+    /// Returns the id of the outbox row that now represents this send (the freshly
+    /// inserted one, or the pre-existing in-flight one when deduped), whether it
+    /// deduped, and the resolved original-header id for the reply/forward badge.
+    nonisolated static func persistQueuedSend(
+        draft: DraftMessage,
+        accountId: String,
+        replyToHeaderId: String?,
+        isForward: Bool,
+        serverDraftId: String?,
+        draftId: String
+    ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) {
+        var outbox = OutboxMessage(
+            accountId: accountId,
             draft: draft,
             originalMessageHeaderId: replyToHeaderId,
             isForward: isForward
@@ -33,21 +103,30 @@ extension AccountManager {
             SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds
         )
 
-        let resolvedOriginalId: String?
+        // Save attachments to disk first (outside DB transaction — a file I/O
+        // failure must not leave an outbox row pointing at a half-written dir).
+        if !draft.attachments.isEmpty {
+            try OutboxMessage.saveAttachments(draft.attachments, dirName: outbox.id)
+        }
+
+        // Capture immutable, Sendable values for the @Sendable async write closure.
+        let outboxToInsert = outbox
+        let inReplyTo = draft.inReplyTo
+        let hadAttachments = !draft.attachments.isEmpty
         do {
-            // Save attachments to disk first (outside DB transaction)
-            if !draft.attachments.isEmpty {
-                try OutboxMessage.saveAttachments(draft.attachments, dirName: outbox.id)
-            }
-            resolvedOriginalId = try AppDatabase.dbPool.write { db in
-                try outbox.insert(db)
+            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) in
+                // FIREWALL: an in-flight row for this draft already exists (double
+                // tap / async reentrancy). Do NOT insert a second row.
+                if let existingId = try inFlightOutboxId(forDraftId: draftId, db: db) {
+                    return (existingId, true, nil)
+                }
+                try outboxToInsert.insert(db)
                 // Optimistic isReplied/isForwarded — matches markRead/archive pattern.
                 // Server state overwrites on next sync (~90s). No rollback needed.
-                guard let originalId = replyToHeaderId else { return nil }
-                let original = try Self.resolveOriginalMessage(
-                    originalId: originalId, inReplyTo: draft.inReplyTo, db: db
-                )
-                guard let original else { return nil }
+                guard let originalId = replyToHeaderId else { return (outboxToInsert.id, false, nil) }
+                guard let original = try resolveOriginalMessage(
+                    originalId: originalId, inReplyTo: inReplyTo, db: db
+                ) else { return (outboxToInsert.id, false, nil) }
                 if isForward {
                     try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
                 } else {
@@ -61,24 +140,20 @@ extension AccountManager {
                         )
                     }
                 }
-                return original.id
+                return (outboxToInsert.id, false, original.id)
             }
-            print("[Outbox] Queued send to \(draft.to.joined(separator: ", ")) (id: \(outbox.id), holdUntil: \(outbox.holdUntil?.description ?? "nil"))")
+            // Deduped → the attachments dir we just wrote (named by the discarded
+            // new outbox.id) is orphaned; clean it up. The kept (existing) row owns
+            // its own dir from its original queueSend.
+            if result.deduped, hadAttachments {
+                outbox.deleteAttachments()
+            }
+            return result
         } catch {
-            print("[Outbox] ERROR: Failed to queue send: \(error)")
-            // Clean up attachments if DB insert failed
+            // Clean up attachments if DB insert failed.
             outbox.deleteAttachments()
             throw error
         }
-
-        NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
-        if let resolvedOriginalId {
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-            // Notify MessageDetailViewModel so reply/forward indicator updates immediately
-            NotificationCenter.default.post(name: .messageDataDidChange, object: resolvedOriginalId)
-        }
-        Task { await self.drainOutbox() }
-        return outbox.id
     }
 
     /// Generate an RFC822 Message-ID for a given sender email address.

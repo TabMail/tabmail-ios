@@ -21,15 +21,29 @@ actor DraftStore {
     /// existing `await DraftStore.shared.save(...)` call sites keep working
     /// (await on a nonisolated throwing func is a no-op).
     nonisolated func save(_ draft: Draft) throws {
-        try AppDatabase.dbPool.write { db in
-            var d = draft
-            // Mark dirty if previously pushed (needs re-push to server)
-            if d.serverPushStatus == "pushed" {
-                d.serverPushStatus = "dirty"
-            }
-            try d.save(db)
-        }
+        try AppDatabase.dbPool.write { db in try Self.applySave(draft, db: db) }
         print("[DraftStore] Saved draft id=\(draft.id)")
+    }
+
+    /// Async sibling of `save` — routes through the ASYNC `dbPool.write` overload
+    /// so a `@MainActor` caller (ComposeView.send / saveDraftAndDismiss) is
+    /// suspended, not blocked, while the single serialized writer is busy. Same
+    /// transaction body as `save` (shared via `applySave`). See the compose-dismiss
+    /// freeze note in PROJECT_MEMORY ("Foreground-return UI freeze").
+    nonisolated func saveAsync(_ draft: Draft) async throws {
+        try await AppDatabase.dbPool.write { db in try Self.applySave(draft, db: db) }
+        print("[DraftStore] Saved draft (async) id=\(draft.id)")
+    }
+
+    /// The save transaction body, shared by the sync + async overloads so they
+    /// can never drift. Marks the draft dirty if it was previously pushed.
+    private static func applySave(_ draft: Draft, db: Database) throws {
+        var d = draft
+        // Mark dirty if previously pushed (needs re-push to server)
+        if d.serverPushStatus == "pushed" {
+            d.serverPushStatus = "dirty"
+        }
+        try d.save(db)
     }
 
     // MARK: - Load
@@ -48,16 +62,29 @@ actor DraftStore {
     /// Delete a draft and its associated chat turns.
     /// Nonisolated: same rationale as `save` and `load`.
     nonisolated func delete(id: String) throws {
-        try AppDatabase.dbPool.write { db in
-            // Delete the draft record
-            _ = try Draft.deleteOne(db, key: id)
-            // Delete associated chat turns (sessionId = "compose:{draftKey}")
-            let sessionId = "compose:\(id)"
-            _ = try ChatTurn.filter(Column("sessionId") == sessionId).deleteAll(db)
-        }
+        try AppDatabase.dbPool.write { db in try Self.applyDelete(id: id, db: db) }
         // Also clean up attachments on disk if any were saved under draftId.
         DraftAttachmentStorage.deleteAttachments(dirName: id)
         print("[DraftStore] Deleted draft + turns for id=\(id)")
+    }
+
+    /// Async sibling of `delete` — routes through the ASYNC `dbPool.write` overload
+    /// so a `@MainActor` caller (ComposeView discard/close) is suspended, not
+    /// blocked, while the single serialized writer is busy. Same transaction body
+    /// as `delete` (shared via `applyDelete`).
+    nonisolated func deleteAsync(id: String) async throws {
+        try await AppDatabase.dbPool.write { db in try Self.applyDelete(id: id, db: db) }
+        DraftAttachmentStorage.deleteAttachments(dirName: id)
+        print("[DraftStore] Deleted draft + turns (async) for id=\(id)")
+    }
+
+    /// The delete transaction body, shared by the sync + async overloads.
+    private static func applyDelete(id: String, db: Database) throws {
+        // Delete the draft record
+        _ = try Draft.deleteOne(db, key: id)
+        // Delete associated chat turns (sessionId = "compose:{draftKey}")
+        let sessionId = "compose:\(id)"
+        _ = try ChatTurn.filter(Column("sessionId") == sessionId).deleteAll(db)
     }
 
     /// Delete a draft by its key (without deleting chat turns).

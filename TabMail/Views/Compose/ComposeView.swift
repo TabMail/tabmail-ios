@@ -419,7 +419,7 @@ struct ComposeView: View {
 
                 // Layer 2: Close/Send — below chat when expanded
                 HStack {
-                    Button("Close") { closeCompose() }
+                    Button("Close") { Task { await closeCompose() } }
                         .font(.subheadline)
                     Spacer()
                     if isSending {
@@ -601,7 +601,7 @@ struct ComposeView: View {
             }
             .alert("Save Draft?", isPresented: $showDiscardPrompt) {
                 Button("Save") { Task { await saveDraftAndDismiss() } }
-                Button("Discard", role: .destructive) { discardDraftAndDismiss() }
+                Button("Discard", role: .destructive) { Task { await discardDraftAndDismiss() } }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("You have unsaved changes. Save as draft?")
@@ -611,10 +611,10 @@ struct ComposeView: View {
                     Button("Use Suggestion & Send") {
                         messageBody = currentSuggestion ?? ""
                         showingSuggestion = false
-                        send()
+                        Task { await send() }
                     }
                 }
-                Button("Send Anyway") { send() }
+                Button("Send Anyway") { Task { await send() } }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 if showingSuggestion, currentSuggestion != nil {
@@ -1189,7 +1189,7 @@ struct ComposeView: View {
 
     /// Handle close button: prompt Save/Discard/Cancel when there are actual changes.
     /// Draft is saved BEFORE dismiss (persist before acknowledge).
-    private func closeCompose() {
+    private func closeCompose() async {
         let hasContent = !subject.isEmpty || !messageBody.isEmpty || !toTokens.isEmpty
             || !attachments.isEmpty
         let hasChanges = subject != initialSubject || messageBody != initialBody
@@ -1198,9 +1198,10 @@ struct ComposeView: View {
         if hasContent && hasChanges {
             showDiscardPrompt = true
         } else {
-            // No content or no changes — just dismiss (delete empty draft if it exists)
+            // No content or no changes — just dismiss (delete empty draft if it exists).
+            // Async delete so the main actor isn't blocked behind a busy writer.
             if !hasContent {
-                do { try DraftStore.shared.delete(id: draftId) }
+                do { try await DraftStore.shared.deleteAsync(id: draftId) }
                 catch { print("[ComposeView] Failed to delete draft: \(error)") }
             }
             dismiss()
@@ -1290,7 +1291,7 @@ struct ComposeView: View {
                 return d
             }()
 
-            try DraftStore.shared.save(draftToSave)
+            try await DraftStore.shared.saveAsync(draftToSave)
             print("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(existing?.serverPushStatus ?? "nil")")
             // Queue server push via PendingOperation (crash-safe, retries on failure).
             // queueDraftSave also refreshes the Drafts-folder MessageHeader's snippet
@@ -1304,7 +1305,7 @@ struct ComposeView: View {
         }
     }
 
-    private func discardDraftAndDismiss() {
+    private func discardDraftAndDismiss() async {
         // Cancel any in-flight agent edit so autoSaveDraft doesn't recreate the draft.
         let sessionKey = "compose:\(draftId)"
         let session = ChatPillState.shared.session(for: sessionKey)
@@ -1313,12 +1314,16 @@ struct ComposeView: View {
         ActiveAgentTracker.shared.clearWorking(sessionKey)
         ChatPillState.shared.removeSession(for: sessionKey)
 
-        // Load draft info before deleting — needed for server-side cleanup + optimistic UI removal
-        let draftRecord = try? AppDatabase.dbPool.read { db in
-            try Draft.fetchOne(db, key: draftId)
+        // Load draft info before deleting — needed for server-side cleanup + optimistic UI removal.
+        // Async read/write so the main actor isn't blocked behind a busy writer (compose-dismiss
+        // freeze class) — this delete was a synchronous main-actor write on the discard path.
+        // `draftId` (MainActor-isolated) is captured into a local for the @Sendable closure.
+        let draftKey = draftId
+        let draftRecord = try? await AppDatabase.dbPool.read { db in
+            try Draft.fetchOne(db, key: draftKey)
         }
 
-        do { try DraftStore.shared.delete(id: draftId) }
+        do { try await DraftStore.shared.deleteAsync(id: draftId) }
         catch { print("[ComposeView] Failed to discard draft: \(error)") }
         // Optimistic removal + server cleanup
         if let draftRecord {
@@ -1589,10 +1594,19 @@ struct ComposeView: View {
             showEmptyBodyPrompt = true
             return
         }
-        send()
+        Task { await send() }
     }
 
-    private func send() {
+    private func send() async {
+        // Reentrancy / double-send guard. Once we commit to sending we flip
+        // `isSending` (swaps the Send button for a spinner), so a second tap
+        // cannot fire a second send during the now-SUSPENDING async persistence.
+        // Before the async conversion, the synchronous writes blocked the main
+        // thread, which implicitly prevented a second tap; suspending the main
+        // actor reopens that window, so the guard is mandatory. The persistence
+        // firewall (queueSend dedups on draftId) is the backstop. `isSending` is
+        // reset on every early-return / error path below so the user can retry.
+        guard !isSending else { return }
         guard let account = resolvedAccount else {
             sendError = "No account available to send from."
             return
@@ -1619,6 +1633,11 @@ struct ComposeView: View {
             return
         }
 
+        // All synchronous validation passed — commit to sending. From here every
+        // early return MUST reset `isSending` (only the success path keeps the
+        // spinner, since the view then dismisses).
+        isSending = true
+
         let (sendBody, isHTML) = buildSendBody()
         let draft = DraftMessage(
             to: finalTo,
@@ -1632,8 +1651,11 @@ struct ComposeView: View {
         )
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
-        let draftRecord = try? AppDatabase.dbPool.read { db in
-            try Draft.fetchOne(db, key: draftId)
+        // Async read so the main actor isn't blocked behind a busy writer. `draftId`
+        // (MainActor-isolated) is captured into a local for the @Sendable closure.
+        let draftKey = draftId
+        let draftRecord = try? await AppDatabase.dbPool.read { db in
+            try Draft.fetchOne(db, key: draftKey)
         }
 
         // Save-before-send — uses the existing draft infra so Undo-Send can
@@ -1678,7 +1700,7 @@ struct ComposeView: View {
             draft.rfc822MessageId = draftRecord?.rfc822MessageId
             draft.attachmentsDirName = dirName
 
-            try DraftStore.shared.save(draft)
+            try await DraftStore.shared.saveAsync(draft)
         } catch {
             // Non-fatal: send still proceeds, but Undo-reopen may not work.
             print("[ComposeView] WARNING: Failed to save draft for Undo-reopen: \(error)")
@@ -1688,7 +1710,7 @@ struct ComposeView: View {
         // If persistence fails, show error — do NOT dismiss or the message is lost.
         let outboxId: String
         do {
-            outboxId = try AccountManager.shared.queueSend(
+            outboxId = try await AccountManager.shared.queueSend(
                 draft: draft,
                 from: account,
                 replyToHeaderId: replyTo?.id,
@@ -1697,6 +1719,10 @@ struct ComposeView: View {
                 draftId: draftId
             )
         } catch {
+            // Persistence failed — the message is NOT queued. Re-enable Send so the
+            // user can retry (their last chance to preserve the message; never
+            // dismiss on failure — Outbox Reliability Rule 1).
+            isSending = false
             sendError = "Failed to save message to outbox: \(error.localizedDescription)"
             // Report to the agent tool (if any) before returning so the LLM
             // sees the structured failure instead of the eventual `.cancelled`
@@ -1713,13 +1739,13 @@ struct ComposeView: View {
         // undos, first autosave after reopen recreates the header.
         if let draftRecord {
             if let serverId = draftRecord.serverDraftId {
-                optimisticDeleteDraftHeader(serverDraftId: serverId, accountId: draftRecord.accountId, rfc822MessageId: draftRecord.rfc822MessageId)
+                await optimisticDeleteDraftHeader(serverDraftId: serverId, accountId: draftRecord.accountId, rfc822MessageId: draftRecord.rfc822MessageId)
                 Task { await AccountManager.shared.queueDraftDelete(serverDraftId: serverId, accountId: draftRecord.accountId, rfc822MessageId: draftRecord.rfc822MessageId) }
             } else if let rfc822 = draftRecord.rfc822MessageId {
                 Task { await AccountManager.shared.removeOptimisticDraftHeader(accountId: draftRecord.accountId, rfc822MessageId: rfc822) }
             }
         } else if let serverHeader = serverDraftHeader {
-            optimisticDeleteDraftHeader(serverDraftId: serverHeader.stableId, accountId: serverHeader.accountId, rfc822MessageId: serverHeader.rfc822MessageId)
+            await optimisticDeleteDraftHeader(serverDraftId: serverHeader.stableId, accountId: serverHeader.accountId, rfc822MessageId: serverHeader.rfc822MessageId)
             Task { await AccountManager.shared.queueDraftDelete(serverDraftId: serverHeader.stableId, accountId: serverHeader.accountId, rfc822MessageId: serverHeader.rfc822MessageId) }
         }
 
@@ -1749,33 +1775,41 @@ struct ComposeView: View {
         dismiss()
     }
 
-    /// Synchronously delete the draft's MessageHeader from the local DB and immediately
-    /// dismiss it from the list (no debounce) so the draft is gone before compose closes.
+    /// Delete the draft's MessageHeader from the local DB and immediately dismiss it
+    /// from the list (no debounce) so the draft is gone before compose closes.
     /// Tries multiple strategies: exact PK from serverDraftHeader, constructed PK from
     /// serverDraftId, and rfc822MessageId query. For Gmail, the serverDraftId (draft
     /// resource ID) differs from the MessageHeader's messageId (Gmail message ID), so
     /// the PK-based delete may miss — the rfc822MessageId fallback catches it.
-    // Sync writeWithoutTransaction on MainActor — intentional. Draft header must be removed
-    // from DB before UI dismisses to prevent stale data flash (persist-before-acknowledge).
-    private func optimisticDeleteDraftHeader(serverDraftId: String, accountId: String, rfc822MessageId: String?) {
-        var deletedIds: [String] = []
-        try? AppDatabase.dbPool.writeWithoutTransaction { db in
+    ///
+    /// `async`: routes through the ASYNC `dbPool.write` overload so the `@MainActor`
+    /// `send()` is suspended (not blocked) while the writer is busy — this was one of
+    /// the three sequential synchronous writes that froze compose-dismiss for 2–3 s.
+    /// The await still completes BEFORE `send()` calls `dismiss()`, preserving
+    /// persist-before-acknowledge (no stale-row flash). The closure RETURNS the
+    /// deleted ids (Sendable) rather than capturing-and-mutating a `var`, which the
+    /// async/@Sendable closure forbids. The original `serverDraftHeader?.id` (a
+    /// MainActor-isolated view property) is captured into a local before the await.
+    private func optimisticDeleteDraftHeader(serverDraftId: String, accountId: String, rfc822MessageId: String?) async {
+        let exactHeaderId = serverDraftHeader?.id
+        let deletedIds: [String] = (try? await AppDatabase.dbPool.write { db -> [String] in
+            var ids: [String] = []
             let draftsFolder = try Folder
                 .filter(Column("accountId") == accountId && Column("role") == FolderRole.drafts.rawValue)
                 .fetchOne(db)
             // Strategy 1: delete by exact header PK from the snapshot the user was viewing
-            if let exactId = serverDraftHeader?.id {
-                if try MessageHeader.deleteOne(db, key: exactId) {
-                    _ = try? MessageBody.deleteOne(db, key: exactId)
-                    deletedIds.append(exactId)
+            if let exactHeaderId {
+                if try MessageHeader.deleteOne(db, key: exactHeaderId) {
+                    _ = try? MessageBody.deleteOne(db, key: exactHeaderId)
+                    ids.append(exactHeaderId)
                 }
             }
             // Strategy 2: delete by constructed PK from serverDraftId
             if let folderPath = draftsFolder?.path {
                 let headerId = "\(accountId):\(folderPath):\(serverDraftId)"
-                if !deletedIds.contains(headerId), try MessageHeader.deleteOne(db, key: headerId) {
+                if !ids.contains(headerId), try MessageHeader.deleteOne(db, key: headerId) {
                     _ = try? MessageBody.deleteOne(db, key: headerId)
-                    deletedIds.append(headerId)
+                    ids.append(headerId)
                 }
             }
             // Strategy 3: delete by rfc822MessageId (catches Gmail where serverDraftId
@@ -1784,13 +1818,14 @@ struct ComposeView: View {
                 let matches = try MessageHeader
                     .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822)
                     .fetchAll(db)
-                for header in matches where !deletedIds.contains(header.id) {
+                for header in matches where !ids.contains(header.id) {
                     _ = try? MessageBody.deleteOne(db, key: header.id)
                     try header.delete(db)
-                    deletedIds.append(header.id)
+                    ids.append(header.id)
                 }
             }
-        }
+            return ids
+        }) ?? []
         // Immediate dismiss from list + trigger reload.
         for id in deletedIds {
             NotificationCenter.default.post(name: .messageDismissedFromDetail, object: id)
