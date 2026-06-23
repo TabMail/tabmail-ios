@@ -8,6 +8,14 @@ import Foundation
 /// Configurable mock EmailProvider for testing services that depend on email operations.
 /// Records all method calls for assertion. Can be configured to throw errors or return specific results.
 actor MockEmailProvider: EmailProvider {
+    // MARK: - Stale-detection window mode (configurable per test; .uid mimics IMAP)
+
+    nonisolated let staleWindowMode: StaleWindowMode
+
+    init(staleWindowMode: StaleWindowMode = .date) {
+        self.staleWindowMode = staleWindowMode
+    }
+
     // MARK: - Call Recording
 
     var callLog: [String] = []

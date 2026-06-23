@@ -11,6 +11,7 @@ struct DebugMenuView: View {
     @State private var reminderTestStatus: String?
     @State private var showTouchRings = TouchVisualizer.shared.isEnabled
     @State private var demoEnterError: String?
+    @State private var stuckScanStatus: String?
     @Environment(NavigationStore.self) private var navigationStore
 
     var body: some View {
@@ -71,6 +72,27 @@ struct DebugMenuView: View {
                     Label("Reset Sync Progress", systemImage: "arrow.counterclockwise")
                 }
                 Text("Resets backfill cursors and completion flags for all folders. Messages are preserved — only sync progress is cleared.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Stuck Message Diagnostics") {
+                Button {
+                    Task {
+                        stuckScanStatus = "Scanning…"
+                        await StuckMessageDiagnostics.run()
+                        stuckScanStatus = "Done — share the report below."
+                    }
+                } label: {
+                    Label("Scan for Stuck Messages", systemImage: "stethoscope")
+                }
+                if let stuckScanStatus {
+                    Text(stuckScanStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                LogShareButton(title: "Stuck Message Report", filename: "stuck_messages.txt", readLog: { BackgroundSyncLogger.readStuckDiagLog() }, clearLog: { BackgroundSyncLogger.clearStuckDiagLog() })
+                Text("Read-only scan for messages that are searchable but can't open / have no snippet / aren't in their folder. Nothing is modified. Run the scan, then share the report.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -148,6 +170,7 @@ struct DebugMenuView: View {
                     BackgroundSyncLogger.clearPushLog()
                     BackgroundSyncLogger.clearInboxLog()
                     BackgroundSyncLogger.clearBodyRenderLog()
+                    BackgroundSyncLogger.clearStuckDiagLog()
                 } label: {
                     Label("Clear All Logs", systemImage: "trash")
                 }

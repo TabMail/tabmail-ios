@@ -127,9 +127,21 @@ protocol MessageExistenceProbe: Sendable {
     func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool
 }
 
+/// How a provider's windowed `fetchMessages(limit:)` orders its results, which
+/// determines the safe dimension for stale-detection's "overlap window".
+/// - `.uid`: IMAP returns the highest UIDs (archive-time order, DECORRELATED from
+///   message date). The stale window MUST be UID-based — a date-based window
+///   over-deletes when an old-dated message is archived into a fresh high UID.
+/// - `.date`: Gmail/Exchange return the most recent by date → date-based window.
+enum StaleWindowMode: Sendable { case uid, date }
+
 protocol EmailProvider: Sendable {
     func connect() async throws
     func disconnect() async throws
+
+    /// Fetch-ordering dimension for stale-detection windowing. Defaults to `.date`
+    /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
+    var staleWindowMode: StaleWindowMode { get }
 
     /// Mark the provider's connections as potentially stale. Called on session start
     /// (foreground return, BGAppRefresh, push wakeup). IMAP providers drain and reseed
@@ -195,6 +207,10 @@ protocol EmailProvider: Sendable {
 extension EmailProvider {
     /// Default no-op for HTTP-based providers (Gmail, Exchange) — ephemeral sessions have no stale connections.
     func markDirty() async {}
+
+    /// HTTP providers (Gmail, Exchange) return most-recent-by-date → date window.
+    /// IMAP overrides to `.uid`.
+    var staleWindowMode: StaleWindowMode { .date }
 
     /// Default sequential implementation. IMAP overrides with batched single-connection fetch.
     ///

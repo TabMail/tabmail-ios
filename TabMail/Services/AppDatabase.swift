@@ -334,6 +334,26 @@ final class AppDatabase: Sendable {
         try migrator.migrate(writer)
     }
 
+    /// One-time heal for ADR-IOS-042 (IMAP Archive "missing months" data-loss):
+    /// reset backfill state so affected folders RE-WALK and re-fetch the headers the
+    /// pre-fix date-window stale detection deleted. Now that stale detection uses a
+    /// UID window (`SyncEngine.selectStaleHeaders`), the re-fetched mail survives.
+    /// Scope: archive-role folders on IMAP accounts only — Gmail/Exchange use a
+    /// date-ordered fetch (never affected) and inbox/sent/trash are chronological
+    /// (UID≈date, never affected). Shared by the v59 migration and its test so the
+    /// scoping SQL has a single source. Returns the number of folders reset.
+    @discardableResult
+    static func rewalkImapArchiveFolders(_ db: Database) throws -> Int {
+        try db.execute(sql: """
+            UPDATE folder SET
+                backfillComplete = 0,
+                backfillUidCursor = NULL
+            WHERE role = ?
+              AND accountId IN (SELECT id FROM account WHERE provider = ?)
+            """, arguments: [FolderRole.archive.rawValue, AccountProvider.imap.rawValue])
+        return db.changesCount
+    }
+
     // MARK: - Migration Definitions
 
     static func registerAllMigrations(on migrator: inout DatabaseMigrator) {
@@ -1664,6 +1684,21 @@ final class AppDatabase: Sendable {
             let healed = db.changesCount
             if healed > 0 {
                 print("[v58] Resynced tagSortOrder on \(healed) row(s)")
+            }
+        }
+
+        // v59: Heal the IMAP Archive "missing months" data-loss (ADR-IOS-042). The
+        // pre-fix stale detection used a DATE overlap window on IMAP's UID-ordered
+        // fetch, so archiving an old-dated email (fresh high UID) dragged the date
+        // floor back and deleted mid-range months from the Archive folder. The code
+        // fix (SyncEngine.selectStaleHeaders → UID window) stops further deletion;
+        // this one-time reset re-walks the affected folders so the deleted headers are
+        // re-fetched from the server and now survive. Ships in the SAME build as the
+        // fix — without the fix, the re-walked mail would just be deleted again.
+        migrator.registerMigration("v59_rewalkImapArchiveAfterStaleWindowFix") { db in
+            let reset = try AppDatabase.rewalkImapArchiveFolders(db)
+            if reset > 0 {
+                print("[v59] Reset backfill for \(reset) IMAP archive folder(s) — re-fetching stale-window-deleted mail")
             }
         }
     }

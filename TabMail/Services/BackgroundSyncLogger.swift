@@ -366,6 +366,36 @@ enum BackgroundSyncLogger {
         try? "".write(to: bodyRenderFileURL, atomically: true, encoding: .utf8)
     }
 
+    // MARK: - Stuck Message Diagnostics Log
+
+    /// Dedicated channel for `StuckMessageDiagnostics` — the read-only scan for
+    /// "searchable but can't open / no snippet / not in its folder" rows. Only
+    /// written by the Debug-menu scan; debug-gated per CLAUDE.md rule 12.
+    private static let stuckDiagFileName = "stuck_messages.log"
+
+    private static var stuckDiagFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TabMail", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(stuckDiagFileName)
+    }
+
+    static func logStuckDiag(_ message: String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let entry = "[\(Date().iso8601String())] \(message)\n"
+        print("[StuckDiag] \(message)")
+        appendAsync(to: stuckDiagFileURL, entry: entry)
+    }
+
+    static func readStuckDiagLog() -> String {
+        flushPendingWrites()
+        return (try? String(contentsOf: stuckDiagFileURL, encoding: .utf8)) ?? "(no stuck-message diagnostics — run the scan from the Debug menu)"
+    }
+
+    static func clearStuckDiagLog() {
+        try? "".write(to: stuckDiagFileURL, atomically: true, encoding: .utf8)
+    }
+
     // MARK: - Body double-escape detector (pure / ungated — unit-testable)
 
     /// True when `html` is ALREADY double-escaped — it contains `&amp;amp;`,

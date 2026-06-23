@@ -13,6 +13,10 @@ struct IMAPFolderStatus: Sendable {
 }
 
 actor IMAPProvider: EmailProvider, MessageExistenceProbe {
+    /// IMAP `fetchMessages(limit:)` returns the highest UIDs (archive-time order,
+    /// decorrelated from message date) → stale detection must use a UID window.
+    nonisolated var staleWindowMode: StaleWindowMode { .uid }
+
     private let host: String
     private let port: Int
     private let username: String

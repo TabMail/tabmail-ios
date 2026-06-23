@@ -63,14 +63,13 @@ private func simulateRunSyncMessages(
     folder: Folder,
     messages: [MessageHeaderInfo],
     limit: Int,
-    undoProtectedIds: Set<String> = []
+    undoProtectedIds: Set<String> = [],
+    windowMode: StaleWindowMode = .date
 ) throws -> (newHeaders: [MessageHeader], staleIds: [String]) {
     let folderPath = folder.path
     let folderId = folder.id
     let accountId = folder.accountId
     let isInInbox = folder.role == .inbox
-
-    let remoteIds = Set(messages.map(\.messageId))
 
     return try db.write { dbConn in
         // Load pending operations
@@ -102,19 +101,12 @@ private func simulateRunSyncMessages(
         var newHeaders: [MessageHeader] = []
         var staleIds: [String] = []
 
-        // Stale detection
-        let stale: [MessageHeader]
-        if messages.count < limit {
-            let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
-            stale = allLocal.filter { !remoteIds.contains($0.messageId) }
-        } else if let fetchCutoff = messages.min(by: { $0.date < $1.date })?.date {
-            let candidates = try MessageHeader
-                .filter(Column("folderId") == folderId && Column("date") >= fetchCutoff)
-                .fetchAll(dbConn)
-            stale = candidates.filter { !remoteIds.contains($0.messageId) }
-        } else {
-            stale = []
-        }
+        // Stale detection — delegate to the production source of truth
+        // (SyncEngine.selectStaleHeaders) so this harness can never drift from
+        // real sync behavior. windowMode selects the UID (IMAP) vs date window.
+        let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
+        let stale = SyncEngine.selectStaleHeaders(
+            candidates: allLocal, fetched: messages, limit: limit, windowMode: windowMode)
 
         let protectedIds = pendingAllIds.union(undoProtectedIds)
         let isProtected: (MessageHeader) -> Bool = { msg in
@@ -504,7 +496,7 @@ struct E2ESyncOptimisticUITests {
 
         // Delete PendingOperation on success
         try await db.write { dbConn in
-            try PendingOperation.deleteOne(dbConn, key: opId)
+            _ = try PendingOperation.deleteOne(dbConn, key: opId)
         }
 
         // 4. Verify
@@ -553,7 +545,7 @@ struct E2ESyncOptimisticUITests {
 
         // 3. Drain
         try await provider.markRead(ids: ["100"], folder: "INBOX")
-        try await db.write { try PendingOperation.deleteOne($0, key: opId) }
+        try await db.write { _ = try PendingOperation.deleteOne($0, key: opId) }
 
         // 4. Verify
         let header = try await db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:100") }
@@ -597,7 +589,7 @@ struct E2ESyncOptimisticUITests {
 
         // 3. Drain
         try await provider.markFlagged(ids: ["100"], flagged: true, folder: "INBOX")
-        try await db.write { try PendingOperation.deleteOne($0, key: opId) }
+        try await db.write { _ = try PendingOperation.deleteOne($0, key: opId) }
 
         // 4. Verify
         let header = try await db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:100") }
@@ -653,7 +645,7 @@ struct E2ESyncOptimisticUITests {
 
         // 3. Drain
         try await provider.move(ids: ["100"], from: "Archive", to: "INBOX")
-        try await db.write { try PendingOperation.deleteOne($0, key: opId) }
+        try await db.write { _ = try PendingOperation.deleteOne($0, key: opId) }
 
         // 4. Verify
         let inboxCount = try await db.read { try MessageHeader.filter(Column("folderId") == "acc1:INBOX").fetchCount($0) }
@@ -878,6 +870,137 @@ struct E2ESyncProviderCallOrderingTests {
         #expect(log[0] == "fetchMessage(id:100,folder:INBOX)")
         #expect(log[1] == "fetchMessage(id:101,folder:INBOX)")
         #expect(log[2] == "fetchMessage(id:102,folder:INBOX)")
+    }
+}
+
+// MARK: - Stale-detection window (Archive month-gap data-loss regression)
+
+/// Regression for the IMAP Archive "missing months" data-loss bug.
+///
+/// Full-sync fetches only the newest `limit` messages, then stale-deletes local rows
+/// that fall *inside the fetched slice* but aren't in the server's response. The
+/// slice MUST be measured in the provider's fetch-ordering dimension. IMAP returns
+/// the highest UIDs (= archive-time), which is DECORRELATED from message date:
+/// archiving an OLD-dated email gives it a fresh HIGH UID. A *date* window then lets
+/// that one old-dated row drag the floor backwards and falsely delete every
+/// mid-range message the fetch never returned — wiping whole months from Archive.
+///
+/// These drive the production source of truth `SyncEngine.selectStaleHeaders`
+/// (via `simulateRunSyncMessages`), so they fail if anyone reverts IMAP to a date
+/// window or reintroduces a divergent copy of the logic.
+@Suite("E2E Sync — Stale Window (Archive month-gap data-loss)")
+struct StaleDetectionWindowTests {
+    private func daysAgo(_ d: Int) -> Date {
+        Calendar.current.date(byAdding: .day, value: -d, to: Date())!
+    }
+
+    /// Decorrelated Archive: two mid-range rows (mid UID / mid date), two recent rows
+    /// (high UID / recent date), and one just-archived OLD-dated row (HIGHEST UID /
+    /// OLDEST date — the date-floor poison).
+    @discardableResult
+    private func seedArchive(_ db: DatabaseQueue) throws -> Folder {
+        try TestDatabase.insertAccount(db, id: "acc1", provider: .imap)
+        let archive = try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+        try TestDatabase.insertMessageHeader(db, messageId: "100", date: daysAgo(40), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a100@example.com>")
+        try TestDatabase.insertMessageHeader(db, messageId: "101", date: daysAgo(38), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a101@example.com>")
+        try TestDatabase.insertMessageHeader(db, messageId: "200", date: daysAgo(5), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a200@example.com>")
+        try TestDatabase.insertMessageHeader(db, messageId: "201", date: daysAgo(4), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a201@example.com>")
+        try TestDatabase.insertMessageHeader(db, messageId: "202", date: daysAgo(60), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a202@example.com>")
+        return archive
+    }
+
+    /// The server's newest-3-by-UID = {202, 201, 200}. Excludes the mid-range rows
+    /// 100/101 (lower UIDs); its OLDEST date is 202's (the poison).
+    private func newestThreeFetch() -> [MessageHeaderInfo] {
+        [
+            makeHeaderInfo(messageId: "202", rfc822MessageId: "<a202@example.com>", date: daysAgo(60)),
+            makeHeaderInfo(messageId: "201", rfc822MessageId: "<a201@example.com>", date: daysAgo(4)),
+            makeHeaderInfo(messageId: "200", rfc822MessageId: "<a200@example.com>", date: daysAgo(5)),
+        ]
+    }
+
+    @Test("IMAP .uid window: archiving an old-dated mail must NOT delete mid-range Archive mail")
+    func uidWindowPreservesMidRange() throws {
+        let db = try TestDatabase.make()
+        let archive = try seedArchive(db)
+        let result = try simulateRunSyncMessages(db: db, folder: archive, messages: newestThreeFetch(), limit: 3, windowMode: .uid)
+
+        #expect(!result.staleIds.contains("acc1:Archive:100"))
+        #expect(!result.staleIds.contains("acc1:Archive:101"))
+        let survives100 = try db.read { try MessageHeader.fetchOne($0, key: "acc1:Archive:100") != nil }
+        let survives101 = try db.read { try MessageHeader.fetchOne($0, key: "acc1:Archive:101") != nil }
+        #expect(survives100, "row 100 (UID < min fetched UID → outside window) must survive")
+        #expect(survives101, "row 101 must survive")
+    }
+
+    @Test("Characterization: a .date window over-deletes the same mid-range rows (the bug we fixed)")
+    func dateWindowOverDeletes() throws {
+        let db = try TestDatabase.make()
+        let archive = try seedArchive(db)
+        // .date is what IMAP used to do — proves the test discriminates and that
+        // switching IMAP to .uid is what stops the data loss.
+        let result = try simulateRunSyncMessages(db: db, folder: archive, messages: newestThreeFetch(), limit: 3, windowMode: .date)
+        #expect(result.staleIds.contains("acc1:Archive:100"))
+        #expect(result.staleIds.contains("acc1:Archive:101"))
+    }
+
+    @Test("IMAP .uid window still deletes a row INSIDE the fetched UID slice that the server dropped")
+    func uidWindowStillDeletesGenuinelyStale() throws {
+        let db = try TestDatabase.make()
+        let archive = try seedArchive(db)
+        // UID 203 > floor(200): inside the window. Server's newest-3 is still
+        // {202,201,200} (203 was deleted server-side) → 203 must be stale-deleted.
+        try TestDatabase.insertMessageHeader(db, messageId: "203", date: daysAgo(3), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a203@example.com>")
+        let result = try simulateRunSyncMessages(db: db, folder: archive, messages: newestThreeFetch(), limit: 3, windowMode: .uid)
+
+        #expect(result.staleIds.contains("acc1:Archive:203"), "row 203 (UID ≥ floor, gone from server) must still be deleted")
+        #expect(!result.staleIds.contains("acc1:Archive:100"), "mid-range row 100 must still survive")
+    }
+}
+
+// MARK: - v59 one-time heal scoping (ADR-IOS-042)
+
+/// `AppDatabase.rewalkImapArchiveFolders` (the v59 migration body) must reset backfill
+/// ONLY for archive-role folders on IMAP accounts — so field users who already lost
+/// Archive mail auto-re-walk on upgrade — and must leave everything else alone.
+@Suite("Archive re-walk heal — scoping (ADR-IOS-042)")
+struct ArchiveRewalkHealTests {
+    private func folderState(_ db: DatabaseQueue, _ id: String) throws -> (complete: Bool, cursor: Int?) {
+        try db.read { dbConn in
+            let row = try Row.fetchOne(dbConn, sql: "SELECT backfillComplete, backfillUidCursor FROM folder WHERE id = ?", arguments: [id])!
+            return ((row["backfillComplete"] as Int) != 0, row["backfillUidCursor"] as Int?)
+        }
+    }
+
+    @Test("Resets only IMAP archive folders; leaves IMAP inbox + Gmail archive intact")
+    func scopesToImapArchiveOnly() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "imap1", provider: .imap)
+        try TestDatabase.insertAccount(db, id: "gmail1", provider: .gmail)
+        let imapArchive = try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "imap1")
+        let imapInbox = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "imap1")
+        let gmailArchive = try TestDatabase.insertFolder(db, name: "All Mail", path: "__GMAIL_ALL_MAIL__", role: .archive, accountId: "gmail1")
+        // All three start "complete" with a non-null cursor.
+        try db.write { dbConn in
+            for fid in [imapArchive.id, imapInbox.id, gmailArchive.id] {
+                try dbConn.execute(sql: "UPDATE folder SET backfillComplete = 1, backfillUidCursor = 999 WHERE id = ?", arguments: [fid])
+            }
+        }
+
+        let reset = try db.write { try AppDatabase.rewalkImapArchiveFolders($0) }
+        #expect(reset == 1, "exactly one folder (IMAP archive) should be reset")
+
+        let archiveState = try folderState(db, imapArchive.id)
+        #expect(archiveState.complete == false, "IMAP archive must be re-walked")
+        #expect(archiveState.cursor == nil, "IMAP archive cursor must be cleared")
+
+        let inboxState = try folderState(db, imapInbox.id)
+        #expect(inboxState.complete == true, "IMAP inbox (chronological) must be untouched")
+        #expect(inboxState.cursor == 999)
+
+        let gmailState = try folderState(db, gmailArchive.id)
+        #expect(gmailState.complete == true, "Gmail archive (date-ordered fetch) must be untouched")
+        #expect(gmailState.cursor == 999)
     }
 }
 

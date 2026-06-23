@@ -428,6 +428,48 @@ extension SyncEngine {
         return (survivor, removedIds, ftsRekey)
     }
 
+    /// SINGLE SOURCE OF TRUTH for "which local rows may be stale-deleted after a
+    /// WINDOWED fetch". Pure + deterministic so production sync and the test harness
+    /// share one rule that cannot drift.
+    ///
+    /// Invariant: a windowed fetch (newest `limit` rows) gives COMPLETE remote
+    /// knowledge ONLY for the slice it covered, measured in the provider's
+    /// fetch-ordering dimension:
+    ///   - `.uid` (IMAP): the fetch returns the highest UIDs. UID == archive-time,
+    ///     DECORRELATED from message `date` — archiving an old email assigns it a
+    ///     fresh high UID with an old date. A DATE floor is dragged backwards by one
+    ///     such message and sweeps in months of mid-range mail the fetch never
+    ///     returned → mass false stale-deletion (the "Archive month-gap" data-loss
+    ///     bug). Bound by UID: never delete a row whose UID is below the smallest
+    ///     fetched UID — it was outside the window.
+    ///   - `.date` (Gmail/Exchange): fetch is most-recent-by-date, so a date floor IS
+    ///     the covered slice (and their ids aren't numeric UIDs anyway).
+    ///
+    /// `fetched.count < limit` ⇒ the whole folder came back ⇒ complete knowledge of
+    /// all of it ⇒ anything local-but-not-remote is genuinely gone.
+    nonisolated static func selectStaleHeaders(
+        candidates: [MessageHeader],
+        fetched: [MessageHeaderInfo],
+        limit: Int,
+        windowMode: StaleWindowMode
+    ) -> [MessageHeader] {
+        let remoteIds = Set(fetched.map(\.messageId))
+        if fetched.count < limit {
+            return candidates.filter { !remoteIds.contains($0.messageId) }
+        }
+        switch windowMode {
+        case .uid:
+            guard let floorUID = fetched.compactMap({ Int64($0.messageId) }).min() else { return [] }
+            return candidates.filter { row in
+                guard let uid = Int64(row.messageId) else { return false } // non-numeric id → never UID-stale
+                return uid >= floorUID && !remoteIds.contains(row.messageId)
+            }
+        case .date:
+            guard let floorDate = fetched.map(\.date).min() else { return [] }
+            return candidates.filter { $0.date >= floorDate && !remoteIds.contains($0.messageId) }
+        }
+    }
+
     /// Core message sync logic — runs entirely off the main thread.
     /// Fetches messages from provider, performs stale detection + upsert in a single
     /// DB write transaction. No MainActor state accessed.
@@ -494,6 +536,10 @@ extension SyncEngine {
             var replyDetectIds: [String] = []
             let stale: [MessageHeader]
             var allLocalIds: Set<String>?
+            // Stale-detection window dimension MUST match the provider's fetch ordering
+            // (see selectStaleHeaders): IMAP = UID (archive-time, decorrelated from date),
+            // Gmail/Exchange = date. A date window on IMAP over-deletes the Archive.
+            let windowMode = provider.staleWindowMode
             if messages.count < limit {
                 // Got everything — find local messages not in remote set
                 let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(db)
@@ -506,15 +552,33 @@ extension SyncEngine {
                         print("[Sync] \(folder.name) stale-check: local=\(allLocal.count) remote=\(messages.count) onlyLocal=\(Array(onlyLocal.prefix(5))) onlyRemote=\(Array(onlyRemote.prefix(5)))")
                     }
                 }
-                stale = allLocal.filter { !remoteIds.contains($0.messageId) }
-            } else if let fetchCutoff = messages.min(by: { $0.date < $1.date })?.date {
-                // Only load messages in the overlap window (date >= oldest remote message)
-                let candidates = try MessageHeader
-                    .filter(Column("folderId") == folderId && Column("date") >= fetchCutoff)
-                    .fetchAll(db)
-                stale = candidates.filter { !remoteIds.contains($0.messageId) }
+                stale = Self.selectStaleHeaders(candidates: allLocal, fetched: messages, limit: limit, windowMode: windowMode)
             } else {
-                stale = []
+                // Folder is larger than the fetch window — load ONLY the bounded
+                // candidate slice (not the whole folder, per the memory budget) in the
+                // fetch-ordering dimension, then let selectStaleHeaders re-apply the
+                // same floor as the single source of truth.
+                let candidates: [MessageHeader]
+                switch windowMode {
+                case .uid:
+                    // messageId is a numeric IMAP UID; CAST avoids a lexicographic compare.
+                    if let floorUID = messages.compactMap({ Int64($0.messageId) }).min() {
+                        candidates = try MessageHeader.fetchAll(db, sql:
+                            "SELECT * FROM messageHeader WHERE folderId = ? AND CAST(messageId AS INTEGER) >= ?",
+                            arguments: [folderId, floorUID])
+                    } else {
+                        candidates = []  // no parseable UID floor → delete nothing (safe)
+                    }
+                case .date:
+                    if let fetchCutoff = messages.map(\.date).min() {
+                        candidates = try MessageHeader
+                            .filter(Column("folderId") == folderId && Column("date") >= fetchCutoff)
+                            .fetchAll(db)
+                    } else {
+                        candidates = []
+                    }
+                }
+                stale = Self.selectStaleHeaders(candidates: candidates, fetched: messages, limit: limit, windowMode: windowMode)
             }
             // Don't delete messages with pending operations or recently completed ops.
             // Undo-restored messages are protected by their PendingOp(move-back).
