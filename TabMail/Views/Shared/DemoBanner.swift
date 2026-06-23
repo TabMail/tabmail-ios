@@ -69,13 +69,3 @@ struct DemoBanner: View {
         return Color.accentColor.opacity(0.92)
     }
 }
-
-#Preview("AI enabled") {
-    DemoBanner(aiEnabled: true)
-        .background(Color.gray.opacity(0.2))
-}
-
-#Preview("AI disabled") {
-    DemoBanner(aiEnabled: false)
-        .background(Color.gray.opacity(0.2))
-}

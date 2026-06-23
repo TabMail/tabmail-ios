@@ -156,6 +156,9 @@ private struct APIKeyProviderSection: View {
             try? KeychainHelper.saveBYOK(trimmed, provider: provider)
             savedIndicator = true
         }
+        // Update the inbox usage-throttle banner immediately — adding/removing a
+        // BYOK key flips whether the user is on the slow shared queue.
+        UsageThrottleStore.shared.refreshKeyState()
     }
 }
 

@@ -26,7 +26,3 @@ struct DemoSeedingSplash: View {
         .padding(.horizontal, 32)
     }
 }
-
-#Preview {
-    DemoSeedingSplash()
-}

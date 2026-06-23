@@ -214,6 +214,23 @@ struct InboxView: View {
                     .foregroundStyle(Theme.errorFg)
                 }
 
+                // Usage-throttle banner — surfaces when background AI
+                // processing is being throttled (monthly budget exhausted /
+                // BYOK on the shared queue). Subtle, non-dismissible; tapping
+                // routes to the relevant upgrade/setup screen. Inbox only.
+                // Reading the @Observable store directly re-renders on change
+                // (same pattern as DemoModeStore.shared below).
+                if isInboxView, let throttleKind = UsageThrottleStore.shared.banner {
+                    UsageThrottleBanner(kind: throttleKind) {
+                        switch throttleKind {
+                        case .upgradeToPro:
+                            NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil)
+                        case .configureKeys:
+                            NotificationCenter.default.post(name: .navigateToAIProvider, object: nil)
+                        }
+                    }
+                }
+
                 if isInboxView {
                     TipView(archiveOldEmailsTip)
                         .padding(.horizontal)

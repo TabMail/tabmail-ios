@@ -709,26 +709,3 @@ struct ActionConfirmationCard: View {
         return "\(fmt.string(from: event.startDate)) – \(endFmt.string(from: event.endDate))"
     }
 }
-
-// MARK: - Previews
-
-#Preview("Warning Bubble") {
-    VStack(spacing: 12) {
-        ChatBubble(message: ChatMessage(
-            role: .warning,
-            content: "Active subscription required. Go to TabMail Account to subscribe.",
-            timestamp: Date()
-        ))
-        ChatBubble(message: ChatMessage(
-            role: .agent,
-            content: "Here's a normal agent message for comparison.",
-            timestamp: Date()
-        ))
-        ChatBubble(message: ChatMessage(
-            role: .user,
-            content: "Test 123",
-            timestamp: Date()
-        ))
-    }
-    .padding()
-}

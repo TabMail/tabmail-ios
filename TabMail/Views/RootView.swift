@@ -576,6 +576,9 @@ struct RootView: View {
             } else {
                 AISubscriptionGate.shared.closeGate()
             }
+            // Feed the inbox usage-throttle banner from this same always-on
+            // foreground /whoami fetch — no extra poll.
+            UsageThrottleStore.shared.update(from: info)
         } catch {
             print("[AISubscriptionGate] Revalidation failed: \(error)")
         }
@@ -746,6 +749,14 @@ extension Notification.Name {
     static let tabMailDidSignIn = Notification.Name("tabMailDidSignIn")
     static let navigateToSettings = Notification.Name("navigateToSettings")
     static let navigateToAccount = Notification.Name("navigateToAccount")
+    /// Posted by the inbox usage-throttle banner (Basic, budget exhausted) to
+    /// open the plan picker. MailNavigationView routes to `.planPicker`.
+    static let navigateToPlanPicker = Notification.Name("navigateToPlanPicker")
+    /// Posted by the inbox usage-throttle banner (BYOK, no own key) to open the
+    /// AI Provider settings — provider selection AND key management both live
+    /// there. MailNavigationView routes to `.prompts` (TabMail Settings) and
+    /// scrolls to the "AI Provider" section.
+    static let navigateToAIProvider = Notification.Name("navigateToAIProvider")
     /// Posted after GRDB writes that affect visible UI (e.g., backfill inserts).
     /// Views should reload data when receiving this notification.
     /// Reserved for rare structural changes (account add/remove, outbox, app launch).

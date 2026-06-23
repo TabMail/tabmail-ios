@@ -49,37 +49,3 @@ struct ChatPillWandIcon: View {
         }
     }
 }
-
-#Preview("Logo States") {
-    ScrollView {
-        VStack(spacing: 30) {
-            // Splash
-            VStack(spacing: 16) {
-                Text("Splash").font(.caption).foregroundStyle(.secondary)
-                Image("TabMailLogo")
-                    .renderingMode(.original)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 240)
-                Text("Tap, Talk, Send")
-                    .font(.title2)
-                    .foregroundStyle(.secondary)
-            }
-
-            Divider()
-
-            // Static vs Working
-            VStack(spacing: 16) {
-                Text("Static vs Working").font(.caption).foregroundStyle(.secondary)
-                HStack(spacing: 20) {
-                    ChatPillWandIcon(isWorking: false, size: 24)
-                    ChatPillWandIcon(isWorking: true, size: 24)
-                }
-                .padding()
-                .background(Palette.buttonBg)
-                .clipShape(Capsule())
-            }
-        }
-        .padding(40)
-    }
-}

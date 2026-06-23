@@ -128,9 +128,3 @@ struct DemoAccountDashboardView: View {
         }
     }
 }
-
-#Preview {
-    NavigationStack {
-        DemoAccountDashboardView()
-    }
-}

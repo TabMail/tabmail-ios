@@ -435,12 +435,7 @@ struct MailNavigationView: View {
                 selectedMessageId = nil
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .navigateToSettings).receive(on: DispatchQueue.main)) { _ in
-            selection = .settings
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .navigateToAccount).receive(on: DispatchQueue.main)) { _ in
-            selection = .account
-        }
+        .modifier(NavigationNotificationHandlers(selection: $selection))
         .sheet(isPresented: $showSignInSheet) {
             TabMailLoginView {
                 showSignInSheet = false
@@ -722,6 +717,35 @@ struct MailNavigationView: View {
         }
     }
 
+}
+
+// MARK: - Navigation Notification Handlers
+
+/// Bundles the sidebar navigation notifications into one modifier. Extracted
+/// from `MailNavigationView.body` so the four `.onReceive` handlers don't bloat
+/// the already-large body modifier chain past the Swift type-checker's limit.
+private struct NavigationNotificationHandlers: ViewModifier {
+    @Binding var selection: MailboxSelection?
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(NotificationCenter.default.publisher(for: .navigateToSettings).receive(on: DispatchQueue.main)) { _ in
+                selection = .settings
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .navigateToAccount).receive(on: DispatchQueue.main)) { _ in
+                selection = .account
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .navigateToPlanPicker).receive(on: DispatchQueue.main)) { _ in
+                selection = .planPicker
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .navigateToAIProvider).receive(on: DispatchQueue.main)) { _ in
+                // BYOK setup needs BOTH provider selection and keys, which live
+                // together in TabMail Settings' "AI Provider" section. Land on
+                // that page and flag it to scroll to the section.
+                UserDefaults.standard.set(true, forKey: TabMailSettingsView.pendingScrollAIProviderKey)
+                selection = .prompts
+            }
+    }
 }
 
 // MARK: - Content Column Container

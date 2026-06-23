@@ -66,11 +66,3 @@ struct SplashView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
-
-#Preview("Splash") {
-    SplashView()
-}
-
-#Preview("Migration Splash") {
-    SplashView(mode: .migrating)
-}

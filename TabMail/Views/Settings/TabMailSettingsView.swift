@@ -26,7 +26,14 @@ struct TabMailSettingsView: View {
     @State private var demoStore = DemoModeStore.shared
     @State private var byokCatalog: BYOKModelCatalog?
 
+    /// Set by the inbox usage-throttle banner (BYOK) before navigating here, so
+    /// this view scrolls to the AI Provider section on appear. See ADR-IOS-044.
+    static let pendingScrollAIProviderKey = "pending_scroll_ai_provider"
+    /// ScrollViewReader anchor for the "AI Provider" section.
+    private static let aiProviderAnchorID = "aiProviderSection"
+
     var body: some View {
+        ScrollViewReader { proxy in
         Form {
             Group {
             Section("Personalization") {
@@ -126,6 +133,7 @@ struct TabMailSettingsView: View {
                 } footer: {
                     Text("Choosing a provider other than TabMail sends requests directly to that provider on your own API key and can incur significant API costs. We strongly recommend TabMail's built-in models unless you have a special pricing agreement with the provider.")
                 }
+                .id(Self.aiProviderAnchorID)
             }
 
             Section {
@@ -496,6 +504,21 @@ struct TabMailSettingsView: View {
             if proactiveEnabled != newProactive { proactiveEnabled = newProactive }
             if windowDays != newWindowDays { windowDays = newWindowDays }
             if advanceMinutes != newAdvanceMin { advanceMinutes = newAdvanceMin }
+        }
+        .onAppear { maybeScrollToAIProvider(proxy) }
+        } // ScrollViewReader
+    }
+
+    /// If the inbox throttle banner flagged a deep-link to the AI Provider
+    /// section (BYOK setup), scroll to it once the form has laid out, then
+    /// clear the flag so it only fires for that one navigation.
+    @MainActor
+    private func maybeScrollToAIProvider(_ proxy: ScrollViewProxy) {
+        guard UserDefaults.standard.bool(forKey: Self.pendingScrollAIProviderKey) else { return }
+        UserDefaults.standard.set(false, forKey: Self.pendingScrollAIProviderKey)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            withAnimation { proxy.scrollTo(Self.aiProviderAnchorID, anchor: .top) }
         }
     }
 

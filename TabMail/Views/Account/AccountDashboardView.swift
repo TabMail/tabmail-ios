@@ -371,7 +371,11 @@ struct AccountDashboardView: View {
         }
 
         do {
-            accountInfo = try await backend.fetchAccountInfo()
+            let info = try await backend.fetchAccountInfo()
+            accountInfo = info
+            // Keep the inbox usage-throttle banner fresh when the user opens
+            // the dashboard.
+            UsageThrottleStore.shared.update(from: info)
         } catch is CancellationError {
             return
         } catch let urlError as URLError where urlError.code == .cancelled {

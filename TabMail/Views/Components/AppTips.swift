@@ -470,37 +470,3 @@ struct ChatPillTipModifier: ViewModifier {
         }
     }
 }
-
-// MARK: - Preview Canvas
-
-#Preview("All Tips") {
-    ScrollView {
-        VStack(alignment: .leading, spacing: 16) {
-            Group {
-                TipView(SwipeActionsTip())
-                TipView(TagTeachingTip())
-                TipView(InboxTagTeachingTip())
-                TipView(ArchiveOldEmailsTip())
-                TipView(EnableInboxPushTip())
-                TipView(TriageModeTip())
-                TipView(SearchScopeTip())
-                TipView(SummaryBubbleTip())
-                TipView(InboxChatPillTip())
-                TipView(ChatPillTip())
-            }
-            Group {
-                TipView(ComposeChatPillTip())
-                TipView(ChatForkTip())
-                TipView(DeviceSyncTip())
-                TipView(OutboxSwipeActionsTip())
-                TipView(AgentBackgroundTip())
-                TipView(ComposeSaveDraftTip())
-                TipView(ComposeChatCollapseTip())
-                TipView(InboxChatCollapseTip())
-                TipView(MessageChatCollapseTip())
-                TipView(RemindersMenuTip())
-            }
-        }
-        .padding()
-    }
-}

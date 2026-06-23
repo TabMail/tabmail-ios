@@ -298,5 +298,22 @@ enum PreviewMocks {
         Tips.hideTipsForTesting(others)
         Tips.showTipsForTesting([type])
     }
+
+    /// Hide EVERY app tip in a preview — for host-view previews (e.g. a seeded
+    /// `InboxView`) that aren't demonstrating a tip and shouldn't have tooltips
+    /// popping in on interaction. Deterministic across Xcode's reused preview
+    /// process (resets the datastore + parameters first, since a prior
+    /// `spotlight` preview may have configured TipKit).
+    @MainActor
+    static func hideAllTips() {
+        resetAllTipParameters()
+        try? Tips.resetDatastore()
+        try? Tips.configure([
+            .displayFrequency(.immediate),
+            .datastoreLocation(.applicationDefault)
+        ])
+        Tips.hideTipsForTesting(allTipTypes)
+        Tips.showTipsForTesting([])
+    }
 }
 #endif
