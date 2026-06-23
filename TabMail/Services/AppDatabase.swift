@@ -1701,5 +1701,16 @@ final class AppDatabase: Sendable {
                 print("[v59] Reset backfill for \(reset) IMAP archive folder(s) — re-fetching stale-window-deleted mail")
             }
         }
+
+        // v60: Persist the Gmail conversation id on queued sends so a reply/forward
+        // files into the source thread on Gmail web. The value survives app
+        // relaunch (outbox drain re-sends with the same binding). Gmail REST send
+        // only; IMAP/Exchange thread via In-Reply-To/References headers. See
+        // PLAN_THREAD_FIX.md / ADR-IOS-043.
+        migrator.registerMigration("v60_addOutboxThreadId") { db in
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "threadId", .text)
+            }
+        }
     }
 }

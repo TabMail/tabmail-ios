@@ -61,7 +61,7 @@ struct GmailSubjectEncodingTests {
     @Test("buildRFC822 emits an encoded Subject, not raw 8-bit Korean")
     func buildRFC822EncodesSubject() async {
         let draft = DraftMessage(to: ["you@example.com"], subject: "테스트 제목", body: "본문")
-        let raw = await makeProvider().buildRFC822(draft: draft)
+        let raw = makeProvider().buildRFC822(draft: draft)
 
         #expect(raw.contains("Subject: =?UTF-8?B?"))
         #expect(!raw.contains("Subject: 테스트"))
@@ -77,7 +77,7 @@ struct GmailSubjectEncodingTests {
     @Test("buildRFC822 leaves an ASCII Subject untouched")
     func buildRFC822AsciiSubject() async {
         let draft = DraftMessage(to: ["you@example.com"], subject: "Plain subject", body: "body")
-        let raw = await makeProvider().buildRFC822(draft: draft)
+        let raw = makeProvider().buildRFC822(draft: draft)
         #expect(raw.contains("Subject: Plain subject\r\n"))
     }
 

@@ -971,7 +971,7 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending Helpers
 
-    private func buildGraphSendPayload(draft: DraftMessage) -> [String: Any] {
+    nonisolated func buildGraphSendPayload(draft: DraftMessage) -> [String: Any] {
         var message: [String: Any] = [:]
 
         message["subject"] = draft.subject

@@ -100,4 +100,55 @@ struct DatabaseOutboxTests {
         #expect(fetched?.outboxStatus == .failed)
         #expect(fetched?.retryCount == 3)
     }
+
+    // MARK: - threadId (v60) — Gmail reply/forward thread binding
+
+    @Test("v60 migration adds the threadId column to outboxMessage")
+    func threadIdColumnExists() throws {
+        let db = try TestDatabase.make()
+        let hasColumn = try db.read { d in
+            try Row.fetchAll(d, sql: "PRAGMA table_info(outboxMessage)")
+                .contains { ($0["name"] as String?) == "threadId" }
+        }
+        #expect(hasColumn)
+    }
+
+    @Test("OutboxMessage round-trips threadId from the draft and back out")
+    func threadIdRoundTrip() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+
+        let draft = DraftMessage(
+            to: ["recipient@example.com"], subject: "Re: Hi", body: "Hello",
+            inReplyTo: "parent@example.com", references: ["root@example.com", "parent@example.com"],
+            threadId: "gmail-thread-abc"
+        )
+        let msg = OutboxMessage(accountId: "acc1", draft: draft)
+        #expect(msg.threadId == "gmail-thread-abc")
+        try db.write { try msg.insert($0) }
+
+        let fetched = try db.read { try OutboxMessage.fetchOne($0, key: msg.id) }
+        #expect(fetched?.threadId == "gmail-thread-abc")
+        // toDraftMessage() reconstructs the send payload (drain path) — threadId
+        // and the full references chain must survive the round-trip.
+        let rebuilt = try fetched?.toDraftMessage()
+        #expect(rebuilt?.threadId == "gmail-thread-abc")
+        #expect(rebuilt?.inReplyTo == "parent@example.com")
+        #expect(rebuilt?.references == ["root@example.com", "parent@example.com"])
+    }
+
+    @Test("threadId is nil for a plain (non-reply) send")
+    func threadIdNilForNewCompose() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+
+        let draft = DraftMessage(to: ["a@b.com"], subject: "Hi", body: "Hello")
+        let msg = OutboxMessage(accountId: "acc1", draft: draft)
+        #expect(msg.threadId == nil)
+        try db.write { try msg.insert($0) }
+
+        let fetched = try db.read { try OutboxMessage.fetchOne($0, key: msg.id) }
+        #expect(fetched?.threadId == nil)
+        #expect(try fetched?.toDraftMessage().threadId == nil)
+    }
 }

@@ -1639,6 +1639,16 @@ struct ComposeView: View {
         isSending = true
 
         let (sendBody, isHTML) = buildSendBody()
+        // Threading headers for reply / reply-all / forward. Single source of
+        // truth (ThreadUtils) builds the In-Reply-To + full References chain and,
+        // for Gmail, the conversation threadId (guarded by account + subject
+        // match). Forward threads like reply per Gmail convention. See ADR-IOS-043.
+        let threadHeaders = ThreadUtils.outgoingThreadHeaders(
+            replyTo: replyTo,
+            sendAccountId: account.id,
+            sendSubject: subject,
+            providerKind: account.provider
+        )
         let draft = DraftMessage(
             to: finalTo,
             cc: finalCc,
@@ -1646,8 +1656,10 @@ struct ComposeView: View {
             subject: subject,
             body: sendBody,
             isHTML: isHTML,
-            inReplyTo: replyTo?.rfc822MessageId,
-            attachments: attachments
+            inReplyTo: threadHeaders.inReplyTo,
+            references: threadHeaders.references,
+            attachments: attachments,
+            threadId: threadHeaders.threadId
         )
 
         // Capture existing draft (server-side metadata preserved through save-before-send).

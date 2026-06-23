@@ -28,6 +28,11 @@ struct DraftMessage: Sendable {
     /// Pre-generated RFC822 Message-ID. When set, providers MUST use this instead of
     /// generating a new one — ensures SMTP send and IMAP Sent append share the same ID.
     var messageId: String?
+    /// Gmail native conversation id of the source message, for reply/forward.
+    /// Only the Gmail REST send consumes it (to file the message into the existing
+    /// thread); IMAP/Exchange thread purely via the In-Reply-To/References headers.
+    /// `nil` for new compositions and non-Gmail providers. See ADR-IOS-043.
+    var threadId: String?
 
     init(
         to: [String] = [],
@@ -38,7 +43,8 @@ struct DraftMessage: Sendable {
         isHTML: Bool = false,
         inReplyTo: String? = nil,
         references: [String] = [],
-        attachments: [DraftAttachment] = []
+        attachments: [DraftAttachment] = [],
+        threadId: String? = nil
     ) {
         self.to = to
         self.cc = cc
@@ -49,5 +55,6 @@ struct DraftMessage: Sendable {
         self.inReplyTo = inReplyTo
         self.references = references
         self.attachments = attachments
+        self.threadId = threadId
     }
 }

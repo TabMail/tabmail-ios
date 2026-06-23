@@ -262,4 +262,92 @@ enum ThreadUtils {
         guard !normalized.isEmpty, !noSubjectSentinels.contains(normalized.lowercased()) else { return nil }
         return "subj:\(accountId):\(normalized.lowercased())"
     }
+
+    // MARK: - Outgoing Threading Headers (send path)
+
+    /// The threading fields a reply/forward must carry so the provider files it
+    /// into the source conversation. See `PLAN_THREAD_FIX.md` and ADR-IOS-043.
+    ///
+    /// - `inReplyTo` / `references` are bare (normalized) RFC 2822 message IDs;
+    ///   each provider adds the `<…>` brackets at the wire boundary.
+    /// - `threadId` is Gmail's native conversation id (used only by the Gmail
+    ///   REST send); `nil` for non-Gmail providers and for new compositions.
+    struct OutgoingThreadHeaders: Sendable, Equatable {
+        var inReplyTo: String?
+        var references: [String]
+        var threadId: String?
+
+        static let none = OutgoingThreadHeaders(inReplyTo: nil, references: [], threadId: nil)
+    }
+
+    /// Derive the outgoing threading headers for a reply, reply-all, or forward.
+    ///
+    /// Reply and forward share ONE derivation path: per Gmail convention a
+    /// forward stays under the source conversation on the sender's side, so it
+    /// gets the same headers as a reply (the forward-specific differences —
+    /// empty `To`, `Fwd:` subject, quoted block — live in ComposeView, not here).
+    /// A `nil` `replyTo` (a true new composition) yields `.none`.
+    ///
+    /// Adapter over the scalar core below; ComposeView passes the resolved header.
+    static func outgoingThreadHeaders(
+        replyTo: MessageHeader?,
+        sendAccountId: String,
+        sendSubject: String,
+        providerKind: AccountProvider
+    ) -> OutgoingThreadHeaders {
+        guard let parent = replyTo else { return .none }
+        return outgoingThreadHeaders(
+            parentRfc822MessageId: parent.rfc822MessageId,
+            parentReferences: parent.references,
+            parentThreadId: parent.threadId,
+            parentAccountId: parent.accountId,
+            parentSubject: parent.subject,
+            sendAccountId: sendAccountId,
+            sendSubject: sendSubject,
+            providerKind: providerKind
+        )
+    }
+
+    /// Pure scalar core — unit-testable without constructing a `MessageHeader`.
+    static func outgoingThreadHeaders(
+        parentRfc822MessageId: String?,
+        parentReferences: [String],
+        parentThreadId: String?,
+        parentAccountId: String,
+        parentSubject: String,
+        sendAccountId: String,
+        sendSubject: String,
+        providerKind: AccountProvider
+    ) -> OutgoingThreadHeaders {
+        // In-Reply-To = the parent's own Message-ID (bare/normalized). Many IMAP
+        // messages lack a Message-ID, in which case there is nothing to thread on.
+        let parentMsgId: String? = parentRfc822MessageId
+            .map { EmailFilter.normalizeMessageId($0) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+
+        // References chain = parent.references ++ parent's Message-ID, normalized,
+        // order-preserving, de-duplicated (RFC 5322 §3.6.4).
+        var references: [String] = []
+        var seen = Set<String>()
+        for raw in parentReferences {
+            let r = EmailFilter.normalizeMessageId(raw)
+            if !r.isEmpty, seen.insert(r).inserted { references.append(r) }
+        }
+        if let pid = parentMsgId, seen.insert(pid).inserted { references.append(pid) }
+
+        // threadId: Gmail only, and only when the stored id belongs to the
+        // sending mailbox AND the subject still matches the thread. Both guards
+        // prevent a Gmail 400 (invalid thread / subject mismatch) and correctly
+        // start a NEW thread when the user switched accounts or changed the
+        // subject. `normalizeSubject` strips Re:/Fwd:, so "Re: X"/"Fwd: X" match "X".
+        var threadId: String? = nil
+        if providerKind == .gmail,
+           let tid = parentThreadId, !tid.isEmpty,
+           parentAccountId == sendAccountId,
+           normalizeSubject(sendSubject) == normalizeSubject(parentSubject) {
+            threadId = tid
+        }
+
+        return OutgoingThreadHeaders(inReplyTo: parentMsgId, references: references, threadId: threadId)
+    }
 }

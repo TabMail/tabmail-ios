@@ -24,6 +24,10 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     var isHTML: Bool
     var inReplyTo: String?
     var referencesJSON: String?
+    /// Gmail native conversation id (reply/forward). Persisted so a drain after
+    /// app relaunch re-sends with the same thread binding. Gmail REST send only;
+    /// nil for IMAP/Exchange and new compositions. See ADR-IOS-043. (v60)
+    var threadId: String?
     /// Relative directory name under outbox_attachments/ (same as id)
     var attachmentsDirName: String?
     var status: String
@@ -101,6 +105,7 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
         self.isHTML = draft.isHTML
         self.inReplyTo = draft.inReplyTo
         self.referencesJSON = encodeStringArray(draft.references)
+        self.threadId = draft.threadId
         self.attachmentsDirName = draft.attachments.isEmpty ? nil : self.id
         self.status = OutboxStatus.queued.rawValue
         self.errorMessage = nil
@@ -190,7 +195,8 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
             isHTML: isHTML,
             inReplyTo: inReplyTo,
             references: references,
-            attachments: try loadAttachments()
+            attachments: try loadAttachments(),
+            threadId: threadId
         )
     }
 }

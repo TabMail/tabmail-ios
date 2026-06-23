@@ -438,15 +438,31 @@ actor GmailProvider: EmailProvider {
     }
 
     func send(draft: DraftMessage) async throws {
-        let base64 = buildUrlSafeBase64(draft: draft)
-        let body = ["raw": base64]
+        let body = buildSendBody(draft: draft)
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let _ = try await request(path: "/messages/send", method: "POST", body: jsonData)
     }
 
+    /// Build the `users.messages.send` request body. Includes `threadId` when the
+    /// draft carries one (reply/forward), so Gmail files the message into the
+    /// existing conversation instead of starting a new thread. Gmail also requires
+    /// the raw message to carry RFC-compliant References/In-Reply-To and a matching
+    /// Subject — all set by the centralized ComposeView callsite. See ADR-IOS-043.
+    /// Extracted from `send()` so the threadId wiring is unit-testable.
+    /// `nonisolated` (pure — derives only from `draft`) so it returns the
+    /// non-Sendable `[String: Any]` without crossing the actor boundary.
+    nonisolated func buildSendBody(draft: DraftMessage) -> [String: Any] {
+        let base64 = buildUrlSafeBase64(draft: draft)
+        var body: [String: Any] = ["raw": base64]
+        if let threadId = draft.threadId, !threadId.isEmpty {
+            body["threadId"] = threadId
+        }
+        return body
+    }
+
     /// Build URL-safe base64-encoded RFC822/MIME message for Gmail API.
     /// Shared between send() and saveDraft() to avoid MIME building duplication.
-    private func buildUrlSafeBase64(draft: DraftMessage) -> String {
+    nonisolated private func buildUrlSafeBase64(draft: DraftMessage) -> String {
         let rawData: Data
         if draft.attachments.isEmpty {
             rawData = buildRFC822(draft: draft).data(using: .utf8)!
@@ -1416,7 +1432,7 @@ actor GmailProvider: EmailProvider {
         }
     }
 
-    func buildRFC822(draft: DraftMessage) -> String {
+    nonisolated func buildRFC822(draft: DraftMessage) -> String {
         var lines: [String] = []
         // Include Message-ID so Gmail preserves our rfc822MessageId. Without this,
         // Gmail assigns its own, breaking rfc822MessageId-based UID remap detection
@@ -1461,7 +1477,7 @@ actor GmailProvider: EmailProvider {
     /// Build a MIME multipart message with attachments for Gmail API.
     /// Calendar invitations (isAlternative=true) use multipart/alternative structure
     /// so Gmail/Outlook render Accept/Decline buttons instead of a generic .ics attachment.
-    func buildMIMEMessage(draft: DraftMessage) -> Data {
+    nonisolated func buildMIMEMessage(draft: DraftMessage) -> Data {
         let boundary = "TabMail-Boundary-\(UUID().uuidString)"
         let hasAlternative = draft.attachments.contains { $0.isAlternative }
         let regularAttachments = draft.attachments.filter { !$0.isAlternative }
