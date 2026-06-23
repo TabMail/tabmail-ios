@@ -47,7 +47,12 @@ enum NSEIMAPConnection {
         rfc822MessageId: String,
         folderPath: String = "INBOX"
     ) async -> (metadata: NSEMessageMetadata, body: RenderedBody)? {
-        let server = IMAPServer(host: host, port: port, useTLS: useTLS)
+        let server = IMAPServer(
+            host: host,
+            port: port,
+            useTLS: useTLS,
+            responseBufferLimit: IMAPFetchMapping.responseBufferLimit
+        )
 
         do {
             try await server.connect()

@@ -112,7 +112,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Create a fresh logged-in IMAP connection.
     private func createServer() async throws -> IMAPServer {
-        let server = IMAPServer(host: host, port: port, useTLS: useTLS)
+        let server = IMAPServer(
+            host: host,
+            port: port,
+            useTLS: useTLS,
+            responseBufferLimit: IMAPFetchMapping.responseBufferLimit
+        )
         try await server.connect()
         try await server.login(username: username, password: password)
         return server

@@ -14,6 +14,23 @@ import SwiftMail
 /// directly rather than spinning up a FakeIMAPServer.
 enum IMAPFetchMapping {
 
+    /// Maximum bytes the IMAP response parser may buffer for a single response.
+    ///
+    /// Dense mailboxes return large SEARCH/FETCH responses (thousands of UIDs)
+    /// and individual messages can have large bodies; the SwiftMail default of
+    /// 1 MB overflows on these and throws `PayloadTooLargeError`, contaminating
+    /// the NIO buffer (the connection must then be discarded). 4 MB clears the
+    /// dense-folder case observed in production.
+    ///
+    /// Single source of truth for both IMAP entry points — main-app
+    /// `IMAPProvider` and the NSE's one-shot `NSEIMAPConnection` pass this to
+    /// `IMAPServer(host:port:useTLS:responseBufferLimit:)` so the two behave
+    /// identically. History: this was a fork-local deviation (a hardcoded
+    /// `bufferLimit: 4 * 1024 * 1024` in the SwiftMail fork). Upstream PR #179
+    /// made the limit a constructor parameter, so the fork is now a pure
+    /// upstream mirror and the value lives here at the call sites instead.
+    static let responseBufferLimit = 4 * 1024 * 1024
+
     /// Build the `messageId` string used as `MessageHeader.messageId`.
     ///
     /// MUST match `IMAPProvider.buildMessageHeaderInfo`'s format so rows the
