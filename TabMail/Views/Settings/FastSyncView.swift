@@ -158,6 +158,7 @@ struct FastSyncView: View {
                 }
             }
         }
+        .keepScreenAwake(while: !isAllComplete)
         .onAppear {
             Task { await manager.setFastSyncMode(true) }
             Task {
