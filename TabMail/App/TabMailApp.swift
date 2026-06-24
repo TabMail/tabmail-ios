@@ -18,6 +18,11 @@ struct TabMailApp: App {
     /// data-repair migrations) is built here, off the synchronous init path,
     /// so a long migration no longer freezes launch (RC2 fix, PLAN_HANG_FIX).
     @State private var startup = AppStartup.shared
+    /// Flips true ~1s into a launch that hasn't reached the inbox yet, to show the
+    /// branded loading splash. The delay means a fast resume (inbox in <1s) never
+    /// flashes it — it goes blank-launch-screen straight to the inbox; only a slow
+    /// cold boot crosses the 1s threshold and gets the splash.
+    @State private var showDelayedSplash = false
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -256,20 +261,41 @@ struct TabMailApp: App {
                                 Task { await NotificationCleanupService.sweepOnForeground() }
                             }
                         }
+                        // Inbox appears instantly (no transition) so only the splash
+                        // animates over it on the swap — keeps fast resumes snappy and
+                        // avoids animating the inbox's ScrollViews.
+                        .transition(.identity)
                 } else if startup.isMigrating {
                     // ONLY shown once we've confirmed real (and potentially slow)
                     // migration work on an existing database. The gating splash
                     // reads as honest progress, not a frozen launch (RC2 fix,
                     // PLAN_HANG_FIX).
                     SplashView(mode: .migrating)
+                } else if showDelayedSplash {
+                    // The launch has crossed the 600ms threshold (see below) without
+                    // reaching the inbox, so show the branded loading splash — a slow
+                    // cold boot reads as "loading", not a frozen blank screen. Fades
+                    // in (300ms) on insert and out (300ms) on the swap to the inbox so
+                    // it blends rather than hard-cutting ("click-clack").
+                    SplashView(mode: .loading)
+                        .transition(.opacity)
                 } else {
-                    // Probing for pending migrations (fast) or running an instant
-                    // already-migrated / fresh-install startup. Match the iOS
-                    // launch screen (empty UILaunchScreen = system background) so
-                    // there's no flash of the "Updating…" splash when nothing is
-                    // actually migrating.
+                    // First 600ms of launch: a blank screen matching the empty
+                    // UILaunchScreen (system background), so a FAST resume shows
+                    // nothing extra and flips straight to the inbox. If we're still
+                    // not ready after 600ms, `showDelayedSplash` flips (with a 300ms
+                    // ease-in) and the branded loading splash (above) takes over.
+                    // (Probing for pending migrations / an instant already-migrated
+                    // startup also lands here, briefly, before isReady.)
                     Color(.systemBackground)
                         .ignoresSafeArea()
+                        .transition(.identity)
+                        .task {
+                            try? await Task.sleep(for: .milliseconds(600))
+                            if !Task.isCancelled {
+                                withAnimation(.easeIn(duration: 0.3)) { showDelayedSplash = true }
+                            }
+                        }
                 }
             }
             .preferredColorScheme(ScreenshotMode.isDarkMode ? .dark : nil)
@@ -498,7 +524,10 @@ final class AppStartup {
         // Build failed (failureMessage shown) or the sidebar already loaded.
         guard dbReady, !isReady else { return }
         navigationStore.loadInitialData()
-        isReady = true
+        // Animate the splash → inbox swap: the loading splash fades OUT (300ms)
+        // while the inbox appears instantly beneath it (RootView uses .identity).
+        // Visually a no-op on a fast resume (blank → inbox are both .identity).
+        withAnimation(.easeOut(duration: 0.3)) { isReady = true }
     }
 
     /// Suspends until the database is usable, kicking off the build if no launch
