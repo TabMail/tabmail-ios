@@ -18,6 +18,14 @@ struct AutoSizingHTMLView: View {
     let previewFilename: String?
     let headerId: String?
     @State private var height: CGFloat
+    /// True once the WKWebView has actually revealed its content (the JS
+    /// `reveal()` flips opacity 0→1 and posts `{revealed:true}`). Until then a
+    /// real message body (headerId != nil) shows a loading placeholder so the
+    /// user never stares at a blank body area during the ~1s WKWebView
+    /// parse/layout (the document sits at opacity:0 until reveal). Reset when the
+    /// bound `html` changes (e.g. pull-to-refresh) so the placeholder returns
+    /// while the new content renders.
+    @State private var hasRevealed = false
 
     init(html: String, previewFilename: String? = nil, headerId: String? = nil) {
         self.html = html
@@ -38,15 +46,34 @@ struct AutoSizingHTMLView: View {
         _height = State(initialValue: headerId.flatMap { HeightSeedCache.shared[$0] } ?? 1)
     }
 
+    /// Loading placeholder only for real message bodies (compose/eml/tooltip
+    /// previews pass headerId == nil) and only until the first reveal.
+    private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
+
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, height: $height)
-            .frame(height: max(height, 1))
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, height: $height, hasRevealed: $hasRevealed)
+            // While a real body is still rendering, reserve room for the
+            // placeholder so it's visible even before the web view reports a
+            // height. Once revealed (or for non-body previews) size strictly to
+            // content — identical to the previous `max(height, 1)` behavior.
+            .frame(height: max(height, showsLoadingPlaceholder ? 80 : 1))
             // Suppress implicit animation on height changes. Without this, the
             // initial @State height=1 grows to the first measured value with a
             // spring animation inherited from a parent (List / ScrollView /
             // sheet), which reads as visual fluctuation during load. The
             // height should snap directly to each measured value.
             .animation(.none, value: height)
+            .overlay {
+                if showsLoadingPlaceholder {
+                    VStack(spacing: 8) {
+                        ProgressView()
+                        Text("Loading message…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
             // All gutters live here in the SwiftUI container, not in body CSS.
             // The web view's content fills its frame exactly; breathing room
             // is applied outside. Doing this here ensures the padding is a
@@ -56,6 +83,17 @@ struct AutoSizingHTMLView: View {
             // inconsistent bubble-bottom gap across emails.
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
+            // Reset the placeholder when the bound content changes (pull-to-
+            // refresh swaps in a new body), then arm a safety timeout so a
+            // missed reveal signal can never strand the placeholder forever.
+            // `.task(id: html)` restarts on every content change and is
+            // cancelled on disappear.
+            .task(id: html) {
+                guard headerId != nil else { return }
+                if hasRevealed { hasRevealed = false }
+                try? await Task.sleep(for: .seconds(4))
+                if !hasRevealed { hasRevealed = true }
+            }
     }
 }
 
@@ -149,6 +187,7 @@ private struct HTMLWebView: UIViewRepresentable {
     let previewFilename: String?
     let headerId: String?
     @Binding var height: CGFloat
+    @Binding var hasRevealed: Bool
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -270,12 +309,15 @@ private struct HTMLWebView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(height: $height)
+        Coordinator(height: $height, hasRevealed: $hasRevealed)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
 
         @Binding var height: CGFloat
+        /// Flipped true when the JS `reveal()` posts `{revealed:true}` — drives
+        /// the SwiftUI loading placeholder removal in `AutoSizingHTMLView`.
+        @Binding var hasRevealed: Bool
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
@@ -312,8 +354,9 @@ private struct HTMLWebView: UIViewRepresentable {
         /// trajectory. Debug-only — released in deinit.
         private var contentSizeObservation: NSKeyValueObservation?
 
-        init(height: Binding<CGFloat>) {
+        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>) {
             self._height = height
+            self._hasRevealed = hasRevealed
             super.init()
             // Re-run fitViewport on foreground return — iOS resumes the WKWebView
             // content process which may have been suspended with incomplete
@@ -529,6 +572,13 @@ private struct HTMLWebView: UIViewRepresentable {
             var rectForLog: CGFloat = 0
             var sourceForLog: String = "RO"
             if let dict = body as? [String: Any] {
+                // Content is now visible (opacity 0→1 via JS reveal()). Drop the
+                // SwiftUI loading placeholder. Idempotent — reveal() can fire on
+                // re-fits; we only need the first.
+                if dict["revealed"] as? Bool == true {
+                    if !hasRevealed { hasRevealed = true }
+                    return
+                }
                 // First-layout fit request from monitorHeightJS: the body is laid
                 // out (width known) but fit() hasn't run. Run it NOW rather than
                 // waiting for didFinish (which waits on external images), so the
@@ -2126,6 +2176,10 @@ private let fitViewportJS: String = {
         // stylesheet's opacity:0.
         function reveal() {
             try { document.documentElement.style.setProperty('opacity', '1', 'important'); } catch(_){}
+            // Tell Swift the content is now visible so the loading placeholder is
+            // removed. Funnels through reveal() so EVERY reveal path (no-overflow,
+            // widen, idempotent re-fit, vw<100 skip) emits it. Idempotent Swift-side.
+            try { window.webkit.messageHandlers.heightChanged.postMessage({ revealed: true }); } catch(_){}
         }
         // Reveal AFTER a paint cycle. Setting opacity:1 synchronously at
         // layout-time shows the box before WebKit has rasterized the visible
