@@ -102,30 +102,27 @@ struct TabMailApp: App {
         // with the inbox first render. Only the agent chat / reply-precompute / inline-
         // edit paths use tools, so the first such request pays the one-time cost.
 
-        // Initialize FTS search index + embedding service (both async to avoid blocking launch).
-        // Task.detached avoids inheriting main actor context — prevents FTS completion
-        // callback from competing for main actor time right after splash dismissal.
-        // Left EAGER (not lazy) only so search is ready promptly — NOT for correctness:
-        // the FTS write paths `indexHeaders`/`updateBodies` call `ensureReady()` (lazy
-        // init) before writing, completion is gated on their confirmed-write return sets
-        // (a no-op writes nothing AND marks nothing complete, so it stays retryable), and
-        // `recoverIncompleteHeaders`/`selfHealFTSBodyMembership` re-index any miss. So an
-        // indexing call that beat init would self-init and write — it can't silently drop.
-        Task.detached {
-            // FTS init reads from the main DB to seed/reconcile the index —
-            // wait for migrations to finish (AppDatabase.dbPool is force-
-            // unwrapped, see AppStartup).
-            await AppStartup.shared.awaitReady()
-            do {
-                try await SearchIndex.shared.initialize()
-            } catch {
-                print("[TabMailApp] FTS index initialization failed: \(error)")
-            }
-        }
+        // EmbeddingService (CoreML) inits off the launch path at .utility — it loads
+        // late (when CPU frees, AFTER the inbox render per device logs), so it doesn't
+        // compete with the first paint. Consumers nil-guard `EmbeddingService.shared`
+        // and degrade to keyword-only until it lands. Left here (not deferred to
+        // body.task) so the BACKGROUND embedding backfill still loads it on a cold
+        // background launch where body.task never runs.
         Task.detached(priority: .utility) {
             await AppStartup.shared.awaitReady()
             EmbeddingService.initialize()
         }
+        // SearchIndex's eager init is deliberately NOT here. Its 257k-doc FTS open
+        // was landing IN the inbox first-render window (it fired at dbReady, before
+        // the paint, per device logs: "Opening FTS database" mid-stall). Moved to
+        // `deferredSearchIndexInitIfNeeded()`, kicked from body.task AFTER the inbox
+        // renders. Safe: the FTS WRITE paths (`indexHeaders`/`updateBodies`/…) call
+        // `ensureReady()`, so any earlier consumer — foreground sync indexing, and
+        // background push/sync (which never runs body.task) — self-initializes the
+        // index and can't silently drop a write (completion is gated on confirmed-
+        // write return sets; `recoverIncompleteHeaders`/`selfHealFTSBodyMembership`
+        // re-index any miss). The deferred init only makes foreground SEARCH ready
+        // promptly without racing the first render.
 
         // Configure TipKit for onboarding hints
         if ScreenshotMode.isActive || ScreenshotMode.isSplashMode {
@@ -223,6 +220,28 @@ struct TabMailApp: App {
         }
     }
 
+    @MainActor private static var didDeferSearchInit = false
+
+    /// Initialize the FTS search index AFTER the inbox first render, so its (large)
+    /// 257k-doc open doesn't compete for CPU/IO with the first paint — it previously
+    /// fired at `dbReady` (pre-render) and showed up mid-stall in device logs.
+    /// Foreground-only (driven from `body.task`): a cold BACKGROUND launch never runs
+    /// `body.task` and doesn't need this — SearchIndex's write methods call
+    /// `ensureReady()`, so push/sync FTS indexing self-initializes the index there.
+    @MainActor private static func deferredSearchIndexInitIfNeeded() {
+        guard !didDeferSearchInit else { return }
+        didDeferSearchInit = true
+        Task.detached {
+            // Settle past the inbox first-render stall before the FTS open.
+            try? await Task.sleep(for: .milliseconds(500))
+            do {
+                try await SearchIndex.shared.initialize()
+            } catch {
+                print("[TabMailApp] FTS index initialization failed: \(error)")
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {
@@ -307,7 +326,10 @@ struct TabMailApp: App {
                 await startup.runIfNeeded(navigationStore: navigationStore)
                 // Inbox is now on screen — prime WebKit off the cold-launch
                 // render path (no-op on a background launch: isReady stays false).
-                if startup.isReady { Self.warmUpWebKitIfNeeded() }
+                if startup.isReady {
+                    Self.warmUpWebKitIfNeeded()
+                    Self.deferredSearchIndexInitIfNeeded()
+                }
             }
         }
     }
