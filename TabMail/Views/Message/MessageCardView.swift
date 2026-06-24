@@ -57,12 +57,34 @@ struct MessageCardView: View {
         (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
     }
 
-    /// User labels for this card's message — loaded directly from DB.
-    /// No aggregation needed in detail view (each card is a single message).
-    private var cardUserLabels: [UserLabel] {
-        (try? AppDatabase.dbPool.read { db in
-            try UserLabelStore.labelsForMessage(message.id, in: db)
+    /// User labels for this card's message.
+    ///
+    /// Loaded ASYNCHRONOUSLY off the main thread. This was previously a computed
+    /// property running a synchronous `dbPool.read` (a label JOIN) INSIDE `body`,
+    /// so it re-executed on the main thread on every card re-render — and the
+    /// focused card re-renders several times during a message open (body lands,
+    /// AI summary/tag updates arrive). That synchronous in-`body` DB read was a
+    /// contributor to the message-open render freeze. Now the read happens in a
+    /// Task and the result is held in `@State`. Refreshed on (1) message identity
+    /// change via `.task(id:)`, and (2) `.inboxDataDidChange`, which the label
+    /// management menu posts after applying/removing a label.
+    @State private var userLabels: [UserLabel] = []
+
+    /// Async-load this card's user labels off the main thread into `userLabels`.
+    private func loadUserLabels() async {
+        let id = message.id
+        // `[UserLabel]` is Sendable → GRDB picks the non-blocking async `read`
+        // overload (the closure must return a Sendable value, or it silently
+        // falls back to the synchronous, main-thread-blocking overload).
+        let labels = (try? await AppDatabase.dbPool.read { db in
+            try UserLabelStore.labelsForMessage(id, in: db)
         }) ?? []
+        // A cancelled reload must not clobber the chips: if `.task(id:)` was torn
+        // down because the card rebound to a different message mid-read, GRDB
+        // throws CancellationError → `try?` yields `[]` here. Writing that would
+        // wipe the chips; the replacement task writes the correct labels instead.
+        guard !Task.isCancelled else { return }
+        userLabels = labels
     }
 
     init(
@@ -131,6 +153,14 @@ struct MessageCardView: View {
                 }
             }
         }
+        // Load user-label chips off the main thread. `.task(id:)` reloads when
+        // this card is bound to a different message; `.inboxDataDidChange`
+        // (posted by UserLabelMenuView on apply/remove) refreshes chips after an
+        // edit without a synchronous read in `body`.
+        .task(id: message.id) { await loadUserLabels() }
+        .onReceive(NotificationCenter.default.publisher(for: .inboxDataDidChange).receive(on: DispatchQueue.main)) { _ in
+            Task { await loadUserLabels() }
+        }
     }
 
     // MARK: - Collapsed State
@@ -177,7 +207,7 @@ struct MessageCardView: View {
                     .padding(.top, 1)
 
                 // User label chips at bottom of compressed bubble (clipped)
-                let compressedLabels = cardUserLabels
+                let compressedLabels = userLabels
                 if !compressedLabels.isEmpty {
                     let segments = UserLabelDisplaySegment.expand(compressedLabels)
                     Menu {
@@ -277,7 +307,7 @@ struct MessageCardView: View {
             .popoverTip(UserLabelCardManageTip(), arrowEdge: .bottom)
 
             // User label chips (below subject, above separator — expanded: wrapping)
-            let expandedLabels = cardUserLabels
+            let expandedLabels = userLabels
             if !expandedLabels.isEmpty {
                 let segments = UserLabelDisplaySegment.expand(expandedLabels)
                 Menu {
