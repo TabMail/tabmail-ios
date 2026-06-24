@@ -148,6 +148,81 @@ extension AIService {
         return ChatResponse(text: cleaned, thinking: response.thinking)
     }
 
+    /// Resume an agent-chat turn that was cut off in transit (the caller caught a
+    /// `ChatConnectionLostError` and kept its `resumeRequest`). Re-enters the tool
+    /// loop from the preserved `conversation_state` carried in `request`, so every
+    /// already-completed tool call and prior round's thinking is reused — nothing is
+    /// re-executed and nothing the user typed is re-sent. This is the continuation
+    /// counterpart to `sendChatMessage`; it is intentionally separate from the
+    /// fork/resend pathways.
+    ///
+    /// Does NOT consume a Demo Mode budget call: the original `sendChatMessage`
+    /// already accounted for this turn.
+    func resumeChatMessage(
+        request: CompletionsRequest,
+        onSSEEvent: BackendClient.SSEEventHandler? = nil
+    ) async throws -> ChatResponse? {
+        guard !disableLLMCalls else {
+            print("[AIService] resumeChatMessage: SKIP — LLM calls disabled")
+            return nil
+        }
+        // Demo Mode budget: a resume re-runs the failed round, so it consumes one
+        // call like a fresh turn. The original send refunded on connection-lost
+        // (DemoModeStore.shouldRefund), so a resumed turn still nets exactly one
+        // call. Refund here too if THIS resume attempt fails transiently.
+        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
+        if inDemo {
+            let exhausted = await MainActor.run { DemoModeStore.shared.isCallBudgetExhausted }
+            guard !exhausted else { throw DemoError.callBudgetExhausted }
+            await MainActor.run { DemoModeStore.shared.consumeCall() }
+        }
+        // Fresh per-turn pagination cache, matching sendChatMessage.
+        await MemorySearchCache.shared.reset()
+
+        print("[AIService] resumeChatMessage: resuming from saved conversation_state")
+        // Refresh client_timestamp_ms: the saved request froze it at the failed
+        // round's time, but a delayed retry should let the backend reason about
+        // "now" (e.g. "what's on my calendar today"). Reconstructing via init
+        // re-stamps the timestamp while preserving messages + conversation_state.
+        // Matches TB, whose resume rebuilds the payload with a fresh Date.now().
+        let refreshed = CompletionsRequest(
+            messages: request.messages,
+            client_timezone: request.client_timezone,
+            disable_tools: request.disable_tools,
+            web_search_enabled: request.web_search_enabled,
+            conversation_state: request.conversation_state,
+            byok: request.byok
+        )
+        let response: CompletionsResponse
+        do {
+            response = try await sendWithToolsDirect(request: refreshed, onSSEEvent: onSSEEvent)
+        } catch {
+            if inDemo, DemoModeStore.shouldRefund(for: error) {
+                await MainActor.run { DemoModeStore.shared.refundCall() }
+            }
+            throw error
+        }
+
+        // Same post-processing as sendChatMessage (kept inline so the demo-budget
+        // accounting there stays untouched).
+        if let error = response.error {
+            print("[AIService] resumeChatMessage error: \(error)")
+            BackgroundSyncLogger.logChatError("Server error (resume): \(error)", userMessage: "(resumed)")
+            throw ChatError.serverError(error)
+        }
+        guard let text = response.assistant, !text.isEmpty else {
+            print("[AIService] resumeChatMessage: empty response")
+            BackgroundSyncLogger.logChatError("Empty assistant response from server (resume)", userMessage: "(resumed)")
+            return nil
+        }
+        let cleaned = Self.normalizeUnicode(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !cleaned.isEmpty else {
+            print("[AIService] resumeChatMessage: empty response after normalization")
+            return nil
+        }
+        return ChatResponse(text: cleaned, thinking: response.thinking)
+    }
+
     /// Get the user's display name for chat system prompt.
     /// Uses the primary account's display name (matching TB's getUserName).
     /// Queries GRDB directly — safe from any isolation context.

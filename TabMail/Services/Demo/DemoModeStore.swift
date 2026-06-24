@@ -102,6 +102,14 @@ final class DemoModeStore {
     /// Pure function — safe to call off the main actor.
     nonisolated static func shouldRefund(for error: Error) -> Bool {
         if error is CancellationError { return true }
+        // Connection-lost is a transient cut → refund the failed round. Handled
+        // explicitly (and before the string-match below) so the decision is
+        // deterministic — otherwise the request's timestamp digits could
+        // incidentally match the "500"/"502" 5xx heuristic. Refund is correct for
+        // BOTH shapes: callers with no resume (inline edit, reply) get their call
+        // back; the chat resume path re-consumes via `resumeChatMessage`, so a
+        // resumed chat turn still nets exactly one call.
+        if error is ChatConnectionLostError { return true }
         if let urlError = error as? URLError {
             switch urlError.code {
             case .notConnectedToInternet, .timedOut, .cancelled, .networkConnectionLost,

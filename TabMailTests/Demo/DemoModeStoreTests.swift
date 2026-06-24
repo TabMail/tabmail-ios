@@ -99,6 +99,17 @@ struct DemoModeStoreTests {
         #expect(!DemoModeStore.shouldRefund(for: err))
     }
 
+    @Test("Refund: connection-lost is a transient cut — deterministic across callers")
+    func refundOnConnectionLost() {
+        // Refund the failed round: callers with no resume (inline edit, reply) get
+        // their call back, and the chat resume re-consumes via resumeChatMessage so
+        // a resumed turn still nets one call. Must be deterministic regardless of
+        // the request's timestamp digits (which could trip the 5xx string-match).
+        let req = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
+        let err = ChatConnectionLostError(resumeRequest: req)
+        #expect(DemoModeStore.shouldRefund(for: err))
+    }
+
     // MARK: - Persistence
 
     @Test("Demo gate flags persist independent of production flags")

@@ -65,6 +65,22 @@ struct BackendErrorExtendedTests {
         }
     }
 
+    // MARK: - streamTruncated (connection-lost / resume)
+
+    @Test("streamTruncated is NOT auto-retriable (manual tap-to-retry only)")
+    func streamTruncatedNotRetriable() {
+        // If this flips to true, the background path (sendCompletionsWithRetry)
+        // would silently auto-retry truncations, and the agent-chat tool loop's
+        // conversion to a resumable ChatConnectionLostError could be bypassed.
+        #expect(BackendError.streamTruncated.isRetriable == false)
+    }
+
+    @Test("streamTruncated errorDescription is descriptive")
+    func streamTruncatedDescription() {
+        let desc = BackendError.streamTruncated.errorDescription!
+        #expect(!desc.isEmpty)
+    }
+
     // MARK: - Error conformance
 
     @Test("BackendError conforms to LocalizedError")

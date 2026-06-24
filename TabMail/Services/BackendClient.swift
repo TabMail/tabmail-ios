@@ -24,11 +24,19 @@ actor BackendClient {
     /// timeoutIntervalForResource caps the TOTAL request time regardless of bytes received,
     /// preventing stalled connections from holding semaphore slots for 5-16 minutes.
     /// The shared ephemeral session doesn't have this because it serves all HTTP traffic.
-    private let llmSession: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
-        return URLSession(configuration: config)
-    }()
+    private let llmSession: URLSession
+
+    /// Test seam: inject a mock `URLSession` (e.g. `FakeHTTP.makeSession()`) to drive
+    /// the streaming/tool-loop path in unit tests. Production passes nil → the default
+    /// ephemeral session with the LLM resource timeout. All other state keeps its
+    /// inline defaults, so `BackendClient()` continues to work unchanged.
+    init(llmSession: URLSession? = nil) {
+        self.llmSession = llmSession ?? {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
+            return URLSession(configuration: config)
+        }()
+    }
 
     // 403 exponential backoff state — shared across all completions requests.
     // When the backend returns 403 (unauthorized/dev-access-denied), we back off
@@ -1145,6 +1153,13 @@ extension BackendClient {
                     finalEvent = try await sendStreamingCompletions(currentRequest, onSSEEvent: onSSEEvent)
                     break
                 } catch let error as BackendError {
+                    // Truncated final → surface as a resumable connection-lost error
+                    // carrying THIS round's input (the last good conversation_state).
+                    // The caller offers a manual "tap to retry" that re-runs only this
+                    // round; all prior rounds' completed tools/thinking are preserved.
+                    if case .streamTruncated = error {
+                        throw ChatConnectionLostError(resumeRequest: currentRequest)
+                    }
                     guard case .requestFailed(statusCode: 429) = error else { throw error }
                     wasThrottled = true
                     throttleAttempt += 1
@@ -1274,7 +1289,29 @@ extension BackendClient {
         BackgroundSyncLogger.logAIProcessing("[HTTP] request START (streaming, \(body.count) bytes)")
 
         let finalData = try await readSSEStreamIncremental(urlRequest, onSSEEvent: onSSEEvent)
-        return try JSONDecoder().decode(CompletionsFinalEvent.self, from: finalData)
+        return try Self.decodeFinalEvent(finalData)
+    }
+
+    /// Decode the SSE `final` event body, distinguishing a TRUNCATED stream (cut in
+    /// transit → non-parseable JSON → `BackendError.streamTruncated`, resumable) from
+    /// a genuine CONTRACT decode error (well-formed JSON, wrong shape → rethrown so a
+    /// real bug surfaces instead of being silently retried). The backend always emits
+    /// the final via JSON.stringify, so a body that doesn't even parse as JSON means
+    /// the tail was cut in transit.
+    static func decodeFinalEvent(_ finalData: Data) throws -> CompletionsFinalEvent {
+        do {
+            return try JSONDecoder().decode(CompletionsFinalEvent.self, from: finalData)
+        } catch {
+            let isWellFormedJSON = (try? JSONSerialization.jsonObject(with: finalData)) != nil
+            #if DEBUG
+            let raw = String(data: finalData.prefix(500), encoding: .utf8) ?? "<binary>"
+            print("[BackendClient] final decode failed (wellFormedJSON=\(isWellFormedJSON), \(finalData.count) bytes): \(error)\n  Raw: \(raw)")
+            #endif
+            if isWellFormedJSON {
+                throw error  // complete but wrong shape → surface the real decode error
+            }
+            throw BackendError.streamTruncated  // cut in transit → resumable
+        }
     }
 
     /// Parse a full SSE text into structured events, calling the handler for each.
@@ -1811,11 +1848,22 @@ enum BackendError: Error, LocalizedError {
     case unauthorized
     case accountGone  // Server confirmed user is not logged in (account deleted/token revoked)
     case forbidden    // 403 — dev access denied or feature disabled; exponential backoff active
+    /// The SSE stream reached a clean end-of-stream but the `final` event body
+    /// was incomplete — i.e. the response was cut in transit (flush/close race,
+    /// edge or device buffering) and `JSONDecoder` saw truncated, non-parseable
+    /// JSON. Distinct from `requestFailed(0)` (a thrown network/stall error) and
+    /// from a contract `typeMismatch` (well-formed JSON, wrong shape). On the
+    /// agent-chat tool loop this is converted to a resumable `ChatConnectionLostError`
+    /// (the failed round is re-runnable from the last good conversation_state).
+    case streamTruncated
 
     /// Whether this error is retriable (network errors, timeouts, 429, 5xx).
     var isRetriable: Bool {
         switch self {
         case .unauthorized, .accountGone, .forbidden: return false
+        // Not auto-retried: the tool-loop path converts it to a resumable
+        // ChatConnectionLostError surfaced as a manual "tap to retry" affordance.
+        case .streamTruncated: return false
         case .requestFailed(let code):
             // Retry: 0 (network failure), 408 (timeout), 429 (rate limit), 5xx (server error)
             // Don't retry: other 4xx (client error — our request is wrong)
@@ -1829,6 +1877,29 @@ enum BackendError: Error, LocalizedError {
         case .unauthorized: return "Unauthorized (401)"
         case .accountGone: return "Account no longer exists"
         case .forbidden: return "Forbidden (403) — backing off"
+        case .streamTruncated: return "Response was cut off in transit"
         }
     }
+}
+
+/// Thrown by the agent-chat tool loop when a round's streamed `final` event was
+/// truncated in transit (`BackendError.streamTruncated`). Carries the request
+/// needed to RESUME the interrupted turn from the last good `conversation_state`
+/// — re-running ONLY the failed round, so completed tool calls and prior thinking
+/// are preserved and never re-executed.
+///
+/// This is deliberately a DISTINCT type from the fork/resend pathways (which
+/// restart from a user message). Resume continues an in-flight turn; it does not
+/// re-send anything the user typed.
+struct ChatConnectionLostError: Error, LocalizedError {
+    /// The failed round's input request (already carries the accumulated
+    /// `conversation_state`). Re-enter the tool loop with this to resume.
+    let resumeRequest: CompletionsRequest
+
+    /// The agent-chat path intercepts this by type (for the resume affordance),
+    /// but the tool loop is shared with non-chat callers (inline edit, reply
+    /// precompute, task eval) that surface `localizedDescription`. Conform to
+    /// LocalizedError so those show a clean message, not the Swift default
+    /// "The operation couldn't be completed. (… error 1.)".
+    var errorDescription: String? { "Connection lost. Please try again." }
 }

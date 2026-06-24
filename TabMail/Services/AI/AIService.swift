@@ -268,4 +268,19 @@ actor AIService {
             onSSEEvent: onSSEEvent
         )
     }
+
+    /// Resume variant — sends an ALREADY-BUILT request (carrying a saved
+    /// `conversation_state`) straight through the tool loop, without rebuilding
+    /// messages. Used by `resumeChatMessage` to continue a turn that was cut off in
+    /// transit, so completed tool rounds are reused. Lives here (not in the AIChat
+    /// extension) because `backendClient` is file-private to AIService.
+    func sendWithToolsDirect(
+        request: CompletionsRequest,
+        onSSEEvent: BackendClient.SSEEventHandler? = nil
+    ) async throws -> CompletionsResponse {
+        guard !disableLLMCalls else {
+            return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
+        }
+        return try await backendClient.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent)
+    }
 }

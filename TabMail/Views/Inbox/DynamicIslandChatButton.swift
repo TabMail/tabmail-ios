@@ -86,6 +86,12 @@ struct DynamicIslandChat: View {
         get { session.lastFailedMessage }
         nonmutating set { session.lastFailedMessage = newValue }
     }
+    /// Saved checkpoint for a turn cut off in transit — drives the "Connection
+    /// lost. Tap to retry." affordance. Separate from `lastFailedMessage`.
+    private var pendingResumeRequest: CompletionsRequest? {
+        get { session.pendingResumeRequest }
+        nonmutating set { session.pendingResumeRequest = newValue }
+    }
     private var activeReminders: [Reminder] {
         get { session.activeReminders }
         nonmutating set { session.activeReminders = newValue }
@@ -1042,6 +1048,28 @@ struct DynamicIslandChat: View {
                         }
                     }
                 }
+                // Connection-lost resume affordance. Tapping continues the interrupted
+                // turn from saved conversation_state (completed tools/thinking preserved)
+                // — distinct from the fork/resend context-menu actions on user messages.
+                if isLive && !isWorking && pendingResumeRequest != nil {
+                    Button {
+                        resumeAgentChat()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption)
+                            Text("Connection lost. Tap to retry.")
+                                .font(.subheadline)
+                        }
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.orange.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(14)
         }
@@ -1612,6 +1640,7 @@ struct DynamicIslandChat: View {
         ActiveAgentTracker.shared.setWorking(sessionKey)
         resetStatusQueue()
         lastFailedMessage = nil
+        pendingResumeRequest = nil  // a fresh send abandons any interrupted turn
         lastChatActivity = Date()
 
         let sid = currentSessionId
@@ -1789,6 +1818,13 @@ struct DynamicIslandChat: View {
                         content: "Active subscription required. Go to TabMail Account to subscribe.",
                         timestamp: Date()
                     ))
+                } else if let resumable = error as? ChatConnectionLostError {
+                    // Cut off mid-turn. Arm the dedicated "tap to retry" affordance
+                    // with the saved checkpoint — completed tool calls + prior thinking
+                    // are preserved in its conversation_state. No hard error bubble, and
+                    // no `lastFailedMessage` (that's the separate fork/resend pathway).
+                    BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
+                    pendingResumeRequest = resumable.resumeRequest
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
@@ -1824,6 +1860,118 @@ struct DynamicIslandChat: View {
     /// Reopen AI subscription gate on successful API response.
     private func confirmSubscriptionActive() {
         AISubscriptionGate.shared.openGate()
+    }
+
+    // MARK: - Connection-lost Resume
+
+    /// Resume a turn that was cut off in transit (the catch above armed
+    /// `pendingResumeRequest`). Re-enters the tool loop from the saved
+    /// `conversation_state`, so every already-completed tool call and prior round's
+    /// thinking is reused — nothing is re-executed and the user's message is NOT
+    /// re-sent. This is intentionally separate from the fork/resend pathways
+    /// (`resendLastUserMessage` / `rewindToMessage` / `forkFromMessage`), which
+    /// restart from a user message via `sendAgentChat`.
+    private func resumeAgentChat() {
+        guard !isWorking, let request = pendingResumeRequest else { return }
+        pendingResumeRequest = nil  // hide the affordance; re-armed on failure
+        isWorking = true
+        ActiveAgentTracker.shared.setWorking(sessionKey)
+        resetStatusQueue()
+        lastChatActivity = Date()
+
+        let sid = currentSessionId
+        let capturedSessionKey = sessionKey
+
+        activeChatTask = Task {
+            let chatStore = ChatStore.shared
+            do {
+                let response = try await AIService.shared.resumeChatMessage(
+                    request: request,
+                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking...")
+                )
+
+                let replyText = response?.text ?? "I couldn't generate a response. Please try again."
+                if response != nil { confirmSubscriptionActive() }
+
+                // Guard: if user pressed stop, stop button already handled UI.
+                guard !Task.isCancelled else { return }
+
+                var displayText = replyText
+                if response != nil {
+                    let rendered = await ChatIdTranslator.shared.processResponseForDisplay(replyText)
+                    displayText = rendered
+                    let assistantTurn = ChatTurn(
+                        id: ChatTurn.generateId(),
+                        timestamp: Date().timeIntervalSince1970 * 1000,
+                        role: "assistant",
+                        content: replyText,
+                        userMessage: nil,
+                        type: "normal",
+                        chars: replyText.count,
+                        renderedContent: rendered != replyText ? rendered : nil,
+                        sessionId: sid,
+                        remindersSnapshot: nil,
+                        emailContextJSON: nil,
+                        thinkingContent: response?.thinking
+                    )
+                    sessionTurns.append(assistantTurn)
+                    do {
+                        let evicted = try await chatStore.appendTurn(assistantTurn)
+                        let assistantRefs = ChatIdTranslator.collectRefsFromTurn(assistantTurn)
+                        await ChatIdTranslator.shared.registerTurnRefs(assistantRefs)
+                        if !evicted.isEmpty {
+                            await ChatIdTranslator.shared.cleanupEvictedIds(evictedTurns: evicted)
+                        }
+                    } catch {
+                        print("[DynamicIslandChat] Failed to persist resumed assistant turn: \(error)")
+                    }
+                }
+
+                guard !Task.isCancelled else { return }
+                chatMessages.append(ChatMessage(
+                    role: .agent,
+                    content: displayText,
+                    timestamp: Date(),
+                    animate: true
+                ))
+                if !isExpanded {
+                    if let onAgentReply {
+                        onAgentReply(displayText)
+                    } else {
+                        ActiveAgentTracker.shared.setPendingResponse(capturedSessionKey, text: displayText)
+                        showAgentToast(displayText)
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                if Self.isSubscriptionError(error) {
+                    chatMessages.append(ChatMessage(
+                        role: .warning,
+                        content: "Active subscription required. Go to TabMail Account to subscribe.",
+                        timestamp: Date()
+                    ))
+                } else if let resumable = error as? ChatConnectionLostError {
+                    // Cut off again — keep the affordance armed with the latest checkpoint.
+                    BackgroundSyncLogger.logChatError("Connection lost again (resumable)", userMessage: "(resumed)")
+                    pendingResumeRequest = resumable.resumeRequest
+                } else {
+                    // Non-transient failure — surface it; the user's message still has
+                    // the fork/resend context menu for a fresh attempt.
+                    BackgroundSyncLogger.logChatError("Resume failed: \(error.localizedDescription)", userMessage: "(resumed)")
+                    chatMessages.append(ChatMessage(
+                        role: .agent,
+                        content: "Couldn't connect. (\(error.localizedDescription))",
+                        timestamp: Date()
+                    ))
+                }
+            }
+            guard !Task.isCancelled else { return }
+            activeChatTask = nil
+            isWorking = false
+            ActiveAgentTracker.shared.clearWorking(capturedSessionKey)
+            resetStatusQueue()
+            lastChatActivity = Date()
+        }
     }
 
     // MARK: - Re-send / Fork

@@ -71,6 +71,13 @@ final class ChatPillState {
         var chatMessages: [ChatMessage] = []
         var lastChatActivity: Date?
         var lastFailedMessage: String?
+        /// Saved checkpoint for a turn that was cut off in transit (connection lost
+        /// mid-stream). Holds the failed round's request with its preserved
+        /// `conversation_state`, so "tap to retry" resumes from completed tool work
+        /// instead of restarting. Deliberately SEPARATE from `lastFailedMessage`
+        /// (the fork/resend pathways) — resume continues an in-flight turn, it does
+        /// not re-send the user's message.
+        var pendingResumeRequest: CompletionsRequest?
         /// Buffer 1 (display): shown on the "new session" page. Swapped from Buffer 2
         /// on pill expand for instant display. Stable while being shown.
         var activeReminders: [Reminder] = []

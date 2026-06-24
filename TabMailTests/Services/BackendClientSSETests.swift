@@ -571,6 +571,113 @@ struct MockLineStream: AsyncSequence {
     }
 }
 
+@Suite("BackendClient final-event truncation discriminator")
+struct BackendClientFinalDecodeTests {
+
+    @Test("complete valid final JSON decodes")
+    func completeDecodes() throws {
+        let json = #"{"assistant":"Hello there","token_usage":null}"#
+        let event = try BackendClient.decodeFinalEvent(Data(json.utf8))
+        #expect(event.assistant == "Hello there")
+    }
+
+    @Test("truncated final JSON throws streamTruncated (resumable)")
+    func truncatedThrowsStreamTruncated() {
+        // Tail cut mid-string — not parseable as JSON → resumable connection-lost.
+        let json = #"{"assistant":"Hello there, here is the long ans"#
+        #expect {
+            _ = try BackendClient.decodeFinalEvent(Data(json.utf8))
+        } throws: { error in
+            guard case BackendError.streamTruncated = error else { return false }
+            return true
+        }
+    }
+
+    @Test("empty final body throws streamTruncated")
+    func emptyThrowsStreamTruncated() {
+        #expect {
+            _ = try BackendClient.decodeFinalEvent(Data())
+        } throws: { error in
+            guard case BackendError.streamTruncated = error else { return false }
+            return true
+        }
+    }
+
+    @Test("well-formed JSON of the wrong shape is NOT treated as truncation")
+    func wrongShapeIsNotTruncation() {
+        // Valid JSON (an array), but not a CompletionsFinalEvent object. This is a
+        // contract error, not a cut stream — it must surface as the real decode
+        // error, NOT be silently classified as resumable truncation.
+        #expect {
+            _ = try BackendClient.decodeFinalEvent(Data("[1,2,3]".utf8))
+        } throws: { error in
+            if case BackendError.streamTruncated = error { return false }
+            return true  // any other error (the real DecodingError) is correct
+        }
+    }
+}
+
+@Suite("BackendClient truncation → resumable (integration)")
+struct BackendClientResumeIntegrationTests {
+
+    /// SSE primer the backend prepends (≥512-byte `:` comment) — included so the
+    /// mock streams match production framing.
+    private static let primer = ":" + String(repeating: " ", count: 600) + "\n\n"
+
+    @Test("truncated streaming final → ChatConnectionLostError carrying conversation_state")
+    func truncatedYieldsResumable() async {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+        // A `final` event whose JSON is cut mid-token, then the stream ends. The
+        // parser flushes the partial final → decodeFinalEvent can't parse it →
+        // streamTruncated → the tool loop converts it to ChatConnectionLostError.
+        let body = Self.primer
+            + "event: keepalive\ndata: {}\n\n"
+            + "event: final\ndata: {\"assistant\":\"this got cut o"
+        FakeHTTP.register(
+            path: "/completions/chat", method: "POST",
+            response: .bytes(Data(body.utf8), contentType: "text/event-stream", statusCode: 200)
+        )
+        let client = BackendClient(llmSession: FakeHTTP.makeSession())
+
+        let msg = HarmonyMessage(role: "tool", content: "search result", thinking: nil, tool_calls: nil, tool_call_id: "call-1")
+        let convState = ConversationState(harmony_messages: [msg], current_round: 3)
+        let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil, conversation_state: convState)
+
+        do {
+            _ = try await client.sendCompletionsWithToolsDirect(request)
+            Issue.record("expected ChatConnectionLostError, but the call returned normally")
+        } catch let error as ChatConnectionLostError {
+            // The resumable error must carry the failed round's input — the saved
+            // conversation_state — so resume continues from completed tool work.
+            #expect(error.resumeRequest.conversation_state?.current_round == 3)
+            #expect(error.resumeRequest.conversation_state?.harmony_messages.count == 1)
+        } catch {
+            Issue.record("expected ChatConnectionLostError, got \(error)")
+        }
+    }
+
+    @Test("complete streaming final decodes — no false truncation")
+    func completeFinalDecodes() async {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+        let body = Self.primer + "event: final\ndata: {\"assistant\":\"all good\"}\n\n"
+        FakeHTTP.register(
+            path: "/completions/chat", method: "POST",
+            response: .bytes(Data(body.utf8), contentType: "text/event-stream", statusCode: 200)
+        )
+        let client = BackendClient(llmSession: FakeHTTP.makeSession())
+        let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
+
+        do {
+            let resp = try await client.sendCompletionsWithToolsDirect(request)
+            #expect(resp.assistant == "all good")
+        } catch {
+            Issue.record("expected a successful decode, got \(error)")
+        }
+    }
+}
+
 // JSONValue needs Equatable for test assertions
 extension JSONValue: @retroactive Equatable {
     public static func == (lhs: JSONValue, rhs: JSONValue) -> Bool {
