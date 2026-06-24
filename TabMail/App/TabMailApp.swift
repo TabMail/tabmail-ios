@@ -183,17 +183,11 @@ struct TabMailApp: App {
         // Enable battery monitoring for power-aware backfill (BackfillProfile).
         UIDevice.current.isBatteryMonitoringEnabled = true
 
-        // Warm up WebKit — eliminates ~300-500ms cold-start lag when user
-        // opens their first message. Since iOS 15+ all WKWebViews share a
-        // single process pool automatically, so any warmup view primes them all.
-        // Deferred by 1s so it doesn't compete with main thread during inbox render.
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1))
-            let warmup = WKWebView(frame: .zero)
-            warmup.loadHTMLString(" ", baseURL: nil)
-            try? await Task.sleep(for: .milliseconds(500))
-            _ = warmup
-        }
+        // WebKit warm-up moved OUT of init — see `warmUpWebKitIfNeeded()`, kicked
+        // off from `body.task` once `isReady` (the inbox is on screen). A fixed
+        // delay from init fired mid-render on a cold boot (where the inbox takes
+        // >1s to appear), so the first WKWebView's cold WebContent/GPU process
+        // launch competed with cold-launch rendering.
 
         // Request push notification permission and register for remote notifications.
         // Silent push (content-available: 1) works without user permission,
@@ -242,6 +236,30 @@ struct TabMailApp: App {
         // #if DEBUG) so demos can be recorded from a TestFlight build. Inert
         // unless the toggle is on. Toggle: Settings → Debug.
         TouchVisualizer.shared.activateIfEnabled()
+    }
+
+    /// Guards the one-shot WebKit warm-up (`body.task` can re-run on scene changes).
+    @MainActor private static var hasWarmedUpWebKit = false
+
+    /// Prime the shared WKWebView process pool AFTER the inbox is on screen, so the
+    /// first (cold) WebContent/GPU process launch never competes with cold-launch
+    /// rendering. Eliminates ~300-500ms lag on the user's first message-open; the
+    /// process pool is shared (iOS 15+) and persists, so the throwaway view can be
+    /// released once `loadHTMLString` has kicked the content process off. Driven
+    /// from `body.task` (the foreground UI path): a cold BACKGROUND launch has no
+    /// UI and never opens a message, so it correctly skips warm-up entirely.
+    @MainActor private static func warmUpWebKitIfNeeded() {
+        guard !hasWarmedUpWebKit else { return }
+        hasWarmedUpWebKit = true
+        Task { @MainActor in
+            // Brief settle so the inbox's first frame paints before we spin up
+            // the (cold) WebKit content process.
+            try? await Task.sleep(for: .milliseconds(500))
+            let warmup = WKWebView(frame: .zero)
+            warmup.loadHTMLString(" ", baseURL: nil)
+            try? await Task.sleep(for: .milliseconds(500))
+            _ = warmup
+        }
     }
 
     var body: some Scene {
@@ -305,6 +323,9 @@ struct TabMailApp: App {
                 // window of half-repaired derived data (the app doesn't operate
                 // mid-migration).
                 await startup.runIfNeeded(navigationStore: navigationStore)
+                // Inbox is now on screen — prime WebKit off the cold-launch
+                // render path (no-op on a background launch: isReady stays false).
+                if startup.isReady { Self.warmUpWebKitIfNeeded() }
             }
         }
     }
