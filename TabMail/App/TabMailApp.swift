@@ -90,66 +90,22 @@ struct TabMailApp: App {
         // background entry points gate via `AppStartup.shared.awaitReady()`.
 
 
-        // Register client-side tools for AI agent chat (matching TB's core.js TOOL_IMPL).
-        // Task.detached avoids inheriting main actor context — eliminates 26 main-actor
-        // round-trips that compete with post-splash UI layout. registerAll does a single actor hop.
-        Task.detached {
-            // Wait for the DB to finish migrating before any tool can touch it
-            // (tools query GRDB when invoked; registration itself doesn't, but
-            // gating here is cheap and keeps all DB-adjacent startup uniform).
-            await AppStartup.shared.awaitReady()
-            let registry = ToolRegistry.shared
-            await registry.registerAll([
-                InboxReadTool(),
-                EmailReadTool(),
-                EmailSearchTool(),
-                EmailDeleteTool(),
-                EmailArchiveTool(),
-                EmailComposeTool(),
-                EmailReplyTool(),
-                EmailForwardTool(),
-                MemorySearchTool(),
-                MemoryReadTool(),
-                KBAddTool(),
-                KBDelTool(),
-                ReminderAddTool(),
-                ReminderDelTool(),
-                // MARK: Scheduled Tasks — DISABLED on iOS (platform limitation)
-                // Task tools require client-side execution (GRDB, FTS, multi-round LLM↔tool loop)
-                // which cannot run reliably in background on iOS. Silent pushes are throttled overnight,
-                // and NSE runs in a separate process without database access.
-                // Scheduled tasks remain Thunderbird-only.
-                // TaskAddTool(),
-                // TaskDelTool(),
-                // TaskEditTool(),
-                ContactSearchTool(),
-                ContactAddTool(),
-                ContactEditTool(),
-                ContactDeleteTool(),
-                CalendarReadTool(),
-                CalendarSearchTool(),
-                CalendarEventReadTool(),
-                CalendarEventCreateTool(),
-                CalendarEventEditTool(),
-                CalendarEventDeleteTool(),
-                EmailOpenTool(),
-                WebReadTool(),
-                ChangeSettingTool(),
-                TemplateReadTool(),
-                TemplateCreateTool(),
-                TemplateEditTool(),
-                TemplateDeleteTool(),
-                TemplateShareTool(),
-                TemplateSearchTool(),
-                TemplateDownloadTool(),
-                TemplateToggleTool(),
-            ])
-            print("[TabMailApp] Registered \(await registry.registeredNames().count) client-side tools")
-        }
+        // Client-side AI tools are registered LAZILY on first tool use
+        // (`ToolRegistry.ensureDefaultToolsRegistered`, called from
+        // `BackendClient.sendCompletionsWithTools`) instead of at launch — keeps the
+        // 35-tool allocation + actor hop off the cold-launch CPU burst that competes
+        // with the inbox first render. Only the agent chat / reply-precompute / inline-
+        // edit paths use tools, so the first such request pays the one-time cost.
 
         // Initialize FTS search index + embedding service (both async to avoid blocking launch).
         // Task.detached avoids inheriting main actor context — prevents FTS completion
         // callback from competing for main actor time right after splash dismissal.
+        // Left EAGER (not lazy) only so search is ready promptly — NOT for correctness:
+        // the FTS write paths `indexHeaders`/`updateBodies` call `ensureReady()` (lazy
+        // init) before writing, completion is gated on their confirmed-write return sets
+        // (a no-op writes nothing AND marks nothing complete, so it stays retryable), and
+        // `recoverIncompleteHeaders`/`selfHealFTSBodyMembership` re-index any miss. So an
+        // indexing call that beat init would self-init and write — it can't silently drop.
         Task.detached {
             // FTS init reads from the main DB to seed/reconcile the index —
             // wait for migrations to finish (AppDatabase.dbPool is force-

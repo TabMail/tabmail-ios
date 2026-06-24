@@ -91,6 +91,40 @@ struct ToolRegistryArgumentTests {
     }
 }
 
+@Suite("ToolRegistry Lazy Default Registration")
+struct ToolRegistryLazyRegistrationTests {
+
+    @Test("ensureDefaultToolsRegistered registers the full default tool set")
+    func ensureRegistersDefaults() async {
+        let registry = ToolRegistry()
+        await registry.ensureDefaultToolsRegistered()
+        let names = await registry.registeredNames()
+        let expected = ToolRegistry.makeDefaultTools().map(\.name).sorted()
+        #expect(!names.isEmpty)
+        #expect(names == expected)
+        // Spot-check tools the agent-chat / reply / compose paths rely on.
+        #expect(names.contains("inbox_read"))
+        #expect(names.contains("email_search"))
+        #expect(names.contains("memory_search"))
+    }
+
+    @Test("ensureDefaultToolsRegistered is idempotent — second call is a no-op")
+    func ensureIdempotent() async {
+        let registry = ToolRegistry()
+        await registry.ensureDefaultToolsRegistered()
+        let first = await registry.registeredNames()
+        await registry.ensureDefaultToolsRegistered()
+        let second = await registry.registeredNames()
+        #expect(first == second)
+    }
+
+    @Test("makeDefaultTools produces unique tool names")
+    func defaultToolsUniqueNames() {
+        let names = ToolRegistry.makeDefaultTools().map(\.name)
+        #expect(names.count == Set(names).count)
+    }
+}
+
 @Suite("ToolJSON Extended")
 struct ToolJSONExtendedTests {
 

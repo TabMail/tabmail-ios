@@ -48,6 +48,72 @@ actor ToolRegistry {
         }
     }
 
+    private var didRegisterDefaults = false
+
+    /// Lazily register the full client-side tool set on first use. Idempotent: the
+    /// FIRST tool-using request (agent chat / reply precompute / inline edit — all
+    /// via `BackendClient.sendCompletionsWithTools`) pays the one-time registration;
+    /// boot does NOT. Moved off the launch path so the 35-tool allocation + actor
+    /// hop don't pile onto the cold-launch CPU burst that competes with the inbox
+    /// first render.
+    func ensureDefaultToolsRegistered() {
+        guard !didRegisterDefaults else { return }
+        didRegisterDefaults = true
+        registerAll(Self.makeDefaultTools())
+        print("[ToolRegistry] Lazily registered \(tools.count) client-side tools on first use")
+    }
+
+    /// The full client-side tool set (matching TB's core.js TOOL_IMPL). `nonisolated`
+    /// so the (cheap) tool allocations don't need the actor. Built lazily — see
+    /// `ensureDefaultToolsRegistered`.
+    nonisolated static func makeDefaultTools() -> [any AgentTool] {
+        [
+            InboxReadTool(),
+            EmailReadTool(),
+            EmailSearchTool(),
+            EmailDeleteTool(),
+            EmailArchiveTool(),
+            EmailComposeTool(),
+            EmailReplyTool(),
+            EmailForwardTool(),
+            MemorySearchTool(),
+            MemoryReadTool(),
+            KBAddTool(),
+            KBDelTool(),
+            ReminderAddTool(),
+            ReminderDelTool(),
+            // MARK: Scheduled Tasks — DISABLED on iOS (platform limitation)
+            // Task tools require client-side execution (GRDB, FTS, multi-round LLM↔tool loop)
+            // which cannot run reliably in background on iOS. Silent pushes are throttled overnight,
+            // and NSE runs in a separate process without database access.
+            // Scheduled tasks remain Thunderbird-only.
+            // TaskAddTool(),
+            // TaskDelTool(),
+            // TaskEditTool(),
+            ContactSearchTool(),
+            ContactAddTool(),
+            ContactEditTool(),
+            ContactDeleteTool(),
+            CalendarReadTool(),
+            CalendarSearchTool(),
+            CalendarEventReadTool(),
+            CalendarEventCreateTool(),
+            CalendarEventEditTool(),
+            CalendarEventDeleteTool(),
+            EmailOpenTool(),
+            WebReadTool(),
+            ChangeSettingTool(),
+            TemplateReadTool(),
+            TemplateCreateTool(),
+            TemplateEditTool(),
+            TemplateDeleteTool(),
+            TemplateShareTool(),
+            TemplateSearchTool(),
+            TemplateDownloadTool(),
+            TemplateToggleTool(),
+        ]
+    }
+
     /// Look up a tool by name.
     func tool(named name: String) -> (any AgentTool)? {
         tools[name]

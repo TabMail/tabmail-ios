@@ -1175,6 +1175,10 @@ extension BackendClient {
             print("[BackendClient] Round \(round): \(toolCalls.count) tool_calls, harmony_messages=\(conversationState.harmony_messages.count)")
 
             let toolRegistry = ToolRegistry.shared
+            // Lazy boot: register the client-side tool set on first use instead of
+            // at launch (idempotent). This is the "block the first tool call, not
+            // boot" point — registration is moved off the cold-launch CPU burst.
+            await toolRegistry.ensureDefaultToolsRegistered()
             var toolResults: [ToolResult] = []
 
             for toolCall in toolCalls {
