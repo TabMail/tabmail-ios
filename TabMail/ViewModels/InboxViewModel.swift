@@ -1073,35 +1073,33 @@ final class InboxViewModel {
             do {
                 print("[SnippetLoader] Tier2 fetching msgId=\(item.header.messageId) folder=\(item.header.folderPath)")
                 let fullMessage = try await provider.fetchMessage(id: item.header.messageId, folder: item.header.folderPath)
-                // For snippet-only extraction: use textBody directly when available (no conversion),
-                // otherwise truncate HTML to ~2KB before stripping (not the full multi-MB body).
-                // FTS indexing is NOT done here — ActiveBodyQueue/BackfillBodyQueue handles it.
-                // Prefer htmlBody (authoritative content), fall through to textBody if HTML is empty
-                // (IMAP servers sometimes return a 1-char text body alongside full HTML)
-                // Uniform snippet derivation: always htmlToPlainText → snippetFromPlainText
-                // (same path as ActiveBodyQueue / AccountManagerFetch / BackfillWalk)
-                var snippet = ""
-                if let html = fullMessage.htmlBody, !html.isEmpty {
-                    let plain = EmailFilter.htmlToPlainText(html)
-                    snippet = EmailFilter.snippetFromPlainText(plain)
-                    if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 htmlBody len=\(html.count) snippet=\(snippet.prefix(50))") }
+                // We just downloaded the WHOLE body for the snippet — CACHE it now
+                // instead of discarding it. Previously this path extracted a ~150
+                // char snippet and threw the body away, so opening the message
+                // re-downloaded the same body (the "first open is slow / re-render"
+                // report). Route the already-fetched message through the shared
+                // BodyFetchProcessor (single source of truth) so it persists the
+                // rendered MessageBody (→ instant open, no re-download), writes
+                // FTS, derives the snippet, and enqueues AI/embedding. `enableAI`
+                // mirrors the queue split: inbox → AI + active embedding (as
+                // ActiveBodyQueue); other folders → backfill embedding only (as
+                // BackfillBodyQueue).
+                let processorItem = BodyFetchProcessor.Item(
+                    headerId: item.headerId, accountId: item.header.accountId,
+                    folderPath: item.header.folderPath, messageId: item.header.messageId,
+                    isInInbox: item.header.isInInbox
+                )
+                let enableAI = item.header.isInInbox
+                if case .success(let fetchResult) = await BodyFetchProcessor.renderFetched(item: processorItem, fullMessage: fullMessage) {
+                    let (_, processed) = await BodyFetchProcessor.process(fetchResult: fetchResult, enableAI: enableAI)
+                    if let processed {
+                        await BodyFetchProcessor.flushBatch([processed], enableAI: enableAI)
+                        snippetUpdates.append((headerId: item.headerId, snippet: processed.snippet))
+                    } else {
+                        // confirmed-empty / first-empty-retry — no usable snippet this pass
+                        print("[SnippetLoader] Tier2 no body content for msgId=\(item.header.messageId)")
+                    }
                 }
-                if snippet.isEmpty, let text = fullMessage.textBody, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    // Guard against HTML documents mislabeled as text/plain (same
-                    // check as EmailFilter.extractPlainText, which this inlines).
-                    let plain = EmailFilter.looksLikeHTMLDocument(text) ? EmailFilter.htmlToPlainText(text) : text
-                    snippet = EmailFilter.snippetFromPlainText(plain)
-                    if DebugModeManager.isLoggingEnabled() { print("[SnippetLoader] Tier2 textBody len=\(text.count) snippet=\(snippet.prefix(50))") }
-                }
-                if snippet.isEmpty {
-                    print("[SnippetLoader] Tier2 NO USABLE BODY for msgId=\(item.header.messageId)")
-                    continue
-                }
-                let finalSnippet = snippet
-                try? await dbPool.write { db in
-                    try db.execute(sql: "UPDATE messageHeader SET snippet = ? WHERE id = ?", arguments: [finalSnippet, item.headerId])
-                }
-                snippetUpdates.append((headerId: item.headerId, snippet: finalSnippet))
             } catch {
                 print("[SnippetLoader] Failed for \(item.headerId): \(error)")
                 // Only blacklist on non-connection errors (e.g., messageNotFound).
