@@ -751,6 +751,7 @@ actor SearchIndex {
     /// Write body text to FTS for a message. Caller sets GRDB flags (bodyComplete, bodyEmptyConfirmed).
     /// Whitespace-only bodies are silently skipped — caller should set bodyEmptyConfirmed in GRDB.
     func updateBody(headerId: String, body: String) throws {
+        ensureReady()
         guard let dbPool else { return }
         guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
@@ -767,6 +768,7 @@ actor SearchIndex {
 
     /// Update cc/bcc fields in FTS for existing messages (v10 migration backfill).
     func updateCcBcc(_ updates: [(headerId: String, cc: String, bcc: String)]) throws {
+        ensureReady()
         guard let dbPool, !updates.isEmpty else { return }
         try dbPool.write { [self] db in
             for update in updates {
@@ -882,6 +884,7 @@ actor SearchIndex {
 
     /// Store an embedding vector for a message in the sqlite-vec KNN table.
     func storeEmbedding(headerId: String, embedding: [Float]) throws {
+        ensureReady()
         guard let dbPool else { return }
         try dbPool.write { db in
             // Graceful no-op if vec table doesn't exist (vec0 module unavailable)
@@ -908,6 +911,7 @@ actor SearchIndex {
 
     /// Bulk store embeddings in a single FTS write transaction.
     func storeEmbeddings(_ items: [(headerId: String, embedding: [Float])]) throws {
+        ensureReady()
         guard let dbPool, !items.isEmpty else { return }
         try dbPool.write { db in
             let vecTableExists = try Bool.fetchOne(db, sql: """
@@ -999,6 +1003,7 @@ actor SearchIndex {
 
     /// Batch-update folderId for messages (used by backfill and move sync).
     func updateFolderIds(headerIds: [String], newFolderId: String) throws {
+        ensureReady()
         guard let dbPool, !headerIds.isEmpty else { return }
         try dbPool.write { [self] db in
             for headerId in headerIds {
