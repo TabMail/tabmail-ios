@@ -223,10 +223,6 @@ private struct HTMLWebView: UIViewRepresentable {
             context.coordinator.pendingHeight = nil
             if DebugModeManager.isLoggingEnabled() {
                 print("[HTMLDebug] HTMLWebView.updateUIView: loading html len=\(html.count)")
-            }
-            let wrapped = EmailHTMLWrapper.wrapHTML(html, previewFilename: previewFilename)
-            if DebugModeManager.isLoggingEnabled() {
-                print("[HTMLDebug] HTMLWebView.updateUIView: wrapped len=\(wrapped.count)")
                 // Log input HTML in chunks so we can see EXACTLY what's being rendered
                 let inputChunkSize = 800
                 let inputPreview = String(html.prefix(inputChunkSize * 3))
@@ -252,19 +248,11 @@ private struct HTMLWebView: UIViewRepresentable {
             // `src` refs are absolute and resolve via the registered handler
             // regardless of which origin the document is loaded under.
             let base: URL? = (headerId != nil) ? BodyAssetConfig.baseURL : nil
-            if DebugModeManager.isLoggingEnabled() {
-                // Privacy-safe per-email fingerprint: SHA256 of the wrapped html,
-                // truncated to 8 hex chars. One-way, not reversible to content.
-                // Lets us match an email open to its log timeline (multiple
-                // [MeasureHeight id=...] / [HeightDiag id=...] lines all share
-                // the same correlation id; this [Load] event ties that id to a
-                // specific html payload).
-                let bytes = Data(wrapped.utf8)
-                let digest = SHA256.hash(data: bytes)
-                let fp = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
-                print("[Load id=\(context.coordinator.webViewId)] bytes=\(wrapped.count) fp=\(fp) hasHeader=\(headerId != nil)")
-            }
-            webView.loadHTMLString(wrapped, baseURL: base)
+            // wrapHTML is regex-heavy (esp. full-document / large emails) — run
+            // it OFF the main thread so it no longer freezes the UI at the render
+            // moment. See Coordinator.wrapAndLoad; the wrapped-html fingerprint
+            // logging moved there (it now exists only after the off-main wrap).
+            context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename, base: base)
         } else if currentWidth > 100 && abs(currentWidth - context.coordinator.lastMeasuredWidth) > 10 {
             // Frame width changed significantly (e.g. sheet animation settled) —
             // reset viewport to device-width and re-fit. ResizeObserver picks
@@ -298,6 +286,12 @@ private struct HTMLWebView: UIViewRepresentable {
         /// listener; overwritten by newer measurements during the same freeze
         /// so only the final value flushes. Cleared on new-document load.
         var pendingHeight: CGFloat?
+        /// Monotonic token identifying the most recent new-document load. Bumped
+        /// by `wrapAndLoad` on every load (updateUIView htmlChanged + content-
+        /// process reload); the off-main wrap captures the token and skips
+        /// `loadHTMLString` if a newer load superseded it — so a slow wrap of an
+        /// OLD body can't clobber a newer one when the card is rebound mid-wrap.
+        var loadGeneration: Int = 0
         private nonisolated(unsafe) var foregroundObserver: NSObjectProtocol?
         private nonisolated(unsafe) var scrollFreezeObserver: NSObjectProtocol?
         /// Per-Coordinator (i.e. per-WebView lifetime) random id. Stamped into
@@ -417,15 +411,56 @@ private struct HTMLWebView: UIViewRepresentable {
             }
         }
 
+        /// Wrap `rawHTML` OFF the main thread, then load it into the web view.
+        ///
+        /// `EmailHTMLWrapper.wrapHTML` is a pure, isolation-free transform, but
+        /// it is regex-heavy: on a full-document / large email (the
+        /// `unwrapFullHTMLDocument` → `neutralizeCSSRules` path plus the image-
+        /// defer / stylesheet-strip passes) it costs 100ms–1s+ of CPU. Run
+        /// synchronously in `updateUIView` it froze the main thread at the exact
+        /// moment a message rendered. Here the wrap runs on a detached task and
+        /// only `loadHTMLString` hops back to the main actor, gated on
+        /// `loadGeneration` so a stale wrap can't overwrite a newer load. The
+        /// document starts at `opacity:0` (EmailHTMLWrapper CSS) and is revealed
+        /// by `fit()` after `didFinish`, so the slightly-later load shows no
+        /// flash. Behaviour is otherwise identical to the previous synchronous
+        /// wrap + load.
+        func wrapAndLoad(rawHTML: String, previewFilename: String?, base: URL?) {
+            loadGeneration &+= 1
+            let gen = loadGeneration
+            let hasHeader = base != nil
+            Task { @MainActor in
+                let wrapped = await Task.detached(priority: .userInitiated) {
+                    EmailHTMLWrapper.wrapHTML(rawHTML, previewFilename: previewFilename)
+                }.value
+                // A newer load superseded this one (card rebound mid-wrap), or
+                // the web view went away — drop this stale result.
+                guard self.loadGeneration == gen, let webView = self.webView else { return }
+                if DebugModeManager.isLoggingEnabled() {
+                    // Privacy-safe per-email fingerprint: SHA256 of the wrapped
+                    // html, truncated to 8 hex chars (one-way, not reversible to
+                    // content). Ties this load to the [MeasureHeight id=…] /
+                    // [HeightDiag id=…] timeline. Moved here from updateUIView
+                    // since `wrapped` is now produced off-main.
+                    let bytes = Data(wrapped.utf8)
+                    let digest = SHA256.hash(data: bytes)
+                    let fp = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+                    print("[HTMLDebug] HTMLWebView.wrapAndLoad: wrapped len=\(wrapped.count)")
+                    print("[Load id=\(self.webViewId)] bytes=\(wrapped.count) fp=\(fp) hasHeader=\(hasHeader)")
+                }
+                webView.loadHTMLString(wrapped, baseURL: base)
+            }
+        }
+
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             // iOS killed the WKWebView content process (memory pressure).
             // Reload the content to restore rendering. Mirror the original
             // baseURL choice: nil for compose/Eml, BodyAssetConfig.baseURL when
             // a headerId is present (so scheme-handler-served images still load).
             if let html = loadedHTML {
-                let wrapped = EmailHTMLWrapper.wrapHTML(html, previewFilename: loadedPreviewFilename)
                 let base: URL? = (loadedHeaderId != nil) ? BodyAssetConfig.baseURL : nil
-                webView.loadHTMLString(wrapped, baseURL: base)
+                // Off-main wrap + reload, same path as updateUIView.
+                wrapAndLoad(rawHTML: html, previewFilename: loadedPreviewFilename, base: base)
             }
         }
 
