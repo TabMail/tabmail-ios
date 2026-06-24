@@ -477,26 +477,32 @@ final class AppStartup {
                 print("[AppStartup] Orphan demo wipe failed: \(error)")
             }
         }
-        // The NSE staging DB is a SEPARATE App-Group `DatabaseQueue` (not the main
-        // pool — the 64-reader backstop does nothing for it), and creating it runs a
-        // write transaction (CREATE TABLE + additive ALTERs) on EVERY launch.
-        // `busyMode = .timeout(2)` (AppDatabase.createNSEStagingDB) means that write
-        // can block up to 2s on the cross-process file lock if the NSE is mid-write
-        // on a push at the moment we foreground — a hard main-thread block behind the
-        // splash. Run it off the main actor (same posture as the pool build and the
-        // `DemoSeed.wipe` above) so the lock wait never lands on the UI thread. Still
-        // `await`ed so it completes before `dbReady` — push / NSE-merge waiters resume
-        // there and read this DB. `mirrorAllState` stays on the main actor: it's
-        // pool-mitigated reads in the pre-contention window, deliberately not converted.
-        await Task.detached(priority: .userInitiated) {
-            AppDatabase.createNSEStagingDBIfNeeded()
-        }.value
-        NSEDataBridge.mirrorAllState()
-
         // DB is usable — unblock everything parked in `awaitReady()` (background
         // push / notification-action / BGTask handlers, detached startup tasks).
+        // Flip this BEFORE the staging-DB upkeep below: that work is NOT needed to
+        // present the inbox, so it must never sit in front of this gate.
         dbReady = true
         resumeDBWaiters()
+
+        // NSE staging-DB schema upkeep + state mirror — OFF the launch gate.
+        // Neither is needed to show the inbox: `mergeNSEStagingData` tolerates a
+        // missing staging file, and `mirror*` only feeds the NSE's NEXT push.
+        // The staging DB is a SEPARATE App-Group `DatabaseQueue` whose creation
+        // takes a CROSS-PROCESS write lock — blocking up to 2s when an NSE is
+        // mid-write on a fresh push (the intermittent post-push cold-launch
+        // blank-screen case) — so it can never gate `isReady`. Now version-gated
+        // (`createNSEStagingDBIfNeeded`) so the steady-state path is a no-op (no
+        // lock taken at all); the rare first-run / schema-bump write lands behind
+        // the already-shown inbox. Safe to detach un-awaited: the main app is the
+        // sole schema creator, but the file already exists from a prior launch on
+        // any device that has ever received a push (a push requires a prior
+        // foreground sign-in launch, which created it), so no consumer here races
+        // a missing schema. `mirrorAllState`'s main-DB reads also move off the
+        // main actor as a bonus.
+        Task.detached(priority: .utility) {
+            AppDatabase.createNSEStagingDBIfNeeded()
+            NSEDataBridge.mirrorAllState()
+        }
     }
 
     /// Resume + clear all `ensureDatabaseReady` waiters. Called on success AND on

@@ -139,8 +139,17 @@ final class AppDatabase: Sendable {
 
     // MARK: - NSE Staging Database
 
+    /// Staging schema version. BUMP whenever the `nse_processed_message` column
+    /// set (or the sibling tables) change in `createNSEStagingDB`. The main app
+    /// is the SOLE migrator of this schema — the NSE assumes it already exists
+    /// (see `NSEStagingDB`) — so a bump takes effect on the next main-app launch,
+    /// before the NSE relies on the new columns. Current = 6 ("populated" flag).
+    private static let nseStagingSchemaVersion = 6
+    private static let nseStagingSchemaVersionKey = "nse.stagingSchemaVersion"
+
     /// Create the NSE staging database schema in the App Group container.
-    /// Called once on app launch. The NSE extension reads/writes this DB.
+    /// The NSE extension reads/writes this DB. Idempotent + version-gated: a no-op
+    /// once the file exists at the current `nseStagingSchemaVersion`.
     static func createNSEStagingDBIfNeeded() {
         guard let url = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: "group.ai.tabmail"
@@ -148,7 +157,24 @@ final class AppDatabase: Sendable {
             print("[AppDatabase] App Group container not available — NSE staging DB not created")
             return
         }
-        createNSEStagingDB(atPath: url.appendingPathComponent("nse_staging.sqlite").path)
+        let path = url.appendingPathComponent("nse_staging.sqlite").path
+        // Skip the CREATE/ALTER storm (and its cross-process write lock) when the
+        // staging file already exists at the current schema version. The schema is
+        // append-only + idempotent, but re-running ~20 `ALTER TABLE` on EVERY
+        // launch is pure waste — each one fails with "duplicate column" (the
+        // logmain.log noise) and, worse, takes the staging DB's write lock, which
+        // blocks up to 2s when an NSE is mid-write on a fresh push. The version
+        // marker lives in the App Group suite (same container as the file → both
+        // are wiped together on uninstall, so they can't drift). Gated off the
+        // production path only; the parameterized core stays ungated for unit tests.
+        let suite = UserDefaults(suiteName: "group.ai.tabmail")
+        if FileManager.default.fileExists(atPath: path),
+           suite?.integer(forKey: nseStagingSchemaVersionKey) == nseStagingSchemaVersion {
+            return
+        }
+        if createNSEStagingDB(atPath: path) {
+            suite?.set(nseStagingSchemaVersion, forKey: nseStagingSchemaVersionKey)
+        }
     }
 
     /// Schema-creation core, parameterized by path. Production resolves the App
@@ -156,7 +182,12 @@ final class AppDatabase: Sendable {
     /// tests (whose host has no app-group entitlement, so the container path is
     /// unavailable) build a real staging DB at a temp path so they can drive the
     /// real `NSEDataBridge.mergeNSEStagingData`.
-    static func createNSEStagingDB(atPath path: String) {
+    /// Returns `true` only if the schema was applied successfully — the
+    /// production caller (`createNSEStagingDBIfNeeded`) gates the version marker
+    /// on this so a failed open/write retries on the next launch instead of being
+    /// permanently skipped.
+    @discardableResult
+    static func createNSEStagingDB(atPath path: String) -> Bool {
         var config = Configuration()
         config.busyMode = .timeout(2)
         // 0xdead10cc defense (ADR-IOS-041). Non-WAL queue: ALL accesses abort
@@ -165,7 +196,7 @@ final class AppDatabase: Sendable {
         config.observesSuspensionNotifications = true
         guard let db = try? DatabaseQueue(path: path, configuration: config) else {
             print("[AppDatabase] Failed to open NSE staging DB")
-            return
+            return false
         }
         do {
             try db.write { db in
@@ -320,8 +351,10 @@ final class AppDatabase: Sendable {
                     """)
             }
             print("[AppDatabase] NSE staging DB schema ready (v6 — populated flag)")
+            return true
         } catch {
             print("[AppDatabase] Failed to create NSE staging DB schema: \(error)")
+            return false
         }
     }
 
