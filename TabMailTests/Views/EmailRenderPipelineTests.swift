@@ -520,3 +520,100 @@ struct HeightSeedCacheTests {
         #expect(cache["msg:1499"] == 1499)
     }
 }
+
+// MARK: - PreviewFreezeGate
+
+/// `.serialized`: `end()` posts the global `.previewFreezeReleased`
+/// notification, so two tests of this suite running in parallel would bump
+/// each other's observer counters. `@MainActor` because `PreviewFreezeGate`
+/// is main-actor isolated.
+@Suite("PreviewFreezeGate", .serialized)
+@MainActor
+struct PreviewFreezeGateTests {
+
+    @Test("begin/end transitions are idempotent")
+    func transitions() {
+        let gate = PreviewFreezeGate()
+        #expect(!gate.isFrozen)
+        gate.begin()
+        #expect(gate.isFrozen)
+        gate.begin() // double-begin stays frozen
+        #expect(gate.isFrozen)
+        gate.end()
+        #expect(!gate.isFrozen)
+        gate.end() // double-end stays released
+        #expect(!gate.isFrozen)
+    }
+
+    @Test("end posts previewFreezeReleased exactly once per freeze")
+    func releaseNotification() {
+        let gate = PreviewFreezeGate()
+        let count = Mutex(0)
+        let obs = NotificationCenter.default.addObserver(
+            forName: .previewFreezeReleased, object: nil, queue: nil
+        ) { _ in
+            count.withLock { $0 += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        gate.end() // not frozen — must not post
+        #expect(count.withLock { $0 } == 0)
+        gate.begin()
+        gate.end()
+        #expect(count.withLock { $0 } == 1)
+        gate.end() // already released — no double post
+        #expect(count.withLock { $0 } == 1)
+    }
+}
+
+// MARK: - PreviewGatedReload (MessageCardView label buffer/flush)
+
+/// Covers the exact regression risks introduced by the preview-blink fix:
+/// (1) a normal (unfrozen) `.inboxDataDidChange` still triggers a label reload,
+/// (2) a reload arriving mid-preview is suppressed, and (3) a burst of
+/// suppressed reloads replays as exactly one refresh when the preview dismisses.
+@Suite("PreviewGatedReload — label reload buffer/flush")
+struct PreviewGatedReloadTests {
+
+    @Test("unfrozen request reloads immediately and buffers nothing")
+    func unfrozenReloadsNow() {
+        var gate = PreviewGatedReload()
+        #expect(gate.request(isFrozen: false) == true)   // reload runs now
+        #expect(gate.isPending == false)
+        #expect(gate.release() == false)                 // nothing to flush
+    }
+
+    @Test("frozen request buffers instead of reloading")
+    func frozenBuffers() {
+        var gate = PreviewGatedReload()
+        #expect(gate.request(isFrozen: true) == false)   // suppressed
+        #expect(gate.isPending == true)
+    }
+
+    @Test("a burst of frozen requests flushes exactly once on release")
+    func burstCoalescesToOneFlush() {
+        var gate = PreviewGatedReload()
+        #expect(gate.request(isFrozen: true) == false)
+        #expect(gate.request(isFrozen: true) == false)
+        #expect(gate.request(isFrozen: true) == false)
+        #expect(gate.isPending == true)
+        #expect(gate.release() == true)                  // one flush
+        #expect(gate.isPending == false)
+        #expect(gate.release() == false)                 // no second flush
+    }
+
+    @Test("release with no buffered request is a no-op")
+    func releaseWithoutPendingIsNoOp() {
+        var gate = PreviewGatedReload()
+        #expect(gate.release() == false)
+    }
+
+    @Test("after a flush, a fresh unfrozen request reloads normally")
+    func resumesNormalReloadAfterFlush() {
+        var gate = PreviewGatedReload()
+        _ = gate.request(isFrozen: true)
+        _ = gate.release()
+        #expect(gate.request(isFrozen: false) == true)   // back to normal
+        #expect(gate.isPending == false)
+    }
+}

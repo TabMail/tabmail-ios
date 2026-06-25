@@ -20,6 +20,34 @@ struct CardVisibilityKey: PreferenceKey {
     }
 }
 
+/// Buffer/flush state for a card reload that must be deferred while a system
+/// preview (QuickLook / `.eml`) is on screen — see `PreviewFreezeGate`. Pulled
+/// out of `MessageCardView` so the "don't re-render the preview's host card
+/// while it's frozen, replay once on release" logic is unit-testable without a
+/// SwiftUI view harness. Pure value type; the View holds it as `@State`.
+struct PreviewGatedReload {
+    /// True when a reload arrived during a freeze and is waiting for release.
+    private(set) var isPending = false
+
+    /// Record a reload request. Returns `true` if the caller should reload now,
+    /// `false` if it was buffered because a preview is on screen.
+    mutating func request(isFrozen: Bool) -> Bool {
+        if isFrozen {
+            isPending = true
+            return false
+        }
+        return true
+    }
+
+    /// Call when the freeze releases. Returns `true` if a buffered reload should
+    /// now run (and clears the pending flag); `false` if nothing was buffered.
+    mutating func release() -> Bool {
+        guard isPending else { return false }
+        isPending = false
+        return true
+    }
+}
+
 /// A reusable message card/bubble for the threaded conversation view.
 /// Renders both the focused message (always expanded) and thread messages (collapsed by default).
 struct MessageCardView: View {
@@ -69,6 +97,14 @@ struct MessageCardView: View {
     /// change via `.task(id:)`, and (2) `.inboxDataDidChange`, which the label
     /// management menu posts after applying/removing a label.
     @State private var userLabels: [UserLabel] = []
+
+    /// Buffer/flush state for the user-label reload while a QuickLook / `.eml`
+    /// attachment preview is on screen (see `PreviewGatedReload` /
+    /// `PreviewFreezeGate`). Deferring the reload keeps `.inboxDataDidChange`
+    /// (one per background sync poll) from re-rendering this card — which hosts
+    /// the preview from inside the List row — and blinking the preview.
+    /// Coalesces a burst of sync notifications into one refresh on release.
+    @State private var labelReload = PreviewGatedReload()
 
     /// Async-load this card's user labels off the main thread into `userLabels`.
     private func loadUserLabels() async {
@@ -159,7 +195,21 @@ struct MessageCardView: View {
         // edit without a synchronous read in `body`.
         .task(id: message.id) { await loadUserLabels() }
         .onReceive(NotificationCenter.default.publisher(for: .inboxDataDidChange).receive(on: DispatchQueue.main)) { _ in
-            Task { await loadUserLabels() }
+            // This card hosts the QuickLook / `.eml` attachment preview from
+            // inside the List row (`AttachmentListView`). Any re-render while a
+            // preview is on screen churns the preview's UIKit bridge → visible
+            // blink/reload. `.inboxDataDidChange` fires on every background sync
+            // cycle (SyncScheduler), so re-running `loadUserLabels()` mid-preview
+            // is the leak. Buffer it and replay on release — mirrors
+            // `MessageDetailViewModel`'s handling of `.messageDataDidChange`.
+            if labelReload.request(isFrozen: PreviewFreezeGate.shared.isFrozen) {
+                Task { await loadUserLabels() }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .previewFreezeReleased).receive(on: DispatchQueue.main)) { _ in
+            if labelReload.release() {
+                Task { await loadUserLabels() }
+            }
         }
     }
 

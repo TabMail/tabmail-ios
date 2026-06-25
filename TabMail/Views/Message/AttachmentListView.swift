@@ -4,6 +4,7 @@
 
 import SwiftUI
 import QuickLook
+import UIKit
 
 struct AttachmentListView: View {
     let message: MessageHeader
@@ -16,7 +17,6 @@ struct AttachmentListView: View {
     let bodyHtml: String?
 
     @State private var downloadingSection: String?
-    @State private var previewURL: URL?
     @State private var downloadedFiles: [String: URL] = [:]
     @State private var emlPreview: EmlPreviewState?
     @State private var error: String?
@@ -78,11 +78,10 @@ struct AttachmentListView: View {
                                 nestedAttachments: nested
                             )
                         } else if let existing = downloadedFiles[attachment.section] {
-                            // Freeze UI BEFORE presenting so the first layout pass
-                            // doesn't race with ongoing sync cascades. Release fires
-                            // from `.onChange(of: previewURL)` when QL dismisses.
-                            PreviewFreezeGate.shared.begin()
-                            previewURL = existing
+                            // Imperative QuickLook — detached from this re-rendering
+                            // List row (see AttachmentQuickLook). It raises the
+                            // freeze gate for the duration and releases on dismiss.
+                            AttachmentQuickLook.present(url: existing)
                         } else {
                             downloadAndPreview(attachment)
                         }
@@ -145,7 +144,6 @@ struct AttachmentListView: View {
                     .foregroundStyle(.red)
             }
         }
-        .quickLookPreview($previewURL)
         .sheet(item: $emlPreview) { preview in
             EmlAttachmentPreview(
                 html: preview.html,
@@ -157,15 +155,11 @@ struct AttachmentListView: View {
             }
         }
         .onDisappear {
-            // Safety net: if the view tears down with a preview still presented,
-            // release the gate so the rest of the app doesn't stay frozen.
-            if previewURL != nil || emlPreview != nil {
-                PreviewFreezeGate.shared.end()
-            }
-        }
-        .onChange(of: previewURL) { old, new in
-            // QL dismissal: URL flips to nil → release the freeze gate.
-            if old != nil && new == nil {
+            // Safety net: if the view tears down with the .eml sheet still
+            // presented, release the gate so the app doesn't stay frozen. The
+            // QuickLook path is imperative (AttachmentQuickLook owns its own gate
+            // release on dismiss, independent of this view's lifetime).
+            if emlPreview != nil {
                 PreviewFreezeGate.shared.end()
             }
         }
@@ -198,10 +192,12 @@ struct AttachmentListView: View {
         print("[Attachment] Starting download: section=\(attachment.section) contentType=\(attachment.contentType) filename=\(attachment.filename) encoding=\(attachment.encoding ?? "nil")")
         Task {
             // Freeze UI BEFORE any work that could precede the QL presentation, so
-            // the sync cascade is quiet by the time QL's UIKit bridge first lays out.
+            // the sync cascade is quiet by the time QuickLook first lays out.
             // `defer` guarantees release on every exit path that does NOT end in a
-            // presented preview — success path flips `presented = true`, and the
-            // `.onChange(of: previewURL)` handler owns release when QL dismisses.
+            // presented preview — success path flips `presented = true`, and
+            // `AttachmentQuickLook` owns the release (via its dismiss delegate)
+            // once QuickLook is dismissed. `present()` re-raising the gate is a
+            // no-op (idempotent), so a single dismiss balances both begins.
             PreviewFreezeGate.shared.begin()
             var presented = false
             defer {
@@ -218,7 +214,7 @@ struct AttachmentListView: View {
                 BodyAssetStore.bumpMessageAccess(headerId: message.id)
                 let fileURL = makePreviewURL(from: storedURL, originalFilename: attachment.filename)
                 downloadedFiles[attachment.section] = fileURL
-                previewURL = fileURL
+                AttachmentQuickLook.present(url: fileURL)
                 presented = true
                 downloadingSection = nil
                 return
@@ -247,7 +243,7 @@ struct AttachmentListView: View {
                 }
                 print("[Attachment] Written to \(fileURL.path), presenting QuickLook")
                 downloadedFiles[attachment.section] = fileURL
-                previewURL = fileURL
+                AttachmentQuickLook.present(url: fileURL)
                 presented = true
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
@@ -300,5 +296,96 @@ struct AttachmentListView: View {
         if bytes < 1024 { return "\(bytes) B" }
         if bytes < 1024 * 1024 { return "\(bytes / 1024) KB" }
         return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
+    }
+}
+
+/// Imperative QuickLook presentation, deliberately detached from the SwiftUI
+/// view tree.
+///
+/// SwiftUI's `.quickLookPreview` modifier must be hosted on a view; here that
+/// view (`AttachmentListView`) lives inside the message-detail `List` row. When
+/// that row's tree re-renders (background sync, label reloads, the inbox/detail
+/// re-evaluating, even QL's own presentation layout passes), SwiftUI
+/// reconfigures the hosted preview — the out-of-process QuickLook *extension*
+/// gets interrupted and relaunched, which the user sees as the preview
+/// "blinking / reloading." This reproduced for BOTH a `.xlsx` and a PDF
+/// (different QL extensions → common cause is the host, not the file), and it
+/// happened even with `PreviewFreezeGate` holding (logmain.log 2026-06-24:
+/// repeated `QLOverlayDefaultActionBut…` re-layouts + `Connection to appex
+/// interrupted`), because the gate only suppresses *some* re-render sources.
+///
+/// Presenting a `QLPreviewController` imperatively from the top view controller
+/// (same pattern as `ICSCalendarImporter`) removes the preview from the SwiftUI
+/// tree entirely, so no re-render at any level can touch it. `PreviewFreezeGate`
+/// is still raised for the duration — defense-in-depth, and it quiets background
+/// sync while the preview is up.
+@MainActor
+enum AttachmentQuickLook {
+    /// `QLPreviewController.dataSource`/`.delegate` are `weak`, so the controller
+    /// and its data source must be retained for the lifetime of the
+    /// presentation (mirrors `ICSCalendarImporter.activeSafari`). Only one
+    /// QuickLook can be on screen at a time (it's full-screen modal), so a
+    /// single static slot is sufficient.
+    private static var activeController: QLPreviewController?
+    private static var activeSource: PreviewSource?
+
+    /// Present `url` in QuickLook. No-op if a preview is already on screen.
+    static func present(url: URL) {
+        guard activeController == nil else {
+            print("[Attachment] QuickLook already presented — ignoring tap")
+            return
+        }
+        guard let presenter = topViewController() else {
+            print("[Attachment] QuickLook: no view controller to present from")
+            return
+        }
+        let source = PreviewSource(url: url)
+        let controller = QLPreviewController()
+        controller.dataSource = source
+        controller.delegate = DismissDelegate.shared
+        activeController = controller
+        activeSource = source
+        PreviewFreezeGate.shared.begin()
+        print("[Attachment] QuickLook presenting \(url.lastPathComponent) from \(type(of: presenter))")
+        presenter.present(controller, animated: true)
+    }
+
+    /// Release the freeze gate + retained refs once the preview dismisses.
+    /// Idempotent — guarded so a stray call can't unbalance the gate.
+    fileprivate static func handleDismiss() {
+        guard activeController != nil else { return }
+        activeController = nil
+        activeSource = nil
+        PreviewFreezeGate.shared.end()
+        print("[Attachment] QuickLook dismissed — freeze released")
+    }
+
+    private static func topViewController() -> UIViewController? {
+        guard let scene = UIApplication.shared.connectedScenes
+            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+              let window = scene.windows.first(where: { $0.isKeyWindow }),
+              var vc = window.rootViewController else { return nil }
+        while let next = vc.presentedViewController { vc = next }
+        return vc
+    }
+
+    /// Single-item data source. `NSURL` conforms to `QLPreviewItem` (returns
+    /// itself as `previewItemURL`), so no wrapper object is needed.
+    private final class PreviewSource: NSObject, QLPreviewControllerDataSource {
+        let url: URL
+        init(url: URL) { self.url = url }
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
+    }
+
+    /// `@unchecked Sendable`: stateless delegate singleton (no mutable members),
+    /// same pattern as `ICSCalendarImporter.SafariDelegate`.
+    private final class DismissDelegate: NSObject, QLPreviewControllerDelegate, @unchecked Sendable {
+        static let shared = DismissDelegate()
+        func previewControllerDidDismiss(_ controller: QLPreviewController) {
+            Task { @MainActor in AttachmentQuickLook.handleDismiss() }
+        }
     }
 }
