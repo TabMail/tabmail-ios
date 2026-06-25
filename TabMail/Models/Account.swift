@@ -52,6 +52,14 @@ struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Senda
     /// Calendar-only accounts have no email provider. Hidden from email sidebar.
     var calendarOnly: Bool = false
 
+    /// True when this iCloud account's email connected but CalDAV (calendar)
+    /// setup failed during add (the best-effort path in `addICloudAccount`).
+    /// Drives the add-time "Calendar Not Connected" alert (read off the
+    /// returned account) and the persistent note in Settings (read off the
+    /// row). Defaults false; existing rows backfill false via the additive
+    /// `v61` migration.
+    var calendarSetupFailed: Bool = false
+
     // Incremental sync cursors
     var lastHistoryId: String? // Gmail only — tracks history.list cursor
 

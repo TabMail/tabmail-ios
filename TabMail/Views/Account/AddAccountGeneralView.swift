@@ -20,6 +20,7 @@ struct AddAccountGeneralView: View {
     @State private var isConnecting = false
     @State private var errorMessage: String?
     @State private var includeCalendar = true
+    @State private var showCalendarFailedAlert = false
 
     var body: some View {
         ScrollView {
@@ -77,6 +78,11 @@ struct AddAccountGeneralView: View {
         // navigationTitle keeps the system back chevron but avoids
         // rendering a second "Add Account" in the toolbar.
         .lockOrientation(.portrait)
+        .alert("Calendar Not Connected", isPresented: $showCalendarFailedAlert) {
+            Button("Continue") { Task { await finishAddAndDismiss() } }
+        } message: {
+            Text("Your iCloud email was added, but iCloud Calendar couldn't be set up right now. You can try connecting it again later.")
+        }
     }
 
     private func providerButton<Icon: View>(_ provider: AccountProvider, label: String, @ViewBuilder icon: () -> Icon) -> some View {
@@ -218,14 +224,20 @@ struct AddAccountGeneralView: View {
         errorMessage = nil
         Task {
             do {
-                _ = try await manager.addICloudAccount(
+                let account = try await manager.addICloudAccount(
                     email: email,
                     appSpecificPassword: password,
                     includeCalendar: includeCalendar
                 )
-                await finishAddAndDismiss()
-            } catch CalDAVError.authFailed {
-                errorMessage = "Calendar authentication failed. Check your app-specific password."
+                isConnecting = false
+                if account.calendarSetupFailed {
+                    // Email added; surface the calendar failure, then the
+                    // alert's Continue button proceeds via finishAddAndDismiss().
+                    showCalendarFailedAlert = true
+                } else {
+                    await finishAddAndDismiss()
+                }
+                return
             } catch {
                 if SyncEngine.isConnectionError(error) {
                     errorMessage = "Connection failed. Please check your network and try again."

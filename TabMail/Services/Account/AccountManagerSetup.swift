@@ -316,6 +316,23 @@ extension AccountManager {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[AccountManager] iCloud Calendar setup failed for \(account.emailAddress); email account kept: \(error)")
                 }
+                // Record the failure so the user is told: the returned account
+                // drives the add-time alert; the persisted column drives the
+                // persistent "Calendar not connected" note in Settings.
+                account.calendarSetupFailed = true
+                let failedId = account.id
+                do {
+                    try await dbPool.write { db in
+                        try db.execute(
+                            sql: "UPDATE account SET calendarSetupFailed = 1 WHERE id = ?",
+                            arguments: [failedId]
+                        )
+                    }
+                } catch let writeError {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[AccountManager] Failed to persist calendarSetupFailed for \(failedId): \(writeError)")
+                    }
+                }
             }
         }
 

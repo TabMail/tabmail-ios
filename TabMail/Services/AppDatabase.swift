@@ -1745,5 +1745,11 @@ final class AppDatabase: Sendable {
                 t.add(column: "threadId", .text)
             }
         }
+
+        migrator.registerMigration("v61_addCalendarSetupFailedToAccount") { db in
+            try db.alter(table: "account") { t in
+                t.add(column: "calendarSetupFailed", .boolean).notNull().defaults(to: false)
+            }
+        }
     }
 }

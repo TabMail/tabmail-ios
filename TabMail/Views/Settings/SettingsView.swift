@@ -64,6 +64,11 @@ struct SettingsView: View {
                                         .font(.caption)
                                         .foregroundStyle(Color.accentColor)
                                 }
+                                if account.calendarSetupFailed {
+                                    Label("Calendar not connected", systemImage: "calendar.badge.exclamationmark")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
                             }
                             Spacer()
                             if state.authFailedAccounts.contains(account.id) {

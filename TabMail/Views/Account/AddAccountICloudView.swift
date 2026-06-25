@@ -25,6 +25,7 @@ struct AddAccountICloudView: View {
     @State private var selectedOption: ICloudOption = .both
     @State private var isConnecting = false
     @State private var errorMessage: String?
+    @State private var showCalendarFailedAlert = false
 
     let detectedEmail: String
     /// Called after the iCloud account is successfully added. Caller
@@ -139,6 +140,11 @@ struct AddAccountICloudView: View {
             }
         }
         .lockOrientation(.portrait)
+        .alert("Calendar Not Connected", isPresented: $showCalendarFailedAlert) {
+            Button("Continue") { Task { await onConnected() } }
+        } message: {
+            Text("Your iCloud email was connected, but iCloud Calendar couldn't be set up right now. You can connect it later from Settings.")
+        }
     }
 
     private var canConnect: Bool {
@@ -211,13 +217,15 @@ struct AddAccountICloudView: View {
         errorMessage = nil
         Task {
             do {
+                var calendarFailed = false
                 switch selectedOption {
                 case .both:
-                    _ = try await manager.addICloudAccount(
+                    let account = try await manager.addICloudAccount(
                         email: appleEmail,
                         appSpecificPassword: appPassword,
                         includeCalendar: true
                     )
+                    calendarFailed = account.calendarSetupFailed
                 case .calendarOnly:
                     _ = try await manager.addCalDAVAccount(
                         serverURL: ICloudConfig.caldavURL,
@@ -227,7 +235,15 @@ struct AddAccountICloudView: View {
                     )
                 }
                 UserDefaults.standard.set(true, forKey: "icloud_setup_prompted")
-                await onConnected()
+                isConnecting = false
+                if calendarFailed {
+                    // Email connected; surface the calendar failure, then the
+                    // alert's Continue button proceeds via onConnected().
+                    showCalendarFailedAlert = true
+                } else {
+                    await onConnected()
+                }
+                return
             } catch CalDAVError.authFailed {
                 errorMessage = "Authentication failed. Check your Apple ID and app-specific password."
             } catch {
