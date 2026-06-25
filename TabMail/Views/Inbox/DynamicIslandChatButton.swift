@@ -759,10 +759,16 @@ struct DynamicIslandChat: View {
                         .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
                 }
-            } else if !isWorking && lastFailedMessage != nil && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
-                // Retry button (re-sends last failed message)
+            } else if !isWorking && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
+                // Retry button. Reverts to the send button as soon as the user types
+                // (the `inputText.isEmpty` gate above). Routes to the right path:
+                // a connection-lost RESUMES from saved state; a plain failure re-sends.
                 Button {
-                    if let msg = lastFailedMessage {
+                    if pendingResumeRequest != nil {
+                        // Connection-lost: resume the interrupted turn (no re-execution
+                        // of completed tools). Same action as the inline affordance.
+                        resumeAgentChat()
+                    } else if let msg = lastFailedMessage {
                         lastFailedMessage = nil
                         // Remove error bubble + user bubble, then re-send (matches TB retry)
                         if chatMessages.count >= 2 {
