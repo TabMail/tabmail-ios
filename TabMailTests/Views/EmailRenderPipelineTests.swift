@@ -50,14 +50,20 @@ struct EmailRenderPipelineTests {
         #expect(out.contains("max-height: none !important"))
     }
 
-    @Test("html has overflow-x hidden (WebKit bug 153852 workaround)")
-    func htmlOverflowXHidden() {
+    @Test("html clips overflow-x with `clip` (153852 workaround, no scroll-container promotion)")
+    func htmlOverflowXClip() {
         let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
-        // body { overflow-x: hidden } alone is ignored on iOS (WebKit bug
-        // 153852). Applying it to html too kills the 1-pixel horizontal
-        // scroll when a descendant (e.g. footer-wrapper w=289 in a 288
-        // viewport) is slightly wider than body.
-        #expect(out.contains("html { overflow-x: hidden !important"))
+        // Applying overflow-x to html too kills the 1-pixel horizontal scroll
+        // when a descendant (e.g. footer-wrapper w=289 in a 288 viewport) is
+        // slightly wider than body (body's overflow alone is ignored on iOS —
+        // WebKit bug 153852). MUST be `clip`, NOT `hidden`: a scrolling value
+        // (hidden/scroll/auto) on one axis promotes the visible other axis to
+        // `auto` (CSS Overflow L3), turning html/body into Y-scroll containers
+        // that hold a stray body.scrollTop after a late image-swap reflow (the
+        // "inner content scrolls, not the page" bug). `clip` is not a scrolling
+        // value, so it clips X without that promotion.
+        #expect(out.contains("html { overflow-x: clip !important"))
+        #expect(!out.contains("html { overflow-x: hidden !important"))
     }
 
     @Test("No max-width: 100vw CSS declaration on html or body (iOS viewport quirk)")
@@ -291,7 +297,7 @@ struct EmailRenderPipelineTests {
         // frame before committing the shrink — showing that un-scaled frame is
         // the "blink". The document must start invisible and be revealed only
         // after the scale commits (fitViewportJS.reveal()).
-        #expect(out.contains("html { overflow-x: hidden !important; opacity: 0;"))
+        #expect(out.contains("html { overflow-x: clip !important; opacity: 0;"))
     }
 
     @Test("fitViewportJS reveals only AFTER a paint cycle (no empty-box, no un-scaled blink)")
