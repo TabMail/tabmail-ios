@@ -70,6 +70,8 @@ final class TabMailAuthService: NSObject {
 
     static func clearSession() {
         KeychainHelper.delete(key: sessionKey)
+        // Session identity changed — re-evaluate the debug-logging gate.
+        DebugModeManager.invalidateLoggingCache()
     }
 
     // MARK: - OAuth Providers
@@ -141,6 +143,8 @@ final class TabMailAuthService: NSObject {
         // Persist in Keychain
         let encoded = try JSONEncoder().encode(session)
         try KeychainHelper.save(encoded, for: Self.sessionKey)
+        // Session identity changed — re-evaluate the debug-logging gate.
+        DebugModeManager.invalidateLoggingCache()
 
         // Sync Stripe customer (non-fatal)
         await syncStripeCustomer(accessToken: session.accessToken)
@@ -235,6 +239,8 @@ final class TabMailAuthService: NSObject {
         // Persist in Keychain
         let encoded = try JSONEncoder().encode(session)
         try KeychainHelper.save(encoded, for: Self.sessionKey)
+        // Session identity changed — re-evaluate the debug-logging gate.
+        DebugModeManager.invalidateLoggingCache()
 
         // Sync Stripe customer (non-fatal)
         await syncStripeCustomer(accessToken: session.accessToken)
@@ -328,6 +334,8 @@ final class TabMailAuthService: NSObject {
         // Persist in Keychain (survives app restarts)
         let encoded = try JSONEncoder().encode(session)
         try KeychainHelper.save(encoded, for: Self.sessionKey)
+        // Session identity changed — re-evaluate the debug-logging gate.
+        DebugModeManager.invalidateLoggingCache()
 
         print("[TabMailAuth] Signed in as: \(session.userEmail)")
         return session

@@ -4,6 +4,7 @@
 
 import Foundation
 import Observation
+import Synchronization
 
 /// Gates all debug features behind a hidden activation.
 /// Tap the version label in TabMail Settings 10 times to unlock.
@@ -75,20 +76,49 @@ final class DebugModeManager {
         return Self.isEmailAllowed(session.userEmail)
     }
 
+    /// Memoized result of the keychain-derived half of `isLoggingEnabled()`
+    /// (session load + decode + domain check). `nil` = not yet computed.
+    ///
+    /// The session identity only changes on login/logout, so this is computed
+    /// once and reused. Without it, every gated log call did a synchronous
+    /// Keychain XPC (`SecItemCopyMatching` → `securityd`). Hit from the
+    /// 100 ms main-thread `MainActorStallDetector` timer and once per backfilled
+    /// body, that blocking call wedged the main thread while backfill held SQLite
+    /// write locks during app suspension → `0xdead10cc` kill (TestFlight
+    /// 1.6.16/324, debug-unlocked accounts only). Invalidated via
+    /// `invalidateLoggingCache()` from the auth session save/clear sites.
+    nonisolated private static let loggingAllowedCache = Mutex<Bool?>(nil)
+
     /// Whether debug logging should be active (unlocked AND allowed user).
     /// Called from BackgroundSyncLogger to gate file I/O in production.
     /// Static nonisolated so it can be called from any thread without MainActor hop.
-    /// Reads UserDefaults (thread-safe) + Keychain (thread-safe) directly
-    /// to avoid MainActor isolation requirements.
+    /// Reads UserDefaults (thread-safe) + a cached Keychain-derived flag, so the
+    /// per-log-call hot path never blocks on a synchronous Keychain XPC.
     static nonisolated func isLoggingEnabled() -> Bool {
         let unlocked = UserDefaults.standard.bool(forKey: "debug_mode_unlocked")
         guard unlocked else { return false }
-        // Read session directly from Keychain (thread-safe) to avoid MainActor hop
-        guard let data = KeychainHelper.load(key: "tabmail_session"),
-              let session = try? JSONDecoder().decode(TabMailSession.self, from: data) else {
-            return false
+        return loggingAllowedCache.withLock { cache in
+            if let cached = cache { return cached }
+            // Read session directly from Keychain (thread-safe) to avoid MainActor
+            // hop. Cached because SecItemCopyMatching is a synchronous XPC to
+            // securityd — far too costly to run on every log call.
+            let allowed: Bool
+            if let data = KeychainHelper.load(key: "tabmail_session"),
+               let session = try? JSONDecoder().decode(TabMailSession.self, from: data) {
+                allowed = isEmailAllowed(session.userEmail)
+            } else {
+                allowed = false
+            }
+            cache = allowed
+            return allowed
         }
-        return isEmailAllowed(session.userEmail)
+    }
+
+    /// Invalidate the `isLoggingEnabled()` cache. MUST be called whenever the
+    /// stored session changes (login / logout) so the debug-logging gate
+    /// re-evaluates against the new identity. Cheap and thread-safe.
+    static nonisolated func invalidateLoggingCache() {
+        loggingAllowedCache.withLock { $0 = nil }
     }
 
     /// Call on each version label tap. Returns true when debug mode is freshly unlocked.
