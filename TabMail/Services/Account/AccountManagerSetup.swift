@@ -293,15 +293,30 @@ extension AccountManager {
         workQueues[account.id] = queue
         await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
 
-        // Set up CalDAV if requested
+        // Set up CalDAV if requested. Best-effort: the email account is the
+        // primary entity and its IMAP connection was already validated above,
+        // so a calendar (CalDAV) failure must NOT fail the whole add. Otherwise
+        // a transient iCloud CalDAV hiccup would both (a) strand the committed
+        // email account behind a "failed" message and (b) block the user from
+        // adding iCloud Mail at all (the onboarding form only offers
+        // Mail+Calendar / Calendar-Only). iCloud uses the same app-specific
+        // password for IMAP and CalDAV, so if IMAP connected a CalDAV failure
+        // is almost always transient/server-side; the calendar can be
+        // reconnected later.
         if includeCalendar {
-            try await setupCalDAV(
-                accountId: account.id,
-                serverURL: ICloudConfig.caldavURL,
-                username: email,
-                password: appSpecificPassword,
-                displayName: "iCloud Calendar"
-            )
+            do {
+                try await setupCalDAV(
+                    accountId: account.id,
+                    serverURL: ICloudConfig.caldavURL,
+                    username: email,
+                    password: appSpecificPassword,
+                    displayName: "iCloud Calendar"
+                )
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AccountManager] iCloud Calendar setup failed for \(account.emailAddress); email account kept: \(error)")
+                }
+            }
         }
 
         // Kick off initial sync in background
@@ -334,32 +349,43 @@ extension AccountManager {
         )
 
         // Store password in Keychain
-        try KeychainHelper.save(password, for: "caldav_password_\(config.id)")
+        let caldavPasswordKey = "caldav_password_\(config.id)"
+        try KeychainHelper.save(password, for: caldavPasswordKey)
 
-        // Run discovery
-        guard let serverBaseURL = URL(string: serverURL) else {
-            throw CalDAVError.discoveryFailed("Invalid server URL: \(serverURL)")
+        do {
+            // Run discovery
+            guard let serverBaseURL = URL(string: serverURL) else {
+                throw CalDAVError.discoveryFailed("Invalid server URL: \(serverURL)")
+            }
+            let client = CalDAVClient(username: username, password: password)
+            let discovery = try await CalDAVDiscovery.discover(serverURL: serverBaseURL, client: client)
+            config.principalURL = discovery.principalURL.absoluteString
+            config.calendarHomeURL = discovery.calendarHomeURL.absoluteString
+
+            // Save config to GRDB
+            let configToInsert = config
+            try await dbPool.write { db in
+                try configToInsert.insert(db)
+            }
+
+            // Create and register provider
+            let provider = CalDAVProvider(
+                client: client,
+                calendarHomeURL: discovery.calendarHomeURL,
+                serverBaseURL: serverBaseURL
+            )
+            calendarProviders[accountId] = provider
+
+            print("[AccountManager] CalDAV set up for account \(accountId): home=\(discovery.calendarHomeURL)")
+        } catch {
+            // Calendar setup failed after the password was written to the
+            // Keychain but before a CalDAVConfig row exists to own it. config.id
+            // is a fresh UUID, so this key is unreachable by removeAccount's
+            // cleanup (which enumerates CalDAVConfig rows) — delete it here so a
+            // failed attempt doesn't leak the app-specific password.
+            KeychainHelper.delete(key: caldavPasswordKey)
+            throw error
         }
-        let client = CalDAVClient(username: username, password: password)
-        let discovery = try await CalDAVDiscovery.discover(serverURL: serverBaseURL, client: client)
-        config.principalURL = discovery.principalURL.absoluteString
-        config.calendarHomeURL = discovery.calendarHomeURL.absoluteString
-
-        // Save config to GRDB
-        let configToInsert = config
-        try await dbPool.write { db in
-            try configToInsert.insert(db)
-        }
-
-        // Create and register provider
-        let provider = CalDAVProvider(
-            client: client,
-            calendarHomeURL: discovery.calendarHomeURL,
-            serverBaseURL: serverBaseURL
-        )
-        calendarProviders[accountId] = provider
-
-        print("[AccountManager] CalDAV set up for account \(accountId): home=\(discovery.calendarHomeURL)")
     }
 
     /// Add a standalone CalDAV calendar account (no email).
@@ -383,14 +409,32 @@ extension AccountManager {
             try acct.insert(db)
         }
 
-        // Set up CalDAV
-        try await setupCalDAV(
-            accountId: account.id,
-            serverURL: serverURL,
-            username: username,
-            password: password,
-            displayName: displayName
-        )
+        // Set up CalDAV. Unlike addICloudAccount, the calendar IS the account
+        // here (calendar-only, no email), so a CalDAV failure must fail the
+        // whole add — roll back the just-inserted synthetic account so it isn't
+        // left orphaned behind the error message. The FK cascade clears any
+        // caldavConfig row; setupCalDAV self-cleans its Keychain entry.
+        do {
+            try await setupCalDAV(
+                accountId: account.id,
+                serverURL: serverURL,
+                username: username,
+                password: password,
+                displayName: displayName
+            )
+        } catch let setupError {
+            let rollbackId = account.id
+            do {
+                try await dbPool.write { db in
+                    _ = try Account.filter(Column("id") == rollbackId).deleteAll(db)
+                }
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AccountManager] CalDAV rollback failed to delete synthetic account \(rollbackId): \(error)")
+                }
+            }
+            throw setupError
+        }
 
         return account
     }

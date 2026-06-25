@@ -28,9 +28,11 @@ struct AddAccountICloudView: View {
 
     let detectedEmail: String
     /// Called after the iCloud account is successfully added. Caller
-    /// (typically `RootView`) clears `PendingAccountAdd` and the
-    /// router moves to the next step.
-    var onConnected: () -> Void = {}
+    /// (typically `RootView`) refreshes the sidebar store, then clears
+    /// `PendingAccountAdd` and the router moves to the next step. Async
+    /// so the **Connect** spinner stays up until the screen actually
+    /// changes (no early button re-enable / double-add window).
+    var onConnected: () async -> Void = {}
     /// Called when the user taps **Later**. Caller clears
     /// `PendingAccountAdd` and marks `icloud_setup_prompted` so we
     /// don't re-prompt.
@@ -38,7 +40,7 @@ struct AddAccountICloudView: View {
 
     init(
         detectedEmail: String,
-        onConnected: @escaping () -> Void = {},
+        onConnected: @escaping () async -> Void = {},
         onLater: @escaping () -> Void = {}
     ) {
         self.detectedEmail = detectedEmail
@@ -225,7 +227,7 @@ struct AddAccountICloudView: View {
                     )
                 }
                 UserDefaults.standard.set(true, forKey: "icloud_setup_prompted")
-                onConnected()
+                await onConnected()
             } catch CalDAVError.authFailed {
                 errorMessage = "Authentication failed. Check your Apple ID and app-specific password."
             } catch {

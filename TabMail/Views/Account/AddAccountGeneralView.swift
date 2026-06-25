@@ -6,6 +6,7 @@ import SwiftUI
 
 struct AddAccountGeneralView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(NavigationStore.self) private var navigationStore
     private var manager = AccountManager.shared
     @State private var selectedProvider: AccountProvider?
     @State private var displayName = ""
@@ -156,7 +157,7 @@ struct AddAccountGeneralView: View {
         Task {
             do {
                 let _ = try await manager.addGmailAccount()
-                dismiss()
+                await finishAddAndDismiss()
             } catch {
                 errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Google sign-in failed: \(error.userFacingDescription)"
             }
@@ -169,7 +170,7 @@ struct AddAccountGeneralView: View {
         Task {
             do {
                 let _ = try await manager.addOutlookAccount()
-                dismiss()
+                await finishAddAndDismiss()
             } catch {
                 errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Microsoft sign-in failed: \(error.userFacingDescription)"
             }
@@ -222,7 +223,7 @@ struct AddAccountGeneralView: View {
                     appSpecificPassword: password,
                     includeCalendar: includeCalendar
                 )
-                dismiss()
+                await finishAddAndDismiss()
             } catch CalDAVError.authFailed {
                 errorMessage = "Calendar authentication failed. Check your app-specific password."
             } catch {
@@ -251,7 +252,7 @@ struct AddAccountGeneralView: View {
                     smtpHost: smtpHost.isEmpty ? imapHost.replacingOccurrences(of: "imap", with: "smtp") : smtpHost,
                     smtpPort: Int(smtpPort) ?? 587
                 )
-                dismiss()
+                await finishAddAndDismiss()
             } catch {
                 if SyncEngine.isConnectionError(error) {
                     errorMessage = "Connection failed. Please check your network and try again."
@@ -261,5 +262,19 @@ struct AddAccountGeneralView: View {
             }
             isConnecting = false
         }
+    }
+
+    /// Refresh the sidebar store BEFORE dismissing, so the Settings accounts
+    /// list (`ForEach(navigationStore.accounts)`) already shows the new account
+    /// when we pop back. `navigationStore.accounts` is otherwise only
+    /// repopulated ~100ms later via the debounced `.backgroundDataDidChange`
+    /// listener (see `NavigationStore.loadInitialData`), so on return the list
+    /// looks unchanged for that gap — the "blink, nothing happened" after a
+    /// successful add. The account row is committed before each `add…` call
+    /// returns, so the refresh is guaranteed to read it.
+    @MainActor
+    private func finishAddAndDismiss() async {
+        await navigationStore.refresh()
+        dismiss()
     }
 }

@@ -609,13 +609,30 @@ struct RootView: View {
             AddAccountICloudView(
                 detectedEmail: pending.email,
                 onConnected: {
-                    withAnimation { PendingAccountAdd.shared.clear() }
+                    await finishPendingAccountAdd()
                 },
                 onLater: {
                     withAnimation { PendingAccountAdd.shared.clear() }
                 }
             )
         }
+    }
+
+    /// Finish a successful account-add: refresh the sidebar store BEFORE
+    /// clearing `PendingAccountAdd`. The router re-evaluates synchronously
+    /// when `pending` clears, but `navigationStore.accounts` is otherwise
+    /// only repopulated ~100ms later via the debounced
+    /// `.backgroundDataDidChange` listener (see `NavigationStore.loadInitialData`).
+    /// Without refreshing first, the router falls through to
+    /// `navigationStore.accounts.isEmpty` and briefly flashes
+    /// `AddAccountGeneralView` (the generic "Add Account" screen) in that gap —
+    /// the intermittent "blink, looks like nothing happened" after adding an
+    /// iCloud account. Refreshing first guarantees `accounts` is populated, so
+    /// the router moves straight to the next gate.
+    @MainActor
+    private func finishPendingAccountAdd() async {
+        await navigationStore.refresh()
+        withAnimation { PendingAccountAdd.shared.clear() }
     }
 
     /// Commit the deferred Gmail/Outlook add. Caller is the
@@ -644,8 +661,9 @@ struct RootView: View {
             let tokens = try await oauth.authenticateMicrosoft(loginHint: email)
             _ = try await AccountManager.shared.addOutlookAccountWithTokens(tokens)
         }
-        // Success: clear pending; gate dismisses on next render.
-        withAnimation { PendingAccountAdd.shared.clear() }
+        // Success: refresh the sidebar store, then clear pending so the gate
+        // dismisses straight to the next step (no stale-empty-accounts flash).
+        await finishPendingAccountAdd()
     }
 
     // MARK: - Per-Account Consent Gate Persistence
