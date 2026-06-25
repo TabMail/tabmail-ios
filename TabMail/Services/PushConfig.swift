@@ -12,18 +12,50 @@ enum PushConfig {
     /// Same rationale as CLAUDE.md rules #9 (single KV_ENTITLEMENTS) and #10 (single Stripe).
     static let baseURL = "https://push.tabmail.ai"
 
-    /// Whether to use APNs sandbox or production.
-    /// Only Xcode debug builds use sandbox APNs. Both TestFlight and App Store
-    /// use production APNs (distribution provisioning profile sets aps-environment=production).
-    /// NOTE: StoreKit's AppTransaction.environment returns .sandbox for TestFlight,
-    /// but that's the StoreKit environment — APNs environment is independent and always
-    /// production for any build signed with a distribution profile.
-    static var isAPNsSandbox: Bool {
+    /// Whether to use APNs sandbox or production — derived from the build's
+    /// ACTUAL `aps-environment` entitlement (read once from
+    /// `embedded.mobileprovision`), NOT `#if DEBUG`.
+    ///
+    /// Why not `#if DEBUG`: a Release-config build installed directly on device,
+    /// or a development-signed archive, is DEBUG-undefined yet ships
+    /// `aps-environment=development` (so iOS hands it a SANDBOX token). Trusting
+    /// `#if DEBUG` there reports `false` (production), so the worker sends that
+    /// sandbox token to the PRODUCTION APNs host — Apple accepts it (200) but
+    /// SILENTLY DROPS delivery and the Push Console shows "device doesn't exist".
+    /// That's the class of bug that made smart push never arrive on dev/Release
+    /// builds. App Store builds have no embedded profile (Apple strips it) → we
+    /// fall back to `#if DEBUG` (release ⇒ production), which is correct there.
+    /// TestFlight keeps a profile with `aps-environment=production` → production.
+    static let isAPNsSandbox: Bool = {
+        if let apsEnv = apsEnvironmentFromEmbeddedProfile() {
+            return apsEnv == "development"
+        }
         #if DEBUG
         return true
         #else
         return false
         #endif
+    }()
+
+    /// Extract `Entitlements.aps-environment` from the app's embedded
+    /// provisioning profile. The file is a CMS-signed blob with the profile
+    /// plist embedded as plaintext between `<plist …>` and `</plist>`. Returns
+    /// nil when there's no profile (App Store builds) or it can't be parsed.
+    private static func apsEnvironmentFromEmbeddedProfile() -> String? {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              // isoLatin1 is byte-preserving, so the binary CMS wrapper doesn't
+              // corrupt the ASCII plist region we slice out below.
+              let raw = String(data: data, encoding: .isoLatin1),
+              let lo = raw.range(of: "<plist"),
+              let hi = raw.range(of: "</plist>") else { return nil }
+        let plistText = String(raw[lo.lowerBound..<hi.upperBound])
+        guard let plistData = plistText.data(using: .isoLatin1),
+              let obj = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil),
+              let dict = obj as? [String: Any],
+              let entitlements = dict["Entitlements"] as? [String: Any],
+              let apsEnv = entitlements["aps-environment"] as? String else { return nil }
+        return apsEnv
     }
 
     // MARK: - UserDefaults Keys
