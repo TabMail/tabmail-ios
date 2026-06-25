@@ -678,6 +678,43 @@ struct BackendClientResumeIntegrationTests {
     }
 }
 
+@Suite("BackendClient.isConnectionLost classifier")
+struct BackendClientConnectionLostTests {
+
+    @Test("streamTruncated is a connection loss")
+    func truncatedIsLost() {
+        #expect(BackendClient.isConnectionLost(BackendError.streamTruncated))
+    }
+
+    @Test("requestFailed(0) (stall / no-final / non-HTTP) is a connection loss")
+    func zeroIsLost() {
+        #expect(BackendClient.isConnectionLost(BackendError.requestFailed(statusCode: 0)))
+    }
+
+    @Test("mid-stream network drops are a connection loss (airplane mode etc.)")
+    func networkDropsAreLost() {
+        for code: URLError.Code in [.networkConnectionLost, .notConnectedToInternet, .timedOut,
+                                    .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+                                    .dataNotAllowed, .internationalRoamingOff] {
+            #expect(BackendClient.isConnectionLost(URLError(code)), "expected \(code) to be a connection loss")
+        }
+    }
+
+    @Test("user cancellation is NOT a connection loss")
+    func cancelIsNotLost() {
+        #expect(!BackendClient.isConnectionLost(URLError(.cancelled)))
+        #expect(!BackendClient.isConnectionLost(CancellationError()))
+    }
+
+    @Test("genuine server/client errors are NOT a connection loss")
+    func serverErrorsAreNotLost() {
+        #expect(!BackendClient.isConnectionLost(BackendError.requestFailed(statusCode: 500)))
+        #expect(!BackendClient.isConnectionLost(BackendError.requestFailed(statusCode: 429)))
+        #expect(!BackendClient.isConnectionLost(BackendError.unauthorized))
+        #expect(!BackendClient.isConnectionLost(URLError(.badURL)))
+    }
+}
+
 // JSONValue needs Equatable for test assertions
 extension JSONValue: @retroactive Equatable {
     public static func == (lhs: JSONValue, rhs: JSONValue) -> Bool {

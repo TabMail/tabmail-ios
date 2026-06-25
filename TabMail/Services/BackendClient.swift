@@ -1152,23 +1152,31 @@ extension BackendClient {
                 do {
                     finalEvent = try await sendStreamingCompletions(currentRequest, onSSEEvent: onSSEEvent)
                     break
-                } catch let error as BackendError {
-                    // Truncated final → surface as a resumable connection-lost error
-                    // carrying THIS round's input (the last good conversation_state).
-                    // The caller offers a manual "tap to retry" that re-runs only this
-                    // round; all prior rounds' completed tools/thinking are preserved.
-                    if case .streamTruncated = error {
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // 429 throttle → retry the same round (preserves conversation_state).
+                    if case BackendError.requestFailed(statusCode: 429) = error {
+                        wasThrottled = true
+                        throttleAttempt += 1
+                        if throttleAttempt == 1 {
+                            onSSEEvent?(.throttled)
+                        }
+                        let backoff = min(1.5 * pow(1.5, Double(throttleAttempt - 1)) + Double.random(in: 0...0.5), 5.0)
+                        print("[BackendClient] Throttled (429), retry #\(throttleAttempt) after \(String(format: "%.1f", backoff))s")
+                        try await Task.sleep(for: .seconds(backoff))
+                        continue
+                    }
+                    // Connection-lost class — a truncated final, a stall / no-final
+                    // (requestFailed 0), OR a mid-stream network drop (airplane mode,
+                    // signal loss → URLError). Surface as a resumable error carrying
+                    // THIS round's input (the last good conversation_state), so the
+                    // caller's manual "tap to retry" resumes instead of restarting;
+                    // all prior rounds' completed tools/thinking are preserved.
+                    if Self.isConnectionLost(error) {
                         throw ChatConnectionLostError(resumeRequest: currentRequest)
                     }
-                    guard case .requestFailed(statusCode: 429) = error else { throw error }
-                    wasThrottled = true
-                    throttleAttempt += 1
-                    if throttleAttempt == 1 {
-                        onSSEEvent?(.throttled)
-                    }
-                    let backoff = min(1.5 * pow(1.5, Double(throttleAttempt - 1)) + Double.random(in: 0...0.5), 5.0)
-                    print("[BackendClient] Throttled (429), retry #\(throttleAttempt) after \(String(format: "%.1f", backoff))s")
-                    try await Task.sleep(for: .seconds(backoff))
+                    throw error
                 }
             }
             if wasThrottled {
@@ -1312,6 +1320,31 @@ extension BackendClient {
             }
             throw BackendError.streamTruncated  // cut in transit → resumable
         }
+    }
+
+    /// Classify an error as a transient CONNECTION LOSS that the agent-chat tool
+    /// loop should surface as a resumable `ChatConnectionLostError`:
+    /// - a truncated `final` (`streamTruncated`),
+    /// - a stall / stream-ended-without-final / non-HTTP response (`requestFailed 0`),
+    /// - a mid-stream network drop — airplane mode, signal loss, no connectivity,
+    ///   timeout, host/DNS failure (the `URLError` network codes).
+    /// Excludes `URLError.cancelled` (a user-initiated stop, not a connection loss)
+    /// and genuine server/client errors (4xx/5xx/auth) — those still surface normally.
+    static func isConnectionLost(_ error: Error) -> Bool {
+        if case BackendError.streamTruncated = error { return true }
+        if case BackendError.requestFailed(statusCode: 0) = error { return true }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .networkConnectionLost, .notConnectedToInternet, .timedOut,
+                 .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+                 .dataNotAllowed, .internationalRoamingOff, .secureConnectionFailed,
+                 .resourceUnavailable:
+                return true
+            default:
+                return false  // .cancelled (user stop) and everything else
+            }
+        }
+        return false
     }
 
     /// Parse a full SSE text into structured events, calling the handler for each.
