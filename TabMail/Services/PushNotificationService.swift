@@ -106,6 +106,13 @@ actor PushNotificationService {
         UserDefaults.standard.set(tokenHex, forKey: PushConfig.lastDeviceTokenKey)
         NSEDataBridge.mirrorDeviceToken()
         await registerDeviceWithWorker(tokenHex: tokenHex, force: true)
+        // CRITICAL: the per-(device, account) records are the dispatch path —
+        // dispatch prefers them over the legacy device record. On a token
+        // rotation we must refresh THEM too, not just the legacy record above,
+        // or dispatch keeps firing the stale per-account token (in the stale
+        // APNs environment) and every push is silently dropped. Covers both
+        // nseCapable=true (visible) and nseCapable=false (silent) accounts.
+        await reregisterAllDeviceAccounts()
     }
 
     /// Called from AppDelegate when APNs registration fails.
@@ -265,46 +272,9 @@ actor PushNotificationService {
                 return  // calendar-only, no mailbox to IDLE on
             }
 
-            // Per-(device, account) registration — decides visible vs silent
-            // push per-account at dispatch time. nseCapable ⇔ (global NSE
-            // toggle ON) AND this provider's NSE is end-to-end ready.
-            if let deviceToken = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
-               let deviceId = UserDefaults.standard.string(forKey: PushConfig.deviceIdKey) {
-                let nseEnabled = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
-                // Visible (nse) push needs a VISUAL surface enabled in iOS
-                // settings (Lock Screen / Notification Center / Banner) —
-                // otherwise iOS won't present it and won't run the NSE. When the
-                // in-app toggle is on but no visual surface is enabled, register
-                // SILENT (do NOT skip) so the app still wakes to sync + badge.
-                //
-                // Read LIVE here (no cached capability): iOS notification
-                // settings can only change in the Settings app, which requires
-                // backgrounding TabMail — so the foreground re-subscribe
-                // (`SyncScheduler.startForegroundPolling` → `subscribeAllAccounts`)
-                // always re-runs this with the current value after any change,
-                // and the worker upserts idempotently. No separate reconcile /
-                // stored-state needed. See PLAN_NSE_ENHANCE §3.2/§3.3.
-                let visualOn = await visualAlertsEnabled()
-                // iCloud routes through the IMAP IDLE proxy (app-password IMAP) —
-                // the droplet emits /imap-new-mail tagged provider="imap", so the
-                // device registration must match to receive visible push.
-                let providerTag = (account.provider == .icloud) ? "imap" : account.provider.rawValue
-                let nseCapable = nseEnabled && NSEProviderSupport.isReady(providerTag) && visualOn
-                do {
-                    try await pushClient.registerDeviceAccount(
-                        deviceToken: deviceToken,
-                        deviceId: deviceId,
-                        userId: session.userId,
-                        accountEmail: account.emailAddress,
-                        provider: providerTag,
-                        apnsSandbox: PushConfig.isAPNsSandbox,
-                        nseCapable: nseCapable
-                    )
-                } catch {
-                    print("[Push] registerDeviceAccount failed for \(account.emailAddress): \(error)")
-                    // Not fatal — dispatch will fall back to legacy device-level record.
-                }
-            }
+            // Per-(device, account) registration — the dispatch record. Decides
+            // visible vs silent push per-account at dispatch time.
+            await registerDeviceAccountRecord(for: account)
         } catch {
             print("[Push] Subscribe failed for \(account.emailAddress): \(error)")
             BackgroundSyncLogger.logPush("Subscribe FAILED for \(account.emailAddress): \(error.localizedDescription)")
@@ -312,6 +282,73 @@ actor PushNotificationService {
 
         if updateDeviceRegistration {
             await registerDeviceWithWorker()
+        }
+    }
+
+    /// (Re)register the per-(device, account) dispatch record for one account
+    /// with the CURRENT device token + APNs environment. This is the record
+    /// dispatch reads, so it MUST carry the live token regardless of push style:
+    /// it runs for both `nseCapable=true` (visible/NSE) and `nseCapable=false`
+    /// (silent/non-NSE) accounts — silent registrations need token rotations too.
+    ///
+    /// Decoupled from the provider subscription (Pub/Sub / IDLE proxy) so it can
+    /// run on a bare token change (`reregisterAllDeviceAccounts`) without
+    /// re-doing a full subscribe. CalDAV has no mailbox → callers skip it.
+    private func registerDeviceAccountRecord(for account: Account) async {
+        guard let sessionData = KeychainHelper.load(key: "tabmail_session"),
+              let session = try? JSONDecoder().decode(TabMailSession.self, from: sessionData),
+              let deviceToken = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
+              let deviceId = UserDefaults.standard.string(forKey: PushConfig.deviceIdKey) else { return }
+
+        let nseEnabled = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
+        // Visible (nse) push needs a VISUAL surface enabled in iOS settings
+        // (Lock Screen / Notification Center / Banner) — otherwise iOS won't
+        // present it and won't run the NSE. When the in-app toggle is on but no
+        // visual surface is enabled, register SILENT (nseCapable=false, do NOT
+        // skip) so the app still wakes to sync + badge. Read LIVE (no cached
+        // capability) — the foreground re-subscribe re-runs this with the
+        // current value and the worker upserts idempotently.
+        let visualOn = await visualAlertsEnabled()
+        // iCloud routes through the IMAP IDLE proxy (app-password IMAP) — the
+        // droplet emits /imap-new-mail tagged provider="imap", so the device
+        // registration must match to receive visible push.
+        let providerTag = (account.provider == .icloud) ? "imap" : account.provider.rawValue
+        let nseCapable = nseEnabled && NSEProviderSupport.isReady(providerTag) && visualOn
+        do {
+            try await pushClient.registerDeviceAccount(
+                deviceToken: deviceToken,
+                deviceId: deviceId,
+                userId: session.userId,
+                accountEmail: account.emailAddress,
+                provider: providerTag,
+                apnsSandbox: PushConfig.isAPNsSandbox,
+                nseCapable: nseCapable
+            )
+        } catch {
+            print("[Push] registerDeviceAccount failed for \(account.emailAddress): \(error)")
+            // Not fatal — dispatch falls back to the legacy device-level record.
+        }
+    }
+
+    /// Re-register EVERY active account's per-(device, account) dispatch record
+    /// with the current device token. Called on APNs token rotation
+    /// (`didReceiveDeviceToken`) so the dispatch records pick up the new token +
+    /// environment — previously a rotation refreshed ONLY the legacy device
+    /// record, leaving dispatch firing the stale per-account token (silent drop).
+    /// Runs for all providers with a mailbox (CalDAV excluded) so the non-NSE /
+    /// silent registrations get the token update too.
+    func reregisterAllDeviceAccounts() async {
+        let accounts: [Account]
+        do {
+            accounts = try await dbPool.read { db in
+                try Account.filter(Column("isActive") == true).fetchAll(db)
+            }
+        } catch {
+            print("[Push] reregisterAllDeviceAccounts: failed to load accounts: \(error)")
+            return
+        }
+        for account in accounts where account.provider != .caldav {
+            await registerDeviceAccountRecord(for: account)
         }
     }
 
