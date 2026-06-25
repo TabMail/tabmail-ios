@@ -128,4 +128,38 @@ struct EmailHTMLWrapperScopeTests {
         #expect(js.contains("BR"))
         #expect(js.contains("removeChild"))
     }
+
+    // MARK: - html/body overflow-x: clip (NOT hidden) — inner-scroll bug guard
+
+    /// Root-cause guard for the "inner rendered content scrolls, not the page"
+    /// bug: `overflow-x: hidden` on html/body promotes the visible `overflow-y`
+    /// to `auto` (CSS Overflow L3), making them Y-scroll containers that can
+    /// hold a stray `body.scrollTop` after a late image-swap reflow. `clip` is
+    /// not a scrolling value, so it clips X without that promotion — the only
+    /// real fix on WebKit, which implements no scroll anchoring / overflow-anchor.
+    @Test("html/body clip horizontal overflow with `clip`, never `hidden`")
+    func htmlBodyUseOverflowClipNotHidden() {
+        let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
+        // Positive: both the html rule and the body rule use clip.
+        #expect(out.contains("html { overflow-x: clip !important"))
+        #expect(out.contains("overflow-x: clip;"))
+        // Negative: the *rule* syntax must never regress to hidden (matched
+        // precisely so the explanatory CSS comment's prose doesn't false-trip).
+        #expect(!out.contains("overflow-x: hidden !important"))
+        #expect(!out.contains("overflow-x: hidden;"))
+    }
+
+    @Test("monitorHeightJS pins only body.scrollTop (zoom-safe), never the viewport scroller")
+    func monitorHeightJsPinsBodyScrollOnly() {
+        let js = _monitorHeightJS
+        // Defense-in-depth reset is present and wired into the image listeners.
+        #expect(js.contains("function pinBodyScroll()"))
+        #expect(js.contains("document.body.scrollTop = 0"))
+        #expect(js.contains("pinBodyScroll(); report();"))
+        // MUST NOT reset documentElement / scrollingElement — those mirror the
+        // native UIScrollView (pinch-zoom pan) on iOS WKWebView; resetting them
+        // would yank a zoomed user to the top.
+        #expect(!js.contains("documentElement.scrollTop = 0"))
+        #expect(!js.contains("scrollingElement.scrollTop"))
+    }
 }

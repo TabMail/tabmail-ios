@@ -241,7 +241,17 @@ private struct HTMLWebView: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.isOpaque = false
         webView.backgroundColor = .clear
-        webView.scrollView.isScrollEnabled = true
+        // Lock the inner scroll view at 1:1 zoom. The webview is sized to its
+        // content height and the parent SwiftUI ScrollView owns vertical
+        // scrolling, so any residual scrollable range here (e.g. a ~1px
+        // sub-pixel contentSize overshoot from a descendant that overflows
+        // body by <1px) reads as a dead-zone the user must drag through before
+        // the page moves — a "double scroll". Disabling scroll removes it.
+        // The zoomScale KVO (didFinish) re-enables scrolling only while
+        // pinch-zoomed so the user can pan the magnified content. NB:
+        // isScrollEnabled does NOT gate pinch-zoom (separate gesture
+        // recognizer), so zoom still works at 1:1.
+        webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
         webView.navigationDelegate = context.coordinator
         return webView
@@ -353,6 +363,15 @@ private struct HTMLWebView: UIViewRepresentable {
         /// value. KVO logs every change so the log shows the full settling
         /// trajectory. Debug-only — released in deinit.
         private var contentSizeObservation: NSKeyValueObservation?
+        /// KVO observation on scrollView.zoomScale. Functional (NOT debug-only):
+        /// toggles `isScrollEnabled` so the inner scroll view is locked at 1:1
+        /// (vertical drags pass to the parent SwiftUI ScrollView — no dead-zone)
+        /// but unlocked while pinch-zoomed (so the user can pan the magnified
+        /// content). We observe zoomScale rather than becoming the scrollView's
+        /// delegate, because replacing a WKWebView's scrollView delegate can
+        /// break WebKit's internal `viewForZooming` and disable zoom entirely.
+        /// Released in deinit.
+        private var zoomObservation: NSKeyValueObservation?
 
         init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>) {
             self._height = height
@@ -400,6 +419,7 @@ private struct HTMLWebView: UIViewRepresentable {
             if let obs = foregroundObserver { NotificationCenter.default.removeObserver(obs) }
             if let obs = scrollFreezeObserver { NotificationCenter.default.removeObserver(obs) }
             contentSizeObservation?.invalidate()
+            zoomObservation?.invalidate()
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -427,6 +447,19 @@ private struct HTMLWebView: UIViewRepresentable {
                         let oldH = change.oldValue?.height ?? 0
                         print(String(format: "[ContentSizeKVO id=%@] contentH=%.0f (was %.0f) zoom=%.3f frameH=%.0f",
                                      id, new.height, oldH, zoom, frameH))
+                    }
+                }
+            }
+            // Functional zoom KVO (always on): keep the inner scroll locked at
+            // 1:1 (parent SwiftUI ScrollView owns the gesture — no ~1px
+            // dead-zone) but allow panning while pinch-zoomed. Set up once.
+            if zoomObservation == nil {
+                zoomObservation = webView.scrollView.observe(\.zoomScale, options: [.new]) { sv, _ in
+                    // zoomScale KVO fires on the main thread (gesture/layout
+                    // driven); assert isolation for the UIKit read/write.
+                    MainActor.assumeIsolated {
+                        let zoomed = sv.zoomScale > 1.001
+                        if sv.isScrollEnabled != zoomed { sv.isScrollEnabled = zoomed }
                     }
                 }
             }
@@ -1523,6 +1556,20 @@ internal var _monitorHeightJS: String { monitorHeightJS }
 private let monitorHeightJS = """
     (function() {
         var lastH = 0;
+        // Defense-in-depth scroll pin. The webview is sized to content height
+        // and the parent SwiftUI ScrollView owns scrolling, so <body> must
+        // never hold a vertical scroll offset. overflow-x:clip on html/body
+        // (EmailHTMLWrapper) already prevents them from being scroll
+        // containers; this resets body.scrollTop in case a late image-swap
+        // reflow lands a stray offset on a WebKit build where `clip` is flaky.
+        // ONLY body.scrollTop — NEVER documentElement / scrollingElement,
+        // which on iOS WKWebView mirror the native UIScrollView (zoom-pan);
+        // touching those would yank a pinch-zoomed user back to the top.
+        // <!DOCTYPE html> standards mode makes documentElement the viewport
+        // scroller, so body.scrollTop is always a safe inner-scroll reset.
+        function pinBodyScroll() {
+            try { if (document.body && document.body.scrollTop !== 0) document.body.scrollTop = 0; } catch(_) {}
+        }
         function report() {
             // Gate the FIRST height post on fit() completing. Before fit()
             // decides whether to widen, body is laid out at the un-widened
@@ -1610,8 +1657,8 @@ private let monitorHeightJS = """
                 if (img.__tmListenersAttached) continue;
                 img.__tmListenersAttached = true;
                 if (img.complete) continue; // already loaded; nothing to wait for
-                img.addEventListener('load', function() { setTimeout(report, 50); }, { once: true });
-                img.addEventListener('error', function() { setTimeout(report, 50); }, { once: true });
+                img.addEventListener('load', function() { setTimeout(function(){ pinBodyScroll(); report(); }, 50); }, { once: true });
+                img.addEventListener('error', function() { setTimeout(function(){ pinBodyScroll(); report(); }, 50); }, { once: true });
             }
         }
         attachImageListeners();

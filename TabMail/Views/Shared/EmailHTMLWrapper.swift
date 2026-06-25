@@ -139,10 +139,27 @@ enum EmailHTMLWrapper {
                `width:100%` + padding, or 100vw including a scrollbar
                gutter) makes WKWebView's UIScrollView scrollable along X,
                which reads as "slight horizontal scroll that screws things
-               up". `body { overflow-x: hidden }` alone is not enough —
+               up". `body { overflow-x: clip }` alone is not enough —
                WebKit bug 153852 tracks body's overflow being ignored on
-               iOS. Clamping html with overflow-x:hidden closes that leak
+               iOS. Clamping html with overflow-x:clip closes that leak
                at the root.
+
+               USE `clip`, NOT `hidden`. Per CSS Overflow L3, when one axis
+               is a scrolling value (hidden/scroll/auto) and the other is
+               `visible`, the visible axis computes to `auto` — so
+               `overflow-x: hidden` here would silently turn html/body into
+               Y-scroll containers. A late reflow (the deferred-image swap in
+               AutoSizingHTMLView) then leaves a stray `body.scrollTop` that
+               WebKit doesn't re-clamp, so the email renders scrolled ~13px
+               INSIDE the card instead of the page scrolling — the "inner
+               content scrolls, not the page" bug. `clip` is NOT a scrolling
+               value: it clips X without promoting overflow-y, so html/body
+               never become scroll containers and the stray offset is
+               structurally impossible. (WebKit implements no scroll
+               anchoring / `overflow-anchor`, so that property can't help —
+               removing the scroll container is the only real fix.) The
+               `monitorHeightJS` image listeners also pin `body.scrollTop=0`
+               as belt-and-suspenders for WebKit builds where `clip` is flaky. */
 
                DO NOT add `max-width: 100vw` here — `100vw` in iOS WebKit
                resolves to the *visual* viewport (device width), not the
@@ -161,7 +178,7 @@ enum EmailHTMLWrapper {
                and masks any sub-frame scale-commit residual. A 700ms fallback in
                monitorHeightJS reveals even if fit() never runs, so content can
                never strand invisible. */
-            html { overflow-x: hidden !important; opacity: 0; transition: opacity 0.07s linear; }
+            html { overflow-x: clip !important; opacity: 0; transition: opacity 0.07s linear; }
             body {
                 font-family: -apple-system, sans-serif;
                 font-size: 16px;
@@ -174,7 +191,7 @@ enum EmailHTMLWrapper {
                 background-color: transparent;
                 overflow-wrap: break-word;
                 word-wrap: break-word;
-                overflow-x: hidden;
+                overflow-x: clip;
                 -webkit-user-select: text;
                 user-select: text;
                 -webkit-touch-callout: default;
