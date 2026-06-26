@@ -185,6 +185,22 @@ enum EmailHTMLWrapper {
                 line-height: 1.5;
                 padding: 0;
                 margin: 0;
+                /* Establish a block formatting context on <body> so a first/last
+                   child's margin can't collapse THROUGH the body and escape the
+                   measured height. The old `overflow-x: hidden` (pre-2026-06-25)
+                   established a BFC as a side effect; switching to `clip` for the
+                   inner-scroll fix (commit d242454) removed it (`clip` is NOT a
+                   BFC trigger, unlike `hidden`). Without a BFC, a calendar
+                   invite's `.tm-ics-collapsible` wrapper — appended at body level
+                   with margin-top:12px / margin-bottom:20px — had its margins
+                   collapse out of the body; body.scrollHeight/getBoundingClientRect
+                   excluded them, so the webview frame was sized ~12px too short
+                   and the bottom of the "Show invite details" pill was clipped.
+                   `flow-root` restores the BFC (contains those margins, included
+                   in the measured height) WITHOUT being a scrolling value — so it
+                   can't re-promote overflow-y / recreate the inner-scroll
+                   container that d242454 eliminated. */
+                display: flow-root;
                 -webkit-text-size-adjust: 100%;
                 color-scheme: light dark;
                 color: #15141a;

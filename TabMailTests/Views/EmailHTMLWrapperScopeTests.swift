@@ -149,6 +149,28 @@ struct EmailHTMLWrapperScopeTests {
         #expect(!out.contains("overflow-x: hidden;"))
     }
 
+    /// Root-cause guard for the "Show invite details" pill clipped at the bottom
+    /// bug. Switching html/body to `overflow-x: clip` (commit d242454) dropped the
+    /// block formatting context that `overflow-x: hidden` used to establish as a
+    /// side effect. Without a BFC, a calendar invite's body-level
+    /// `.tm-ics-collapsible` wrapper had its collapsing top/bottom margins escape
+    /// the body, so the measured height was short and the toggle pill was clipped.
+    /// `display: flow-root` restores the BFC (margins contained → measured) without
+    /// being a scrolling value (so it can't recreate the inner-scroll container the
+    /// `clip` change removed). This test fails if `flow-root` regresses away.
+    @Test("body establishes a BFC via flow-root so child margins can't escape the measured height")
+    func bodyEstablishesBlockFormattingContext() {
+        let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
+        #expect(out.contains("display: flow-root;"))
+        // The fix must NOT re-introduce a scroll container: the body must keep
+        // `overflow-x: clip` (not regress to `hidden`, which is a BFC trigger but
+        // also promotes overflow-y to a Y-scroll container — the d242454 bug).
+        // `.tm-quote-wrapper` legitimately uses the `overflow: hidden` shorthand
+        // for border-radius clipping, so we assert on the body's axis rule only.
+        #expect(out.contains("overflow-x: clip;"))
+        #expect(!out.contains("overflow-x: hidden;"))
+    }
+
     @Test("monitorHeightJS pins only body.scrollTop (zoom-safe), never the viewport scroller")
     func monitorHeightJsPinsBodyScrollOnly() {
         let js = _monitorHeightJS
