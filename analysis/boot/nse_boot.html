@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSE · TabMail iOS boot analysis</title>
+<link rel="stylesheet" href="assets/boot.css">
+</head>
+<body>
+<div class="nav">
+  <span class="brand">TabMail iOS <small>boot / foreground / NSE analysis</small></span>
+  <span class="links">
+    <a data-page="index" href="index.html">Overview</a>
+    <a data-page="cold" href="cold_boot.html">Cold boot</a>
+    <a data-page="warm" href="warm_boot.html">Warm foreground</a>
+    <a data-page="nse" href="nse_boot.html">NSE</a>
+  </span>
+</div>
+<div class="wrap"><div id="flow-root"></div></div>
+
+<script src="assets/boot.js"></script>
+<script>
+markNav("nse");
+const BOOT_DATA = {
+  flavor: "nse", kicker: "Notification Service Extension · NEW gradual architecture",
+  title: "NSE — fetch, stage gradually, run AI, deliver",
+  sub: "The extension that wakes on a push, fetches the message, and now <b>stages it gradually</b> — header → body → summary → action — flipping <code>populated=1</code> at the header stage. " +
+       "The main app’s merge surfaces the message the moment its header is staged (~2s), instead of waiting for all AI (~14s). This timeline shows the architecture <b>after</b> the 2026-06-25 change.",
+  pxPerMs: 0.072, maxTime: 16000, gridStep: 2000,
+  callouts: [
+    { title: "✓ Gradual staging (implemented).",
+      body: "<code>stageHeader</code> (after metadata) flips <code>populated=1</code> → the message is merge-visible at ~2s. <code>stageBody</code> (after body fetch, ~5s), <code>stageSummary</code> (after the summary LLM), then the terminal write (after the action LLM) sets <code>aiCompleted=1</code>. The merge applies each piece idempotently and keeps the staging row until AI completes.",
+      tip: true },
+    { title: "Verified timing assumptions (per your guidance + code).",
+      body: "Typical <b>summary 4–8s</b>, <b>action 1–2s</b> (both capped by a 12s timeout, <code>NSEConfig.summaryTimeoutSeconds</code>/<code>actionTimeoutSeconds</code>; <code>actionVoteCount=1</code>). So the NSE usually delivers in ~10–16s, not the 30s budget. The bars below use ~6s summary / ~1.5s action.",
+      tip: false },
+    { title: "⚠ Verified: the NSE does NOT compute a reply.",
+      body: "Confirmed in <code>NotificationService.swift</code> — the NSE runs <b>summary + action only</b>. <b>Reply precompute is a main-app step</b> (<code>ActiveAIQueue</code> / reply-precompute, <code>system_prompt_reply</code> with tools), which is the slow one (4–8s+ and can time out). It is NOT staged by the NSE today. If you want reply staged too (timing out to the main app), that’s a follow-up — see hotspot #4.",
+      tip: false }
+  ],
+  lanes: [
+    { id: "proc",  label: "NSE process (serial)", kindHint: "cpu" },
+    { id: "net",   label: "Network · fetch",      kindHint: "net" },
+    { id: "stage", label: "Staging DB (gradual)", kindHint: "dbw" },
+    { id: "llm",   label: "LLM backend",          kindHint: "llm" }
+  ],
+  phases: [
+    { label: "fetch + stage header/body", start: 0,     end: 4790,  color: "rgba(20,184,166,.12)" },
+    { label: "AI cache probe",            start: 4790,  end: 6300,  color: "rgba(110,168,254,.10)" },
+    { label: "summary + action AI",       start: 6300,  end: 13870, color: "rgba(168,85,247,.12)" },
+    { label: "terminal + deliver",        start: 13870, end: 16000, color: "rgba(217,119,6,.13)" }
+  ],
+  markers: [
+    { t: 1790,  label: "★ stageHeader → merge can see it (~2s)", color: "#10b981", text: "#04140d" },
+    { t: 4790,  label: "stageBody → openable", color: "#7cc4ff", text: "#04121f" },
+    { t: 13870, label: "AI done → terminal (aiCompleted=1)", color: "#a855f7", text: "#fff" },
+    { t: 13960, label: "delivered", color: "#f59e0b", text: "#241500" }
+  ],
+  jobs: [
+    { id: "entry", lane: "proc", kind: "cpu", start: 0, dur: 12, file: "NotificationService.swift:48",
+      detail: "<p><code>didReceive</code>: parse the push payload, apply the 60s recency filter, spawn the async process task with the contentHandler.</p>", qos: "NSE main" },
+
+    { id: "account", lane: "proc", kind: "cpu", start: 12, dur: 48, file: "NotificationService.swift:184",
+      detail: "<p>Account lookup (App-Group UserDefaults) + token load (<code>SharedKeychain</code>; skipped for IMAP). ~1–10ms each.</p>", qos: "NSE main" },
+
+    { id: "resolveids", lane: "net", kind: "net", start: 60, dur: 200, file: "NotificationService.swift:222",
+      detail: "<p>Resolve message IDs. Fast path: the payload carries <code>messageId</code> (~0). Legacy fallback: Gmail history.list (1–3s).</p>", qos: "net" },
+
+    { id: "fetchmeta", lane: "net", kind: "net", start: 260, dur: 1500, file: "NotificationService.swift:311",
+      detail: "<p>Fetch message metadata (Gmail/Graph/IMAP). 0.5–3s. The header fields needed to DISPLAY the row are now in hand.</p>", qos: "net" },
+
+    { id: "stageHeader", lane: "stage", kind: "dbw", start: 1760, dur: 30, file: "NSEStagingDB.stageHeader (new)",
+      detail: "<p><b>NEW — gradual stage 1.</b> Write the header columns + <code>populated=1</code> via UPSERT, so the main app’s merge surfaces the message NOW (~2s), before body and AI. Sets <code>aiCompleted=0</code>; the merge keeps the row until AI completes. <code>processedAt</code> is stamped here (anchors the abandon window).</p>",
+      opt: true, optSev: "high",
+      optimize: "<p>✓ This is the core of the implemented change. The merge’s <code>WHERE populated=1</code> now matches at the header stage instead of only after AI.</p>",
+      qos: "App-Group write" },
+
+    { id: "fetchbody", lane: "net", kind: "net", start: 1760, dur: 3000, file: "NotificationService.swift:338",
+      detail: "<p>Fetch + render the full body (Gmail/Graph <code>messageFull</code>; IMAP reuses step 4). 1–5s.</p>", qos: "net" },
+
+    { id: "stageBody", lane: "stage", kind: "dbw", start: 4760, dur: 30, file: "NSEStagingDB.stageBody (new)",
+      detail: "<p><b>NEW — gradual stage 2.</b> UPDATE the staged row with the rendered body. The merge then writes <code>MessageBody</code> + FTS, and the main app’s body queue won’t re-fetch. Idempotent.</p>", qos: "App-Group write" },
+
+    { id: "probe", lane: "net", kind: "net", start: 4790, dur: 1500, file: "NSEAICacheProbe.swift:24",
+      detail: "<p>Cross-device AI cache probe (3s timeout) + local staging cache check. A peer hit skips the NSE’s own AI. Runs after the body fetch.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p><span class='deferbadge'>deferred</span> Run the probe in parallel with the body fetch (it only needs <code>rfc822MessageId</code> from metadata) to shave up to 3s.</p>", qos: "net (3s timeout)" },
+
+    { id: "leaseclaim", lane: "proc", kind: "cpu", start: 6300, dur: 40, file: "NotificationService.swift:457",
+      detail: "<p>AI ownership lease (ADR-IOS-037): if the main app holds a fresh lease, skip AI; else <code>tryClaim</code> + 1Hz heartbeat. Prevents duplicate LLM spend. <b>Unchanged by the gradual work</b> — coordination still holds.</p>", qos: "NSE main" },
+
+    { id: "summary", lane: "llm", kind: "llm", start: 6340, dur: 6000, file: "NotificationService.swift:503",
+      detail: "<p>Summary LLM (<code>system_prompt_summary</code>). <b>Typical 4–8s</b>, 12s timeout. Produces blurb + todos + reminder.</p>", qos: "backend (≤12s)" },
+
+    { id: "stageSummary", lane: "stage", kind: "dbw", start: 12340, dur: 30, file: "NSEStagingDB.stageSummary (new)",
+      detail: "<p><b>NEW — gradual stage 3a.</b> UPDATE the summary/reminder columns so a merge landing during the action vote shows the summary. <code>aiCompleted</code> stays 0 until the terminal write.</p>", qos: "App-Group write" },
+
+    { id: "action", lane: "llm", kind: "llm", start: 12370, dur: 1500, file: "NotificationService.swift:521",
+      detail: "<p>Action classification (<code>system_prompt_action</code>, <code>actionVoteCount=1</code>). <b>Typical 1–2s</b>, 12s timeout. Sequential after summary (the action prompt embeds the summary).</p>",
+      opt: true, optSev: "low",
+      optimize: "<p>Action is fast (1–2s) so the sequential dependency costs little now. Visibility no longer waits on it anyway — the header/body were staged ~10s earlier.</p>", qos: "backend (≤12s)" },
+
+    { id: "persist", lane: "stage", kind: "dbw", start: 13870, dur: 40, file: "NSEStagingDB.persistProcessedMessage (terminal)",
+      detail: "<p><b>Terminal write</b> — the existing <code>persistProcessedMessage</code> finalizes the row with the action tag + <code>aiCompleted=1</code> + <code>notified</code>. The next merge applies the action and <b>deletes</b> the (now terminal) staging row.</p>", qos: "App-Group write" },
+
+    { id: "leaserelease", lane: "proc", kind: "cpu", start: 13910, dur: 20, file: "NotificationService.swift:545",
+      detail: "<p>Cancel heartbeat + release the AI lease (conditional on still owning).</p>", qos: "NSE main" },
+
+    { id: "deliver", lane: "proc", kind: "cpu", start: 13930, dur: 40, file: "NotificationService.swift:587",
+      detail: "<p>Compute badge (idempotent), build the notification (active + sound only when reply-tagged), and <code>deliver(c)</code> — the single one-shot notification, ~14s after the push.</p>", qos: "NSE main" },
+
+    { id: "expiry", lane: "proc", kind: "defer", start: 28000, dur: 120, file: "NotificationService.swift:130",
+      detail: "<p>Contingency only — fires if the 30s budget expires before delivery (rare with ~14s typical). Delivers a minimal passive fallback. The NSE can only deliver once.</p>", qos: "system callback" }
+  ],
+  hotspots: [
+    { title: "Gradual staging — populated=1 at the header stage", sev: "low",
+      problem: "<span class='donebadge'>✓ done</span> Previously the staging row only flipped <code>populated=1</code> in the terminal write, after summary + action (~14s). A foreground mid-AI saw nothing.",
+      fix: "Implemented: <code>stageHeader</code> writes the header + <code>populated=1</code> right after metadata; <code>stageBody</code>/<code>stageSummary</code> fill in; the terminal write finalizes. The merge applies each piece and keeps the row until <code>aiCompleted=1</code> (or it’s abandoned). New tests: <code>NSEGradualMergeTests</code>.",
+      jobs: ["stageHeader", "stageBody", "stageSummary", "persist"] },
+
+    { title: "Summary → action are sequential (but action is fast)", sev: "low",
+      problem: "Action’s prompt embeds the summary, so it waits for summary. With real timings (summary ~6s + action ~1.5s) this is ~7.5s, and visibility no longer depends on it.",
+      fix: "No change needed — the gradual-staging fix removed AI from the <i>visibility</i> path. A tighter summary timeout would trim the notification latency if desired.",
+      jobs: ["summary", "action"] },
+
+    { title: "AI cache probe runs after the body fetch", sev: "med",
+      problem: "<span class='deferbadge'>deferred</span> The probe (3s timeout) only needs <code>rfc822MessageId</code> but runs serially after the full body fetch.",
+      fix: "Kick the probe in parallel with the body fetch; on a peer hit, skip the NSE’s own AI entirely.",
+      jobs: ["probe"] },
+
+    { title: "Reply is NOT computed in the NSE (verified)", sev: "med",
+      problem: "<span class='deferbadge'>not built</span> The NSE runs summary + action only. Reply precompute (the slow 4–8s+ step that can time out) is a <b>main-app</b> step (<code>ActiveAIQueue</code>), not staged by the NSE. So a reply-tagged message gets its draft from the main app on next wake, not from the NSE.",
+      fix: "If you want the NSE to also precompute + stage the reply (gradual stage 4, timing out to the main app on the 12s budget): add a <code>system_prompt_reply</code> call after the action stage, a <code>stageReply</code> write, and a merge branch that surfaces the cached reply. Bigger change — call it if the NSE-side reply latency matters for the notification.",
+      jobs: ["action", "persist"] }
+  ]
+};
+BootFlow.render(BOOT_DATA);
+
+/* ---- inject the before/after (staging write order) at the top ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>What changed &nbsp;<span class="donebadge">✓ implemented 2026-06-25</span></h2>' +
+    '<div class="desc">The staging row is no longer written once at the end (after AI). The NSE writes it in stages and flips <code>populated=1</code> at the header stage, so the merge surfaces the message ~12s earlier and fills in body + AI as they land. (Timings use the verified typical numbers: summary 4–8s, action 1–2s.)</div>' +
+    '<div class="ba">' +
+      '<div class="col before"><h4><span class="tag">before</span> one terminal write</h4>' +
+        '<div class="lead">A single <code>persistProcessedMessage</code> set <code>populated=1</code> only after summary + action.</div>' +
+        '<div class="stagestrip">' +
+          '<div class="st"><div class="w">~14s</div><div class="n">persist (populated=1)</div><div class="x">header + body + AI written together, after both LLM calls</div></div>' +
+          '<div class="st vis"><div class="w">~14s</div><div class="n">▶ merge can see it</div><div class="x">nothing visible to the merge until here</div></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="col after"><h4><span class="tag">after</span> gradual staging</h4>' +
+        '<div class="lead">Four idempotent writes; <code>populated=1</code> at the header stage. The merge keeps the row until AI completes.</div>' +
+        '<div class="stagestrip">' +
+          '<div class="st vis"><div class="w">~2s</div><div class="n">stageHeader<br>▶ visible</div><div class="x">populated=1; merge surfaces it now</div></div>' +
+          '<div class="st"><div class="w">~5s</div><div class="n">stageBody</div><div class="x">body merged → openable, FTS</div></div>' +
+          '<div class="st"><div class="w">~12s</div><div class="n">stageSummary</div><div class="x">summary merged before the action vote</div></div>' +
+          '<div class="st"><div class="w">~14s</div><div class="n">persist (terminal)</div><div class="x">action + aiCompleted=1 → merge deletes the row</div></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="ba-files">' +
+      '<span class="f">NSEStagingDB.stageHeader / stageBody / stageSummary (new)</span>' +
+      '<span class="f">NotificationService.swift steps 4 / 5 / 6a</span>' +
+      '<span class="f">NSEDataBridge.mergeNSEStagingData (incremental + keep-until-terminal)</span>' +
+      '<span class="f">NSEGradualMergeTests (new)</span>' +
+    '</div>' +
+    '<div class="note">Coordination unchanged: the AI ownership lease still prevents the main app from duplicating the NSE’s in-flight AI. Non-terminal rows are kept and re-merged idempotently until <code>aiCompleted=1</code> (then deleted) or until the NSE is long gone (abandon window, then deleted after the header is durable). Measured: a clean header-only merge surfaces the message in a few ms (<code>NSEGradualMergeTests.headerOnlyMergeIsFast</code>).</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
+
+/* ---- inject MEASURED NSE timeline (device console 2026-06-26) ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>Measured on device &nbsp;<span class="donebadge">✓ 2026-06-26 · NSE os_log</span></h2>' +
+    '<div class="desc">A real single-message NSE run from the device console, confirming gradual staging works and refining the AI-timing estimates.</div>' +
+    '<div class="stagestrip">' +
+      '<div class="st vis"><div class="w">+0ms</div><div class="n">STARTED</div><div class="x">push received</div></div>' +
+      '<div class="st"><div class="w">+519ms</div><div class="n">stage1 header (populated)</div><div class="x">★ merge-visible here, ~5s before delivery</div></div>' +
+      '<div class="st"><div class="w">+809ms</div><div class="n">stage2 body</div><div class="x">body fetch done</div></div>' +
+      '<div class="st"><div class="w">+3.8s</div><div class="n">summary OK</div><div class="x">summary ≈ 2.7s</div></div>' +
+      '<div class="st"><div class="w">+5.6s</div><div class="n">action=reply</div><div class="x">action ≈ 1.8s</div></div>' +
+      '<div class="st vis"><div class="w">+5.6s</div><div class="n">DELIVERED</div><div class="x">total 5623ms — not the 30s budget</div></div>' +
+    '</div>' +
+    '<div class="note" style="margin-top:14px">Verified: <b>stage1 (header, <code>populated=1</code>) at +519ms</b> vs DELIVERED at 5623ms — a foreground during this window now surfaces the message ~5s before AI finishes. Real AI timings: <b>summary ≈2.7s, action ≈1.8s</b> (the page bars use a slightly conservative 6s/1.5s; both well under the 12s timeouts). Confirms the verified assumption that the NSE delivers in ~6–16s, and that it runs summary+action only (no reply).</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
+</script>
+</body>
+</html>

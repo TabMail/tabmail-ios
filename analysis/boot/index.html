@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TabMail iOS — boot / foreground / NSE performance analysis</title>
+<link rel="stylesheet" href="assets/boot.css">
+<style>
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px,1fr)); gap: 16px; margin-top: 8px; }
+.card { display:block; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; color: var(--txt); }
+.card:hover { border-color: var(--accent); text-decoration: none; transform: translateY(-2px); transition: .12s; }
+.card h3 { margin: 6px 0 6px; font-size: 17px; }
+.card p { color: var(--txt-dim); font-size: 13px; margin: 0; }
+.card .pill { font-size: 10px; }
+.flow-mini { font: 11px/1.4 "SF Mono", ui-monospace, monospace; color: var(--txt-faint); margin-top: 10px; }
+.big { display:grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+@media (max-width: 820px){ .big { grid-template-columns: 1fr; } }
+ol.findings { padding-left: 20px; } ol.findings li { margin-bottom: 12px; }
+ol.findings b { color: var(--txt); }
+ol.findings .src { color: var(--txt-faint); font-size: 12px; }
+table.matrix { border-collapse: collapse; width: 100%; font-size: 12.5px; margin-top: 6px; }
+table.matrix th, table.matrix td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+table.matrix th { background: var(--bg2); color: var(--txt-dim); font-weight: 700; }
+.sev2 { font-size:10px; font-weight:800; padding:1px 7px; border-radius:5px; }
+.s-high{background:#3a1414;color:#ff9b9b;} .s-med{background:#3a2c10;color:#ffce82;} .s-low{background:#13301f;color:#8fe0b0;}
+</style>
+</head>
+<body>
+<div class="nav">
+  <span class="brand">TabMail iOS <small>boot / foreground / NSE analysis</small></span>
+  <span class="links">
+    <a data-page="index" class="active" href="index.html">Overview</a>
+    <a data-page="cold" href="cold_boot.html">Cold boot</a>
+    <a data-page="warm" href="warm_boot.html">Warm foreground</a>
+    <a data-page="nse" href="nse_boot.html">NSE</a>
+  </span>
+</div>
+<div class="wrap">
+
+  <div class="hero">
+    <span class="pill cold">Performance investigation</span>
+    <h1>Why boot &amp; foreground feel slower than before</h1>
+    <div class="sub">An interactive map of the three startup flows and where the time goes. The hang is gone, but startup now throws a large concurrent
+    <b>herd</b> of work at the first second, and NSE-staged mail is gated behind full AI completion — so the &ldquo;message pops in at 10ms&rdquo; behaviour was lost. Open each flow to click through every job.</div>
+  </div>
+
+  <div class="callout tip">
+    <b>✓ Implemented 2026-06-25 — the two focused changes.</b>
+    <div class="why">
+      <b>1 — Gradual NSE staging.</b> The NSE now stages <code>header → body → summary → action</code> incrementally, flipping <code>populated=1</code> at the header stage. The merge applies each piece idempotently and keeps the row until AI completes, so a foreground surfaces NSE mail ~17s earlier instead of waiting for all AI. <span class="donebadge">opt&nbsp;#1</span><br><br>
+      <b>2 — Foreground reorder.</b> The first foreground after a cold launch yields + settles 0.35s so the inbox paints before the merge + sync herd starts. <span class="donebadge">opt&nbsp;#2</span><br><br>
+      <b>3 — Cold-boot first paint (found via on-device BootProfiler).</b> The orphan <code>DemoSeed.wipe</code> ran unindexed <code>LIKE 'demo-account:%'</code> full-table scans on the writer <i>before</i> first paint — gating the inbox by ~10s on a large mailbox. Now gated on a 1ms indexed existence check (skipped when there's no demo data) and the wipe's scans converted to index-using range queries. <span class="donebadge">opt&nbsp;#3</span><br><br>
+      The remaining optimizations below were intentionally <b>deferred as overkill for now</b>. A DEBUG-only <code>BootProfiler</code> (kernel-process-start timeline) was added to measure all of this.
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <b>✓ Measured on device (2026-06-26 BootProfiler / NSE os_log).</b>
+    <div class="why">
+      <b>Cold boot → inbox: 22.2s → 6.6s</b> — <code>db.built → FIRST PAINT</code> went from 10.3s (DemoSeed full scans) to ~14ms; the remainder is pre-main dyld load (debug+debugger-inflated, smaller on Release). DB build itself was always fast (220ms).<br>
+      <b>NSE gradual staging:</b> header staged (<code>populated=1</code>) at +519ms vs delivery at 5623ms — message surfaces ~5s before AI finishes. Real AI: summary ≈2.7s, action ≈1.8s (no reply in NSE).<br>
+      <b>Foreground reorder:</b> 0.35s settle → inbox first → NSE merge surfaced the staged message in 64ms; the ~6s sync herd runs behind the visible inbox.
+    </div>
+  </div>
+
+  <div class="callout">
+    <b>Two findings explain the regression.</b>
+    <div class="why">
+      <b>1 — The foreground herd.</b> <code>scenePhase → .active</code> launches the unified <code>startForegroundPolling</code> pipeline: <code>mergeNSEStagingData</code> ×2, two full sync passes (<code>backgroundSyncAll</code> + <code>foregroundSyncAll</code>), 6 queue repopulations, push re-subscribe, FTS self-heal, and <code>whoami</code> ×3–4 — all in the first ~1–2s, contending the single GRDB writer, the reader pool, the network and the CPU exactly when SwiftUI's ~1.3s first-render stall needs them.<br><br>
+      <b>2 — NSE mail is gated behind AI.</b> The merge shows only <code>populated=1</code> rows, and the NSE writes that flag <i>after</i> summary + action (≤24s of LLM) — even though the header+body were ready ~5s in. Foreground while the NSE is mid-AI ⇒ the message is invisible until the NSE finishes or the app's own (slower) sync re-fetches it. Exactly the &ldquo;staging should catch up in 10ms&rdquo; behaviour you remember, now lost.
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>The three flows</h2>
+    <div class="cards">
+      <a class="card" href="cold_boot.html">
+        <span class="pill cold">Cold boot</span>
+        <h3>Process killed → fresh launch</h3>
+        <p>dyld → init → DB build (off-main, splash) → first paint → the post-render herd.</p>
+        <div class="flow-mini">dyld ▸ init ▸ probe+build ▸ ◀paint▶ ▸ [MainStall] + herd</div>
+      </a>
+      <a class="card" href="warm_boot.html">
+        <span class="pill warm">Warm foreground</span>
+        <h3>Backgrounded → returns (post-NSE)</h3>
+        <p>scenePhase .active ▸ NSE merge ▸ 500ms reload debounce ▸ sync herd. Includes the NSE→inbox merge pathway.</p>
+        <div class="flow-mini">.active ▸ merge ▸ ⏱500ms ▸ reload ▸ 2× sync</div>
+      </a>
+      <a class="card" href="nse_boot.html">
+        <span class="pill nse">NSE</span>
+        <h3>Push → fetch → AI → deliver</h3>
+        <p>Fetch (~5s) ▸ AI cache probe ▸ summary+action (≤24s) ▸ <b>populated=1</b> ▸ deliver. The visibility gate lives here.</p>
+        <div class="flow-mini">fetch ▸ probe ▸ summary→action ▸ ★populated=1 ▸ deliver</div>
+      </a>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Top optimizations (ranked, cross-cutting)</h2>
+    <div class="desc">Each links to the flow page where it's detailed and clickable. Ordered by perceived-latency impact vs. effort.</div>
+    <table class="matrix">
+      <thead><tr><th style="width:34px">#</th><th>Change</th><th>Effect</th><th style="width:80px">Impact</th><th style="width:150px">Where</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><span class="donebadge">✓ done</span> <b>Split the NSE staging write</b> — write header+body with <code>populated=1, aiCompleted=0</code> right after fetch; UPDATE AI columns when they land.</td>
+          <td>NSE mail is merge-visible ~17s earlier; foreground merge surfaces it in ~10ms; AI fills in after — the behaviour you expect.</td>
+          <td><span class="sev2 s-high">high</span></td><td><a href="nse_boot.html">NSE · #1</a></td></tr>
+        <tr><td>2</td><td><span class="donebadge">✓ done</span> <b>Reorder — inbox first, then the herd</b> (implemented as a one-shot 0.35s first-foreground settle in <code>startForegroundPolling</code>; the whole merge+sync herd waits for it so the cold first render paints first). A finer-grained selective deferral (delay only the 2nd sync pass / Backfill* / self-heal) is the deferred next step.</td>
+          <td>Frees CPU/GRDB/network for the ~1.3s SwiftUI first-render stall on cold launch — the inbox shows before the herd starts.</td>
+          <td><span class="sev2 s-high">high</span></td><td><a href="cold_boot.html">Cold · #1</a></td></tr>
+        <tr><td>3</td><td><span class="deferbadge">deferred</span> <b>Bypass the 500ms inbox debounce for merge-inserts</b> — when <code>mergeNSEStagingData</code> INSERTs new inbox rows, reload immediately; keep 500ms coalescing only for background-sync churn.</td>
+          <td>A merged message draws in ~10ms instead of ~0.5–0.7s.</td>
+          <td><span class="sev2 s-high">high</span></td><td><a href="warm_boot.html">Warm · #2</a></td></tr>
+        <tr><td>4</td><td><span class="deferbadge">deferred</span> <b>Collapse the two sync passes</b> into one per foreground (drop <code>poll()</code> from startup, or short-circuit if <code>backgroundPoll</code> ran &lt;N s ago).</td>
+          <td>Halves the sync work + the duplicate inboxDataDidChange + whoami on every foreground.</td>
+          <td><span class="sev2 s-med">med</span></td><td><a href="warm_boot.html">Warm · #4</a></td></tr>
+        <tr><td>5</td><td><span class="deferbadge">deferred</span> <b>De-dupe <code>whoami</code></b> (in-flight guard + min-interval) and <b>skip the inner <code>mergeNSEStagingData</code></b> on the foreground entry (outer call already merged).</td>
+          <td>Removes 3 redundant TLS round-trips + a redundant staging-DB open per foreground.</td>
+          <td><span class="sev2 s-med">med</span></td><td><a href="warm_boot.html">Warm · #3/#5</a></td></tr>
+        <tr><td>6</td><td><span class="deferbadge">deferred</span> <b>Take <code>recoverIncompleteHeaders</code> off the critical path</b> (conditional/fire-and-forget) and <b>stagger the 6 queue repopulations</b> (Active* now, Backfill* after settle).</td>
+          <td>Removes a steady-state no-op scan + reader-pool contention from the first-render window.</td>
+          <td><span class="sev2 s-med">med</span></td><td><a href="cold_boot.html">Cold · #5/#6</a></td></tr>
+        <tr><td>7</td><td><span class="deferbadge">deferred</span> <b>Run the NSE AI cache probe in parallel with the body fetch</b> (it only needs rfc822MessageId).</td>
+          <td>Up to 3s off the NSE critical path on the common path.</td>
+          <td><span class="sev2 s-med">med</span></td><td><a href="nse_boot.html">NSE · #3</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="big section">
+    <div>
+      <h2>What's already well-placed (don't regress)</h2>
+      <ol class="findings">
+        <li><b>DB build off init</b>, splash-gated, version-gated. <span class="src">the original foreground-hang fix.</span></li>
+        <li><b>SearchIndex FTS open + WebKit warm-up deferred</b> to post-<code>isReady</code>+500ms. <span class="src">No longer mid-render.</span></li>
+        <li><b>EmbeddingService eager <code>.utility</code></b> (lands late, after paint; kept eager so background launches still build embeddings). <span class="src">QoS-lever to lower these was tried &amp; reverted.</span></li>
+        <li><b>NSE staging schema upkeep</b> off the <code>isReady</code> gate + version-gated (no cross-process lock in steady state).</li>
+        <li><b>NSE↔main-app AI lease</b> (ADR-IOS-037) prevents duplicate LLM spend — keep it; the split-write fix coexists with it.</li>
+      </ol>
+    </div>
+    <div>
+      <h2>How to get real numbers</h2>
+      <p style="color:var(--txt-dim);font-size:13px">All timings in these pages are architectural estimates from the code paths (durations are representative, not profiled), except where a device-log number is cited. To confirm on a <b>Release / TestFlight</b> build (the debugger inflates WebKit/CoreML 3–4×):</p>
+      <ol class="findings" style="font-size:13px">
+        <li><code>BackgroundSyncLogger</code> <b><code>fgReturn[+Nms]</code></b> lines (<code>fgStep</code> in <code>startForegroundPolling</code>) — the warm-foreground herd timeline.</li>
+        <li><code>BackgroundSyncLogger</code> <b><code>syncStartup[+Nms]</code></b> (<code>stepLog</code>) — each step's offset.</li>
+        <li><b><code>MainActorStallDetector</code></b> output — pinpoints which main-actor op blocked &gt;200ms.</li>
+        <li><b>NSE os_log</b> — <code>NSE step6a/6b</code> timings and the final <code>DELIVERED (Nms)</code> line.</li>
+        <li><code>AppStartup</code> <b><code>database ready in Nms</code></b> — confirms DB build is (not) the cost.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="note" style="margin-top:30px">Generated from a read-only code trace of <code>TabMailApp.swift</code>, <code>AppStartup</code>, <code>SyncScheduler.swift</code>, <code>NSEDataBridge.swift</code>, <code>InboxViewModel.swift</code>, the <code>TabMailNotificationService/</code> target, and the iOS <code>PROJECT_MEMORY.md</code> boot history. No source was modified.</div>
+</div>
+</body>
+</html>

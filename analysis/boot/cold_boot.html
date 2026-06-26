@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cold boot · TabMail iOS boot analysis</title>
+<link rel="stylesheet" href="assets/boot.css">
+</head>
+<body>
+<div class="nav">
+  <span class="brand">TabMail iOS <small>boot / foreground / NSE analysis</small></span>
+  <span class="links">
+    <a data-page="index" href="index.html">Overview</a>
+    <a data-page="cold" href="cold_boot.html">Cold boot</a>
+    <a data-page="warm" href="warm_boot.html">Warm foreground</a>
+    <a data-page="nse" href="nse_boot.html">NSE</a>
+  </span>
+</div>
+<div class="wrap"><div id="flow-root"></div></div>
+
+<script src="assets/boot.js"></script>
+<script>
+markNav("cold");
+const BOOT_DATA = {
+  flavor: "cold", kicker: "Cold boot · fresh process launch",
+  title: "Cold boot — process was killed, launched fresh",
+  sub: "The path when iOS has terminated the app (memory pressure, swipe-kill, reboot, or a long sleep) and the user taps the icon or a push. " +
+       "Nothing is in memory: dyld loads frameworks, <code>TabMailApp.init</code> runs, the DB is built off-main behind a splash, the inbox paints, " +
+       "then a large herd of post-render work — sync, AI, FTS, embeddings, push, NSE merge — competes for CPU, the GRDB pool and the network.",
+  pxPerMs: 0.13, maxTime: 9000, gridStep: 1000,
+  callouts: [
+    { title: "Why cold boot feels slower now:",
+      body: "the inbox paints at roughly the same time, but the moment <code>scenePhase → .active</code> fires, <code>startForegroundPolling</code> launches the full unified sync herd <i>on top of</i> the ~1.3s SwiftUI first-render stall — two sync passes, 6 queue repopulations, push re-subscribe, <code>whoami</code> ×3–4, FTS self-heal — all contending for the single GRDB writer, the reader pool and the CPU exactly when SwiftUI needs them.",
+      why: "Pre-unification, foreground did a single delta poll. The herd is correctness-complete but front-loads everything into the first second." },
+    { title: "✓ And NSE-staged mail now &ldquo;pops in&rdquo; via the merge:",
+      body: "gradual staging (implemented) means the NSE flips <code>populated=1</code> at the header stage, so the cold-boot merge — which runs right after the settle — surfaces recent NSE mail in ~10ms instead of waiting for AI. See the <a href='nse_boot.html'>NSE page</a>.",
+      tip: true }
+  ],
+  lanes: [
+    { id: "main", label: "Main / UI thread", kindHint: "main" },
+    { id: "dbw",  label: "GRDB writer",       kindHint: "dbw" },
+    { id: "dbr",  label: "GRDB readers",      kindHint: "dbr" },
+    { id: "cpu",  label: "Background actors", kindHint: "cpu" },
+    { id: "net",  label: "Network · IMAP",    kindHint: "net" },
+    { id: "ml",   label: "CoreML · FTS",      kindHint: "ml" },
+    { id: "llm",  label: "LLM backend",       kindHint: "llm" }
+  ],
+  phases: [
+    { label: "pre-main (dyld)", start: 0,    end: 1400, color: "rgba(100,116,139,.12)" },
+    { label: "init + DB build", start: 1400, end: 2060, color: "rgba(217,119,6,.12)" },
+    { label: "first paint",     start: 2060, end: 3400, color: "rgba(239,68,68,.12)" },
+    { label: "post-render herd", start: 3400, end: 9000, color: "rgba(59,130,246,.10)" }
+  ],
+  markers: [
+    { t: 1400, label: "init", color: "#f59e0b", text: "#241500" },
+    { t: 2060, label: "▶ inbox painted", color: "#7cc4ff", text: "#04121f" },
+    { t: 2120, label: "scenePhase .active", color: "#9b8cff", text: "#0c0820" }
+  ],
+  jobs: [
+    { id: "dyld", lane: "main", kind: "main", start: 0, dur: 1400, file: "(pre-main: dyld + Swift runtime)",
+      detail: "<p>Framework / dylib load + Swift runtime init <i>before</i> any app code runs. This is most of the initial blank window on a true cold boot.</p><p>Per the iOS memory notes, cold boot is ~5–6s on debug <b>and</b> TestFlight; DB build is fast (~200ms), so the bulk is pre-main load + the first-render stall, not app logic.</p>",
+      qos: "n/a (system)" },
+
+    { id: "init", lane: "main", kind: "main", start: 1400, dur: 60, file: "TabMailApp.swift:28",
+      detail: "<p>Synchronous <code>TabMailApp.init</code>. Deliberately light — DB build was moved <i>off</i> init (the foreground-hang fix).</p><ul>" +
+        "<li>fresh-install detection: <code>UserDefaults</code> + <code>Keychain</code> + <code>FileManager.fileExists</code> on the sqlite path</li>" +
+        "<li>proactive-notify one-shot migration, TipKit config, battery monitoring</li>" +
+        "<li>registers 2 BGTask handlers, starts <code>MainActorStallDetector</code></li>" +
+        "<li>kicks <code>Task.detached(.utility)</code> → <code>EmbeddingService.initialize()</code> (gated on <code>dbReady</code>)</li></ul>",
+      qos: "@MainActor (sync)" },
+
+    { id: "appdelegate", lane: "main", kind: "mainlite", start: 1460, dur: 30, file: "AppDelegate.swift didFinishLaunching",
+      detail: "<p>Runs on <b>every</b> launch type. Keychain accessibility migrate, notification delegate + action categories, <code>DatabaseSuspension.start()</code> (0xdead10cc defense), AI opt-out flag migration, and kicks <code>Task { ensureDatabaseReady() }</code> so background launches (no <code>body.task</code>) still build the DB.</p>",
+      qos: "@MainActor (sync)" },
+
+    { id: "probe", lane: "dbr", kind: "dbr", start: 1500, dur: 90, file: "TabMailApp.swift:439",
+      detail: "<p>Phase 1 of <code>ensureDatabaseReady</code>: open the pool + <code>hasPendingMigrationWork</code> (reads applied-migration set + one-time reset flags). Fast. Decides whether to show the &ldquo;Updating…&rdquo; splash.</p>",
+      qos: "Task.detached(.userInitiated)" },
+
+    { id: "build", lane: "dbw", kind: "dbw", start: 1590, dur: 200, file: "TabMailApp.swift:470",
+      detail: "<p>Phase 2: GRDB schema migrations + one-time data resets, then publishes <code>AppDatabase.shared</code> and flips <code>dbReady</code>.</p><p>Device logs: <b>&ldquo;database ready in ~181–200ms&rdquo;</b> on the steady-state path. Worst case is O(mailbox-size) thread-repair migrations (v9/v27/v47/v53/v54) — minutes after a multi-version jump — which is why this is off-main behind the migration splash.</p>",
+      opt: true, optSev: "low",
+      optimize: "<p>Already correct: off-main on <code>.userInitiated</code>, splash-gated, version-gated. <b>This gates first paint</b> but the steady-state cost is tiny. Leave it; just don't add work behind the same gate.</p>",
+      qos: "Task.detached(.userInitiated)" },
+
+    { id: "demowipe", lane: "dbw", kind: "dbw", start: 1800, dur: 40, file: "TabMailApp.swift:500",
+      detail: "<p>Async <code>DemoSeed.wipe</code> — clears orphan demo rows. Off the <code>dbReady</code> gate, async write overload (non-blocking).</p>",
+      qos: "await dbPool.write" },
+
+    { id: "loadInitial", lane: "main", kind: "mainlite", start: 1980, dur: 80, file: "NavigationStore.swift:51",
+      detail: "<p><code>loadInitialData()</code> — the sidebar load (accounts, folders, outbox, hasAnyAccount). A <b>synchronous</b> <code>dbPool.read</code> on the main actor.</p><p>Deliberately NOT converted to async (ADR-IOS-031 &amp; the 2026-06-21 re-audit): runs pre-contention on cold launch, pool-mitigated by 64 readers. Once it returns, <code>isReady</code> flips and the inbox paints.</p>",
+      qos: "@MainActor sync read" },
+
+    { id: "mainstall", lane: "main", kind: "main", start: 2060, dur: 1300, file: "RootView / SwiftUI first render",
+      detail: "<p>The dominant cold-boot main-thread cost: SwiftUI builds the inbox + reactive re-evals fire. Device logs show a <b>~1.2–1.5s <code>[MainStall]</code></b> right after <code>isReady</code>.</p><p>The off-main boot herd (FTS open, CoreML, sync, repopulations) runs concurrently and <i>competes for CPU</i> with this render even though none of it is on the main thread.</p>",
+      opt: true, optSev: "high",
+      optimize: "<p>The QoS-lever (lowering FTS/Embedding priority) was tried and <b>reverted</b>. The remaining lever is <b>reducing how much off-main work runs during this window</b> — defer the non-essential foreground herd (2nd sync pass, 6 repopulations, FTS self-heal, push subscribe) by ~1–2s so the first render has the CPU to itself. See hotspots 1 &amp; 3.</p>",
+      qos: "@MainActor" },
+
+    { id: "remindersetup", lane: "cpu", kind: "cpu", start: 2080, dur: 40, file: "RootView.swift:290",
+      detail: "<p><code>NetworkMonitor.start()</code>, <code>ReminderBuilder.setupCacheInvalidation()</code> — register observers. Cheap.</p>", qos: "@MainActor" },
+
+    { id: "connect", lane: "net", kind: "net", start: 2100, dur: 1200, file: "RootView.swift:313",
+      detail: "<p>Per active account: if no provider yet, <code>connectAccount</code> (IMAP login / OAuth). First network egress. Followed by <code>reconcilePendingOperations</code> + <code>BackfillAIQueue.repopulateFromDatabase</code>.</p>",
+      qos: "Task (inherited)" },
+
+    { id: "whoami", lane: "net", kind: "net", start: 2150, dur: 400, file: "RootView.swift:531 · SyncScheduler.swift:641/714",
+      detail: "<p><code>revalidateAISubscriptionGate()</code> — a <code>/whoami</code> network round-trip that gates the AI subscription + feeds <code>UsageThrottleStore</code>.</p><p>Fired from RootView <code>.onAppear</code> (531) <b>and</b> <code>scenePhase .active</code> (550) <b>and</b> inside <code>backgroundPoll</code> (641) <b>and</b> inside <code>poll</code> (714) — up to 4× per cold foreground.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>Coalesce to one <code>/whoami</code> per foreground transition (e.g. a short in-flight de-dupe / min-interval guard in <code>revalidateAISubscriptionGate</code>). It's idempotent but each call is a full TLS round-trip competing with sync.</p>",
+      qos: "Task" },
+
+    { id: "nsestaging", lane: "cpu", kind: "cpu", start: 1850, dur: 120, file: "TabMailApp.swift:527",
+      detail: "<p><code>createNSEStagingDBIfNeeded()</code> + <code>mirrorAllState()</code>, detached <code>.utility</code> after <code>dbReady</code>. Version-gated → no-op in steady state (no lock taken). Only the first-run / schema-bump path takes the cross-process write lock (up to 2s) — and that's off the <code>isReady</code> gate, behind the already-shown inbox.</p>",
+      qos: "Task.detached(.utility)" },
+
+    { id: "searchindex", lane: "ml", kind: "ml", start: 2560, dur: 700, file: "TabMailApp.swift:231",
+      detail: "<p><code>SearchIndex.initialize()</code> — opens the 257k-doc FTS5 sidecar. Deferred to <code>body.task</code> + 500ms settle so it lands <i>after</i> first paint (it used to fire at <code>dbReady</code>, mid-stall).</p><p>Safe to defer: FTS write paths call <code>ensureReady()</code>, so push/sync indexing self-initializes.</p>",
+      qos: "Task.detached(.default)" },
+
+    { id: "embedding", lane: "ml", kind: "ml", start: 2900, dur: 900, file: "TabMailApp.swift:111",
+      detail: "<p><code>EmbeddingService.initialize()</code> — loads the ~45MB all-MiniLM CoreML model. Eager <code>.utility</code> in init (gated on <code>dbReady</code>); lands late, after the inbox render. Left eager (not deferred) so cold <i>background</i> launches still build embeddings.</p>",
+      qos: "Task.detached(.utility)" },
+
+    { id: "webkitwarm", lane: "main", kind: "mainlite", start: 2560, dur: 600, file: "TabMailApp.swift:209",
+      detail: "<p>WebKit warm-up: a throwaway <code>WKWebView.loadHTMLString(\" \")</code> to prime the WebContent/GPU process so the first message-open isn't cold. Kicked from <code>body.task</code> + 500ms settle (post-<code>isReady</code> only).</p><p><b>Caveat (unconfirmed):</b> whether this is the dominant blank-screen lever was never validated on a Release build — the original evidence was debugger-inflated.</p>",
+      qos: "Task { @MainActor } yields" },
+
+    { id: "fgmerge", lane: "dbw", kind: "dbw", start: 2200, dur: 150, file: "SyncScheduler.swift:366",
+      detail: "<p>First <code>mergeNSEStagingData()</code> on foreground — imports NSE-staged mail (header + body + AI) into the main GRDB and posts <code>.inboxDataDidChange</code>. Async write overload (non-blocking).</p><p>✓ With gradual staging, the NSE flips <code>populated=1</code> at the header stage, so this merge now surfaces recent NSE mail in ~10ms instead of waiting for AI.</p>",
+      opt: true, optSev: "low",
+      optimize: "<p>✓ Implemented — see the <a href='nse_boot.html'>NSE page</a>. The NSE writes header (then body, summary) with <code>populated=1</code> as it goes, so this merge surfaces the message immediately and AI catches up on a later merge.</p>",
+      qos: "await dbPool.write" },
+
+    { id: "syncstartup", lane: "cpu", kind: "cpu", start: 2350, dur: 60, file: "SyncScheduler.swift:155",
+      detail: "<p><code>syncStartup(inboxOnly:false, drain:.none)</code> — the unified entry. Does a <i>second</i> <code>mergeNSEStagingData</code> (line 173, idempotent), then spawns the repopulate task, the +5s self-heal task, and the sync task, and returns immediately (drain <code>.none</code>).</p>",
+      qos: "Task (inherited)" },
+
+    { id: "recoverheaders", lane: "dbr", kind: "dbr", start: 2410, dur: 200, file: "SyncScheduler.swift:183",
+      detail: "<p><code>recoverIncompleteHeaders()</code> — crash-recovery scan (rows GRDB has but FTS doesn't). Kept <b>on the critical path</b>, awaited before sync starts.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>In steady state this finds nothing but still scans. Move it off the critical path (fire-and-forget like the +5s self-heal), or gate it on a &ldquo;dirty&rdquo; flag set only when a body fetch actually failed, so a clean launch skips the scan.</p>",
+      qos: "await" },
+
+    { id: "repopulate", lane: "cpu", kind: "cpu", start: 2410, dur: 600, file: "SyncScheduler.swift:192",
+      detail: "<p>A task group repopulates <b>6 queues</b> from the DB concurrently: ActiveBody, BackfillBody, ActiveAI, BackfillEmbedding, BackfillAI, + MemorySelfHeal Stage A/B. Each is an actor issuing GRDB reads.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>Six actors hammer the reader pool at the exact moment of first render. Stagger them (e.g. Active* now, Backfill* after a short settle) or gate Backfill* behind the post-paint window — the inbox only needs ActiveBody/ActiveAI to feel responsive.</p>",
+      qos: "Task → withTaskGroup" },
+
+    { id: "synctask", lane: "net", kind: "net", start: 2470, dur: 2500, file: "SyncScheduler.swift:249",
+      detail: "<p>The sync task: <code>markAllProvidersDirty()</code> (reconnect stale sockets) → parallel <code>drainPendingSyncs()</code> + <code>backgroundPoll(inboxOnly:false)</code> → <code>backgroundSyncAll()</code> (delta sync <b>all accounts</b>) → re-mirror historyIds → <code>drainPendingQueue / drainOutbox / drainCalendarQueue</code>.</p>",
+      qos: "Task (inherited)" },
+
+    { id: "subscribe", lane: "net", kind: "net", start: 2470, dur: 800, file: "SyncScheduler.swift:382",
+      detail: "<p><code>subscribeAllAccounts()</code> — re-registers push (Gmail Pub/Sub / Graph / IMAP push relay) and the device with the push service. Network-heavy; runs in parallel with sync.</p>",
+      qos: "await" },
+
+    { id: "poll", lane: "net", kind: "net", start: 5000, dur: 1600, file: "SyncScheduler.swift:659",
+      detail: "<p><code>poll()</code> — a <b>second</b> full sync pass: <code>foregroundSyncAll()</code> (header sync of all accounts again), <code>scheduleMaintenanceInBackground(includePrune:true)</code>, then <code>drainPendingQueue / Outbox / Calendar</code> again, then <code>revalidateAISubscriptionGate</code> again.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>This runs right after <code>syncTask</code>'s <code>backgroundSyncAll()</code> already synced every account. Two near-back-to-back syncs (delta + header) per foreground. Collapse to one, or have <code>poll()</code> short-circuit if <code>backgroundPoll</code> completed &lt;N seconds ago.</p>",
+      qos: "@MainActor" },
+
+    { id: "aitail", lane: "llm", kind: "llm", start: 5200, dur: 3200, file: "ActiveAIQueue → BackendClient",
+      detail: "<p>Once sync discovers new inbox mail, the AI queue runs summary + action (3-call voting on TB; vote=1 on iOS NSE) via the backend. CPU/network heavy, but off the user-visible path — the message is already shown; AI fields fill in via <code>flushAIBatch</code>.</p>",
+      qos: "actor + LLM semaphore" },
+
+    { id: "selfheal", lane: "cpu", kind: "cpu", start: 7410, dur: 800, file: "SyncScheduler.swift:228",
+      detail: "<p>Delayed (+5s) FTS self-heal: <code>selfHealFTSBodyMembership</code> + <code>selfHealBackfillFTSMembership</code> + <code>oneTimeFTSReconciliation</code>. Each fetches thousands of MessageHeader rows + probes the FTS sidecar. Already moved off the critical path; in steady state finds 0 rows but the scan still costs.</p>",
+      qos: "Task + 5s sleep" }
+  ],
+  hotspots: [
+    { title: "The foreground herd lands on top of the first-render stall", sev: "med",
+      problem: "<span class='donebadge'>partly done</span> <code>scenePhase .active</code> fires as soon as the inbox is interactive, and <code>startForegroundPolling</code> launched the entire unified sync pipeline straight into the ~1.3s SwiftUI <code>[MainStall]</code> — two sync passes, 6 queue repopulations, push re-subscribe, whoami ×3–4, +5s self-heal — stealing CPU/GRDB/network from the render.",
+      fix: "Implemented (reorder): the first foreground per process yields + settles <code>SyncConfig.firstForegroundSettleSeconds</code> (0.35s) so the inbox paints before the herd starts. <b>Deferred next step:</b> finer-grained selective deferral — keep NSE merge + one delta sync immediate, and push the 2nd sync pass / Backfill* repopulations / FTS self-heal / push re-subscribe further back individually.",
+      jobs: ["mainstall", "synctask", "repopulate", "poll", "subscribe"] },
+
+    { title: "Two full sync passes per foreground", sev: "med",
+      problem: "<code>syncTask</code> runs <code>backgroundSyncAll()</code> and then <code>poll()</code> runs <code>foregroundSyncAll()</code> — both sync every account back-to-back, each posting <code>.inboxDataDidChange</code> and re-running <code>whoami</code>.",
+      fix: "Collapse to one sync per foreground. Either drop the <code>poll()</code> call from <code>startForegroundPolling</code> (the timer still polls every 60s) or have <code>poll()</code> no-op when <code>backgroundPoll</code> completed within the last few seconds.",
+      jobs: ["synctask", "poll"] },
+
+    { title: "NSE-staged mail surfaces via the merge (no AI wait)", sev: "low",
+      problem: "<span class='donebadge'>✓ done</span> Before: the cold-boot merge could only show NSE mail whose row was <code>populated=1</code>, flipped by the NSE after summary + action. Launch mid-AI showed nothing until the app re-fetched.",
+      fix: "Implemented (gradual staging): the NSE flips <code>populated=1</code> at the header stage; the merge (right after the first-foreground settle) surfaces the mail in ~10ms and AI catches up on later merges. See the <a href='nse_boot.html'>NSE page</a>.",
+      jobs: ["fgmerge"] },
+
+    { title: "whoami runs up to 4× per foreground", sev: "med",
+      problem: "<code>revalidateAISubscriptionGate</code> is called from RootView onAppear, scenePhase .active, backgroundPoll, and poll — four full <code>/whoami</code> round-trips competing with sync for the network.",
+      fix: "De-dupe: a single in-flight guard + min-interval (e.g. skip if revalidated &lt;10s ago) inside <code>revalidateAISubscriptionGate</code>.",
+      jobs: ["whoami"] },
+
+    { title: "recoverIncompleteHeaders sits on the critical path", sev: "med",
+      problem: "Awaited inside <code>syncStartup</code> before sync starts; a full crash-recovery scan that finds 0 rows in steady state.",
+      fix: "Make it conditional (only when a body fetch actually failed since last launch) or fire-and-forget alongside the +5s self-heal.",
+      jobs: ["recoverheaders"] },
+
+    { title: "Six queue repopulations fire during first render", sev: "med",
+      problem: "ActiveBody, BackfillBody, ActiveAI, BackfillEmbedding, BackfillAI and MemorySelfHeal all repopulate from GRDB at once, contending the reader pool with the inbox render's own reads.",
+      fix: "Stagger: Active* immediately, Backfill*/Memory after the first-paint settle window.",
+      jobs: ["repopulate"] },
+
+    { title: "DB build & FTS/Embedding are already well-placed — don't regress", sev: "low",
+      problem: "These were the historical hang sources and are now off-main, splash-gated and post-render. The QoS-lever to lower their priority was tried and reverted (risked starving FTS/embeddings under Low Power Mode).",
+      fix: "Keep as-is. The win is in the herd, not these. Validate any future change on a Release/TestFlight build, not under the debugger (which inflates WebKit/CoreML 3–4×).",
+      jobs: ["build", "searchindex", "embedding"] }
+  ]
+};
+BootFlow.render(BOOT_DATA);
+
+/* ---- inject the IMPLEMENTED before/after at the top ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>What changed &nbsp;<span class="donebadge">✓ implemented 2026-06-25</span></h2>' +
+    '<div class="desc">The reorder change applies here: the first foreground after a cold launch now lets the inbox paint before the sync herd fires. (The gradual NSE staging change — see the <a href="nse_boot.html">NSE page</a> — also lets cold-boot mail appear via the merge right after the settle.)</div>' +
+    '<div class="ba">' +
+      '<div class="col before"><h4><span class="tag">before</span> herd vs. first render</h4>' +
+        '<ul>' +
+          '<li><code>scenePhase .active</code> fires <code>startForegroundPolling</code> immediately, so the NSE merge + two sync passes + 6 queue repopulations land <b>during</b> the ~1.3s SwiftUI <code>[MainStall]</code>.</li>' +
+          '<li>The off-main herd steals CPU / GRDB readers from the first paint.</li>' +
+        '</ul></div>' +
+      '<div class="col after"><h4><span class="tag">after</span> inbox first, then herd</h4>' +
+        '<ul>' +
+          '<li>The first foreground per process does <code>await Task.yield()</code> + a <code>SyncConfig.firstForegroundSettleSeconds</code> (0.35s) settle, letting the inbox’s first frame paint before the herd starts.</li>' +
+          '<li>One-shot: warm returns (inbox already on screen) skip it.</li>' +
+        '</ul></div>' +
+    '</div>' +
+    '<div class="ba-files">' +
+      '<span class="f">SyncScheduler.startForegroundPolling</span>' +
+      '<span class="f">SyncConfig.firstForegroundSettleSeconds (new)</span>' +
+    '</div>' +
+    '<div class="note">De-scoped as overkill for now (still shown in the timeline / hotspots below): collapsing the two sync passes, whoami de-dupe, taking <code>recoverIncompleteHeaders</code> off the critical path, staggering the 6 repopulations.</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
+
+/* ---- inject MEASURED results (device trace 2026-06-26) at the very top ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>Measured on device &nbsp;<span class="donebadge">✓ 2026-06-26 · BootProfiler trace</span></h2>' +
+    '<div class="desc">A <code>BootProfiler</code> (DEBUG-only, kernel-process-start origin) was added to time the whole launch as one channel: <code>[BootProfile +Nms (Δms)] label</code>. The trace exposed the REAL cold-boot gate — and it was not the DB build.</div>' +
+    '<div class="ba">' +
+      '<div class="col before"><h4><span class="tag">before</span> the gate was DemoSeed.wipe</h4>' +
+        '<ul>' +
+          '<li><b>DB build itself: 220ms</b> (migrate 1ms) — never the bottleneck.</li>' +
+          '<li>But <code>db.built → dbReady</code> was <b>Δ10,294ms</b> (36 main-thread stalls) — and FIRST PAINT waits on <code>dbReady</code>.</li>' +
+          '<li>Cause: the orphan <code>DemoSeed.wipe</code> ran on the writer <i>before</i> <code>dbReady</code>, with <code>... id LIKE \'demo-account:%\'</code> DELETEs over messageBody/messageAICache. LIKE is case-insensitive → can\'t use the TEXT PK index → <b>full scans of a large mailbox</b>, every launch, even with zero demo data.</li>' +
+          '<li>Cold-boot → inbox: <b>+22,207ms</b>.</li>' +
+        '</ul></div>' +
+      '<div class="col after"><h4><span class="tag">after</span> gated + indexed</h4>' +
+        '<ul>' +
+          '<li><b>Fix 1:</b> <code>DemoSeed.hasDemoData()</code> — one indexed PK lookup (account seeded first / deleted last). No demo data → skip the wipe entirely.</li>' +
+          '<li><b>Fix 2:</b> the wipe\'s LIKE scans → index-using range queries (<code>id &gt;= \'demo-account:\' AND id &lt; \'demo-account;\'</code>) so it\'s near-instant even when it runs.</li>' +
+          '<li>New trace: <code>db.built → DemoSeed check (hasDemo=false, Δ1ms) → dbReady → FIRST PAINT</code> all within <b>~14ms</b>.</li>' +
+          '<li>Cold-boot → inbox: <b>+6,554ms</b> (the rest is pre-main dyld/framework load, debug+debugger-inflated).</li>' +
+        '</ul></div>' +
+    '</div>' +
+    '<div class="ba-files">' +
+      '<span class="f">DemoSeed.hasDemoData + range-query wipe</span>' +
+      '<span class="f">TabMailApp.ensureDatabaseReady (gate the wipe)</span>' +
+      '<span class="f">BootProfiler.swift (new, DEBUG)</span>' +
+      '<span class="f">DemoIsolationTests (wipe scoping)</span>' +
+    '</div>' +
+    '<div class="note">Post-paint was already smooth in the trace (inbox render 12ms, FTS open 156ms for the full index). The remaining cold-boot cost is pre-main (~5.7s in the debug+debugger run; much less on Release) — measure that on a Release/TestFlight BootProfiler run before chasing it. Commits: <code>f929a59</code> (skip), <code>9629326</code> (range scans), <code>28931ff</code> (BootProfiler).</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
+</script>
+</body>
+</html>

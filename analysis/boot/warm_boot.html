@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warm foreground · TabMail iOS boot analysis</title>
+<link rel="stylesheet" href="assets/boot.css">
+<style>
+/* page-local: NSE→inbox pathway strip */
+.pathway { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+.pw-row { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; }
+.pw-step { flex: 1 1 0; min-width: 132px; background: var(--bg2); border: 1px solid var(--line2); border-radius: 10px; padding: 10px 12px; position: relative; }
+.pw-step + .pw-step { margin-left: 22px; }
+.pw-step::before { content: "▶"; position: absolute; left: -18px; top: 50%; transform: translateY(-50%); color: var(--txt-faint); font-size: 12px; }
+.pw-step:first-child::before { content: ""; }
+.pw-step .s { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px; color: var(--txt-faint); }
+.pw-step .t { font-weight: 700; font-size: 13px; margin: 2px 0 3px; }
+.pw-step .d { font-size: 11.5px; color: var(--txt-dim); }
+.pw-step.gate { background: linear-gradient(180deg,#2a1414,#1a1010); border-color: #6b2424; }
+.pw-step.gate .t { color: #ff9b9b; }
+.pw-step.delay { background: linear-gradient(180deg,#2c2410,#1c1810); border-color: #6b531c; }
+.pw-step.delay .t { color: #ffce82; }
+.pw-step.win { background: linear-gradient(180deg,#0f2218,#0d1a14); border-color: #245c3b; }
+.pw-step.win .t { color: #8fe0b0; }
+</style>
+</head>
+<body>
+<div class="nav">
+  <span class="brand">TabMail iOS <small>boot / foreground / NSE analysis</small></span>
+  <span class="links">
+    <a data-page="index" href="index.html">Overview</a>
+    <a data-page="cold" href="cold_boot.html">Cold boot</a>
+    <a data-page="warm" href="warm_boot.html">Warm foreground</a>
+    <a data-page="nse" href="nse_boot.html">NSE</a>
+  </span>
+</div>
+<div class="wrap"><div id="flow-root"></div></div>
+
+<script src="assets/boot.js"></script>
+<script>
+markNav("warm");
+const BOOT_DATA = {
+  flavor: "warm", kicker: "Warm foreground · process alive",
+  title: "Warm foreground-return — often right after an NSE push",
+  sub: "The app was backgrounded but not killed; the user brings it back — frequently by tapping a push the NSE just processed (or while the NSE is still processing). " +
+       "<code>scenePhase → .active</code> fires <code>startForegroundPolling</code>, which merges NSE staging, then runs the full sync herd. " +
+       "The user's expectation: the staged message <b>pops in within ~10ms</b>, then the rest catches up. Today it often doesn't.",
+  pxPerMs: 0.18, maxTime: 6000, gridStep: 1000,
+  callouts: [
+    { title: "✓ Fixed (your report): the message now appears without waiting for AI.",
+      body: "&ldquo;if the NSE is doing AI action/summary while the app spins up, that message shouldn't be blocked from appearing — staging should catch up immediately (~10ms), then NSE's other work catches up.&rdquo; <b>Before:</b> the foreground merge read <code>WHERE populated=1</code>, which the NSE flipped only <i>after</i> summary + action (~14s with typical 4–8s summary / 1–2s action). <b>After:</b> the NSE flips <code>populated=1</code> at the <i>header</i> stage (~2s), so the merge surfaces the message immediately and AI fills in across wakes.",
+      tip: true,
+      why: "The header + body were ready in the NSE ~5s in — they're no longer withheld behind the AI columns of the same staging row." },
+    { title: "And even once the merge writes the row, the inbox waits 500ms:",
+      body: "<code>InboxViewModel</code>'s <code>.inboxDataDidChange</code> listener debounces reloads by <b>500ms</b> (<code>InboxViewModel.swift:389</code>) before <code>reloadMessages</code> draws it.",
+      tip: false },
+    { title: "Plus the herd:",
+      body: "<code>mergeNSEStagingData</code> runs <b>twice</b>, two full sync passes (<code>backgroundSyncAll</code> + <code>foregroundSyncAll</code>), 6 queue repopulations, push re-subscribe and <code>whoami</code> ×3–4 all fire in the first ~1–2s — heavy GRDB/network contention while you're waiting for one row to appear.",
+      tip: false }
+  ],
+  lanes: [
+    { id: "main", label: "Main / UI thread", kindHint: "main" },
+    { id: "dbw",  label: "GRDB writer",       kindHint: "dbw" },
+    { id: "dbr",  label: "GRDB readers",      kindHint: "dbr" },
+    { id: "cpu",  label: "Background actors", kindHint: "cpu" },
+    { id: "net",  label: "Network · IMAP",    kindHint: "net" },
+    { id: "llm",  label: "LLM backend",       kindHint: "llm" }
+  ],
+  phases: [
+    { label: "merge (should show mail)", start: 0,   end: 700,  color: "rgba(217,119,6,.13)" },
+    { label: "UI reload",               start: 700,  end: 900,  color: "rgba(16,185,129,.10)" },
+    { label: "sync herd",               start: 200,  end: 4500, color: "rgba(20,184,166,.10)" },
+    { label: "AI tail",                 start: 3000, end: 6000, color: "rgba(168,85,247,.10)" }
+  ],
+  markers: [
+    { t: 0,   label: "scenePhase .active", color: "#9b8cff", text: "#0c0820" },
+    { t: 180, label: "merge done", color: "#f59e0b", text: "#241500" },
+    { t: 790, label: "▶ row drawn (if populated=1)", color: "#7cc4ff", text: "#04121f" }
+  ],
+  jobs: [
+    { id: "active", lane: "main", kind: "mainlite", start: 0, dur: 20, file: "RootView.swift:533",
+      detail: "<p><code>onChange(of: scenePhase)</code> → <code>.active</code>. Kicks <code>revalidateAISubscriptionGate()</code> and <code>syncScheduler.startForegroundPolling()</code>, plus <code>NotificationCleanupService.sweepOnForeground()</code>.</p>",
+      qos: "@MainActor" },
+
+    { id: "whoami", lane: "net", kind: "net", start: 10, dur: 400, file: "RootView.swift:531/550 · SyncScheduler:641/714",
+      detail: "<p><code>revalidateAISubscriptionGate()</code> — <code>/whoami</code> round-trip. Fired from RootView (onAppear + .active) and again inside <code>backgroundPoll</code> (641) and <code>poll</code> (714): up to 4× per foreground.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>De-dupe to one per foreground (in-flight guard + min-interval). Each is a TLS round-trip competing with the sync passes.</p>",
+      qos: "Task" },
+
+    { id: "merge1", lane: "dbw", kind: "dbw", start: 30, dur: 150, file: "SyncScheduler.swift:366",
+      detail: "<p>Outer <code>mergeNSEStagingData()</code> — the fast path. Reads <code>SELECT * FROM nse_processed_message WHERE populated=1</code>, then per-message savepoint: UPDATE existing header (AI + body) or INSERT a new header. Posts <code>.inboxDataDidChange</code>. Async write overload (non-blocking, the foreground-hang fix).</p><p><b>This is where a staged message becomes visible — but only if its row is <code>populated=1</code>.</b></p>",
+      opt: true, optSev: "high",
+      optimize: "<p>The merge itself is fast (~10–150ms). The problem is upstream: the NSE only flips <code>populated=1</code> after AI. Fix on the NSE side (split the staging write) and this merge surfaces mail instantly.</p>",
+      qos: "await dbPool.write" },
+
+    { id: "post1", lane: "main", kind: "mainlite", start: 180, dur: 8, file: "SyncScheduler.swift:370",
+      detail: "<p>Posts <code>.inboxDataDidChange</code> unconditionally after the outer merge so the UI reloads even if the merge mutated nothing.</p>",
+      qos: "@MainActor" },
+
+    { id: "inboxlisten", lane: "main", kind: "mainlite", start: 190, dur: 8, file: "InboxViewModel.swift:374",
+      detail: "<p>The inbox listener receives <code>.inboxDataDidChange</code>, sets <code>backgroundChangeDirty = true</code>, and spawns the throttle task if not already running.</p>",
+      qos: "@MainActor" },
+
+    { id: "debounce", lane: "cpu", kind: "defer", start: 198, dur: 500, file: "InboxViewModel.swift:389",
+      detail: "<p>The throttle loop sleeps <b>500ms</b> before clearing the dirty bit and calling <code>reloadMessages(animated:true)</code>. Coalesces sync-burst notifications — but it also delays the <i>first</i> merged message from drawing by up to 500ms.</p>",
+      opt: true, optSev: "high",
+      optimize: "<p>For the NSE-merge path specifically, bypass the debounce: when <code>mergeNSEStagingData</code> actually INSERTed new inbox rows, trigger an immediate (un-debounced) reload, and keep the 500ms coalescing only for chatty background-sync churn. Or pass a &ldquo;reason&rdquo; on <code>.inboxDataDidChange</code> so a merge-insert reloads now.</p>",
+      qos: "Task.sleep(500ms)" },
+
+    { id: "reload", lane: "main", kind: "mainlite", start: 698, dur: 120, file: "InboxViewModel.swift:590",
+      detail: "<p><code>reloadMessages</code>: async GRDB read (off-main) + <code>applyDiff</code> + <code>rebuildDisplayGroups</code> (the MainActor-sync cost, logged). The new row animates in here — the message is finally visible.</p>",
+      qos: "@MainActor (async read)" },
+
+    { id: "aiflush", lane: "main", kind: "mainlite", start: 470, dur: 20, file: "InboxViewModel.swift:426",
+      detail: "<p><code>flushAIBatch</code> (300ms debounce) — targeted per-row updates for AI fields (summary/tag) without a full reload. Safe with the optimistic overlay (no freeze gate).</p>",
+      qos: "@MainActor" },
+
+    { id: "merge2", lane: "dbw", kind: "dbw", start: 210, dur: 15, file: "SyncScheduler.swift:173",
+      detail: "<p><b>Second</b> <code>mergeNSEStagingData()</code> — inside <code>syncStartup</code>. Idempotent: the outer merge (366) already drained staging, so this finds nothing (~5–15ms) but still opens the staging DB and runs the SELECT.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>Redundant on the foreground path (the outer call at 366 already merged). Skip the inner merge when <code>syncStartup</code> is reached via <code>startForegroundPolling</code> (it's only needed for BG/push entry points that don't do the outer merge).</p>",
+      qos: "await dbPool.write" },
+
+    { id: "recoverheaders", lane: "dbr", kind: "dbr", start: 230, dur: 200, file: "SyncScheduler.swift:183",
+      detail: "<p><code>recoverIncompleteHeaders()</code> — crash-recovery FTS scan, awaited on the critical path before sync.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>Make conditional / fire-and-forget so a clean foreground doesn't pay the scan.</p>",
+      qos: "await" },
+
+    { id: "reconnect", lane: "net", kind: "net", start: 290, dur: 300, file: "SyncScheduler.swift:251",
+      detail: "<p><code>markAllProvidersDirty()</code> — IMAP TCP sockets go stale during device sleep, so providers reconnect on next use. Necessary on warm return.</p>",
+      qos: "await" },
+
+    { id: "repopulate", lane: "cpu", kind: "cpu", start: 230, dur: 600, file: "SyncScheduler.swift:192",
+      detail: "<p>6 queues repopulate from GRDB concurrently (ActiveBody, BackfillBody, ActiveAI, BackfillEmbedding, BackfillAI, MemorySelfHeal). Reader-pool contention right when <code>reloadMessages</code> wants to read.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>Stagger Backfill*/Memory after the first reload draws.</p>",
+      qos: "Task → withTaskGroup" },
+
+    { id: "subscribe", lane: "net", kind: "net", start: 300, dur: 800, file: "SyncScheduler.swift:382",
+      detail: "<p><code>subscribeAllAccounts()</code> — re-register push + device. Reads <code>visualAlertsEnabled()</code> live so nse-vs-silent registration stays in sync with notification settings.</p>",
+      qos: "await" },
+
+    { id: "pushconsent", lane: "net", kind: "net", start: 320, dur: 300, file: "SyncScheduler.swift:387",
+      detail: "<p><code>checkPushConsentStatusForForeground()</code> — non-interactive check for a pending push-service classification error; posts a banner signal if found.</p>",
+      qos: "Task" },
+
+    { id: "imapidle", lane: "net", kind: "net", start: 340, dur: 60, file: "SyncScheduler.swift:406",
+      detail: "<p><code>startImapIdle()</code> — start IMAP IDLE on primary connections (foreground only).</p>", qos: "Task" },
+
+    { id: "syncpass1", lane: "net", kind: "net", start: 590, dur: 2200, file: "SyncScheduler.swift:254 → backgroundSyncAll",
+      detail: "<p><code>backgroundPoll(inboxOnly:false)</code> → <code>backgroundSyncAll()</code> — delta sync <b>all accounts</b>. Discovers new mail and enqueues body/AI. If the NSE didn't stage a message, <i>this</i> is what eventually fetches it (slower than the 10ms merge).</p>",
+      qos: "Task" },
+
+    { id: "syncpass2", lane: "net", kind: "net", start: 2900, dur: 1500, file: "SyncScheduler.swift:390 → foregroundSyncAll",
+      detail: "<p><code>poll()</code> → <code>foregroundSyncAll()</code> — a <b>second</b> sync of all accounts, plus <code>scheduleMaintenanceInBackground(includePrune:true)</code>, drains, and another <code>whoami</code>. Runs right after pass 1.</p>",
+      opt: true, optSev: "med",
+      optimize: "<p>Collapse the two passes. Drop <code>poll()</code> from <code>startForegroundPolling</code> (the 60s timer still covers steady state), or short-circuit <code>poll()</code> if <code>backgroundPoll</code> ran &lt;N s ago.</p>",
+      qos: "@MainActor" },
+
+    { id: "aitail", lane: "llm", kind: "llm", start: 3000, dur: 3000, file: "ActiveAIQueue → BackendClient",
+      detail: "<p>AI (summary + action) for any newly-synced inbox mail the NSE didn't already cache. Off the visible path — fills in via <code>flushAIBatch</code>.</p>",
+      qos: "actor + LLM semaphore" }
+  ],
+  hotspots: [
+    { title: "NSE mail surfaces without waiting for AI", sev: "low",
+      problem: "<span class='donebadge'>✓ done</span> Before: the merge filtered <code>WHERE populated=1</code>, which the NSE flipped only after summary + action (~14s). Foreground mid-AI showed nothing.",
+      fix: "Implemented (gradual staging): the NSE flips <code>populated=1</code> at the <code>stageHeader</code> stage (~2s), <code>stageBody</code>/<code>stageSummary</code> fill in, and the terminal write finalizes. The merge applies each piece idempotently and keeps the row until <code>aiCompleted=1</code> (or it's abandoned). See the <a href='nse_boot.html'>NSE page</a>. Net effect: staging catches up in ~10ms (measured), NSE AI catches up after.",
+      jobs: ["merge1"] },
+
+    { title: "500ms reload debounce delays even a successfully-merged row", sev: "high",
+      problem: "Once the merge inserts the row and posts <code>.inboxDataDidChange</code>, the inbox listener sleeps 500ms before <code>reloadMessages</code>. So best case the new mail draws ~0.5–0.7s after foreground, not ~10ms.",
+      fix: "Bypass the debounce for merge-inserts: when <code>mergeNSEStagingData</code> INSERTed new inbox rows, fire an immediate reload (or tag the notification so the listener reloads now and keeps the 500ms coalescing only for background-sync churn).",
+      jobs: ["debounce", "reload"] },
+
+    { title: "mergeNSEStagingData runs twice on the foreground path", sev: "med",
+      problem: "Outer call at <code>SyncScheduler:366</code>, then again inside <code>syncStartup</code> at <code>:173</code>. The second is idempotent but still opens the App-Group staging DB + runs the SELECT.",
+      fix: "Pass a flag to <code>syncStartup</code> (or a recently-merged guard) so the foreground entry skips the inner merge; keep the inner merge only for BG/push entry points that lack the outer call.",
+      jobs: ["merge1", "merge2"] },
+
+    { title: "Two full sync passes back-to-back", sev: "med",
+      problem: "<code>backgroundSyncAll()</code> (pass 1) then <code>foregroundSyncAll()</code> (pass 2) sync every account in sequence, each re-running whoami and posting inboxDataDidChange.",
+      fix: "Collapse to one. The 60s foreground timer covers steady-state; the startup pass is enough on return.",
+      jobs: ["syncpass1", "syncpass2"] },
+
+    { title: "whoami ×3–4 per foreground", sev: "med",
+      problem: "RootView onAppear + .active + backgroundPoll + poll all call <code>revalidateAISubscriptionGate</code>.",
+      fix: "In-flight de-dupe + min-interval guard.",
+      jobs: ["whoami"] },
+
+    { title: "recoverIncompleteHeaders on the critical path", sev: "med",
+      problem: "Awaited before sync; a full scan that finds nothing in steady state.",
+      fix: "Conditional or fire-and-forget.",
+      jobs: ["recoverheaders"] }
+  ]
+};
+BootFlow.render(BOOT_DATA);
+
+/* ---- inject the NSE → inbox pathway strip just above the timeline ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>NSE&nbsp;→&nbsp;inbox merge pathway</h2>' +
+    '<div class="desc">The exact hops a NSE-fetched message takes to become visible on warm foreground. The red step is the gate that holds it; the amber step adds 500ms.</div>' +
+    '<div class="pathway"><div class="pw-row">' +
+      '<div class="pw-step win"><div class="s">NSE · stageHeader (NEW)</div><div class="t">populated = 1</div><div class="d">now flipped at the HEADER stage (~2s), not after AI — the merge can surface the message immediately.</div></div>' +
+      '<div class="pw-step"><div class="s">merge · read</div><div class="t">SELECT … WHERE populated=1</div><div class="d">NSEDataBridge.swift:281 — opens App-Group staging DB on foreground.</div></div>' +
+      '<div class="pw-step"><div class="s">merge · write</div><div class="t">UPDATE / INSERT header</div><div class="d">:447 update existing · :517 insert new → message now in main GRDB.</div></div>' +
+      '<div class="pw-step"><div class="s">notify</div><div class="t">post .inboxDataDidChange</div><div class="d">:575 — wakes the inbox listener.</div></div>' +
+      '<div class="pw-step delay"><div class="s">UI · debounce</div><div class="t">sleep 500ms</div><div class="d">InboxViewModel.swift:389 — coalesces sync bursts, delays the draw.</div></div>' +
+      '<div class="pw-step win"><div class="s">UI · draw</div><div class="t">reloadMessages</div><div class="d">:590 — diff + rebuild → row animates in. Message visible.</div></div>' +
+    '</div></div>';
+  const firstSection = document.querySelector("#flow-root .section");
+  firstSection.parentNode.insertBefore(sec, firstSection);
+})();
+
+/* ---- inject the IMPLEMENTED before/after at the very top ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>What changed &nbsp;<span class="donebadge">✓ implemented 2026-06-25</span></h2>' +
+    '<div class="desc">Two focused changes: (1) the NSE stages mail gradually so the merge surfaces it without waiting for AI; (2) the first foreground after a cold launch lets the inbox paint before the sync herd starts.</div>' +
+    '<div class="ba">' +
+      '<div class="col before"><h4><span class="tag">before</span> gradual staging — the message</h4>' +
+        '<ul>' +
+          '<li>NSE writes <code>populated=1</code> only <b>after summary + action</b> (≤24s).</li>' +
+          '<li>Foreground while the NSE is mid-AI → merge sees <b>nothing</b>; the message waits for the NSE to finish or the app to re-fetch it.</li>' +
+        '</ul></div>' +
+      '<div class="col after"><h4><span class="tag">after</span> gradual staging — the message</h4>' +
+        '<ul>' +
+          '<li>NSE flips <code>populated=1</code> at the <b>header</b> stage; merge surfaces header+body the moment they’re staged.</li>' +
+          '<li>The merge keeps the row and fills in summary → action across wakes (idempotent); deletes it once AI completes.</li>' +
+        '</ul></div>' +
+      '<div class="col before"><h4><span class="tag">before</span> reorder — the herd</h4>' +
+        '<ul>' +
+          '<li>On cold launch, <code>scenePhase .active</code> fires the merge + 2 sync passes + 6 repopulations <b>into</b> the ~1.3s first-render stall.</li>' +
+        '</ul></div>' +
+      '<div class="col after"><h4><span class="tag">after</span> reorder — the herd</h4>' +
+        '<ul>' +
+          '<li>The first foreground per process yields + settles <code>SyncConfig.firstForegroundSettleSeconds</code> (0.35s) so the inbox paints first, then the herd starts.</li>' +
+          '<li>Warm returns (inbox already up) skip the settle.</li>' +
+        '</ul></div>' +
+    '</div>' +
+    '<div class="ba-files">' +
+      '<span class="f">SyncScheduler.startForegroundPolling (one-shot settle)</span>' +
+      '<span class="f">SyncConfig.firstForegroundSettleSeconds (new)</span>' +
+      '<span class="f">NSEDataBridge.mergeNSEStagingData (incremental + keep-until-terminal)</span>' +
+      '<span class="f">NSE stageHeader / stageBody / stageSummary</span>' +
+    '</div>' +
+    '<div class="note">Not changed (de-scoped as overkill for now): the 500ms inbox reload debounce, collapsing the two sync passes, whoami de-dupe, the duplicate inner merge. See the pathway + timeline below for where those still sit.</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
+
+/* ---- inject MEASURED foreground trace (2026-06-26 BootProfiler) ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>Measured on device &nbsp;<span class="donebadge">✓ 2026-06-26 · BootProfiler trace</span></h2>' +
+    '<div class="desc">A real foreground-return after a backgrounded NSE push, from the <code>BootProfiler</code> channel. The reorder + gradual merge behave as designed.</div>' +
+    '<div class="stagestrip">' +
+      '<div class="st"><div class="w">+0ms</div><div class="n">startForegroundPolling</div><div class="x">scenePhase .active</div></div>' +
+      '<div class="st vis"><div class="w">+360ms</div><div class="n">settle done → inbox first</div><div class="x">0.35s first-foreground settle</div></div>' +
+      '<div class="st vis"><div class="w">+425ms</div><div class="n">NSE merge done</div><div class="x">found 1 staged, merged in 64ms = message surfaced</div></div>' +
+      '<div class="st"><div class="w">+4.3s</div><div class="n">backgroundPoll done</div><div class="x">sync all accounts ≈3.9s</div></div>' +
+      '<div class="st"><div class="w">+5.9s</div><div class="n">poll() done</div><div class="x">2nd sync pass ≈1.5s</div></div>' +
+    '</div>' +
+    '<div class="note" style="margin-top:14px">The inbox + NSE mail appear in <b>~0.4s</b>; the ~6s sync herd (the two passes still de-scoped) runs <i>behind</i> the visible inbox. The merge surfaced the NSE message in <b>64ms</b> — the ~10ms-class fast path, now actually on the screen.</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
+</script>
+</body>
+</html>
