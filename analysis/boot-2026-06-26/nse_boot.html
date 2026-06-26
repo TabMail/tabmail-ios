@@ -191,6 +191,45 @@ BootFlow.render(BOOT_DATA);
   const first = document.querySelector("#flow-root .section");
   first.parentNode.insertBefore(sec, first);
 })();
+
+/* ---- inject MERGE→INBOX streamlining (main-app side, 2026-06-26) ---- */
+(function () {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML =
+    '<h2>Merge → inbox: the privileged single-threaded step &nbsp;<span class="donebadge">✓ 2026-06-26</span></h2>' +
+    '<div class="desc">Gradual staging fixed WHEN the NSE makes a message visible. This fixed HOW FAST the staged row reaches the inbox once the NSE is done — the part that was &ldquo;sometimes instant, sometimes 3–5s,&rdquo; including the slow notification-tap deep link.</div>' +
+    '<div class="ba">' +
+      '<div class="col before"><h4><span class="tag">before</span> uncoordinated + invisible</h4>' +
+        '<div class="lead">The merge raced the foreground herd, and a new row was invisible until a detached flush flipped it.</div>' +
+        '<div class="stagestrip">' +
+          '<div class="st"><div class="w">gate</div><div class="n">headerComplete=false</div><div class="x">inbox query filters <code>headerComplete==true</code> → new row hidden</div></div>' +
+          '<div class="st"><div class="w">race</div><div class="n">detached FTS flip</div><div class="x">flips the flag later, posts NO reload signal</div></div>' +
+          '<div class="st"><div class="w">×6</div><div class="n">uncoordinated merges</div><div class="x">each opens staging, fights 2s/5s busy lock + writer + the herd</div></div>' +
+          '<div class="st"><div class="w">3–5s</div><div class="n">deep-link tap</div><div class="x">awaits that contended merge on the nav critical path</div></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="col after"><h4><span class="tag">after</span> privileged, single-threaded</h4>' +
+        '<div class="lead">One serial merge runs alone and fully before the herd, then signals once.</div>' +
+        '<div class="stagestrip">' +
+          '<div class="st vis"><div class="w">1×</div><div class="n">NSEMergeCoordinator</div><div class="x">all 6 callers funnel into one in-flight serial run</div></div>' +
+          '<div class="st"><div class="w">sync</div><div class="n">FTS flip awaited</div><div class="x">headerComplete=1 + bodyComplete=1 before signaling</div></div>' +
+          '<div class="st vis"><div class="w">once</div><div class="n">1 immediate post</div><div class="x">end-of-merge <code>.inboxDataDidChange</code>, bypasses the 500ms debounce</div></div>' +
+          '<div class="st"><div class="w">order</div><div class="n">merge → then herd</div><div class="x">foreground awaits the full merge before sync/backfill/AI start</div></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="ba-files">' +
+      '<span class="f">NSEMergeCoordinator (new — serial task chain)</span>' +
+      '<span class="f">NSEDataBridge.performMerge (synchronous FTS flush + single end post)</span>' +
+      '<span class="f">InboxViewModel (immediate bypass + single-flight reload)</span>' +
+      '<span class="f">SyncScheduler / MailNavigationView / AppDelegate (callers coordinated)</span>' +
+      '<span class="f">NSEGradualMergeTests.concurrentMergesSerialized (new)</span>' +
+    '</div>' +
+    '<div class="note">The 500ms inbox debounce is intentionally kept — but only for the noisy background producers (sync, backfill, AI, user actions). The merge is special: a boot-priority step that paints at once. Why the merge can afford a synchronous FTS flip: because it runs alone, nothing contends the GRDB / FTS writers while it does.</div>';
+  const first = document.querySelector("#flow-root .section");
+  first.parentNode.insertBefore(sec, first);
+})();
 </script>
 </body>
 </html>

@@ -45,6 +45,33 @@ table.matrix th { background: var(--bg2); color: var(--txt-dim); font-weight: 70
   </div>
 
   <div class="callout tip">
+    <b>✓ Update 2026-06-26 (b) — a cooperative <code>PriorityGate</code> so the background herd yields to the merge.</b>
+    <div class="why">
+      <b>Why the merge was still slow.</b> An on-device trace showed a warm-foreground merge of a pushed email taking <b>3185ms</b> (<code>mergeNSEStagingData: DONE in 3185ms</code>). The cause: a deep <b>backfill</b> (historical-archive body fetch) was mid-flight from a prior background cycle — back-to-back 50-item batches whose write step holds the GRDB + FTS writers and saturates the cooperative thread pool. The earlier &ldquo;merge before herd&rdquo; only gates <i>this</i> foreground's own sync herd; it does nothing to a backfill that's <i>already running</i>. So &ldquo;privileged&rdquo; held against other merges but not against the backfill.
+      <br><br>
+      <b>The proper fix — cooperative quiescence.</b> You can't preempt an in-progress SQLite transaction or reserve the cooperative pool, and QoS only deprioritizes (tried &amp; reverted). So <code>PriorityGate</code> (a small <code>actor</code>) lets the privileged path raise a count-based flag (<code>privileged { }</code>), and every heavy background loop calls <code>await yield()</code> at a SAFE boundary (between batches, before it grabs the writer) — parking until the gate clears. Wired into backfill body (twice: batch top + right before the write), backfill AI, all three embedding queues, and the header walk. Bound: a batch already mid-flight runs to its next boundary, so the merge waits at most ~<b>one batch</b> instead of the whole backfill run. It's the GRDB/FTS analogue of the IMAP priority lock (ADR-IOS-014).
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <b>✓ Update 2026-06-26 — the NSE→inbox merge is now a privileged, single-threaded boot step.</b>
+    <div class="why">
+      <b>New finding (the remaining lag).</b> With the NSE long finished, a freshly pushed message could still take 3–5s to appear — and tapping its notification could stall 3–5s before the deep link opened it. Two structural causes:
+      <ul>
+        <li><b>Visibility gate.</b> The inbox query filters <code>headerComplete == true</code>, but a brand-new merged header is inserted <code>headerComplete = false</code> and only flipped later inside a <i>detached</i> FTS flush that posted <b>no</b> reload signal — so the row stayed invisible until some unrelated later notification happened to fire.</li>
+        <li><b>Uncoordinated merges.</b> Six call sites (deep-link tap, foreground, <code>syncStartup</code> step-0, foreground-push, silent push, AI queue) each opened the staging DB and fought the 2s/5s busy lock + the single GRDB writer — concurrently with the sync/backfill/AI herd. The deep-link tap <code>await</code>s the merge on its navigation critical path, so that contention <i>is</i> the 3–5s tap delay (the post-merge lookup itself is not <code>headerComplete</code>-gated).</li>
+      </ul>
+      <b>The fix — make the merge special.</b>
+      <ol>
+        <li><b>Serialize via <code>NSEMergeCoordinator</code></b> — all six callers funnel into one in-flight, single-threaded run (a serial task chain); no two merges ever fight the locks.</li>
+        <li><b>Synchronous FTS flip</b> — the merge now <i>awaits</i> the flush, so <code>headerComplete=1</code> (and <code>bodyComplete=1</code>, from the NSE's pre-rendered body) is set <i>before</i> it signals; the row is visible <i>and</i> opens with no body-load flash.</li>
+        <li><b>One immediate post at the end</b> — the whole merge (header→body→summary→action→FTS→removals→tasks) emits a single <code>.inboxDataDidChange</code>, flagged to <b>bypass the 500ms debounce</b>. The debounce stays for the noisy background producers (sync/backfill/AI); the merge is privileged.</li>
+        <li><b>Merge before the herd</b> — the foreground <code>await</code>s the full merge before spawning sync/backfill/AI, so the writer is free while it runs and it stays near-instant.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="callout tip">
     <b>✓ Implemented 2026-06-25 — the two focused changes.</b>
     <div class="why">
       <b>1 — Gradual NSE staging.</b> The NSE now stages <code>header → body → summary → action</code> incrementally, flipping <code>populated=1</code> at the header stage. The merge applies each piece idempotently and keeps the row until AI completes, so a foreground surfaces NSE mail ~17s earlier instead of waiting for all AI. <span class="donebadge">opt&nbsp;#1</span><br><br>
@@ -107,14 +134,14 @@ table.matrix th { background: var(--bg2); color: var(--txt-dim); font-weight: 70
         <tr><td>2</td><td><span class="donebadge">✓ done</span> <b>Reorder — inbox first, then the herd</b> (implemented as a one-shot 0.35s first-foreground settle in <code>startForegroundPolling</code>; the whole merge+sync herd waits for it so the cold first render paints first). A finer-grained selective deferral (delay only the 2nd sync pass / Backfill* / self-heal) is the deferred next step.</td>
           <td>Frees CPU/GRDB/network for the ~1.3s SwiftUI first-render stall on cold launch — the inbox shows before the herd starts.</td>
           <td><span class="sev2 s-high">high</span></td><td><a href="cold_boot.html">Cold · #1</a></td></tr>
-        <tr><td>3</td><td><span class="deferbadge">deferred</span> <b>Bypass the 500ms inbox debounce for merge-inserts</b> — when <code>mergeNSEStagingData</code> INSERTs new inbox rows, reload immediately; keep 500ms coalescing only for background-sync churn.</td>
-          <td>A merged message draws in ~10ms instead of ~0.5–0.7s.</td>
+        <tr><td>3</td><td><span class="donebadge">✓ done 2026-06-26</span> <b>Bypass the 500ms inbox debounce for the merge</b> — the merge emits ONE end-of-merge <code>.inboxDataDidChange</code> carrying an immediate flag; the inbox reloads at once (single-flight, shared with the throttled path). The 500ms coalescing stays only for background-sync churn.</td>
+          <td>A merged message draws at once instead of ~0.5–0.7s. Combined with the coordinator + synchronous FTS flip, the row is already <code>headerComplete=1</code> when that single reload reads.</td>
           <td><span class="sev2 s-high">high</span></td><td><a href="warm_boot.html">Warm · #2</a></td></tr>
         <tr><td>4</td><td><span class="deferbadge">deferred</span> <b>Collapse the two sync passes</b> into one per foreground (drop <code>poll()</code> from startup, or short-circuit if <code>backgroundPoll</code> ran &lt;N s ago).</td>
           <td>Halves the sync work + the duplicate inboxDataDidChange + whoami on every foreground.</td>
           <td><span class="sev2 s-med">med</span></td><td><a href="warm_boot.html">Warm · #4</a></td></tr>
-        <tr><td>5</td><td><span class="deferbadge">deferred</span> <b>De-dupe <code>whoami</code></b> (in-flight guard + min-interval) and <b>skip the inner <code>mergeNSEStagingData</code></b> on the foreground entry (outer call already merged).</td>
-          <td>Removes 3 redundant TLS round-trips + a redundant staging-DB open per foreground.</td>
+        <tr><td>5</td><td><span class="deferbadge">deferred</span> <b>De-dupe <code>whoami</code></b> (in-flight guard + min-interval). <span class="donebadge">✓ partial 2026-06-26</span> The redundant inner <code>mergeNSEStagingData</code> staging-DB open is no longer a cost — <code>NSEMergeCoordinator</code> coalesces the duplicate call into the single in-flight run.</td>
+          <td>Removes 3 redundant TLS round-trips (whoami, still deferred); the duplicate staging-DB open is already eliminated.</td>
           <td><span class="sev2 s-med">med</span></td><td><a href="warm_boot.html">Warm · #3/#5</a></td></tr>
         <tr><td>6</td><td><span class="deferbadge">deferred</span> <b>Take <code>recoverIncompleteHeaders</code> off the critical path</b> (conditional/fire-and-forget) and <b>stagger the 6 queue repopulations</b> (Active* now, Backfill* after settle).</td>
           <td>Removes a steady-state no-op scan + reader-pool contention from the first-render window.</td>
@@ -150,7 +177,7 @@ table.matrix th { background: var(--bg2); color: var(--txt-dim); font-weight: 70
     </div>
   </div>
 
-  <div class="note" style="margin-top:30px">Generated from a read-only code trace of <code>TabMailApp.swift</code>, <code>AppStartup</code>, <code>SyncScheduler.swift</code>, <code>NSEDataBridge.swift</code>, <code>InboxViewModel.swift</code>, the <code>TabMailNotificationService/</code> target, and the iOS <code>PROJECT_MEMORY.md</code> boot history. No source was modified.</div>
+  <div class="note" style="margin-top:30px">Originally generated from a read-only code trace of <code>TabMailApp.swift</code>, <code>AppStartup</code>, <code>SyncScheduler.swift</code>, <code>NSEDataBridge.swift</code>, <code>InboxViewModel.swift</code>, the <code>TabMailNotificationService/</code> target, and the iOS <code>PROJECT_MEMORY.md</code> boot history. The badged changes (gradual staging, foreground reorder, cold-boot first paint, and the 2026-06-26 merge streamlining) have since landed in source. Snapshot dated 2026-06-26.</div>
 </div>
 </body>
 </html>

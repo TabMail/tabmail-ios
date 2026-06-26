@@ -169,14 +169,14 @@ const BOOT_DATA = {
       fix: "Implemented (gradual staging): the NSE flips <code>populated=1</code> at the <code>stageHeader</code> stage (~2s), <code>stageBody</code>/<code>stageSummary</code> fill in, and the terminal write finalizes. The merge applies each piece idempotently and keeps the row until <code>aiCompleted=1</code> (or it's abandoned). See the <a href='nse_boot.html'>NSE page</a>. Net effect: staging catches up in ~10ms (measured), NSE AI catches up after.",
       jobs: ["merge1"] },
 
-    { title: "500ms reload debounce delays even a successfully-merged row", sev: "high",
-      problem: "Once the merge inserts the row and posts <code>.inboxDataDidChange</code>, the inbox listener sleeps 500ms before <code>reloadMessages</code>. So best case the new mail draws ~0.5–0.7s after foreground, not ~10ms.",
-      fix: "Bypass the debounce for merge-inserts: when <code>mergeNSEStagingData</code> INSERTed new inbox rows, fire an immediate reload (or tag the notification so the listener reloads now and keeps the 500ms coalescing only for background-sync churn).",
+    { title: "500ms reload debounce delays even a successfully-merged row", sev: "low",
+      problem: "<span class='donebadge'>✓ done 2026-06-26</span> Before: once the merge inserted the row and posted <code>.inboxDataDidChange</code>, the inbox listener slept 500ms before <code>reloadMessages</code> — best case the new mail drew ~0.5–0.7s after foreground.",
+      fix: "Implemented: the merge emits ONE end-of-merge <code>.inboxDataDidChange</code> carrying an immediate flag; the listener reloads at once (single-flight, shared with the throttled path). The 500ms coalescing is KEPT — but only for the noisy background producers (sync/backfill/AI). The merge is a privileged boot step. Combined with the synchronous FTS flip, the row is already <code>headerComplete=1</code> when that reload reads.",
       jobs: ["debounce", "reload"] },
 
-    { title: "mergeNSEStagingData runs twice on the foreground path", sev: "med",
-      problem: "Outer call at <code>SyncScheduler:366</code>, then again inside <code>syncStartup</code> at <code>:173</code>. The second is idempotent but still opens the App-Group staging DB + runs the SELECT.",
-      fix: "Pass a flag to <code>syncStartup</code> (or a recently-merged guard) so the foreground entry skips the inner merge; keep the inner merge only for BG/push entry points that lack the outer call.",
+    { title: "mergeNSEStagingData ran uncoordinated from 6 call sites", sev: "low",
+      problem: "<span class='donebadge'>✓ done 2026-06-26</span> Before: outer call at <code>SyncScheduler</code>, inner call inside <code>syncStartup</code>, plus deep-link tap / foreground-push / silent push / AI queue — each opened the App-Group staging DB and fought the 2s/5s busy lock + the GRDB writer, concurrently with the herd. That contention was the 3–5s notification-tap deep-link delay.",
+      fix: "Implemented: <code>NSEMergeCoordinator</code> funnels all callers into one in-flight, single-threaded serial run — no two merges overlap. Redundant passes find the staging table drained and early-return in ~ms.",
       jobs: ["merge1", "merge2"] },
 
     { title: "Two full sync passes back-to-back", sev: "med",
@@ -250,7 +250,7 @@ BootFlow.render(BOOT_DATA);
       '<span class="f">NSEDataBridge.mergeNSEStagingData (incremental + keep-until-terminal)</span>' +
       '<span class="f">NSE stageHeader / stageBody / stageSummary</span>' +
     '</div>' +
-    '<div class="note">Not changed (de-scoped as overkill for now): the 500ms inbox reload debounce, collapsing the two sync passes, whoami de-dupe, the duplicate inner merge. See the pathway + timeline below for where those still sit.</div>';
+    '<div class="note">Followed up 2026-06-26 (see the NSE page): the merge is now a privileged single-threaded step — coordinated (<code>NSEMergeCoordinator</code>), synchronous FTS flip, one end-of-merge post that bypasses the 500ms debounce. Still de-scoped as overkill for now: collapsing the two sync passes, whoami de-dupe. The 500ms debounce is kept deliberately for background-sync churn.</div>';
   const first = document.querySelector("#flow-root .section");
   first.parentNode.insertBefore(sec, first);
 })();
