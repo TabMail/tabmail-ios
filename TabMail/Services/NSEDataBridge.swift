@@ -251,6 +251,15 @@ enum NSEDataBridge {
         // bother recomputing the badge at the end.
         var didMutate = false
 
+        // Age window after which a still-incomplete (populated=1, aiCompleted=0)
+        // GRADUAL staging row is treated as abandoned — its NSE died before
+        // finishing AI. By then the header+body have been merged (durable in main
+        // GRDB) and the main-app AI queue will finish the AI, so the staging row is
+        // deleted. The same window reaps populated=0 lease placeholders at the end.
+        // NSE has a ~30s OS budget; 60s is well past it.
+        let staleStagingWindowSeconds: TimeInterval = 60
+        let abandonedCutoff = Date().timeIntervalSince1970 - staleStagingWindowSeconds
+
         // 1. Read all NSE-processed messages — only `populated=1` rows. Lease
         // placeholders from AIOwnershipLease.ensureRow keep populated=0 and
         // are invisible to merge until the orphan reap deletes them on age.
@@ -347,7 +356,16 @@ enum NSEDataBridge {
             // deleting `processedIds` (the whole read set) regardless of
             // commit outcome — a bug that dropped staging rows for
             // savepoints that never committed.
+            // Rows whose staging entry should be DELETED after the tx commits.
+            // With gradual staging this is NOT every merged row — only TERMINAL
+            // ones (NSE finished AI) or ABANDONED ones (NSE long gone). Non-terminal
+            // gradual rows (header/body staged, AI pending) merge successfully but
+            // are KEPT so the next wake picks up the AI stage.
             var successfullyMergedIds: [String] = []
+            // Count of rows that committed at least a header/body update this wake
+            // (terminal OR kept). Drives the UI refresh + badge recount — a kept
+            // gradual row still changed main GRDB and must refresh the inbox.
+            var committedCount = 0
             // Collect FTS pipeline work across ALL committed messages; flushed
             // once after the main tx commits. Per-message ftsBatch is built
             // INSIDE the savepoint and only merged into this batch after the
@@ -372,8 +390,9 @@ enum NSEDataBridge {
                 // busyMode). The @Sendable closure can't capture mutable outer
                 // state, so the per-message accumulators are built INSIDE and
                 // returned, then assigned to successfullyMergedIds/ftsBatch below.
-                let writeResult: (ids: [String], fts: [(headerId: String, textContent: String)]) = try await AppDatabase.dbPool.write { db in
+                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)]) = try await AppDatabase.dbPool.write { db in
                     var localMergedIds: [String] = []
+                    var localCommitted = 0
                     var localFtsAccumulator: [(headerId: String, textContent: String)] = []
                     for msg in processed {
                         // Per-message savepoint: a single bad row (FK
@@ -433,37 +452,21 @@ enum NSEDataBridge {
                                     let existingFolderPath: String = row["folderPath"] ?? msg.folderPath
                                     let existingRfc822: String? = row["rfc822MessageId"]
 
-                                    if msg.aiCompleted {
-                                        // Keep `tagSortOrder` paired with `actionTag` — the main app's
-                                        // triage view sorts by `ORDER BY tagSortOrder ASC, date DESC`,
-                                        // so a row with `actionTag='reply'` but the default
-                                        // `tagSortOrder=99` lands at the bottom of the list even
-                                        // though the UI tag is rendered correctly. (Caught via
-                                        // [TriageSortDiag] DESYNC detector; see InboxViewModel.)
-                                        let aiTagSortOrder: Int = {
-                                            guard let raw = msg.actionTag, let tag = ActionTag(rawValue: raw) else { return 99 }
-                                            return tag.sortOrder
-                                        }()
-                                        try db.execute(sql: """
-                                            UPDATE messageHeader SET
-                                                summaryBlurb = ?, summaryTodos = ?, actionTag = ?, tagSortOrder = ?,
-                                                reminderDate = ?, reminderTime = ?, reminderContent = ?,
-                                                notified = CASE WHEN ? THEN 1 ELSE notified END
-                                            WHERE id = ?
-                                            """, arguments: [
-                                                msg.summaryBlurb, msg.summaryTodos, msg.actionTag, aiTagSortOrder,
-                                                msg.reminderDate, msg.reminderTime, msg.reminderContent,
-                                                msg.notified, headerId
-                                            ])
-                                        markReachedOutIfNotified(
-                                            notified: msg.notified,
-                                            reminderContent: msg.reminderContent,
-                                            rfc822MessageId: msg.rfc822MessageId,
-                                            headerId: headerId
-                                        )
-                                        // Persist rendered body from NSE staging (if NSE rendered one).
-                                        // Main app's body queue skips bodyComplete=1 rows — no re-fetch
-                                        // for non-CID mail. CID-having mail stays bodyComplete=0.
+                                    // GRADUAL MERGE (header→body→summary→action):
+                                    // apply each staged piece as it becomes present
+                                    // so a not-yet-AI-complete row updates the
+                                    // existing main-GRDB header incrementally across
+                                    // wakes, instead of all-or-nothing on aiCompleted.
+                                    // Every step is idempotent so re-merging a kept
+                                    // (non-terminal) row is safe.
+
+                                    // 1. Body — persist whenever NSE staged one.
+                                    // MessageBody insert is onConflict:.ignore and
+                                    // the body queue skips bodyComplete=1, so a
+                                    // re-merge of an already-bodied row is a cheap
+                                    // no-op. Hoisted OUT of the AI gate so the body
+                                    // lands at the body stage, before AI.
+                                    if msg.htmlContent != nil || msg.textContent != nil {
                                         try persistRenderedBodyFromStaging(
                                             db: db, headerId: headerId,
                                             htmlContent: msg.htmlContent, textContent: msg.textContent,
@@ -471,12 +474,63 @@ enum NSEDataBridge {
                                             hasUnresolvedCIDs: msg.hasUnresolvedCIDs,
                                             ftsBatch: &localFtsBatch
                                         )
+                                    }
 
-                                        // Update MessageAICache — use the shared key helper
-                                        // so NSE writes + main-app reads agree byte-for-byte.
-                                        // folderPath here is the EXISTING header's (current
-                                        // GRDB state) — avoids cache drift if sync moved
-                                        // the message between NSE fetch and merge.
+                                    // 2. Summary — apply as soon as it's staged
+                                    // (the NSE stages it before the action vote).
+                                    if msg.summaryBlurb != nil || msg.summaryTodos != nil
+                                        || msg.reminderDate != nil || msg.reminderTime != nil
+                                        || msg.reminderContent != nil {
+                                        try db.execute(sql: """
+                                            UPDATE messageHeader SET
+                                                summaryBlurb = ?, summaryTodos = ?,
+                                                reminderDate = ?, reminderTime = ?, reminderContent = ?
+                                            WHERE id = ?
+                                            """, arguments: [
+                                                msg.summaryBlurb, msg.summaryTodos,
+                                                msg.reminderDate, msg.reminderTime, msg.reminderContent,
+                                                headerId
+                                            ])
+                                    }
+
+                                    // 3. Action — apply when staged (terminal AI
+                                    // stage). Keep `tagSortOrder` paired with
+                                    // `actionTag` — the triage view sorts by
+                                    // `ORDER BY tagSortOrder ASC, date DESC`, so a
+                                    // 'reply' tag with the default 99 sort lands at
+                                    // the bottom (caught via [TriageSortDiag]). OR-in
+                                    // `notified`. Queue the IMAP tag write here too
+                                    // (idempotent via deterministic id), since it
+                                    // only matters once a tag exists.
+                                    if let actionRaw = msg.actionTag {
+                                        let aiTagSortOrder = ActionTag(rawValue: actionRaw)?.sortOrder ?? 99
+                                        try db.execute(sql: """
+                                            UPDATE messageHeader SET
+                                                actionTag = ?, tagSortOrder = ?,
+                                                notified = CASE WHEN ? THEN 1 ELSE notified END
+                                            WHERE id = ?
+                                            """, arguments: [actionRaw, aiTagSortOrder, msg.notified, headerId])
+                                        try queueSetTagPendingOp(db: db, accountId: msg.accountId,
+                                                                 messageId: msg.messageId, tag: msg.actionTag)
+                                    } else if msg.notified {
+                                        // Notification delivered but no action tag (AI failed / passive).
+                                        try db.execute(sql: "UPDATE messageHeader SET notified = 1 WHERE id = ?",
+                                                       arguments: [headerId])
+                                    }
+
+                                    markReachedOutIfNotified(
+                                        notified: msg.notified,
+                                        reminderContent: msg.reminderContent,
+                                        rfc822MessageId: msg.rfc822MessageId,
+                                        headerId: headerId
+                                    )
+
+                                    // 4. AI cache — write once summary or action is
+                                    // present so the main-app AI queue's cache probe
+                                    // hits and skips a duplicate LLM call. Keyed on
+                                    // the EXISTING header's folderPath (current GRDB
+                                    // state) to avoid drift if sync moved the message.
+                                    if msg.summaryBlurb != nil || msg.actionTag != nil {
                                         let rfc = msg.rfc822MessageId ?? existingRfc822
                                         if let cacheKey = MessageIdentity.aiCacheKey(
                                             accountId: msg.accountId,
@@ -492,21 +546,7 @@ enum NSEDataBridge {
                                                     msg.actionTag, msg.processedAt
                                                 ])
                                         }
-                                    } else if msg.notified {
-                                        // AI didn't complete but notification was delivered
-                                        try db.execute(sql: "UPDATE messageHeader SET notified = 1 WHERE id = ?",
-                                                       arguments: [headerId])
-                                        markReachedOutIfNotified(
-                                            notified: msg.notified,
-                                            reminderContent: msg.reminderContent,
-                                            rfc822MessageId: msg.rfc822MessageId,
-                                            headerId: headerId
-                                        )
                                     }
-
-                                    // Queue IMAP tag write — idempotent via deterministic id.
-                                    try queueSetTagPendingOp(db: db, accountId: msg.accountId,
-                                                             messageId: msg.messageId, tag: msg.actionTag)
                                 } else {
                                     // Header not in main DB yet — create it from NSE staging data
                                     // so the message appears in inbox immediately (before sync).
@@ -544,10 +584,20 @@ enum NSEDataBridge {
                                 }
                                 return .commit
                             }
-                            // Savepoint committed — promote local FTS batch
-                            // and record id for post-tx delete.
-                            localMergedIds.append(msg.id)
+                            // Savepoint committed — promote local FTS batch and
+                            // count the commit (drives the UI refresh / badge recount).
                             localFtsAccumulator.append(contentsOf: localFtsBatch)
+                            localCommitted += 1
+                            // Delete the staging row only when the NSE's work is
+                            // DONE: AI completed (terminal), or a gradual row whose
+                            // NSE is long gone (older than the abandon window — its
+                            // header+body are now durable in main GRDB and the
+                            // main-app AI queue will finish the AI). Recent
+                            // aiCompleted=0 rows are KEPT so the next wake merges the
+                            // AI stage as the NSE fills it in.
+                            if msg.aiCompleted || msg.processedAt < abandonedCutoff {
+                                localMergedIds.append(msg.id)
+                            }
                         } catch {
                             // inSavepoint already rolled back the savepoint
                             // and re-threw the error; the outer transaction
@@ -557,7 +607,7 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
-                    return (ids: localMergedIds, fts: localFtsAccumulator)
+                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator)
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
@@ -565,12 +615,15 @@ enum NSEDataBridge {
                 // so the post-tx staging delete + FTS flush + badge update can
                 // proceed.
                 successfullyMergedIds = writeResult.ids
+                committedCount = writeResult.committed
                 ftsBatch = writeResult.fts
                 outerCommitted = true
-                print("[NSEDataBridge] mergeNSEStagingData: \(successfullyMergedIds.count)/\(processed.count) committed")
+                print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
-                // Trigger UI refresh only if at least one savepoint committed.
-                if !successfullyMergedIds.isEmpty {
+                // Trigger UI refresh if ANY savepoint committed — including kept
+                // gradual rows (header/body staged, AI pending) that changed main
+                // GRDB but are not yet in the delete set.
+                if committedCount > 0 {
                     Task { @MainActor in
                         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
                     }
@@ -590,7 +643,7 @@ enum NSEDataBridge {
             // the outer commit failed, the per-msg savepoint releases got
             // rolled back; successfullyMergedIds is misleading and we should
             // not trigger a badge update.
-            if outerCommitted, !successfullyMergedIds.isEmpty {
+            if outerCommitted, committedCount > 0 {
                 didMutate = true
             }
 
@@ -657,8 +710,7 @@ enum NSEDataBridge {
         // peer is mid-flight: ensureRow's INSERT OR IGNORE re-creates the row
         // on the next tryClaim, costing at most one duplicate LLM call
         // (lease state was already considered stale by then anyway).
-        let orphanThresholdSeconds: TimeInterval = 60
-        let orphanCutoff = Date().timeIntervalSince1970 - orphanThresholdSeconds
+        // Reuse the same stale window as the gradual-row abandon check above.
         do {
             // Return the count from the (now async) @Sendable write closure
             // rather than mutating a captured outer var.
@@ -666,11 +718,11 @@ enum NSEDataBridge {
                 try db.execute(sql: """
                     DELETE FROM nse_processed_message
                     WHERE populated = 0 AND processedAt < ?
-                    """, arguments: [orphanCutoff])
+                    """, arguments: [abandonedCutoff])
                 return db.changesCount
             }
             if reaped > 0 {
-                print("[NSEDataBridge] Orphan reap: deleted \(reaped) stale placeholder(s) older than \(Int(orphanThresholdSeconds))s")
+                print("[NSEDataBridge] Orphan reap: deleted \(reaped) stale placeholder(s) older than \(Int(staleStagingWindowSeconds))s")
             }
         } catch {
             // Best-effort. A failed reap is benign — the placeholders stay

@@ -335,6 +335,18 @@ final class NotificationService: UNNotificationServiceExtension {
         }
         os_log(.error, log: log, "NSE step4 OK: from=%{public}@ subj=%{public}@", msg.senderName, String(msg.subject.prefix(40)))
 
+        // ── GRADUAL STAGING stage 1: header ──
+        // Write the header + populated=1 NOW so the main app's merge can SHOW the
+        // message before body fetch and AI complete. Body / summary / action are
+        // staged incrementally below as each finishes (no longer one big write at
+        // the end). The merge keeps the row until AI completes.
+        if let db {
+            NSEStagingDB.stageHeader(
+                db: db, accountId: accountId, accountEmail: accountEmail,
+                provider: provider, message: msg, historyId: info["historyId"])
+            os_log(.error, log: log, "NSE stage1: header staged (populated)")
+        }
+
         // ── Step 5: Body (full render via shared BodyRenderer) ──
         os_log(.error, log: log, "NSE step5: fetching body")
         let rendered: RenderedBody?
@@ -361,6 +373,14 @@ final class NotificationService: UNNotificationServiceExtension {
         let body = rendered?.textContent
         os_log(.error, log: log, "NSE step5: body=%d chars cidsUnresolved=%{public}@",
                body?.count ?? 0, (rendered?.hasUnresolvedCIDs ?? false) ? "YES" : "NO")
+
+        // ── GRADUAL STAGING stage 2: body ──
+        // Attach the rendered body to the already-staged header so the merge can
+        // write MessageBody + FTS (and the main app's body queue won't re-fetch).
+        if let db {
+            NSEStagingDB.stageBody(db: db, accountId: accountId, messageId: msg.messageId, renderedBody: rendered)
+            os_log(.error, log: log, "NSE stage2: body staged")
+        }
 
         // ── Step 5.5: AI cache probe — check peers + staging DB before running AI ──
         // Cross-device probe (respects Device Sync user setting)
@@ -514,6 +534,16 @@ final class NotificationService: UNNotificationServiceExtension {
                 reminderDate = parsed.reminderDate; reminderTime = parsed.reminderTime
                 reminderContent = parsed.reminderContent
                 os_log(.error, log: log, "NSE step6a OK: blurb=%{public}@", String((summaryBlurb ?? "nil").prefix(60)))
+                // ── GRADUAL STAGING stage 3a: summary ──
+                // Surface the summary before the action vote returns, so a merge
+                // landing mid-vote shows it. aiCompleted stays 0 until step 7.
+                if let db {
+                    NSEStagingDB.stageSummary(
+                        db: db, accountId: accountId, messageId: msg.messageId,
+                        summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
+                        reminderDate: reminderDate, reminderTime: reminderTime,
+                        reminderContent: reminderContent)
+                }
             } else {
                 os_log(.error, log: log, "NSE step6a FAIL: summary call failed")
             }

@@ -135,6 +135,134 @@ enum NSEStagingDB {
         }
     }
 
+    // MARK: - Gradual staging (header → body → summary → [terminal] persist)
+    //
+    // Instead of one big `persistProcessedMessage` at the very end (after AI),
+    // the NSE writes the row in stages so the main app's merge can surface the
+    // message the moment its header is known, then fill in body and AI as they
+    // land. The first writer (`stageHeader`) flips `populated=1`; `mergeNSEStagingData`
+    // applies whatever subset is present and keeps the row until AI completes.
+
+    /// Stage 1 — the message header (everything needed to DISPLAY the row) +
+    /// `populated=1`, so the merge surfaces the message BEFORE body fetch and AI.
+    /// UPSERT (not INSERT OR REPLACE) so a pre-existing row — a prior duplicate-
+    /// push run that already carries body/AI, or the `AIOwnershipLease` placeholder
+    /// — keeps those columns; only the header fields + `populated` are (re)written.
+    /// `processedAt` is set on first insert only (it anchors the orphan/abandon age
+    /// window); the conflict path leaves it untouched.
+    static func stageHeader(
+        db: DatabaseQueue,
+        accountId: String, accountEmail: String, provider: String,
+        message: NSEMessageMetadata, historyId: String?
+    ) {
+        let id = "\(accountId):\(message.messageId)"
+        func encodeJSONArray(_ arr: [String]) -> String? {
+            guard !arr.isEmpty,
+                  let data = try? JSONSerialization.data(withJSONObject: arr),
+                  let s = String(data: data, encoding: .utf8) else { return nil }
+            return s
+        }
+        let referencesJSON = encodeJSONArray(message.references)
+        let providerLabelsJSON = encodeJSONArray(message.providerLabels)
+        do {
+            try db.write { db in
+                try db.execute(sql: """
+                    INSERT INTO nse_processed_message
+                    (id, accountId, accountEmail, provider, messageId, rfc822MessageId, threadId,
+                     folderPath, subject, senderName, senderEmail, snippet, date,
+                     toRaw, ccRaw, bccRaw, replyToRaw, inReplyTo, referencesJSON,
+                     isRead, isFlagged, hasAttachments, providerLabelsJSON,
+                     isReplied, isForwarded, processedAt, historyId, populated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(id) DO UPDATE SET
+                        accountEmail = excluded.accountEmail, provider = excluded.provider,
+                        rfc822MessageId = excluded.rfc822MessageId, threadId = excluded.threadId,
+                        folderPath = excluded.folderPath, subject = excluded.subject,
+                        senderName = excluded.senderName, senderEmail = excluded.senderEmail,
+                        snippet = excluded.snippet, date = excluded.date,
+                        toRaw = excluded.toRaw, ccRaw = excluded.ccRaw, bccRaw = excluded.bccRaw,
+                        replyToRaw = excluded.replyToRaw, inReplyTo = excluded.inReplyTo,
+                        referencesJSON = excluded.referencesJSON, isRead = excluded.isRead,
+                        isFlagged = excluded.isFlagged, hasAttachments = excluded.hasAttachments,
+                        providerLabelsJSON = excluded.providerLabelsJSON,
+                        isReplied = excluded.isReplied, isForwarded = excluded.isForwarded,
+                        historyId = excluded.historyId, populated = 1
+                    """, arguments: [
+                        id, accountId, accountEmail, provider, message.messageId,
+                        message.rfc822MessageId, message.threadId, message.folderPath,
+                        message.subject, message.senderName, message.senderEmail,
+                        message.snippet, message.date?.timeIntervalSince1970,
+                        message.to, message.cc, message.bcc, message.replyTo,
+                        message.inReplyTo, referencesJSON,
+                        message.isRead ? 1 : 0, message.isFlagged ? 1 : 0,
+                        message.hasAttachments ? 1 : 0, providerLabelsJSON,
+                        message.isReplied ? 1 : 0, message.isForwarded ? 1 : 0,
+                        Date().timeIntervalSince1970, historyId
+                    ])
+            }
+        } catch {
+            NSELog.error("stageHeader failed: \(error)")
+        }
+    }
+
+    /// Stage 2 — add the rendered body to an already-staged header row. No-op if
+    /// NSE didn't render one. Idempotent plain UPDATE.
+    static func stageBody(
+        db: DatabaseQueue,
+        accountId: String, messageId: String, renderedBody: RenderedBody?
+    ) {
+        guard let rb = renderedBody else { return }
+        let id = "\(accountId):\(messageId)"
+        let attachmentsJSON: String? = {
+            guard !rb.attachments.isEmpty else { return nil }
+            return (try? JSONEncoder().encode(rb.attachments)).flatMap { String(data: $0, encoding: .utf8) }
+        }()
+        do {
+            try db.write { db in
+                try db.execute(sql: """
+                    UPDATE nse_processed_message SET
+                        htmlContent = ?, textContent = ?, attachmentsJSON = ?,
+                        icsText = ?, hasUnresolvedCIDs = ?
+                    WHERE id = ?
+                    """, arguments: [
+                        rb.htmlContent, rb.textContent, attachmentsJSON,
+                        rb.icsText, rb.hasUnresolvedCIDs ? 1 : 0, id
+                    ])
+            }
+        } catch {
+            NSELog.error("stageBody failed: \(error)")
+        }
+    }
+
+    /// Stage 3a — summary (computed before the action vote). Updates the
+    /// summary/reminder columns so a merge landing during the action vote shows
+    /// the summary. Does NOT set `aiCompleted` — the terminal `persistProcessedMessage`
+    /// flips that once the action lands.
+    static func stageSummary(
+        db: DatabaseQueue,
+        accountId: String, messageId: String,
+        summaryBlurb: String?, summaryTodos: String?,
+        reminderDate: String?, reminderTime: String?, reminderContent: String?
+    ) {
+        let id = "\(accountId):\(messageId)"
+        do {
+            try db.write { db in
+                try db.execute(sql: """
+                    UPDATE nse_processed_message SET
+                        summaryBlurb = ?, summaryTodos = ?,
+                        reminderDate = ?, reminderTime = ?, reminderContent = ?
+                    WHERE id = ?
+                    """, arguments: [
+                        summaryBlurb, summaryTodos,
+                        reminderDate, reminderTime, reminderContent, id
+                    ])
+            }
+        } catch {
+            NSELog.error("stageSummary failed: \(error)")
+        }
+    }
+
     /// Persist messages removed from inbox (archived/deleted/moved).
     /// Main app merges these on wake to update GRDB.
     static func persistInboxRemovals(

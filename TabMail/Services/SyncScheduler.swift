@@ -342,6 +342,11 @@ final class SyncScheduler {
 
     // MARK: - Tier 1: Foreground Polling
 
+    /// One-shot guard for the first-foreground settle (see `startForegroundPolling`).
+    /// Reset only by a process restart, so exactly the first foreground after a
+    /// cold launch pays the settle; warm returns within the same process skip it.
+    private var didFirstForegroundSettle = false
+
     func startForegroundPolling() {
         // On return from background (or fresh launch after iOS killed the process),
         // reconnect providers (TCP sockets go stale during device sleep) and do an
@@ -359,6 +364,19 @@ final class SyncScheduler {
                     BackgroundSyncLogger.log("fgReturn[+\(ms)ms]: \(label)")
                 }
                 fgStep("Task body start")
+                // REORDER — show the inbox first, then start everything else.
+                // On the FIRST foreground after a cold launch, let the inbox's
+                // (heavy) SwiftUI first render paint before kicking the NSE merge +
+                // sync + queue-repopulation herd. Displaying cached mail is the sole
+                // priority of the first frame; the herd isn't needed for that, and
+                // NSE-staged mail still merges in right after the settle. Warm
+                // returns (inbox already on screen) skip it.
+                if !didFirstForegroundSettle {
+                    didFirstForegroundSettle = true
+                    await Task.yield()
+                    try? await Task.sleep(for: .seconds(SyncConfig.firstForegroundSettleSeconds))
+                    fgStep("first-foreground settle done")
+                }
                 // Startup data resets already ran synchronously in AppDatabase.init
                 // (before the pool was exposed), so there's nothing to await here.
                 // Merge NSE staging data FIRST — before sync, before UI reload.

@@ -370,6 +370,16 @@ enum SyncConfig {
     /// this mainly serves IMAP-only accounts and as a safety net.
     static let foregroundPollIntervalSeconds: TimeInterval = 300 // 5 min
 
+    /// One-shot settle before the FIRST foreground sync herd after a cold launch.
+    /// The inbox renders at `AppStartup.isReady`; the SwiftUI first render is the
+    /// heaviest main-thread span of the launch. Letting it paint before kicking
+    /// the NSE merge + sync + queue repopulation herd keeps "show the inbox" the
+    /// sole priority of the first frame (the herd is not needed to display cached
+    /// mail). Applies only to the first foreground per process — warm returns skip
+    /// it (the inbox is already on screen). Kept short so NSE-staged mail still
+    /// merges in promptly right after the inbox appears.
+    static let firstForegroundSettleSeconds: TimeInterval = 0.35
+
     /// BGAppRefresh earliest begin date. iOS controls actual timing;
     /// this is the minimum delay we request.
     static let bgAppRefreshIntervalSeconds: TimeInterval = 300 // 5 min
