@@ -52,11 +52,20 @@ enum DemoSeed {
     }
 
     static func wipe(_ db: Database) throws {
-        try db.execute(sql: "DELETE FROM messageBody WHERE id LIKE 'demo-account:%'")
+        // Prefix matches use index-friendly half-open RANGE bounds
+        // (`>= 'p' AND < 'p<next-byte>'`) instead of `LIKE 'p%'`. SQLite's default
+        // LIKE is case-insensitive, so it can't use a TEXT PRIMARY KEY's (BINARY)
+        // index and falls back to a full table scan — the cost that gated cold-boot
+        // FIRST PAINT before `hasDemoData` short-circuited it (and the cost the wipe
+        // would still pay every time it DID run). ';' (0x3B) is the byte after ':'
+        // (0x3A), so `< 'demo-account;'` is the exclusive upper bound for the
+        // `demo-account:` prefix. Demo ids are always lowercase, so the
+        // (case-sensitive) range matches exactly the rows LIKE did.
+        try db.execute(sql: "DELETE FROM messageBody WHERE id >= 'demo-account:' AND id < 'demo-account;'")
         try db.execute(sql: "DELETE FROM messageHeader WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM folder WHERE accountId = ?", arguments: [demoAccountId])
-        try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE 'demo-account:%'")
-        try db.execute(sql: "DELETE FROM chatTurn WHERE sessionId LIKE 'demo:%'")
+        try db.execute(sql: "DELETE FROM messageAICache WHERE key >= 'demo-account:' AND key < 'demo-account;'")
+        try db.execute(sql: "DELETE FROM chatTurn WHERE sessionId >= 'demo:' AND sessionId < 'demo;'")
         try db.execute(sql: "DELETE FROM outboxMessage WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM pendingOperation WHERE accountId = ?", arguments: [demoAccountId])
         try? db.execute(sql: "DELETE FROM demoCalendarEvent")
