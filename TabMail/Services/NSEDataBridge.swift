@@ -527,12 +527,19 @@ enum NSEDataBridge {
                                         headerId: headerId
                                     )
 
-                                    // 4. AI cache — write once summary or action is
-                                    // present so the main-app AI queue's cache probe
-                                    // hits and skips a duplicate LLM call. Keyed on
-                                    // the EXISTING header's folderPath (current GRDB
-                                    // state) to avoid drift if sync moved the message.
-                                    if msg.summaryBlurb != nil || msg.actionTag != nil {
+                                    // 4. AI cache — write ONLY once AI is complete
+                                    // (both summary + action), matching the new-header
+                                    // branch and the pre-gradual behavior. The cache
+                                    // is the LLM-SKIP optimization read by peers /
+                                    // the main-app AI queue, so it must be
+                                    // complete-or-nothing — a transient summary-only
+                                    // entry could let a reader skip the action. The
+                                    // header's own summary/action columns still update
+                                    // gradually above (display); only this cache waits.
+                                    // Keyed on the EXISTING header's folderPath
+                                    // (current GRDB state) to avoid drift if sync moved
+                                    // the message.
+                                    if msg.aiCompleted {
                                         let rfc = msg.rfc822MessageId ?? existingRfc822
                                         if let cacheKey = MessageIdentity.aiCacheKey(
                                             accountId: msg.accountId,
