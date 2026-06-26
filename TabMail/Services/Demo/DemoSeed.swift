@@ -35,6 +35,22 @@ enum DemoSeed {
 
     /// Wipe all demo rows from GRDB. Mirrors the cleanup pass in
     /// `DemoModeService.exit()`. Idempotent.
+    /// Cheap indexed existence check: is there any demo data to wipe?
+    ///
+    /// The demo account row is seeded FIRST and deleted LAST by `wipe`, so its
+    /// presence ⟺ a demo seed exists or a prior `wipe` was interrupted (demo
+    /// data may remain); its absence ⟺ a completed wipe or a never-seeded DB.
+    /// A normal launch returns `false` on a single primary-key lookup, letting
+    /// `AppStartup.ensureDatabaseReady` SKIP the `wipe` DELETEs entirely — several
+    /// of which are unindexed `LIKE 'demo-account:%'` full table scans over
+    /// messageHeader/messageBody and cost seconds on a large mailbox. Because the
+    /// wipe runs before `dbReady`, those scans were directly gating FIRST PAINT
+    /// (≈10s in the 2026-06-26 cold-boot trace).
+    static func hasDemoData(_ db: Database) throws -> Bool {
+        try Int.fetchOne(db, sql: "SELECT 1 FROM account WHERE id = ? LIMIT 1",
+                         arguments: [demoAccountId]) != nil
+    }
+
     static func wipe(_ db: Database) throws {
         try db.execute(sql: "DELETE FROM messageBody WHERE id LIKE 'demo-account:%'")
         try db.execute(sql: "DELETE FROM messageHeader WHERE accountId = ?", arguments: [demoAccountId])

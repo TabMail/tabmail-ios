@@ -508,8 +508,21 @@ final class AppStartup {
         ScreenshotMode.seedChatSessionsIfNeeded()
         if let db = AppDatabase.shared.withLock({ $0 }) {
             do {
-                // Async context → GRDB's async `write` overload (non-blocking).
-                try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+                // Gate the orphan demo-row wipe on a CHEAP indexed existence
+                // check first. `DemoSeed.wipe` is a series of DELETEs — several
+                // are unindexed `LIKE 'demo-account:%'` full table scans over
+                // messageHeader/messageBody — and it runs BEFORE `dbReady`, so on
+                // a large mailbox it directly delayed FIRST PAINT (≈10s in the
+                // 2026-06-26 cold-boot trace). A normal launch has no demo data,
+                // so the single PK lookup short-circuits the scans entirely. Only
+                // an actual seeded/interrupted-demo launch pays for the wipe — and
+                // it stays on the gate there so no demo rows flash into the inbox.
+                let hasDemo = try await db.dbPool.read { try DemoSeed.hasDemoData($0) }
+                BootProfiler.mark("DemoSeed existence check (hasDemo=\(hasDemo))")
+                if hasDemo {
+                    try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
+                    BootProfiler.mark("DemoSeed.wipe done")
+                }
             } catch {
                 print("[AppStartup] Orphan demo wipe failed: \(error)")
             }
