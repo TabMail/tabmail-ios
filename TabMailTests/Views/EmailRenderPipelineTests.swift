@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import Synchronization
+import JavaScriptCore
 @testable import TabMail
 
 /// Regression guards for the email rendering pipeline that lives in
@@ -621,5 +622,157 @@ struct PreviewGatedReloadTests {
         _ = gate.release()
         #expect(gate.request(isFrozen: false) == true)   // back to normal
         #expect(gate.isPending == false)
+    }
+}
+
+/// Gated post-load image aspect-ratio correction (`tmFixImgAspect`).
+///
+/// Exercises the SHARED `fixImgAspectFnJS` source from AutoSizingHTMLView.swift
+/// in a JSContext with synthetic `img` mocks — the same zero-drift pattern as
+/// the `walkUpToWrapStart` tests. `tmFixImgAspect` only reads naturalWidth /
+/// naturalHeight / getBoundingClientRect and writes `style.height`, so a plain
+/// object stands in for the DOM node (no polyfill).
+///
+/// The safety-critical property under test: the gate fires ONLY when the
+/// rendered ratio diverges from the natural ratio, and the fix touches ONLY
+/// height — so a proportional logo is never ballooned (which would feed a
+/// bogus fitViewport widen) and the document's horizontal extent is untouched.
+@Suite("Image aspect-ratio correction — tmFixImgAspect gate")
+struct ImageAspectRatioFixTests {
+
+    /// Fresh JSContext with the shared fn + a mock-img factory that records
+    /// whether `height` was set (and at what priority).
+    private func makeContext() -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(fixImgAspectFnJS)
+        ctx.evaluateScript("""
+        function mkImg(nw, nh, rw, rh, attrW, attrH) {
+            return {
+                naturalWidth: nw, naturalHeight: nh,
+                src: '', currentSrc: '',
+                getBoundingClientRect: function() { return { width: rw, height: rh }; },
+                getAttribute: function(k) {
+                    if (k === 'width') return (attrW == null ? null : String(attrW));
+                    if (k === 'height') return (attrH == null ? null : String(attrH));
+                    return null;
+                },
+                style: {
+                    _h: null, _prio: null,
+                    setProperty: function(k, v, p) { if (k === 'height') { this._h = v; this._prio = p; } }
+                }
+            };
+        }
+        """)
+        return ctx
+    }
+
+    @Test("corrects a distorted full-width image (width capped, height pinned)")
+    func correctsDistorted() {
+        let ctx = makeContext()
+        // natural 1200x600 (2:1); rendered 390x300 (1.3:1) — width capped to the
+        // card, height stuck at the authored value → vertical stretch.
+        ctx.evaluateScript("var img = mkImg(1200, 600, 390, 300); var res = tmFixImgAspect(img);")
+        #expect(ctx.evaluateScript("res")?.toBool() == true)
+        #expect(ctx.evaluateScript("img.style._h")?.toString() == "auto")
+        #expect(ctx.evaluateScript("img.style._prio")?.toString() == "important")
+        #expect(ctx.evaluateScript("img.__tmAspectFixed")?.toBool() == true)
+    }
+
+    @Test("leaves a proportional height-only logo untouched (no balloon)")
+    func leavesLogoUntouched() {
+        let ctx = makeContext()
+        // Apple-survey-style logo: natural 200x174, rendered 33x29 — already at
+        // its true ratio (just small). Must NOT get height:auto, or it would
+        // balloon to the container width and drive a bogus fitViewport widen.
+        ctx.evaluateScript("var img = mkImg(200, 174, 33, 29); var res = tmFixImgAspect(img);")
+        #expect(ctx.evaluateScript("res")?.toBool() == false)
+        #expect(ctx.evaluateScript("img.style._h == null")?.toBool() == true)
+    }
+
+    @Test("leaves an already-proportional full-width image untouched")
+    func leavesProportionalUntouched() {
+        let ctx = makeContext()
+        // natural 1200x600, rendered 390x195 — correct 2:1 (e.g. an image that
+        // carried both width+height attrs, already handled by img[width] CSS).
+        ctx.evaluateScript("var img = mkImg(1200, 600, 390, 195); var res = tmFixImgAspect(img);")
+        #expect(ctx.evaluateScript("res")?.toBool() == false)
+        #expect(ctx.evaluateScript("img.style._h == null")?.toBool() == true)
+    }
+
+    @Test("no-ops when the image is not loaded yet (naturalWidth 0)")
+    func noOpWhenUnloaded() {
+        let ctx = makeContext()
+        // A deferred remote img before its bytes arrive: 0 natural size → skip,
+        // so we never write a bogus height before the real ratio is known.
+        ctx.evaluateScript("var img = mkImg(0, 0, 390, 300); var res = tmFixImgAspect(img);")
+        #expect(ctx.evaluateScript("res")?.toBool() == false)
+        #expect(ctx.evaluateScript("img.style._h == null")?.toBool() == true)
+    }
+
+    @Test("no-ops when the image is not laid out (zero rendered box)")
+    func noOpWhenNotLaidOut() {
+        let ctx = makeContext()
+        ctx.evaluateScript("var img = mkImg(1200, 600, 0, 0); var res = tmFixImgAspect(img);")
+        #expect(ctx.evaluateScript("res")?.toBool() == false)
+        #expect(ctx.evaluateScript("img.style._h == null")?.toBool() == true)
+    }
+
+    @Test("is idempotent — a corrected image is not re-corrected")
+    func isIdempotent() {
+        let ctx = makeContext()
+        // After the first correction sets __tmAspectFixed, a second call (even
+        // with the same distorted geometry) must early-return — the flag stops
+        // a re-fire loop from the re-scan / ResizeObserver path.
+        ctx.evaluateScript("""
+        var img = mkImg(1200, 600, 390, 300);
+        var first = tmFixImgAspect(img);
+        img.style._h = null;                 // pretend nothing was written
+        var second = tmFixImgAspect(img);
+        """)
+        #expect(ctx.evaluateScript("first")?.toBool() == true)
+        #expect(ctx.evaluateScript("second")?.toBool() == false)
+        #expect(ctx.evaluateScript("img.style._h == null")?.toBool() == true)
+    }
+
+    @Test("emits a debug reason via the optional log callback (no throw on a DOM-like img)")
+    func emitsLogReason() {
+        let ctx = makeContext()
+        // The log path builds an info string from getAttribute/src — exercise it
+        // to guard against a future change that throws there (e.g. assuming a
+        // property the real <img> may lack).
+        ctx.evaluateScript("""
+        var logs = [];
+        var L = function(s) { logs.push(s); };
+        var distorted = mkImg(1200, 600, 390, 300, null, 300); // height-only, no width attr
+        tmFixImgAspect(distorted, L);
+        var logo = mkImg(200, 174, 33, 29, null, 29);
+        tmFixImgAspect(logo, L);
+        """)
+        #expect(ctx.evaluateScript("logs.length")?.toInt32() == 2)
+        #expect(ctx.evaluateScript("logs[0].indexOf('FIX') === 0")?.toBool() == true)
+        #expect(ctx.evaluateScript("logs[0].indexOf('attrH=300') >= 0")?.toBool() == true)
+        #expect(ctx.evaluateScript("logs[1].indexOf('skip(proportional)') === 0")?.toBool() == true)
+    }
+
+    // MARK: - Production script wiring (string-level regressions)
+
+    @Test("production script only ever sets height — never width (fitViewport safety)")
+    func productionScriptNeverTouchesWidth() {
+        let js = _fixImageAspectRatioJS
+        #expect(js.contains("tmFixImgAspect"))
+        #expect(js.contains("setProperty('height', 'auto', 'important')"))
+        // The invariant the whole design rests on: touching width could perturb
+        // fitViewportJS's horizontal-overflow widen decision.
+        #expect(!js.contains("setProperty('width'"))
+    }
+
+    @Test("production script hooks load events (covers deferred remote images)")
+    func productionScriptHooksLoad() {
+        let js = _fixImageAspectRatioJS
+        // Deferred remote imgs are `complete` (no src) at documentEnd, so they
+        // need their own load listener attached here — not {once}, since the
+        // load fires only when deferredImageLoadJS swaps the real src in.
+        #expect(js.contains("addEventListener('load'"))
+        #expect(js.contains("getElementsByTagName('img')"))
     }
 }

@@ -222,6 +222,10 @@ private struct HTMLWebView: UIViewRepresentable {
         let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let deferImages = WKUserScript(source: deferredImageLoadJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        // After heightMonitor so window.__tmReportHeight is defined when a
+        // correction fires; its own load listeners coexist with the height
+        // monitor's (a single <img> can carry multiple load listeners).
+        let aspectFix = WKUserScript(source: fixImageAspectRatioJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(idStamp)
@@ -233,6 +237,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(icsCollapse)
         config.userContentController.addUserScript(deferImages)
         config.userContentController.addUserScript(heightMonitor)
+        config.userContentController.addUserScript(aspectFix)
         config.userContentController.addUserScript(debugReport)
         config.userContentController.addUserScript(heightDiag)
         config.userContentController.add(context.coordinator, name: "heightChanged")
@@ -1692,6 +1697,112 @@ private let monitorHeightJS = """
         }, 700);
     })();
     """
+
+/// Shared, pure gated aspect-ratio correction — evaluated by BOTH the
+/// production `fixImageAspectRatioJS` script and the unit tests (zero-drift,
+/// same pattern as `walkUpToWrapStartJS`). Reads naturalWidth/naturalHeight +
+/// getBoundingClientRect, writes ONLY `height`. Returns true iff it corrected.
+///
+/// WHY: some senders pin a fixed `height` on a full-width image without a
+/// matching `width`, so when our `img{max-width:100%}` caps the width on a
+/// phone the height stays fixed and the image stretches vertically. The CSS
+/// `img[width]{height:auto}` rule only covers images that carry a `width`
+/// attribute; this catches the rest (height-only / inline-styled).
+///
+/// SAFETY (see `fitViewportJS`, which widens the layout viewport on horizontal
+/// overflow): we ONLY ever set `height` — never width — so the document's
+/// horizontal extent is unchanged and the widen decision cannot be perturbed.
+/// And we ONLY act when the RENDERED ratio diverges from the image's NATURAL
+/// ratio, so a logo sized by `height="29"` (rendered at its true ratio, just
+/// small) is left untouched and can't balloon to full container width — the
+/// exact regression the scoped CSS rule guards against. WebKit's
+/// naturalWidth/naturalHeight are EXIF-orientation corrected, so rotated
+/// photos compare correctly.
+let fixImgAspectFnJS = """
+function tmFixImgAspect(img, log) {
+    // `log` is an optional debug callback (no-op in production / unit tests),
+    // same pattern as walkUpToWrapStart's logFn. It records the decision at
+    // every branch so we can see WHY a given image was or wasn't corrected.
+    if (!log) log = function() {};
+    // >2% off the natural ratio == visibly distorted. The margin absorbs
+    // sub-pixel getBoundingClientRect rounding (a proportionally-scaled image
+    // diverges well under 1%); genuine distortion is 10%+.
+    var TOL = 0.02;
+    if (!img) return false;
+    var src = (img.currentSrc || img.src || img.getAttribute('data-tmsrc') || '').slice(-48);
+    if (img.__tmAspectFixed) { log('skip(already-fixed) ' + src); return false; }
+    var nw = img.naturalWidth, nh = img.naturalHeight;
+    if (!nw || !nh) { log('skip(unloaded nat=' + nw + 'x' + nh + ') ' + src); return false; }  // not loaded / broken / SVG w/o intrinsic size
+    var r = img.getBoundingClientRect();
+    if (!r || r.width < 1 || r.height < 1) { log('skip(no-box) ' + src); return false; }  // not laid out / hidden
+    var natRatio = nw / nh;
+    var renderRatio = r.width / r.height;
+    var div = Math.abs(renderRatio - natRatio) / natRatio;
+    var info = 'nat=' + nw + 'x' + nh + '(' + natRatio.toFixed(3) + ') render=' + Math.round(r.width) + 'x' + Math.round(r.height) + '(' + renderRatio.toFixed(3) + ') div=' + (div * 100).toFixed(1) + '% attrW=' + (img.getAttribute('width') || '-') + ' attrH=' + (img.getAttribute('height') || '-') + ' ' + src;
+    if (div <= TOL) { log('skip(proportional) ' + info); return false; }  // proportional — leave alone
+    img.style.setProperty('height', 'auto', 'important');
+    img.__tmAspectFixed = true;
+    log('FIX height:auto ' + info);
+    return true;
+}
+"""
+
+/// Gated post-load image aspect-ratio correction (injected at documentEnd).
+/// Wires the shared `tmFixImgAspect` to every image's load event — covering
+/// BOTH inline `tabmail-asset://` images (loaded at first paint) AND remote
+/// images whose `src` is swapped in later by `deferredImageLoadJS` (those are
+/// `complete` with no src at documentEnd, so monitorHeightJS's image listeners
+/// skip them; this attaches its own non-`once` listeners + re-scans after the
+/// swap). Exposed for unit tests via `_fixImageAspectRatioJS`.
+internal var _fixImageAspectRatioJS: String { fixImageAspectRatioJS }
+private var fixImageAspectRatioJS: String {
+    // Debug-gated log helper (same shape as fitViewportJS): a no-op function in
+    // production so the diagnostic is fully stripped, per CLAUDE.md rule 12.
+    // Lands on the `consoleLog` handler, which `print()`s only when logging is
+    // enabled. Tag `[ImgAspect]` so it's greppable alongside `[FitViewport]`.
+    let logFn = DebugModeManager.isLoggingEnabled()
+        ? "function log(s) { try { window.webkit.messageHandlers.consoleLog.postMessage('[ImgAspect] ' + s); } catch(_){} }"
+        : "function log(s) {}"
+    return """
+    (function() {
+        \(logFn)
+        \(fixImgAspectFnJS)
+        function fixAndReport(img) {
+            if (tmFixImgAspect(img, log)) {
+                // Height changed to the true ratio — nudge the height monitor so
+                // the webview frame resizes. Deduped by monitorHeightJS's lastH
+                // guard; one-shot per image (flag), and once corrected the ratio
+                // matches so it cannot re-fire.
+                try { if (window.__tmReportHeight) window.__tmReportHeight(); } catch(_) {}
+            }
+        }
+        window.__tmFixImgAspect = fixAndReport;
+        function scan() {
+            var imgs = document.getElementsByTagName('img');
+            log('scan ' + imgs.length + ' img(s) rs=' + document.readyState);
+            for (var i = 0; i < imgs.length; i++) {
+                var img = imgs[i];
+                if (!img.__tmAspectListener) {
+                    img.__tmAspectListener = true;
+                    // NOT {once}: a deferred remote img fires `load` only when its
+                    // swapped-in src finishes; fixAndReport is flag-guarded so any
+                    // extra fire is a no-op.
+                    img.addEventListener('load', function() { fixAndReport(this); });
+                }
+                fixAndReport(img); // correct now if already loaded (inline/cached)
+            }
+        }
+        scan();
+        // Re-scan after the deferred-image swap (deferredImageLoadJS swaps on a
+        // double-rAF after load, 1500ms failsafe). The per-img load listener
+        // already covers swapped images; the re-scans also pick up imgs added to
+        // the DOM after first paint by author scripts.
+        if (document.readyState === 'complete') { requestAnimationFrame(scan); }
+        else { window.addEventListener('load', function() { setTimeout(scan, 50); }, { once: true }); }
+        setTimeout(scan, 1600);
+    })();
+    """
+}
 
 /// Debug report JS — logs DOM state after all other scripts have run.
 /// Gated by DebugModeManager so it's a no-op in production.
