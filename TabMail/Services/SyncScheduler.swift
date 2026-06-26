@@ -182,6 +182,7 @@ final class SyncScheduler {
         // Kept on the critical path: crash-recovery for rows GRDB has but FTS doesn't.
         await manager.syncEngine.recoverIncompleteHeaders()
         stepLog("step2 recoverIncompleteHeaders")
+        BootProfiler.mark("syncStartup: recoverIncompleteHeaders done (critical-path scan)")
 
         // 3. Repopulate queues — detached so sync starts immediately.
         // Sync never reads from the queues (only enqueues, dedup-safe), so repopulate
@@ -255,6 +256,7 @@ final class SyncScheduler {
             _ = await (pendingDrain, syncAll)
             let syncMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.log("syncStartup: sync done in \(syncMs)ms (inboxOnly=\(inboxOnly))")
+            BootProfiler.mark("syncStartup: backgroundPoll (sync all accounts) done in \(syncMs)ms")
 
             // Re-mirror historyIds after sync advances cursors — NSE needs fresh values
             NSEDataBridge.mirrorLastHistoryIds()
@@ -364,6 +366,7 @@ final class SyncScheduler {
                     BackgroundSyncLogger.log("fgReturn[+\(ms)ms]: \(label)")
                 }
                 fgStep("Task body start")
+                BootProfiler.mark("startForegroundPolling enter (firstForeground=\(!didFirstForegroundSettle))")
                 // REORDER — show the inbox first, then start everything else.
                 // On the FIRST foreground after a cold launch, let the inbox's
                 // (heavy) SwiftUI first render paint before kicking the NSE merge +
@@ -376,6 +379,7 @@ final class SyncScheduler {
                     await Task.yield()
                     try? await Task.sleep(for: .seconds(SyncConfig.firstForegroundSettleSeconds))
                     fgStep("first-foreground settle done")
+                    BootProfiler.mark("startForegroundPolling: first-foreground settle done (\(SyncConfig.firstForegroundSettleSeconds)s — inbox painted first)")
                 }
                 // Startup data resets already ran synchronously in AppDatabase.init
                 // (before the pool was exposed), so there's nothing to await here.
@@ -383,12 +387,14 @@ final class SyncScheduler {
                 // This imports AI results and inbox removals so the UI shows them immediately.
                 await NSEDataBridge.mergeNSEStagingData()
                 fgStep("outer NSE merge")
+                BootProfiler.mark("startForegroundPolling: outer NSE merge done")
                 // Reload UI immediately — NSE merge + background push may have new data.
                 // Don't wait for reconnect+poll (can take 60s+).
                 NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
                 fgStep("posted .inboxDataDidChange")
                 await syncStartup(inboxOnly: false, drain: .none)
                 fgStep("syncStartup returned")
+                BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")
                 // Re-subscribe push on foreground return.
                 // subscribeAllAccounts() calls registerDeviceWithWorker() internally at the end,
                 // so no separate registerDeviceWithWorker() call needed here.
@@ -406,6 +412,7 @@ final class SyncScheduler {
                     await PushNotificationService.shared.checkPushConsentStatusForForeground()
                 }
                 await poll()
+                BootProfiler.mark("startForegroundPolling: poll() done (foreground sync pass complete)")
             }
         }
 

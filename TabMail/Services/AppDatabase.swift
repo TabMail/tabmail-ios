@@ -97,6 +97,7 @@ final class AppDatabase: Sendable {
         let migrateT0 = CFAbsoluteTimeGetCurrent()
         try Self.runMigrations(on: pool)
         BackgroundSyncLogger.log("AppDatabase: schema migrations completed in \(Int((CFAbsoluteTimeGetCurrent() - migrateT0) * 1000))ms")
+        BootProfiler.mark("AppDatabase.migrate done in \(Int((CFAbsoluteTimeGetCurrent() - migrateT0) * 1000))ms")
         if runStartupResets {
             StartupMigrations.run(pool)
         }

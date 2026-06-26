@@ -207,6 +207,7 @@ enum NSEDataBridge {
     static func mergeNSEStagingData(stagingPathOverride: String? = nil) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         print("[NSEDataBridge] mergeNSEStagingData: START")
+        BootProfiler.mark("mergeNSEStagingData START")
 
         // Production reads the App Group staging DB. Tests inject a path: the
         // unit-test host has no app-group entitlement, so `containerURL` returns
@@ -348,6 +349,7 @@ enum NSEDataBridge {
 
         let aiCount = processed.filter { $0.aiCompleted }.count
         print("[NSEDataBridge] mergeNSEStagingData: found \(processed.count) staged message(s) (\(aiCount) with AI)")
+        BootProfiler.mark("mergeNSEStagingData: found \(processed.count) staged (\(aiCount) AI-complete)")
 
         if !processed.isEmpty {
             // Only delete from staging the rows that actually committed. A
@@ -735,6 +737,7 @@ enum NSEDataBridge {
 
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         print("[NSEDataBridge] mergeNSEStagingData: DONE in \(ms)ms (didMutate=\(didMutate))")
+        BootProfiler.mark("mergeNSEStagingData DONE in \(ms)ms (didMutate=\(didMutate))")
     }
 
     // MARK: - Inbox Removals

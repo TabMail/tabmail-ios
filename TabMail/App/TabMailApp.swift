@@ -26,6 +26,9 @@ struct TabMailApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        // First app-code mark — its `+Nms` is the pre-main (dyld / runtime /
+        // static-init) cost, usually the biggest single chunk of a cold launch.
+        BootProfiler.mark("TabMailApp.init enter")
         // Detect fresh install: UserDefaults is cleared on reinstall, Keychain is not.
         // If this is a fresh install but Keychain has stale data, clear it.
         // GUARD: also check for existing GRDB database file. If the database exists,
@@ -110,7 +113,9 @@ struct TabMailApp: App {
         // background launch where body.task never runs.
         Task.detached(priority: .utility) {
             await AppStartup.shared.awaitReady()
+            BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility)")
             EmbeddingService.initialize()
+            BootProfiler.mark("EmbeddingService.initialize() DONE")
         }
         // SearchIndex's eager init is deliberately NOT here. Its 257k-doc FTS open
         // was landing IN the inbox first-render window (it fired at dbReady, before
@@ -194,6 +199,7 @@ struct TabMailApp: App {
         // #if DEBUG) so demos can be recorded from a TestFlight build. Inert
         // unless the toggle is on. Toggle: Settings → Debug.
         TouchVisualizer.shared.activateIfEnabled()
+        BootProfiler.mark("TabMailApp.init exit (sync work done; DB build is async)")
     }
 
     /// Guards the one-shot WebKit warm-up (`body.task` can re-run on scene changes).
@@ -234,8 +240,10 @@ struct TabMailApp: App {
         Task.detached {
             // Settle past the inbox first-render stall before the FTS open.
             try? await Task.sleep(for: .milliseconds(500))
+            BootProfiler.mark("SearchIndex.initialize() START (FTS open, post-paint +500ms)")
             do {
                 try await SearchIndex.shared.initialize()
+                BootProfiler.mark("SearchIndex.initialize() DONE (FTS ready)")
             } catch {
                 print("[TabMailApp] FTS index initialization failed: \(error)")
             }
@@ -327,6 +335,7 @@ struct TabMailApp: App {
                 // Inbox is now on screen — prime WebKit off the cold-launch
                 // render path (no-op on a background launch: isReady stays false).
                 if startup.isReady {
+                    BootProfiler.mark("body.task: post-paint deferrals kicked (WebKit warm-up + FTS)")
                     Self.warmUpWebKitIfNeeded()
                     Self.deferredSearchIndexInitIfNeeded()
                 }
@@ -432,6 +441,7 @@ final class AppStartup {
         // never show the migration splash on first install (it would falsely
         // read "Updating…" with nothing to update).
         let dbExisted = FileManager.default.fileExists(atPath: AppDatabase.databaseURL.path)
+        BootProfiler.mark("ensureDatabaseReady enter (dbExisted=\(dbExisted))")
 
         // Phase 1 (off main): open the pool + cheaply probe for pending migration
         // work. Fast — opens the connection and reads the migrator's applied set
@@ -458,6 +468,7 @@ final class AppStartup {
         // on an existing mailbox — switch from the blank launch screen to the
         // "Updating…" splash. The common case (already-migrated DB) skips this
         // and stays blank until `isReady` flips straight to the inbox.
+        BootProfiler.mark("db.probe done (pendingMigration=\(probe.pending))")
         if probe.pending && dbExisted {
             isMigrating = true
             BackgroundSyncLogger.log("AppStartup: pending migration work on existing DB — showing migration splash")
@@ -484,6 +495,7 @@ final class AppStartup {
             return
         }
         BackgroundSyncLogger.log("AppStartup: database ready in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+        BootProfiler.mark("db.built+migrated (AppDatabase.shared published)")
 
         // DB-dependent NON-UI launch steps, in the same spirit/order as before
         // (all touch AppDatabase / shared UserDefaults). These previously lived
@@ -508,6 +520,7 @@ final class AppStartup {
         // present the inbox, so it must never sit in front of this gate.
         dbReady = true
         resumeDBWaiters()
+        BootProfiler.mark("dbReady=true (push / NSE-merge / BGTask waiters unblocked)")
 
         // NSE staging-DB schema upkeep + state mirror — OFF the launch gate.
         // Neither is needed to show the inbox: `mergeNSEStagingData` tolerates a
@@ -525,8 +538,10 @@ final class AppStartup {
         // a missing schema. `mirrorAllState`'s main-DB reads also move off the
         // main actor as a bonus.
         Task.detached(priority: .utility) {
+            BootProfiler.mark("NSE staging upkeep + mirrorAllState START (.utility, off-gate)")
             AppDatabase.createNSEStagingDBIfNeeded()
             NSEDataBridge.mirrorAllState()
+            BootProfiler.mark("NSE staging upkeep + mirrorAllState DONE")
         }
     }
 
@@ -545,11 +560,14 @@ final class AppStartup {
         await ensureDatabaseReady()
         // Build failed (failureMessage shown) or the sidebar already loaded.
         guard dbReady, !isReady else { return }
+        BootProfiler.mark("loadInitialData (sidebar: accounts/folders/outbox) START — @MainActor sync read")
         navigationStore.loadInitialData()
+        BootProfiler.mark("loadInitialData DONE (accounts=\(navigationStore.accounts.count) folders=\(navigationStore.folders.count))")
         // Animate the splash → inbox swap: the loading splash fades OUT (300ms)
         // while the inbox appears instantly beneath it (RootView uses .identity).
         // Visually a no-op on a fast resume (blank → inbox are both .identity).
         withAnimation(.easeOut(duration: 0.3)) { isReady = true }
+        BootProfiler.mark("★ isReady=true → FIRST PAINT (inbox on screen)")
     }
 
     /// Suspends until the database is usable, kicking off the build if no launch

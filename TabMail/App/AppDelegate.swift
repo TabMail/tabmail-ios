@@ -323,6 +323,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        BootProfiler.mark("AppDelegate.didFinishLaunching enter")
         // CRITICAL: Migrate keychain to shared access group FIRST — before anything
         // reads tokens. All keychain queries now include kSecAttrAccessGroup, so old
         // items (without access group) are invisible until migrated. If this runs
@@ -346,6 +347,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // so they still run on every launch as they did before the splash work.
         Task { await AppStartup.shared.ensureDatabaseReady() }
         migrateOptOutFlagToSharedSuite()
+        BootProfiler.mark("AppDelegate.didFinishLaunching exit (DB build kicked async)")
         return true
     }
 
