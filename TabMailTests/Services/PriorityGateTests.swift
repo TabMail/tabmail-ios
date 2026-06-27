@@ -133,4 +133,37 @@ struct PriorityGateTests {
         let active = await PriorityGate.shared.isPrivileged
         #expect(active == false)
     }
+
+    @Test("resetting inPrivilegedContext=false re-exposes nested work to the gate (taint guard)")
+    func resettingPrivilegedContextReExposesToGate() async {
+        // The merge resets `inPrivilegedContext` to false when it enqueues
+        // downstream AI/embedding work (NSEDataBridge step 6), because `enqueue`
+        // spawns the drain loop via an unstructured `Task {}` that COPIES task-
+        // locals — so without the reset that drain would inherit the merge's
+        // exemption and never yield to a LATER merge. This guards the mechanism:
+        // inside a privileged context (true), a nested withValue(false) must make
+        // yield() PARK again. If the reset regressed (work stays exempt under the
+        // ambient true), `bg` would slip straight past yield() while the gate is
+        // raised and the first #expect would see resumed == true.
+        let gate = PriorityGate()
+        await gate.begin()                               // gate raised (count == 1)
+
+        let resumed = Mutex<Bool>(false)
+        let bg = Task {
+            // Ambient "inside the merge" context (true), then the taint fix's
+            // reset (false) around the drain's gate interaction.
+            await PriorityGate.$inPrivilegedContext.withValue(true) {
+                await PriorityGate.$inPrivilegedContext.withValue(false) {
+                    await gate.yield("downstream")       // must PARK (gate raised, not exempt)
+                }
+            }
+            resumed.withLock { $0 = true }
+        }
+
+        try? await Task.sleep(for: .milliseconds(120))
+        #expect(resumed.withLock { $0 } == false)        // parked despite the ambient privileged ctx
+        await gate.end()                                 // clear gate → parked work resumes
+        await bg.value
+        #expect(resumed.withLock { $0 } == true)
+    }
 }

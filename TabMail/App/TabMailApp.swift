@@ -644,7 +644,11 @@ final class AppStartup {
         var waited = Duration.zero
         let limit = Duration.seconds(firstPaintTimeoutSeconds)
         while !isReady, waited < limit {
-            try? await Task.sleep(for: step)
+            // Bail on cancellation rather than busy-iterating: a cancelled
+            // `Task.sleep` throws immediately, so without this the loop would
+            // burst through `limit/step` no-op iterations on the MainActor.
+            if Task.isCancelled { return }
+            do { try await Task.sleep(for: step) } catch { return }
             waited += step
         }
     }

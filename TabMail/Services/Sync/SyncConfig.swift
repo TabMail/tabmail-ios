@@ -387,6 +387,16 @@ enum SyncConfig {
     /// the earlier arbitrary 3s.
     static let embeddingLoadGateTimeoutSeconds: Double = 1
 
+    /// Coalesce window (ms) for the read-through NSE-staging probe
+    /// (`NSEDataBridge.stagingHasPending`). `PrioritizedDatabase.read` calls it
+    /// before every async read; the probe is a cross-process read of the NSE's
+    /// non-WAL staging file, so it runs at most once per this window. Between
+    /// probes a freshly-staged row waits ≤ this long for a read-triggered merge —
+    /// but the explicit boot/foreground/push merges (which bypass the probe) are
+    /// the primary path, so this is only the safety-net's latency. Small enough to
+    /// be imperceptible, large enough that frequent reads don't hammer the file.
+    static let stagingProbeCoalesceMs: Double = 100
+
     /// BGAppRefresh earliest begin date. iOS controls actual timing;
     /// this is the minimum delay we request.
     static let bgAppRefreshIntervalSeconds: TimeInterval = 300 // 5 min

@@ -17,10 +17,16 @@ enum NSEDataBridge {
     /// Cached read connection to the NSE staging DB for the read-path "is there
     /// anything to merge?" check. We deliberately do NOT use a cross-process dirty
     /// FLAG — a flag can drift (a false-negative silently skips a merge). Instead
-    /// we query the REAL staging DB (source of truth, can't drift), and cache the
-    /// connection so the check is a ~µs `EXISTS` query rather than a per-read DB
-    /// open. `nil` until the staging file first exists (no push received yet).
+    /// we query the REAL staging DB (source of truth, can't drift), cache the
+    /// connection, and COALESCE probes (`lastProbeMs` + `stagingProbeCoalesceMs`)
+    /// so the cross-process read runs at most once per window — NOT once per app
+    /// read, which (the staging DB being a NON-WAL shared file, ADR-IOS-041) would
+    /// open a read transaction per read and could block behind an NSE commit.
+    /// `nil` until the staging file first exists (no push received yet).
     private static let stagingProbe = Mutex<DatabaseQueue?>(nil)
+    /// Monotonic ms (CFAbsoluteTime ×1000) of the last probe attempt — gates the
+    /// coalesce window so frequent reads don't each hit the cross-process file.
+    private static let lastProbeMs = Mutex<Double>(0)
 
     private static func stagingProbeConnection() -> DatabaseQueue? {
         stagingProbe.withLock { cached in
@@ -31,7 +37,12 @@ enum NSEDataBridge {
             guard FileManager.default.fileExists(atPath: path) else { return nil }
             var config = Configuration()
             config.observesSuspensionNotifications = true   // ADR-IOS-041
-            config.busyMode = .timeout(1.0)
+            // Fail FAST, never stall. The staging DB is the NSE's NON-WAL shared
+            // file (ADR-IOS-041), so a reader blocks behind an NSE commit. A probe
+            // must NEVER make an app read wait: on contention it returns "not
+            // pending" and the next-window probe / explicit boot/foreground/push
+            // merge catches the row (which stays populated=1 — nothing is lost).
+            config.busyMode = .immediateError
             let q = try? DatabaseQueue(path: path, configuration: config)
             cached = q
             return q
@@ -39,10 +50,21 @@ enum NSEDataBridge {
     }
 
     /// True when the staging DB actually holds a populated (merge-ready) row.
-    /// Reads the real staging DB via the cached connection — correct (no drift),
-    /// and cheap (no per-read open).
+    /// COALESCED to at most one cross-process probe per `stagingProbeCoalesceMs`:
+    /// reads are frequent and the probe is a non-WAL shared-container read, so
+    /// without this every read would pay a cross-process read transaction.
+    /// Between probes it returns false — a freshly-staged row is picked up by the
+    /// next post-window read (≤ window latency) or the explicit merge triggers
+    /// (which call `mergeNSEStagingData` directly, bypassing this probe), and the
+    /// row stays populated=1 so nothing is lost.
     private static func stagingHasPending() async -> Bool {
-        guard let db = stagingProbeConnection() else { return false }
+        let nowMs = CFAbsoluteTimeGetCurrent() * 1000
+        let shouldProbe = lastProbeMs.withLock { last -> Bool in
+            guard nowMs - last >= SyncConfig.stagingProbeCoalesceMs else { return false }
+            last = nowMs
+            return true
+        }
+        guard shouldProbe, let db = stagingProbeConnection() else { return false }
         return (try? await db.read { db -> Bool in
             guard try db.tableExists("nse_processed_message") else { return false }
             return try Bool.fetchOne(
@@ -1297,11 +1319,20 @@ enum NSEDataBridge {
         }
 
         // 6. Enqueue downstream queues. `enqueue` dedups per-actor.
-        for item in confirmedItems {
-            if item.header.isInInbox {
-                await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.header.accountId)
+        // Enqueue as NORMAL priority, not privileged: `enqueue` spawns the queue's
+        // drain loop via an unstructured `Task {}`, which COPIES task-locals — so
+        // without resetting `inPrivilegedContext` here, a drain loop first kicked
+        // from inside this merge would inherit the merge's exemption and never
+        // yield to a LATER merge (defeating the gate, incl. the embedding queue's
+        // own sidecar yields). The downstream AI/embedding work is ordinary
+        // background work and must step aside for future privileged merges.
+        await PriorityGate.$inPrivilegedContext.withValue(false) {
+            for item in confirmedItems {
+                if item.header.isInInbox {
+                    await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.header.accountId)
+                }
+                await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
             }
-            await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
         }
 
         if confirmedItems.count > 1 {
