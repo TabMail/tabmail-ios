@@ -778,9 +778,21 @@ actor ActiveAIQueue {
             if let value = first {
                 return value // job completed before deadline
             }
-            // Deadline fired — job exceeded wall clock
+            // The deadline task returned its nil sentinel. CAUTION: `try? await
+            // Task.sleep` ALSO returns nil when its task is CANCELLED — and the AI
+            // queue cancels in-flight jobs on user-activity prioritization / job
+            // supersession, which fires immediately. So this branch is reached by
+            // BOTH a genuine `deadline`-second timeout AND a fast cancellation.
+            // Discriminate by whether we actually reached the deadline: `Task.sleep`
+            // never under-sleeps, so jobMs >= deadline is a real timeout, while a
+            // small jobMs is a cancellation. (Conflating them produced impossible
+            // logs like "DEADLINE exceeded (254ms > 150s)".) Both still retry.
             let jobMs = Int((CFAbsoluteTimeGetCurrent() - jobT0) * 1000)
-            BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) DEADLINE exceeded (\(jobMs)ms > \(Int(deadline))s) — will retry")
+            if jobMs >= Int(deadline * 1000) {
+                BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) DEADLINE exceeded (\(jobMs)ms > \(Int(deadline))s) — will retry")
+            } else {
+                BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) cancelled after \(jobMs)ms (deadline \(Int(deadline))s not reached) — will retry")
+            }
             return true // retry
         }
 

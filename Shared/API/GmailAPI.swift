@@ -13,6 +13,14 @@ import Foundation
 enum GmailAPI {
     private static let baseURL = "https://gmail.googleapis.com/gmail/v1/users/me"
 
+    /// Max concurrent in-flight HTTP requests per Gmail account. Gmail enforces a
+    /// per-USER concurrency cap (HTTP 429 "Too many concurrent requests for user",
+    /// reason `rateLimitExceeded`, status `RESOURCE_EXHAUSTED`); fanning out a whole
+    /// `messages.list` page (~50) of `messages.get?format=metadata` calls at once
+    /// blew past it. 6 keeps strong parallelism (~6× over sequential — a 50-message
+    /// folder still lands in ~3-4s) while staying well under the cap. Tunable.
+    static let maxConcurrentRequests = 6
+
     /// `?format=metadata&metadataHeaders=...` query for `users.messages.get`.
     /// Single source of truth: both `GmailAPI.messageMetadata` (NSE-owned
     /// fetch path) and every `GmailProvider` call site that assembles the

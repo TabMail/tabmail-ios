@@ -32,6 +32,17 @@ actor GmailProvider: EmailProvider {
     /// `FakeHTTP` URLProtocol on this session to intercept Gmail API calls.
     private let testSession: URLSession?
 
+    /// Concurrency gate for Gmail HTTP requests (ADR-free; see `GmailAPI.maxConcurrentRequests`).
+    /// Gmail caps concurrent requests PER USER, and internal fan-outs (a whole
+    /// `messages.list` page of metadata fetches) bypass the per-account
+    /// `ProviderWorkQueue` because they call `request()` directly from inside the
+    /// provider. So `request()` self-limits: at most `maxConcurrentRequests` HTTP
+    /// calls are in flight at once; the rest wait FIFO. Actor isolation provides
+    /// the synchronization (no lock needed) — these are only touched inside the
+    /// actor's `acquireRequestSlot` / `releaseRequestSlot`.
+    private var inFlightRequests = 0
+    private var requestSlotWaiters: [CheckedContinuation<Void, Never>] = []
+
     init(
         userEmail: String,
         accessToken: @Sendable @escaping (_ forceRefresh: Bool) async throws -> String,
@@ -917,6 +928,13 @@ actor GmailProvider: EmailProvider {
             throw ProviderError.syntheticFolderPath(path)
         }
         let url = baseURL + path
+        // Bound total in-flight Gmail HTTP concurrency per account — Gmail returns
+        // 429 "Too many concurrent requests for user" when an internal fan-out
+        // (e.g. a whole messages.list page of metadata.get) exceeds the per-user
+        // cap. Holding the slot across the call (incl. the HTTP layer's own 429
+        // backoff) keeps the cap honored under retry too.
+        await acquireRequestSlot()
+        defer { releaseRequestSlot() }
         do {
             switch method {
             case "GET": return try await authedHTTP.get(url)
@@ -928,6 +946,27 @@ actor GmailProvider: EmailProvider {
             }
         } catch let e as HTTPError {
             throw ProviderError.networkError(underlying: e)
+        }
+    }
+
+    /// Acquire one of `GmailAPI.maxConcurrentRequests` HTTP slots, suspending FIFO
+    /// when the cap is reached. Actor-isolated, so the counter/waiter mutations are
+    /// race-free without a lock.
+    private func acquireRequestSlot() async {
+        if inFlightRequests < GmailAPI.maxConcurrentRequests {
+            inFlightRequests += 1
+            return
+        }
+        await withCheckedContinuation { requestSlotWaiters.append($0) }
+    }
+
+    /// Release an HTTP slot. If a caller is waiting, hand the slot straight to it
+    /// (count unchanged); otherwise decrement. Synchronous, so it runs from `defer`.
+    private func releaseRequestSlot() {
+        if !requestSlotWaiters.isEmpty {
+            requestSlotWaiters.removeFirst().resume()
+        } else {
+            inFlightRequests = max(0, inFlightRequests - 1)
         }
     }
 

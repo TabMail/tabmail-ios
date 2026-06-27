@@ -506,6 +506,64 @@ struct GmailProviderMockTests {
         #expect(FakeHTTP.recordedCalls().count == 3)
     }
 
+    // MARK: - request() concurrency gate (GmailAPI.maxConcurrentRequests)
+
+    @Test("request() gate: N≫limit concurrent fetches all drain (no deadlock / no loss)")
+    func requestConcurrencyGateDrainsAll() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        // Fire well above the per-account cap so most callers must wait on the
+        // gate's FIFO waiter queue, then be handed a slot as earlier ones release.
+        // A release-accounting bug (a stuck waiter) hangs here; a dropped request
+        // shows up as a short count.
+        let count = GmailAPI.maxConcurrentRequests * 5
+        for i in 0..<count {
+            let id = String(format: "cmsg-%03d", i)
+            FakeHTTP.register(
+                path: "/messages/\(id)",
+                method: "GET",
+                response: .json(raw: makeGmailMessageJSON(
+                    id: id,
+                    internalDateMs: "1700000000000",
+                    topLevelMimeType: "multipart/alternative",
+                    payloadHeaders: [
+                        ("Subject", "S\(i)"),
+                        ("From", "sender@example.com"),
+                        ("Date", "Wed, 2 Oct 2025 01:50:00 +0000")
+                    ],
+                    parts: [.html(body: "<p>body \(i)</p>")]
+                ))
+            )
+        }
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        let okCount = await withTaskGroup(of: Bool.self) { group in
+            for i in 0..<count {
+                let id = String(format: "cmsg-%03d", i)
+                group.addTask {
+                    let info = try? await provider.fetchMessage(id: id, folder: "INBOX")
+                    return info?.htmlBody?.contains("body \(i)") ?? false
+                }
+            }
+            var ok = 0
+            for await r in group where r { ok += 1 }
+            return ok
+        }
+
+        // Every concurrent fetch completed → the gate released slots correctly
+        // and no caller was stranded.
+        #expect(okCount == count)
+        // …and each one actually hit the network (no request swallowed by the gate).
+        let gets = FakeHTTP.recordedCalls().filter { $0.url.contains("/messages/cmsg-") }
+        #expect(gets.count >= count)
+    }
+
     @Test("search with empty folder is account-wide: no labelIds, no exclusion terms")
     func searchAccountWideOmitsScoping() async throws {
         FakeHTTP.reset()
