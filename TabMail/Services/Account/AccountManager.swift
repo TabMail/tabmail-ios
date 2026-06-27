@@ -225,7 +225,7 @@ actor AccountManager {
     // processingAccounts and aiProcessingTasks removed — AI processing now handled by
     // ActiveBodyQueue + ActiveAIQueue actors (event-driven, decoupled from sync).
 
-    var dbPool: DatabasePool { AppDatabase.dbPool }
+    var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // MARK: - Demo Mode provider injection
 

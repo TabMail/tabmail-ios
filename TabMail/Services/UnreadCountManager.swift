@@ -24,7 +24,7 @@ actor UnreadCountManager {
     /// True while a recount is in-flight or the cooldown window is open.
     private var isActive = false
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     /// Request a recount of unread messages for the given folder IDs.
     /// First request fires immediately. Subsequent requests within the

@@ -460,11 +460,11 @@ actor ChatStore {
         try Self.evictInboxSessionsImpl(dbPool: AppDatabase.dbPool, limit: limit)
     }
 
-    nonisolated func evictInboxSessionsSync(dbPool: DatabasePool, limit: Int) throws -> Int {
+    nonisolated func evictInboxSessionsSync(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         try Self.evictInboxSessionsImpl(dbPool: dbPool, limit: limit)
     }
 
-    private static func evictInboxSessionsImpl(dbPool: DatabasePool, limit: Int) throws -> Int {
+    private static func evictInboxSessionsImpl(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         try dbPool.write { db in
             let sessionRows = try Row.fetchAll(db, sql: """
                 SELECT sessionId, MAX(timestamp) as maxTs
@@ -515,11 +515,11 @@ actor ChatStore {
     }
 
     /// Nonisolated eviction for background maintenance thread.
-    nonisolated func evictHistoryBeyondCapSync(dbPool: DatabasePool, maxTurns: Int) throws -> [String] {
+    nonisolated func evictHistoryBeyondCapSync(dbPool: PrioritizedDatabase, maxTurns: Int) throws -> [String] {
         try Self.evictHistoryBeyondCapImpl(dbPool: dbPool, maxTurns: maxTurns)
     }
 
-    private static func evictHistoryBeyondCapImpl(dbPool: DatabasePool, maxTurns: Int) throws -> [String] {
+    private static func evictHistoryBeyondCapImpl(dbPool: PrioritizedDatabase, maxTurns: Int) throws -> [String] {
         try dbPool.write { db in
             let totalCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM chatHistory") ?? 0
             guard totalCount > maxTurns else { return [] }
@@ -549,11 +549,11 @@ actor ChatStore {
     }
 
     /// Nonisolated eviction for background maintenance thread.
-    nonisolated func evictMessageDetailSessionsSync(dbPool: DatabasePool, limit: Int) throws -> Int {
+    nonisolated func evictMessageDetailSessionsSync(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         try Self.evictMessageDetailSessionsImpl(dbPool: dbPool, limit: limit)
     }
 
-    private static func evictMessageDetailSessionsImpl(dbPool: DatabasePool, limit: Int) throws -> Int {
+    private static func evictMessageDetailSessionsImpl(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         try dbPool.write { db in
             let sessionRows = try Row.fetchAll(db, sql: """
                 SELECT sessionId, MAX(timestamp) as maxTs
@@ -614,11 +614,11 @@ actor ChatStore {
     }
 
     /// Nonisolated eviction for background maintenance thread.
-    nonisolated func evictComposeSessionsSync(dbPool: DatabasePool, ttlDays: Int) throws -> Int {
+    nonisolated func evictComposeSessionsSync(dbPool: PrioritizedDatabase, ttlDays: Int) throws -> Int {
         try Self.evictComposeSessionsImpl(dbPool: dbPool, ttlDays: ttlDays)
     }
 
-    private static func evictComposeSessionsImpl(dbPool: DatabasePool, ttlDays: Int) throws -> Int {
+    private static func evictComposeSessionsImpl(dbPool: PrioritizedDatabase, ttlDays: Int) throws -> Int {
         let cutoffMs = (Date().timeIntervalSince1970 - Double(ttlDays) * 86400) * 1000
         return try dbPool.write { db in
             let sessionRows = try Row.fetchAll(db, sql: """

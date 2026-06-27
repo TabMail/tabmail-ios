@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import UserNotifications
 
 /// Bridges data between the main app and the Notification Service Extension.
@@ -12,6 +13,58 @@ import UserNotifications
 enum NSEDataBridge {
     private static let appGroupId = "group.ai.tabmail"
     private static var suite: UserDefaults? { UserDefaults(suiteName: appGroupId) }
+
+    /// Cached read connection to the NSE staging DB for the read-path "is there
+    /// anything to merge?" check. We deliberately do NOT use a cross-process dirty
+    /// FLAG — a flag can drift (a false-negative silently skips a merge). Instead
+    /// we query the REAL staging DB (source of truth, can't drift), and cache the
+    /// connection so the check is a ~µs `EXISTS` query rather than a per-read DB
+    /// open. `nil` until the staging file first exists (no push received yet).
+    private static let stagingProbe = Mutex<DatabaseQueue?>(nil)
+
+    private static func stagingProbeConnection() -> DatabaseQueue? {
+        stagingProbe.withLock { cached in
+            if let cached { return cached }
+            guard let containerURL = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: appGroupId) else { return nil }
+            let path = containerURL.appendingPathComponent("nse_staging.sqlite").path
+            guard FileManager.default.fileExists(atPath: path) else { return nil }
+            var config = Configuration()
+            config.observesSuspensionNotifications = true   // ADR-IOS-041
+            config.busyMode = .timeout(1.0)
+            let q = try? DatabaseQueue(path: path, configuration: config)
+            cached = q
+            return q
+        }
+    }
+
+    /// True when the staging DB actually holds a populated (merge-ready) row.
+    /// Reads the real staging DB via the cached connection — correct (no drift),
+    /// and cheap (no per-read open).
+    private static func stagingHasPending() async -> Bool {
+        guard let db = stagingProbeConnection() else { return false }
+        return (try? await db.read { db -> Bool in
+            guard try db.tableExists("nse_processed_message") else { return false }
+            return try Bool.fetchOne(
+                db, sql: "SELECT EXISTS(SELECT 1 FROM nse_processed_message WHERE populated = 1)"
+            ) ?? false
+        }) ?? false
+    }
+
+    /// READ-PATH entry: drain NSE staging into main GRDB if (and only if) the
+    /// staging DB has a pending row. Treats staging as a read-through delta — any
+    /// read (UI render, silent push, BGAppRefresh, BGProcessing) merges it first,
+    /// with no per-call-site placement. The pending check reads the real staging
+    /// DB (no flag drift) and is ~µs when empty; the full merge runs only when
+    /// there's actually something to merge.
+    static func mergeIfStagingPending() async {
+        // Recursion guard: the merge does its own GRDB reads (e.g. the FTS flush
+        // bulk header read), which run inside `PriorityGate.privileged` — don't
+        // re-trigger a merge from within one.
+        guard !PriorityGate.inPrivilegedContext else { return }
+        guard await stagingHasPending() else { return }
+        await mergeNSEStagingData()
+    }
 
     // MARK: - Mirror (Main App → Shared UserDefaults for NSE)
 
@@ -204,7 +257,23 @@ enum NSEDataBridge {
         return try? DatabaseQueue(path: stagingPath, configuration: config)
     }
 
+    /// Public entry point. The NSE→inbox merge is a PRIVILEGED, single-threaded
+    /// step of the boot / foreground sequence — it must run ALONE (no concurrent
+    /// sibling merge fighting the staging-DB busy lock, and ideally ahead of the
+    /// sync/backfill/AI herd contending for the GRDB writer) and FULLY complete
+    /// before the rest of the herd starts. All six call sites (deep-link tap,
+    /// foreground outer, `syncStartup` step-0, foreground-push `willPresent`,
+    /// silent push, AI queue) funnel through `NSEMergeCoordinator` so they
+    /// serialize into one in-flight run instead of each opening the staging DB
+    /// and waiting out the 2s/5s `busyMode` timeout behind the others.
     static func mergeNSEStagingData(stagingPathOverride: String? = nil) async {
+        await NSEMergeCoordinator.shared.merge(stagingPathOverride: stagingPathOverride)
+    }
+
+    /// The actual merge work. NEVER call directly — go through
+    /// `mergeNSEStagingData` so the coordinator's serialization holds. (Only the
+    /// coordinator calls this.)
+    static func performMerge(stagingPathOverride: String? = nil) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         print("[NSEDataBridge] mergeNSEStagingData: START")
         BootProfiler.mark("mergeNSEStagingData START")
@@ -629,14 +698,13 @@ enum NSEDataBridge {
                 outerCommitted = true
                 print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
-                // Trigger UI refresh if ANY savepoint committed — including kept
-                // gradual rows (header/body staged, AI pending) that changed main
-                // GRDB but are not yet in the delete set.
-                if committedCount > 0 {
-                    Task { @MainActor in
-                        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-                    }
-                }
+                // NOTE: no UI-refresh post here anymore. The whole merge emits
+                // ONE `.inboxDataDidChange` (immediate) at the very end, after the
+                // synchronous FTS flush below has flipped `headerComplete=1` — so
+                // a brand-new staged header is already VISIBLE to the inbox query
+                // (which filters `headerComplete == true`) when the single reload
+                // fires. Posting mid-flight here would trigger a reload that the
+                // not-yet-flipped header would miss.
             } catch {
                 // Outer dbPool.write threw — usually a hard SQLite error
                 // (SQLITE_FULL/IOERR/INTERRUPT) at commit time. EVERY released
@@ -664,11 +732,20 @@ enum NSEDataBridge {
             if outerCommitted {
                 // Fire ONE batched FTS pipeline for all committed messages.
                 // No-op if ftsBatch is empty.
+                //
+                // AWAITED (not detached) — this is what flips `headerComplete=1`
+                // (and `bodyComplete=1`). Because the merge is privileged and
+                // single-threaded (see `NSEMergeCoordinator`), nothing else is
+                // contending for the GRDB / FTS writers while it runs, so the
+                // flush is fast; awaiting it means the brand-new staged header is
+                // FTS-indexed and `headerComplete=1` BEFORE the single end-of-merge
+                // `.inboxDataDidChange` fires. The inbox query gates on
+                // `headerComplete == true`, so this is the difference between the
+                // pushed message appearing in this reload vs. waiting (invisibly)
+                // for some unrelated later signal. The pre-rendered body landing
+                // here too means the user opens it with no "loading body" flash.
                 if !ftsBatch.isEmpty {
-                    let batchSnapshot = ftsBatch
-                    Task {
-                        await Self.flushNSEBatchToFTS(items: batchSnapshot)
-                    }
+                    await Self.flushNSEBatchToFTS(items: ftsBatch)
                 }
 
                 // Delete only the rows whose per-msg savepoint released AND
@@ -739,6 +816,25 @@ enum NSEDataBridge {
             // (Includes ADR-IOS-041 suspension aborts; don't log those at all.)
             if !error.isDatabaseSuspensionAbort {
                 print("[NSEDataBridge] Orphan reap failed: \(error)")
+            }
+        }
+
+        // SINGLE end-of-merge UI signal. Every stage (header → body → summary →
+        // action → synchronous FTS flip → inbox removals → task results) is now
+        // durable, so we post ONE `.inboxDataDidChange` here instead of mid-flight
+        // — less reload churn, and the row is fully visible (`headerComplete=1`)
+        // and bodied when the single reload reads. It carries `inboxReloadImmediate`
+        // so the inbox reloads AT ONCE, bypassing its 500ms background-coalescing
+        // debounce: this merge is the privileged, single-threaded boot-priority
+        // step and must paint immediately (the debounce stays for the noisy
+        // background producers — sync/backfill/AI — not for the merge).
+        if didMutate {
+            Task { @MainActor in
+                NotificationCenter.default.post(
+                    name: .inboxDataDidChange,
+                    object: nil,
+                    userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+                )
             }
         }
 
@@ -820,11 +916,8 @@ enum NSEDataBridge {
             // removal DELETEs are durable and we can safely clear staging.
             outerCommitted = true
             print("[NSEDataBridge] Merged \(successfullyConsumedIds.count)/\(removals.count) inbox removal(s), deleted \(deletedTotal) header row(s)")
-            if deletedTotal > 0 {
-                Task { @MainActor in
-                    NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-                }
-            }
+            // No post here — `performMerge` emits ONE immediate `.inboxDataDidChange`
+            // at the end (this function's `deletedTotal > 0` return feeds `didMutate`).
         } catch {
             // Outer dbPool.write threw — even per-row DELETEs that we logged
             // as committed got rolled back with the outer tx. Don't clear
@@ -1476,5 +1569,64 @@ enum NSEDataBridge {
         // IMAP tag write + AI cache write are done by the caller (they're
         // shared with the existing-header branch).
         return didInsert
+    }
+}
+
+// MARK: - Merge serialization
+
+/// Serializes every `NSEDataBridge.mergeNSEStagingData` request so the NSE→inbox
+/// merge runs as a PRIVILEGED, single-threaded step — never two at once.
+///
+/// Why: the merge is part of the boot / foreground sequence and is privileged.
+/// It must complete BEFORE the sync/backfill/AI herd starts, and it must not
+/// have a sibling merge running alongside it. Before this coordinator, six call
+/// sites (deep-link tap, foreground outer, `syncStartup` step-0, foreground-push
+/// `willPresent`, silent push, AI queue) could each fire concurrently; each
+/// opened its own `DatabaseQueue` to the staging DB and waited out the 2s-then-5s
+/// `busyMode` timeout behind the others, while all of them piled onto GRDB's
+/// single writer. That contention is exactly the "sometimes 3-5s" deep-link and
+/// inbox-merge lag.
+///
+/// Semantics: a serial task chain. Each caller links its merge after the current
+/// tail and awaits ONLY its own link, so:
+///   • No two `performMerge` runs ever overlap (no staging-DB / writer fights).
+///   • A caller's await returns only after a merge that STARTED no earlier than
+///     its call — so data a still-finishing NSE staged mid-read is never missed.
+/// Concurrent callers therefore form A→B→C; passes after the first find the
+/// staging table already drained and early-return in ~ms (idempotent), so the
+/// extra serial passes are effectively free.
+actor NSEMergeCoordinator {
+    static let shared = NSEMergeCoordinator()
+
+    /// Tail of the serial chain. `nil` when no merge is in flight.
+    private var tail: Task<Void, Never>?
+    /// Monotonic id so the tail-clearing check doesn't need `Task` identity
+    /// (Task isn't Equatable): a caller clears the tail only if no later caller
+    /// chained after it.
+    private var generation = 0
+
+    func merge(stagingPathOverride: String? = nil) async {
+        let previous = tail
+        generation += 1
+        let gen = generation
+        let mine = Task { [previous] in
+            // Wait our turn (serial — the privileged merge runs alone), then do
+            // the actual work. `previous` may be a completed task (instant) on a
+            // cold chain.
+            await previous?.value
+            // PRIVILEGED section: the heavy background writers (backfill body/AI,
+            // embedding queues, header walk) yield to the merge so it doesn't
+            // queue behind their GRDB/FTS-writer transactions or compete for the
+            // cooperative pool. This is what makes "single-threaded" actually hold
+            // against an in-flight backfill, not just against other merges.
+            await PriorityGate.privileged {
+                await NSEDataBridge.performMerge(stagingPathOverride: stagingPathOverride)
+            }
+        }
+        tail = mine
+        await mine.value
+        // If nobody chained after us, drop the (now-completed) tail so the next
+        // merge starts a fresh chain instead of awaiting a dead task.
+        if generation == gen { tail = nil }
     }
 }

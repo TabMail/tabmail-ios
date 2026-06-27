@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// End-to-end coverage for the GRADUAL NSE staging merge (2026-06-25).
@@ -213,6 +214,113 @@ struct NSEGradualMergeTests {
         let bodyCount = try await pool.read { try MessageBody.filter(Column("id") == headerId()).fetchCount($0) }
         #expect(bodyCount == 1)
         #expect(try stagingRowExists(q) == false)
+    }
+
+    @Test("Coordinator serializes concurrent merges — terminal row merged exactly once")
+    func concurrentMergesSerialized() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // A complete, terminal staged message.
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        try stageAIRow(q, action: "archive")
+
+        // Fire several merges concurrently. WITHOUT the coordinator these would
+        // each open the staging DB in parallel and fight the busy lock / GRDB
+        // writer (the "sometimes slow" contention). WITH it they serialize into
+        // one chain: the first pass does the work + deletes the staging row, the
+        // rest find it drained and early-return. INSERT OR IGNORE + the
+        // deterministic AI-cache key make the end state exactly-once regardless
+        // of how many callers raced.
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<5 {
+                group.addTask { await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path) }
+            }
+        }
+
+        let headerCount = try await pool.read {
+            try MessageHeader.filter(Column("id") == headerId()).fetchCount($0)
+        }
+        #expect(headerCount == 1)
+        let bodyCount = try await pool.read {
+            try MessageBody.filter(Column("id") == headerId()).fetchCount($0)
+        }
+        #expect(bodyCount == 1)
+        let cacheCount = try await pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageAICache") ?? 0
+        }
+        #expect(cacheCount == 1)
+        let h = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(h?.actionTag == .archive)
+        #expect(try stagingRowExists(q) == false)
+    }
+
+    @Test("Synchronous FTS flush flips headerComplete so the merged message is inbox-visible")
+    @MainActor func mergeFlipsHeaderCompleteSynchronously() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // Header only — no body text, so nothing is FTS-indexed and
+        // headerComplete stays false (the inbox query would hide this row).
+        try stageHeaderRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        let afterHeader = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(afterHeader?.headerComplete == false)
+
+        // Body staged: the merge now AWAITS the FTS flush (was a detached Task), so
+        // `headerComplete=1` / `bodyComplete=1` MUST be set by the time the merge
+        // returns. This is the visibility fix: the inbox query filters
+        // `headerComplete == true`, so a regression to a detached flush would leave
+        // the freshly-merged message invisible until some unrelated later signal.
+        try stageBodyRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        let afterBody = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(afterBody?.headerComplete == true)
+        #expect(afterBody?.bodyComplete == true)
+    }
+
+    @Test("Merge emits exactly ONE inboxDataDidChange, flagged immediate (bypasses debounce)")
+    @MainActor func mergePostsSingleImmediateSignal() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        try stageAIRow(q, action: "archive")
+
+        // Capture every .inboxDataDidChange + whether it carried the immediate flag.
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { note in
+            let imm = (note.userInfo?[Notification.Name.inboxReloadImmediateKey] as? Bool) == true
+            posts.withLock { $0.append(imm) }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        // The single post is dispatched via Task { @MainActor } at the very end of
+        // the merge — let it run.
+        try await Task.sleep(for: .milliseconds(200))
+
+        let captured = posts.withLock { $0 }
+        // Exactly one (the old code posted mid-merge for messages AND again for
+        // removals); and it MUST be flagged immediate so the inbox bypasses the
+        // 500ms debounce.
+        #expect(captured.count == 1)
+        #expect(captured.first == true)
     }
 
     /// Simulator measurement: a clean header-only merge (no AI, no contention)

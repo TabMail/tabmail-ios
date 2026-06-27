@@ -129,7 +129,7 @@ final class ChatPillState {
             var isFirstEmission = true
             var debounceTask: Task<Void, Never>?
             do {
-                for try await _ in observation.values(in: AppDatabase.dbPool) {
+                for try await _ in observation.values(in: AppDatabase.rawPool) {
                     if isFirstEmission {
                         activeReminders = await ReminderBuilder.getRandomReminders(count: 3, force: true)
                         isFirstEmission = false

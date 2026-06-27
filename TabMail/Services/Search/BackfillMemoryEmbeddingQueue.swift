@@ -150,6 +150,9 @@ actor BackfillMemoryEmbeddingQueue {
     }
 
     private func processBatch(_ items: [Item]) async {
+        // Yield to a privileged merge before CoreML inference + the memory vec
+        // write (MemoryIndex is a separate pool with sync `@noasync` writes).
+        await PriorityGate.shared.yield("backfill-memory-embed")
         let t0 = CFAbsoluteTimeGetCurrent()
         guard let embeddingService = EmbeddingService.shared else {
             // Mark all items shouldRetry:false so they don't loop; next

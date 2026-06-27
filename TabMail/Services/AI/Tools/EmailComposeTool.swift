@@ -109,7 +109,7 @@ struct EmailComposeTool: AgentTool, Sendable {
         relatedBodyText: String? = nil,
         db: (any DatabaseReader & Sendable)? = nil
     ) async throws -> InlineEditResult {
-        let dbReader = db ?? AppDatabase.dbPool
+        let dbReader = db ?? AppDatabase.rawPool
         // Get sender info from primary account (matching TB's user identity resolution)
         let account: Account? = try? await dbReader.read { db in
             if let primary = try Account.filter(Column("isActive") == true && Column("isPrimary") == true).fetchOne(db) {

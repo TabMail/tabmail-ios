@@ -370,15 +370,22 @@ enum SyncConfig {
     /// this mainly serves IMAP-only accounts and as a safety net.
     static let foregroundPollIntervalSeconds: TimeInterval = 300 // 5 min
 
-    /// One-shot settle before the FIRST foreground sync herd after a cold launch.
-    /// The inbox renders at `AppStartup.isReady`; the SwiftUI first render is the
-    /// heaviest main-thread span of the launch. Letting it paint before kicking
-    /// the NSE merge + sync + queue repopulation herd keeps "show the inbox" the
-    /// sole priority of the first frame (the herd is not needed to display cached
-    /// mail). Applies only to the first foreground per process — warm returns skip
-    /// it (the inbox is already on screen). Kept short so NSE-staged mail still
-    /// merges in promptly right after the inbox appears.
-    static let firstForegroundSettleSeconds: TimeInterval = 0.35
+    /// Safety-net timeout for the first-paint launch gate
+    /// (`AppStartup.awaitLaunchReady(background: false)`). The deferrable FOREGROUND
+    /// boot herd (NSE merge / sync / queue repopulation / CoreML load) waits for the
+    /// REAL first paint (`isReady`), not a fixed settle. A foreground launch always
+    /// paints, so this bound is only reached on a background launch (no paint) or a
+    /// pathological stall — it just stops the herd hanging forever.
+    static let firstPaintGateTimeoutSeconds: Double = 8
+
+    /// First-paint-gate timeout for the CoreML embedding load specifically (the one
+    /// boot task that runs on BOTH launch kinds). On a FOREGROUND launch it resumes
+    /// at first paint and this value is irrelevant; on a cold BACKGROUND launch
+    /// (which never paints) it waits this long so the privileged NSE merge wins the
+    /// CPU first, THEN loads the 45MB model. Sized comfortably above the unburdened
+    /// merge's worst case (a few hundred ms incl. a cold first FTS open) — far below
+    /// the earlier arbitrary 3s.
+    static let embeddingLoadGateTimeoutSeconds: Double = 1
 
     /// BGAppRefresh earliest begin date. iOS controls actual timing;
     /// this is the minimum delay we request.

@@ -39,7 +39,7 @@ struct SearchView: View {
     /// Each "load older" step goes this many more days back
     private let olderStepDays: Int = 60
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
     private var isSearching: Bool { pendingAccounts > 0 }
 
     /// Folder IDs for scoped search, or nil for search-all.

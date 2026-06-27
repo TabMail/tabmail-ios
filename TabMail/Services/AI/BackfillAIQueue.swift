@@ -37,7 +37,7 @@ actor BackfillAIQueue {
     private var activeBatchCount = 0
     private let maxActiveBatches = 1
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // MARK: - Public API — enqueue
 
@@ -218,6 +218,9 @@ actor BackfillAIQueue {
             #endif
             return
         }
+
+        // Pause the whole batch while a privileged merge holds the gate.
+        await PriorityGate.shared.yield("backfill-ai")
 
         // Collect candidates; drop those still in backoff.
         let rawCandidates = storage.collectCandidates(

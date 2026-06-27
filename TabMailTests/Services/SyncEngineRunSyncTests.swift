@@ -1011,7 +1011,7 @@ struct RunSyncUIDRemapFtsRekeyTests {
         ])
 
         let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: pool)
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
 
         // ftsRekeys carries the move, with the new provider message id.
         #expect(result.ftsRekeys.count == 1)

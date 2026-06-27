@@ -79,7 +79,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             Task { @MainActor in
                 // A push can arrive during the one-time migration window; wait
                 // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
-                await AppStartup.shared.awaitReady()
+                await AppStartup.shared.awaitLaunchReady(background: true)
                 await NSEDataBridge.mergeNSEStagingData()
                 await SyncScheduler.shared.syncStartup(inboxOnly: true)
             }
@@ -130,7 +130,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
                 // A notification action can fire during the one-time migration
                 // window; wait for the DB before touching it (AppStartup).
-                await AppStartup.shared.awaitReady()
+                await AppStartup.shared.awaitLaunchReady(background: true)
                 let header: MessageHeader?
                 do {
                     header = try await AppDatabase.dbPool.read { db -> MessageHeader? in
@@ -180,9 +180,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                     defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
                     // Can fire during the one-time migration window — wait for
                     // the DB before touching it (AppStartup).
-                    await AppStartup.shared.awaitReady()
+                    await AppStartup.shared.awaitLaunchReady(background: true)
                     do {
-                        // Async context (awaitReady above) → GRDB async write overload.
+                        // Async context (awaitLaunchReady above) → GRDB async write overload.
                         try await AppDatabase.dbPool.write { db in
                             let opType: String
                             switch actionId {
@@ -410,7 +410,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // A silent push can arrive during the one-time migration window; wait
         // for the DB to finish building before any handler touches it
         // (AppDatabase.dbPool force-unwraps AppDatabase.shared). See AppStartup.
-        await AppStartup.shared.awaitReady()
+        await AppStartup.shared.awaitLaunchReady(background: true)
 
         let appState = application.applicationState
         let stateStr = appState == .active ? "active" : appState == .background ? "background" : "inactive"

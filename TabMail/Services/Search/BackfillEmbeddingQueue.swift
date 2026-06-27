@@ -184,6 +184,9 @@ actor BackfillEmbeddingQueue {
     }
 
     private func processBatch(_ items: [Item]) async {
+        // Yield to a privileged merge before CoreML inference + the FTS vector
+        // write (SearchIndex is a separate pool with sync `@noasync` writes).
+        await PriorityGate.shared.yield("backfill-embed")
         let t0 = CFAbsoluteTimeGetCurrent()
         guard let embeddingService = EmbeddingService.shared else {
             for item in items { storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries) }

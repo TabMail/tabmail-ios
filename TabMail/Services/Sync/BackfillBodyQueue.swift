@@ -42,7 +42,7 @@ actor BackfillBodyQueue {
     private var folderActiveBatches: [String: Int] = [:]
     private let maxBatchesPerFolder = 2
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // MARK: - Public API
 
@@ -204,6 +204,12 @@ actor BackfillBodyQueue {
             return
         }
 
+        // PAUSE THE WHOLE BATCH while a privileged merge holds the gate — the
+        // body fetch + render (CPU) + FTS write should all step aside for a
+        // foreground NSE→inbox merge, not just the individual GRDB writes.
+        // No-op when nothing privileged is active.
+        await PriorityGate.shared.yield("backfill-body")
+
         // Always collect a full batch — concurrency is limited by activeBatchCount, not per-item
         let batch = storage.collectCandidates(maxJobs: storage.activeJobs + batchSize)
         guard !batch.isEmpty else { print("[BackfillBody] dispatchBatch: no candidates"); return }
@@ -330,8 +336,13 @@ actor BackfillBodyQueue {
                     }
                     let processMs = Int((CFAbsoluteTimeGetCurrent() - tProcess) * 1000)
 
-                    // 3. Write ALL to FTS + update headers in one batch
+                    // 3. Write ALL to FTS + update headers in one batch.
+                    // Yield to a privileged merge before the write: the FTS write
+                    // (SearchIndex) is a SEPARATE pool the `dbPool` wrapper can't
+                    // gate, and SearchIndex's writes are sync (`@noasync` — can't be
+                    // gated inside the actor), so the async background CALLER yields.
                     if !processedItems.isEmpty {
+                        await PriorityGate.shared.yield("backfill-body-write")
                         await BodyFetchProcessor.flushBatch(processedItems, enableAI: false)
                     }
 

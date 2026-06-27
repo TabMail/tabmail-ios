@@ -111,7 +111,7 @@ struct ComposeView: View {
     /// `didEndPresentationScope` flag make duplicate calls no-ops.
     @State private var lifecycleTracker = ComposeLifecycleTracker()
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private enum ComposeField {
         case to, cc, bcc, body
@@ -1004,7 +1004,7 @@ struct ComposeView: View {
     /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it.
     private func persistCachedReply(_ text: String) {
         guard let reply = replyTo else { return }
-        Task { await Self.writeCachedReplyToDB(text, headerId: reply.id, db: dbPool) }
+        Task { await Self.writeCachedReplyToDB(text, headerId: reply.id, db: dbPool.pool) }
     }
 
     /// Internal for testability — exact SQL used by `persistCachedReply`.

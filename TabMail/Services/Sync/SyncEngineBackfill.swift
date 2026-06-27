@@ -230,6 +230,13 @@ extension SyncEngine {
                         continue
                     }
 
+                    // PAUSE THE WHOLE CRAWL while a privileged merge holds the gate.
+                    // The per-write facade yield only steps the GRDB writes aside;
+                    // this parks the entire batch (network fetch + body render CPU +
+                    // FTS index) so a foreground NSE→inbox merge runs unburdened.
+                    // No-op when nothing privileged is active.
+                    await PriorityGate.shared.yield("backfill-walk")
+
                     // Pause backfill when user has WiFi-only setting enabled and we're on cellular.
                     // Uses checkExpensive() (Mutex-backed) as WiFi proxy — on iOS, expensive == cellular/hotspot.
                     // Pauses (not stops) so backfill resumes instantly when WiFi returns or setting is toggled.

@@ -281,7 +281,7 @@ struct QueueStorage<Item: Hashable> {
 /// Used by drain queues (PendingOperation, Outbox, Calendar) for critical DB writes
 /// that must succeed (e.g., deleting a completed op after remote execution).
 func retryWrite<T: Sendable>(
-    _ dbPool: DatabasePool,
+    _ dbPool: PrioritizedDatabase,
     maxAttempts: Int = 3,
     retryDelay: Duration = .milliseconds(100),
     label: String,

@@ -48,7 +48,7 @@ enum StuckMessageDiagnostics {
 
     static func run() async {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        let pool = AppDatabase.dbPool
+        let pool = AppDatabase.rawPool
         BackgroundSyncLogger.clearStuckDiagLog()
         BackgroundSyncLogger.logStuckDiag("==== Stuck-message scan START ====")
 

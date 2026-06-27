@@ -10,7 +10,7 @@ extension SyncEngine {
     // MARK: - Background Maintenance (nonisolated)
 
     /// Nonisolated prune — runs entirely off the main thread.
-    nonisolated static func runPruneIfOverBudget(dbPool: DatabasePool) {
+    nonisolated static func runPruneIfOverBudget(dbPool: PrioritizedDatabase) {
         guard StorageEstimator.isOverBudget() else { return }
 
         let totalMB = StorageEstimator.totalSizeMB()
@@ -111,7 +111,7 @@ extension SyncEngine {
     }
 
     /// Nonisolated evict — runs entirely off the main thread.
-    nonisolated static func runEvictStaleBodies(dbPool: DatabasePool, undoProtectedBodyIds: Set<String>) {
+    nonisolated static func runEvictStaleBodies(dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>) {
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date()) ?? Date.distantPast
         let recentPerFolder = SyncConfig.bodyCacheRecentPerFolder
         let chunkSize = SyncConfig.pruneChunkSize
@@ -184,7 +184,7 @@ extension SyncEngine {
     /// Lazy TTL touch + purge — runs after AI queue drains, not during sync.
     /// Touches updatedAt on all inbox AI cache entries, then purges expired ones.
     /// Runs on a background thread to avoid GRDB writer lock contention on MainActor.
-    nonisolated static func refreshAICacheTTLAndPurge(dbPool: DatabasePool) {
+    nonisolated static func refreshAICacheTTLAndPurge(dbPool: PrioritizedDatabase) {
         // Touch: refresh TTL for all inbox messages' AI cache entries
         do {
             let touchedCount = try dbPool.write { db in
@@ -215,7 +215,7 @@ extension SyncEngine {
     }
 
     /// Nonisolated purge — runs entirely off the main thread.
-    nonisolated static func runPurgeExpiredAICache(dbPool: DatabasePool) {
+    nonisolated static func runPurgeExpiredAICache(dbPool: PrioritizedDatabase) {
         let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date()) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
@@ -359,7 +359,7 @@ extension SyncEngine {
     /// 2. Compose: delete turns older than TTL (compose sessions are never resumable; each opens fresh)
     /// 3. Compose drafts: DraftStore model eviction (count-based)
     /// 4. Global turn cap: delete oldest turns across all types (enforces Memory setting)
-    nonisolated static func runEvictChatSessions(dbPool: DatabasePool) {
+    nonisolated static func runEvictChatSessions(dbPool: PrioritizedDatabase) {
         let msgLimit = SyncConfig.maxMessageChatSessions
         let composeLimit = SyncConfig.maxComposeDraftSessions
         let composeTTL = SyncConfig.composeChatSessionTTLDays

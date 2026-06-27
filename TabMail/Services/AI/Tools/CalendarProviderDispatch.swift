@@ -76,7 +76,7 @@ enum CalendarProviderDispatch {
     /// Resolve the active calendar backend for tool calls.
     /// Uses the preferred account if set, otherwise falls back to the first account with a calendar provider.
     static func resolve(db: (any DatabaseReader & Sendable)? = nil) async -> CalendarBackend {
-        let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.dbPool
+        let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.rawPool
         let manager = AccountManager.shared
 
         // Use preferred account if set and still active
@@ -109,7 +109,7 @@ enum CalendarProviderDispatch {
     /// Snapshots the providers dict on main actor (instant), then does GRDB reads off-main
     /// to avoid holding the main actor during IO.
     static func resolveAll(db: (any DatabaseReader & Sendable)? = nil) async -> [(provider: any CalendarProvider, account: Account)] {
-        let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.dbPool
+        let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.rawPool
         // One instant main-actor hop to snapshot the dict
         let calProviders = await AccountManager.shared.calendarProviders
         // Rest runs off-main — GRDB is thread-safe

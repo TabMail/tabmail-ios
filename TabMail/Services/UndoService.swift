@@ -48,7 +48,7 @@ final class UndoService {
     private(set) var showToast = false
 
     private var dismissTask: Task<Void, Never>?
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private init() {}
 

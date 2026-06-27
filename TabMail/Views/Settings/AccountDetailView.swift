@@ -18,7 +18,7 @@ struct AccountDetailView: View {
     @State private var isResetting = false
     @State private var folders: [Folder] = []
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     /// The assignable roles (excluding .custom which is the default)
     private let assignableRoles: [FolderRole] = [.inbox, .sent, .drafts, .archive, .trash, .spam]

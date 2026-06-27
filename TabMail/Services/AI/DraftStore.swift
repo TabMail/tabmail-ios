@@ -349,11 +349,11 @@ actor DraftStore {
     }
 
     /// Nonisolated eviction for background maintenance thread.
-    nonisolated func evictSync(dbPool: DatabasePool, limit: Int) throws -> Int {
+    nonisolated func evictSync(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         try Self.evictImpl(dbPool: dbPool, limit: limit)
     }
 
-    private static func evictImpl(dbPool: DatabasePool, limit: Int) throws -> Int {
+    private static func evictImpl(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         // Collect attachment dirs to delete outside the DB transaction (file I/O outside transaction)
         var attachmentDirsToDelete: [String] = []
 

@@ -64,7 +64,7 @@ struct ToolContext: Sendable {
 
     /// Production default: uses app singletons.
     init() {
-        self.db = AppDatabase.dbPool
+        self.db = AppDatabase.rawPool
         self.translator = ChatIdTranslator.shared
         self.routerOverride = nil
     }

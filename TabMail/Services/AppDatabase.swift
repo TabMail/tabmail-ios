@@ -133,9 +133,19 @@ final class AppDatabase: Sendable {
     /// Read-write access (serialized writes).
     var writer: any DatabaseWriter { dbPool }
 
-    /// Convenience accessor — safe after app init.
-    static var dbPool: DatabasePool {
+    /// The raw GRDB pool. Use ONLY for GRDB APIs that require a `DatabasePool` /
+    /// `DatabaseReader` (e.g. `ValueObservation.publisher(in:)`). For reads/writes
+    /// prefer `dbPool` so priority is applied uniformly (see `PrioritizedDatabase`).
+    static var rawPool: DatabasePool {
         shared.withLock { $0!.dbPool }
+    }
+
+    /// The app database chokepoint — every read/write flows through here. Its
+    /// async writes yield to an active privileged section (the NSE→inbox merge /
+    /// boot path) automatically, so essential work isn't queued behind them; the
+    /// privileged context itself is exempt (see `PriorityGate`/`PrioritizedDatabase`).
+    static var dbPool: PrioritizedDatabase {
+        PrioritizedDatabase(pool: rawPool)
     }
 
     // MARK: - NSE Staging Database

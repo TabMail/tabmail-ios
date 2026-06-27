@@ -39,6 +39,11 @@ extension SyncEngine {
     /// Sets headerComplete=1 in GRDB after FTS indexing succeeds.
     func indexHeadersForFTS(_ records: [FTSHeaderRecord]) async {
         guard !records.isEmpty else { return }
+        // Yield to a privileged merge before the FTS index write. This is the
+        // common chokepoint for header indexing (backfill walk, self-heal,
+        // recover) — SearchIndex's writes are a separate sync `@noasync` pool, so
+        // the async caller yields on its behalf.
+        await PriorityGate.shared.yield("fts-index")
         do {
             let inserted = try await SearchIndex.shared.indexHeaders(records)
             if inserted > 0 {

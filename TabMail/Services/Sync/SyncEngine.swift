@@ -43,7 +43,7 @@ actor SyncEngine {
     var recoverIncompleteExplainLogged = false
 
     /// GRDB DatabasePool — thread-safe, no background queue needed.
-    var dbPool: DatabasePool { AppDatabase.dbPool }
+    var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     /// Read current fast sync mode state from AccountManager (MainActor hop).
     func getIsFastSync() async -> Bool {

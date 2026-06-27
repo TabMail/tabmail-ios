@@ -22,7 +22,7 @@ actor PushNotificationService {
     static let shared = PushNotificationService()
 
     let pushClient = PushClient()
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     #if DEBUG
     /// Test-only override for the consent-status scan. When nil, the real
@@ -150,7 +150,7 @@ actor PushNotificationService {
         // app update the DB build is delayed by migrations, so this path wins the
         // race. Gate on readiness like every other dbPool entry point. (Cheap once
         // ready; the no-session / no-token early returns above already skipped it.)
-        await AppStartup.shared.awaitReady()
+        await AppStartup.shared.awaitLaunchReady(background: true)
 
         do {
             let emails = try await dbPool.read { db in

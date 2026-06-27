@@ -26,7 +26,7 @@ struct RetryWriteTests {
 
     @Test("Succeeds on first attempt")
     func successFirstAttempt() async throws {
-        let db = try Self.makePool()
+        let db = PrioritizedDatabase(pool: try Self.makePool())
         let callCount = Mutex(0)
         let result = try await retryWrite(db, maxAttempts: 3, retryDelay: .milliseconds(10), label: "test") { db in
             callCount.withLock { $0 += 1 }
@@ -38,7 +38,7 @@ struct RetryWriteTests {
 
     @Test("Retries on transient failure then succeeds")
     func retryThenSucceed() async throws {
-        let db = try Self.makePool()
+        let db = PrioritizedDatabase(pool: try Self.makePool())
         let callCount = Mutex(0)
         let result = try await retryWrite(db, maxAttempts: 3, retryDelay: .milliseconds(10), label: "test") { db in
             let count = callCount.withLock { $0 += 1; return $0 }
@@ -54,7 +54,7 @@ struct RetryWriteTests {
     @Test("Throws after exhausting all attempts")
     func exhaustRetries() async {
         do {
-            let db = try Self.makePool()
+            let db = PrioritizedDatabase(pool: try Self.makePool())
             _ = try await retryWrite(db, maxAttempts: 2, retryDelay: .milliseconds(10), label: "test") { _ -> Int in
                 throw TestError.transient
             }
@@ -66,7 +66,7 @@ struct RetryWriteTests {
 
     @Test("Passes Database handle to operation")
     func passesDatabase() async throws {
-        let db = try Self.makePool()
+        let db = PrioritizedDatabase(pool: try Self.makePool())
         try await retryWrite(db, maxAttempts: 1, retryDelay: .milliseconds(10), label: "test") { db in
             try db.execute(sql: "SELECT 1")
         }
@@ -75,7 +75,7 @@ struct RetryWriteTests {
     @Test("Respects maxAttempts = 1 (no retry)")
     func singleAttemptNoRetry() async {
         do {
-            let db = try Self.makePool()
+            let db = PrioritizedDatabase(pool: try Self.makePool())
             _ = try await retryWrite(db, maxAttempts: 1, retryDelay: .milliseconds(10), label: "test") { _ -> Int in
                 throw TestError.transient
             }

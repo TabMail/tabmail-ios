@@ -785,6 +785,14 @@ extension Notification.Name {
     /// Posted when inbox message list data changes (new headers from sync/backfill).
     /// InboxViewModel reloads message list. NavigationStore refreshes folders.
     static let inboxDataDidChange = Notification.Name("inboxDataDidChange")
+    /// `userInfo` key on `.inboxDataDidChange`. When `true`, the inbox reload
+    /// runs IMMEDIATELY, bypassing the 500ms coalescing debounce that the noisy
+    /// background producers (sync, backfill, AI, user actions) ride.
+    ///
+    /// Reserved for the PRIVILEGED NSE→inbox merge-complete signal: the merge is
+    /// a boot-priority, single-threaded step (see `NSEMergeCoordinator`) whose
+    /// result must paint at once. Background producers MUST NOT set this key.
+    static let inboxReloadImmediateKey = "inboxReloadImmediate"
     /// Posted by `PushNotificationService.checkPushConsentStatusForForeground`
     /// (and the consent-error notification-tap handler) when one or more push
     /// accounts — Gmail **or** Outlook — have an `error`/`missing` state on

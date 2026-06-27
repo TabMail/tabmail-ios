@@ -187,6 +187,70 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         }
     }
 
+    // MARK: - Immediate (privileged NSE-merge) bypass
+
+    @Test("Immediate-flagged signal reloads at once, bypassing the 500ms debounce")
+    @MainActor func immediateSignalBypassesDebounce() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let ids = try insertMessages(pool, count: 3, folderId: folder.id)
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        #expect(vm.loadedMessages.count == 3)
+
+        // Mutate, then post WITH the privileged immediate flag (what the NSE→inbox
+        // merge emits at the end of `performMerge`).
+        try setTag(pool, headerId: ids[0], tag: .archive)
+        NotificationCenter.default.post(
+            name: .inboxDataDidChange, object: nil,
+            userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+        )
+
+        // The change must be visible WELL under the 500ms debounce floor. If a
+        // regression routed the immediate signal through the throttle, the tag
+        // would not be applied yet at 250ms.
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(vm.loadedMessages.first(where: { $0.id == ids[0] })?.actionTag == .archive)
+    }
+
+    @Test("Immediate signal arriving during an in-flight reload is not lost")
+    @MainActor func immediateDuringReloadNotLost() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let ids = try insertMessages(pool, count: 3, folderId: folder.id)
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        #expect(vm.loadedMessages.count == 3)
+
+        // Two immediate signals back-to-back: the first starts a reload, the second
+        // arrives while it is (potentially) still in flight. The single-flight
+        // `runReloadCoalesced` must re-run so the second mutation is never dropped.
+        try setTag(pool, headerId: ids[0], tag: .archive)
+        NotificationCenter.default.post(
+            name: .inboxDataDidChange, object: nil,
+            userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+        )
+        try setTag(pool, headerId: ids[1], tag: .reply)
+        NotificationCenter.default.post(
+            name: .inboxDataDidChange, object: nil,
+            userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+        )
+
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(vm.loadedMessages.first(where: { $0.id == ids[0] })?.actionTag == .archive)
+        #expect(vm.loadedMessages.first(where: { $0.id == ids[1] })?.actionTag == .reply)
+    }
+
     @Test("Idle state — no signal means no unnecessary reload")
     @MainActor func idleStateNoReload() async throws {
         let (pool, folder, dir, previous) = try makeTestDB()

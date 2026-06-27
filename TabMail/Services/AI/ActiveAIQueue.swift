@@ -103,7 +103,7 @@ actor ActiveAIQueue {
         let compositionPrompt: String
     }
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // MARK: - Public API
 

@@ -27,10 +27,10 @@ final class MessageDetailViewModel {
     @ObservationIgnored private var markReadOnOpenCalled = false
 
     private let manager = AccountManager.shared
-    private var dbPool: DatabasePool { _dbPoolOverride ?? AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { _dbPoolOverride ?? AppDatabase.dbPool }
 
     // Test seams — internal so @testable import can inject them
-    @ObservationIgnored var _dbPoolOverride: DatabasePool?
+    @ObservationIgnored var _dbPoolOverride: PrioritizedDatabase?
     @ObservationIgnored var _fetchBodyOverride: ((MessageHeader) async throws -> Void)?
 
     /// The resolved composite ID — may differ from `messageId` if the message was found
@@ -66,7 +66,7 @@ final class MessageDetailViewModel {
     /// Test-only init that accepts a DatabasePool override and fetch closure.
     /// Must be set before `loadBody()` accesses `dbPool`.
     init(messageId: String, dbPool: DatabasePool, fetchBodyOverride: @escaping (MessageHeader) async throws -> Void) {
-        self._dbPoolOverride = dbPool
+        self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
         if var m = resolveMessage(compositeId: messageId) {
@@ -928,7 +928,7 @@ final class MessageDetailViewModel {
             }
             do {
                 let results = try await Task.detached {
-                    try ThreadDetection.findRelatedMessages(for: msg, in: pool)
+                    try ThreadDetection.findRelatedMessages(for: msg, in: pool.pool)
                 }.value
                 print("[ThreadDebug] Found \(results.count) related messages for \(msg.id.prefix(40))")
                 for r in results {

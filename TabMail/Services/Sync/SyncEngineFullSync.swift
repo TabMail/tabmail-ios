@@ -109,6 +109,10 @@ extension SyncEngine {
         // Helper: process sync result — FTS indexing, ReplyDetect notifications, collect migrated IDs.
         // Extracted to avoid duplication between initial sync and connection-error retry.
         @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
+            // Yield to a privileged merge before this folder's FTS writes (rekey /
+            // remove / index). SearchIndex is a separate pool with sync `@noasync`
+            // writes, so the async caller yields on its behalf.
+            await PriorityGate.shared.yield("sync-fts")
             ReplyParentResolver.postParentNotifications(result.replyDetectIds)
             if !result.ftsRekeys.isEmpty {
                 // In-place FTS re-key (UID remap / remnant canonicalization) —
@@ -477,7 +481,7 @@ extension SyncEngine {
         for folder: Folder,
         provider: any EmailProvider,
         limit: Int,
-        dbPool: DatabasePool,
+        dbPool: PrioritizedDatabase,
         recentlyCompleted: [String: Date] = [:]
     ) async throws -> SyncMessagesResult {
         let messages = try await provider.fetchMessages(folder: folder.path, limit: limit, offset: 0)

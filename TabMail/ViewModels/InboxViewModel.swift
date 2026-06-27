@@ -71,7 +71,7 @@ final class InboxViewModel {
     /// overlapping Tasks.
     @ObservationIgnored private var isSyncPending = false
     private var loadedIds: Set<String> = []
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // On-demand snippet loading state
     private var snippetQueue: Set<String> = []
@@ -84,6 +84,12 @@ final class InboxViewModel {
     /// this bit causes the throttle task to loop and reload again after the current pass finishes.
     /// Prevents lost-wakeup where a signal arriving during the 500ms window was silently dropped.
     private var backgroundChangeDirty: Bool = false
+    /// Single-flight guard so the IMMEDIATE (privileged NSE-merge) reload path and
+    /// the THROTTLED (background-producer) reload path never run `reloadMessages`
+    /// concurrently. A reload requested while one is in flight re-runs once more
+    /// after it (see `runReloadCoalesced`).
+    private var isReloadingMessages: Bool = false
+    private var reloadRequestedAgain: Bool = false
     @ObservationIgnored nonisolated(unsafe) private var backgroundChangeObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var aiUpdateObserver: NSObjectProtocol?
     @ObservationIgnored private var folderObservationCancellable: AnyCancellable?
@@ -338,7 +344,7 @@ final class InboxViewModel {
         }
 
         folderObservationCancellable = observation
-            .publisher(in: AppDatabase.dbPool)
+            .publisher(in: AppDatabase.rawPool)
             .removeDuplicates { old, new in
                 // Set-based so order churn from unrelated folder writes doesn't propagate.
                 Set(old.map { "\($0.id):\($0.role.rawValue)" }) ==
@@ -375,9 +381,21 @@ final class InboxViewModel {
             forName: .inboxDataDidChange,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
+            // PRIVILEGED merge signal? The NSE→inbox merge is a single-threaded,
+            // boot-priority step (see `NSEMergeCoordinator`); its result must paint
+            // AT ONCE, bypassing the 500ms coalescing debounce that the noisy
+            // background producers (sync, backfill, AI, user actions) ride.
+            let immediate = (note.userInfo?[Notification.Name.inboxReloadImmediateKey] as? Bool) == true
             Task { @MainActor in
                 guard let self else { return }
+                if immediate {
+                    // Reload now — no debounce. Funnels through the same
+                    // single-flight as the throttled path so the two never run
+                    // `reloadMessages` concurrently.
+                    await self.runReloadCoalesced()
+                    return
+                }
                 // Dirty bit + throttled loop.
                 // Every signal sets the bit unconditionally. The throttle task loops until
                 // the bit is clean at the start of a reload — so any signal arriving during
@@ -390,13 +408,32 @@ final class InboxViewModel {
                             if Task.isCancelled { break }
                             // Clear BEFORE reload so signals arriving during reload re-arm the loop.
                             self.backgroundChangeDirty = false
-                            await self.reloadMessages(animated: true)
+                            await self.runReloadCoalesced()
                         }
                         self?.backgroundChangeTask = nil
                     }
                 }
             }
         }
+    }
+
+    /// Single-flight wrapper around `reloadMessages`. The privileged immediate
+    /// (NSE-merge) path and the throttled background path both go through here, so
+    /// they never run `reloadMessages` concurrently (which would interleave at the
+    /// async DB-read suspension point and double-apply the diff). A reload asked
+    /// for while one is in flight sets `reloadRequestedAgain`, which re-runs one
+    /// more pass after the current one — so the latest data always wins.
+    private func runReloadCoalesced() async {
+        if isReloadingMessages {
+            reloadRequestedAgain = true
+            return
+        }
+        isReloadingMessages = true
+        repeat {
+            reloadRequestedAgain = false
+            await reloadMessages(animated: true)
+        } while reloadRequestedAgain
+        isReloadingMessages = false
     }
 
     /// Listen for AI processing completion and refresh just the affected snapshot in-place.

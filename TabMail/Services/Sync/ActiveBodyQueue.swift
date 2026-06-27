@@ -41,7 +41,7 @@ actor ActiveBodyQueue {
     private var folderActiveBatches: [String: Int] = [:]
     private let maxBatchesPerFolder = 2
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // MARK: - Public API
 

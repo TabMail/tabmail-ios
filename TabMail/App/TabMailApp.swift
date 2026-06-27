@@ -95,7 +95,7 @@ struct TabMailApp: App {
         // the detached FTS/tool/embedding tasks below — must wait for that:
         // `AppDatabase.dbPool` force-unwraps `AppDatabase.shared`, so any access
         // before the coordinator sets it would crash. UI is gated by the splash;
-        // background entry points gate via `AppStartup.shared.awaitReady()`.
+        // background entry points gate via `awaitLaunchReady(background: true)`.
 
 
         // Client-side AI tools are registered LAZILY on first tool use
@@ -105,15 +105,32 @@ struct TabMailApp: App {
         // with the inbox first render. Only the agent chat / reply-precompute / inline-
         // edit paths use tools, so the first such request pays the one-time cost.
 
-        // EmbeddingService (CoreML) inits off the launch path at .utility — it loads
-        // late (when CPU frees, AFTER the inbox render per device logs), so it doesn't
-        // compete with the first paint. Consumers nil-guard `EmbeddingService.shared`
-        // and degrade to keyword-only until it lands. Left here (not deferred to
-        // body.task) so the BACKGROUND embedding backfill still loads it on a cold
-        // background launch where body.task never runs.
+        // EmbeddingService (CoreML, ~45MB) inits off the launch path at .utility.
+        // It MUST land AFTER the first paint so it can't compete with the cold-boot
+        // critical path (the privileged NSE staging merge + first render). Gating on
+        // dbReady (`awaitLaunchReady(background: true)`) used to *empirically* achieve
+        // that — the fast inbox render won the race and this `.utility` load got CPU
+        // later — but
+        // that's soft: once the merge runs BEFORE paint (`runIfNeeded`), a contended
+        // merge stretches the pre-paint window and the CoreML load starves it (a
+        // debug cold boot showed an 11s load running CONCURRENTLY with the merge,
+        // turning a ~50ms merge into 10.5s and blocking first paint for 17.6s). So
+        // gate HARD on first paint via `awaitLaunchReady(background: false)`. Background
+        // launches never paint — its timeout lets the embedding backfill still load (the merge has
+        // long finished, unburdened, by then). Consumers nil-guard
+        // `EmbeddingService.shared` and degrade to keyword-only until it lands. Left
+        // here (not in body.task) so a cold BACKGROUND launch still loads it.
         Task.detached(priority: .utility) {
-            await AppStartup.shared.awaitReady()
-            BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility)")
+            // background: false → wait for first paint (foreground) so the CoreML
+            // load can't starve the pre-paint merge / first render. On a cold
+            // BACKGROUND launch (no paint) the shorter `embeddingLoadGateTimeoutSeconds`
+            // applies instead of the 8s herd default: just long enough for the
+            // now-unburdened merge to win the CPU, then load — no wasted budget.
+            await AppStartup.shared.awaitLaunchReady(
+                background: false,
+                firstPaintTimeoutSeconds: SyncConfig.embeddingLoadGateTimeoutSeconds
+            )
+            BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility, post-first-paint)")
             EmbeddingService.initialize()
             BootProfiler.mark("EmbeddingService.initialize() DONE")
         }
@@ -362,7 +379,7 @@ struct TabMailApp: App {
 ///     additionally runs the UI-only sidebar load and flips `isReady`.
 /// Relying solely on `body.task` was a regression: background launches left
 /// `AppDatabase.shared` nil → BGTask handlers crashed and push/notification
-/// handlers hung on `awaitReady()`.
+/// handlers hung on `awaitLaunchReady()`.
 ///
 /// It runs in two phases on a background task:
 ///   1. **Probe** — open the pool and cheaply check for pending migration work
@@ -378,7 +395,7 @@ struct TabMailApp: App {
 /// is nil and `AppDatabase.dbPool` (which force-unwraps it) MUST NOT be touched.
 /// The UI is gated by the launch screen / splash; background / UIKit entry points
 /// that can fire during this window (silent push, notification actions, BGTask
-/// sync/AI) gate via `awaitReady()`.
+/// sync/AI) gate via `awaitLaunchReady(background: true)`.
 @MainActor
 @Observable
 final class AppStartup {
@@ -527,7 +544,7 @@ final class AppStartup {
                 print("[AppStartup] Orphan demo wipe failed: \(error)")
             }
         }
-        // DB is usable — unblock everything parked in `awaitReady()` (background
+        // DB is usable — unblock everything parked in `awaitLaunchReady` (background
         // push / notification-action / BGTask handlers, detached startup tasks).
         // Flip this BEFORE the staging-DB upkeep below: that work is NOT needed to
         // present the inbox, so it must never sit in front of this gate.
@@ -573,6 +590,15 @@ final class AppStartup {
         await ensureDatabaseReady()
         // Build failed (failureMessage shown) or the sidebar already loaded.
         guard dbReady, !isReady else { return }
+        // Merge NSE staging BEFORE the first read/render. Staging IS the delta:
+        // draining it here means the inbox's FIRST PAINT already contains pushed
+        // mail — no "cached inbox, then the message pops in a beat later" gap.
+        // It runs ahead of the sync/backfill herd (which only starts later in
+        // `startForegroundPolling`), so it's contention-free and fast; and it's a
+        // cheap no-op when there's nothing staged (tolerates a missing/empty
+        // staging DB). The later foreground/push merges remain as belt-and-suspenders.
+        await NSEDataBridge.mergeNSEStagingData()
+        BootProfiler.mark("runIfNeeded: NSE staging merged (pre-first-paint)")
         BootProfiler.mark("loadInitialData (sidebar: accounts/folders/outbox) START — @MainActor sync read")
         navigationStore.loadInitialData()
         BootProfiler.mark("loadInitialData DONE (accounts=\(navigationStore.accounts.count) folders=\(navigationStore.folders.count))")
@@ -583,11 +609,43 @@ final class AppStartup {
         BootProfiler.mark("★ isReady=true → FIRST PAINT (inbox on screen)")
     }
 
-    /// Suspends until the database is usable, kicking off the build if no launch
-    /// path has yet. Used by UIKit push / notification / BGTask handlers that can
-    /// fire on a cold BACKGROUND launch (where `body.task` never runs) or during
-    /// the migration window — see `AppDelegate` / `SyncScheduler`.
-    func awaitReady() async {
+    /// Suspends until the launch milestone appropriate for the caller, kicking off
+    /// the DB build if no launch path has yet. ONE gate; the `background` flag
+    /// picks the milestone:
+    ///
+    /// - `background: true` → resume at **`dbReady`** (DB built + migrated). For
+    ///   cold BACKGROUND entry points (push / silent-push / notification action /
+    ///   BGTask) that never paint and are budget-bound: they're the time-critical
+    ///   reason the app woke and must run ASAP, NOT wait for a first paint that
+    ///   will never come.
+    /// - `background: false` → resume at **first paint** (`isReady`), or after
+    ///   `firstPaintTimeoutSeconds` as a fallback. For the deferrable FOREGROUND
+    ///   boot herd (NSE merge / sync / queue repopulation / CoreML embedding load):
+    ///   "show the inbox" is the sole priority of the first frame, none of that
+    ///   work is needed to draw it, and NSE-staged mail already merged pre-paint
+    ///   via the read-through. The timeout only bounds the pathological
+    ///   never-paints case — and lets a task that runs on BOTH launch kinds (the
+    ///   CoreML load) still proceed on a background launch.
+    ///
+    /// Both paths first `await ensureDatabaseReady()`, so a `false` caller is also
+    /// guaranteed a usable DB even if it hits the timeout. The paint wait is polled
+    /// (no continuation bookkeeping) — every caller is a one-shot boot task, so
+    /// ~100ms granularity is invisible. Acyclic: the work that flips `isReady` (the
+    /// pre-paint merge + `loadInitialData`, driven from `runIfNeeded`) never calls
+    /// this with `background: false`, so a foreground waiter can't gate its own
+    /// signal.
+    func awaitLaunchReady(
+        background: Bool,
+        firstPaintTimeoutSeconds: Double = SyncConfig.firstPaintGateTimeoutSeconds
+    ) async {
         await ensureDatabaseReady()
+        guard !background else { return }
+        let step = Duration.milliseconds(100)
+        var waited = Duration.zero
+        let limit = Duration.seconds(firstPaintTimeoutSeconds)
+        while !isReady, waited < limit {
+            try? await Task.sleep(for: step)
+            waited += step
+        }
     }
 }

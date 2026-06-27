@@ -137,7 +137,7 @@ final class SyncScheduler {
         return anyChanges
     }
 
-    private var dbPool: DatabasePool { AppDatabase.dbPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private init() {}
 
@@ -368,28 +368,37 @@ final class SyncScheduler {
                 fgStep("Task body start")
                 BootProfiler.mark("startForegroundPolling enter (firstForeground=\(!didFirstForegroundSettle))")
                 // REORDER — show the inbox first, then start everything else.
-                // On the FIRST foreground after a cold launch, let the inbox's
-                // (heavy) SwiftUI first render paint before kicking the NSE merge +
-                // sync + queue-repopulation herd. Displaying cached mail is the sole
-                // priority of the first frame; the herd isn't needed for that, and
-                // NSE-staged mail still merges in right after the settle. Warm
-                // returns (inbox already on screen) skip it.
+                // On the FIRST foreground after a cold launch, BLOCK the entire herd
+                // (NSE merge, sync, queue repopulation, push resub, poll) on the REAL
+                // first-paint signal — not a fixed timer. Nothing here is needed for
+                // the first frame: cached mail is already drawn, and NSE-staged mail
+                // merged PRE-paint via runIfNeeded's read-through. So it ALL waits
+                // until the inbox has painted, then runs. This path only fires on a
+                // foreground scene activation (where `isReady` flips), so the timeout
+                // is a pure safety net. Warm returns (inbox already on screen) skip it.
                 if !didFirstForegroundSettle {
                     didFirstForegroundSettle = true
-                    await Task.yield()
-                    try? await Task.sleep(for: .seconds(SyncConfig.firstForegroundSettleSeconds))
-                    fgStep("first-foreground settle done")
-                    BootProfiler.mark("startForegroundPolling: first-foreground settle done (\(SyncConfig.firstForegroundSettleSeconds)s — inbox painted first)")
+                    await AppStartup.shared.awaitLaunchReady(background: false)
+                    fgStep("first-paint gate cleared")
+                    BootProfiler.mark("startForegroundPolling: first paint reached — herd starting")
                 }
                 // Startup data resets already ran synchronously in AppDatabase.init
                 // (before the pool was exposed), so there's nothing to await here.
-                // Merge NSE staging data FIRST — before sync, before UI reload.
-                // This imports AI results and inbox removals so the UI shows them immediately.
+                // Merge NSE staging data FIRST — before sync, before the herd.
+                // The merge is the PRIVILEGED, single-threaded boot step: it runs
+                // ALONE here (the coordinator guarantees no sibling merge, and
+                // `syncStartup` below only spawns the sync/backfill/AI herd AFTER
+                // this awaited merge fully returns). When it stages new mail it
+                // emits its OWN single `.inboxDataDidChange` (immediate flag —
+                // bypasses the inbox 500ms debounce) at the end of the merge.
                 await NSEDataBridge.mergeNSEStagingData()
                 fgStep("outer NSE merge")
                 BootProfiler.mark("startForegroundPolling: outer NSE merge done")
-                // Reload UI immediately — NSE merge + background push may have new data.
-                // Don't wait for reconnect+poll (can take 60s+).
+                // Generic foreground refresh (debounced — NOT the immediate merge
+                // signal above): repaints from whatever is already in GRDB (e.g. a
+                // background-cycle merge that wrote while we were off-screen) without
+                // waiting for reconnect+poll (can take 60s+). Coalesces with the
+                // merge's immediate post via the inbox single-flight reload.
                 NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
                 fgStep("posted .inboxDataDidChange")
                 await syncStartup(inboxOnly: false, drain: .none)
@@ -859,7 +868,7 @@ final class SyncScheduler {
             // where the SwiftUI scene `.task` never runs — so the DB may not be
             // built yet. Build/await it before any `AppDatabase.dbPool` access
             // (which force-unwraps `AppDatabase.shared`) → otherwise crash.
-            await AppStartup.shared.awaitReady()
+            await AppStartup.shared.awaitLaunchReady(background: true)
             print("[SyncScheduler] SYNC Task body start")
             let pollActive = self.isPollActive
             BackgroundSyncLogger.logBGAppRefresh("Task body start (pollActive=\(pollActive), network=\(NetworkMonitor.checkConnected()))")
@@ -984,7 +993,7 @@ final class SyncScheduler {
             // where the SwiftUI scene `.task` never runs — so the DB may not be
             // built yet. Build/await it before any `AppDatabase.dbPool` access
             // (which force-unwraps `AppDatabase.shared`) → otherwise crash.
-            await AppStartup.shared.awaitReady()
+            await AppStartup.shared.awaitLaunchReady(background: true)
             let taskT0 = CFAbsoluteTimeGetCurrent()
             print("[SyncScheduler] PROCESSING Task body start")
             BackgroundSyncLogger.logBGProcessing("Task body start")
