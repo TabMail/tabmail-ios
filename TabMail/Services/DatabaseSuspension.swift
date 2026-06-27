@@ -52,11 +52,59 @@ final class DatabaseSuspension {
     /// can read it without hopping to the main actor.
     private nonisolated static let appActive = Mutex<Bool>(true)
 
+    /// Thread-safe mirror of "is the GRDB pool currently suspended?" (ADR-IOS-046).
+    /// Driven by OBSERVING the same `Database.suspendNotification` /
+    /// `resumeNotification` posts that GRDB itself observes (see
+    /// `installSuspensionStateObserver`), so it is authoritative — not a second
+    /// bookkeeping copy that could drift from GRDB's real state. Background drain
+    /// loops (backfill body/AI/embedding, background maintenance) poll
+    /// `isSuspended` at their dispatch boundary and ABANDON when it's true: they
+    /// do not attempt writes that would only abort (SQLITE_ABORT), and they do NOT
+    /// take a lease to delay suspension — keeping the pool write-capable into the
+    /// freeze is exactly the 0xdead10cc kill this whole subsystem exists to
+    /// prevent. Abandon-and-retry-next-wake is always correct (every store is
+    /// idempotent/self-healing). `nonisolated` (a Sendable Mutex) so off-main
+    /// actors read it with no main-actor hop. See ADR-IOS-046.
+    private nonisolated static let suspendedFlag = Mutex<Bool>(false)
+
+    /// Guards one-time installation of the suspend/resume state observer.
+    private nonisolated static let stateObserverInstalled = Mutex<Bool>(false)
+
+    /// True while the GRDB pool is suspended (ADR-IOS-041/046). Background drain
+    /// loops poll this at safe boundaries to abandon work that would only abort;
+    /// it clears on the next resume (foreground / silent push / BGTask wake).
+    nonisolated static var isSuspended: Bool { suspendedFlag.withLock { $0 } }
+
+    /// Idempotently mirror GRDB's suspend/resume notifications into `isSuspended`.
+    /// Installed from `start()` (production) and lazily by tests. The two observers
+    /// are process-lived (never removed) — one pair for the app's lifetime.
+    /// Delivered synchronously (`queue: nil`) on the posting thread, so the flag is
+    /// already up to date the instant `post(...)` returns at every suspend/resume
+    /// site (`suspendNow`, `postSuspendImmediately`, `resumeDatabases`).
+    nonisolated static func installSuspensionStateObserver() {
+        let already = stateObserverInstalled.withLock { v -> Bool in
+            if v { return true }
+            v = true
+            return false
+        }
+        guard !already else { return }
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: Database.suspendNotification, object: nil, queue: nil) { _ in
+            suspendedFlag.withLock { $0 = true }
+        }
+        nc.addObserver(forName: Database.resumeNotification, object: nil, queue: nil) { _ in
+            suspendedFlag.withLock { $0 = false }
+        }
+    }
+
     private init() {}
 
     /// Install app lifecycle observers. Call once from
     /// `application(_:didFinishLaunchingWithOptions:)`.
     func start() {
+        // Mirror GRDB's suspend/resume into the pollable `isSuspended` flag that
+        // background loops read to abandon-on-suspend (ADR-IOS-046).
+        Self.installSuspensionStateObserver()
         // Seed the foreground flag from the actual launch state. A BGTask can
         // cold-launch a terminated app into `.background`; a normal launch is
         // `.inactive` transitioning to `.active`. Treat anything but `.background`

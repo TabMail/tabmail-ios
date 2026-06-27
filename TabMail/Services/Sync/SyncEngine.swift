@@ -142,20 +142,25 @@ actor SyncEngine {
             let undoProtectedBodyIds = await MainActor.run {
                 Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
             }
+            // ADR-IOS-046: abandon maintenance the instant the GRDB pool suspends.
+            // Every step is a write that would just abort (SQLITE_ABORT); they're
+            // all idempotent and re-run on the next maintenance schedule. Gated
+            // alongside cancellation — both answer "should I still be doing this?".
+            func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
             let t0 = CFAbsoluteTimeGetCurrent()
-            if includePrune && !Task.isCancelled {
+            if includePrune && shouldRun() {
                 SyncEngine.runPruneIfOverBudget(dbPool: pool)
             }
             let t1 = CFAbsoluteTimeGetCurrent()
-            if !Task.isCancelled {
+            if shouldRun() {
                 SyncEngine.runEvictStaleBodies(dbPool: pool, undoProtectedBodyIds: undoProtectedBodyIds)
             }
             let t2 = CFAbsoluteTimeGetCurrent()
-            if !Task.isCancelled {
+            if shouldRun() {
                 SyncEngine.runPurgeExpiredAICache(dbPool: pool)
             }
             let t3 = CFAbsoluteTimeGetCurrent()
-            if !Task.isCancelled {
+            if shouldRun() {
                 SyncEngine.runEvictChatSessions(dbPool: pool)
             }
             let t4 = CFAbsoluteTimeGetCurrent()
@@ -165,11 +170,11 @@ actor SyncEngine {
             // and idempotent on repeated runs. Order matters: evict first so the
             // sweep doesn't have to walk freshly-evicted-but-still-on-disk files
             // (it would skip them anyway via the min-age guard).
-            if !Task.isCancelled {
+            if shouldRun() {
                 await BodyAssetMaintenance.evictIfOverCap()
             }
             let t5 = CFAbsoluteTimeGetCurrent()
-            if !Task.isCancelled {
+            if shouldRun() {
                 await BodyAssetMaintenance.pruneOrphans()
             }
             let t6 = CFAbsoluteTimeGetCurrent()

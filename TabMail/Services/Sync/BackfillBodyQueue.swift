@@ -108,10 +108,15 @@ actor BackfillBodyQueue {
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if totalAdded > 0 {
                 print("[BackfillBody] Repopulated \(totalAdded) items in \(ms)ms")
-                scheduleDispatch()
             } else {
                 print("[BackfillBody] Repopulate: 0 non-inbox messages need body fetch (\(ms)ms)")
             }
+            // Re-kick on every wake. `totalAdded` counts only NEW rows; items left
+            // pending by a suspend-abandoned cycle (ADR-IOS-046) are already
+            // enqueued, so they'd be dropped from `totalAdded` and never
+            // re-dispatched. Dispatching whenever ANY work remains guarantees the
+            // queue resumes on the next wake. scheduleDispatch is idempotent/guarded.
+            if storage.pendingCount > 0 { scheduleDispatch() }
         } catch {
             print("[BackfillBody] Repopulate failed: \(error)")
         }
@@ -184,6 +189,20 @@ actor BackfillBodyQueue {
         }
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
+
+        // ADR-IOS-046: if the GRDB pool is suspended (app backgrounded past its
+        // grace window), ABANDON — don't fetch bodies we can't persist. Every
+        // write would abort (SQLITE_ABORT); the work is idempotent and
+        // re-dispatches on the next wake via repopulateFromDatabase. We do NOT
+        // hold a lease to keep going — that would keep the pool write-capable into
+        // the freeze (0xdead10cc). Items stay pending (not yet collected), so
+        // nothing is lost. Just stop.
+        guard !DatabaseSuspension.isSuspended else {
+            #if DEBUG
+            print("[BackfillBody] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            #endif
+            return
+        }
 
         // Always collect a full batch — concurrency is limited by activeBatchCount, not per-item
         let batch = storage.collectCandidates(maxJobs: storage.activeJobs + batchSize)

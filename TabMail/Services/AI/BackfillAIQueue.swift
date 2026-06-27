@@ -124,9 +124,9 @@ actor BackfillAIQueue {
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         BackgroundSyncLogger.logBackfillAI("repopulateFromDatabase loaded=\(loaded) droppedTTL=\(dropped) (\(ms)ms)")
 
-        if loaded > 0 {
-            scheduleDispatch()
-        }
+        // Re-kick on every wake — covers items left pending by a suspend-abandoned
+        // cycle (ADR-IOS-046), which `loaded` (new rows only) would miss.
+        if storage.pendingCount > 0 { scheduleDispatch() }
     }
 
     /// Foreground-return: wipe in-memory state. GRDB rows are preserved —
@@ -209,6 +209,15 @@ actor BackfillAIQueue {
             return
         }
         guard activeBatchCount < maxActiveBatches else { return }
+
+        // ADR-IOS-046: abandon if the GRDB pool is suspended — refinement writes
+        // would only abort; the queue re-dispatches on the next wake.
+        guard !DatabaseSuspension.isSuspended else {
+            #if DEBUG
+            print("[BackfillAI] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            #endif
+            return
+        }
 
         // Collect candidates; drop those still in backoff.
         let rawCandidates = storage.collectCandidates(

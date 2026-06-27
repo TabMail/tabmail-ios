@@ -1488,3 +1488,34 @@ Forward semantics were verified against Gmail (web research, 2026-06-23): Gmail 
 - Imperative presentation is **not** unit-testable (it presents UIKit controllers from the key window); verification is build + on-device. The `PreviewFreezeGate` / `PreviewGatedReload` buffer-flush logic remains unit-tested (`EmailRenderPipelineTests.swift`).
 - `AttachmentListView` still owns the **download** (spinner, `BodyAssetStore` cache, `makePreviewURL`, `downloadedFiles` checkmark + `ShareLink`); only the final present step is imperative.
 - If the `.eml` sheet ever shows the same blink, migrate it the same way (wrap `EmlAttachmentPreview` in a `UIHostingController` presented imperatively, replicating `.large` detent via the sheet presentation controller).
+
+---
+
+## ADR-IOS-046: Background Drain Loops Are Abandon-on-Suspend — Never Hold a Lease to "Look Cooperative"
+
+**Date:** 2026-06-26
+**Status:** Accepted
+**Extends:** ADR-IOS-041 (GRDB suspension / 0xdead10cc defense)
+
+**Context:** A device `logmain.log` showed **6,312** identical `SQLite error 4: Database is suspended … BEGIN IMMEDIATE TRANSACTION` lines in a single post-suspend window (`DatabaseSuspension SUSPEND (quiesce window expired)` at the start, no RESUME for the rest of the capture). Root cause is a **two-counter coordination gap** in ADR-IOS-041's implementation. There are two independent "keep alive" mechanisms:
+- **Process assertion** — `UIApplication.beginBackgroundTask` (`backfill-grace` in `SyncScheduler`, `db-quiesce` in `DatabaseSuspension`): keeps the *process* alive / grants OS background time.
+- **DB-resume lease** — `DatabaseSuspension.beginBackgroundWork`/`endBackgroundWork` (a work-unit counter): keeps the *database* resumed. The quiesce window arms only when this counter hits 0.
+
+The detached background drain loops (`BackfillBodyQueue`, `BackfillAIQueue`, the three embedding queues, and `SyncEngine.scheduleMaintenanceInBackground`) run under the **process** assertion (`backfill-grace`) but take **no DB-resume lease**. So when the silent-push handler — the only `beginBackgroundWork` holder covering that work — returned (3.7 s), the counter hit 0, the quiesce window armed and SUSPENDED, while a 46 s iCloud body batch (slow IDLE reset) and the maintenance sweep were still in flight. Every subsequent write aborted; the loops kept fetching-and-discarding because the process was still alive.
+
+**Decision (the key call): the fix is "stop now," NOT "delay the suspend."** Giving the loops their own `beginBackgroundWork` lease was explicitly **rejected** — a DB-resume lease does not extend the finite OS budget (all assertions expire together at the app-wide deadline), it only keeps the pool **write-capable closer to the freeze**, which is exactly the `0xdead10cc` SIGKILL ADR-IOS-041 exists to prevent. Trading a benign, self-healing aborted-write for a hard mid-write kill to "look cooperative" is strictly worse. Background work is idempotent and abandonable by contract (Resilience Rule 3, ADR-IOS-001/003), so the correct response to suspension is to **abandon and retry next wake**.
+
+Mechanically:
+1. **`DatabaseSuspension.isSuspended`** — a pollable `nonisolated static` flag, driven by **observing** the same `Database.suspendNotification` / `resumeNotification` posts GRDB observes (`installSuspensionStateObserver`, installed from `start()`), so it is authoritative, not a second bookkeeping copy that can drift.
+2. **Every background drain loop checks it at its existing dispatch boundary** (right where it already does the network gate + `PriorityGate.yield`) and returns early when suspended. Items were not yet collected, so nothing is lost; nothing is marked complete (honoring "never mark unfetched as fetched"). `SyncEngine`'s maintenance loop gates each step with `shouldRun() = !Task.isCancelled && !DatabaseSuspension.isSuspended` (suspension is treated like cancellation — both answer "should I still be doing this?").
+3. **Resume re-kick:** each queue's `repopulateFromDatabase` (run on every wake by `syncStartup`) now `scheduleDispatch()`s whenever `storage.pendingCount > 0`, not only when the query found NEW rows — items left pending by an abandoned cycle are already enqueued, so the old `if added > 0` gate would strand them.
+4. **Log hygiene (backstop):** the residual aborts from the ≤3 batches whose fetch was already in flight when suspend fired are filtered through `error.isDatabaseSuspensionAbort` (app paths: `BodyFetchProcessor`) / GRDB's `isInterruptionError` (shared/NSE path: `BodyAssetStore`) so an *expected* abort is never logged as a failure. The new debug breadcrumbs in the loops are `#if DEBUG` only.
+
+**Rationale:** This is the GRDB/FTS-writer analogue of the existing cooperative-priority pattern (ADR-IOS-002 user-activity prioritization, ADR-IOS-014 IMAP priority lock, the `PriorityGate` merge gate): a background loop yields/stops at a SAFE boundary rather than fighting for a resource it can't safely hold. Abandon-on-suspend is universal — a suspended DB rejects all writes regardless of the loop's priority — so it lives in one shared flag every loop polls, with no per-subsystem classification to forget.
+
+**Consequences:**
+- The one batch already mid-fetch when suspend fires still attempts (and harmlessly aborts) its writes — its bytes were already fetched, so skipping the write saves nothing; it's quieted by the log hygiene and re-fetched next wake. Everything *after* the suspend point is skipped, eliminating the bulk of the waste.
+- The **active** queues (`ActiveBodyQueue`, `ActiveEmbeddingQueue`) were deliberately NOT given the dispatch guard: they run inside the resumed lease window (driven by foreground/push events), so `isSuspended` is false when they run. They are still covered by the shared `BodyFetchProcessor`/`BodyAssetStore` log hygiene. Add the guard there too if a future path runs them detached.
+- A DB-resume lease for backfill must never be reintroduced as a "finish the work" mechanism — it reopens the 0xdead10cc window. Stopping is the contract.
+
+**Tests:** `DatabaseSuspensionTests.isSuspendedFlagTracksNotifications` (flag mirrors suspend/resume posts, idempotent re-install). The underlying abort-and-retry safety is pinned by the existing `DatabaseSuspensionTests` suite (ADR-IOS-041).

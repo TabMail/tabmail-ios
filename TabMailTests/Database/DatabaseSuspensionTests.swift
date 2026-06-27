@@ -255,6 +255,31 @@ struct DatabaseSuspensionTests {
         #expect(badge == 0)
     }
 
+    @Test("isSuspended flag mirrors the suspend/resume notifications (ADR-IOS-046)")
+    func isSuspendedFlagTracksNotifications() {
+        // The pollable flag background drain loops read (abandon-on-suspend) is
+        // driven by OBSERVING the same process-wide posts GRDB observes — so it is
+        // authoritative. Install (idempotent) then drive it via the notifications.
+        DatabaseSuspension.installSuspensionStateObserver()
+        defer { Self.postResume() }
+
+        Self.postResume() // known baseline
+        #expect(DatabaseSuspension.isSuspended == false)
+
+        Self.postSuspend()
+        #expect(DatabaseSuspension.isSuspended == true)
+
+        Self.postResume()
+        #expect(DatabaseSuspension.isSuspended == false)
+
+        // Re-installing must NOT detach or double-register: still tracks correctly.
+        DatabaseSuspension.installSuspensionStateObserver()
+        Self.postSuspend()
+        #expect(DatabaseSuspension.isSuspended == true)
+        Self.postResume()
+        #expect(DatabaseSuspension.isSuspended == false)
+    }
+
     @Test("Suspension abort mid-maintenance leaves prior committed data intact and retryable")
     func abortedMaintenanceIsRetryable() throws {
         // Models the SyncEngine.scheduleMaintenanceInBackground pattern: each

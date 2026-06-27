@@ -108,7 +108,12 @@ enum BodyFetchProcessor {
                         )
                     }
                 } catch {
-                    print("[BodyFetch] Failed to flag payload-too-large \(item.headerId.prefix(30)): \(error)")
+                    // ADR-IOS-046: a suspension abort here is expected + retryable —
+                    // don't log it as a failure (BodyFetchProcessor writes run on
+                    // background backfill paths that can suspend mid-flight).
+                    if !error.isDatabaseSuspensionAbort {
+                        print("[BodyFetch] Failed to flag payload-too-large \(item.headerId.prefix(30)): \(error)")
+                    }
                 }
                 return .failure(.payloadTooLarge)
             } else {
@@ -150,7 +155,11 @@ enum BodyFetchProcessor {
                     try bodyToInsert.insert(db, onConflict: .ignore)
                 }
             } catch {
-                print("[BodyFetch] MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
+                // ADR-IOS-046: suspension aborts are expected + retryable (bodyComplete
+                // stays 0 → re-fetched next wake); only log genuine failures.
+                if !error.isDatabaseSuspensionAbort {
+                    print("[BodyFetch] MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
+                }
             }
             let snippet = EmailFilter.snippetFromPlainText(plainText)
             let processed = ProcessedItem(
@@ -182,7 +191,9 @@ enum BodyFetchProcessor {
                     try bodyToInsert.insert(db, onConflict: .ignore)
                 }
             } catch {
-                print("[BodyFetch] Attachment-only MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
+                if !error.isDatabaseSuspensionAbort {
+                    print("[BodyFetch] Attachment-only MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
+                }
             }
             let placeholder = "[attachment]"
             let processed = ProcessedItem(
@@ -232,7 +243,9 @@ enum BodyFetchProcessor {
                         )
                     }
                 } catch {
-                    print("[BodyFetch] Confirmed-empty flag write failed for \(item.headerId.prefix(30)): \(error)")
+                    if !error.isDatabaseSuspensionAbort {
+                        print("[BodyFetch] Confirmed-empty flag write failed for \(item.headerId.prefix(30)): \(error)")
+                    }
                 }
                 return (.confirmedEmpty, nil)
             } else {
@@ -248,7 +261,9 @@ enum BodyFetchProcessor {
                         )
                     }
                 } catch {
-                    print("[BodyFetch] emptyFetchCount increment failed for \(item.headerId.prefix(30)): \(error)")
+                    if !error.isDatabaseSuspensionAbort {
+                        print("[BodyFetch] emptyFetchCount increment failed for \(item.headerId.prefix(30)): \(error)")
+                    }
                 }
                 return (.retry, nil)
             }
@@ -270,7 +285,11 @@ enum BodyFetchProcessor {
         do {
             writtenToFts = try await SearchIndex.shared.updateBodies(ftsBuffer)
         } catch {
-            print("[BodyFetch] Batch FTS write failed (\(items.count) items): \(error)")
+            // ADR-IOS-046: a suspension abort is expected + benign here — bodyComplete
+            // stays 0, the next wake's repopulate retries. Only log real failures.
+            if !error.isDatabaseSuspensionAbort {
+                print("[BodyFetch] Batch FTS write failed (\(items.count) items): \(error)")
+            }
             // Items already have MessageBody in GRDB. bodyComplete stays 0.
             // Next repopulate will retry.
             return
@@ -301,7 +320,9 @@ enum BodyFetchProcessor {
                 }
             }
         } catch {
-            print("[BodyFetch] flushBatch snippet/bodyComplete write failed (\(confirmedItems.count) items): \(error)")
+            if !error.isDatabaseSuspensionAbort {
+                print("[BodyFetch] flushBatch snippet/bodyComplete write failed (\(confirmedItems.count) items): \(error)")
+            }
         }
         let dbMs = Int((CFAbsoluteTimeGetCurrent() - tDb) * 1000)
 

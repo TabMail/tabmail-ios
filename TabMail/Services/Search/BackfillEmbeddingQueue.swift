@@ -99,8 +99,11 @@ actor BackfillEmbeddingQueue {
             let added = storage.enqueueBatch(headerIds.map { Item(headerId: $0) })
             if added > 0 {
                 print("[BackfillEmbeddingQueue] Repopulated \(added) items from GRDB in \(ms)ms")
-                scheduleDispatch()
             }
+            // Re-kick on every wake — items left pending by a suspend-abandoned
+            // cycle (ADR-IOS-046) are already enqueued, so `added` (new rows only)
+            // would skip them. scheduleDispatch is idempotent/guarded.
+            if storage.pendingCount > 0 { scheduleDispatch() }
         } catch {
             print("[BackfillEmbeddingQueue] Repopulate failed: \(error)")
         }
@@ -159,6 +162,15 @@ actor BackfillEmbeddingQueue {
     private func dispatchBatch() async {
         guard EmbeddingService.shared != nil else { return }
         guard storage.activeJobs < maxActiveBatches else { return }
+
+        // ADR-IOS-046: abandon if the GRDB/FTS pool is suspended — the vector
+        // write would only abort; candidates stay pending and re-dispatch next wake.
+        guard !DatabaseSuspension.isSuspended else {
+            #if DEBUG
+            print("[BackfillEmbeddingQueue] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            #endif
+            return
+        }
 
         let candidates = storage.collectCandidates(maxJobs: batchSize)
         guard !candidates.isEmpty else { return }

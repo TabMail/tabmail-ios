@@ -315,7 +315,14 @@ enum BodyAssetStore {
                 )
             }
         } catch {
-            print("[BodyAssetStore] row insert failed for \(id): \(error)")
+            // ADR-IOS-046: a database-suspension abort (SQLITE_ABORT/INTERRUPT) is
+            // expected + benign — the asset row re-writes on the next wake. Don't
+            // log it as a failure. (Shared with the NSE target, so this uses GRDB's
+            // built-in `isInterruptionError` rather than the app-only
+            // `Error.isDatabaseSuspensionAbort` helper.)
+            if (error as? DatabaseError)?.isInterruptionError != true {
+                print("[BodyAssetStore] row insert failed for \(id): \(error)")
+            }
             return nil
         }
 
