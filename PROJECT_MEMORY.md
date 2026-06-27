@@ -827,6 +827,16 @@ NOT GRDB schema migrations (those are in `AppDatabase.runMigrations`, the `Datab
 
 ---
 
+## Dictation leaves AVAudioSession active → haptics die process-wide (2026-06-27)
+
+- Symptom: `UIFeedbackGenerator`/SwiftUI `.sensoryFeedback` haptics (tag-tap ticks in `MessageRowView`/`TriageCardView`/`MessageCardView`) silently stop firing mid-session; only quitting + relaunching the app brings them back. Correlates with prior **dictation** use (`SpeechRecognizer` via `DynamicIslandChatButton`/`AgentChatSheet`).
+- Root cause: iOS mutes haptics and certain system sounds while an `AVAudioSession` is **active in a recording-capable category** (`allowHapticsAndSystemSoundsDuringRecording` defaults to `false`). `SpeechRecognizer.beginRecording` sets `.playAndRecord` + `setActive(true)` but the teardown only stopped the `AVAudioEngine` — it **never called `setActive(false)`**, so the session stayed active for the whole process and haptics stayed muted until relaunch. Restart resets the session → haptics return.
+- Fix (2026-06-27): `SpeechRecognizer.deactivateAudioSession()` (`nonisolated`, runs off main per iOS 26 AVAudioSession requirement, `setActive(false, .notifyOthersOnDeactivation)`) is now called on **every exit path after activation**: committed-recording teardown in `stop()` (guarded by the `generation` counter so a late teardown can't deactivate a session a concurrent restart just activated), the stale-teardown path, the invalid-format early return, and the `catch`. `stop()`'s deactivation lives inside its `engine != nil` teardown; the stale/error paths (engine never committed to state) own their own deactivation.
+- Did **not** use `setAllowHapticsAndSystemSoundsDuringRecording(true)` — that only masks the symptom, leaves the session leaked (other apps' audio stays interrupted, mic capability held), and could let Taptic buzz bleed into the dictation mic. Deactivating is the correct fix; haptics and dictation are on different screens so haptics-during-recording isn't needed.
+- Not unit-tested (hardware; simulator doesn't reproduce haptic muting) — verify on device: dictate in chat → stop → tap a tag in inbox → haptic fires.
+
+---
+
 ## Knowledge Gaps
 
 (none currently)

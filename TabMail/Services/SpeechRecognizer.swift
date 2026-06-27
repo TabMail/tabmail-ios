@@ -61,9 +61,11 @@ final class SpeechRecognizer {
 
     func stop() {
         // Extract resources from mutex quickly, update UI state immediately.
-        // Heavy audio teardown (engine.stop, removeTap) runs off main thread
-        // to prevent blocking keyboard animation on dictation→keyboard switch.
-        let resources = _audioState.withLock { state -> (AVAudioEngine?, SFSpeechRecognitionTask?, SFSpeechAudioBufferRecognitionRequest?) in
+        // Heavy audio teardown (engine.stop, removeTap, session deactivation)
+        // runs off the main thread to avoid blocking keyboard animation on the
+        // dictation→keyboard switch, and because iOS 26 requires AVAudioSession
+        // mutations off the main actor.
+        let (engine, task, request, stopGeneration) = _audioState.withLock { state -> (AVAudioEngine?, SFSpeechRecognitionTask?, SFSpeechAudioBufferRecognitionRequest?, UInt) in
             state.generation &+= 1  // Invalidate any in-flight beginRecording
             let engine = state.audioEngine
             let task = state.recognitionTask
@@ -71,20 +73,46 @@ final class SpeechRecognizer {
             state.audioEngine = nil
             state.recognitionTask = nil
             state.recognitionRequest = nil
-            return (engine, task, request)
+            return (engine, task, request, state.generation)
         }
         isRecording = false
         isStarting = false
 
-        let (engine, task, request) = resources
         if engine != nil || task != nil || request != nil {
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 task?.cancel()
                 request?.endAudio()
                 if let engine {
                     engine.stop()
                     engine.inputNode.removeTap(onBus: 0)
                 }
+                // Release the audio session. Without this the .playAndRecord
+                // session stays active for the rest of the process, which makes
+                // iOS mute UIFeedbackGenerator/.sensoryFeedback haptics (and keeps
+                // other apps' audio interrupted) until the app is relaunched.
+                // Guarded by `generation`: if a newer start/stop cycle has begun,
+                // skip — that cycle now owns the session and we must not deactivate
+                // a recording it just activated.
+                guard let self else { return }
+                let stillCurrent = self._audioState.withLock { $0.generation == stopGeneration }
+                if stillCurrent {
+                    self.deactivateAudioSession()
+                }
+            }
+        }
+    }
+
+    /// Deactivates the shared audio session so the system stops muting haptics
+    /// and other apps can resume audio. MUST be called off the main actor (iOS 26
+    /// requires AVAudioSession mutations off main). `setActive(false)` can throw
+    /// `AVAudioSessionErrorCodeIsBusy` if audio I/O hasn't fully stopped; log and
+    /// move on — the next `start()` re-activates the session regardless.
+    nonisolated private func deactivateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Speech] Failed to deactivate audio session: \(error)")
             }
         }
     }
@@ -122,6 +150,9 @@ final class SpeechRecognizer {
                 let recordingFormat = inputNode.outputFormat(forBus: 0)
                 guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
                     print("[Speech] No valid audio input format available")
+                    // Session was activated above but we're bailing before any
+                    // recording starts — release it so haptics aren't left muted.
+                    self?.deactivateAudioSession()
                     DispatchQueue.main.async { [weak self] in self?.isStarting = false }
                     return
                 }
@@ -161,11 +192,14 @@ final class SpeechRecognizer {
                 }
 
                 if !shouldCommit {
-                    // Stale — stop() was called during setup. Tear down.
+                    // Stale — stop() was called during setup. Tear down. stop()
+                    // couldn't release the session (our engine was never committed
+                    // to state, so its teardown was skipped), so deactivate here.
                     engine.stop()
                     inputNode.removeTap(onBus: 0)
                     task.cancel()
                     request.endAudio()
+                    self.deactivateAudioSession()
                     return
                 }
 
@@ -183,6 +217,10 @@ final class SpeechRecognizer {
                 }
             } catch {
                 print("[Speech] Failed to start recording: \(error)")
+                // setActive(true) above may have succeeded before the failure
+                // (e.g. engine.start() threw) — release the session so haptics
+                // aren't left muted.
+                self?.deactivateAudioSession()
                 DispatchQueue.main.async { [weak self] in
                     self?.stop()
                 }
