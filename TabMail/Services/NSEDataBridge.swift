@@ -465,6 +465,13 @@ enum NSEDataBridge {
             // savepoint commits — so a savepoint rollback doesn't leak stale
             // entries that point at non-existent main-GRDB rows.
             var ftsBatch: [(headerId: String, textContent: String)] = []
+            // The id of EVERY committed merged header (bodied or not). Header
+            // visibility (headerComplete) is independent of body presence, so the
+            // post-tx flush indexes + flips headerComplete for this full set — an
+            // image-only / unresolved-CID push becomes inbox-visible at merge time
+            // rather than waiting for a later recoverIncompleteHeaders pass. Body
+            // FTS / bodyComplete stay scoped to `ftsBatch` (the bodied subset).
+            var allMergedHeaderIds: [String] = []
 
             // Tracks whether the outer dbPool.write actually committed. Per-
             // message savepoints can RELEASE successfully but if the outer
@@ -483,10 +490,11 @@ enum NSEDataBridge {
                 // busyMode). The @Sendable closure can't capture mutable outer
                 // state, so the per-message accumulators are built INSIDE and
                 // returned, then assigned to successfullyMergedIds/ftsBatch below.
-                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)]) = try await AppDatabase.dbPool.write { db in
+                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String]) = try await AppDatabase.dbPool.write { db in
                     var localMergedIds: [String] = []
                     var localCommitted = 0
                     var localFtsAccumulator: [(headerId: String, textContent: String)] = []
+                    var localHeaderAccumulator: [String] = []
                     for msg in processed {
                         // Per-message savepoint: a single bad row (FK
                         // violation, ThreadUtils throw, FTS contention, etc.)
@@ -504,6 +512,10 @@ enum NSEDataBridge {
                         // a rollback doesn't leak FTS entries pointing at
                         // non-existent rows.
                         var localFtsBatch: [(headerId: String, textContent: String)] = []
+                        // The id of the header this savepoint committed (existing or
+                        // newly inserted). Captured regardless of body so the post-tx
+                        // flush can index it + flip headerComplete → inbox-visible.
+                        var committedHeaderId: String?
                         do {
                             try db.inSavepoint {
                                 // Find existing MessageHeader in main DB.
@@ -534,6 +546,7 @@ enum NSEDataBridge {
                                 }
                                 if let row = existingRow {
                                     let headerId: String = row["id"]
+                                    committedHeaderId = headerId
                                     // Use the existing header's folderPath (not the
                                     // staged msg.folderPath) as the AI cache key's
                                     // folder component. If sync raced ahead of our
@@ -657,6 +670,17 @@ enum NSEDataBridge {
                                     _ = try Self.insertNewHeaderFromStaging(
                                         msg, db: db, ftsBatch: &localFtsBatch
                                     )
+                                    // MessageHeader.id == MessageIdentity.headerId(...)
+                                    // by construction (MessageHeader.swift:232), so this
+                                    // is exactly the row insertNewHeaderFromStaging wrote
+                                    // (onConflict:.ignore — same id whether it inserted or
+                                    // sync already had it; re-flipping headerComplete is an
+                                    // idempotent no-op in the latter case).
+                                    committedHeaderId = MessageIdentity.headerId(
+                                        accountId: msg.accountId,
+                                        folderPath: msg.folderPath,
+                                        messageId: msg.messageId
+                                    )
 
                                     // Queue IMAP tag write so the tag propagates to the server.
                                     // Without this, the fresh-header branch would set header.actionTag
@@ -687,6 +711,9 @@ enum NSEDataBridge {
                             // Savepoint committed — promote local FTS batch and
                             // count the commit (drives the UI refresh / badge recount).
                             localFtsAccumulator.append(contentsOf: localFtsBatch)
+                            if let hid = committedHeaderId {
+                                localHeaderAccumulator.append(hid)
+                            }
                             localCommitted += 1
                             // Delete the staging row only when the NSE's work is
                             // DONE: AI completed (terminal), or a gradual row whose
@@ -707,7 +734,7 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
-                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator)
+                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator)
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
@@ -717,6 +744,7 @@ enum NSEDataBridge {
                 successfullyMergedIds = writeResult.ids
                 committedCount = writeResult.committed
                 ftsBatch = writeResult.fts
+                allMergedHeaderIds = writeResult.headers
                 outerCommitted = true
                 print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
@@ -753,21 +781,24 @@ enum NSEDataBridge {
             // delete their staging rows.
             if outerCommitted {
                 // Fire ONE batched FTS pipeline for all committed messages.
-                // No-op if ftsBatch is empty.
+                // No-op if nothing was merged this wake.
                 //
                 // AWAITED (not detached) — this is what flips `headerComplete=1`
-                // (and `bodyComplete=1`). Because the merge is privileged and
-                // single-threaded (see `NSEMergeCoordinator`), nothing else is
-                // contending for the GRDB / FTS writers while it runs, so the
-                // flush is fast; awaiting it means the brand-new staged header is
-                // FTS-indexed and `headerComplete=1` BEFORE the single end-of-merge
+                // for EVERY merged header (and `bodyComplete=1` for the bodied
+                // subset). Because the merge is privileged and single-threaded
+                // (see `NSEMergeCoordinator`), nothing else is contending for the
+                // GRDB / FTS writers while it runs, so the flush is fast; awaiting
+                // it means the brand-new staged header is FTS-indexed and
+                // `headerComplete=1` BEFORE the single end-of-merge
                 // `.inboxDataDidChange` fires. The inbox query gates on
                 // `headerComplete == true`, so this is the difference between the
                 // pushed message appearing in this reload vs. waiting (invisibly)
-                // for some unrelated later signal. The pre-rendered body landing
-                // here too means the user opens it with no "loading body" flash.
-                if !ftsBatch.isEmpty {
-                    await Self.flushNSEBatchToFTS(items: ftsBatch)
+                // for some unrelated later signal — now true even for image-only /
+                // unresolved-CID mail that has no indexable body. For the bodied
+                // subset, the pre-rendered body landing here too means the user
+                // opens it with no "loading body" flash.
+                if !allMergedHeaderIds.isEmpty {
+                    await Self.flushNSEBatchToFTS(headerIds: allMergedHeaderIds, bodyItems: ftsBatch)
                 }
 
                 // Delete only the rows whose per-msg savepoint released AND
@@ -1198,10 +1229,13 @@ enum NSEDataBridge {
                 """, arguments: [snippet, headerId])
         }
 
-        // Queue up the FTS pipeline work. `flushNSEBatchToFTS` runs once per merge
-        // with the full batch of headerIds — amortizes FTS transaction overhead.
-        // Unresolved-CID and empty-text messages skip FTS (same as before) — they
-        // stay at headerComplete=0; recoverIncompleteHeaders catches them next wake.
+        // Queue up the FTS BODY work. `flushNSEBatchToFTS` runs once per merge with
+        // the full batch — amortizes FTS transaction overhead. Unresolved-CID and
+        // empty-text messages skip the BODY batch (no indexable plain text), so
+        // their `bodyComplete` stays 0 and the body queue fetches the body later.
+        // Their HEADER is still FTS-indexed + flipped headerComplete=1 via the merge's
+        // all-headers path (`allMergedHeaderIds`), so they ARE inbox-visible at merge
+        // time — they no longer wait for a recoverIncompleteHeaders pass.
         if let text = textContent, !text.isEmpty, !hasUnresolvedCIDs {
             ftsBatch.append((headerId: headerId, textContent: text))
         }
@@ -1211,11 +1245,19 @@ enum NSEDataBridge {
     /// Runs after the main merge transaction commits, in a single detached Task.
     /// Amortizes FTS and GRDB write overhead across the whole batch.
     ///
+    /// Header visibility (`headerComplete`) is DECOUPLED from body indexing:
+    /// `headerIds` is EVERY merged message; `bodyItems` is the subset that had a
+    /// rendered, CID-resolved, non-empty plain-text body.
+    ///
     /// Pipeline steps:
-    ///   1. Bulk read MessageHeaders → build FTSHeaderRecords.
+    ///   1. Bulk read MessageHeaders for ALL `headerIds` → build FTSHeaderRecords.
     ///   2. `SearchIndex.shared.indexHeaders(records)` — idempotent on known IDs.
-    ///   3. Bulk `UPDATE messageHeader SET headerComplete=1 WHERE id IN (...)`.
-    ///   4. `SearchIndex.shared.updateBodies(items)` — returns set of confirmed IDs.
+    ///   3. Bulk `UPDATE messageHeader SET headerComplete=1 WHERE id IN (...)` —
+    ///      makes EVERY merged message inbox-visible at merge time (image-only /
+    ///      unresolved-CID / body-less mail included; the inbox query gates on
+    ///      headerComplete == true).
+    ///   4. `SearchIndex.shared.updateBodies(bodyItems)` — body subset only;
+    ///      returns set of confirmed IDs.
     ///   5. Bulk `UPDATE messageHeader SET bodyComplete=1 WHERE id IN (confirmed)`.
     ///   6. Enqueue AI (inbox only) + embedding for confirmed items.
     ///
@@ -1223,13 +1265,12 @@ enum NSEDataBridge {
     /// heal via `recoverIncompleteHeaders`, the body queue (`bodyComplete=0`
     /// refetch), and drain-time self-repopulate.
     fileprivate static func flushNSEBatchToFTS(
-        items: [(headerId: String, textContent: String)]
+        headerIds: [String],
+        bodyItems: [(headerId: String, textContent: String)]
     ) async {
-        guard !items.isEmpty else { return }
+        guard !headerIds.isEmpty else { return }
 
-        let headerIds = items.map(\.headerId)
-
-        // 1. Bulk read the headers.
+        // 1. Bulk read ALL merged headers (regardless of body presence).
         let headersById: [String: MessageHeader]
         do {
             headersById = try await AppDatabase.dbPool.read { db in
@@ -1244,25 +1285,23 @@ enum NSEDataBridge {
         }
 
         // Filter to headers that actually exist (handle races where a header was
-        // deleted/moved between merge and flush).
-        let validItems = items.compactMap { item -> (headerId: String, textContent: String, header: MessageHeader)? in
-            guard let header = headersById[item.headerId] else { return nil }
-            return (item.headerId, item.textContent, header)
-        }
-        guard !validItems.isEmpty else { return }
+        // deleted/moved between merge and flush). Preserve merge order.
+        let validHeaders = headerIds.compactMap { headersById[$0] }
+        guard !validHeaders.isEmpty else { return }
 
-        // 2. Batch FTS header indexing. Idempotent — known IDs are skipped.
-        let records = validItems.map { item -> FTSHeaderRecord in
+        // 2. Batch FTS header indexing for ALL merged headers. Idempotent — known
+        //    IDs are skipped; header records carry no body, so this is cheap.
+        let records = validHeaders.map { header -> FTSHeaderRecord in
             FTSHeaderRecord(
-                headerId: item.header.id,
-                messageId: item.header.messageId,
-                subject: item.header.subject,
-                from: "\(item.header.from) <\(item.header.fromAddress)>",
-                to: item.header.to,
-                cc: item.header.cc,
-                bcc: item.header.bcc,
-                dateMs: Int64(item.header.date.timeIntervalSince1970 * 1000),
-                folderId: item.header.folderId
+                headerId: header.id,
+                messageId: header.messageId,
+                subject: header.subject,
+                from: "\(header.from) <\(header.fromAddress)>",
+                to: header.to,
+                cc: header.cc,
+                bcc: header.bcc,
+                dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
+                folderId: header.folderId
             )
         }
         do {
@@ -1272,8 +1311,10 @@ enum NSEDataBridge {
             return
         }
 
-        // 3. Batch flip headerComplete=1 for all indexed headers.
-        let indexedIds = validItems.map(\.headerId)
+        // 3. Batch flip headerComplete=1 for ALL indexed headers → inbox-visible
+        //    NOW. This is the fix for body-less / unresolved-CID pushed mail being
+        //    invisible until a later recoverIncompleteHeaders pass.
+        let indexedIds = validHeaders.map(\.id)
         do {
             try await AppDatabase.dbPool.write { db in
                 let placeholders = indexedIds.map { _ in "?" }.joined(separator: ",")
@@ -1287,8 +1328,18 @@ enum NSEDataBridge {
             return
         }
 
-        // 4. Batch FTS body write.
-        let ftsBodies = validItems.map { ($0.headerId, $0.textContent) }
+        // 4. Batch FTS BODY write — ONLY the subset that had a rendered, CID-
+        //    resolved, non-empty plain-text body (`bodyItems`). Body-less rows are
+        //    now headerComplete=1 / bodyComplete=0, so the body queue fetches them
+        //    (we never set bodyComplete for a body we didn't index — "never mark
+        //    unfetched content as fetched").
+        let validBodyItems = bodyItems.compactMap { item -> (headerId: String, textContent: String, header: MessageHeader)? in
+            guard let header = headersById[item.headerId] else { return nil }
+            return (item.headerId, item.textContent, header)
+        }
+        guard !validBodyItems.isEmpty else { return }
+
+        let ftsBodies = validBodyItems.map { ($0.headerId, $0.textContent) }
         let written: Set<String>
         do {
             written = try await SearchIndex.shared.updateBodies(ftsBodies)
@@ -1297,7 +1348,7 @@ enum NSEDataBridge {
             return
         }
 
-        let confirmedItems = validItems.filter { written.contains($0.headerId) }
+        let confirmedItems = validBodyItems.filter { written.contains($0.headerId) }
         guard !confirmedItems.isEmpty else {
             print("[NSEDataBridge] FTS batch: no body writes confirmed (\(ftsBodies.count) attempted) — body queue will retry")
             return
@@ -1509,9 +1560,11 @@ enum NSEDataBridge {
         header.notified = msg.notified
         // headerComplete reflects "row exists in FTS". Stays false until
         // `flushNSEBatchToFTS` indexes the FTS header row (and sets the flag).
-        // Inbox visibility does not depend on this flag — body queue's filter
-        // does, which is correct: we don't want body queue to refetch a body
-        // that NSE already rendered.
+        // The inbox query gates on headerComplete == true, so this row is
+        // INVISIBLE until the post-tx flush flips it — which it now does for
+        // EVERY merged header (not just bodied ones), so an image-only /
+        // unresolved-CID push appears at merge time. The body queue's filter
+        // (headerComplete=1 AND bodyComplete=0) then fetches any missing body.
         header.headerComplete = false
 
         // Action tag (ADR-IOS-036): local-only. NSE writes its AI-computed

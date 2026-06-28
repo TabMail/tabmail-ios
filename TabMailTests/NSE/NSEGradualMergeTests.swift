@@ -92,6 +92,23 @@ struct NSEGradualMergeTests {
         }
     }
 
+    /// Stage a body the NSE rendered but left with UNRESOLVED inline CIDs (an
+    /// inline image exceeded the size/count cap so a `cid:` ref remains). Mirrors
+    /// `NSEStagingDB.stageBody` with `hasUnresolvedCIDs=1` — such a body is
+    /// intentionally NOT cached as `MessageBody` (the main app re-renders on open)
+    /// and NOT FTS-body-indexed, yet the header must still become inbox-visible.
+    private func stageUnresolvedCIDBodyRow(_ q: DatabaseQueue, messageId: String = "msg-1") throws {
+        try q.write { db in
+            try db.execute(sql: """
+                UPDATE nse_processed_message SET
+                    htmlContent = ?, textContent = ?, hasUnresolvedCIDs = 1
+                WHERE id = ?
+                """, arguments: [
+                    "<p>Newsletter</p><img src=\"cid:logo@x\">", "Newsletter", "acc1:\(messageId)"
+                ])
+        }
+    }
+
     /// Stage 3 — terminal AI (summary + action + `aiCompleted=1`), mirroring
     /// `NSEStagingDB.stageSummary` + the terminal `persistProcessedMessage`.
     private func stageAIRow(
@@ -260,7 +277,7 @@ struct NSEGradualMergeTests {
         #expect(try stagingRowExists(q) == false)
     }
 
-    @Test("Synchronous FTS flush flips headerComplete so the merged message is inbox-visible")
+    @Test("Header-only / body-less merge makes the message inbox-visible immediately (headerComplete=1, bodyComplete=0)")
     @MainActor func mergeFlipsHeaderCompleteSynchronously() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
         defer {
@@ -269,18 +286,22 @@ struct NSEGradualMergeTests {
         }
         let (path, q) = try makeStagingFile(in: dir)
 
-        // Header only — no body text, so nothing is FTS-indexed and
-        // headerComplete stays false (the inbox query would hide this row).
+        // Header only — no body text. Header visibility is DECOUPLED from body
+        // indexing: the merge FTS-indexes the header and flips headerComplete=1
+        // (inbox-visible NOW — the inbox query gates on headerComplete == true)
+        // even with no body yet; bodyComplete stays 0 so the body queue fetches it.
+        // BEFORE this fix a body-less push stayed headerComplete=0 → invisible until
+        // a later recoverIncompleteHeaders pass (the reported 1-3s "minor cases").
         try stageHeaderRow(q)
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
         let afterHeader = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
-        #expect(afterHeader?.headerComplete == false)
+        #expect(afterHeader?.headerComplete == true)
+        #expect(afterHeader?.bodyComplete == false)
 
-        // Body staged: the merge now AWAITS the FTS flush (was a detached Task), so
-        // `headerComplete=1` / `bodyComplete=1` MUST be set by the time the merge
-        // returns. This is the visibility fix: the inbox query filters
-        // `headerComplete == true`, so a regression to a detached flush would leave
-        // the freshly-merged message invisible until some unrelated later signal.
+        // Body staged: bodyComplete now ALSO flips. The merge AWAITS the FTS flush
+        // (was a detached Task), so both flags MUST be set by the time the merge
+        // returns — a regression to a detached flush would leave the freshly-merged
+        // message invisible/bodyless until some unrelated later signal.
         try stageBodyRow(q)
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
         let afterBody = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
@@ -288,9 +309,38 @@ struct NSEGradualMergeTests {
         #expect(afterBody?.bodyComplete == true)
     }
 
+    @Test("Unresolved-CID body: header becomes visible; no MessageBody cached, bodyComplete stays 0")
+    @MainActor func unresolvedCIDMergeStillVisible() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // A pushed inline-image email whose CIDs the NSE could not resolve within
+        // its memory budget — it has a body, but the body is neither MessageBody-
+        // cached nor FTS-body-indexed, so the OLD merge never flipped
+        // headerComplete and the message was invisible for 1-3s. The fix flips
+        // headerComplete on the header alone (visible NOW); the body re-fetches on
+        // open / via the body queue, which resolves the CIDs.
+        try stageHeaderRow(q)
+        try stageUnresolvedCIDBodyRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        let h = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(h?.headerComplete == true)   // VISIBLE now (the fix)
+        #expect(h?.bodyComplete == false)    // body not claimed → body queue re-fetches + resolves CIDs
+        // No MessageBody is cached for an unresolved-CID body (re-render on open).
+        let bodyCount = try await pool.read {
+            try MessageBody.filter(Column("id") == headerId()).fetchCount($0)
+        }
+        #expect(bodyCount == 0)
+    }
+
     @Test("Merge emits exactly ONE inboxDataDidChange, flagged immediate (bypasses debounce)")
     @MainActor func mergePostsSingleImmediateSignal() async throws {
-        let (dir, pool, previous) = try makeAppDatabase()
+        let (dir, _, previous) = try makeAppDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
