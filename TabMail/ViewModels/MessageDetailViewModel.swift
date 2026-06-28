@@ -195,9 +195,31 @@ final class MessageDetailViewModel {
     /// retries after the connection pool self-heals.
     /// Unbounded: runs until body arrives, user navigates away (Task cancelled),
     /// or ViewModel is deallocated (weak self).
-    private func startBodyPoll() {
+    /// Internal (not `private`) so tests can drive the immediate-cache path
+    /// directly — `@testable import` cannot reach `private` members.
+    func startBodyPoll() {
         bodyPollTask?.cancel()
         bodyPollTask = Task { [weak self] in
+            // IMMEDIATE cache check, BEFORE the first 2s sleep. On the
+            // notification-tap deep-link path the body is usually ALREADY in the DB
+            // (the deep-link's own NSE merge wrote it) — loadBody just got cancelled
+            // by the inbox-reload/navigation re-render churn during its initial read
+            // (GRDB throws CancellationError on async reads in a cancelled task), so
+            // it deferred here. This independent, un-cancelled task can read it NOW
+            // and render at once instead of waiting 2s on a body that's already
+            // present. Pure DB read — NO server fetch, so it doesn't compete for the
+            // IMAP connection (the risky retry path stays on the 2s cadence below).
+            if let self, self.messageBody == nil {
+                let rid = self.resolvedId
+                if let body = try? await self.dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
+                    self.messageBody = body
+                    self.isLoading = false
+                    self.error = nil
+                    self.loadThreadMessagesAsync()
+                    print("[MessageDetail] Body found immediately on poll start for \(rid.prefix(40))")
+                    return
+                }
+            }
             var fetchAttempt = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))

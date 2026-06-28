@@ -86,6 +86,47 @@ struct OnDemandBodyFetchGRDBTests {
         #expect(!fetchBodyCalled, "fetchBody should not be called when body is already cached")
     }
 
+    @Test("startBodyPoll renders an already-cached body immediately (no 2s floor)")
+    @MainActor
+    func startBodyPollImmediateCacheHit() async throws {
+        let (pool, _) = try makeTestPool()
+
+        let header = try await insertFixtures(pool, messageId: "odf_poll_\(Int(Date().timeIntervalSince1970))")
+
+        // Body is ALREADY cached — mirrors the notification-tap path, where the
+        // deep-link's own NSE merge wrote the body before loadBody's task got
+        // cancelled (by the inbox-reload/nav churn) and deferred to the poll.
+        try await pool.write { db in
+            let body = MessageBody(headerId: header.id, htmlContent: "<p>cached before poll</p>")
+            try body.insert(db)
+        }
+
+        var fetchBodyCalled = false
+        let vm = MessageDetailViewModel(
+            messageId: header.id,
+            dbPool: pool,
+            fetchBodyOverride: { _ in fetchBodyCalled = true }
+        )
+        #expect(vm.messageBody == nil)
+
+        // Drive the deferral directly (what loadBody does on CancellationError).
+        vm.startBodyPoll()
+
+        // The immediate cache check (before the first 2s sleep) must render the body
+        // WELL under the 2s poll floor. Poll up to 1s; with the fix it's ~ms, without
+        // it the body stays nil until the 2s tick → this assertion fails.
+        var waited = 0
+        while vm.messageBody == nil && waited < 20 {
+            try await Task.sleep(for: .milliseconds(50))
+            waited += 1
+        }
+
+        #expect(vm.messageBody != nil, "immediate cache check should render before the 2s floor")
+        #expect(vm.messageBody?.htmlContent == "<p>cached before poll</p>")
+        #expect(vm.isLoading == false)
+        #expect(!fetchBodyCalled, "immediate check is a pure DB read — must not server-fetch")
+    }
+
     @Test("loadBody calls fetchBody when body is NOT cached and NOT in queue")
     @MainActor
     func loadBodyFetchesWhenNotCached() async throws {
