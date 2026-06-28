@@ -34,6 +34,53 @@ struct NormalizeUnicodeTests {
         #expect(result == input)
     }
 
+    @Test("Line-start dashes (list bullets) normalize to ASCII hyphen")
+    func lineStartDashesNormalized() {
+        // dash at the very start of the string
+        #expect(AIService.normalizeUnicode("\u{2014}item") == "-item")
+        // dash right after a newline: en-dash / em-dash / horizontal bar / minus
+        #expect(AIService.normalizeUnicode("a\n\u{2013}item") == "a\n-item")
+        #expect(AIService.normalizeUnicode("a\n\u{2014}item") == "a\n-item")
+        #expect(AIService.normalizeUnicode("a\n\u{2015}item") == "a\n-item")
+        #expect(AIService.normalizeUnicode("a\n\u{2212}item") == "a\n-item")
+        // indented bullets keep their indentation, dash still normalizes
+        #expect(AIService.normalizeUnicode("a\n  \u{2013} item") == "a\n  - item")
+        #expect(AIService.normalizeUnicode("a\n\t\u{2014} item") == "a\n\t- item")
+        // an already-ASCII bullet is untouched
+        #expect(AIService.normalizeUnicode("a\n- item") == "a\n- item")
+    }
+
+    @Test("Inline dashes (prose em-dashes, ranges) are left intact")
+    func inlineDashesPreserved() {
+        // em-dash used as punctuation mid-line is preserved (HTML email typography)
+        #expect(AIService.normalizeUnicode("store\u{2014}it") == "store\u{2014}it")
+        #expect(AIService.normalizeUnicode("word \u{2014} word") == "word \u{2014} word")
+        // en-dash range mid-line is preserved (not at line start)
+        #expect(AIService.normalizeUnicode("pages 10\u{2013}20") == "pages 10\u{2013}20")
+    }
+
+    @Test("Smart single quotes + primes normalize to straight apostrophe")
+    func smartSingleQuotes() {
+        #expect(AIService.normalizeUnicode("\u{2018}hi\u{2019}") == "'hi'")
+        #expect(AIService.normalizeUnicode("\u{201B}foo") == "'foo")
+        // prime / reversed-prime → straight apostrophe
+        #expect(AIService.normalizeUnicode("5\u{2032} 3\u{2035}") == "5' 3'")
+    }
+
+    @Test("Smart double quotes normalize to straight quote")
+    func smartDoubleQuotes() {
+        #expect(AIService.normalizeUnicode("\u{201C}hi\u{201D}") == "\"hi\"")
+        #expect(AIService.normalizeUnicode("\u{201E}foo\u{201F}") == "\"foo\"")
+    }
+
+    @Test("Special spaces (thin, zero-width, etc.) normalize to a regular space")
+    func specialSpaces() {
+        #expect(AIService.normalizeUnicode("a\u{2009}b") == "a b")  // thin space
+        #expect(AIService.normalizeUnicode("a\u{200B}b") == "a b")  // zero-width space
+        #expect(AIService.normalizeUnicode("a\u{205F}b") == "a b")  // medium math space
+        #expect(AIService.normalizeUnicode("a\u{3000}b") == "a b")  // ideographic space
+    }
+
     @Test("Empty string unchanged")
     func emptyString() {
         #expect(AIService.normalizeUnicode("") == "")
