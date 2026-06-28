@@ -339,6 +339,20 @@ final class SyncScheduler {
 
             // Refresh notification dedup TTL
             await ProactiveNotifyService.shared.refreshActiveReminders()
+
+            // Storage maintenance (WAL-only here — BodyAssetStore is foreground-only,
+            // ADR-IOS-046). BGProcessing is opportunistic and not guaranteed to run, so
+            // the foreground poll runs this same WAL pass too; both converge here. Runs
+            // off-main and abandons on suspend at each step.
+            if !Task.isCancelled {
+                let undoIds = Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
+                await Task.detached(priority: .utility) {
+                    SyncEngine.runWALMaintenance(
+                        dbPool: AppDatabase.dbPool, includePrune: true,
+                        undoProtectedBodyIds: undoIds
+                    )
+                }.value
+            }
         }
     }
 
@@ -444,6 +458,12 @@ final class SyncScheduler {
         timer?.invalidate()
         timer = nil
         stopImapIdle()
+        // Cancel the foreground maintenance task so its detached `.utility` body can't
+        // be resumed by the cooperative pool inside a later BGTask window and run its
+        // NON-WAL BodyAssetStore read while the process suspends (0xdead10cc). The
+        // `isAppActive` gate in `runBodyAssetMaintenance` is the hard guarantee; this
+        // frees the task promptly. ADR-IOS-046.
+        Task { await manager.syncEngine.cancelMaintenance() }
         BackgroundSyncLogger.log("stopPolling: app going to background (pollActive=\(isPollActive))")
         print("[SyncScheduler] Stopped polling")
     }

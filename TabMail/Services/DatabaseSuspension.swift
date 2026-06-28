@@ -75,6 +75,17 @@ final class DatabaseSuspension {
     /// it clears on the next resume (foreground / silent push / BGTask wake).
     nonisolated static var isSuspended: Bool { suspendedFlag.withLock { $0 } }
 
+    /// True while the app is foreground/active (mirrors the lifecycle observers).
+    /// Maintenance that reads a NON-WAL store (the BodyAssetStore manifest, an
+    /// App-Group `DatabaseQueue`) MUST gate on this: a non-WAL read holds a SQLite
+    /// lock that RunningBoard kills as `0xdead10cc` if the process suspends mid-read,
+    /// and — unlike a WAL read — `Database.suspendNotification` cannot abort it (it is
+    /// blocked in `pread`). So such reads may only START in the foreground, where iOS
+    /// never freezes the process. WAL accesses don't need this (they abort benignly).
+    /// See ADR-IOS-046. `nonisolated` (a Sendable Mutex) so off-main maintenance reads
+    /// it without a main-actor hop.
+    nonisolated static var isAppActive: Bool { appActive.withLock { $0 } }
+
     /// Idempotently mirror GRDB's suspend/resume notifications into `isSuspended`.
     /// Installed from `start()` (production) and lazily by tests. The two observers
     /// are process-lived (never removed) — one pair for the app's lifetime.

@@ -329,4 +329,63 @@ struct DatabaseSuspensionTests {
         let remainingAfter = try pool.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM item") }
         #expect(remainingAfter == 0)
     }
+
+    @Test("Non-WAL reads are NOT suspension-exempt (WAL reads are) — why BodyAssetStore maintenance is foreground-only (ADR-IOS-046)")
+    func nonWALReadsAreNotSuspensionExempt() throws {
+        // The BodyAssetStore manifest is a NON-WAL App-Group `DatabaseQueue` (it opens
+        // with a default `Configuration()`, no WAL — like below). A WAL read keeps
+        // working while suspended (`suspendedPoolAbortsWritesAllowsReads`), but a
+        // non-WAL read is interrupted. At REAL process suspension that read can be
+        // blocked in `pread` and unable to abort in time, so its held SQLite lock
+        // becomes a `0xdead10cc` kill. THAT asymmetry is why
+        // `SyncEngine.runBodyAssetMaintenance` gates on `isAppActive` (foreground-only)
+        // while `runWALMaintenance` does not. If this ever starts allowing reads while
+        // suspended (e.g. the manifest is moved to WAL), revisit that gate.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("suspension-nonwal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            Self.postResume()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        // Default Configuration() == rollback journal (NON-WAL), matching BodyAssetStore.
+        var config = Configuration()
+        config.busyMode = .timeout(5)
+        config.observesSuspensionNotifications = true
+        let queue = try DatabaseQueue(
+            path: dir.appendingPathComponent("manifest.sqlite").path,
+            configuration: config
+        )
+        try queue.write { db in
+            try db.execute(sql: "CREATE TABLE bodyAsset (id INTEGER PRIMARY KEY, sizeBytes INTEGER NOT NULL)")
+            try db.execute(sql: "INSERT INTO bodyAsset (sizeBytes) VALUES (10), (20), (30)")
+        }
+
+        // Active baseline: the usedBytes-style SUM read works.
+        Self.postResume()
+        let before = try queue.read {
+            try Int64.fetchOne($0, sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset")
+        }
+        #expect(before == 60)
+
+        // Suspended: the SAME non-WAL read now throws (the WAL pool allows it — this is
+        // the whole point). This read is the one that holds the lock at the kill site.
+        Self.postSuspend()
+        do {
+            _ = try queue.read {
+                try Int64.fetchOne($0, sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset")
+            }
+            Issue.record("Non-WAL read succeeded while suspended — it should be interrupted; running it backgrounded is the 0xdead10cc liability")
+        } catch {
+            #expect(Self.isSuspensionAbort(error), "Unexpected error type: \(error)")
+        }
+
+        // Resume restores reads.
+        Self.postResume()
+        let after = try queue.read {
+            try Int64.fetchOne($0, sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset")
+        }
+        #expect(after == 60)
+    }
 }

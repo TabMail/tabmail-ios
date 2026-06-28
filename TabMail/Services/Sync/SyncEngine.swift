@@ -134,6 +134,18 @@ actor SyncEngine {
     /// Run evict/purge/prune off the main thread. These use synchronous GRDB
     /// operations that would block the main actor if called inline.
     /// Captures all MainActor-isolated state before detaching.
+    /// Foreground maintenance pass — runs BOTH the WAL housekeeping (storage prune,
+    /// body-TTL evict, AI-cache purge, chat-session evict) and the NON-WAL
+    /// BodyAssetStore housekeeping (attachment evict + orphan sweep). Triggered once
+    /// per foreground poll. Off the main thread (these are synchronous GRDB calls).
+    ///
+    /// The two halves have OPPOSITE background safety, so they are split and gated
+    /// differently (see `runWALMaintenance` / `runBodyAssetMaintenance`):
+    /// - WAL steps abort benignly under suspension → may run anywhere; the `.full`
+    ///   BGProcessing drain calls `runWALMaintenance` directly.
+    /// - BodyAssetStore steps read a NON-WAL App-Group `DatabaseQueue` whose read lock
+    ///   cannot be aborted at process suspension (`0xdead10cc`) → foreground-only.
+    /// See ADR-IOS-046.
     func scheduleMaintenanceInBackground(includePrune: Bool = false) {
         maintenanceTask?.cancel()
         let pool = AppDatabase.dbPool
@@ -142,48 +154,92 @@ actor SyncEngine {
             let undoProtectedBodyIds = await MainActor.run {
                 Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
             }
-            // ADR-IOS-046: abandon maintenance the instant the GRDB pool suspends.
-            // Every step is a write that would just abort (SQLITE_ABORT); they're
-            // all idempotent and re-run on the next maintenance schedule. Gated
-            // alongside cancellation — both answer "should I still be doing this?".
-            func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
-            let t0 = CFAbsoluteTimeGetCurrent()
-            if includePrune && shouldRun() {
-                SyncEngine.runPruneIfOverBudget(dbPool: pool)
-            }
-            let t1 = CFAbsoluteTimeGetCurrent()
-            if shouldRun() {
-                SyncEngine.runEvictStaleBodies(dbPool: pool, undoProtectedBodyIds: undoProtectedBodyIds)
-            }
-            let t2 = CFAbsoluteTimeGetCurrent()
-            if shouldRun() {
-                SyncEngine.runPurgeExpiredAICache(dbPool: pool)
-            }
-            let t3 = CFAbsoluteTimeGetCurrent()
-            if shouldRun() {
-                SyncEngine.runEvictChatSessions(dbPool: pool)
-            }
-            let t4 = CFAbsoluteTimeGetCurrent()
-            // BodyAssetStore maintenance: evict if attachments are over the user's
-            // budget, then sweep orphan files (NSE-written assets whose push got
-            // dropped, eviction crashes, etc.). Both are no-ops on cold + empty state,
-            // and idempotent on repeated runs. Order matters: evict first so the
-            // sweep doesn't have to walk freshly-evicted-but-still-on-disk files
-            // (it would skip them anyway via the min-age guard).
-            if shouldRun() {
-                await BodyAssetMaintenance.evictIfOverCap()
-            }
-            let t5 = CFAbsoluteTimeGetCurrent()
-            if shouldRun() {
-                await BodyAssetMaintenance.pruneOrphans()
-            }
-            let t6 = CFAbsoluteTimeGetCurrent()
-            if includePrune {
-                print("[Sync] Background maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms assetEvict=\(Int((t5-t4)*1000))ms assetSweep=\(Int((t6-t5)*1000))ms")
-            } else {
-                print("[Sync] Background maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms assetEvict=\(Int((t5-t4)*1000))ms assetSweep=\(Int((t6-t5)*1000))ms")
-            }
+            SyncEngine.runWALMaintenance(
+                dbPool: pool, includePrune: includePrune,
+                undoProtectedBodyIds: undoProtectedBodyIds
+            )
+            await SyncEngine.runBodyAssetMaintenance()
         }
+    }
+
+    /// Cancel any in-flight foreground maintenance task. Called on background entry
+    /// (`SyncScheduler.stopPolling`) so a foreground-started `.utility` task can't be
+    /// resumed by the cooperative pool inside a later BGTask window and run its
+    /// NON-WAL BodyAssetStore read while the process is being suspended (the exact
+    /// `0xdead10cc` this prevents). The per-step `isAppActive` gate in
+    /// `runBodyAssetMaintenance` is the hard guarantee; this is the matching lifecycle
+    /// cleanup. See ADR-IOS-046.
+    func cancelMaintenance() {
+        maintenanceTask?.cancel()
+        maintenanceTask = nil
+    }
+
+    /// WAL-only maintenance (AppDatabase + SearchIndex). A WAL access at the suspension
+    /// instant throws a benign `SQLITE_ABORT`, never `0xdead10cc`, so this runs from
+    /// BOTH the foreground poll and the `.full` BGProcessing drain — foreground is
+    /// reliable, BGProcessing is opportunistic (iOS does not guarantee it runs), and we
+    /// want maintenance to happen whenever EITHER fires. Abandons on suspend at each
+    /// step (ADR-IOS-046).
+    nonisolated static func runWALMaintenance(
+        dbPool: PrioritizedDatabase,
+        includePrune: Bool,
+        undoProtectedBodyIds: Set<String>
+    ) {
+        func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        if includePrune && shouldRun() {
+            runPruneIfOverBudget(dbPool: dbPool)
+        }
+        let t1 = CFAbsoluteTimeGetCurrent()
+        if shouldRun() {
+            runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+        }
+        let t2 = CFAbsoluteTimeGetCurrent()
+        if shouldRun() {
+            runPurgeExpiredAICache(dbPool: dbPool)
+        }
+        let t3 = CFAbsoluteTimeGetCurrent()
+        if shouldRun() {
+            runEvictChatSessions(dbPool: dbPool)
+        }
+        let t4 = CFAbsoluteTimeGetCurrent()
+        if includePrune {
+            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms")
+        } else {
+            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms")
+        }
+    }
+
+    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap, then
+    /// sweep cross-DB/filesystem orphans (NSE-written assets whose push got dropped,
+    /// eviction crashes, etc.). Both are no-ops on cold/empty state and idempotent;
+    /// order matters (evict first so the sweep skips freshly-evicted files).
+    ///
+    /// FOREGROUND-ONLY. The manifest is a non-WAL `DatabaseQueue` in the App-Group
+    /// container (shared with the NSE); its read holds a SQLite lock that RunningBoard
+    /// kills as `0xdead10cc` if the process suspends mid-read, and GRDB's
+    /// `Database.suspendNotification` cannot abort it (it's blocked in `pread`). WAL is
+    /// the only suspension-exempt access and we keep this DB non-WAL for App-Group
+    /// sharing safety, so these reads must only START while `isAppActive` (iOS never
+    /// freezes a foreground process). The foreground poll fires every interval the app
+    /// is open, so eviction is NOT starved by the unguaranteed BGProcessing task.
+    /// See ADR-IOS-046.
+    nonisolated static func runBodyAssetMaintenance() async {
+        func shouldRun() -> Bool {
+            !Task.isCancelled
+                && !DatabaseSuspension.isSuspended
+                && DatabaseSuspension.isAppActive
+        }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        if shouldRun() {
+            await BodyAssetMaintenance.evictIfOverCap()
+        }
+        let t1 = CFAbsoluteTimeGetCurrent()
+        if shouldRun() {
+            await BodyAssetMaintenance.pruneOrphans()
+        }
+        let t2 = CFAbsoluteTimeGetCurrent()
+        print("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms assetSweep=\(Int((t2-t1)*1000))ms")
     }
 
     /// Two-tier sync: tries delta sync first (fast), falls back to full sync (robust).
