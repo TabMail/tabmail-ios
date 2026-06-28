@@ -62,6 +62,11 @@ enum BodyAssetMaintenance {
         var iterations = 0
         while current > target && iterations < maxEvictionIterations {
             iterations += 1
+            // Abandon if the app backgrounded mid-eviction (ADR-IOS-046): the manifest
+            // is a NON-WAL `DatabaseQueue`, so a read/delete held into process
+            // suspension is a `0xdead10cc` kill that `Database.suspendNotification`
+            // can't abort mid-`pread`. Foreground-only; re-runs next foreground poll.
+            guard DatabaseSuspension.isAppActive && !DatabaseSuspension.isSuspended else { break }
             let batch = BodyAssetStore.oldestAccessedMessages(limit: evictionBatchSize)
             if batch.isEmpty { break }
 
@@ -155,6 +160,9 @@ enum BodyAssetMaintenance {
                 }
                 let dead = manifestHeaderIds.subtracting(liveHeaderIds)
                 for headerId in dead {
+                    // Abandon if backgrounded mid-sweep (ADR-IOS-046) — non-WAL deletes
+                    // held into suspension are the same 0xdead10cc risk as the reads.
+                    guard DatabaseSuspension.isAppActive && !DatabaseSuspension.isSuspended else { break }
                     _ = BodyAssetStore.deleteAllAssets(forHeaderId: headerId)
                 }
             } catch {
