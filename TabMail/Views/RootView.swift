@@ -311,9 +311,21 @@ struct RootView: View {
             // runs in AppDatabase.init before the pool is exposed), so there's no
             // migrate-vs-sync ordering to manage here anymore.
             Task {
-                for account in accounts where account.isActive {
-                    if await manager.provider(for: account) == nil {
-                        try? await manager.connectAccount(account)
+                // Connect all active accounts CONCURRENTLY. connectAccount blocks up
+                // to SyncConfig.connectTimeoutSeconds on a slow/flaky network; the old
+                // serial loop meant N accounts = up to N×timeout before any provider
+                // was live — and sync (which needs a connected provider) waited that
+                // long. The AccountManager actor serializes the per-account bookkeeping
+                // while the provider.connect() network waits OVERLAP (actor reentrancy),
+                // so providers come up in ~one timeout total and new mail starts flowing
+                // as soon as the first account connects.
+                await withTaskGroup(of: Void.self) { group in
+                    for account in accounts where account.isActive {
+                        group.addTask {
+                            if await manager.provider(for: account) == nil {
+                                try? await manager.connectAccount(account)
+                            }
+                        }
                     }
                 }
 
