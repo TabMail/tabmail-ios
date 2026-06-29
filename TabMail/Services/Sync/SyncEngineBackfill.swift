@@ -146,8 +146,9 @@ extension SyncEngine {
     func resetForFastSync() {
         // Don't reset backfillComplete — folders already crawled stay crawled.
         // Only reset cursors for incomplete folders so they retry from scratch.
-        Task { [weak self] in
-            try? await self?.dbPool.write { db in
+        Task {
+            // Background-tagged: bulk folder-cursor reset yields to foreground/UI work.
+            try? await AppDatabase.backgroundPool.write { db in
                 _ = try Folder.filter(
                     Column("backfillComplete") == false &&
                     Column("path") != ""
@@ -176,7 +177,8 @@ extension SyncEngine {
         // Reset folder progress — anchor to today so backward crawl starts from top.
         // Cursors = nil → IMAP inits from UIDNEXT-1, Gmail/Exchange from first page.
         let now = Date()
-        try? await dbPool.write { db in
+        // Background-tagged: bulk smart-reindex folder/message resets yield to UI work.
+        try? await AppDatabase.backgroundPool.write { db in
             _ = try Folder.filter(Column("path") != "")
                 .updateAll(db,
                     Column("backfillComplete").set(to: false),
@@ -186,7 +188,7 @@ extension SyncEngine {
                 )
         }
         // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance
-        try? await dbPool.write { db in
+        try? await AppDatabase.backgroundPool.write { db in
             try db.execute(sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 0, emptyFetchCount = 0, bodyComplete = 0 WHERE bodyEmptyConfirmed = 1")
         }
         // Reset cc/bcc backfill flag so existing messages get cc/bcc populated

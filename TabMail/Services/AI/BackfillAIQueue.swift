@@ -37,7 +37,8 @@ actor BackfillAIQueue {
     private var activeBatchCount = 0
     private let maxActiveBatches = 1
 
-    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
+    // Background-tagged: deep-backfill AI writes yield to foreground/UI work.
+    private var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
 
     // MARK: - Public API — enqueue
 

@@ -166,4 +166,106 @@ struct PriorityGateTests {
         await bg.value
         #expect(resumed.withLock { $0 } == true)
     }
+
+    // MARK: - Inversion: foreground/UI priority makes background yield
+
+    @Test("priority section parks a background waiter — the badge/inbox-reload fix")
+    func priorityParksBackgroundWaiter() async {
+        // The inversion: a foreground/UI write opens a PRIORITY section (not the
+        // merge); a background loop's yield() must park until it ends. This is what
+        // makes the unread-badge recount / inbox reload jump ahead of a backfill or
+        // reply-precompute batch in the single-writer FIFO.
+        let gate = PriorityGate()
+        await gate.beginPriority()
+
+        let resumed = Mutex<Bool>(false)
+        let bg = Task {
+            await gate.yield("bg")
+            resumed.withLock { $0 = true }
+        }
+        try? await Task.sleep(for: .milliseconds(120))
+        #expect(resumed.withLock { $0 } == false)    // parked while a UI priority write is active
+
+        await gate.endPriority()
+        await bg.value
+        #expect(resumed.withLock { $0 } == true)     // resumed once the UI write finished
+    }
+
+    @Test("priority + privileged compose: background resumes only when BOTH clear")
+    func priorityAndPrivilegedComposeForYield() async {
+        let gate = PriorityGate()
+        await gate.begin()           // privileged (merge)
+        await gate.beginPriority()   // UI write
+
+        let resumed = Mutex<Bool>(false)
+        let bg = Task {
+            await gate.yield("bg")
+            resumed.withLock { $0 = true }
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        await gate.end()             // merge done — UI section still holds the gate
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(resumed.withLock { $0 } == false)   // still parked (priorityCount == 1)
+
+        await gate.endPriority()     // last section clears the gate
+        await bg.value
+        #expect(resumed.withLock { $0 } == true)
+    }
+
+    @Test("a priority section raises the gate but is NOT the privileged merge context")
+    func priorityIsNotPrivilegedContext() async {
+        // A UI priority write must not claim to be the merge — else the
+        // read-through merge recursion guard / yield exemption (keyed on
+        // inPrivilegedContext / isPrivileged) would misfire. isPrivileged tracks
+        // ONLY the merge; a priority section raises the gate without flipping it.
+        let gate = PriorityGate()
+        await gate.beginPriority()
+        let priv = await gate.isPrivileged
+        let raised = await gate.isGateRaised
+        #expect(priv == false)        // not "the merge"
+        #expect(raised == true)       // but the gate is up → background yields
+        await gate.endPriority()
+        let raisedAfter = await gate.isGateRaised
+        #expect(raisedAfter == false)
+    }
+
+    @Test("static priority { } (on .shared) brackets and parks a background waiter")
+    func priorityHelperBrackets() async {
+        // Exercises the exact helper `PrioritizedDatabase.write` uses for a
+        // foreground/UI write. `.serialized` suite + no background loops, so
+        // operating on `.shared` is safe; the helper always releases.
+        let inside = Mutex<Bool>(false)
+        let p = Task {
+            await PriorityGate.priority {
+                inside.withLock { $0 = true }
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+        }
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(inside.withLock { $0 } == true)
+
+        let resumed = Mutex<Bool>(false)
+        let bg = Task {
+            await PriorityGate.shared.yield("bg")
+            resumed.withLock { $0 = true }
+        }
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(resumed.withLock { $0 } == false)   // parked while the UI write runs
+
+        await p.value
+        await bg.value
+        #expect(resumed.withLock { $0 } == true)
+
+        let raised = await PriorityGate.shared.isGateRaised
+        #expect(raised == false)                    // released cleanly
+    }
+
+    @Test("background { } sets inBackgroundContext for its body and scopes it")
+    func backgroundContextTaskLocal() async {
+        #expect(PriorityGate.inBackgroundContext == false)
+        await PriorityGate.background {
+            #expect(PriorityGate.inBackgroundContext == true)
+        }
+        #expect(PriorityGate.inBackgroundContext == false)   // scoped to the body
+    }
 }

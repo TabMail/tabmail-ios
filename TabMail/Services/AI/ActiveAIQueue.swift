@@ -103,7 +103,11 @@ actor ActiveAIQueue {
         let compositionPrompt: String
     }
 
-    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
+    // Background-tagged: this queue's async writes (summary/action/reply, lease
+    // and Device-Sync write-throughs) yield to foreground/UI work (NSE merge,
+    // badge recount, inbox reload) instead of queueing ahead of it. Reads are
+    // unaffected (WAL — they never contend the writer).
+    private var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
 
     // MARK: - Public API
 
@@ -452,7 +456,7 @@ actor ActiveAIQueue {
                 // Lazy TTL touch + eviction: refresh AI cache TTL for inbox messages
                 // and purge expired entries. Runs once after all AI work completes.
                 Task.detached {
-                    SyncEngine.refreshAICacheTTLAndPurge(dbPool: AppDatabase.dbPool)
+                    SyncEngine.refreshAICacheTTLAndPurge(dbPool: AppDatabase.backgroundPool)
                 }
             }
         }

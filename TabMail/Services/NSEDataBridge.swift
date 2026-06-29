@@ -1369,20 +1369,46 @@ enum NSEDataBridge {
             return
         }
 
-        // 6. Enqueue downstream queues. `enqueue` dedups per-actor.
-        // Enqueue as NORMAL priority, not privileged: `enqueue` spawns the queue's
-        // drain loop via an unstructured `Task {}`, which COPIES task-locals — so
-        // without resetting `inPrivilegedContext` here, a drain loop first kicked
-        // from inside this merge would inherit the merge's exemption and never
-        // yield to a LATER merge (defeating the gate, incl. the embedding queue's
-        // own sidecar yields). The downstream AI/embedding work is ordinary
-        // background work and must step aside for future privileged merges.
-        await PriorityGate.$inPrivilegedContext.withValue(false) {
-            for item in confirmedItems {
-                if item.header.isInInbox {
-                    await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.header.accountId)
+        // 6. Enqueue downstream queues (reply precompute + embedding). `enqueue`
+        // dedups per-actor.
+        //
+        // On a FOREGROUND merge (the user opened right after the push), DEFER the
+        // heavy herd until the freshly-surfaced message has PAINTED + a short
+        // settle — so reply-precompute (SSE/tool LLM) and the CoreML embedding
+        // don't contend with first render. The DB side of that contention is
+        // already handled by the background pool (those queues now yield to UI
+        // writes); this settle covers the non-DB CPU/network cost the gate can't
+        // see. On a BACKGROUND merge (silent push / BGAppRefresh) there's no paint
+        // to wait for and precomputing the reply before the user ever opens is the
+        // whole point, so enqueue at once.
+        //
+        // Resilience: if this detached task is dropped (app killed), the message
+        // is re-discovered by `ActiveAIQueue.repopulateFromDatabase` on the next
+        // foreground poll — the enqueue is an optimization, not the only path.
+        let downstream: [(headerId: String, accountId: String, isInInbox: Bool)] =
+            confirmedItems.map { ($0.headerId, $0.header.accountId, $0.header.isInInbox) }
+        Task.detached(priority: .utility) {
+            // Gate only when a REAL foreground app is running. `dbReady` is true at
+            // any production merge time (the merge needs the DB) and false in unit
+            // tests, which never boot AppStartup — so tests skip the gate, enqueue
+            // immediately (old behavior), and never trigger ensureDatabaseReady() /
+            // a DB build from this detached task. Background launches (isAppActive
+            // false) also skip — reply precompute should run ASAP there.
+            let booted = await MainActor.run { AppStartup.shared.dbReady }
+            if DatabaseSuspension.isAppActive && booted {
+                await AppStartup.shared.awaitLaunchReady(background: false)
+                try? await Task.sleep(for: .seconds(SyncConfig.nseMergeHerdSettleSeconds))
+            }
+            // Task.detached starts with inPrivilegedContext = false (task-locals
+            // don't cross the detach), so a drain kicked here can't inherit the
+            // merge's gate exemption — keep the explicit reset for clarity (FIX 6d).
+            await PriorityGate.$inPrivilegedContext.withValue(false) {
+                for item in downstream {
+                    if item.isInInbox {
+                        await ActiveAIQueue.shared.enqueue(headerId: item.headerId, accountId: item.accountId)
+                    }
+                    await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
                 }
-                await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
             }
         }
 

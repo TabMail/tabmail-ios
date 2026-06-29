@@ -378,6 +378,16 @@ enum SyncConfig {
     /// pathological stall — it just stops the herd hanging forever.
     static let firstPaintGateTimeoutSeconds: Double = 8
 
+    /// Settle delay after a FOREGROUND NSE merge before the downstream reply-
+    /// precompute + embedding herd is enqueued (`NSEDataBridge.flushNSEBatchToFTS`).
+    /// On a quick-open, the merge surfaces the message and the inbox reloads via the
+    /// immediate signal; this brief window lets that render land before the heavy
+    /// herd's non-DB cost (SSE/tool LLM, CoreML) starts. Reply precompute is 4–8s
+    /// anyway, so this only shifts WHEN it starts. Background merges skip it
+    /// entirely (precomputing before the user opens is the point). Gated on first
+    /// paint first, so cold-launch waits for the inbox; this is the post-paint settle.
+    static let nseMergeHerdSettleSeconds: Double = 1.0
+
     /// First-paint-gate timeout for the CoreML embedding load specifically (the one
     /// boot task that runs on BOTH launch kinds). On a FOREGROUND launch it resumes
     /// at first paint and this value is irrelevant; on a cold BACKGROUND launch

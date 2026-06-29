@@ -42,7 +42,11 @@ actor BackfillBodyQueue {
     private var folderActiveBatches: [String: Int] = [:]
     private let maxBatchesPerFolder = 2
 
-    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
+    // Background-tagged: deep-backfill body writes (partition/cleanup flag flips)
+    // yield to foreground/UI work. The shared `BodyFetchProcessor` is tagged
+    // separately at its call sites via `PriorityGate.background` (it's also used
+    // by the priority on-demand / active body fetch).
+    private var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
 
     // MARK: - Public API
 
@@ -306,9 +310,15 @@ actor BackfillBodyQueue {
                                     )
                                     switch renderResult {
                                     case .success(let fetchResult):
-                                        let (result, processed) = await BodyFetchProcessor.process(
-                                            fetchResult: fetchResult, enableAI: false
-                                        )
+                                        // Background-tagged: `BodyFetchProcessor` is
+                                        // shared with the on-demand / active body
+                                        // fetch (priority) — only the backfill caller
+                                        // wraps it so ITS main-pool writes yield to UI.
+                                        let (result, processed) = await PriorityGate.background {
+                                            await BodyFetchProcessor.process(
+                                                fetchResult: fetchResult, enableAI: false
+                                            )
+                                        }
                                         return (item, processed, result == .retry)
                                     case .failure:
                                         return (item, nil, true)
@@ -343,7 +353,12 @@ actor BackfillBodyQueue {
                     // gated inside the actor), so the async background CALLER yields.
                     if !processedItems.isEmpty {
                         await PriorityGate.shared.yield("backfill-body-write")
-                        await BodyFetchProcessor.flushBatch(processedItems, enableAI: false)
+                        // Background-tagged so flushBatch's main-pool flag writes
+                        // (bodyComplete) yield to UI; the explicit yield above
+                        // covers the separate SearchIndex (FTS) sidecar pool.
+                        await PriorityGate.background {
+                            await BodyFetchProcessor.flushBatch(processedItems, enableAI: false)
+                        }
                     }
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -362,7 +377,7 @@ actor BackfillBodyQueue {
                             // Single message too large — mark all items as empty
                             print("[BackfillBody] Single item too large for \(key.folderPath) — marking bodyEmptyConfirmed")
                             for item in items {
-                                try? await AppDatabase.dbPool.write { db in
+                                try? await AppDatabase.backgroundPool.write { db in
                                     try db.execute(
                                         sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 1 WHERE id = ?",
                                         arguments: [item.headerId]

@@ -187,7 +187,9 @@ actor ActiveEmbeddingQueue {
 
         let allDoneIds = succeeded.map(\.headerId) + emptyBodyIds
         if !allDoneIds.isEmpty {
-            try? await AppDatabase.dbPool.write { db in
+            // Background-tagged: yields to foreground/UI work (NSE merge, badge,
+            // inbox reload) instead of queueing this flag flip ahead of it.
+            try? await AppDatabase.backgroundPool.write { db in
                 try db.execute(
                     sql: "UPDATE messageHeader SET embeddingComplete = 1 WHERE id IN (\(allDoneIds.map { _ in "?" }.joined(separator: ",")))",
                     arguments: StatementArguments(allDoneIds)

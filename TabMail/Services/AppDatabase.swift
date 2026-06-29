@@ -148,6 +148,15 @@ final class AppDatabase: Sendable {
         PrioritizedDatabase(pool: rawPool)
     }
 
+    /// Background-tagged chokepoint for the heavy background queues (reply
+    /// precompute, embedding, body/header backfill). Identical to `dbPool` except
+    /// its async writes YIELD to any active priority/privileged section (the
+    /// foreground/UI work — NSE merge, badge recount, inbox reload) instead of
+    /// making that work queue behind them. See `PriorityGate`/`PrioritizedDatabase`.
+    static var backgroundPool: PrioritizedDatabase {
+        PrioritizedDatabase(pool: rawPool, isBackground: true)
+    }
+
     // MARK: - NSE Staging Database
 
     /// Staging schema version. BUMP whenever the `nse_processed_message` column

@@ -271,7 +271,8 @@ actor BackfillEmbeddingQueue {
         // 5. Bulk update embeddingComplete flags in GRDB (1 write instead of N)
         let allDoneIds = succeeded.map(\.headerId) + emptyBodyIds
         if !allDoneIds.isEmpty {
-            try? await AppDatabase.dbPool.write { db in
+            // Background-tagged: yields to foreground/UI work.
+            try? await AppDatabase.backgroundPool.write { db in
                 try db.execute(
                     sql: "UPDATE messageHeader SET embeddingComplete = 1 WHERE id IN (\(allDoneIds.map { _ in "?" }.joined(separator: ",")))",
                     arguments: StatementArguments(allDoneIds)

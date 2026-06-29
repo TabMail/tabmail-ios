@@ -424,7 +424,10 @@ final class AppStartup {
     /// This — NOT `isReady` — is what background entry points wait on, because a
     /// cold BACKGROUND launch (silent push / BGTask / notification action) never
     /// runs `loadInitialData`/`isReady` (no UI), yet still needs a usable DB.
-    private var dbReady = false
+    // `private(set)` so the NSE merge's deferred-herd gate can tell a real,
+    // booted foreground app (dbReady == true at merge time) from a unit test that
+    // never boots AppStartup (false) — see `NSEDataBridge.flushNSEBatchToFTS`.
+    private(set) var dbReady = false
 
     /// Continuations parked by `ensureDatabaseReady()` while the DB is building.
     private var dbWaiters: [CheckedContinuation<Void, Never>] = []
