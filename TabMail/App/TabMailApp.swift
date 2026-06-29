@@ -593,15 +593,22 @@ final class AppStartup {
         await ensureDatabaseReady()
         // Build failed (failureMessage shown) or the sidebar already loaded.
         guard dbReady, !isReady else { return }
-        // Merge NSE staging BEFORE the first read/render. Staging IS the delta:
-        // draining it here means the inbox's FIRST PAINT already contains pushed
-        // mail — no "cached inbox, then the message pops in a beat later" gap.
-        // It runs ahead of the sync/backfill herd (which only starts later in
-        // `startForegroundPolling`), so it's contention-free and fast; and it's a
-        // cheap no-op when there's nothing staged (tolerates a missing/empty
-        // staging DB). The later foreground/push merges remain as belt-and-suspenders.
-        await NSEDataBridge.mergeNSEStagingData()
-        BootProfiler.mark("runIfNeeded: NSE staging merged (pre-first-paint)")
+        // Merge NSE staging BEFORE the first read/render so the inbox's FIRST PAINT
+        // already contains pushed mail — but via the FAIL-FAST probe path
+        // (`mergeIfStagingPending`, immediateError busyMode). If the NSE is still
+        // mid-write — a slow-network AI keeps it (and its 1Hz lease heartbeat) busy
+        // past notification delivery — the probe returns "not pending" and we SKIP
+        // rather than block FIRST PAINT on the staging busy-timeout (2s→5s). The
+        // post-paint read-through merge picks the row up the instant the NSE frees
+        // the cross-process file (row stays populated=1, nothing lost). So the
+        // common fast path (staging readable → NSE done) keeps "message in first
+        // frame", while a busy NSE on a slow network no longer regresses cold-boot
+        // time. Changed from the unconditional blocking `mergeNSEStagingData()`
+        // 2026-06-29 after cold-boot-OOO reports — the pre-paint merge must never
+        // wait on the NSE's lock (same principle as FIX 6d's probe). The later
+        // foreground/push merges remain as belt-and-suspenders.
+        await NSEDataBridge.mergeIfStagingPending()
+        BootProfiler.mark("runIfNeeded: NSE staging merge (fail-fast, pre-first-paint)")
         BootProfiler.mark("loadInitialData (sidebar: accounts/folders/outbox) START — @MainActor sync read")
         navigationStore.loadInitialData()
         BootProfiler.mark("loadInitialData DONE (accounts=\(navigationStore.accounts.count) folders=\(navigationStore.folders.count))")
