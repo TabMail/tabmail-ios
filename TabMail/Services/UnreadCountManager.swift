@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import UIKit
 import UserNotifications
 
@@ -41,7 +42,11 @@ actor UnreadCountManager {
             }
             // Badge can update immediately — folder.unreadCount was already set
             // by the optimistic write in the same transaction as the user action.
-            Task { await updateBadge() }
+            // Protected by a background-task assertion so a user who reads an
+            // email and IMMEDIATELY backgrounds still gets the badge decrement:
+            // without it, the read+setBadgeCount races iOS suspension and the
+            // badge stays stale until the next foreground recount.
+            Task { await updateBadgeProtected() }
         }
         pendingFolderIds.formUnion(folderIds)
         if !isActive {
@@ -174,6 +179,34 @@ actor UnreadCountManager {
                 print("[UnreadCount] Badge update error: \(error)")
             }
         }
+    }
+
+    /// `updateBadge()` wrapped in a UIKit background-task assertion so it completes
+    /// even when the user backgrounds the app immediately after the action that
+    /// triggered it (read an email → flick to the home screen). The assertion
+    /// delays iOS suspension for the ~ms the read + `setBadgeCount` need, so the
+    /// badge reflects the new count instead of staying stale until the next
+    /// foreground recount. The atomic `Mutex` lets the expiration handler and the
+    /// `defer` end the task race-safely (whoever runs first wins; the other
+    /// no-ops). Mirrors `ActiveAIQueue.executeJob`'s bg-task pattern.
+    func updateBadgeProtected() async {
+        let bgTaskId = Mutex<UIBackgroundTaskIdentifier>(.invalid)
+        let beginId = await MainActor.run {
+            UIApplication.shared.beginBackgroundTask(withName: "badge-update") {
+                let toEnd = bgTaskId.withLock { v -> UIBackgroundTaskIdentifier in let was = v; v = .invalid; return was }
+                if toEnd != .invalid {
+                    Task { @MainActor in UIApplication.shared.endBackgroundTask(toEnd) }
+                }
+            }
+        }
+        bgTaskId.withLock { $0 = beginId }
+        defer {
+            let toEnd = bgTaskId.withLock { v -> UIBackgroundTaskIdentifier in let was = v; v = .invalid; return was }
+            if toEnd != .invalid {
+                Task { @MainActor in UIApplication.shared.endBackgroundTask(toEnd) }
+            }
+        }
+        await updateBadge()
     }
 
     /// Stamp the most-recent unread inbox messages into the NSE's

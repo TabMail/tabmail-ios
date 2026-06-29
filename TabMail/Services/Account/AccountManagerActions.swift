@@ -56,7 +56,11 @@ extension AccountManager {
             NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         }
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds) }
+        // notifyImmediately: the optimistic write above already decremented
+        // folder.unreadCount, so the app-icon badge can update NOW (bg-task
+        // protected) — without it, a read→immediate-background leaves the badge
+        // stale until the next foreground recount.
+        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds, notifyImmediately: true) }
         Task { await drainPendingQueue() }
     }
 
@@ -97,7 +101,9 @@ extension AccountManager {
             NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         }
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds) }
+        // notifyImmediately: optimistic write already adjusted folder.unreadCount,
+        // so the badge updates NOW (bg-task protected) and survives a quick background.
+        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds, notifyImmediately: true) }
         Task { await drainPendingQueue() }
     }
 
