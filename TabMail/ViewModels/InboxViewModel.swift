@@ -702,6 +702,7 @@ final class InboxViewModel {
         let diffMs = Int((CFAbsoluteTimeGetCurrent() - tDiff) * 1000)
 
         print("[MoveTrace] reloadMessages — newCount=\(loadedMessages.count) hasMore=\(hasMoreMessages)")
+        MergeSurfaceProbe.logSince("inbox reloaded (\(loadedMessages.count) rows)")
         let tRebuild = CFAbsoluteTimeGetCurrent()
         rebuildDisplayGroups()
         let rebuildMs = Int((CFAbsoluteTimeGetCurrent() - tRebuild) * 1000)

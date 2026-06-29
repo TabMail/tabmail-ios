@@ -7,6 +7,34 @@ import GRDB
 import Synchronization
 import UserNotifications
 
+/// DEBUG-ONLY probe to pin a "merged outcome shows late" lag. Stamps when the NSE
+/// merge fires its immediate inbox-reload signal, then measures how long until the
+/// inbox actually reloads (`InboxViewModel.reloadMessages`) and the badge is set
+/// (`UnreadCountManager.updateBadge`). On a quick-open capture:
+///   • `inbox reloaded +Nms` large  → the signal→reload path is the lag (debounce /
+///     single-flight / interaction-freeze) — look there.
+///   • `inbox reloaded +Nms` small but the row still looks late → SwiftUI RENDER
+///     delay after the @Observable mutation.
+///   • both small → the merge fired late (trigger timing), not the surfacing.
+/// No-op unless `DebugModeManager.isLoggingEnabled()` (CLAUDE.md rule 12).
+enum MergeSurfaceProbe {
+    nonisolated static let signalAt = Mutex<CFAbsoluteTime>(0)
+
+    static func markMergeSignal() {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        signalAt.withLock { $0 = CFAbsoluteTimeGetCurrent() }
+    }
+
+    static func logSince(_ label: @autoclosure () -> String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let t0 = signalAt.withLock { $0 }
+        guard t0 > 0 else { return }
+        let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        guard ms <= 30_000 else { return } // ignore events unrelated to a recent merge
+        print("[MergeSurface] \(label()) +\(ms)ms after merge signal")
+    }
+}
+
 /// Bridges data between the main app and the Notification Service Extension.
 /// Main app writes to shared UserDefaults (prompts, account map, etc.).
 /// NSE writes to the staging DB. Main app merges staging data on every wake.
@@ -882,6 +910,7 @@ enum NSEDataBridge {
         // step and must paint immediately (the debounce stays for the noisy
         // background producers — sync/backfill/AI — not for the merge).
         if didMutate {
+            MergeSurfaceProbe.markMergeSignal()
             Task { @MainActor in
                 NotificationCenter.default.post(
                     name: .inboxDataDidChange,

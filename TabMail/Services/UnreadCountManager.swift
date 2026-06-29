@@ -167,6 +167,7 @@ actor UnreadCountManager {
             UserDefaults(suiteName: "group.ai.tabmail")?.set(totalUnread, forKey: NSEBadge.badgeCountKey)
             print("[UnreadCount] Badge set to \(totalUnread)")
             BackgroundSyncLogger.log("badge: \(totalUnread)")
+            MergeSurfaceProbe.logSince("badge set to \(totalUnread)")
             // Record the recently-arrived unread inbox messages this count
             // already includes into the NSE's dedup table, so a concurrent NSE
             // delivery for the same message doesn't increment on top (the
