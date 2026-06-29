@@ -92,7 +92,7 @@ extension SyncEngine {
                         }
                     }
                 }
-                let (inserted, ftsRecords, ccBccUpdates) = insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -149,7 +149,7 @@ extension SyncEngine {
                         ids: chunk, batchSize: gmailBatchSize, interBatchDelay: gmailDelay
                     )
                 }
-                let (inserted, ftsRecords, ccBccUpdates) = insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -205,7 +205,7 @@ extension SyncEngine {
                         ids: chunk, batchSize: batchSize, interBatchDelay: batchDelay
                     )
                 }
-                let (inserted, ftsRecords, ccBccUpdates) = insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -248,145 +248,162 @@ extension SyncEngine {
         folderPath: String,
         folderRole: FolderRole,
         isInInbox: Bool
-    ) -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]) {
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]) {
         guard !headers.isEmpty else { return (0, [], []) }
 
         var ftsRecords: [FTSHeaderRecord] = []
         var count = 0
         var unreadInserted = 0
         var discoveredParents: [String] = []
-
         var ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)] = []
-        do {
-            try dbPool.write { db in
-                // Load pending destructive IDs to skip messages with optimistic moves.
-                // Scoped to (accountId, folderPath) to prevent IMAP cross-folder UID collisions.
-                let scopedOps = try PendingOperation
-                    .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
-                    .fetchAll(db)
-                let snapshot = PendingOperationSnapshot(ops: scopedOps)
 
-                // Batch existence check: one query instead of per-row fetchCount
-                let incomingIds = headers.map(\.messageId)
-                var existingIds = Set<String>()
-                let sqlChunkSize = 500
-                for start in stride(from: 0, to: incomingIds.count, by: sqlChunkSize) {
-                    let end = min(start + sqlChunkSize, incomingIds.count)
-                    let chunk = Array(incomingIds[start..<end])
-                    let found = try String.fetchSet(db,
-                        MessageHeader
-                            .select(Column("messageId"))
-                            .filter(Column("folderId") == folderId && chunk.contains(Column("messageId")))
-                    )
-                    existingIds.formUnion(found)
-                }
+        // CHUNKED async insert: split the batch into transactions of
+        // SyncConfig.backfillInsertChunkSize rows so each holds the single GRDB
+        // writer only briefly, and route each via backgroundPool so it yields to
+        // foreground/UI between chunks. The pending-op snapshot + existence check
+        // stay INSIDE each chunk's write txn (TOCTOU rule: a user action mustn't
+        // slip a PendingOperation between a separate read and the insert). The write
+        // closure RETURNS its accumulated values (no capture-mutate — required for
+        // the @Sendable async write).
+        let chunkSize = SyncConfig.backfillInsertChunkSize
+        for start in stride(from: 0, to: headers.count, by: chunkSize) {
+            let end = min(start + chunkSize, headers.count)
+            let chunk = Array(headers[start..<end])
+            do {
+                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], ccBcc: [(headerId: String, cc: String, bcc: String)], parents: [String]) =
+                    try await AppDatabase.backgroundPool.write { db in
+                        // Load pending destructive IDs to skip messages with optimistic moves.
+                        // Scoped to (accountId, folderPath) to prevent IMAP cross-folder UID collisions.
+                        let scopedOps = try PendingOperation
+                            .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
+                            .fetchAll(db)
+                        let snapshot = PendingOperationSnapshot(ops: scopedOps)
 
-                let needsCcBccBackfill = !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
-                for info in headers {
-                    if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId) { continue }
-                    if existingIds.contains(info.messageId) {
-                        // v10 cc/bcc backfill: update existing messages with cc/bcc from server
-                        if needsCcBccBackfill && (!info.cc.isEmpty || !info.bcc.isEmpty) {
-                            let headerId = "\(accountId):\(folderPath):\(info.messageId)"
-                            try db.execute(
-                                sql: "UPDATE messageHeader SET cc = ?, bcc = ? WHERE id = ?",
-                                arguments: [info.cc, info.bcc, headerId]
-                            )
-                            ccBccFtsUpdates.append((headerId: headerId, cc: info.cc, bcc: info.bcc))
-                        }
-                        continue
-                    }
-
-                    var header = MessageHeader(
-                        messageId: info.messageId,
-                        subject: info.subject,
-                        from: info.from,
-                        fromAddress: info.fromAddress,
-                        to: info.to,
-                        date: info.date,
-                        snippet: EmailFilter.cleanSnippet(info.snippet),
-                        folderId: folderId,
-                        accountId: accountId,
-                        folderPath: folderPath,
-                        isInInbox: isInInbox
-                    )
-                    header.rfc822MessageId = info.rfc822MessageId
-                    header.inReplyTo = info.inReplyTo
-                    header.referencesJSON = MessageHeader.encodeReferences(info.references)
-                    header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: accountId, subject: header.subject)
-                    try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: info.threadId, db: db)
-                    header.replyTo = info.replyTo
-                    header.cc = info.cc
-                    header.bcc = info.bcc
-                    header.isRead = info.isRead
-                    header.isFlagged = info.isFlagged
-                    header.hasAttachments = info.hasAttachments
-                    header.isReplied = info.isReplied
-                    header.isForwarded = info.isForwarded
-                    header.actionTag = info.actionTag
-                    header.tagSortOrder = info.actionTag?.sortOrder ?? 99
-                    try MessageAICache.restoreIfCached(
-                        into: &header,
-                        accountId: accountId,
-                        folderPath: folderPath,
-                        db: db
-                    )
-                    // ReplyDetect: if message is already replied and tagged as "reply", override to "none"
-                    // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
-                    if header.isReplied && header.actionTag == .reply {
-                        header.actionTag = ActionTag.none
-                        header.tagSortOrder = ActionTag.none.sortOrder
-                        let tagOp = PendingOperation(
-                            type: .setTag,
-                            messageIds: [header.stableId],
-                            accountId: accountId,
-                            folderPath: folderPath,
-                            tagValue: ActionTag.none.rawValue
+                        // Existence check — one IN query (chunk <= chunkSize < SQLite's
+                        // ~999 bound-variable limit, so no sub-chunking needed).
+                        let incomingIds = chunk.map(\.messageId)
+                        let existingIds = try String.fetchSet(db,
+                            MessageHeader
+                                .select(Column("messageId"))
+                                .filter(Column("folderId") == folderId && incomingIds.contains(Column("messageId")))
                         )
-                        try tagOp.insert(db)
-                        print("[ReplyDetect] Backfill insert: reply→none for \(header.messageId) (already replied)")
+
+                        var fts: [FTSHeaderRecord] = []
+                        var ccBcc: [(headerId: String, cc: String, bcc: String)] = []
+                        var inserted = 0
+                        var unread = 0
+
+                        let needsCcBccBackfill = !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
+                        for info in chunk {
+                            if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId) { continue }
+                            if existingIds.contains(info.messageId) {
+                                // v10 cc/bcc backfill: update existing messages with cc/bcc from server
+                                if needsCcBccBackfill && (!info.cc.isEmpty || !info.bcc.isEmpty) {
+                                    let headerId = "\(accountId):\(folderPath):\(info.messageId)"
+                                    try db.execute(
+                                        sql: "UPDATE messageHeader SET cc = ?, bcc = ? WHERE id = ?",
+                                        arguments: [info.cc, info.bcc, headerId]
+                                    )
+                                    ccBcc.append((headerId: headerId, cc: info.cc, bcc: info.bcc))
+                                }
+                                continue
+                            }
+
+                            var header = MessageHeader(
+                                messageId: info.messageId,
+                                subject: info.subject,
+                                from: info.from,
+                                fromAddress: info.fromAddress,
+                                to: info.to,
+                                date: info.date,
+                                snippet: EmailFilter.cleanSnippet(info.snippet),
+                                folderId: folderId,
+                                accountId: accountId,
+                                folderPath: folderPath,
+                                isInInbox: isInInbox
+                            )
+                            header.rfc822MessageId = info.rfc822MessageId
+                            header.inReplyTo = info.inReplyTo
+                            header.referencesJSON = MessageHeader.encodeReferences(info.references)
+                            header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: accountId, subject: header.subject)
+                            try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: info.threadId, db: db)
+                            header.replyTo = info.replyTo
+                            header.cc = info.cc
+                            header.bcc = info.bcc
+                            header.isRead = info.isRead
+                            header.isFlagged = info.isFlagged
+                            header.hasAttachments = info.hasAttachments
+                            header.isReplied = info.isReplied
+                            header.isForwarded = info.isForwarded
+                            header.actionTag = info.actionTag
+                            header.tagSortOrder = info.actionTag?.sortOrder ?? 99
+                            try MessageAICache.restoreIfCached(
+                                into: &header,
+                                accountId: accountId,
+                                folderPath: folderPath,
+                                db: db
+                            )
+                            // ReplyDetect: if message is already replied and tagged as "reply", override to "none"
+                            // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                            if header.isReplied && header.actionTag == .reply {
+                                header.actionTag = ActionTag.none
+                                header.tagSortOrder = ActionTag.none.sortOrder
+                                let tagOp = PendingOperation(
+                                    type: .setTag,
+                                    messageIds: [header.stableId],
+                                    accountId: accountId,
+                                    folderPath: folderPath,
+                                    tagValue: ActionTag.none.rawValue
+                                )
+                                try tagOp.insert(db)
+                                print("[ReplyDetect] Backfill insert: reply→none for \(header.messageId) (already replied)")
+                            }
+                            try header.insert(db)
+                            try ThreadUtils.insertMessageReferences(for: header, db: db)
+
+                            // Insert user label associations (Gmail labels / IMAP keywords)
+                            for labelId in info.userLabelIds {
+                                // Auto-create UserLabel if it doesn't exist (IMAP keywords, or Gmail labels
+                                // already synced via fetchFolders). INSERT OR IGNORE for idempotency.
+                                try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
+                                    .insert(db, onConflict: .ignore)
+                                try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                                    .insert(db, onConflict: .ignore)
+                            }
+
+                            inserted += 1
+                            if !info.isRead { unread += 1 }
+
+                            fts.append(FTSHeaderRecord(
+                                headerId: header.id,
+                                messageId: header.messageId,
+                                subject: header.subject,
+                                from: "\(header.from) <\(header.fromAddress)>",
+                                to: header.to,
+                                cc: header.cc,
+                                bcc: header.bcc,
+                                dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
+                                folderId: header.folderId
+                            ))
+                        }
+
+                        // Sent-folder reply discovery — no-op when folderRole != .sent.
+                        let parents = try ReplyParentResolver.markParentsReplied(
+                            inReplyTos: chunk.map(\.inReplyTo),
+                            folderRole: folderRole,
+                            accountId: accountId,
+                            db: db
+                        )
+                        return (inserted, unread, fts, ccBcc, parents)
                     }
-                    try header.insert(db)
-                    try ThreadUtils.insertMessageReferences(for: header, db: db)
-
-                    // Insert user label associations (Gmail labels / IMAP keywords)
-                    for labelId in info.userLabelIds {
-                        // Auto-create UserLabel if it doesn't exist (IMAP keywords, or Gmail labels
-                        // already synced via fetchFolders). INSERT OR IGNORE for idempotency.
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
-                            .insert(db, onConflict: .ignore)
-                    }
-
-                    count += 1
-                    if !info.isRead { unreadInserted += 1 }
-
-                    ftsRecords.append(FTSHeaderRecord(
-                        headerId: header.id,
-                        messageId: header.messageId,
-                        subject: header.subject,
-                        from: "\(header.from) <\(header.fromAddress)>",
-                        to: header.to,
-                        cc: header.cc,
-                        bcc: header.bcc,
-                        dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
-                        folderId: header.folderId
-                    ))
-                }
-
-                // Sent-folder reply discovery — no-op when folderRole != .sent.
-                let parents = try ReplyParentResolver.markParentsReplied(
-                    inReplyTos: headers.map(\.inReplyTo),
-                    folderRole: folderRole,
-                    accountId: accountId,
-                    db: db
-                )
-                discoveredParents.append(contentsOf: parents)
-
+                count += result.inserted
+                unreadInserted += result.unread
+                ftsRecords.append(contentsOf: result.fts)
+                ccBccFtsUpdates.append(contentsOf: result.ccBcc)
+                discoveredParents.append(contentsOf: result.parents)
+            } catch {
+                print("[Backfill] Insert chunk failed: \(error)")
             }
-        } catch {
-            print("[Backfill] Insert failed: \(error)")
         }
 
         if count > 0 {

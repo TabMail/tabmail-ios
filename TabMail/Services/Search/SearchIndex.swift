@@ -9,7 +9,7 @@ import GRDB
 // Uses GRDB DatabasePool with WAL mode. Shared actor — all calls serialized.
 
 /// A record to be indexed into FTS5.
-struct FTSHeaderRecord {
+struct FTSHeaderRecord: Sendable {
     let headerId: String
     let messageId: String
     let subject: String

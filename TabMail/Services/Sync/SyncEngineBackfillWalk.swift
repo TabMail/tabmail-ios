@@ -496,7 +496,7 @@ extension SyncEngine {
 
                     if !headers.isEmpty {
                         // Step 1: Insert headers to GRDB (batch dedup)
-                        let (inserted, ftsRecords, ccBccUpdates) = insertBackfillBatch(
+                        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                             headers, folderId: folder.id, accountId: folder.accountId,
                             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                         )

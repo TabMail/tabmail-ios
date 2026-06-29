@@ -388,6 +388,17 @@ enum SyncConfig {
     /// paint first, so cold-launch waits for the inbox; this is the post-paint settle.
     static let nseMergeHerdSettleSeconds: Double = 1.0
 
+    /// Max headers per `insertBackfillBatch` write TRANSACTION. The backfill walk
+    /// may hand it up to `backfillChunkSize` (500–1000) headers; inserting them in
+    /// one transaction holds the single GRDB writer for the whole batch (~100s of
+    /// ms), so a priority/UI write (badge recount, NSE merge) that arrives mid-batch
+    /// waits the full batch — SQLite can't preempt an in-flight transaction. Splitting
+    /// the insert into transactions of this size (each via `backgroundPool`, which
+    /// yields to foreground/UI between chunks) bounds that wait to ~one small chunk.
+    /// Kept well under SQLite's ~999 bound-variable limit so the per-chunk existence
+    /// check stays a single `IN (...)` query.
+    static let backfillInsertChunkSize = 100
+
     /// First-paint-gate timeout for the CoreML embedding load specifically (the one
     /// boot task that runs on BOTH launch kinds). On a FOREGROUND launch it resumes
     /// at first paint and this value is irrelevant; on a cold BACKGROUND launch
