@@ -471,6 +471,115 @@ enum NSEDataBridge {
         BootProfiler.mark("mergeNSEStagingData: found \(processed.count) staged (\(aiCount) AI-complete)")
 
         if !processed.isEmpty {
+            // ============================================================
+            // TWO-PHASE MERGE.
+            //
+            // Phase 1 (this block): surface each staged message's HEADER +
+            // snippet and flip `headerComplete=1` (what makes it inbox-VISIBLE),
+            // then render — OFF the body blob's critical path. A large HTML body
+            // write is the proven-slow part (1.3–8s measured for big bodies); the
+            // user sees the message arrive on a lightweight header write instead
+            // of waiting on it. Phase 1 deletes NOTHING.
+            //
+            // Phase 2 (the existing write block below, UNCHANGED): writes the
+            // body blob + summary/action/AI cache, FTS-indexes the body, and
+            // deletes the staging row. Because phase 1 created/visible-flipped the
+            // headers, phase 2 normally hits its existing-header branch; if phase
+            // 1 ever missed a row (its savepoint failed), phase 2's new-header
+            // branch is the fallback.
+            //
+            // CRITICAL: staging rows are deleted ONLY in phase 2. Staging is the
+            // durable source until fully merged, so a crash BETWEEN phases
+            // self-heals on the next wake — phase 1's header upsert is idempotent
+            // and phase 2 still has the row to write the body from.
+            // ============================================================
+            var phase1HeaderIds: [String] = []
+            do {
+                phase1HeaderIds = try await AppDatabase.dbPool.write { db -> [String] in
+                    var localIds: [String] = []
+                    for msg in processed {
+                        // Per-message savepoint: a failure leaves THIS row in
+                        // staging for retry (same contract as phase 2's loop) —
+                        // siblings still commit.
+                        do {
+                            try db.inSavepoint {
+                                // Find existing header: provider messageId first,
+                                // then rfc822 fallback for IMAP UID remaps —
+                                // mirrors phase 2's lookup.
+                                var existingId = try String.fetchOne(db, sql: """
+                                    SELECT id FROM messageHeader
+                                    WHERE accountId = ? AND messageId = ?
+                                    """, arguments: [msg.accountId, msg.messageId])
+                                if existingId == nil,
+                                   let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
+                                    existingId = try String.fetchOne(db, sql: """
+                                        SELECT id FROM messageHeader
+                                        WHERE accountId = ? AND rfc822MessageId = ?
+                                        """, arguments: [msg.accountId, rfc822])
+                                }
+                                if let id = existingId {
+                                    // Already visible (sync or a prior merge).
+                                    // Just refresh the snippet if NSE staged a
+                                    // non-empty one; everything else is phase 2's
+                                    // job.
+                                    if !msg.snippet.isEmpty {
+                                        try db.execute(
+                                            sql: "UPDATE messageHeader SET snippet = ? WHERE id = ?",
+                                            arguments: [msg.snippet, id]
+                                        )
+                                    }
+                                    localIds.append(id)
+                                } else {
+                                    // No header yet — create the header-only row
+                                    // (snippet + thread + junctions; NO body blob,
+                                    // NO AI fields). Body + AI land in phase 2.
+                                    var dummyFts: [(headerId: String, textContent: String)] = []
+                                    _ = try Self.insertNewHeaderFromStaging(
+                                        msg, db: db, ftsBatch: &dummyFts, headerOnly: true
+                                    )
+                                    localIds.append(MessageIdentity.headerId(
+                                        accountId: msg.accountId,
+                                        folderPath: msg.folderPath,
+                                        messageId: msg.messageId
+                                    ))
+                                }
+                                return .commit
+                            }
+                        } catch {
+                            // Savepoint rolled back + re-threw; outer tx still
+                            // alive. Row stays in staging (phase 2 re-attempts it
+                            // this same wake; otherwise next wake).
+                            print("[NSEDataBridge] Merge phase 1 failed for \(msg.id): \(error) — left in staging for retry")
+                        }
+                    }
+                    return localIds
+                }
+            } catch {
+                // Outer write threw — nothing durable from phase 1. Phase 2 below
+                // still runs and creates the headers via its own new-header
+                // branch; staging is untouched so nothing is lost.
+                print("[NSEDataBridge] Merge phase 1 failed (outer tx): \(error)")
+            }
+
+            // Surface the headers NOW: index + flip headerComplete=1 (inbox-
+            // visible), then render. This is the early paint that decouples
+            // visibility from the body blob; phase 2's end-of-merge post is the
+            // second render once the body + AI are durable.
+            if !phase1HeaderIds.isEmpty {
+                await Self.flushHeadersToFTS(headerIds: phase1HeaderIds)
+                didMutate = true
+                BootProfiler.mark("merge phase1: headers visible (\(phase1HeaderIds.count)) — rendered")
+                MergeSurfaceProbe.markMergeSignal()
+                Task { @MainActor in
+                    NotificationCenter.default.post(
+                        name: .inboxDataDidChange,
+                        object: nil,
+                        userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+                    )
+                }
+            }
+
+            // ---- Phase 2 (existing, UNCHANGED) ----
             // Only delete from staging the rows that actually committed. A
             // per-message savepoint failure leaves its row in staging for
             // retry on the next wake. This replaces the historical pattern of
@@ -1298,6 +1407,78 @@ enum NSEDataBridge {
         }
     }
 
+    /// Phase-1 header-only FTS flush. Mirrors steps 1–3 of `flushNSEBatchToFTS`
+    /// (bulk header read → `indexHeaders` → bulk `headerComplete=1`) and STOPS —
+    /// it never touches the body half. Used by the two-phase merge to make each
+    /// staged message inbox-VISIBLE on a lightweight header write, off the (1.3–8s
+    /// for large bodies) body-blob critical path.
+    ///
+    /// Idempotent: `indexHeaders` skips known IDs and the `headerComplete=1` flip
+    /// is a no-op the second time, so phase 2's `flushNSEBatchToFTS` re-running the
+    /// same IDs is harmless. Same log-and-return error handling as the steps it
+    /// copies.
+    fileprivate static func flushHeadersToFTS(headerIds: [String]) async {
+        guard !headerIds.isEmpty else { return }
+
+        // 1. Bulk read ALL merged headers (regardless of body presence).
+        let headersById: [String: MessageHeader]
+        do {
+            headersById = try await AppDatabase.dbPool.read { db in
+                let headers = try MessageHeader
+                    .filter(headerIds.contains(Column("id")))
+                    .fetchAll(db)
+                return Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0) })
+            }
+        } catch {
+            print("[NSEDataBridge] FTS header flush: bulk header read failed: \(error) — next wake will recover")
+            return
+        }
+
+        // Filter to headers that actually exist (handle races where a header was
+        // deleted/moved between merge and flush). Preserve merge order.
+        let validHeaders = headerIds.compactMap { headersById[$0] }
+        guard !validHeaders.isEmpty else { return }
+
+        // 2. Batch FTS header indexing for ALL merged headers. Idempotent — known
+        //    IDs are skipped; header records carry no body, so this is cheap.
+        let records = validHeaders.map { header -> FTSHeaderRecord in
+            FTSHeaderRecord(
+                headerId: header.id,
+                messageId: header.messageId,
+                subject: header.subject,
+                from: "\(header.from) <\(header.fromAddress)>",
+                to: header.to,
+                cc: header.cc,
+                bcc: header.bcc,
+                dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
+                folderId: header.folderId
+            )
+        }
+        do {
+            _ = try await SearchIndex.shared.indexHeaders(records)
+        } catch {
+            print("[NSEDataBridge] FTS header flush: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
+            return
+        }
+
+        // 3. Batch flip headerComplete=1 for ALL indexed headers → inbox-visible
+        //    NOW. The inbox query gates on headerComplete == true, so this is what
+        //    surfaces the pushed message.
+        let indexedIds = validHeaders.map(\.id)
+        do {
+            try await AppDatabase.dbPool.write { db in
+                let placeholders = indexedIds.map { _ in "?" }.joined(separator: ",")
+                try db.execute(
+                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id IN (\(placeholders))",
+                    arguments: StatementArguments(indexedIds)
+                )
+            }
+        } catch {
+            print("[NSEDataBridge] FTS header flush: headerComplete update failed: \(error)")
+            return
+        }
+    }
+
     /// Batched post-tx FTS pipeline for all NSE-merged messages in a single wake.
     /// Runs after the main merge transaction commits, in a single detached Task.
     /// Amortizes FTS and GRDB write overhead across the whole batch.
@@ -1596,7 +1777,8 @@ enum NSEDataBridge {
     static func insertNewHeaderFromStaging(
         _ msg: StagedMessage,
         db: GRDB.Database,
-        ftsBatch: inout [(headerId: String, textContent: String)]
+        ftsBatch: inout [(headerId: String, textContent: String)],
+        headerOnly: Bool = false
     ) throws -> Bool {
         // CRITICAL: use the folderPath NSE captured from the provider
         // (Gmail: "INBOX"; Outlook/Graph: parentFolderId; IMAP: "INBOX")
@@ -1660,16 +1842,21 @@ enum NSEDataBridge {
 
         // Action tag (ADR-IOS-036): local-only. NSE writes its AI-computed
         // value into MessageHeader; provider labels are not consulted.
-        if msg.aiCompleted {
-            header.summaryBlurb = msg.summaryBlurb
-            header.summaryTodos = msg.summaryTodos
-            header.reminderDate = msg.reminderDate
-            header.reminderTime = msg.reminderTime
-            header.reminderContent = msg.reminderContent
-        }
-        if let aiRaw = msg.actionTag, let aiTag = ActionTag(rawValue: aiRaw) {
-            header.actionTag = aiTag
-            header.tagSortOrder = aiTag.sortOrder
+        //
+        // `headerOnly` (phase-1 pre-pass) SKIPS the AI header fields — phase 2
+        // writes summary/action/AI later, off the body blob's critical path.
+        if !headerOnly {
+            if msg.aiCompleted {
+                header.summaryBlurb = msg.summaryBlurb
+                header.summaryTodos = msg.summaryTodos
+                header.reminderDate = msg.reminderDate
+                header.reminderTime = msg.reminderTime
+                header.reminderContent = msg.reminderContent
+            }
+            if let aiRaw = msg.actionTag, let aiTag = ActionTag(rawValue: aiRaw) {
+                header.actionTag = aiTag
+                header.tagSortOrder = aiTag.sortOrder
+            }
         }
         // INSERT OR IGNORE — if sync already created it, don't overwrite.
         // Detect the no-op case so callers can skip the junction/body writes
@@ -1698,13 +1885,19 @@ enum NSEDataBridge {
             SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?
             """, arguments: [msg.accountId, msg.messageId]) ?? ""
         if !newHeaderId.isEmpty {
-            try persistRenderedBodyFromStaging(
-                db: db, headerId: newHeaderId,
-                htmlContent: msg.htmlContent, textContent: msg.textContent,
-                attachmentsJSON: msg.attachmentsJSON, icsText: msg.icsText,
-                hasUnresolvedCIDs: msg.hasUnresolvedCIDs,
-                ftsBatch: &ftsBatch
-            )
+            // `headerOnly` (phase-1 pre-pass) SKIPS the (potentially multi-MB)
+            // body blob persist — phase 2 writes it later. The thread-continuity
+            // + user-label junctions below STILL run so the header threads and
+            // labels correctly the moment it surfaces.
+            if !headerOnly {
+                try persistRenderedBodyFromStaging(
+                    db: db, headerId: newHeaderId,
+                    htmlContent: msg.htmlContent, textContent: msg.textContent,
+                    attachmentsJSON: msg.attachmentsJSON, icsText: msg.icsText,
+                    hasUnresolvedCIDs: msg.hasUnresolvedCIDs,
+                    ftsBatch: &ftsBatch
+                )
+            }
 
             // Thread-continuity junction — mirrors sync's insert path
             // (SyncEngineFullSync.swift:654 etc). Without this, reply-chain

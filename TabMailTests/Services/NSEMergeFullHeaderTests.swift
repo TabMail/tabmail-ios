@@ -50,7 +50,10 @@ struct NSEMergeFullHeaderTests {
         isForwarded: Bool = false,
         providerLabels: [String] = [],
         actionTag: String? = nil,
-        aiCompleted: Bool = false
+        aiCompleted: Bool = false,
+        htmlContent: String? = nil,
+        textContent: String? = nil,
+        summaryBlurb: String? = nil
     ) -> NSEDataBridge.StagedMessage {
         NSEDataBridge.StagedMessage(
             id: "acc1:\(messageId)",
@@ -75,11 +78,11 @@ struct NSEMergeFullHeaderTests {
             isReplied: isReplied,
             isForwarded: isForwarded,
             providerLabels: providerLabels,
-            summaryBlurb: nil, summaryTodos: nil, actionTag: actionTag,
+            summaryBlurb: summaryBlurb, summaryTodos: nil, actionTag: actionTag,
             reminderDate: nil, reminderTime: nil, reminderContent: nil,
             processedAt: Date().timeIntervalSince1970,
             aiCompleted: aiCompleted, notified: false,
-            htmlContent: nil, textContent: nil, attachmentsJSON: nil,
+            htmlContent: htmlContent, textContent: textContent, attachmentsJSON: nil,
             icsText: nil, hasUnresolvedCIDs: false
         )
     }
@@ -98,6 +101,61 @@ struct NSEMergeFullHeaderTests {
             accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
         )
         return (inserted, headerId)
+    }
+
+    // MARK: - Two-phase merge: headerOnly defers body + AI
+
+    /// Phase 1 of the two-phase merge inserts a HEADER-ONLY row
+    /// (`headerOnly: true`): the message goes inbox-visible on a lightweight
+    /// write (snippet present), but the multi-MB body blob and the AI fields are
+    /// deferred to phase 2 — off the visibility critical path. The default
+    /// (`headerOnly: false`) writes them, as the new-header fallback still must.
+    @Test("headerOnly=true defers body blob + AI fields; default writes them")
+    func headerOnlyDefersBodyAndAI() throws {
+        // Phase 1 — headerOnly: true.
+        let dbA = try makeDB()
+        let msgA = staged(
+            actionTag: "reply", aiCompleted: true,
+            htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary"
+        )
+        var ftsA: [(headerId: String, textContent: String)] = []
+        try dbA.write { db in
+            _ = try NSEDataBridge.insertNewHeaderFromStaging(msgA, db: db, ftsBatch: &ftsA, headerOnly: true)
+        }
+        let hidA = MessageIdentity.headerId(
+            accountId: msgA.accountId, folderPath: msgA.folderPath, messageId: msgA.messageId
+        )
+        let headerA = try dbA.read { try MessageHeader.fetchOne($0, key: hidA) }
+        #expect(headerA?.snippet == "snippet preview")   // visible: snippet present
+        #expect(headerA?.summaryBlurb == nil)            // AI deferred to phase 2
+        #expect(headerA?.actionTag == nil)               // AI deferred to phase 2
+        let bodyCountA = try dbA.read {
+            try MessageBody.filter(Column("id") == hidA).fetchCount($0)
+        }
+        #expect(bodyCountA == 0)                          // body blob deferred to phase 2
+        // The header-only FTS batch carries no body work either.
+        #expect(ftsA.isEmpty)
+
+        // Default (headerOnly: false) — body + AI written (new-header fallback path).
+        let dbB = try makeDB()
+        let msgB = staged(
+            actionTag: "reply", aiCompleted: true,
+            htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary"
+        )
+        var ftsB: [(headerId: String, textContent: String)] = []
+        try dbB.write { db in
+            _ = try NSEDataBridge.insertNewHeaderFromStaging(msgB, db: db, ftsBatch: &ftsB)
+        }
+        let hidB = MessageIdentity.headerId(
+            accountId: msgB.accountId, folderPath: msgB.folderPath, messageId: msgB.messageId
+        )
+        let headerB = try dbB.read { try MessageHeader.fetchOne($0, key: hidB) }
+        #expect(headerB?.summaryBlurb == "a summary")
+        #expect(headerB?.actionTag?.rawValue == "reply")
+        let bodyCountB = try dbB.read {
+            try MessageBody.filter(Column("id") == hidB).fetchCount($0)
+        }
+        #expect(bodyCountB == 1)                          // body blob written
     }
 
     // MARK: - Header fields populated (no placeholders)

@@ -386,7 +386,7 @@ enum SyncConfig {
     /// anyway, so this only shifts WHEN it starts. Background merges skip it
     /// entirely (precomputing before the user opens is the point). Gated on first
     /// paint first, so cold-launch waits for the inbox; this is the post-paint settle.
-    static let nseMergeHerdSettleSeconds: Double = 1.0
+    static let nseMergeHerdSettleSeconds: Double = 0.5
 
     /// Max headers per `insertBackfillBatch` write TRANSACTION. The backfill walk
     /// may hand it up to `backfillChunkSize` (500–1000) headers; inserting them in

@@ -338,7 +338,7 @@ struct NSEGradualMergeTests {
         #expect(bodyCount == 0)
     }
 
-    @Test("Merge emits exactly ONE inboxDataDidChange, flagged immediate (bypasses debounce)")
+    @Test("Two-phase merge emits TWO immediate inboxDataDidChange (header render, then body/AI)")
     @MainActor func mergePostsSingleImmediateSignal() async throws {
         let (dir, _, previous) = try makeAppDatabase()
         defer {
@@ -366,11 +366,13 @@ struct NSEGradualMergeTests {
         try await Task.sleep(for: .milliseconds(200))
 
         let captured = posts.withLock { $0 }
-        // Exactly one (the old code posted mid-merge for messages AND again for
-        // removals); and it MUST be flagged immediate so the inbox bypasses the
-        // 500ms debounce.
-        #expect(captured.count == 1)
-        #expect(captured.first == true)
+        // TWO posts by design: the two-phase merge renders the inbox TWICE — phase 1
+        // surfaces header + snippet (inbox-visible) OFF the body blob's critical path,
+        // then phase 2 lands the body + AI. Both MUST be flagged immediate so the
+        // inbox bypasses its 500ms background-coalescing debounce. (Bounded at two —
+        // it must NOT spam a post per gradual stage the way the pre-gradual code did.)
+        #expect(captured.count == 2)
+        #expect(captured.allSatisfy { $0 == true })
     }
 
     /// Simulator measurement: a clean header-only merge (no AI, no contention)
