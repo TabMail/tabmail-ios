@@ -109,6 +109,18 @@ actor ActiveAIQueue {
     // unaffected (WAL — they never contend the writer).
     private var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
 
+    /// Compact, MESSAGE-discriminating id for logs. A `headerId` is
+    /// "accountId:folder:messageId"; the accountId is a 36-char UUID, so the old
+    /// `headerId.prefix(30)` never reached the messageId — it printed the SAME string for
+    /// every message in an account, making distinct messages look like one message
+    /// processed repeatedly (the trap that read as a "double LLM call" bug). Show a short
+    /// account head plus the messageId tail so per-message lifecycles are auditable.
+    static func logId(_ headerId: String) -> String {
+        let parts = headerId.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+        let msg = parts.count >= 3 ? String(parts[2]) : headerId
+        return "\(headerId.prefix(8))…\(msg.suffix(24))"
+    }
+
     // MARK: - Public API
 
     /// Enqueue an inbox message for AI processing after its body is written to FTS.
@@ -126,7 +138,7 @@ actor ActiveAIQueue {
             if storage.enqueue(job) { added += 1 }
         }
         guard added > 0 else { return }
-        BackgroundSyncLogger.logAIProcessing("Enqueued \(headerId.prefix(30)) (\(added) jobs, total: \(storage.count))")
+        BackgroundSyncLogger.logAIProcessing("Enqueued \(Self.logId(headerId)) (\(added) jobs, total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -213,8 +225,8 @@ actor ActiveAIQueue {
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
         if taskCount > 0 || activeJobsBefore > 0 {
-            print("[ActiveAI] Cancelled \(taskCount) in-flight tasks on foreground return")
-            BackgroundSyncLogger.logAIProcessing("Cancelled \(taskCount) in-flight tasks on foreground return (activeJobs: \(activeJobsBefore)→0, depth=\(storage.count))")
+            print("[ActiveAI] Cancelled \(taskCount) in-flight AI tasks (suspension recovery)")
+            BackgroundSyncLogger.logAIProcessing("Cancelled \(taskCount) in-flight AI tasks (suspension recovery) (activeJobs: \(activeJobsBefore)→0, depth=\(storage.count))")
         }
     }
 
@@ -388,7 +400,7 @@ actor ActiveAIQueue {
         // cleaned up by cancelAllInFlight() (foreground return or BGAppRefresh).
         // Skip storage update — cancel already reset activeJobs to 0.
         guard inFlightTasks.removeValue(forKey: job) != nil else {
-            BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) completed but not in inFlightTasks (cancelled?) activeJobs=\(storage.activeJobs)")
+            BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) completed but not in inFlightTasks (cancelled?) activeJobs=\(storage.activeJobs)")
             return
         }
 
@@ -419,8 +431,8 @@ actor ActiveAIQueue {
             backoff[job] = Date().addingTimeInterval(delaySecs)
             backoffRetryCount[job] = backoffCount + 1
             let newCount = retryCount + 1
-            print("[ActiveAI] Retry \(newCount) for \(job.headerId.prefix(30)).\(job.jobType.rawValue) (backoff \(delaySecs)s, advisory=\(advisoryRetry))")
-            BackgroundSyncLogger.logAIProcessing("Retry \(newCount) for \(job.headerId.prefix(30)).\(job.jobType.rawValue) (backoff \(delaySecs)s)")
+            print("[ActiveAI] Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s, advisory=\(advisoryRetry))")
+            BackgroundSyncLogger.logAIProcessing("Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s)")
 
             // Schedule a delayed re-dispatch for when backoff expires
             Task {
@@ -525,7 +537,7 @@ actor ActiveAIQueue {
         let jobT0 = CFAbsoluteTimeGetCurrent()
         // Bail early if cancelled (e.g., foreground return cancelled frozen tasks)
         guard !Task.isCancelled else {
-            BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) cancelled before start")
+            BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) cancelled before start")
             return false
         }
 
@@ -597,9 +609,9 @@ actor ActiveAIQueue {
             }) ?? false
             let ftsReason = await SearchIndex.shared.bodyTextDiagnostic(headerId: job.headerId)
             let diag = "bodyComplete=\(message.bodyComplete), hasMessageBody=\(hasMessageBody), ftsReady=\(ftsDbReady), fts=\(ftsReason)"
-            print("[ActiveAI] No FTS body for \(job.headerId.prefix(30)) — dropping (\(diag))")
-            BackgroundSyncLogger.logAIProcessing("No FTS body for \(job.headerId.prefix(30)) — dropping (\(diag))")
-            BackgroundSyncLogger.logError("No FTS body: \(diag)", source: "activeAI:\(job.headerId.prefix(30))")
+            print("[ActiveAI] No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
+            BackgroundSyncLogger.logAIProcessing("No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
+            BackgroundSyncLogger.logError("No FTS body: \(diag)", source: "activeAI:\(Self.logId(job.headerId))")
             return false
         }
 
@@ -631,7 +643,7 @@ actor ActiveAIQueue {
                             msg.reminderTime = ps.reminderTime?.isEmpty == true ? nil : ps.reminderTime
                             msg.reminderContent = ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent
                             changed = true
-                            BackgroundSyncLogger.logAIProcessing("DeviceSync summary HIT for \(job.headerId.prefix(30))")
+                            BackgroundSyncLogger.logAIProcessing("DeviceSync summary HIT for \(Self.logId(job.headerId))")
                         }
                     }
                     if let pa = cached.action, msg.actionTag == nil, let tag = ActionTag(rawValue: pa) {
@@ -639,12 +651,12 @@ actor ActiveAIQueue {
                         msg.actionTag = effective
                         msg.tagSortOrder = effective.sortOrder
                         changed = true
-                        BackgroundSyncLogger.logAIProcessing("DeviceSync action HIT for \(job.headerId.prefix(30)): \(tag.rawValue)")
+                        BackgroundSyncLogger.logAIProcessing("DeviceSync action HIT for \(Self.logId(job.headerId)): \(tag.rawValue)")
                     }
                     if let pr = cached.reply, !pr.isEmpty, msg.cachedReply == nil {
                         msg.cachedReply = pr
                         changed = true
-                        BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(job.headerId.prefix(30))")
+                        BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(Self.logId(job.headerId))")
                     }
                     if changed {
                         try msg.save(db)
@@ -712,13 +724,13 @@ actor ActiveAIQueue {
                     switch job.jobType {
                     case .summary:
                         if updated.summaryBlurb != nil && !(updated.summaryBlurb?.isEmpty ?? true) {
-                            BackgroundSyncLogger.logAIProcessing("NSE lease HIT (summary) for \(job.headerId.prefix(30))")
+                            BackgroundSyncLogger.logAIProcessing("NSE lease HIT (summary) for \(Self.logId(job.headerId))")
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                             return false
                         }
                     case .action:
                         if updated.actionTag != nil {
-                            BackgroundSyncLogger.logAIProcessing("NSE lease HIT (action) for \(job.headerId.prefix(30))")
+                            BackgroundSyncLogger.logAIProcessing("NSE lease HIT (action) for \(Self.logId(job.headerId))")
                             return false
                         }
                     case .reply:
@@ -737,7 +749,7 @@ actor ActiveAIQueue {
                existing.owner == .nse,
                AIOwnershipLease.isFresh(heartbeatMs: existing.heartbeatMs),
                !AIOwnershipLease.hasResult(db: nseDB, accountId: accountId, messageId: messageId) {
-                BackgroundSyncLogger.logAIProcessing("NSE actively computing \(job.headerId.prefix(30)).\(job.jobType.rawValue) — defer, no block (retry)")
+                BackgroundSyncLogger.logAIProcessing("NSE actively computing \(Self.logId(job.headerId)).\(job.jobType.rawValue) — defer, no block (retry)")
                 return true // retry later — never block the queue slot on the NSE
             }
             // Phase 3 — claim for ourselves and start the heartbeat. Best-effort:
@@ -800,9 +812,9 @@ actor ActiveAIQueue {
             // logs like "DEADLINE exceeded (254ms > 150s)".) Both still retry.
             let jobMs = Int((CFAbsoluteTimeGetCurrent() - jobT0) * 1000)
             if jobMs >= Int(deadline * 1000) {
-                BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) DEADLINE exceeded (\(jobMs)ms > \(Int(deadline))s) — will retry")
+                BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) DEADLINE exceeded (\(jobMs)ms > \(Int(deadline))s) — will retry")
             } else {
-                BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) cancelled after \(jobMs)ms (deadline \(Int(deadline))s not reached) — will retry")
+                BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) cancelled after \(jobMs)ms (deadline \(Int(deadline))s not reached) — will retry")
             }
             return true // retry
         }
@@ -821,7 +833,7 @@ actor ActiveAIQueue {
 
         let jobMs = Int((CFAbsoluteTimeGetCurrent() - jobT0) * 1000)
         if jobMs > 10000 {
-            BackgroundSyncLogger.logAIProcessing("[JOB] \(job.headerId.prefix(30)).\(job.jobType.rawValue) total wall=\(jobMs)ms retry=\(result)")
+            BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) total wall=\(jobMs)ms retry=\(result)")
         }
         return result
     }
@@ -837,7 +849,7 @@ actor ActiveAIQueue {
     ) async -> Bool {
         // Cache check: if summary already exists, skip LLM but still chain A.
         if let existing = message.summaryBlurb, !existing.isEmpty {
-            BackgroundSyncLogger.logAIProcessing("Summary cache HIT for \(job.headerId.prefix(30))")
+            BackgroundSyncLogger.logAIProcessing("Summary cache HIT for \(Self.logId(job.headerId))")
             // Always chain A — even from cache hit
             let actionJob = AIJob(headerId: job.headerId, accountId: job.accountId, jobType: .action)
             if storage.enqueue(actionJob) { scheduleDispatch() }
@@ -845,7 +857,7 @@ actor ActiveAIQueue {
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        BackgroundSyncLogger.logAIProcessing("Summary START \(job.headerId.prefix(30))")
+        BackgroundSyncLogger.logAIProcessing("Summary START \(Self.logId(job.headerId))")
 
         do {
             let summary = try await config.aiService.generateSummary(
@@ -890,7 +902,7 @@ actor ActiveAIQueue {
             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
             await AISubscriptionGate.shared.openGate()
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            BackgroundSyncLogger.logAIProcessing("Summary complete for \(job.headerId.prefix(30)) in \(elapsed)ms")
+            BackgroundSyncLogger.logAIProcessing("Summary complete for \(Self.logId(job.headerId)) in \(elapsed)ms")
 
             // Always chain A after summary completes
             let actionJob = AIJob(headerId: job.headerId, accountId: job.accountId, jobType: .action)
@@ -898,7 +910,7 @@ actor ActiveAIQueue {
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             print("[ActiveAI] Summary failed for \(message.messageId): \(error)")
-            BackgroundSyncLogger.logAIProcessing("Summary FAILED for \(job.headerId.prefix(30)) after \(elapsed)ms: \(error.localizedDescription)")
+            BackgroundSyncLogger.logAIProcessing("Summary FAILED for \(Self.logId(job.headerId)) after \(elapsed)ms: \(error.localizedDescription)")
             if Self.isSubscriptionError(error) {
                 await AISubscriptionGate.shared.closeGate()
                 return false
@@ -926,18 +938,18 @@ actor ActiveAIQueue {
 
         // Cache check: if action already exists, skip LLM
         guard msg.actionTag == nil else {
-            BackgroundSyncLogger.logAIProcessing("Action cache HIT for \(job.headerId.prefix(30))")
+            BackgroundSyncLogger.logAIProcessing("Action cache HIT for \(Self.logId(job.headerId))")
             return false
         }
 
         // No summary yet? Drop — S job will chain A when it completes.
         guard let blurb = msg.summaryBlurb, !blurb.isEmpty else {
-            BackgroundSyncLogger.logAIProcessing("Action skipped (no summary yet) \(job.headerId.prefix(30))")
+            BackgroundSyncLogger.logAIProcessing("Action skipped (no summary yet) \(Self.logId(job.headerId))")
             return false
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        BackgroundSyncLogger.logAIProcessing("Action START \(job.headerId.prefix(30))")
+        BackgroundSyncLogger.logAIProcessing("Action START \(Self.logId(job.headerId))")
 
         do {
             let existingSummary = SummaryResult(
@@ -984,13 +996,13 @@ actor ActiveAIQueue {
                 NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                 let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 print("[ActiveAI] Action for \(message.messageId): \(effectiveAction.displayName) in \(elapsed)ms")
-                BackgroundSyncLogger.logAIProcessing("Action complete for \(job.headerId.prefix(30)) in \(elapsed)ms")
+                BackgroundSyncLogger.logAIProcessing("Action complete for \(Self.logId(job.headerId)) in \(elapsed)ms")
                 await AISubscriptionGate.shared.openGate()
             }
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             print("[ActiveAI] Action failed for \(message.messageId): \(error)")
-            BackgroundSyncLogger.logAIProcessing("Action FAILED for \(job.headerId.prefix(30)) after \(elapsed)ms: \(error.localizedDescription)")
+            BackgroundSyncLogger.logAIProcessing("Action FAILED for \(Self.logId(job.headerId)) after \(elapsed)ms: \(error.localizedDescription)")
             if Self.isSubscriptionError(error) {
                 await AISubscriptionGate.shared.closeGate()
                 return false
@@ -1011,12 +1023,12 @@ actor ActiveAIQueue {
     ) async -> Bool {
         // Cache check: if reply already exists, skip LLM
         if let existing = message.cachedReply, !existing.isEmpty {
-            BackgroundSyncLogger.logAIProcessing("Reply cache HIT for \(job.headerId.prefix(30))")
+            BackgroundSyncLogger.logAIProcessing("Reply cache HIT for \(Self.logId(job.headerId))")
             return false
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        BackgroundSyncLogger.logAIProcessing("Reply START \(job.headerId.prefix(30))")
+        BackgroundSyncLogger.logAIProcessing("Reply START \(Self.logId(job.headerId))")
 
         do {
             let reply = try await config.aiService.processReply(
@@ -1050,7 +1062,7 @@ actor ActiveAIQueue {
                         )
                         let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                         print("[ActiveAI] Reply precomputed for \(message.messageId)")
-                        BackgroundSyncLogger.logAIProcessing("Reply precomputed for \(job.headerId.prefix(30)) in \(elapsed)ms")
+                        BackgroundSyncLogger.logAIProcessing("Reply precomputed for \(Self.logId(job.headerId)) in \(elapsed)ms")
                     } else {
                         print("[ActiveAI] Reply filtered (sentinel) for \(message.messageId)")
                     }
@@ -1061,7 +1073,7 @@ actor ActiveAIQueue {
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             print("[ActiveAI] Reply failed for \(message.messageId): \(error)")
-            BackgroundSyncLogger.logAIProcessing("Reply FAILED for \(job.headerId.prefix(30)) after \(elapsed)ms: \(error.localizedDescription)")
+            BackgroundSyncLogger.logAIProcessing("Reply FAILED for \(Self.logId(job.headerId)) after \(elapsed)ms: \(error.localizedDescription)")
             if Self.isSubscriptionError(error) {
                 await AISubscriptionGate.shared.closeGate()
             }

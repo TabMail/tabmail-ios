@@ -81,7 +81,11 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
                 await AppStartup.shared.awaitLaunchReady(background: true)
                 await NSEDataBridge.mergeNSEStagingData()
-                await SyncScheduler.shared.syncStartup(inboxOnly: true)
+                // willPresent only fires while the app is foreground-active, so request the
+                // fast-path: syncStartup still cancels in-flight AI if the oracle detects any
+                // background/suspension since the last recovery — it only skips when the app
+                // is provably continuous-foreground (connections live, nothing to recover).
+                await SyncScheduler.shared.syncStartup(inboxOnly: true, foregroundFastPath: true)
             }
             return []  // Suppress — user is already in the app
         }

@@ -79,6 +79,20 @@ final class SyncScheduler {
     /// Prevents duplicate subscribe/sync work when iOS delivers multiple .active transitions.
     private var isStartupInFlight = false
 
+    /// Did the app enter the background (→ possible iOS suspension → stale TCP/HTTP
+    /// connections + frozen in-flight queue tasks) since the last suspension-recovery
+    /// cancel ran? Starts `true`: a cold launch must recover once before any fast-path
+    /// skip is allowed. Set by the `didEnterBackgroundNotification` observer (a @Sendable
+    /// block, hence a static `Mutex`); cleared by `syncStartup` after it runs recovery.
+    ///
+    /// This is the authoritative "we might have suspended" signal that gates the
+    /// foreground fast-path: a foreground new-mail push may skip the recovery cancel
+    /// ONLY when this is `false` AND the app is currently active. Bias is asymmetric on
+    /// purpose — over-cancelling wastes a little recompute; under-cancelling leaves frozen
+    /// tasks on dead sockets (hang) or races GRDB suspension (0xdead10cc crash). Every
+    /// uncertain case must cancel.
+    private nonisolated static let didBackgroundSinceRecovery = Mutex<Bool>(true)
+
     // Startup data resets (StartupMigrations) now run synchronously inside
     // AppDatabase.init — before the pool is exposed — so there is no longer an
     // async gate to wait on here. Ordering (resets → NSE merge → sync) is
@@ -139,7 +153,46 @@ final class SyncScheduler {
 
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
-    private init() {}
+    private init() {
+        // Authoritative pre-suspension signal. iOS posts didEnterBackgroundNotification
+        // before it ever suspends the process, so once it fires the next syncStartup MUST
+        // run suspension recovery — even on a foreground fast-path. queue: .main keeps the
+        // block on the main thread; it only touches the Sendable static Mutex (no self,
+        // no MainActor hop), so it is safe under Swift 6 strict concurrency.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { _ in
+            SyncScheduler.didBackgroundSinceRecovery.withLock { $0 = true }
+        }
+    }
+
+    /// Pure suspension-recovery decision — no UIKit / global state, so it is unit-testable.
+    /// `true` = run recovery (cancel in-flight queues + mark providers dirty).
+    ///
+    /// Non-foreground callers (`foregroundFastPath == false`) ALWAYS recover — this is the
+    /// safe default for every genuine resume (foreground return, BGAppRefresh, BGProcessing).
+    /// A foreground new-mail push (`foregroundFastPath == true`) may SKIP recovery ONLY when
+    /// the app is currently active AND has not backgrounded since the last recovery — i.e. it
+    /// is provably continuous-foreground, so connections are live and tasks are healthy.
+    /// Over-cancelling is safe; under-cancelling crashes — so every uncertain case returns true.
+    nonisolated static func shouldRunResumeRecovery(
+        foregroundFastPath: Bool, appIsActive: Bool, backgroundedSinceRecovery: Bool
+    ) -> Bool {
+        guard foregroundFastPath else { return true }
+        return !appIsActive || backgroundedSinceRecovery
+    }
+
+    /// Conservative oracle for "could connections be stale / tasks be frozen?" — the
+    /// foreground fast-path's recovery decision, read against live app + flag state.
+    /// A foreground new-mail push may skip recovery ONLY when this returns `false`.
+    func mayHaveStaleConnections() -> Bool {
+        Self.shouldRunResumeRecovery(
+            foregroundFastPath: true,
+            appIsActive: UIApplication.shared.applicationState == .active,
+            backgroundedSinceRecovery: Self.didBackgroundSinceRecovery.withLock { $0 }
+        )
+    }
 
     // MARK: - Unified Sync Startup
 
@@ -152,13 +205,29 @@ final class SyncScheduler {
     /// Unified startup sequence for all sync entry points.
     /// - inboxOnly: true for BGAppRefresh/push (limited budget), false for foreground/BGProcessing
     /// - drain: how long to wait for queue drain after repopulate
-    func syncStartup(inboxOnly: Bool, drain: DrainMode = .none) async {
+    /// - foregroundFastPath: pass `true` ONLY from in-foreground new-mail triggers
+    ///   (`willPresent`, foreground silent push). It REQUESTS skipping the suspension
+    ///   recovery (the in-flight cancel + provider re-dirty), but the request is honored
+    ///   only when `mayHaveStaleConnections()` independently confirms the app never left
+    ///   the foreground since the last recovery. Default `false` = always recover, so every
+    ///   genuine resume path (foreground return, BGAppRefresh, BGProcessing) is unchanged.
+    func syncStartup(inboxOnly: Bool, drain: DrainMode = .none, foregroundFastPath: Bool = false) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         func stepLog(_ label: String) {
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.log("syncStartup[+\(ms)ms]: \(label)")
         }
         stepLog("ENTER (inboxOnly=\(inboxOnly))")
+
+        // Decide whether to run suspension recovery. DEFAULT: yes. Skip ONLY when a
+        // foreground caller requested the fast-path AND the app is provably continuous-
+        // foreground (no suspension → connections live, tasks healthy). Over-cancelling is
+        // safe; under-cancelling crashes — so the decision errs toward true.
+        let runResumeRecovery = Self.shouldRunResumeRecovery(
+            foregroundFastPath: foregroundFastPath,
+            appIsActive: UIApplication.shared.applicationState == .active,
+            backgroundedSinceRecovery: Self.didBackgroundSinceRecovery.withLock { $0 }
+        )
 
         // Pause sync while demo mode is active — real accounts must not sync or
         // merge NSE data underneath the demo (incl. debug-menu demo while logged in).
@@ -174,9 +243,21 @@ final class SyncScheduler {
         NSEDataBridge.mirrorLastHistoryIds()
         stepLog("step0 NSE merge + mirror")
 
-        // 1. Cancel stale in-flight tasks from previous cycles (parallel — independent actors).
-        await Self.cancelAllInFlightQueues(inboxOnly: inboxOnly)
-        stepLog("step1 cancelAllInFlight")
+        // 1. Cancel stale in-flight tasks from previous cycles (parallel — independent
+        // actors). cancelAllInFlight releases tasks frozen by iOS suspension (stale
+        // TCP/HTTP) — required on every genuine resume. A foreground new-mail push is NOT
+        // a suspension boundary: connections are live and in-flight AI LLM calls are
+        // healthy, so cancelling them just discards calls already dispatched to the backend
+        // and forces recompute (observed: foreground pushes during triage nuked the AI
+        // queue every ~30–90s). New mail still arrives via sync→enqueueBatch (dedup-safe).
+        if runResumeRecovery {
+            await Self.cancelAllInFlightQueues(inboxOnly: inboxOnly)
+            // Connections are now fresh — allow the next continuous-foreground push to skip.
+            Self.didBackgroundSinceRecovery.withLock { $0 = false }
+            stepLog("step1 cancelAllInFlight")
+        } else {
+            stepLog("step1 cancelAllInFlight SKIPPED (verified continuous-foreground)")
+        }
 
         // 2. Recover incomplete headers (headerComplete=0 → FTS index → set flag).
         // Kept on the critical path: crash-recovery for rows GRDB has but FTS doesn't.
@@ -249,8 +330,17 @@ final class SyncScheduler {
         // If offline, sync returns quickly. If slow server, drain still proceeds.
         let syncTask = Task { [self] in
             let syncT0 = CFAbsoluteTimeGetCurrent()
-            await manager.markAllProvidersDirty()
-            BackgroundSyncLogger.log("syncTask[+\(Int((CFAbsoluteTimeGetCurrent() - syncT0)*1000))ms]: markAllProvidersDirty done")
+            // Same gate as step1. In continuous-foreground, connections are live: marking
+            // providers dirty drains IMAP pools, kills IDLE, and force-reconnects the
+            // DeviceSync WebSocket — all wasted, and the source of the spurious
+            // "[DeviceSync] Force reconnect — network interface changed" storms on a stable
+            // foreground network. Genuine WiFi↔cellular reconnects are NetworkMonitor's job.
+            if runResumeRecovery {
+                await manager.markAllProvidersDirty()
+                BackgroundSyncLogger.log("syncTask[+\(Int((CFAbsoluteTimeGetCurrent() - syncT0)*1000))ms]: markAllProvidersDirty done")
+            } else {
+                BackgroundSyncLogger.log("syncTask: markAllProvidersDirty SKIPPED (foreground — connections live)")
+            }
             async let pendingDrain: Void = { _ = await self.drainPendingSyncs() }()
             async let syncAll: Void = { await self.backgroundPoll(inboxOnly: inboxOnly) }()
             _ = await (pendingDrain, syncAll)

@@ -948,10 +948,15 @@ actor PushNotificationService {
             BackgroundSyncLogger.log("SilentPush NSE_FOLLOWUP — merge + reply precompute + FTS + tags")
             BackgroundSyncLogger.logPush("NSE_FOLLOWUP — heavy AI work")
             await NSEDataBridge.mergeNSEStagingData()
-            // Sync first to persist MessageHeaders, then AI queue picks up reply precomputation
+            // Sync first to persist MessageHeaders, then AI queue picks up reply precomputation.
+            // foregroundFastPath: the oracle inside syncStartup still forces a full recovery
+            // when this push woke us from the background (applicationState != .active) or any
+            // background occurred since the last recovery — it only skips the in-flight cancel
+            // when the app is provably continuous-foreground.
             await SyncScheduler.shared.syncStartup(
                 inboxOnly: true,
-                drain: .budget(PushConfig.silentPushDeadlineSeconds)
+                drain: .budget(PushConfig.silentPushDeadlineSeconds),
+                foregroundFastPath: true
             )
             return .newData
         }
@@ -970,9 +975,13 @@ actor PushNotificationService {
         // syncStartup handles: cancel stale tasks, recover incomplete headers,
         // mark connections dirty, sync all accounts, drain pending ops, repopulate queues.
         let syncTask = Task { @Sendable in
+            // foregroundFastPath: skip the in-flight AI cancel only when the oracle confirms
+            // continuous-foreground. A silent push that woke us from background still recovers
+            // (applicationState != .active → mayHaveStaleConnections() == true).
             await SyncScheduler.shared.syncStartup(
                 inboxOnly: true,
-                drain: .budget(PushConfig.silentPushDeadlineSeconds)
+                drain: .budget(PushConfig.silentPushDeadlineSeconds),
+                foregroundFastPath: true
             )
             // One-time FTS tokenizer migration (ADR-024) — small post-sync slice,
             // bounded by BOTH the slice budget AND the remaining push envelope so
