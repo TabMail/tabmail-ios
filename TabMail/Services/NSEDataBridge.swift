@@ -858,10 +858,27 @@ enum NSEDataBridge {
                                             folderPath: existingFolderPath,
                                             rfc822MessageId: rfc
                                         ) {
+                                            // Value-guarded UPSERT (not INSERT OR REPLACE):
+                                            // re-writing the SAME cached summary/action on a
+                                            // re-merge of a terminal row whose prior staging
+                                            // delete failed must be a 0-row no-op — otherwise it
+                                            // bumps total_changes() (redundant reload) AND, since
+                                            // REPLACE = delete+insert, NULLs columns it doesn't
+                                            // list (e.g. a peer's precomputed `cachedReply`).
+                                            // DO UPDATE touches only these four columns, and only
+                                            // when the content actually differs.
                                             try db.execute(sql: """
-                                                INSERT OR REPLACE INTO messageAICache
-                                                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
-                                                VALUES (?, ?, ?, ?, ?)
+                                                INSERT INTO messageAICache
+                                                    (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
+                                                    VALUES (?, ?, ?, ?, ?)
+                                                ON CONFLICT(key) DO UPDATE SET
+                                                    summaryBlurb = excluded.summaryBlurb,
+                                                    summaryTodos = excluded.summaryTodos,
+                                                    actionTag = excluded.actionTag,
+                                                    updatedAt = excluded.updatedAt
+                                                WHERE summaryBlurb IS NOT excluded.summaryBlurb
+                                                   OR summaryTodos IS NOT excluded.summaryTodos
+                                                   OR actionTag IS NOT excluded.actionTag
                                                 """, arguments: [
                                                     cacheKey, msg.summaryBlurb, msg.summaryTodos,
                                                     msg.actionTag, msg.processedAt
@@ -904,10 +921,21 @@ enum NSEDataBridge {
                                         folderPath: msg.folderPath,
                                         rfc822MessageId: msg.rfc822MessageId
                                        ) {
+                                        // Value-guarded UPSERT — same rationale as the existing-
+                                        // header branch (no REPLACE-clobber of cachedReply, no
+                                        // redundant count on a no-op re-write).
                                         try db.execute(sql: """
-                                            INSERT OR REPLACE INTO messageAICache
-                                            (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
-                                            VALUES (?, ?, ?, ?, ?)
+                                            INSERT INTO messageAICache
+                                                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
+                                                VALUES (?, ?, ?, ?, ?)
+                                            ON CONFLICT(key) DO UPDATE SET
+                                                summaryBlurb = excluded.summaryBlurb,
+                                                summaryTodos = excluded.summaryTodos,
+                                                actionTag = excluded.actionTag,
+                                                updatedAt = excluded.updatedAt
+                                            WHERE summaryBlurb IS NOT excluded.summaryBlurb
+                                               OR summaryTodos IS NOT excluded.summaryTodos
+                                               OR actionTag IS NOT excluded.actionTag
                                             """, arguments: [
                                                 cacheKey, msg.summaryBlurb, msg.summaryTodos,
                                                 msg.actionTag, msg.processedAt

@@ -422,7 +422,8 @@ struct NSEGradualMergeTests {
         // Summary staged but NOT aiCompleted — the NSE stages the summary BEFORE the
         // terminal action vote, so this is a KEPT gradual row that re-merges every
         // wake until the action lands. Re-applying the SAME summary must NOT reload.
-        try q.write { db in
+        // (await: GRDB picks the async write overload in this async test context.)
+        try await q.write { db in
             try db.execute(sql: """
                 UPDATE nse_processed_message SET summaryBlurb = ?, summaryTodos = ?
                 WHERE id = ?
@@ -443,6 +444,44 @@ struct NSEGradualMergeTests {
         // Re-merge with nothing new: the value-guarded summary UPDATE is a 0-row
         // no-op, so total_changes doesn't grow → NO redundant reload. (Without the
         // guard the unconditional summary re-write would re-fire the reload.)
+        posts.withLock { $0 = [] }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0 }.isEmpty)
+    }
+
+    @Test("Re-merge of a re-staged TERMINAL (aiCompleted) row emits NO extra reload")
+    @MainActor func reMergeTerminalRowEmitsNoSignal() async throws {
+        let (dir, _, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        try stageAIRow(q, action: "archive")   // terminal: aiCompleted=1 + summary + action
+
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { _ in posts.withLock { $0.append(true) } }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        // First merge writes header + body + summary + action + AI cache, then
+        // deletes the terminal staging row.
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0.count } >= 1)
+
+        // Simulate a terminal row whose prior staging delete FAILED (or a re-delivery):
+        // re-stage the SAME row and re-merge. Everything is already applied → the
+        // value-guarded summary/action UPDATEs AND the AI-cache UPSERT are all 0-row
+        // no-ops → total_changes doesn't grow → NO redundant reload. (Without the
+        // UPSERT guard the AI-cache INSERT OR REPLACE would re-count and reload.)
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        try stageAIRow(q, action: "archive")
         posts.withLock { $0 = [] }
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
         try await Task.sleep(for: .milliseconds(200))
