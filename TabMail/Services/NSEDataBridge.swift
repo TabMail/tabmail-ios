@@ -370,6 +370,12 @@ enum NSEDataBridge {
         // Track whether any merge step mutated main GRDB. Drives whether we
         // bother recomputing the badge at the end.
         var didMutate = false
+        // Track whether anything changed AFTER phase 1's header render — i.e. in
+        // phase 2 (body/AI), inbox removals, or task results. Gates the SECOND
+        // (end-of-merge) `.inboxDataDidChange` so a re-merge that changes nothing
+        // past the header doesn't fire a redundant reload. Phase 1's own render is
+        // gated separately on headers becoming newly visible.
+        var endOfMergeChanged = false
 
         // Age window after which a still-incomplete (populated=1, aiCompleted=0)
         // GRADUAL staging row is treated as abandoned — its NSE died before
@@ -518,13 +524,22 @@ enum NSEDataBridge {
                                         """, arguments: [msg.accountId, rfc822])
                                 }
                                 if let id = existingId {
-                                    // Already visible (sync or a prior merge).
-                                    // Just refresh the snippet if NSE staged a
-                                    // non-empty one; everything else is phase 2's
-                                    // job.
+                                    // Already visible (sync or a prior merge). SEED
+                                    // the snippet from the NSE's staged value ONLY if
+                                    // the header has none yet — so the fast header
+                                    // render has something to show. Do NOT overwrite
+                                    // an existing snippet: phase 2 computes the
+                                    // canonical body-derived snippet (matching the
+                                    // sync path), and re-seeding msg.snippet here on
+                                    // every wake would OSCILLATE against phase 2's
+                                    // value (each merge flips it), which both churns
+                                    // the column and defeats the no-op detection that
+                                    // gates the end-of-merge render → redundant
+                                    // reloads. `AND (snippet IS NULL OR snippet = '')`
+                                    // makes the re-seed a one-time, no-oscillation op.
                                     if !msg.snippet.isEmpty {
                                         try db.execute(
-                                            sql: "UPDATE messageHeader SET snippet = ? WHERE id = ?",
+                                            sql: "UPDATE messageHeader SET snippet = ? WHERE id = ? AND (snippet IS NULL OR snippet = '')",
                                             arguments: [msg.snippet, id]
                                         )
                                     }
@@ -566,16 +581,25 @@ enum NSEDataBridge {
             // visibility from the body blob; phase 2's end-of-merge post is the
             // second render once the body + AI are durable.
             if !phase1HeaderIds.isEmpty {
-                await Self.flushHeadersToFTS(headerIds: phase1HeaderIds)
-                didMutate = true
-                BootProfiler.mark("merge phase1: headers visible (\(phase1HeaderIds.count)) — rendered")
-                MergeSurfaceProbe.markMergeSignal()
-                Task { @MainActor in
-                    NotificationCenter.default.post(
-                        name: .inboxDataDidChange,
-                        object: nil,
-                        userInfo: [Notification.Name.inboxReloadImmediateKey: true]
-                    )
+                // flushHeadersToFTS returns how many headers it flipped from
+                // headerComplete=0 → 1 (i.e. became NEWLY inbox-visible this wake).
+                // It still indexes + flips ALL ids (idempotent recovery); only the
+                // RENDER is gated on a real visibility change, so a foreground
+                // re-merge of already-visible rows doesn't fire a redundant reload.
+                let newlyVisible = await Self.flushHeadersToFTS(headerIds: phase1HeaderIds)
+                if newlyVisible > 0 {
+                    didMutate = true
+                    BootProfiler.mark("merge phase1: \(newlyVisible) header(s) newly visible — rendered")
+                    MergeSurfaceProbe.markMergeSignal()
+                    Task { @MainActor in
+                        NotificationCenter.default.post(
+                            name: .inboxDataDidChange,
+                            object: nil,
+                            userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+                        )
+                    }
+                } else {
+                    BootProfiler.mark("merge phase1: \(phase1HeaderIds.count) header(s) already visible — no extra render")
                 }
             }
 
@@ -609,6 +633,10 @@ enum NSEDataBridge {
             // rather than waiting for a later recoverIncompleteHeaders pass. Body
             // FTS / bodyComplete stay scoped to `ftsBatch` (the bodied subset).
             var allMergedHeaderIds: [String] = []
+            // Whether the phase-2 main write changed anything durable (its
+            // total_changes delta). Drives the SECOND, end-of-merge render so a
+            // no-op re-merge doesn't reload. Assigned from writeResult.realChanged.
+            var mainWriteChanged = false
 
             // Tracks whether the outer dbPool.write actually committed. Per-
             // message savepoints can RELEASE successfully but if the outer
@@ -633,8 +661,17 @@ enum NSEDataBridge {
                 // late-surfacing residual is writer contention, not the write itself.
                 let writeReqT0 = CFAbsoluteTimeGetCurrent()
                 BootProfiler.mark("merge: requesting GRDB writer for \(processed.count) staged msg(s)")
-                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String]) = try await AppDatabase.dbPool.write { db in
+                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool) = try await AppDatabase.dbPool.write { db in
                     BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
+                    // Connection-level write counter snapshot. The delta over this
+                    // whole transaction tells us whether phase 2 changed anything
+                    // durable (new header, first body insert, snippet/summary/action
+                    // write) vs. a no-op re-merge (body insert ignored, snippet
+                    // value-guarded to a no-op). Conservative by design: an ignored
+                    // INSERT and a 0-row UPDATE don't count, so it never MISSES a
+                    // real change (worst case over-counts → one extra harmless
+                    // reload); it only suppresses the provably-nothing-changed case.
+                    let tcStart = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
                     var localMergedIds: [String] = []
                     var localCommitted = 0
                     var localFtsAccumulator: [(headerId: String, textContent: String)] = []
@@ -731,15 +768,29 @@ enum NSEDataBridge {
                                     if msg.summaryBlurb != nil || msg.summaryTodos != nil
                                         || msg.reminderDate != nil || msg.reminderTime != nil
                                         || msg.reminderContent != nil {
+                                        // Value-guarded: the NSE stages the summary BEFORE the
+                                        // terminal action vote, so an aiCompleted=0 row with a
+                                        // summary is KEPT and re-merges every wake until the
+                                        // action lands. Re-writing the SAME five values must be a
+                                        // 0-row no-op — otherwise it inflates the merge's
+                                        // total_changes() and fires a redundant end-of-merge
+                                        // reload. The OR-chain still updates whenever ANY field
+                                        // actually differs.
                                         try db.execute(sql: """
                                             UPDATE messageHeader SET
                                                 summaryBlurb = ?, summaryTodos = ?,
                                                 reminderDate = ?, reminderTime = ?, reminderContent = ?
-                                            WHERE id = ?
+                                            WHERE id = ? AND (
+                                                summaryBlurb IS NOT ? OR summaryTodos IS NOT ?
+                                                OR reminderDate IS NOT ? OR reminderTime IS NOT ?
+                                                OR reminderContent IS NOT ?
+                                            )
                                             """, arguments: [
                                                 msg.summaryBlurb, msg.summaryTodos,
                                                 msg.reminderDate, msg.reminderTime, msg.reminderContent,
-                                                headerId
+                                                headerId,
+                                                msg.summaryBlurb, msg.summaryTodos,
+                                                msg.reminderDate, msg.reminderTime, msg.reminderContent
                                             ])
                                     }
 
@@ -754,17 +805,30 @@ enum NSEDataBridge {
                                     // only matters once a tag exists.
                                     if let actionRaw = msg.actionTag {
                                         let aiTagSortOrder = ActionTag(rawValue: actionRaw)?.sortOrder ?? 99
+                                        // Value-guarded (same rationale as summary): a re-merge of
+                                        // a row whose tag is already applied is a 0-row no-op. The
+                                        // third OR-term keeps the notified 0→1 flip working (the
+                                        // CASE sets notified=1 only when msg.notified is true).
                                         try db.execute(sql: """
                                             UPDATE messageHeader SET
                                                 actionTag = ?, tagSortOrder = ?,
                                                 notified = CASE WHEN ? THEN 1 ELSE notified END
-                                            WHERE id = ?
-                                            """, arguments: [actionRaw, aiTagSortOrder, msg.notified, headerId])
+                                            WHERE id = ? AND (
+                                                actionTag IS NOT ? OR tagSortOrder IS NOT ?
+                                                OR (? = 1 AND notified = 0)
+                                            )
+                                            """, arguments: [
+                                                actionRaw, aiTagSortOrder, msg.notified, headerId,
+                                                actionRaw, aiTagSortOrder, msg.notified
+                                            ])
                                         try queueSetTagPendingOp(db: db, accountId: msg.accountId,
                                                                  messageId: msg.messageId, tag: msg.actionTag)
                                     } else if msg.notified {
                                         // Notification delivered but no action tag (AI failed / passive).
-                                        try db.execute(sql: "UPDATE messageHeader SET notified = 1 WHERE id = ?",
+                                        // `AND notified = 0`: a re-merge of an already-notified kept
+                                        // row (aiCompleted=0, notified=1, survives up to the 60s
+                                        // abandon window) is a 0-row no-op → no redundant reload.
+                                        try db.execute(sql: "UPDATE messageHeader SET notified = 1 WHERE id = ? AND notified = 0",
                                                        arguments: [headerId])
                                     }
 
@@ -878,7 +942,8 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
-                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator)
+                    let tcEnd = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
+                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart)
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
@@ -889,6 +954,7 @@ enum NSEDataBridge {
                 committedCount = writeResult.committed
                 ftsBatch = writeResult.fts
                 allMergedHeaderIds = writeResult.headers
+                mainWriteChanged = writeResult.realChanged
                 outerCommitted = true
                 // Main tx done. With the "writer ACQUIRED after Xms" mark above this
                 // decomposes the merge: START→found = read; found→ACQUIRED = writer
@@ -917,12 +983,15 @@ enum NSEDataBridge {
                 print("[NSEDataBridge] Merge failed (outer tx): \(error)")
             }
 
-            // Drive `didMutate` off actual commits AND outer-tx success. If
-            // the outer commit failed, the per-msg savepoint releases got
-            // rolled back; successfullyMergedIds is misleading and we should
-            // not trigger a badge update.
-            if outerCommitted, committedCount > 0 {
+            // Drive the render/recount off REAL durable changes AND outer-tx
+            // success. If the outer commit failed, the per-msg savepoint releases
+            // got rolled back, so nothing changed. `mainWriteChanged` (phase 2's
+            // total_changes delta) is true only when body/AI/snippet/new-header
+            // actually wrote — so a no-op re-merge sets neither flag and fires no
+            // end-of-merge reload.
+            if outerCommitted, mainWriteChanged {
                 didMutate = true
+                endOfMergeChanged = true
             }
 
             // Both the FTS flush and the staging-row delete are gated on the
@@ -949,6 +1018,32 @@ enum NSEDataBridge {
                 // subset, the pre-rendered body landing here too means the user
                 // opens it with no "loading body" flash.
                 if !allMergedHeaderIds.isEmpty {
+                    // Dropped-render guard: the post-tx flush below ALSO flips
+                    // headerComplete=1 (for body-less / unresolved-CID rows, AND as
+                    // a backstop if phase 1's flushHeadersToFTS hit a transient error
+                    // and returned 0). If neither phase has rendered yet
+                    // (endOfMergeChanged still false), a header that's STILL
+                    // headerComplete=0 here is about to become visible with no
+                    // reload — so detect that and render. In the common case phase 1
+                    // already flipped these to 1, so the count is 0 and nothing extra
+                    // fires (no over-render). Cheap PK-indexed COUNT, post-tx only.
+                    if !endOfMergeChanged {
+                        // Immutable copy so the @Sendable read closure doesn't
+                        // capture the mutable `allMergedHeaderIds` (Swift 6).
+                        let idsForVisibilityCheck = allMergedHeaderIds
+                        let placeholders = idsForVisibilityCheck.map { _ in "?" }.joined(separator: ",")
+                        let stillHidden = (try? await AppDatabase.dbPool.read { db -> Int in
+                            try Int.fetchOne(
+                                db,
+                                sql: "SELECT COUNT(*) FROM messageHeader WHERE id IN (\(placeholders)) AND headerComplete = 0",
+                                arguments: StatementArguments(idsForVisibilityCheck)
+                            ) ?? 0
+                        }) ?? 0
+                        if stillHidden > 0 {
+                            didMutate = true
+                            endOfMergeChanged = true
+                        }
+                    }
                     await Self.flushNSEBatchToFTS(headerIds: allMergedHeaderIds, bodyItems: ftsBatch)
                 }
 
@@ -978,10 +1073,10 @@ enum NSEDataBridge {
         }
 
         // 2. Process inbox removals — messages archived/deleted/moved while app was sleeping
-        if mergeInboxRemovals(from: nseDB) { didMutate = true }
+        if mergeInboxRemovals(from: nseDB) { didMutate = true; endOfMergeChanged = true }
 
         // Consume pending task results
-        if consumePendingTaskResults(from: nseDB) { didMutate = true }
+        if consumePendingTaskResults(from: nseDB) { didMutate = true; endOfMergeChanged = true }
 
         // Whenever the merge changed state, RECOMPUTE inbox unread counts (the merge
         // writes messageHeader but does NOT maintain folder.unreadCount). The merge
@@ -1033,7 +1128,7 @@ enum NSEDataBridge {
         // debounce: this merge is the privileged, single-threaded boot-priority
         // step and must paint immediately (the debounce stays for the noisy
         // background producers — sync/backfill/AI — not for the merge).
-        if didMutate {
+        if endOfMergeChanged {
             MergeSurfaceProbe.markMergeSignal()
             Task { @MainActor in
                 NotificationCenter.default.post(
@@ -1389,9 +1484,13 @@ enum NSEDataBridge {
         let snipT0 = CFAbsoluteTimeGetCurrent()
         let snippet = textContent.map { EmailFilter.snippetFromPlainText($0) } ?? ""
         if !snippet.isEmpty {
+            // `AND snippet IS NOT ?` makes a same-value re-write a true no-op (0
+            // rows changed) — so a foreground re-merge of an already-snippeted row
+            // doesn't inflate the merge's `total_changes()`, which gates the
+            // end-of-merge render. The snippet still updates whenever it differs.
             try db.execute(sql: """
-                UPDATE messageHeader SET snippet = ? WHERE id = ?
-                """, arguments: [snippet, headerId])
+                UPDATE messageHeader SET snippet = ? WHERE id = ? AND snippet IS NOT ?
+                """, arguments: [snippet, headerId, snippet])
         }
         let snipMs = Int((CFAbsoluteTimeGetCurrent() - snipT0) * 1000)
         if snipMs > 20 {
@@ -1420,8 +1519,13 @@ enum NSEDataBridge {
     /// is a no-op the second time, so phase 2's `flushNSEBatchToFTS` re-running the
     /// same IDs is harmless. Same log-and-return error handling as the steps it
     /// copies.
-    fileprivate static func flushHeadersToFTS(headerIds: [String]) async {
-        guard !headerIds.isEmpty else { return }
+    ///
+    /// - Returns: the number of headers this call flipped from `headerComplete=0`
+    ///   → `1` (i.e. became NEWLY inbox-visible). 0 means everything was already
+    ///   visible (or an error short-circuited) — the caller uses this to skip a
+    ///   redundant render. Indexing + the flip still run for ALL ids regardless.
+    fileprivate static func flushHeadersToFTS(headerIds: [String]) async -> Int {
+        guard !headerIds.isEmpty else { return 0 }
 
         // 1. Bulk read ALL merged headers (regardless of body presence).
         let headersById: [String: MessageHeader]
@@ -1434,13 +1538,13 @@ enum NSEDataBridge {
             }
         } catch {
             print("[NSEDataBridge] FTS header flush: bulk header read failed: \(error) — next wake will recover")
-            return
+            return 0
         }
 
         // Filter to headers that actually exist (handle races where a header was
         // deleted/moved between merge and flush). Preserve merge order.
         let validHeaders = headerIds.compactMap { headersById[$0] }
-        guard !validHeaders.isEmpty else { return }
+        guard !validHeaders.isEmpty else { return 0 }
 
         // 2. Batch FTS header indexing for ALL merged headers. Idempotent — known
         //    IDs are skipped; header records carry no body, so this is cheap.
@@ -1461,24 +1565,28 @@ enum NSEDataBridge {
             _ = try await SearchIndex.shared.indexHeaders(records)
         } catch {
             print("[NSEDataBridge] FTS header flush: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
-            return
+            return 0
         }
 
-        // 3. Batch flip headerComplete=1 for ALL indexed headers → inbox-visible
-        //    NOW. The inbox query gates on headerComplete == true, so this is what
-        //    surfaces the pushed message.
+        // 3. Batch flip headerComplete=1 for the indexed headers that are NOT yet
+        //    visible → inbox-visible NOW. The inbox query gates on headerComplete
+        //    == true, so this is what surfaces the pushed message. The `AND
+        //    headerComplete = 0` clause keeps the flip idempotent AND makes
+        //    `changesCount` the count of headers that became NEWLY visible — the
+        //    caller renders only when that's > 0.
         let indexedIds = validHeaders.map(\.id)
         do {
-            try await AppDatabase.dbPool.write { db in
+            return try await AppDatabase.dbPool.write { db -> Int in
                 let placeholders = indexedIds.map { _ in "?" }.joined(separator: ",")
                 try db.execute(
-                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id IN (\(placeholders))",
+                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id IN (\(placeholders)) AND headerComplete = 0",
                     arguments: StatementArguments(indexedIds)
                 )
+                return db.changesCount
             }
         } catch {
             print("[NSEDataBridge] FTS header flush: headerComplete update failed: \(error)")
-            return
+            return 0
         }
     }
 

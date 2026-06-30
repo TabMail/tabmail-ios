@@ -375,6 +375,80 @@ struct NSEGradualMergeTests {
         #expect(captured.allSatisfy { $0 == true })
     }
 
+    @Test("Re-merge with nothing new emits NO extra inboxDataDidChange (no redundant reload)")
+    @MainActor func reMergeWithoutChangesEmitsNoSignal() async throws {
+        let (dir, _, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        // Header + body, NO AI → a KEPT gradual row (aiCompleted=0) that survives
+        // the first merge in staging and is re-read on the next wake.
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { _ in posts.withLock { $0.append(true) } }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        // First merge: surfaces the header + lands the body → at least one render.
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0.count } >= 1)
+
+        // Re-merge the SAME staging with nothing new: the header is already visible
+        // (flushHeadersToFTS flips 0 rows) and phase 2's total_changes delta is 0
+        // (body insert ignored, snippet value-guarded, no AI staged) → ZERO reloads.
+        // This is the redundant-reload guard.
+        posts.withLock { $0 = [] }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0 }.isEmpty)
+    }
+
+    @Test("Re-merge of a summary-staged, action-pending row emits NO extra reload")
+    @MainActor func reMergeWithSummaryButNoActionEmitsNoSignal() async throws {
+        let (dir, _, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        // Summary staged but NOT aiCompleted — the NSE stages the summary BEFORE the
+        // terminal action vote, so this is a KEPT gradual row that re-merges every
+        // wake until the action lands. Re-applying the SAME summary must NOT reload.
+        try q.write { db in
+            try db.execute(sql: """
+                UPDATE nse_processed_message SET summaryBlurb = ?, summaryTodos = ?
+                WHERE id = ?
+                """, arguments: ["A short summary", "todo one", "acc1:msg-1"])
+        }
+
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { _ in posts.withLock { $0.append(true) } }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        // First merge surfaces header + body + summary → at least one render.
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0.count } >= 1)
+
+        // Re-merge with nothing new: the value-guarded summary UPDATE is a 0-row
+        // no-op, so total_changes doesn't grow → NO redundant reload. (Without the
+        // guard the unconditional summary re-write would re-fire the reload.)
+        posts.withLock { $0 = [] }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0 }.isEmpty)
+    }
+
     /// Simulator measurement: a clean header-only merge (no AI, no contention)
     /// surfaces the message in a handful of ms — the whole point of gradual
     /// staging is that visibility is NOT blocked behind the NSE's ~6-10s of AI.
