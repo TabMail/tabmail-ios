@@ -325,6 +325,53 @@ struct NSEStagingMergeBugfixTests {
         #expect(populated == 0)
     }
 
+    // MARK: - AIOwnershipLease.release — conditional + idempotent
+    //
+    // The NSE now releases its lease from EVERY exit path (the natural
+    // top-of-process `defer`, the graceful-exit watchdog, and
+    // `serviceExtensionTimeWillExpire`) — "lease all the time", so the main app
+    // never waits out a stale lease after a clean NSE exit. That is only safe
+    // because `release` is (a) conditional on still owning (`WHERE aiOwner='nse'`)
+    // and (b) idempotent. These two tests pin both invariants.
+
+    @Test("release(owner:.nse) does NOT clobber a lease a stale-takeover handed to mainApp")
+    func releaseIsConditionalOnOwner() throws {
+        let db = try makeStagingDB()
+        // NSE claims, then "dies": backdate its heartbeat past staleMs.
+        #expect(AIOwnershipLease.tryClaim(db: db, accountId: "acc1", messageId: "msg-1", owner: .nse))
+        let staleHb = Int64(Date().timeIntervalSince1970 * 1000) - (AIOwnershipLease.staleMs + 1000)
+        try db.write { try $0.execute(sql: "UPDATE nse_processed_message SET aiHeartbeatMs = ?", arguments: [staleHb]) }
+        // Main app takes over the stale lease.
+        #expect(AIOwnershipLease.tryClaim(db: db, accountId: "acc1", messageId: "msg-1", owner: .mainApp))
+
+        // The dead NSE's late exit (watchdog / expiration) fires `release(.nse)`.
+        // It must be a no-op — mainApp's takeover survives.
+        AIOwnershipLease.release(db: db, accountId: "acc1", messageId: "msg-1", owner: .nse)
+
+        let owner = try db.read { try String.fetchOne($0, sql: """
+            SELECT aiOwner FROM nse_processed_message WHERE id = 'acc1:msg-1'
+            """) }
+        #expect(owner == "mainApp")
+    }
+
+    @Test("release is idempotent — the NSE's multiple exit paths releasing twice is harmless")
+    func releaseIsIdempotent() throws {
+        let db = try makeStagingDB()
+        #expect(AIOwnershipLease.tryClaim(db: db, accountId: "acc1", messageId: "msg-1", owner: .nse))
+
+        // First release (natural `defer`), then a second (watchdog/expiration that
+        // raced the same exit). Neither throws; the slot ends genuinely free.
+        AIOwnershipLease.release(db: db, accountId: "acc1", messageId: "msg-1", owner: .nse)
+        AIOwnershipLease.release(db: db, accountId: "acc1", messageId: "msg-1", owner: .nse)
+
+        let owner = try db.read { try String.fetchOne($0, sql: """
+            SELECT aiOwner FROM nse_processed_message WHERE id = 'acc1:msg-1'
+            """) }
+        #expect(owner == nil)
+        // The freed slot is claimable by the next actor (main app takes over).
+        #expect(AIOwnershipLease.tryClaim(db: db, accountId: "acc1", messageId: "msg-1", owner: .mainApp))
+    }
+
     // MARK: - GRDB inSavepoint rollback-on-throw semantics
 
     /// Insert a minimal MessageHeader on an existing GRDB `Database` (inside

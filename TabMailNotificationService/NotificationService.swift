@@ -20,16 +20,44 @@ final class OneShotFlag: @unchecked Sendable {
     }
 }
 
-/// Reference-typed holder for the AI lease heartbeat Task. Mutex is
-/// noncopyable, so a class wrapper is the simplest way to share the slot
-/// between `process` (sets it) and `serviceExtensionTimeWillExpire` (cancels
-/// it). `cancelAndClear` is idempotent — both paths can call it.
-final class HeartbeatHolder: @unchecked Sendable {
+/// Reference-typed holder for a cancellable Task (the AI lease heartbeat, and
+/// the graceful-exit watchdog). Mutex is noncopyable, so a class wrapper is the
+/// simplest way to share the slot between `process` (sets it) and the instance's
+/// exit handlers (cancel it). `cancelAndClear` is idempotent — both paths can
+/// call it.
+final class CancellableTaskHolder: @unchecked Sendable {
     private let slot = Mutex<Task<Void, Never>?>(nil)
     func set(_ task: Task<Void, Never>) { slot.withLock { $0 = task } }
     func cancelAndClear() {
         let t = slot.withLock { let was = $0; $0 = nil; return was }
         t?.cancel()
+    }
+}
+
+/// Reference-typed holder carrying the claimed AI-lease identity from the static
+/// `process(...)` back to the instance, so EVERY exit path (natural completion,
+/// the graceful-exit watchdog, and `serviceExtensionTimeWillExpire`) can release
+/// the lease — "lease all the time". `releaseIfHeld` is idempotent: it reads and
+/// clears the slot under the lock, so whichever path runs first does the single
+/// conditional release write and the rest are no-ops (no duplicate / edge write).
+///
+/// Why this matters: without it, an NSE that times out mid-AI leaves a held
+/// lease that the main app must wait out (`staleMs` = 4 s) before taking over.
+/// Releasing it on the way out hands off instantly. The watchdog (fires
+/// `NSEConfig.watchdogSeconds` before the ~30 s hard-kill) is what makes the
+/// release SAFE — it happens with margin, not racing suspension (0xdead10cc).
+final class LeaseHolder: @unchecked Sendable {
+    private let slot = Mutex<(db: DatabaseQueue, accountId: String, messageId: String)?>(nil)
+    func claim(db: DatabaseQueue, accountId: String, messageId: String) {
+        slot.withLock { $0 = (db, accountId, messageId) }
+    }
+    /// Release the lease iff still held, then clear the slot. Returns true if a
+    /// release was actually performed (for logging). Idempotent across paths.
+    @discardableResult
+    func releaseIfHeld() -> Bool {
+        guard let held = slot.withLock({ let was = $0; $0 = nil; return was }) else { return false }
+        AIOwnershipLease.release(db: held.db, accountId: held.accountId, messageId: held.messageId, owner: .nse)
+        return true
     }
 }
 
@@ -39,11 +67,18 @@ final class NotificationService: UNNotificationServiceExtension {
     private lazy var nseDB: DatabaseQueue? = NSEStagingDB.open()
     private let delivered = OneShotFlag()
     /// Instance-scoped holder for the AI lease heartbeat Task spawned inside
-    /// `process(...)`. `serviceExtensionTimeWillExpire` cancels it so the 1Hz
-    /// SQLite drumbeat stops before iOS suspends NSE — without this, a refresh
-    /// write in flight at suspension can trip RUNNINGBOARD 0xdead10cc on the
-    /// extension. Mirrors the main app's heartbeat lifecycle hygiene.
-    private let heartbeatHolder = HeartbeatHolder()
+    /// `process(...)`. The exit handlers cancel it so the 1Hz SQLite drumbeat
+    /// stops before iOS suspends NSE — without this, a refresh write in flight at
+    /// suspension can trip RUNNINGBOARD 0xdead10cc on the extension. Mirrors the
+    /// main app's heartbeat lifecycle hygiene.
+    private let heartbeatHolder = CancellableTaskHolder()
+    /// Graceful-exit watchdog Task (set in `didReceive`). Fires
+    /// `NSEConfig.watchdogSeconds` before the ~30 s hard-kill to release the lease
+    /// + deliver passive with margin. Natural completion and the iOS expiration
+    /// handler cancel it so it never fires after we've already exited.
+    private let watchdogHolder = CancellableTaskHolder()
+    /// Carries the claimed AI-lease identity so every exit path can release it.
+    private let leaseHolder = LeaseHolder()
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -101,39 +136,74 @@ final class NotificationService: UNNotificationServiceExtension {
         let db = nseDB
         let deliverGuard = delivered
         let heartbeatHolder = self.heartbeatHolder
+        let watchdogHolder = self.watchdogHolder
+        let leaseHolder = self.leaseHolder
         nonisolated(unsafe) let deliver = contentHandler
         nonisolated(unsafe) let c = content
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // The shared delivery closure — exactly one of {process completion,
+        // watchdog, iOS expiration} actually fires it (OneShotFlag), the rest
+        // are no-ops. Factored out so the watchdog can deliver too.
+        let deliverOnce: @Sendable (UNNotificationContent) -> Void = { notification in
+            guard deliverGuard.tryFire() else {
+                os_log(.error, log: log, "NSE deliver: already fired (race)")
+                return
+            }
+            let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            if let n = notification as? UNMutableNotificationContent {
+                os_log(.error, log: log, "NSE ━━━ DELIVERED (%dms) ━━━ title=%{public}@ level=%d sound=%{public}@",
+                       ms, n.title, n.interruptionLevel.rawValue,
+                       n.sound == nil ? "nil" : "SET")
+            } else {
+                os_log(.error, log: log, "NSE ━━━ DELIVERED (%dms) ━━━ (immutable)", ms)
+            }
+            deliver(notification)
+        }
 
         Task { @Sendable in
-            let t0 = CFAbsoluteTimeGetCurrent()
             await NotificationService.process(
                 c: c, info: info, fanOutIds: fanOutIds, db: db,
                 heartbeatHolder: heartbeatHolder,
-                deliver: { notification in
-                    guard deliverGuard.tryFire() else {
-                        os_log(.error, log: log, "NSE deliver: already fired (race)")
-                        return
-                    }
-                    let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                    if let n = notification as? UNMutableNotificationContent {
-                        os_log(.error, log: log, "NSE ━━━ DELIVERED (%dms) ━━━ title=%{public}@ level=%d sound=%{public}@",
-                               ms, n.title, n.interruptionLevel.rawValue,
-                               n.sound == nil ? "nil" : "SET")
-                    } else {
-                        os_log(.error, log: log, "NSE ━━━ DELIVERED (%dms) ━━━ (immutable)", ms)
-                    }
-                    deliver(notification)
-                })
+                watchdogHolder: watchdogHolder,
+                leaseHolder: leaseHolder,
+                deliver: deliverOnce)
         }
+
+        // ── Graceful-exit watchdog ──
+        // Fires NSEConfig.watchdogSeconds before iOS's ~30s hard-kill so cleanup
+        // happens with margin (NOT racing suspension — see 0xdead10cc rule). On
+        // fire: stop the heartbeat, RELEASE the AI lease (so the main app takes
+        // over instantly instead of waiting out the 4s stale window), and deliver
+        // a passive banner if process() hasn't delivered yet. Natural completion
+        // and the iOS expiration handler both cancel this so it never fires late.
+        let watchdogSecs = Int(NSEConfig.watchdogSeconds)
+        watchdogHolder.set(Task { @Sendable in
+            try? await Task.sleep(nanoseconds: UInt64(NSEConfig.watchdogSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            os_log(.error, log: log, "NSE ⏱️ WATCHDOG (%ds) — graceful exit: release lease + deliver", watchdogSecs)
+            heartbeatHolder.cancelAndClear()
+            let released = leaseHolder.releaseIfHeld()
+            os_log(.error, log: log, "NSE watchdog: lease %{public}@", released ? "RELEASED" : "(not held)")
+            if c.title.isEmpty { c.title = "New Email"; c.body = "You have a new message" }
+            c.interruptionLevel = .passive; c.sound = nil
+            deliverOnce(c)
+        })
     }
 
     override func serviceExtensionTimeWillExpire() {
         os_log(.error, log: log, "NSE ⏰ TIMEOUT")
-        // Stop the AI lease heartbeat before iOS suspends — same wind-down as
-        // the main app's BG expiration handlers. The lease will go stale (4s)
-        // and the main app can take over cleanly. cancelAndClear is idempotent
-        // so a concurrent natural-exit cancel in process() doesn't double-fire.
+        // iOS-fired backstop at the suspension edge. In the common case the
+        // watchdog (NSEConfig.watchdogSeconds, ~3s earlier) already released the
+        // lease + delivered, so the calls below are idempotent no-ops and we do
+        // NO write here — keeping us clear of a 0xdead10cc at suspension. Only if
+        // iOS gave us a shorter-than-watchdog budget does this do the actual
+        // release; a single conditional UPDATE is the lesser evil vs. a held
+        // lease (which the main app would otherwise wait out for staleMs=4s).
+        watchdogHolder.cancelAndClear()
         heartbeatHolder.cancelAndClear()
+        let released = leaseHolder.releaseIfHeld()
+        if released { os_log(.error, log: log, "NSE timeout: lease RELEASED (watchdog hadn't run)") }
         guard let contentHandler, let content = bestAttemptContent else { return }
         guard delivered.tryFire() else { return }
         if content.title.isEmpty { content.title = "New Email"; content.body = "You have a new message" }
@@ -149,12 +219,30 @@ final class NotificationService: UNNotificationServiceExtension {
         info: [String: String],
         fanOutIds: [String],
         db: DatabaseQueue?,
-        heartbeatHolder: HeartbeatHolder,
+        heartbeatHolder: CancellableTaskHolder,
+        watchdogHolder: CancellableTaskHolder,
+        leaseHolder: LeaseHolder,
         deliver: @escaping (UNNotificationContent) -> Void
     ) async {
         let provider = info["provider"] ?? ""
         let accountEmail = info["accountEmail"] ?? ""
         os_log(.error, log: log, "NSE process: provider=%{public}@ email=%{public}@ fanOut=%d", provider, accountEmail, fanOutIds.count)
+
+        // Graceful-exit cleanup on EVERY return path. Order matters: cancel the
+        // watchdog (we finished before it fired, so it must not deliver a late
+        // passive), STOP the heartbeat, THEN release the lease (heartbeat down
+        // first so no 1Hz refresh races the release write). All idempotent —
+        // no-ops for the task_alarm / imap_reconnect / no-claim paths, and no-ops
+        // if the watchdog or the iOS expiration handler already ran. This is the
+        // "lease all the time" guarantee: the main app never has to wait out a
+        // stale lease after a clean NSE exit. The lease releases AFTER step-7
+        // persist (scope exit is past it), so the staged AI results are visible
+        // to whoever claims next — a clean handoff, not a half-written row.
+        defer {
+            watchdogHolder.cancelAndClear()
+            heartbeatHolder.cancelAndClear()
+            leaseHolder.releaseIfHeld()
+        }
 
         // ── Route by type ──
         if provider == "task_alarm" {
@@ -477,8 +565,12 @@ final class NotificationService: UNNotificationServiceExtension {
             } else if AIOwnershipLease.tryClaim(db: db, accountId: accountId, messageId: msg.messageId, owner: .nse) {
                 didClaimAI = true
                 os_log(.error, log: log, "NSE step6: claimed AI ownership")
-                // Register with the instance so serviceExtensionTimeWillExpire can
-                // cancel us if iOS expires NSE before we reach the natural cleanup.
+                // Register the claimed identity so EVERY exit path (natural defer,
+                // watchdog, iOS expiration) can release this lease — "lease all
+                // the time", so the main app never waits out a stale lease.
+                leaseHolder.claim(db: db, accountId: accountId, messageId: msg.messageId)
+                // Register the heartbeat so the exit handlers can stop the 1Hz
+                // SQLite drumbeat before iOS suspends NSE.
                 heartbeatHolder.set(Task { @Sendable [db, accountId, mid = msg.messageId] in
                     while !Task.isCancelled {
                         try? await Task.sleep(nanoseconds: AIOwnershipLease.heartbeatIntervalMs * 1_000_000)
@@ -566,15 +658,10 @@ final class NotificationService: UNNotificationServiceExtension {
             os_log(.error, log: log, "NSE step6: SKIP (no body)")
         }
 
-        // Release AI ownership + stop heartbeat. Done regardless of outcome —
-        // success, LLM failure, or skip-after-claim — so next actor sees a
-        // clean slot. Conditional release (WHERE aiOwner = "nse") means if a
-        // stale takeover happened elsewhere, we won't clobber it.
-        // cancelAndClear is idempotent — fine if the expiration handler beat us.
-        heartbeatHolder.cancelAndClear()
-        if didClaimAI, let db {
-            AIOwnershipLease.release(db: db, accountId: accountId, messageId: msg.messageId, owner: .nse)
-        }
+        // AI ownership release + heartbeat stop now happen in the top-of-function
+        // `defer` (runs at scope exit, AFTER step-7 persist below) so the staged
+        // results are visible before the lease frees. Conditional release
+        // (WHERE aiOwner = "nse") means a stale takeover elsewhere isn't clobbered.
 
         // ── Step 7: Persist ──
         // `notified` records whether the NSE delivered an ACTIVE (reply-tagged)
