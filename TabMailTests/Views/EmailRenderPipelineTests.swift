@@ -223,39 +223,52 @@ struct EmailRenderPipelineTests {
         #expect(abortIdx < stampIdx)
     }
 
-    @Test("eatGutterMarginsJS pulls body to absorb the email's own margin (gutter as MIN, clip-safe)")
-    func eatGutterMarginsClipSafe() {
+    @Test("eatGutterMarginsJS measures the email's inset and posts a reduced gutter (min-indent, no content fiddle)")
+    func eatGutterMeasuresAndPostsReducedGutter() {
         let js = _eatGutterMarginsJS
-        // The SwiftUI 16pt gutter must stay a MINIMUM that absorbs the email's own
-        // outer inset instead of stacking with it. The body is pulled out with a
-        // negative margin, but ONLY by min(minLeftInset, minRightInset, GUTTER) so
-        // no content is ever pulled past the viewport edge (no clip) and none newly
-        // overflows (no spurious fitViewport widen).
-        #expect(js.contains("var GUTTER = 16"))                                  // matches SwiftUI gutter
-        #expect(js.contains("var m = Math.min(minLeft, minRight, GUTTER)"))      // capped + symmetric
-        #expect(js.contains("setProperty('margin-left', (-m) + 'px', 'important')"))
-        #expect(js.contains("setProperty('margin-right', (-m) + 'px', 'important')"))
-        // Only text/image leaves count as content (structural wrappers at inset 0
-        // must NOT peg the measured inset to 0).
-        #expect(js.contains("var isImg = el.tagName === 'IMG'"))
-        #expect(js.contains("if (!isImg && !hasText) continue"))
-        // Zero-size (hidden / not-yet-loaded) elements excluded.
-        #expect(js.contains("if (r.width <= 0 || r.height <= 0) continue"))
+        // The 16pt gutter is a MINIMUM that absorbs the email's own inset instead of
+        // stacking. Implementation MEASURES the inset and posts the SwiftUI padding
+        // to apply (= 16 − inset, clamped) — it must NOT touch the email layout
+        // (no body margin/pull), so it can't clip or perturb rendering.
+        #expect(js.contains("var GUTTER = 16"))                                   // matches SwiftUI default
+        #expect(js.contains("var WIDE = bw * 0.6"))                               // main-column width filter
+        #expect(js.contains("if (r.width < WIDE || r.height <= 0) continue"))     // wide text leaves only
+        #expect(js.contains("var xl = Math.max(0, Math.min(minLeft, GUTTER))"))   // clamp [0,16] (can't harm)
+        #expect(js.contains("var padL = GUTTER - xl"))                            // padding = 16 − inset
+        #expect(js.contains("messageHandlers.gutterAdjust.postMessage"))          // posts to Swift, doesn't mutate DOM
+        // Regression guard: must NOT pull the body (the old, ineffective approach).
+        #expect(!js.contains("margin-left"))
+        #expect(!js.contains("margin-right"))
     }
 
-    @Test("fixDarkModeColorsJS dims colored backgrounds ONLY when they carry text")
-    func darkModeDimSkipsTextlessDecorations() {
+    @Test("fixDarkModeColorsJS dims only LIGHT LOW-SATURATION text fills — preserves textless + saturated colors")
+    func darkModeDimScopedToLightLowSatTextFills() {
         let js = _fixDarkModeColorsJS
-        // The colored-bg dim normalizes a fill to luminance ~80 so white text on
-        // it stays legible. Applied to TEXTLESS decorations (score/accent bars,
-        // rule lines, swatches) it instead collapses sender color-coding: Scholar
-        // Inbox per-paper score bars #C14600 and #E57C4F both became lum~80 →
-        // indistinguishable (logmain.log 2026-06-29). The dim must be gated on the
-        // element actually containing text.
+        // The colored-bg dim normalizes a fill to luminance ~80 so white text on it
+        // stays legible. Applied to (a) TEXTLESS decorations (accent bars) or (b)
+        // DELIBERATE SATURATED colors (score badges/chips/buttons), it collapses
+        // sender color-coding: Scholar's score bars AND badges (#C14600 vs #E57C4F)
+        // both flattened to lum~80. So the dim is gated on text AND low saturation;
+        // textless and saturated colors keep their hue (text contrast handled by the
+        // safety net).
         #expect(js.contains("var elHasText = (el.textContent || '')"))
-        #expect(js.contains("if (coloredBg && bgL > 80 && elHasText)"))
-        // The bare ungated form must be gone (regression guard).
+        #expect(js.contains("var saturated = bgS > 100"))
+        #expect(js.contains("if (coloredBg && bgL > 80 && elHasText && !saturated)"))
+        // Regression guards: neither the bare form nor the text-only form may return.
         #expect(!js.contains("if (coloredBg && bgL > 80) {"))
+        #expect(!js.contains("if (coloredBg && bgL > 80 && elHasText) {"))
+    }
+
+    @Test("fixDarkModeColorsJS makes the outermost near-white surface a darker panel (not erased)")
+    func darkModeNearWhitePanelDarkening() {
+        let js = _fixDarkModeColorsJS
+        // White paper panels were being erased (nearWhite → transparent → blends
+        // into the card). The OUTERMOST near-white surface now gets a translucent
+        // black overlay so it reads as a panel darker than its surroundings; nested
+        // near-whites stay transparent so overlays don't stack into mud.
+        #expect(js.contains("data-tm-panel"))
+        #expect(js.contains("el.parentElement.closest('[data-tm-panel]')"))
+        #expect(js.contains("rgba(0,0,0,0.22)"))
     }
 
     @Test("fitViewportJS overflow measurement excludes not-yet-loaded images (layer 2 upstream fix)")

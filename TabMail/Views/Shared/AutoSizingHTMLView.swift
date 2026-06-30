@@ -26,6 +26,13 @@ struct AutoSizingHTMLView: View {
     /// bound `html` changes (e.g. pull-to-refresh) so the placeholder returns
     /// while the new content renders.
     @State private var hasRevealed = false
+    /// Horizontal gutter per side, seeded at the 16pt minimum and REDUCED by the
+    /// email's own measured content inset via the `gutterAdjust` message (see
+    /// `eatGutterMarginsJS`). The 16 is never lowered as a floor — total indent
+    /// stays `max(16, emailInset)` — it just stops our gutter double-counting the
+    /// email's own indent.
+    @State private var leadingPad: CGFloat = 16
+    @State private var trailingPad: CGFloat = 16
 
     init(html: String, previewFilename: String? = nil, headerId: String? = nil) {
         self.html = html
@@ -51,7 +58,7 @@ struct AutoSizingHTMLView: View {
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, height: $height, hasRevealed: $hasRevealed)
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
             // While a real body is still rendering, reserve room for the
             // placeholder so it's visible even before the web view reports a
             // height. Once revealed (or for non-body previews) size strictly to
@@ -81,7 +88,14 @@ struct AutoSizingHTMLView: View {
             // the layout viewport — a CSS `padding: 12px` bottom would shrink
             // to 8.6 pt visually when widened (12 × 0.72 scale), producing an
             // inconsistent bubble-bottom gap across emails.
-            .padding(.horizontal, 16)
+            // Horizontal is the dynamic gutter (16pt minimum, reduced by the
+            // email's own inset via gutterAdjust). `.animation(.none)` so the
+            // one-time reduce-on-load doesn't slide (it lands while the body is
+            // still opacity:0, but a parent animation could otherwise pick it up).
+            .padding(.leading, leadingPad)
+            .padding(.trailing, trailingPad)
+            .animation(.none, value: leadingPad)
+            .animation(.none, value: trailingPad)
             .padding(.bottom, 12)
             // Reset the placeholder when the bound content changes (pull-to-
             // refresh swaps in a new body), then arm a safety timeout so a
@@ -188,6 +202,12 @@ private struct HTMLWebView: UIViewRepresentable {
     let headerId: String?
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
+    // Dynamic horizontal gutter: starts at the 16pt minimum and is REDUCED by the
+    // email's own measured content inset (eatGutterMarginsJS → gutterAdjust) so the
+    // gutter absorbs the email's indent instead of stacking on it. Never below the
+    // value the email's own inset frees up; clamped so it can't harm other emails.
+    @Binding var leadingPad: CGFloat
+    @Binding var trailingPad: CGFloat
     // Observed so SwiftUI re-invokes updateUIView on a light<->dark flip — see the
     // schemeChanged branch in updateUIView (reload so the dark-mode scripts re-run
     // for the new appearance).
@@ -250,6 +270,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(heightDiag)
         config.userContentController.add(context.coordinator, name: "heightChanged")
         config.userContentController.add(context.coordinator, name: "consoleLog")
+        config.userContentController.add(context.coordinator, name: "gutterAdjust")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.isOpaque = false
@@ -348,7 +369,7 @@ private struct HTMLWebView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(height: $height, hasRevealed: $hasRevealed)
+        Coordinator(height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
@@ -357,6 +378,10 @@ private struct HTMLWebView: UIViewRepresentable {
         /// Flipped true when the JS `reveal()` posts `{revealed:true}` — drives
         /// the SwiftUI loading placeholder removal in `AutoSizingHTMLView`.
         @Binding var hasRevealed: Bool
+        /// Dynamic horizontal gutter, driven by the `gutterAdjust` message from
+        /// `eatGutterMarginsJS` (= 16 − the email's own measured inset, clamped).
+        @Binding var leadingPad: CGFloat
+        @Binding var trailingPad: CGFloat
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
@@ -407,9 +432,11 @@ private struct HTMLWebView: UIViewRepresentable {
         /// Released in deinit.
         private var zoomObservation: NSKeyValueObservation?
 
-        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>) {
+        init(height: Binding<CGFloat>, hasRevealed: Binding<Bool>, leadingPad: Binding<CGFloat>, trailingPad: Binding<CGFloat>) {
             self._height = height
             self._hasRevealed = hasRevealed
+            self._leadingPad = leadingPad
+            self._trailingPad = trailingPad
             super.init()
             // Re-run fitViewport on foreground return — iOS resumes the WKWebView
             // content process which may have been suspended with incomplete
@@ -597,6 +624,15 @@ private struct HTMLWebView: UIViewRepresentable {
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             if message.name == "heightChanged" {
                 handleHeightMessage(message.body)
+            } else if message.name == "gutterAdjust", let d = message.body as? [String: Any] {
+                // eatGutterMarginsJS measured the email's own content inset and sent
+                // the SwiftUI padding to apply (= 16 − inset, clamped). Only ever
+                // ≤ the 16pt default, so the gutter stays a minimum. Guard equality
+                // to avoid a redundant frame resize (which would re-fit needlessly).
+                let l = (d["l"] as? NSNumber).map { CGFloat(truncating: $0) } ?? leadingPad
+                let r = (d["r"] as? NSNumber).map { CGFloat(truncating: $0) } ?? trailingPad
+                if leadingPad != l { leadingPad = l }
+                if trailingPad != r { trailingPad = r }
             } else if message.name == "consoleLog", let msg = message.body as? String {
                 // Defense-in-depth gate: most JS-side log sites already
                 // substitute an empty string when DebugModeManager is off (see
@@ -911,8 +947,13 @@ private let constrainWidthsJS = """
 /// - Links inside colored-bg elements → forced to white (overrides CSS blue).
 /// Exposed as `internal` for unit tests (same pattern as `_fitViewportJS`).
 internal var _fixDarkModeColorsJS: String { fixDarkModeColorsJS }
-private let fixDarkModeColorsJS = """
+private var fixDarkModeColorsJS: String {
+    let dl = DebugModeManager.isLoggingEnabled()
+        ? "function dl(s){try{window.webkit.messageHandlers.consoleLog.postMessage('[DarkMode] '+s);}catch(_){}}"
+        : "function dl(s){}"
+    return """
     (function() {
+        \(dl)
         if (!window.matchMedia('(prefers-color-scheme: dark)').matches) return;
         var LIGHT = '#fbfbfe';
         function parseRGB(s) {
@@ -933,13 +974,53 @@ private let fixDarkModeColorsJS = """
             var bgS = hasBg ? sat(bg.r, bg.g, bg.b) : 0;
             var nearWhite = hasBg && bgL > 220 && bgS < 10;
             var coloredBg = hasBg && !nearWhite;
+            // "Chrome" = a deliberate box: a visible border, rounded corners, or a
+            // shadow. Such boxes (cards, callouts like Scholar's "Important" note)
+            // must stay DISTINCT from their surroundings in dark mode — otherwise a
+            // cream callout inside a cream section both collapse to the same dimmed
+            // luminance and the box's fill "disappears", leaving only its border.
+            var hasBorder = (parseFloat(cs.borderTopWidth) || 0) > 0 || (parseFloat(cs.borderRightWidth) || 0) > 0
+                || (parseFloat(cs.borderBottomWidth) || 0) > 0 || (parseFloat(cs.borderLeftWidth) || 0) > 0;
+            var hasChrome = hasBorder || (parseFloat(cs.borderTopLeftRadius) || 0) > 0 || (!!cs.boxShadow && cs.boxShadow !== 'none');
+            if (hasBg) {
+                dl((nearWhite ? 'nearWhite' : 'colored') + ' ' + el.tagName + '.' + (el.className || '')
+                    + ' bg=rgb(' + bg.r + ',' + bg.g + ',' + bg.b + ') L=' + Math.round(bgL) + ' S=' + Math.round(bgS)
+                    + ' chrome=' + (hasChrome ? 1 : 0)
+                    + ' w=' + Math.round(el.getBoundingClientRect().width)
+                    + ' text=' + ((el.textContent || '').replace(/\\u00a0/g, ' ').trim().length > 0 ? 1 : 0)
+                    + ' "' + (el.innerText || '').slice(0, 18).replace(/\\s+/g, ' ') + '"');
+            }
             if (nearWhite) {
-                // Near-white → transparent so the card bubble background shows through.
-                // Previously used opaque #000 to prevent "see-through stacking" in nested
-                // elements, but that covers the card's background color. Transparent is
-                // correct because the card itself provides the dark background in dark mode.
-                el.style.setProperty('background-color', 'transparent', 'important');
-                if (el.style.background) el.style.setProperty('background', 'transparent', 'important');
+                // A near-white surface is one of two things in dark mode:
+                //   (a) a full-bleed wrapper that should DISAPPEAR so the dark card
+                //       bubble shows through, or
+                //   (b) a distinct PANEL (a bright card in light mode) that should
+                //       stay visible — and, per design, render DARKER than its
+                //       surroundings rather than blending in (Scholar's white paper
+                //       cards were vanishing because we forced transparent).
+                // The OUTERMOST near-white surface (no already-converted near-white
+                // ancestor) gets a translucent-black overlay so it reads as a
+                // slightly sunken panel, darker than whatever is behind it (the
+                // dimmed section bg, or the card). NESTED near-whites stay
+                // transparent so overlays can't stack into mud on white-heavy
+                // emails (Anthropic/Amazon receipts). Translucent (not opaque) so it
+                // composites over the real backdrop — that is what makes it "darker
+                // than the surrounding" for free.
+                // Darken (= make a visible sunken panel) if this is a distinct
+                // surface: the OUTERMOST near-white, OR a CHROME box (border/radius/
+                // shadow) even when nested (a bordered callout must keep a fill, not
+                // just its border). Only PLAIN nested wrappers (no chrome) go
+                // transparent, so overlays can't stack into mud on white-heavy emails.
+                var ancestorPanel = el.parentElement && el.parentElement.closest('[data-tm-panel]');
+                if (ancestorPanel && !hasChrome) {
+                    el.style.setProperty('background-color', 'transparent', 'important');
+                    if (el.style.background) el.style.setProperty('background', 'transparent', 'important');
+                } else {
+                    el.style.setProperty('background-color', 'rgba(0,0,0,0.22)', 'important');
+                    if (el.style.background) el.style.setProperty('background', 'rgba(0,0,0,0.22)', 'important');
+                    el.setAttribute('data-tm-panel', '1');
+                    dl('panel→darken ' + el.tagName + '.' + (el.className || '') + ' chrome=' + (hasChrome ? 1 : 0) + ' w=' + Math.round(el.getBoundingClientRect().width));
+                }
                 if (el.hasAttribute('bgcolor')) el.removeAttribute('bgcolor');
             }
             // Only dim a colored fill that actually carries TEXT — the dim exists
@@ -951,14 +1032,34 @@ private let fixDarkModeColorsJS = """
             // 2026-06-29). textContent is recursive, so a colored WRAPPER that
             // contains text is still dimmed (its text still needs the contrast).
             var elHasText = (el.textContent || '').replace(/\\u00a0/g, ' ').trim().length > 0;
-            if (coloredBg && bgL > 80 && elHasText) {
-                var f = 80 / bgL;
+            // Preserve DELIBERATE, SATURATED colors (score badges, chips, brand
+            // buttons/accents) — dimming them to a fixed luminance collapses their
+            // hue and any color-coding (Scholar's score badges #C14600 vs #E57C4F
+            // both flattened to lum~80). Only LIGHT, LOW-SATURATION tinted fills
+            // (section backgrounds) get dimmed, where the dim is really about
+            // keeping light text legible. Text contrast on a preserved saturated
+            // fill is handled by the contrast safety net below. Threshold 100
+            // separates the score colors (sat 150/193) from cream section fills
+            // (sat 15-34) and the CAUTION banner (sat 76).
+            var saturated = bgS > 100;
+            if (coloredBg && bgL > 80 && elHasText && saturated) {
+                dl('keep(saturated) ' + el.tagName + '.' + (el.className || '') + ' bg=rgb(' + bg.r + ',' + bg.g + ',' + bg.b + ') S=' + Math.round(bgS) + ' "' + (el.innerText || '').slice(0, 12).replace(/\\s+/g, ' ') + '"');
+            }
+            if (coloredBg && bgL > 80 && elHasText && !saturated) {
+                // Dim light tinted fills so light text stays legible. A CHROME box
+                // (bordered callout, e.g. the "Important" note) dims to a DARKER
+                // target so it stands out from its dimmed surroundings instead of a
+                // cream-on-cream collapse (both → lum 80 → fill looks empty). Plain
+                // section fills keep the lum-80 target.
+                var target = hasChrome ? 50 : 80;
+                var f = target / bgL;
                 var nr = Math.round(bg.r * f);
                 var ng = Math.round(bg.g * f);
                 var nb = Math.round(bg.b * f);
                 var dimmed = 'rgb(' + nr + ',' + ng + ',' + nb + ')';
                 el.style.setProperty('background-color', dimmed, 'important');
                 if (el.style.background) el.style.setProperty('background', dimmed, 'important');
+                if (hasChrome) dl('dim(chrome→' + target + ') ' + el.tagName + '.' + (el.className || '') + ' "' + (el.innerText || '').slice(0, 14).replace(/\\s+/g, ' ') + '"');
             }
             var tc = parseRGB(cs.color);
             // Skip <a> AND descendants of <a>: the dark-mode @media rule sets
@@ -1014,6 +1115,7 @@ private let fixDarkModeColorsJS = """
         }
     })();
     """
+}
 
 /// Shared walk-up logic: given an initial `quoteStart` node, climb the parent
 /// chain and return the highest ancestor whose preceding siblings contain only
@@ -1597,67 +1699,76 @@ private let deferredImageLoadJS = """
     })();
     """
 
-/// Make the SwiftUI gutter (`AutoSizingHTMLView.padding(.horizontal, 16)`) act as
-/// a MINIMUM that ABSORBS an email's own outer horizontal margin, instead of the
-/// two stacking (16pt gutter + the email's 8px cell padding ≈ 24pt, which reads as
-/// over-inset now that we no longer shrink emails).
+/// Make the SwiftUI gutter act as a MINIMUM "indent" that ABSORBS an email's own
+/// outer horizontal inset, instead of the two STACKING (our 16pt + the email's own
+/// 8px cell padding ≈ 24pt, which reads as over-inset now that we no longer shrink
+/// emails).
 ///
-/// The gutter value itself is never changed — it stays the fixed 16pt min for
-/// every email. This script pulls `<body>` outward with a NEGATIVE horizontal
-/// margin equal to the email's own content inset, capped at the gutter. Because
-/// the body's top-level content is fluid (`width:100%`), widening the body lets
-/// that content reflow into the reclaimed space, so the least-inset content lands
-/// right at the 16pt gutter line and never closer.
+/// Mechanism (NO content fiddling, so it cannot clip or perturb the email layout):
+/// this script only MEASURES the email's own content inset and posts it to Swift,
+/// which then REDUCES the SwiftUI horizontal padding to `max(0, 16 − emailInset)`.
+/// Total inset = padding + emailInset = `max(16, emailInset)`:
+///   • email with no inset (full-bleed)  → pad 16 → total 16  (unchanged)
+///   • email with 8px inset (Scholar)    → pad 8  → total 16  (absorbed)
+///   • email indented more than 16        → pad 0  → total = its own inset
+/// The 16 constant is never lowered — it stays the floor for every email — so this
+/// CANNOT harm other emails: the clamp to `[0, 16]` means we only ever REMOVE our
+/// own double-count, never add indent or pull content.
 ///
-/// CLIP-SAFE BY CONSTRUCTION: the pull is `min(minLeftInset, minRightInset, 16)`
-/// — never more than the SMALLEST content inset present — so no element is pulled
-/// past the viewport edge (the WKWebView bounds would hard-clip it) and none
-/// newly overflows the right edge (no spurious `fitViewportJS` widen). Symmetric
-/// (same pull both sides) to avoid tilting centered layouts.
-///
-/// LIMITATION: a narrow, low-inset element (e.g. an injected
-/// "[CAUTION: external email]" banner at 3px) lowers the safe pull, so emails
-/// carrying one are only partially de-inset (still ≥ gutter, never clipped).
-/// Content = text/image leaves only; structural wrappers and not-yet-loaded
-/// (zero-size) images are skipped. Exposed for unit tests via `_eatGutterMarginsJS`.
+/// Inset = the MIN left/right inset among WIDE text leaves (width ≥ 60% of body):
+/// the main content column. Narrow elements (an injected "[CAUTION]" banner, a
+/// centered date) and structural full-width wrappers (no direct text) are excluded,
+/// so a single low-inset outlier can't defeat it (the failure mode of the earlier
+/// body-pull approach). A negative inset (content overflowing the body) clamps to 0
+/// → no reduction. Exposed for unit tests via `_eatGutterMarginsJS`.
 internal var _eatGutterMarginsJS: String { eatGutterMarginsJS }
-private let eatGutterMarginsJS = """
+private var eatGutterMarginsJS: String {
+    let gl = DebugModeManager.isLoggingEnabled()
+        ? "function gl(s){try{window.webkit.messageHandlers.consoleLog.postMessage('[EatGutter] '+s);}catch(_){}}"
+        : "function gl(s){}"
+    return """
     (function() {
+        \(gl)
         if (!document.body) return;
         try {
-            // MUST match AutoSizingHTMLView's .padding(.horizontal, 16). We never
-            // pull more than this, so the gutter is preserved as the minimum inset.
+            // MUST match AutoSizingHTMLView's default .padding gutter. We only ever
+            // REDUCE the SwiftUI padding by the email's own inset (down to 0), never
+            // below — so the gutter stays the minimum indent.
             var GUTTER = 16;
             var b = document.body.getBoundingClientRect();
-            var minLeft = Infinity, minRight = Infinity;
+            var bw = b.width;
+            if (bw <= 0) return;
+            var WIDE = bw * 0.6; // main-column width; excludes banners / centered chips
+            var minLeft = Infinity, minRight = Infinity, cp = null;
             var els = document.body.getElementsByTagName('*');
             for (var i = 0; i < els.length; i++) {
                 var el = els[i];
-                var isImg = el.tagName === 'IMG';
-                // Content = a leaf carrying real text, or an image. Structural
-                // wrappers (full-width tables/divs at inset 0) are skipped so they
-                // don't peg the inset to 0 — we want the inset of actual content.
+                // Direct-text leaf only: structural full-width wrappers (no direct
+                // text) are skipped so they can't peg the inset to 0.
                 var hasText = false;
-                if (!isImg) {
-                    for (var n = el.firstChild; n; n = n.nextSibling) {
-                        if (n.nodeType === 3 && n.textContent.replace(/\\u00a0/g, ' ').trim().length) { hasText = true; break; }
-                    }
+                for (var n = el.firstChild; n; n = n.nextSibling) {
+                    if (n.nodeType === 3 && n.textContent.replace(/\\u00a0/g, ' ').trim().length) { hasText = true; break; }
                 }
-                if (!isImg && !hasText) continue;
+                if (!hasText) continue;
                 var r = el.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) continue; // hidden / unloaded image
-                var li = r.left - b.left;   if (li < minLeft) minLeft = li;
+                if (r.width < WIDE || r.height <= 0) continue; // main column only
+                var li = r.left - b.left;   if (li < minLeft) { minLeft = li; cp = el; }
                 var ri = b.right - r.right; if (ri < minRight) minRight = ri;
             }
-            if (!isFinite(minLeft) || !isFinite(minRight)) return;
-            // Symmetric, clip-safe: never exceed the smaller side's inset nor the gutter.
-            var m = Math.min(minLeft, minRight, GUTTER);
-            if (m <= 0) return;
-            document.body.style.setProperty('margin-left', (-m) + 'px', 'important');
-            document.body.style.setProperty('margin-right', (-m) + 'px', 'important');
-        } catch (e) {}
+            if (!isFinite(minLeft) || !isFinite(minRight)) { gl('no wide text content — keep 16'); return; }
+            // Email's own inset, clamped [0, GUTTER]. padX = GUTTER − insetX so the
+            // total indent is max(GUTTER, inset). Clamp ≥0 means an overflowing
+            // (negative) inset never INCREASES our padding.
+            var xl = Math.max(0, Math.min(minLeft, GUTTER));
+            var xr = Math.max(0, Math.min(minRight, GUTTER));
+            var padL = GUTTER - xl, padR = GUTTER - xr;
+            gl('emailInset L=' + Math.round(minLeft) + ' R=' + Math.round(minRight)
+                + ' → SwiftUI pad L=' + padL + ' R=' + padR + ' (' + (cp ? cp.tagName + '.' + (cp.className || '') : '?') + ')');
+            window.webkit.messageHandlers.gutterAdjust.postMessage({ l: padL, r: padR });
+        } catch (e) { gl('error: ' + (e && e.message ? e.message : e)); }
     })();
     """
+}
 
 internal var _monitorHeightJS: String { monitorHeightJS }
 private let monitorHeightJS = """
