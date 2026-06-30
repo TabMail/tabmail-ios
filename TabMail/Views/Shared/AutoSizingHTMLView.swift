@@ -2425,11 +2425,51 @@ private let fitViewportJS: String = {
         // min-width 420 > its own 415 breakpoint, so any widen reveals the
         // desktop layout). We re-measure post-reflow and widen again until stable.
         function measureMaxRight() {
+            // LAYER 2 — neutralize not-yet-displayable images for the overflow
+            // measurement (the UPSTREAM fix; the runaway guard after the loop is
+            // the downstream backstop). A DEFERRED image (its src stripped to
+            // data-tmsrc for first paint, swapped back only AFTER paint) or a
+            // still-loading <img> has no reliable intrinsic size and, with
+            // width:auto, can balloon far past its container — making the loop
+            // widen for a PHANTOM overflow that vanishes the instant the image
+            // loads and img{max-width:100%} clamps it (Scholar Inbox header logo:
+            // 43px phantom overflow → 0.33x shrink; logmain.log 2026-06-29).
+            // Hide such images (display:none) so their — AND their inline <a>
+            // wrapper's — bogus extent is excluded from the rightmost-edge scan,
+            // then restore immediately (synchronous, before paint; no lasting
+            // mutation). SCOPE is deliberate: keyed on data-tmsrc / !complete,
+            // NEVER on naturalWidth===0 — a LOADED image (incl. an intrinsic-
+            // size-less SVG) keeps its real width and still drives the decision.
+            // NB: deferred imgs report complete===true (no src), so the
+            // data-tmsrc check is REQUIRED — the old `!complete`-only guard
+            // (reverted 2026-06-16) skipped 0 of them. This does NOT regress the
+            // height:auto logo-balloon case: that image is LOADED, so it is not
+            // hidden here and its (now height-scoped) sizing is unchanged.
+            var imgs = document.body.getElementsByTagName('img');
+            var hiddenImgs = [];
+            for (var hi = 0; hi < imgs.length; hi++) {
+                var hm = imgs[hi];
+                if (hm.hasAttribute('data-tmsrc') || hm.hasAttribute('data-tmsrcset') || !hm.complete) {
+                    // Capture the original inline display VALUE and PRIORITY so the
+                    // restore is byte-faithful — e.g. enforceMediaDisplayJS (runs
+                    // before fit) may have set `display:block !important` to beat a
+                    // stylesheet's `display:none !important`; restoring without the
+                    // priority would silently re-hide it.
+                    hiddenImgs.push([hm, hm.style.getPropertyValue('display'), hm.style.getPropertyPriority('display')]);
+                    hm.style.setProperty('display', 'none', 'important');
+                }
+            }
             var mr = 0, cp = null;
             var all = document.body.getElementsByTagName('*');
             for (var k = 0; k < all.length; k++) {
                 var rr = all[k].getBoundingClientRect().right;
                 if (rr > mr) { mr = rr; cp = all[k]; }
+            }
+            // Restore each hidden image's original inline display value + priority.
+            for (var ri = 0; ri < hiddenImgs.length; ri++) {
+                var rEl = hiddenImgs[ri][0], rVal = hiddenImgs[ri][1], rPri = hiddenImgs[ri][2];
+                if (rVal) rEl.style.setProperty('display', rVal, rPri);
+                else rEl.style.removeProperty('display');
             }
             return { maxRight: mr, culprit: cp };
         }
@@ -2535,6 +2575,7 @@ private let fitViewportJS: String = {
         // fitViewportJS re-entry. So the worst case is "widen to 1200 once."
         var MAX_PASSES = 4;
         var targetWidth = 0;
+        var converged = false;
         for (var pass = 0; pass < MAX_PASSES; pass++) {
             var want = Math.min(Math.max(Math.ceil(maxRight), STANDARD_MIN), 1200);
             // Stop once we're not asking for materially more than already set.
@@ -2543,6 +2584,7 @@ private let fitViewportJS: String = {
             // pass budget instead of converging in one widen.
             if (want <= targetWidth + OVERFLOW_SLOP) {
                 if (targetWidth > 0) log('widen stable at ' + targetWidth + 'px after ' + pass + ' pass(es)');
+                converged = true;
                 break;
             }
             targetWidth = want;
@@ -2566,6 +2608,43 @@ private let fitViewportJS: String = {
             log('WIDEN pass ' + pass + ': set ' + targetWidth + 'px → remeasured maxRight=' + Math.round(maxRight)
                 + (culprit ? ' culprit=' + culprit.tagName + '.' + (culprit.className || '') : ''));
             if (targetWidth >= 1200) { log('widen hit 1200px cap'); break; }
+        }
+        // RUNAWAY GUARD — abort the widen when the culprit is FLUID, not wide.
+        // A width:auto / max-width:100% element (classically a not-yet-loaded
+        // deferred <img> whose src we strip to data-tmsrc for first paint, so
+        // `img{max-width:100%}` can't clamp it) GROWS with whatever viewport we
+        // set. The loop above then chases it pass after pass without ever
+        // containing it, settling at a large targetWidth and rendering the WHOLE
+        // email at a tiny sub-0.5x scale — the "desktop size" shrink (Scholar
+        // Inbox digest: a 43px logo overflow at vw=288 ran 288→400→499→648→873
+        // and committed 0.33x; logmain.log 2026-06-29). The idempotency guard
+        // then locks that scale even after the image loads and would fit.
+        //
+        // Discriminator: genuinely fixed-width content CONVERGES — once the
+        // viewport is >= its intrinsic width it fits (maxRight <= targetWidth),
+        // so `converged` is set. Fluid content never converges: after widening
+        // to `targetWidth` it STILL overflows (maxRight > targetWidth). So:
+        // not converged AND still-overflowing AND below the 1200 cap => fluid
+        // runaway. Revert to device width and render at 1.0x (large, readable —
+        // what Apple Mail does); html{overflow-x:clip} hides the few px of
+        // transient overflow, and once the deferred image loads `max-width:100%`
+        // snaps it inside the device-width container so nothing stays clipped.
+        // The `targetWidth < 1200` gate preserves scale-to-fit for genuinely
+        // wider-than-cap FIXED emails (clipping those would lose real content).
+        if (!converged && targetWidth < 1200 && maxRight > targetWidth + OVERFLOW_SLOP) {
+            log('RUNAWAY widen aborted: maxRight=' + Math.round(maxRight) + ' still > targetWidth=' + targetWidth
+                + ' (fluid culprit ' + (culprit ? culprit.tagName + '.' + (culprit.className || '') : '?')
+                + ') — reverting to device width, rendering at 1.0x');
+            if (meta) meta.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes');
+            // Leave __tmLayoutVp unset (0): monitorHeightJS measures at scale 1.0
+            // and the idempotency guard stays open so a later legitimate re-fit
+            // (rotation / width change) can still run.
+            window.__tmLayoutVp = 0;
+            // Reflow back to device width before reporting the (now 1.0x) height.
+            void document.documentElement.offsetHeight;
+            if (window.__tmReportHeight) window.__tmReportHeight();
+            revealAfterPaint();
+            return false;
         }
         var scaleFactor = (vw / targetWidth).toFixed(2);
         log('WIDENING viewport to ' + targetWidth + 'px → CONTENT WILL RENDER AT ' + scaleFactor + 'x SCALE');

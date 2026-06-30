@@ -193,6 +193,70 @@ struct EmailRenderPipelineTests {
         #expect(js.contains("if (targetWidth >= 1200)"))                // (3) ceiling break
     }
 
+    @Test("fitViewportJS aborts a runaway widen on a fluid culprit (Scholar Inbox logo)")
+    func fitViewportRunawayGuard() {
+        let js = _fitViewportJS
+        // A width:auto / max-width:100% element (classically a deferred, not-yet-
+        // loaded <img> whose src we strip to data-tmsrc) grows with whatever
+        // viewport the loop sets, so it never converges — the loop chases it and
+        // commits a tiny sub-0.5x scale ("desktop size" shrink). Scholar Inbox
+        // digest header logo: 43px overflow at vw=288 ran 288→400→499→648→873 →
+        // 0.33x (logmain.log 2026-06-29).
+        //
+        // The guard distinguishes FLUID (never converges, still overflows the
+        // width we set) from genuinely-WIDE FIXED content (converges, fits the
+        // width we set) and, for the fluid case below the 1200 cap, reverts to
+        // device width + 1.0x (Apple-Mail-like) instead of shrinking.
+        #expect(js.contains("var converged = false"))                  // tracks convergence
+        #expect(js.contains("converged = true"))                       // set on the no-progress break
+        // Abort condition: not converged, below cap, still overflowing.
+        #expect(js.contains("if (!converged && targetWidth < 1200 && maxRight > targetWidth + OVERFLOW_SLOP)"))
+        // Abort action: revert the viewport meta to device width (no shrink).
+        #expect(js.contains("'width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes'"))
+        // Must bail BEFORE stamping __tmLayoutVp (which would lock the widen via
+        // the idempotency guard) — verify the abort returns before that commit.
+        guard let abortIdx = js.range(of: "RUNAWAY widen aborted")?.lowerBound,
+              let stampIdx = js.range(of: "window.__tmLayoutVp = targetWidth")?.lowerBound else {
+            Issue.record("expected both the runaway-abort log and the layoutVp commit in fitViewportJS")
+            return
+        }
+        #expect(abortIdx < stampIdx)
+    }
+
+    @Test("fitViewportJS overflow measurement excludes not-yet-loaded images (layer 2 upstream fix)")
+    func fitViewportHidesUnloadedImagesForMeasurement() {
+        let js = _fitViewportJS
+        // UPSTREAM fix for the Scholar-Inbox runaway: a deferred (data-tmsrc, src
+        // stripped for first paint) or still-loading <img> has unreliable extent
+        // and, with width:auto, can balloon far past its container — a phantom
+        // overflow that makes fitViewportJS widen. measureMaxRight must hide such
+        // images (so their — and their inline <a> wrapper's — bogus extent is
+        // excluded), measure, then RESTORE (no lasting mutation). Once loaded,
+        // img{max-width:100%} clamps them, so they never need to drive a widen.
+        //
+        // Scope invariant: keyed on data-tmsrc (deferred imgs are complete===true,
+        // no src — the reverted `!complete`-only guard skipped 0 of them) PLUS
+        // !complete for in-flight loads. NEVER naturalWidth===0, which would also
+        // hide a loaded intrinsic-size-less SVG and wrongly drop its real width.
+        #expect(js.contains("hm.hasAttribute('data-tmsrc')"))
+        #expect(js.contains("!hm.complete"))
+        #expect(js.contains("hm.style.setProperty('display', 'none', 'important')"))
+        // Restored after measuring — measurement-time only, no lasting layout change.
+        // Faithful restore preserves the original value AND priority (captured via
+        // getPropertyPriority) so an enforceMediaDisplayJS `!important` survives.
+        #expect(js.contains("getPropertyPriority('display')"))
+        #expect(js.contains("rEl.style.removeProperty('display')"))
+        // The hide/measure/restore lives INSIDE measureMaxRight, so the loop's
+        // re-measures are guarded too (not just the first measurement).
+        guard let fnIdx = js.range(of: "function measureMaxRight()")?.lowerBound,
+              let hideIdx = js.range(of: "hm.hasAttribute('data-tmsrc')")?.lowerBound,
+              let retIdx = js.range(of: "return { maxRight: mr, culprit: cp };")?.lowerBound else {
+            Issue.record("expected the image-hide guard to live inside measureMaxRight")
+            return
+        }
+        #expect(fnIdx < hideIdx && hideIdx < retIdx)
+    }
+
     // MARK: - monitorHeightJS regressions
 
     @Test("monitorHeightJS requests an early fit on first layout (not blocked on didFinish)")
