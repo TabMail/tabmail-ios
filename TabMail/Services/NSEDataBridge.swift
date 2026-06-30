@@ -1271,11 +1271,19 @@ enum NSEDataBridge {
         }
 
         // Snippet computed from plain text via shared EmailFilter (matches main-app path).
+        // Timed (with textLen) because this runs EVEN when the body insert is skipped
+        // (unresolved-CID NSE bodies), so if a slow merge has no body-insert mark, this
+        // is the next suspect — `snippetFromPlainText` over a very large plain-text body.
+        let snipT0 = CFAbsoluteTimeGetCurrent()
         let snippet = textContent.map { EmailFilter.snippetFromPlainText($0) } ?? ""
         if !snippet.isEmpty {
             try db.execute(sql: """
                 UPDATE messageHeader SET snippet = ? WHERE id = ?
                 """, arguments: [snippet, headerId])
+        }
+        let snipMs = Int((CFAbsoluteTimeGetCurrent() - snipT0) * 1000)
+        if snipMs > 20 {
+            BootProfiler.mark("merge: snippet from plainText textLen=\(textContent?.count ?? 0) in \(snipMs)ms")
         }
 
         // Queue up the FTS BODY work. `flushNSEBatchToFTS` runs once per merge with
@@ -1629,9 +1637,17 @@ enum NSEDataBridge {
         // (SyncEngineFullSync computes this on insert). Without this, a
         // pushed message sits in a singleton thread until sync materializes
         // the row again.
+        // Timed: new-header path only. assignComputedThreadId runs up to 3 indexed
+        // IN-probes over messageHeader for reply-chain adoption — fast normally, but
+        // the other merge-write suspect if the body/snippet marks come back cheap.
+        let threadT0 = CFAbsoluteTimeGetCurrent()
         try ThreadUtils.assignComputedThreadId(
             to: &header, nativeThreadId: msg.threadId, db: db
         )
+        let threadMs = Int((CFAbsoluteTimeGetCurrent() - threadT0) * 1000)
+        if threadMs > 20 {
+            BootProfiler.mark("merge: assignComputedThreadId (new header) in \(threadMs)ms")
+        }
         header.notified = msg.notified
         // headerComplete reflects "row exists in FTS". Stays false until
         // `flushNSEBatchToFTS` indexes the FTS header row (and sets the flag).

@@ -172,6 +172,7 @@ struct DebugMenuView: View {
                     BackgroundSyncLogger.clearInboxLog()
                     BackgroundSyncLogger.clearBodyRenderLog()
                     BackgroundSyncLogger.clearStuckDiagLog()
+                    BackgroundSyncLogger.clearBootLog()
                 } label: {
                     Label("Clear All Logs", systemImage: "trash")
                 }
