@@ -518,7 +518,14 @@ enum NSEDataBridge {
                 // busyMode). The @Sendable closure can't capture mutable outer
                 // state, so the per-message accumulators are built INSIDE and
                 // returned, then assigned to successfullyMergedIds/ftsBatch below.
+                // Diagnostic: decompose the merge time into "wait for the GRDB
+                // writer" (queued behind a concurrent sync/backfill/body write)
+                // vs. the actual write. A big gap between these two marks ⇒ the
+                // late-surfacing residual is writer contention, not the write itself.
+                let writeReqT0 = CFAbsoluteTimeGetCurrent()
+                BootProfiler.mark("merge: requesting GRDB writer for \(processed.count) staged msg(s)")
                 let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String]) = try await AppDatabase.dbPool.write { db in
+                    BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
                     var localMergedIds: [String] = []
                     var localCommitted = 0
                     var localFtsAccumulator: [(headerId: String, textContent: String)] = []
@@ -774,6 +781,11 @@ enum NSEDataBridge {
                 ftsBatch = writeResult.fts
                 allMergedHeaderIds = writeResult.headers
                 outerCommitted = true
+                // Main tx done. With the "writer ACQUIRED after Xms" mark above this
+                // decomposes the merge: START→found = read; found→ACQUIRED = writer
+                // wait (contention); ACQUIRED→here = the actual main write; here→DONE
+                // = post-tx FTS flush. Whichever Δ dominates is the real residual.
+                BootProfiler.mark("merge: main tx committed (\(committedCount) merged) — FTS flush next")
                 print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
                 // NOTE: no UI-refresh post here anymore. The whole merge emits
