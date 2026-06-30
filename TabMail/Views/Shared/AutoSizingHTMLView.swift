@@ -188,6 +188,10 @@ private struct HTMLWebView: UIViewRepresentable {
     let headerId: String?
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
+    // Observed so SwiftUI re-invokes updateUIView on a light<->dark flip — see the
+    // schemeChanged branch in updateUIView (reload so the dark-mode scripts re-run
+    // for the new appearance).
+    @Environment(\.colorScheme) private var colorScheme
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -221,6 +225,9 @@ private struct HTMLWebView: UIViewRepresentable {
         let quoteCollapse = WKUserScript(source: collapseQuotesJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let deferImages = WKUserScript(source: deferredImageLoadJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        // After the layout-affecting transforms (quote/ics collapse, eml cleanup)
+        // and before height monitoring/fit, so it measures the settled layout.
+        let eatMargins = WKUserScript(source: eatGutterMarginsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         // After heightMonitor so window.__tmReportHeight is defined when a
         // correction fires; its own load listeners coexist with the height
@@ -236,6 +243,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(quoteCollapse)
         config.userContentController.addUserScript(icsCollapse)
         config.userContentController.addUserScript(deferImages)
+        config.userContentController.addUserScript(eatMargins)
         config.userContentController.addUserScript(heightMonitor)
         config.userContentController.addUserScript(aspectFix)
         config.userContentController.addUserScript(debugReport)
@@ -275,6 +283,7 @@ private struct HTMLWebView: UIViewRepresentable {
             // New document — a height buffered during scroll for the OLD
             // document must not flush onto the new one.
             context.coordinator.pendingHeight = nil
+            context.coordinator.loadedColorScheme = colorScheme
             if DebugModeManager.isLoggingEnabled() {
                 print("[HTMLDebug] HTMLWebView.updateUIView: loading html len=\(html.count)")
                 // Log input HTML in chunks so we can see EXACTLY what's being rendered
@@ -307,6 +316,21 @@ private struct HTMLWebView: UIViewRepresentable {
             // moment. See Coordinator.wrapAndLoad; the wrapped-html fingerprint
             // logging moved there (it now exists only after the off-main wrap).
             context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename, base: base)
+        } else if context.coordinator.loadedColorScheme != colorScheme {
+            // Appearance flipped (light <-> dark) while the body is on screen. The
+            // CSS @media (prefers-color-scheme) rules re-evaluate automatically,
+            // but fixDarkModeColorsJS ran ONCE at load and baked inline color
+            // overrides (!important) for the OLD appearance — those persist and
+            // are wrong after the flip (e.g. light text forced for dark mode now
+            // sitting on a light background, or near-white→transparent fills not
+            // reapplied). Reload so every script re-runs fresh for the current
+            // appearance. Cheap: wrap is off-main and WebKit caches the (deferred)
+            // images. hasRevealed stays true (html is unchanged) so there's no
+            // "Loading…" placeholder — the opacity:0→reveal fade covers the brief
+            // re-render.
+            context.coordinator.loadedColorScheme = colorScheme
+            let base: URL? = (headerId != nil) ? BodyAssetConfig.baseURL : nil
+            context.coordinator.wrapAndLoad(rawHTML: html, previewFilename: previewFilename, base: base)
         } else if currentWidth > 100 && abs(currentWidth - context.coordinator.lastMeasuredWidth) > 10 {
             // Frame width changed significantly (e.g. sheet animation settled) —
             // reset viewport to device-width and re-fit. ResizeObserver picks
@@ -336,6 +360,11 @@ private struct HTMLWebView: UIViewRepresentable {
         var loadedHTML: String?
         var loadedPreviewFilename: String?
         var loadedHeaderId: String?
+        /// Appearance the current document was rendered under. fixDarkModeColorsJS
+        /// bakes inline color overrides for ONE appearance at load; when this no
+        /// longer matches the SwiftUI environment, updateUIView reloads so the
+        /// scripts re-run fresh for the new light/dark mode.
+        var loadedColorScheme: ColorScheme?
         var lastMeasuredWidth: CGFloat = 0
         weak var webView: WKWebView?
         /// Latest measured height that arrived while `ScrollFreezeGate` was
@@ -880,6 +909,8 @@ private let constrainWidthsJS = """
 /// - Colored backgrounds → dimmed to ~brightness 80 so white text is readable.
 /// - Dark inline text → forced to light #fbfbfe.
 /// - Links inside colored-bg elements → forced to white (overrides CSS blue).
+/// Exposed as `internal` for unit tests (same pattern as `_fitViewportJS`).
+internal var _fixDarkModeColorsJS: String { fixDarkModeColorsJS }
 private let fixDarkModeColorsJS = """
     (function() {
         if (!window.matchMedia('(prefers-color-scheme: dark)').matches) return;
@@ -911,7 +942,16 @@ private let fixDarkModeColorsJS = """
                 if (el.style.background) el.style.setProperty('background', 'transparent', 'important');
                 if (el.hasAttribute('bgcolor')) el.removeAttribute('bgcolor');
             }
-            if (coloredBg && bgL > 80) {
+            // Only dim a colored fill that actually carries TEXT — the dim exists
+            // to keep (white) text legible on the fill. A decorative colored
+            // element with NO text (score/accent bars, rule lines, swatches) must
+            // keep its hue: forcing every colored bg to luminance ~80 collapses
+            // sender color-coding (Scholar Inbox per-paper score bars #C14600 and
+            // #E57C4F both became lum~80 → indistinguishable; logmain.log
+            // 2026-06-29). textContent is recursive, so a colored WRAPPER that
+            // contains text is still dimmed (its text still needs the contrast).
+            var elHasText = (el.textContent || '').replace(/\\u00a0/g, ' ').trim().length > 0;
+            if (coloredBg && bgL > 80 && elHasText) {
                 var f = 80 / bgL;
                 var nr = Math.round(bg.r * f);
                 var ng = Math.round(bg.g * f);
@@ -1554,6 +1594,68 @@ private let deferredImageLoadJS = """
         // Failsafe: images must load even if 'load'/rAF are starved (offscreen
         // throttling, etc.). swap() is idempotent.
         setTimeout(swap, 1500);
+    })();
+    """
+
+/// Make the SwiftUI gutter (`AutoSizingHTMLView.padding(.horizontal, 16)`) act as
+/// a MINIMUM that ABSORBS an email's own outer horizontal margin, instead of the
+/// two stacking (16pt gutter + the email's 8px cell padding ≈ 24pt, which reads as
+/// over-inset now that we no longer shrink emails).
+///
+/// The gutter value itself is never changed — it stays the fixed 16pt min for
+/// every email. This script pulls `<body>` outward with a NEGATIVE horizontal
+/// margin equal to the email's own content inset, capped at the gutter. Because
+/// the body's top-level content is fluid (`width:100%`), widening the body lets
+/// that content reflow into the reclaimed space, so the least-inset content lands
+/// right at the 16pt gutter line and never closer.
+///
+/// CLIP-SAFE BY CONSTRUCTION: the pull is `min(minLeftInset, minRightInset, 16)`
+/// — never more than the SMALLEST content inset present — so no element is pulled
+/// past the viewport edge (the WKWebView bounds would hard-clip it) and none
+/// newly overflows the right edge (no spurious `fitViewportJS` widen). Symmetric
+/// (same pull both sides) to avoid tilting centered layouts.
+///
+/// LIMITATION: a narrow, low-inset element (e.g. an injected
+/// "[CAUTION: external email]" banner at 3px) lowers the safe pull, so emails
+/// carrying one are only partially de-inset (still ≥ gutter, never clipped).
+/// Content = text/image leaves only; structural wrappers and not-yet-loaded
+/// (zero-size) images are skipped. Exposed for unit tests via `_eatGutterMarginsJS`.
+internal var _eatGutterMarginsJS: String { eatGutterMarginsJS }
+private let eatGutterMarginsJS = """
+    (function() {
+        if (!document.body) return;
+        try {
+            // MUST match AutoSizingHTMLView's .padding(.horizontal, 16). We never
+            // pull more than this, so the gutter is preserved as the minimum inset.
+            var GUTTER = 16;
+            var b = document.body.getBoundingClientRect();
+            var minLeft = Infinity, minRight = Infinity;
+            var els = document.body.getElementsByTagName('*');
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                var isImg = el.tagName === 'IMG';
+                // Content = a leaf carrying real text, or an image. Structural
+                // wrappers (full-width tables/divs at inset 0) are skipped so they
+                // don't peg the inset to 0 — we want the inset of actual content.
+                var hasText = false;
+                if (!isImg) {
+                    for (var n = el.firstChild; n; n = n.nextSibling) {
+                        if (n.nodeType === 3 && n.textContent.replace(/\\u00a0/g, ' ').trim().length) { hasText = true; break; }
+                    }
+                }
+                if (!isImg && !hasText) continue;
+                var r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue; // hidden / unloaded image
+                var li = r.left - b.left;   if (li < minLeft) minLeft = li;
+                var ri = b.right - r.right; if (ri < minRight) minRight = ri;
+            }
+            if (!isFinite(minLeft) || !isFinite(minRight)) return;
+            // Symmetric, clip-safe: never exceed the smaller side's inset nor the gutter.
+            var m = Math.min(minLeft, minRight, GUTTER);
+            if (m <= 0) return;
+            document.body.style.setProperty('margin-left', (-m) + 'px', 'important');
+            document.body.style.setProperty('margin-right', (-m) + 'px', 'important');
+        } catch (e) {}
     })();
     """
 

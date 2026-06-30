@@ -223,6 +223,41 @@ struct EmailRenderPipelineTests {
         #expect(abortIdx < stampIdx)
     }
 
+    @Test("eatGutterMarginsJS pulls body to absorb the email's own margin (gutter as MIN, clip-safe)")
+    func eatGutterMarginsClipSafe() {
+        let js = _eatGutterMarginsJS
+        // The SwiftUI 16pt gutter must stay a MINIMUM that absorbs the email's own
+        // outer inset instead of stacking with it. The body is pulled out with a
+        // negative margin, but ONLY by min(minLeftInset, minRightInset, GUTTER) so
+        // no content is ever pulled past the viewport edge (no clip) and none newly
+        // overflows (no spurious fitViewport widen).
+        #expect(js.contains("var GUTTER = 16"))                                  // matches SwiftUI gutter
+        #expect(js.contains("var m = Math.min(minLeft, minRight, GUTTER)"))      // capped + symmetric
+        #expect(js.contains("setProperty('margin-left', (-m) + 'px', 'important')"))
+        #expect(js.contains("setProperty('margin-right', (-m) + 'px', 'important')"))
+        // Only text/image leaves count as content (structural wrappers at inset 0
+        // must NOT peg the measured inset to 0).
+        #expect(js.contains("var isImg = el.tagName === 'IMG'"))
+        #expect(js.contains("if (!isImg && !hasText) continue"))
+        // Zero-size (hidden / not-yet-loaded) elements excluded.
+        #expect(js.contains("if (r.width <= 0 || r.height <= 0) continue"))
+    }
+
+    @Test("fixDarkModeColorsJS dims colored backgrounds ONLY when they carry text")
+    func darkModeDimSkipsTextlessDecorations() {
+        let js = _fixDarkModeColorsJS
+        // The colored-bg dim normalizes a fill to luminance ~80 so white text on
+        // it stays legible. Applied to TEXTLESS decorations (score/accent bars,
+        // rule lines, swatches) it instead collapses sender color-coding: Scholar
+        // Inbox per-paper score bars #C14600 and #E57C4F both became lum~80 →
+        // indistinguishable (logmain.log 2026-06-29). The dim must be gated on the
+        // element actually containing text.
+        #expect(js.contains("var elHasText = (el.textContent || '')"))
+        #expect(js.contains("if (coloredBg && bgL > 80 && elHasText)"))
+        // The bare ungated form must be gone (regression guard).
+        #expect(!js.contains("if (coloredBg && bgL > 80) {"))
+    }
+
     @Test("fitViewportJS overflow measurement excludes not-yet-loaded images (layer 2 upstream fix)")
     func fitViewportHidesUnloadedImagesForMeasurement() {
         let js = _fitViewportJS
