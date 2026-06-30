@@ -1259,7 +1259,15 @@ enum NSEDataBridge {
             BackgroundSyncLogger.diagnoseStoredBody(source: "NSEMerge", headerId: headerId, htmlContent: body.htmlContent)
             body.attachmentsJSON = attachmentsJSON
             body.icsText = icsText
+            // Diagnostic: time the HTML-blob insert + log its size. The merge-write
+            // decomposition showed 0ms writer-wait but a ~1.3s (up to 8s) in-tx write
+            // for ONE message — suspect is a large newsletter body (inline base64
+            // images = multi-MB blob). If a slow merge shows a big htmlLen here eating
+            // the time, that's confirmed; the fix is to keep the large body off the
+            // merge critical path (header surfaces instantly, body lands async).
+            let bodyInsT0 = CFAbsoluteTimeGetCurrent()
             try body.insert(db, onConflict: .ignore)
+            BootProfiler.mark("merge: MessageBody insert htmlLen=\(htmlContent?.count ?? 0) in \(Int((CFAbsoluteTimeGetCurrent() - bodyInsT0) * 1000))ms")
         }
 
         // Snippet computed from plain text via shared EmailFilter (matches main-app path).
