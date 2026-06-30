@@ -4,11 +4,9 @@
 
 import Foundation
 import Darwin
-#if DEBUG
 import Synchronization
-#endif
 
-/// Boot / foreground / NSE-merge timeline profiler (DEBUG builds only).
+/// Boot / foreground / NSE-merge timeline profiler.
 ///
 /// Emits ONE greppable channel so a launch reads as a single ordered timeline:
 ///
@@ -19,51 +17,52 @@ import Synchronization
 /// single biggest chunk of a cold launch) is visible as the first mark's `+Nms`.
 /// `<delta>` is the gap since the previous mark, so the slow STEP jumps out.
 ///
-/// Gating: `#if DEBUG`. In any debug build every `mark(...)` prints — no runtime
-/// toggle to unlock first — which is exactly how we analyze it (run the Xcode
-/// debug build; it shows everything regardless, slower but easier to read). In a
-/// Release/TestFlight build the whole type is compiled out: each `mark(...)` is
-/// an empty call (the label autoclosure is never evaluated, so no string cost)
-/// and none of the sysctl / Mutex / print machinery ships. Rule 12 ("`#if DEBUG`
-/// is acceptable for code that should be fully stripped from release binaries").
+/// Gating: runtime — `guard DebugModeManager.isLoggingEnabled()`. When debug
+/// logging is LOCKED (the default release state) every `mark(...)` is a single
+/// guard-return: the `label` autoclosure is never evaluated and the lazy
+/// `processStart` / `lastMark` statics are never initialized (no sysctl, no Mutex
+/// alloc), so it's effectively free. When UNLOCKED (debug build, or
+/// TestFlight/Release with debug mode unlocked in Settings) it prints to the
+/// console AND appends to the downloadable **boot.log** (`BackgroundSyncLogger`),
+/// so a cold-launch timeline can be captured on-device and shared from the debug
+/// menu — not just read from the Xcode console. (Was `#if DEBUG`-only; switched to
+/// the runtime gate 2026-06-29 to enable on-device/OOO boot capture, as the old
+/// doc comment anticipated. Rule 12: a runtime debug gate is the sanctioned
+/// alternative to `#if DEBUG`.)
 ///
-/// (If you ever want on-device / TestFlight boot capture, swap the `#if DEBUG`
-/// in `mark` for `guard DebugModeManager.isLoggingEnabled() else { return }` —
-/// the same runtime gate `BackgroundSyncLogger` uses for its on-device log file.)
-///
-/// To read a launch: filter the Xcode console on `BootProfile`. The biggest `Δ`
-/// between consecutive marks is the next thing to make instant; compare the
-/// first mark's `+total` (pre-main) against the `first paint` mark to see how
-/// much is framework load vs. our own work.
+/// To read a launch: filter on `BootProfile` (console) or download "Boot Profile
+/// Logs" from Settings → Debug. The biggest `Δ` between consecutive marks is the
+/// next thing to make instant; compare the first mark's `+total` (pre-main)
+/// against the `first paint` mark to see how much is framework load vs. our work.
 enum BootProfiler {
 
-    #if DEBUG
     /// Kernel process-start as a `CFAbsoluteTime`, so `+total` includes pre-main.
-    /// Falls back to "first touch" if the sysctl is unavailable.
+    /// Lazy — only initialized once `mark` first runs with logging unlocked, so a
+    /// locked release build pays nothing. Falls back to "first touch" if the
+    /// sysctl is unavailable.
     private static let processStart: CFAbsoluteTime = kernelProcessStart() ?? CFAbsoluteTimeGetCurrent()
 
     /// Timestamp of the previous mark, for the inter-mark `Δ`. Marks fire from
     /// many isolation domains (main actor, detached tasks, GRDB queues), so it's
     /// guarded by a `Mutex` (SE-0433) rather than `nonisolated(unsafe)`.
     private static let lastMark = Mutex<CFAbsoluteTime>(processStart)
-    #endif
 
-    /// Record a boot-timeline mark. No-op (and label not built) in release.
-    /// `label` is an `@autoclosure` so any interpolation it does is skipped
-    /// entirely when the body is compiled out.
+    /// Record a boot-timeline mark. No-op (and `label` not built) unless debug
+    /// logging is unlocked. `label` is an `@autoclosure` so any interpolation it
+    /// does is skipped entirely when gated out.
     static func mark(_ label: @autoclosure () -> String) {
-        #if DEBUG
+        guard DebugModeManager.isLoggingEnabled() else { return }
         let now = CFAbsoluteTimeGetCurrent()
         let last = lastMark.withLock { prev -> CFAbsoluteTime in
             let p = prev; prev = now; return p
         }
         let total = Int((now - processStart) * 1000)
         let delta = Int((now - last) * 1000)
-        print("[BootProfile +\(total)ms (Δ\(delta)ms)] \(label())")
-        #endif
+        let line = "[BootProfile +\(total)ms (Δ\(delta)ms)] \(label())"
+        print(line)
+        BackgroundSyncLogger.logBoot(line)
     }
 
-    #if DEBUG
     /// Read this process's start time from the kernel (`KERN_PROC_PID`) and
     /// convert the `p_starttime` timeval (unix epoch) to `CFAbsoluteTime`.
     private static func kernelProcessStart() -> CFAbsoluteTime? {
@@ -78,5 +77,4 @@ enum BootProfiler {
         let unixSeconds = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000.0
         return unixSeconds - kCFAbsoluteTimeIntervalSince1970
     }
-    #endif
 }

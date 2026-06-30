@@ -183,11 +183,10 @@ enum AIOwnershipLease {
     //
     // Numbers tuned around the NSE's ~30 s hard budget. `staleMs` must exceed
     // `heartbeatIntervalMs` by enough margin that scheduling jitter on either
-    // side doesn't trigger a spurious takeover. `pollMaxMs` caps main-app
-    // waiting at just under NSE's budget so a stuck NSE can't deadlock the
-    // main-app AI queue.
+    // side doesn't trigger a spurious takeover. The main app no longer
+    // SLEEP-POLLS a fresh NSE claim — it merges what the NSE has staged and
+    // DEFERS, retrying via the AI queue's backoff (see `ActiveAIQueue.executeJob`),
+    // so the old `mainAppPoll*` caps are gone (a stuck NSE never blocks a queue slot).
     static let heartbeatIntervalMs: UInt64 = 1000
     static let staleMs: Int64 = 4000
-    static let mainAppPollIntervalMs: UInt64 = 1000
-    static let mainAppPollMaxMs: UInt64 = 28000
 }

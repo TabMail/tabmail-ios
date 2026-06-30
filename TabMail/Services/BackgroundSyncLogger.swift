@@ -329,6 +329,37 @@ enum BackgroundSyncLogger {
         try? "".write(to: inboxFileURL, atomically: true, encoding: .utf8)
     }
 
+    // MARK: - Boot Profile Log
+
+    private static let bootFileName = "boot.log"
+
+    private static var bootFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TabMail", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(bootFileName)
+    }
+
+    /// Append a `BootProfiler` timeline line to the DOWNLOADABLE boot log. Gated on
+    /// DebugModeManager so it captures on-device / TestFlight, where no Xcode console
+    /// is attached and BootProfiler's `print` goes nowhere observable — this file
+    /// channel is the only way to read a cold-launch timeline there. Called from
+    /// `BootProfiler.mark`; does not print (BootProfiler handles the console echo) —
+    /// this is the file channel.
+    static func logBoot(_ line: String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        appendAsync(to: bootFileURL, entry: line + "\n")
+    }
+
+    static func readBootLog() -> String {
+        flushPendingWrites()
+        return (try? String(contentsOf: bootFileURL, encoding: .utf8)) ?? "(no boot log)"
+    }
+
+    static func clearBootLog() {
+        try? "".write(to: bootFileURL, atomically: true, encoding: .utf8)
+    }
+
     // MARK: - Body Render / HTML double-escape Log
 
     /// Dedicated diagnostic channel for the rare "HTML body shows literal `&amp;` /

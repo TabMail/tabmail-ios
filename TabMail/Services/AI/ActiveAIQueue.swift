@@ -684,32 +684,26 @@ actor ActiveAIQueue {
             }
         }
 
-        // NSE ownership lease: NSE may be running summary/action right now for
-        // this same message (all pushes wake NSE regardless of main-app state).
-        // Coordinate via the lease columns on `nse_processed_message`:
-        //   • NSE holds a fresh claim → poll until NSE finishes, then merge
-        //     staging and skip our LLM (main-app fields will be populated).
-        //   • No claim or stale → take it ourselves; heartbeat every 1s so
-        //     any future NSE run knows we're active.
-        // NSE has no Reply pass, so the poll short-circuits on summaryBlurb
-        // landing; Reply always runs here regardless.
+        // NSE ownership lease: the NSE may be computing summary/action for this
+        // same message RIGHT NOW (all pushes wake the NSE). Coordinate via the
+        // lease columns on `nse_processed_message` to AVOID DOUBLE LLM work — but
+        // NEVER by blocking. We (a) merge whatever the NSE has already staged and
+        // skip our LLM if our job is satisfied (dedup), and (b) if the NSE is
+        // actively claiming with nothing staged yet, DEFER and let the queue retry
+        // with backoff — instead of the old up-to-28s sleep-poll that held a queue
+        // slot (and, if the NSE timed out / died mid-AI, sat on the stale lease for
+        // ~4s). When the NSE finishes, the merge brings its result in and a retry
+        // finds the job done; if the NSE died, its lease goes stale (4s) and a retry
+        // claims + computes. Reply is EXEMPT — the NSE never computes it — so it
+        // never stalls behind an NSE summary/action run.
         let nseDB: DatabaseQueue? = NSEDataBridge.openStagingDB()
         var didClaimForMainApp = false
         var heartbeatTask: Task<Void, Never>?
         if let nseDB {
             let accountId = message.accountId
             let messageId = message.messageId
-            // Phase 1 — wait out any fresh NSE claim.
-            var waitedMs: UInt64 = 0
-            while waitedMs < AIOwnershipLease.mainAppPollMaxMs,
-                  let existing = AIOwnershipLease.state(db: nseDB, accountId: accountId, messageId: messageId),
-                  existing.owner == .nse,
-                  AIOwnershipLease.isFresh(heartbeatMs: existing.heartbeatMs) {
-                if AIOwnershipLease.hasResult(db: nseDB, accountId: accountId, messageId: messageId) { break }
-                try? await Task.sleep(nanoseconds: AIOwnershipLease.mainAppPollIntervalMs * 1_000_000)
-                waitedMs += AIOwnershipLease.mainAppPollIntervalMs
-            }
-            // Phase 2 — if NSE finished, merge and see if our job is now done.
+            // (a) Dedup — pull in any result the NSE has ALREADY staged (cheap,
+            // idempotent) and skip our LLM if our job is now satisfied.
             if AIOwnershipLease.hasResult(db: nseDB, accountId: accountId, messageId: messageId) {
                 await NSEDataBridge.mergeNSEStagingData()
                 if let updated = try? await dbPool.read({ db in
@@ -732,6 +726,19 @@ actor ActiveAIQueue {
                         break
                     }
                 }
+            }
+            // (b) If the NSE is ACTIVELY computing summary/action for this message
+            // (fresh claim, nothing staged yet), DEFER — don't double-compute, don't
+            // block. The queue retries with backoff; the dedup branch above catches
+            // the NSE's result on a later pass, or the lease goes stale (NSE died)
+            // and a retry claims below. Reply is exempt.
+            if job.jobType != .reply,
+               let existing = AIOwnershipLease.state(db: nseDB, accountId: accountId, messageId: messageId),
+               existing.owner == .nse,
+               AIOwnershipLease.isFresh(heartbeatMs: existing.heartbeatMs),
+               !AIOwnershipLease.hasResult(db: nseDB, accountId: accountId, messageId: messageId) {
+                BackgroundSyncLogger.logAIProcessing("NSE actively computing \(job.headerId.prefix(30)).\(job.jobType.rawValue) — defer, no block (retry)")
+                return true // retry later — never block the queue slot on the NSE
             }
             // Phase 3 — claim for ourselves and start the heartbeat. Best-effort:
             // if the claim fails (rare — race with another fresh NSE wake), we

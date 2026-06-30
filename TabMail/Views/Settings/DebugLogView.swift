@@ -157,6 +157,7 @@ struct DebugMenuView: View {
                 LogShareButton(title: "Push Notification Logs", filename: "push_logs.txt", readLog: { BackgroundSyncLogger.readPushLog() }, clearLog: { BackgroundSyncLogger.clearPushLog() })
                 LogShareButton(title: "Inbox Logs", filename: "inbox_logs.txt", readLog: { BackgroundSyncLogger.readInboxLog() }, clearLog: { BackgroundSyncLogger.clearInboxLog() })
                 LogShareButton(title: "Body Render Logs", filename: "body_render_logs.txt", readLog: { BackgroundSyncLogger.readBodyRenderLog() }, clearLog: { BackgroundSyncLogger.clearBodyRenderLog() })
+                LogShareButton(title: "Boot Profile Logs", filename: "boot_logs.txt", readLog: { BackgroundSyncLogger.readBootLog() }, clearLog: { BackgroundSyncLogger.clearBootLog() })
 
                 Button(role: .destructive) {
                     BackgroundSyncLogger.clearLog()
