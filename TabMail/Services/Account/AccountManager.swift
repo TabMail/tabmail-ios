@@ -500,6 +500,12 @@ actor AccountManager {
             return
         }
 
+        // Boot-timeline tag — provider type + short account-id prefix (NOT the
+        // email address: keeps the downloadable boot log free of the full address
+        // while still distinguishing parallel per-account connects).
+        let acctTag = "\(account.provider):\(account.id.prefix(6))"
+        BootProfiler.mark("connectAccount[\(acctTag)]: provider created (token/keychain resolved)")
+
         // Store provider + work queue BEFORE connecting. This ensures the queue's
         // cooldown logic applies even if the first connection fails (e.g., max_userip_connections).
         // Without this, accounts that can't connect never get a queue, so cooldown never kicks in.
@@ -523,12 +529,16 @@ actor AccountManager {
             await syncEngine.register(accountId: account.id, provider: provider, workQueue: queue)
         }
 
+        let connectT0 = CFAbsoluteTimeGetCurrent()
+        BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() START (network — timeout \(Int(SyncConfig.connectTimeoutSeconds))s)")
         do {
             try await withTimeout(seconds: SyncConfig.connectTimeoutSeconds) {
                 try await provider.connect()
             }
             authFailedAccounts.remove(account.id)
+            BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() DONE in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms")
         } catch {
+            BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() FAILED in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms (auth=\(isAuthError(error)))")
             if isAuthError(error) {
                 print("[AccountManager] Auth failed for \(account.emailAddress): \(error)")
                 authFailedAccounts.insert(account.id)

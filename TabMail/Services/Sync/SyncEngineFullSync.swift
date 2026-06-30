@@ -11,9 +11,12 @@ extension SyncEngine {
 
     func fullSync(account: Account, provider: any EmailProvider) async throws {
         let fs0 = CFAbsoluteTimeGetCurrent()
+        let acctTag = "\(account.provider):\(account.id.prefix(6))"
+        BootProfiler.mark("fullSync[\(acctTag)] START (network — fetch folders + inbox headers → populates inbox)")
         // Sync folder list
         let remoteFolders = try await provider.fetchFolders()
         print("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+        BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
 
         let pool = AppDatabase.dbPool
         try await pool.write { db in
@@ -231,6 +234,7 @@ extension SyncEngine {
         if !uidMigratedOldIds.isEmpty {
             print("[FullSync] UID migrated \(uidMigratedOldIds.count) messages")
         }
+        BootProfiler.mark("fullSync[\(acctTag)] DONE in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (inbox headers synced)")
 
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.

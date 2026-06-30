@@ -319,6 +319,11 @@ struct RootView: View {
                 // while the provider.connect() network waits OVERLAP (actor reentrancy),
                 // so providers come up in ~one timeout total and new mail starts flowing
                 // as soon as the first account connects.
+                // This whole block is fire-and-forget (a detached Task), so it does
+                // NOT gate first paint — the marks below time the NETWORK path (the
+                // prime cold-boot-slow suspect), which runs in parallel with paint.
+                let connectT0 = CFAbsoluteTimeGetCurrent()
+                BootProfiler.mark("RootView: connect loop START (\(accounts.filter { $0.isActive }.count) active accounts) — async, does NOT gate paint")
                 await withTaskGroup(of: Void.self) { group in
                     for account in accounts where account.isActive {
                         group.addTask {
@@ -328,6 +333,7 @@ struct RootView: View {
                         }
                     }
                 }
+                BootProfiler.mark("RootView: connect loop DONE in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms (all providers connect-attempted)")
 
                 // If any account failed auth, navigate to settings
                 if !AccountManagerState.shared.authFailedAccounts.isEmpty {
@@ -340,11 +346,14 @@ struct RootView: View {
                 // post-onboarding sheet is needed here anymore.
 
                 await manager.reconcilePendingOperations()
+                BootProfiler.mark("RootView: reconcilePendingOperations done")
                 await BackfillAIQueue.shared.repopulateFromDatabase()
+                BootProfiler.mark("RootView: BackfillAIQueue.repopulate done")
                 // Notify UI before sync — background push may have already synced
                 // data while app was suspended. Reload from GRDB immediately so
                 // the user sees current state, then sync finds any remaining changes.
                 NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+                BootProfiler.mark("RootView: posted inboxDataDidChange (UI reload from GRDB)")
                 // Sync is handled by startForegroundPolling() (triggered by scenePhase → .active).
                 // Do NOT call foregroundSyncAll() here — it races with the poll's sync,
                 // causing every full sync to run twice (doubled API calls, IMAP connections, DB writes).

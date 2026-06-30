@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
+import UIKit
 import UserNotifications
 
 struct DebugMenuView: View {
@@ -16,6 +17,24 @@ struct DebugMenuView: View {
 
     var body: some View {
         List {
+            Section("Boot Diagnostics") {
+                NavigationLink {
+                    BootDebugLogsView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Boot Debug Logs")
+                            Text("Cold-launch timeline — copy/paste friendly")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "stopwatch")
+                            .foregroundStyle(.blue)
+                    }
+                }
+            }
+
             Section("Demo Recording") {
                 Toggle("Show Touch Rings", isOn: $showTouchRings)
                     .onChange(of: showTouchRings) { _, newValue in
@@ -228,6 +247,92 @@ struct DebugMenuView: View {
                 reminderTestStatus = "Failed: \(error.localizedDescription)"
                 print("[ProactiveNotify] Failed to schedule test reminder: \(error)")
             }
+        }
+    }
+}
+
+/// Dedicated, copy-paste-first view for the boot timeline (`BootProfiler` →
+/// `boot.log`). Unlike the share-sheet `LogShareButton`, this renders the whole
+/// log inline as selectable monospaced text with a one-tap "Copy All" so a
+/// cold-launch timeline captured on-device (e.g. on a slow network) can be
+/// pasted straight into a chat/bug report. Refresh re-reads after a relaunch;
+/// Clear wipes it so the next launch is captured clean.
+struct BootDebugLogsView: View {
+    @State private var logText: String = ""
+    @State private var copied = false
+    @State private var fileToShare: URL?
+
+    private var capturing: Bool { DebugModeManager.isLoggingEnabled() }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Capture-state banner — tells the user whether the NEXT launch will
+            // actually record a timeline (logging gate must be on during boot).
+            HStack(spacing: 6) {
+                Image(systemName: capturing ? "record.circle" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(capturing ? .green : .orange)
+                Text(capturing
+                     ? "Boot logging is ON — relaunch the app, then come back and tap Refresh."
+                     : "Boot logging is OFF — unlock debug mode first (tap version 10×).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal).padding(.vertical, 8)
+
+            // Action bar
+            HStack(spacing: 12) {
+                Button {
+                    UIPasteboard.general.string = logText
+                    copied = true
+                    Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+                } label: {
+                    Label(copied ? "Copied!" : "Copy All", systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                        .font(.body.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(logText.isEmpty)
+
+                Button {
+                    logText = BackgroundSyncLogger.readBootLog()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
+
+                Button {
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent("boot_logs.txt")
+                    try? logText.write(to: url, atomically: true, encoding: .utf8)
+                    fileToShare = url
+                } label: { Image(systemName: "square.and.arrow.up") }
+
+                Button(role: .destructive) {
+                    BackgroundSyncLogger.clearBootLog()
+                    logText = ""
+                } label: { Image(systemName: "trash") }
+            }
+            .padding(.horizontal).padding(.bottom, 8)
+
+            Divider()
+
+            ScrollView {
+                Text(logText.isEmpty
+                     ? "(no boot timeline yet)\n\nDo one cold launch (force-quit first), then return here and tap Refresh. Copy All puts the whole timeline on the clipboard for pasting."
+                     : logText)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+        }
+        .navigationTitle("Boot Debug Logs")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { logText = BackgroundSyncLogger.readBootLog() }
+        .sheet(item: $fileToShare) { url in
+            ActivityViewController(activityItems: [url])
+                .presentationDetents([.medium, .large])
         }
     }
 }
