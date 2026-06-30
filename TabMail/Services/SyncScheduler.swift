@@ -370,6 +370,35 @@ final class SyncScheduler {
         // poll() has an isPollActive guard so this is safe even if RootView.task's
         // initial sync is still running — one will no-op.
         BackgroundSyncLogger.log("startForegroundPolling: ENTER (pollActive=\(isPollActive), startupInFlight=\(isStartupInFlight))")
+        // Mark EVERY foreground call (not just the ones that pass the herd gate) so a
+        // wifi-off capture shows how often a foreground lands while a slow sync still
+        // holds the gate — the exact window the ungated merge below now covers.
+        BootProfiler.mark("⟳ startForegroundPolling CALLED (herdInFlight=\(isStartupInFlight), pollActive=\(isPollActive))")
+
+        // ── ALWAYS, UNGATED: surface already-available mail on EVERY foreground ──
+        // The NSE merge + inbox reload signal must NOT live behind the heavy herd's
+        // `isStartupInFlight` gate. On a slow (mobile) network `poll()` holds that
+        // gate for 60s+ (boot logs: poll() = 63s, fullSync = 70s), and a foreground
+        // arriving in that window used to fall straight through to the timer guard —
+        // NO merge, NO reload — so newly-pushed (NSE-staged) mail stayed hidden and
+        // "Updated … ago" stayed stale until the in-flight sync finished. The merge
+        // is the PRIVILEGED single-flight (NSEMergeCoordinator serializes it), so
+        // running it concurrently with an in-flight poll is safe. This realizes the
+        // rule: the update signal goes right after the merge, independent of the herd.
+        Task {
+            // Instant once the inbox has painted (warm foreground); on a cold-launch
+            // first foreground this waits for first paint, same as the herd gate.
+            await AppStartup.shared.awaitLaunchReady(background: false)
+            // Emits its OWN immediate `.inboxDataDidChange` (debounce-bypass flag)
+            // when it stages new mail.
+            await NSEDataBridge.mergeNSEStagingData()
+            // Generic debounced repaint from whatever is already in GRDB (e.g. a
+            // background-cycle merge that wrote while we were off-screen). Coalesces
+            // with the merge's immediate post via the inbox single-flight reload.
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+        }
+
+        // ── GATED: the heavy herd (sync / push resub / poll) — one cycle at a time ──
         if !isStartupInFlight {
             isStartupInFlight = true
             Task {
@@ -381,40 +410,16 @@ final class SyncScheduler {
                 }
                 fgStep("Task body start")
                 BootProfiler.mark("startForegroundPolling enter (firstForeground=\(!didFirstForegroundSettle))")
-                // REORDER — show the inbox first, then start everything else.
-                // On the FIRST foreground after a cold launch, BLOCK the entire herd
-                // (NSE merge, sync, queue repopulation, push resub, poll) on the REAL
-                // first-paint signal — not a fixed timer. Nothing here is needed for
-                // the first frame: cached mail is already drawn, and NSE-staged mail
-                // merged PRE-paint via runIfNeeded's read-through. So it ALL waits
-                // until the inbox has painted, then runs. This path only fires on a
-                // foreground scene activation (where `isReady` flips), so the timeout
-                // is a pure safety net. Warm returns (inbox already on screen) skip it.
+                // On the FIRST foreground after a cold launch, BLOCK the herd (sync,
+                // queue repopulation, push resub, poll) on the REAL first-paint signal
+                // — not a fixed timer. The quick merge above already ran ungated; this
+                // gate only holds back the heavy network work. Warm returns skip it.
                 if !didFirstForegroundSettle {
                     didFirstForegroundSettle = true
                     await AppStartup.shared.awaitLaunchReady(background: false)
                     fgStep("first-paint gate cleared")
                     BootProfiler.mark("startForegroundPolling: first paint reached — herd starting")
                 }
-                // Startup data resets already ran synchronously in AppDatabase.init
-                // (before the pool was exposed), so there's nothing to await here.
-                // Merge NSE staging data FIRST — before sync, before the herd.
-                // The merge is the PRIVILEGED, single-threaded boot step: it runs
-                // ALONE here (the coordinator guarantees no sibling merge, and
-                // `syncStartup` below only spawns the sync/backfill/AI herd AFTER
-                // this awaited merge fully returns). When it stages new mail it
-                // emits its OWN single `.inboxDataDidChange` (immediate flag —
-                // bypasses the inbox 500ms debounce) at the end of the merge.
-                await NSEDataBridge.mergeNSEStagingData()
-                fgStep("outer NSE merge")
-                BootProfiler.mark("startForegroundPolling: outer NSE merge done")
-                // Generic foreground refresh (debounced — NOT the immediate merge
-                // signal above): repaints from whatever is already in GRDB (e.g. a
-                // background-cycle merge that wrote while we were off-screen) without
-                // waiting for reconnect+poll (can take 60s+). Coalesces with the
-                // merge's immediate post via the inbox single-flight reload.
-                NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-                fgStep("posted .inboxDataDidChange")
                 await syncStartup(inboxOnly: false, drain: .none)
                 fgStep("syncStartup returned")
                 BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")
@@ -437,6 +442,11 @@ final class SyncScheduler {
                 await poll()
                 BootProfiler.mark("startForegroundPolling: poll() done (foreground sync pass complete)")
             }
+        } else {
+            // A previous foreground's herd is still grinding through its sync/poll.
+            // We DON'T start a second one — but the ungated merge above already ran,
+            // so a foreground during a slow sync still surfaces freshly-staged mail.
+            BootProfiler.mark("startForegroundPolling: herd SKIPPED (sync already in flight) — ungated merge still ran")
         }
 
         guard timer == nil else { return }

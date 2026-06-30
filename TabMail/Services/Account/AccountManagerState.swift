@@ -99,10 +99,13 @@ final class AccountManagerState {
     }
 
     /// Timestamp of the last successful header sync. Nil if no sync has completed yet.
+    /// This is the source of the inbox "Updated … ago" subtitle — marking it in the
+    /// boot timeline shows EXACTLY when the freshness indicator resets vs. stays stale.
     var lastSyncCompletedAt: Date? {
         didSet {
             let v = lastSyncCompletedAt.map { "\(Int(Date().timeIntervalSince($0)))s ago" } ?? "nil"
             print("[SyncPhaseMut] lastSyncCompletedAt = \(v)")
+            BootProfiler.mark("✓ 'Updated … ago' RESET (lastSyncCompletedAt = now)")
         }
     }
 
@@ -111,6 +114,7 @@ final class AccountManagerState {
     var lastSyncFailed = false {
         didSet {
             print("[SyncPhaseMut] lastSyncFailed = \(lastSyncFailed)")
+            BootProfiler.mark("'Last updated' subtitle: lastSyncFailed = \(lastSyncFailed)")
         }
     }
 

@@ -552,6 +552,8 @@ struct RootView: View {
             Task { await Self.revalidateAISubscriptionGate() }
         }
         .onChange(of: scenePhase) { _, phase in
+            let phaseName = phase == .active ? "active" : (phase == .background ? "background" : "inactive")
+            BootProfiler.mark("◐ scenePhase → \(phaseName) (accounts=\(navigationStore.accounts.count))")
             switch phase {
             case .active:
                 if !navigationStore.accounts.isEmpty {
