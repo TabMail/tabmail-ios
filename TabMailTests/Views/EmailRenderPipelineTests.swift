@@ -233,8 +233,11 @@ struct EmailRenderPipelineTests {
         #expect(js.contains("var GUTTER = 16"))                                   // matches SwiftUI default
         #expect(js.contains("var WIDE = bw * 0.6"))                               // main-column width filter
         #expect(js.contains("if (r.width < WIDE || r.height <= 0) continue"))     // wide text leaves only
-        #expect(js.contains("var xl = Math.max(0, Math.min(minLeft, GUTTER))"))   // clamp [0,16] (can't harm)
-        #expect(js.contains("var padL = GUTTER - xl"))                            // padding = 16 − inset
+        // SYMMETRIC reduction by the smaller side's inset, clamped [0,16] — never
+        // lopsided (no flush-on-one-side regression), and overflow → 0 → no change.
+        #expect(js.contains("var x = Math.max(0, Math.min(minLeft, minRight, GUTTER))"))
+        #expect(js.contains("var pad = GUTTER - x"))
+        #expect(js.contains("{ l: pad, r: pad }"))                                // same padding both sides
         #expect(js.contains("messageHandlers.gutterAdjust.postMessage"))          // posts to Swift, doesn't mutate DOM
         // Regression guard: must NOT pull the body (the old, ineffective approach).
         #expect(!js.contains("margin-left"))

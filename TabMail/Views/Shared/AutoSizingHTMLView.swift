@@ -1715,12 +1715,15 @@ private let deferredImageLoadJS = """
 /// CANNOT harm other emails: the clamp to `[0, 16]` means we only ever REMOVE our
 /// own double-count, never add indent or pull content.
 ///
-/// Inset = the MIN left/right inset among WIDE text leaves (width ≥ 60% of body):
-/// the main content column. Narrow elements (an injected "[CAUTION]" banner, a
-/// centered date) and structural full-width wrappers (no direct text) are excluded,
-/// so a single low-inset outlier can't defeat it (the failure mode of the earlier
-/// body-pull approach). A negative inset (content overflowing the body) clamps to 0
-/// → no reduction. Exposed for unit tests via `_eatGutterMarginsJS`.
+/// Inset = the MIN inset among WIDE text leaves (width ≥ 60% of body): the main
+/// content column. Narrow elements (an injected "[CAUTION]" banner, a centered
+/// date) and structural full-width wrappers (no direct text) are excluded, so a
+/// single low-inset outlier can't defeat it (the failure mode of the earlier
+/// body-pull approach). The reduction is SYMMETRIC (both sides reduced by the
+/// smaller of the two sides' insets) so the gutter is never lopsided — content
+/// can't go flush on one side while padded on the other. A negative inset
+/// (content overflowing the body, i.e. a desktop email that fitViewportJS will
+/// widen) clamps to 0 → no reduction. Exposed for unit tests via `_eatGutterMarginsJS`.
 internal var _eatGutterMarginsJS: String { eatGutterMarginsJS }
 private var eatGutterMarginsJS: String {
     let gl = DebugModeManager.isLoggingEnabled()
@@ -1756,15 +1759,19 @@ private var eatGutterMarginsJS: String {
                 var ri = b.right - r.right; if (ri < minRight) minRight = ri;
             }
             if (!isFinite(minLeft) || !isFinite(minRight)) { gl('no wide text content — keep 16'); return; }
-            // Email's own inset, clamped [0, GUTTER]. padX = GUTTER − insetX so the
-            // total indent is max(GUTTER, inset). Clamp ≥0 means an overflowing
-            // (negative) inset never INCREASES our padding.
-            var xl = Math.max(0, Math.min(minLeft, GUTTER));
-            var xr = Math.max(0, Math.min(minRight, GUTTER));
-            var padL = GUTTER - xl, padR = GUTTER - xr;
+            // SYMMETRIC reduction: reduce BOTH sides by the SMALLER inset, clamped
+            // [0, GUTTER]. Using the min keeps the gutter symmetric so content can
+            // never end up flush on one side while padded on the other — the
+            // regression on a desktop email whose content overflowed the LEFT
+            // (minLeft=-8) but sat 16px from the RIGHT: per-side ate right→0 while
+            // left stayed 16, so content hugged the right edge. A negative
+            // (overflow) inset → 0 → no reduction (overflowing/desktop emails are
+            // handled by fitViewportJS's widen, not by the gutter).
+            var x = Math.max(0, Math.min(minLeft, minRight, GUTTER));
+            var pad = GUTTER - x;
             gl('emailInset L=' + Math.round(minLeft) + ' R=' + Math.round(minRight)
-                + ' → SwiftUI pad L=' + padL + ' R=' + padR + ' (' + (cp ? cp.tagName + '.' + (cp.className || '') : '?') + ')');
-            window.webkit.messageHandlers.gutterAdjust.postMessage({ l: padL, r: padR });
+                + ' → SwiftUI pad ' + pad + ' (both, ' + (cp ? cp.tagName + '.' + (cp.className || '') : '?') + ')');
+            window.webkit.messageHandlers.gutterAdjust.postMessage({ l: pad, r: pad });
         } catch (e) { gl('error: ' + (e && e.message ? e.message : e)); }
     })();
     """
