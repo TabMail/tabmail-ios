@@ -57,6 +57,41 @@ struct EmailAddressParseTests {
         #expect(r.email == "ob@test.com")
     }
 
+    // MARK: - Malformed input that must not crash (regression)
+
+    /// A `>` inside the quoted display name appears BEFORE the `<` of the
+    /// address. A naive `firstIndex(of: ">")` matches that earlier `>`, giving
+    /// angleEnd < angleStart and crashing with "Range requires lowerBound
+    /// <= upperBound". Real-world headers from some servers look like this
+    /// (display name = "<address> >> Real Name"). Generalized from a real crash.
+    @Test("Quoted display name containing '>>' before the address does not crash")
+    func quotedNameWithStrayGreaterThan() {
+        let r = EmailAddress.parse("\"user@domain.com >> User Name\" <user@domain.com>")
+        #expect(r.email == "user@domain.com")
+        #expect(r.name == "user@domain.com >> User Name")
+    }
+
+    @Test("Single stray '>' before the address does not crash")
+    func strayGreaterThanBeforeAddress() {
+        let r = EmailAddress.parse("a > b <ab@domain.com>")
+        #expect(r.email == "ab@domain.com")
+        #expect(r.name == "a > b")
+    }
+
+    @Test("'>' with no following '<' falls back to bare-address handling")
+    func greaterThanWithoutAngleAddress() {
+        let r = EmailAddress.parse("plain > text")
+        #expect(r.name == "plain > text")
+        #expect(r.email == "plain > text")
+    }
+
+    @Test("Trailing '<' with no closing '>' does not crash")
+    func danglingOpenAngle() {
+        let r = EmailAddress.parse("Name <")
+        #expect(r.name == "Name <")
+        #expect(r.email == "Name <")
+    }
+
     // MARK: - Bare addresses
 
     @Test("Bare address produces name == email == same value")

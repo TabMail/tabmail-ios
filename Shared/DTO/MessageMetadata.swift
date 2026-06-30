@@ -51,8 +51,13 @@ struct EmailAddress: Sendable, Equatable {
     static func parse(_ raw: String) -> EmailAddress {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return EmailAddress(name: "", email: "") }
+        // Search for the closing `>` only AFTER the opening `<`. A bare
+        // `firstIndex(of: ">")` matches a `>` that appears earlier — e.g. inside
+        // a quoted display name like `"a@b.com >> Name" <a@b.com>` — yielding
+        // angleEnd < angleStart and a `lowerBound > upperBound` range crash.
+        // Mirrors the safe idiom in EmailFilter.extractFirstMessageId.
         if let angleStart = trimmed.firstIndex(of: "<"),
-           let angleEnd = trimmed.firstIndex(of: ">") {
+           let angleEnd = trimmed[trimmed.index(after: angleStart)...].firstIndex(of: ">") {
             let name = String(trimmed[trimmed.startIndex..<angleStart])
                 .trimmingCharacters(in: .whitespaces)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
