@@ -897,12 +897,14 @@ enum NSEDataBridge {
                 BootProfiler.mark("merge: main tx committed (\(committedCount) merged) — FTS flush next")
                 print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
-                // NOTE: no UI-refresh post here anymore. The whole merge emits
-                // ONE `.inboxDataDidChange` (immediate) at the very end, after the
-                // synchronous FTS flush below has flipped `headerComplete=1` — so
-                // a brand-new staged header is already VISIBLE to the inbox query
-                // (which filters `headerComplete == true`) when the single reload
-                // fires. Posting mid-flight here would trigger a reload that the
+                // NOTE: no UI-refresh post here anymore. performMerge posts its
+                // end-of-flow `.inboxDataDidChange` (immediate) at the very end,
+                // after the synchronous FTS flush below has flipped
+                // `headerComplete=1` — so a brand-new staged header is already
+                // VISIBLE to the inbox query (which filters `headerComplete ==
+                // true`) when that reload fires. (Phase 1 already posted the
+                // earlier header-only render; this end-of-merge post is the
+                // second.) Posting mid-flight here would trigger a reload that the
                 // not-yet-flipped header would miss.
             } catch {
                 // Outer dbPool.write threw — usually a hard SQLite error
@@ -1021,11 +1023,12 @@ enum NSEDataBridge {
             }
         }
 
-        // SINGLE end-of-merge UI signal. Every stage (header → body → summary →
-        // action → synchronous FTS flip → inbox removals → task results) is now
-        // durable, so we post ONE `.inboxDataDidChange` here instead of mid-flight
+        // End-of-merge UI signal — the SECOND render of the two-phase merge
+        // (phase 1 already posted the header-only render). Every stage (header →
+        // body → summary → action → synchronous FTS flip → inbox removals → task
+        // results) is now durable, so we post here instead of per-stage mid-flight
         // — less reload churn, and the row is fully visible (`headerComplete=1`)
-        // and bodied when the single reload reads. It carries `inboxReloadImmediate`
+        // and bodied when this reload reads. It carries `inboxReloadImmediate`
         // so the inbox reloads AT ONCE, bypassing its 500ms background-coalescing
         // debounce: this merge is the privileged, single-threaded boot-priority
         // step and must paint immediately (the debounce stays for the noisy
@@ -1119,7 +1122,7 @@ enum NSEDataBridge {
             // removal DELETEs are durable and we can safely clear staging.
             outerCommitted = true
             print("[NSEDataBridge] Merged \(successfullyConsumedIds.count)/\(removals.count) inbox removal(s), deleted \(deletedTotal) header row(s)")
-            // No post here — `performMerge` emits ONE immediate `.inboxDataDidChange`
+            // No post here — `performMerge` emits its immediate `.inboxDataDidChange`
             // at the end (this function's `deletedTotal > 0` return feeds `didMutate`).
         } catch {
             // Outer dbPool.write threw — even per-row DELETEs that we logged
