@@ -262,6 +262,132 @@ struct EmailRenderPipelineTests {
         #expect(!js.contains("if (coloredBg && bgL > 80 && elHasText) {"))
     }
 
+    // MARK: - constrainLeftOverflowJS (behavioral, via JSContext + mock DOM)
+    //
+    // These run the PRODUCTION `constrainLeftOverflowJS` source against a minimal
+    // synthetic DOM (positions + computed styles supplied per element), so they
+    // exercise the real decision logic — not just its text. Content is generic
+    // (no real senders/domains). `applied(key)` returns the inline styles the pass
+    // set on the element created with that key. requestAnimationFrame/setTimeout
+    // are stubbed to no-ops, so only the synchronous documentEnd pass runs.
+    private static let leftFixDomHarness = """
+    var _applied = {}, _byKey = {}, _roots = [];
+    function _el(tag, o, kids) {
+        o = o || {}; kids = kids || [];
+        var key = o.key || ('k' + Object.keys(_byKey).length);
+        var n = {
+            tagName: tag.toUpperCase(), className: o.cls || '', textContent: o.text || '',
+            children: kids, parentElement: null, _key: key,
+            _comp: { marginLeft: (o.ml || 0) + 'px', textIndent: (o.ti || 0) + 'px',
+                     paddingLeft: (o.pl || 0) + 'px', borderLeftWidth: '0px', display: o.disp || 'block' },
+            _rect: { left: (o.left || 0), width: (o.w == null ? 200 : o.w), height: (o.h == null ? 20 : o.h) },
+            getBoundingClientRect: function () { return this._rect; },
+            style: { setProperty: function (k, v, p) { (_applied[key] = _applied[key] || {})[k] = v; } }
+        };
+        for (var i = 0; i < kids.length; i++) kids[i].parentElement = n;
+        _byKey[key] = n; return n;
+    }
+    function _flatten(node, out) { for (var i = 0; i < node.children.length; i++) { out.push(node.children[i]); _flatten(node.children[i], out); } return out; }
+    function _allDesc() { var out = []; for (var i = 0; i < _roots.length; i++) { out.push(_roots[i]); _flatten(_roots[i], out); } return out; }
+    var document = { body: {
+        getBoundingClientRect: function () { return { left: 0, width: 288, height: 2000 }; },
+        getElementsByTagName: function (t) { return _allDesc(); },
+        querySelectorAll: function (s) { return _allDesc().filter(function (n) { return n.tagName === 'UL' || n.tagName === 'OL'; }); }
+    } };
+    var window = { getComputedStyle: function (n) { return n._comp; },
+                   webkit: { messageHandlers: { consoleLog: { postMessage: function () {} } } } };
+    function requestAnimationFrame(fn) {}
+    function setTimeout(fn, t) {}
+    function applied(key) { return _applied[key] || {}; }
+    function setBody(roots) { _roots = roots; }
+    """
+
+    /// Fresh JSContext with the DOM mock + the tree built by `bodyJS` (which must
+    /// call `setBody([...])`), then runs the production left-overflow pass.
+    private func runLeftFix(_ bodyJS: String) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.leftFixDomHarness)
+        ctx.evaluateScript(bodyJS)
+        ctx.evaluateScript(_constrainLeftOverflowJS)
+        #expect(ctx.exception == nil, "left-overflow JS threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    private func appliedValue(_ ctx: JSContext, _ key: String, _ prop: String) -> String? {
+        let v = ctx.evaluateScript("applied('\(key)')['\(prop)']")
+        return (v?.isUndefined ?? true) ? nil : v?.toString()
+    }
+
+    @Test("constrainLeftOverflowJS normalizes a hanging-bullet list to a clean indent")
+    func leftFixNormalizesHangingBulletList() {
+        // Generic list using the desktop hanging-bullet hack: <li> with negative
+        // margin-left + text-indent. Expect the <ul> normalized (sane padding,
+        // outside markers, margin 0) and each <li>'s negatives zeroed.
+        let ctx = runLeftFix("""
+        setBody([ _el('ul', { key: 'list', pl: 8 }, [
+            _el('li', { key: 'i1', ml: -47, ti: -17, left: 9, text: 'Item one' }),
+            _el('li', { key: 'i2', ml: -47, ti: -17, left: 9, text: 'Item two' })
+        ]) ]);
+        """)
+        #expect(appliedValue(ctx, "list", "padding-left") == "24px")           // marker gutter restored
+        #expect(appliedValue(ctx, "list", "margin-left") == "0")
+        #expect(appliedValue(ctx, "list", "list-style-position") == "outside")
+        for li in ["i1", "i2"] {
+            #expect(appliedValue(ctx, li, "margin-left") == "0")
+            #expect(appliedValue(ctx, li, "text-indent") == "0")               // no more broken hang
+        }
+    }
+
+    @Test("constrainLeftOverflowJS zeroes a negative text-indent that spills text past the left edge")
+    func leftFixZeroesTextIndentSpill() {
+        // A block whose BOX fits (left = 0) but whose small negative text-indent
+        // pushes the first line's text left of the body edge (content-left 8 +
+        // (-17) = -9 < 0). No inline child, so only the text-indent check catches it.
+        let ctx = runLeftFix("""
+        setBody([ _el('p', { key: 'foot', pl: 8, ti: -17, left: 0, text: 'Help topics' }) ]);
+        """)
+        #expect(appliedValue(ctx, "foot", "text-indent") == "0")
+    }
+
+    @Test("constrainLeftOverflowJS leaves image-replacement text-indent (huge negative) alone")
+    func leftFixIgnoresImageReplacementTextIndent() {
+        // text-indent:-9999px is the classic "hide text, show background image"
+        // trick — zeroing it would reveal hidden label text. Must be excluded.
+        let ctx = runLeftFix("""
+        setBody([ _el('span', { key: 'hidden', ti: -9999, left: 0, text: 'Logo label' }) ]);
+        """)
+        #expect(appliedValue(ctx, "hidden", "text-indent") == nil)             // untouched
+    }
+
+    @Test("constrainLeftOverflowJS walks ancestors to zero a box-overflowing negative margin")
+    func leftFixWalksAncestorsForBoxOverflow() {
+        // A non-list block whose own box overflows the left edge via a negative
+        // margin (an inline child rides along). The pass walks up from the child
+        // and zeroes the block's negative margin-left.
+        let ctx = runLeftFix("""
+        setBody([ _el('div', { key: 'wrap', ml: -20, left: -8 }, [
+            _el('a', { key: 'link', left: -8, text: 'A link' })
+        ]) ]);
+        """)
+        #expect(appliedValue(ctx, "wrap", "margin-left") == "0")
+    }
+
+    @Test("constrainLeftOverflowJS leaves well-formed content untouched")
+    func leftFixLeavesWellFormedContentAlone() {
+        // A normal list (no negative offsets) and normal paragraph — nothing
+        // overflows or spills, so the pass must not mutate anything.
+        let ctx = runLeftFix("""
+        setBody([
+            _el('ul', { key: 'ok-list', pl: 40 }, [ _el('li', { key: 'ok-li', left: 40, text: 'Fine' }) ]),
+            _el('p', { key: 'ok-p', left: 16, text: 'Fine paragraph' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "ok-list", "padding-left") == nil)
+        #expect(appliedValue(ctx, "ok-list", "list-style-position") == nil)
+        #expect(appliedValue(ctx, "ok-li", "text-indent") == nil)
+        #expect(appliedValue(ctx, "ok-p", "text-indent") == nil)
+    }
+
     @Test("fixDarkModeColorsJS makes the outermost near-white surface a darker panel (not erased)")
     func darkModeNearWhitePanelDarkening() {
         let js = _fixDarkModeColorsJS

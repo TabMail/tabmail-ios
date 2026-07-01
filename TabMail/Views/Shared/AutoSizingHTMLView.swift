@@ -247,6 +247,7 @@ private struct HTMLWebView: UIViewRepresentable {
         let deferImages = WKUserScript(source: deferredImageLoadJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         // After the layout-affecting transforms (quote/ics collapse, eml cleanup)
         // and before height monitoring/fit, so it measures the settled layout.
+        let leftFix = WKUserScript(source: constrainLeftOverflowJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let eatMargins = WKUserScript(source: eatGutterMarginsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         // After heightMonitor so window.__tmReportHeight is defined when a
@@ -263,6 +264,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(quoteCollapse)
         config.userContentController.addUserScript(icsCollapse)
         config.userContentController.addUserScript(deferImages)
+        config.userContentController.addUserScript(leftFix)
         config.userContentController.addUserScript(eatMargins)
         config.userContentController.addUserScript(heightMonitor)
         config.userContentController.addUserScript(aspectFix)
@@ -939,6 +941,137 @@ private let constrainWidthsJS = """
         }
     })();
     """
+
+/// Neutralize content that overflows the LEFT edge (which `html{overflow-x:clip}`
+/// hard-clips, cutting off the first character(s) of a line). `fitViewportJS`
+/// only handles RIGHT overflow (it widens + scales), so left overflow is invisible
+/// to it. The classic cause is a desktop email's negative `margin-left` /
+/// `text-indent` (list hanging-indents, e.g. `li { margin-left:-47px;
+/// text-indent:-17px }`) sized for a wide centered container; on a narrow
+/// device-width render the container sits at the edge so those negatives push the
+/// content off-screen-left (Meta/WhatsApp newsletter: nested `<li>` clipped ~8px,
+/// "Initial"→"nitial", "Business"→"usiness"; logmain.log 2026-06-30).
+///
+/// Conservative + scoped: only elements whose left edge is actually PAST the body's
+/// left edge get their NEGATIVE `margin-left` / `text-indent` zeroed (a block
+/// element with a negative left margin is also WIDER than its container, so zeroing
+/// it makes the box fit and the text reflow into view). Positive margins/indents
+/// and non-overflowing elements are untouched, so well-rendered emails are
+/// unaffected (their content never overflows the body's left edge). Top-down
+/// document order means fixing a parent reflows its children before they're tested.
+/// Runs at documentEnd before `eatGutterMarginsJS`/fit so the corrected layout
+/// flows through both. Exposed for unit tests via `_constrainLeftOverflowJS`.
+internal var _constrainLeftOverflowJS: String { constrainLeftOverflowJS }
+private var constrainLeftOverflowJS: String {
+    let ll = DebugModeManager.isLoggingEnabled()
+        ? "function ll(s){try{window.webkit.messageHandlers.consoleLog.postMessage('[LeftFix] '+s);}catch(_){}}"
+        : "function ll(s){}"
+    return """
+    (function() {
+        \(ll)
+        function fixLeft(tag) {
+            if (!document.body) return;
+            try {
+                var bl = document.body.getBoundingClientRect().left;
+                var els = document.body.getElementsByTagName('*');
+                var fixed = 0, seen = 0, spill = 0, lists = 0;
+                // (0) NORMALIZE hanging-bullet lists. Desktop emails style lists with
+                // negative margin-left / text-indent on <li> (a hanging-bullet indent
+                // sized for a wide container). Just zeroing those un-clips the text but
+                // leaves the bullets un-indented ("bullets not indented properly"). So
+                // for any <ul>/<ol> that carries the hack, reset it to a clean,
+                // mobile-friendly list: outside markers, a sane padding-left for the
+                // marker gutter, and zeroed item negatives. Only touches lists that
+                // actually use the hack, so normal lists are unaffected.
+                var listEls = document.body.querySelectorAll('ul, ol');
+                for (var q = 0; q < listEls.length; q++) {
+                    var L = listEls[q];
+                    var Lcs = window.getComputedStyle(L);
+                    var hack = (parseFloat(Lcs.marginLeft) || 0) < 0;
+                    var kids = L.children;
+                    for (var q2 = 0; q2 < kids.length && !hack; q2++) {
+                        if (kids[q2].tagName === 'LI') {
+                            var Ics = window.getComputedStyle(kids[q2]);
+                            if ((parseFloat(Ics.marginLeft) || 0) < 0 || (parseFloat(Ics.textIndent) || 0) < 0) hack = true;
+                        }
+                    }
+                    if (!hack) continue;
+                    L.style.setProperty('margin-left', '0', 'important');
+                    L.style.setProperty('list-style-position', 'outside', 'important');
+                    if ((parseFloat(Lcs.paddingLeft) || 0) < 24) L.style.setProperty('padding-left', '24px', 'important');
+                    for (var q3 = 0; q3 < kids.length; q3++) {
+                        if (kids[q3].tagName === 'LI') {
+                            kids[q3].style.setProperty('margin-left', '0', 'important');
+                            kids[q3].style.setProperty('text-indent', '0', 'important');
+                            kids[q3].style.setProperty('padding-left', '0', 'important');
+                        }
+                    }
+                    lists++; fixed++;
+                    if (lists <= 4) ll(tag + ' list-normalize ' + L.tagName + '.' + (L.className || '').toString().slice(0, 20) + ' pl=' + Lcs.paddingLeft + '→24 items=' + kids.length);
+                }
+                // Then the two general left-overflow mechanisms (non-list content):
+                //  (A) box overflow — the element's own box is past the left edge
+                //      (negative margin-left, e.g. the <li> at -47). getBoundingClientRect
+                //      catches it; we walk the ancestor chain zeroing negatives.
+                //  (B) text-indent SPILL — the box fits but a small negative text-indent
+                //      shifts the first line's TEXT left of the body edge WITHOUT moving
+                //      the box (footer "Help Center" with direct text, no inline child),
+                //      so (A) can't see it. Detect via content-left + text-indent < bl.
+                //      Exclude huge negatives (image-replacement, e.g. -9999px).
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    var r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    var cs0 = window.getComputedStyle(el);
+                    var ti0 = parseFloat(cs0.textIndent) || 0;
+                    if (ti0 < 0 && ti0 > -1000) {
+                        var contentLeft = r.left + (parseFloat(cs0.borderLeftWidth) || 0) + (parseFloat(cs0.paddingLeft) || 0);
+                        if (contentLeft + ti0 < bl - 1) {
+                            el.style.setProperty('text-indent', '0', 'important');
+                            fixed++;
+                            if (spill < 5) { ll(tag + ' textspill ' + el.tagName + '.' + (el.className || '').toString().slice(0, 20) + ' cl=' + Math.round(contentLeft) + ' ti=' + Math.round(ti0) + ' → 0'); spill++; }
+                        }
+                    }
+                    if (r.left >= bl - 1) continue; // box not overflowing the left edge
+                    seen++;
+                    var node = el, depth = 0, didFix = false;
+                    while (node && node !== document.body && depth < 8) {
+                        var ncs = window.getComputedStyle(node);
+                        var nml = parseFloat(ncs.marginLeft) || 0;
+                        var nti = parseFloat(ncs.textIndent) || 0;
+                        if (nml < 0) { node.style.setProperty('margin-left', '0', 'important'); didFix = true; }
+                        if (nti < 0) { node.style.setProperty('text-indent', '0', 'important'); didFix = true; }
+                        if (seen <= 4 && (nml < 0 || nti < 0 || depth === 0)) {
+                            ll(tag + ' overflow ' + el.tagName + ' left=' + Math.round(r.left) + ' | anc[' + depth + ']='
+                                + node.tagName + '.' + (node.className || '').toString().slice(0, 20)
+                                + ' ml=' + Math.round(nml) + ' ti=' + Math.round(nti) + ' disp=' + ncs.display
+                                + (nml < 0 ? ' ZEROml' : '') + (nti < 0 ? ' ZEROti' : ''));
+                        }
+                        node = node.parentElement; depth++;
+                    }
+                    if (didFix) fixed++;
+                }
+                var newMin = Infinity;
+                for (var k = 0; k < els.length; k++) {
+                    var rr = els[k].getBoundingClientRect();
+                    if (rr.width > 0 && rr.height > 0 && (rr.left - bl) < newMin) newMin = rr.left - bl;
+                }
+                ll(tag + ' done: lists=' + lists + ' seen=' + seen + ' spill=' + spill + ' fixed=' + fixed + ' newMinLeftInset=' + (isFinite(newMin) ? Math.round(newMin) : 'n/a'));
+            } catch (e) { ll('error: ' + (e && e.message ? e.message : e)); }
+        }
+        // Run at documentEnd, then RE-RUN after later reflows re-introduce left
+        // overflow — notably our own gutter adjustment (eatGutterMarginsJS posts a
+        // reduced SwiftUI padding → the webview widens → content reflows, and an
+        // element's negative offset can land past the new left edge AFTER the
+        // documentEnd pass already ran), plus deferred-image loads. Idempotent
+        // (zeroing an already-zeroed value is a no-op), so extra passes are safe.
+        fixLeft('docEnd');
+        requestAnimationFrame(function() { requestAnimationFrame(function() { fixLeft('raf2'); }); });
+        setTimeout(function() { fixLeft('t500'); }, 500);
+        setTimeout(function() { fixLeft('t1500'); }, 1500);
+    })();
+    """
+}
 
 /// Dark mode fix (injected as WKUserScript at document end — no blink).
 /// - Near-white (bright + low saturation) backgrounds → stripped to transparent.
