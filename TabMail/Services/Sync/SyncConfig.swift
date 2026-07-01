@@ -455,7 +455,7 @@ enum SyncConfig {
     /// `SyncEngine.checkpointWALThrottled`; this throttle stops a high-frequency caller
     /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
     /// autocheckpoint is disabled (see `AppDatabase.makePool`).
-    static let walCheckpointMinIntervalSeconds: TimeInterval = 3
+    static let walCheckpointMinIntervalSeconds: TimeInterval = 1.5
     /// Timeout for WiFi check (NWPathMonitor). Returns false if exceeded.
     static let wifiCheckTimeoutSeconds: TimeInterval = 5
     /// Timeout for per-account background delta sync (ensureConnected + delta).
