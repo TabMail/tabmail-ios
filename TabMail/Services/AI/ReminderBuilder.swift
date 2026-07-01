@@ -49,7 +49,15 @@ enum ReminderBuilder {
         KBTaskParser.invalidateCache()
         KBReminderParser.invalidateCache()
         cachedList.withLock { $0 = nil }
-        Task { _ = await buildReminderList(includeDisabled: true) }
+        // DETACHED on purpose: this is a background cache refresh, so it must NOT
+        // inherit the caller's context — priority, actor, or (critically) the
+        // `@TaskLocal` DisabledRemindersStore test-defaults override. A plain `Task{}`
+        // would inherit that override and run gcStaleEntries against a unit test's
+        // ISOLATED defaults using the (empty) test GRDB, wiping the store mid-test
+        // (epoch-zero-timestamped entries are >90d old → GC'd). Detached → the rebuild
+        // reads the real `.standard` store, matching production (where the override is
+        // always nil) and no longer racing/clobbering an isolated test store.
+        Task.detached { _ = await buildReminderList(includeDisabled: true) }
     }
 
     private static let didSetupInvalidation = Mutex(false)
