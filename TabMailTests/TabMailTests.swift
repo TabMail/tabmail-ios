@@ -175,7 +175,14 @@ import Testing
         "<html style=\"margin:0\"><body style=\"padding:0\">D</body></html>",
     ]
     for input in inputs {
+        // Strip CSS (/* */) and HTML (<!-- -->) comments BEFORE locating the wrapper
+        // body: the wrapper's own stylesheet mentions tags like "<body>" in explanatory
+        // comments, which are inert — but the naive range(of: "<body>") below would
+        // otherwise latch onto the comment's "<body>", mis-extract, and then flag the
+        // real body tag as "nested".
         let wrapped = EmailHTMLWrapper.wrapHTML(input)
+            .replacingOccurrences(of: #"/\*[\s\S]*?\*/"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"<!--[\s\S]*?-->"#, with: "", options: .regularExpression)
         // Extract content between our wrapper's <body> and </body>
         guard let bodyStart = wrapped.range(of: "<body>"),
               let bodyEnd = wrapped.range(of: "</body>", options: .backwards) else {
