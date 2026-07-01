@@ -200,6 +200,9 @@ actor ActiveEmbeddingQueue {
         storage.decrementActiveJobs()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         print("[ActiveEmbed] Batch done: \(succeeded.count) embedded, \(emptyBodyIds.count) empty in \(ms)ms")
+        // Keep the WAL bounded: the embedding backfill is the app's most constant writer,
+        // so it's the most reliable place to hang the (throttled) checkpoint.
+        await SyncEngine.checkpointWALThrottled()
 
         // No inter-batch delay — forward queue runs at full speed
 

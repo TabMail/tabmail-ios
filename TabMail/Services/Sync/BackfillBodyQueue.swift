@@ -363,6 +363,7 @@ actor BackfillBodyQueue {
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                     print("[BackfillBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
+                    await SyncEngine.checkpointWALThrottled()
 
                     // Success — restore folder batch size if it was halved
                     if self.folderMaxBatch[key.folderPath] != nil {

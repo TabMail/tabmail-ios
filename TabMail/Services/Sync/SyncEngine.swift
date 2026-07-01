@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import UIKit
 
 actor SyncEngine {
@@ -164,6 +165,7 @@ actor SyncEngine {
                 dbPool: pool, includePrune: includePrune,
                 undoProtectedBodyIds: undoProtectedBodyIds
             )
+            await SyncEngine.checkpointWALThrottled(truncate: includePrune)
             await SyncEngine.runBodyAssetMaintenance()
         }
     }
@@ -214,24 +216,31 @@ actor SyncEngine {
         } else {
             print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms")
         }
-        // Flush the WAL that these deletes (+ all prior background writes) accumulated.
-        // Autocheckpoint is OFF (AppDatabase.makePool), so this is the ONLY place the WAL
-        // is checkpointed — always on `.background`, never on a foreground/`.priority`
-        // write. TRUNCATE on the full pass to also shrink the WAL file.
-        if shouldRun() {
-            checkpointWALFile(dbPool: dbPool, truncate: includePrune)
-        }
     }
 
-    /// PASSIVE (or TRUNCATE) WAL checkpoint — called ONLY from the background maintenance
-    /// path. SQLite autocheckpoint is disabled, so foreground/`.priority` writes (the
-    /// NSE→inbox merge, user actions) never stall eating a checkpoint (the ~1-2s "merge
-    /// tic lagging the paint"). Sync + off-queue, matching the sibling maintenance steps;
-    /// aggressive per-poll cadence keeps the WAL small so each checkpoint is cheap.
-    private static func checkpointWALFile(dbPool: PrioritizedDatabase, truncate: Bool) {
+    private static let walCheckpointState = Mutex<Double>(0)
+
+    /// Throttled PASSIVE (or TRUNCATE) WAL checkpoint. Safe to call from ANY `.normal` /
+    /// `.background` job — full/delta sync, header/body/embedding backfill, maintenance —
+    /// which is where every caller is. Self-throttles to at most once per
+    /// `SyncConfig.walCheckpointMinIntervalSeconds`, so a high-frequency caller (the
+    /// embedding queue drains every ~260ms) can't over-checkpoint. SQLite autocheckpoint is
+    /// OFF (`AppDatabase.makePool`), so THIS is what bounds the WAL — and it always runs on
+    /// `.background` (via `backgroundPool`), NEVER on a foreground/`.priority` write, so the
+    /// merge / a user action can't inherit a checkpoint stall (the ~1-2s "tic"). Hanging it
+    /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
+    /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
+    nonisolated static func checkpointWALThrottled(truncate: Bool = false) async {
+        let now = CFAbsoluteTimeGetCurrent()
+        let go = walCheckpointState.withLock { last -> Bool in
+            guard now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
+            last = now
+            return true
+        }
+        guard go, !DatabaseSuspension.isSuspended else { return }
         let sql = truncate ? "PRAGMA wal_checkpoint(TRUNCATE)" : "PRAGMA wal_checkpoint(PASSIVE)"
         let t0 = CFAbsoluteTimeGetCurrent()
-        let frames = try? dbPool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
+        let frames = try? await AppDatabase.backgroundPool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
             guard let row = try Row.fetchOne(db, sql: sql) else { return (-1, -1) }
             let log: Int = row[1] ?? -1
             let ckpt: Int = row[2] ?? -1
@@ -328,6 +337,7 @@ actor SyncEngine {
                         .updateAll(db, Column("lastSyncedAt").set(to: Date()))
                 }
                 print("[Sync:bg] Delta sync completed for \(account.emailAddress) (changes: \(result.hadChanges))")
+                await Self.checkpointWALThrottled()
                 return (result.hadChanges, result.hadChanges ? "deltaChanges" : "deltaNoChanges")
             } else {
                 print("[Sync:bg] Delta not ready for \(account.emailAddress) (no cursor or expired) — will full-sync on foreground")

@@ -450,6 +450,12 @@ enum SyncConfig {
     static let connectTimeoutSeconds: TimeInterval = 15
     /// Timeout for per-account sync during poll(). Prevents one stalled server from blocking others.
     static let perAccountSyncTimeoutSeconds: TimeInterval = 60
+    /// Min seconds between WAL checkpoints. The checkpoint is invoked from many
+    /// background/normal jobs (full/delta sync, backfill batches, maintenance) via
+    /// `SyncEngine.checkpointWALThrottled`; this throttle stops a high-frequency caller
+    /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
+    /// autocheckpoint is disabled (see `AppDatabase.makePool`).
+    static let walCheckpointMinIntervalSeconds: TimeInterval = 3
     /// Timeout for WiFi check (NWPathMonitor). Returns false if exceeded.
     static let wifiCheckTimeoutSeconds: TimeInterval = 5
     /// Timeout for per-account background delta sync (ensureConnected + delta).

@@ -235,6 +235,7 @@ extension SyncEngine {
             print("[FullSync] UID migrated \(uidMigratedOldIds.count) messages")
         }
         BootProfiler.mark("fullSync[\(acctTag)] DONE in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (inbox headers synced)")
+        await SyncEngine.checkpointWALThrottled()
 
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
