@@ -62,6 +62,16 @@ final class AppDatabase: Sendable {
         // WAL reads keep working while suspended; lock-acquiring accesses throw
         // SQLITE_ABORT/SQLITE_INTERRUPT and retry on next wake. See ADR-IOS-041.
         config.observesSuspensionNotifications = true
+        // WAL checkpointing is driven MANUALLY off the background maintenance path
+        // (`SyncEngine.runWALMaintenance` → PASSIVE/TRUNCATE checkpoint), NOT by SQLite's
+        // automatic page-count threshold. With autocheckpoint OFF, a foreground /
+        // `.priority` write (the NSE→inbox merge, a user action) NEVER stalls doing a
+        // checkpoint: the write that happened to cross the threshold used to eat a
+        // ~1-2s PASSIVE checkpoint, seen as the merge "tic" lagging the paint by 1-2s.
+        // Now checkpoints land only on `.background`, keeping the foreground path fast.
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+        }
         return try DatabasePool(path: databaseURL.path, configuration: config)
     }
 
