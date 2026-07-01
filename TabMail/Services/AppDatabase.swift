@@ -149,7 +149,17 @@ final class AppDatabase: Sendable {
         PrioritizedDatabase(pool: rawPool)
     }
 
-    /// `.background`-tier chokepoint for the heavy background queues (reply
+    /// `.normal`-tier chokepoint for foreground SYNC — full / delta / pull-down sync,
+    /// on-demand folder sync, infinite-scroll pagination. Beats the deep background
+    /// filling queues (`.background`) in the write scheduler but yields to the merge
+    /// and to a live user action (`.priority`). Used as `SyncEngine.dbPool`, so sync
+    /// writes are `.normal` even when issued from a `Task.detached` — the pool's own
+    /// tier survives the task-local loss a `PriorityGate.normal { }` override would not.
+    static var syncPool: PrioritizedDatabase {
+        PrioritizedDatabase(pool: rawPool, priority: .normal)
+    }
+
+    /// `.background`-tier chokepoint for the heavy background FILLING queues (reply
     /// precompute, embedding, body/header backfill, maintenance, FTS self-heal,
     /// drain-loop reconciliation). Its async writes run last in the write
     /// scheduler, so foreground/`.normal` work is never queued behind them.

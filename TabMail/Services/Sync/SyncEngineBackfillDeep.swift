@@ -43,7 +43,7 @@ extension SyncEngine {
 
             // Step 2: Find missing UIDs via batch IN query (efficient, no per-UID round-trips)
             let missingUIDs: [UInt32] = try await dbPool.read { db in
-                let sqlChunkSize = 500
+                let sqlChunkSize = SyncConfig.sqlChunkSize
                 var existingIds = Set<String>()
                 for start in stride(from: 0, to: allUIDs.count, by: sqlChunkSize) {
                     let end = min(start + sqlChunkSize, allUIDs.count)
@@ -120,7 +120,7 @@ extension SyncEngine {
 
             // Step 2: Find missing IDs via batch IN query
             let missingIds: [String] = try await dbPool.read { db in
-                let sqlChunkSize = 500
+                let sqlChunkSize = SyncConfig.sqlChunkSize
                 var existingIds = Set<String>()
                 for start in stride(from: 0, to: allIds.count, by: sqlChunkSize) {
                     let end = min(start + sqlChunkSize, allIds.count)
@@ -176,7 +176,7 @@ extension SyncEngine {
 
             // Step 2: Find missing IDs via batch IN query
             let missingIds: [String] = try await dbPool.read { db in
-                let sqlChunkSize = 500
+                let sqlChunkSize = SyncConfig.sqlChunkSize
                 var existingIds = Set<String>()
                 for start in stride(from: 0, to: allIds.count, by: sqlChunkSize) {
                     let end = min(start + sqlChunkSize, allIds.count)
@@ -488,7 +488,7 @@ extension SyncEngine {
                 print("[Backfill] Deep crawl \(folder.name): all \(result.found) found already exist — continuing deeper")
             }
 
-            try await dbPool.write { db in
+            try await AppDatabase.backgroundPool.write { db in
                 _ = try Folder.filter(Column("id") == folder.id)
                     .updateAll(db, Column("oldestSyncedDate").set(to: windowStart))
             }

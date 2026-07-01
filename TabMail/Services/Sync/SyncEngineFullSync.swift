@@ -504,7 +504,7 @@ extension SyncEngine {
         if let cached = cachedLocalIds {
             return remoteIds.subtracting(cached)
         }
-        let sqlChunkSize = 500
+        let sqlChunkSize = SyncConfig.sqlChunkSize
         let remoteArr = Array(remoteIds)
         var existingLocalIds = Set<String>()
         for start in stride(from: 0, to: remoteArr.count, by: sqlChunkSize) {

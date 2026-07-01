@@ -110,7 +110,7 @@ extension SyncEngine {
 
         // Step 2: Find which UIDs we're missing locally
         let missingUIDs: [UInt32] = try await dbPool.read { db in
-            let sqlChunkSize = 500
+            let sqlChunkSize = SyncConfig.sqlChunkSize
             var existingIds = Set<String>()
             for start in stride(from: 0, to: remoteUIDs.count, by: sqlChunkSize) {
                 let end = min(start + sqlChunkSize, remoteUIDs.count)

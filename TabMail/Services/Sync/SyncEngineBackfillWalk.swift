@@ -181,7 +181,7 @@ extension SyncEngine {
                         }
                         let initialCursor = uidNext - 1
                         if initialCursor < 1 {
-                            try? await dbPool.write { db in
+                            try? await AppDatabase.backgroundPool.write { db in
                                 _ = try Folder.filter(Column("id") == folder.id)
                                     .updateAll(db,
                                         Column("backfillComplete").set(to: true),
@@ -193,7 +193,7 @@ extension SyncEngine {
                             await updateBackfillProgressForAccount(account)
                             continue
                         }
-                        try await dbPool.write { db in
+                        try await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db,
                                     Column("backfillUidCursor").set(to: initialCursor),
@@ -247,7 +247,7 @@ extension SyncEngine {
                                         await cursor.confirmRange(from: range.from, to: range.to)
                                         if await lastProgressUpdate.shouldUpdate() {
                                             let snapshotCursor = await cursor.currentCursor
-                                            try? await self.dbPool.write { db in
+                                            try? await AppDatabase.backgroundPool.write { db in
                                                 _ = try Folder.filter(Column("id") == folderCaptured.id)
                                                     .updateAll(db, Column("backfillUidCursor").set(to: snapshotCursor))
                                             }
@@ -322,7 +322,7 @@ extension SyncEngine {
 
                                     if await lastProgressUpdate.shouldUpdate() {
                                         let snapshotCursor = await cursor.currentCursor
-                                        try? await self.dbPool.write { db in
+                                        try? await AppDatabase.backgroundPool.write { db in
                                             _ = try Folder.filter(Column("id") == folderCaptured.id)
                                                 .updateAll(db, Column("backfillUidCursor").set(to: snapshotCursor))
                                         }
@@ -341,7 +341,7 @@ extension SyncEngine {
                     let finalCursor = await cursor.currentCursor
                     let isComplete = await cursor.isComplete
                     if isComplete {
-                        try? await dbPool.write { db in
+                        try? await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db,
                                     Column("backfillComplete").set(to: true),
@@ -350,7 +350,7 @@ extension SyncEngine {
                         }
                         print("[Backfill] \(folder.name) fully crawled (all ranges confirmed)")
                     } else {
-                        try? await dbPool.write { db in
+                        try? await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db, Column("backfillUidCursor").set(to: finalCursor))
                         }
@@ -390,7 +390,7 @@ extension SyncEngine {
 
                     if pageIds.isEmpty && nextToken == nil {
                         // No more pages — folder fully crawled
-                        try? await dbPool.write { db in
+                        try? await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db,
                                     Column("backfillComplete").set(to: true),
@@ -409,7 +409,7 @@ extension SyncEngine {
 
                     // Dedup returned IDs against DB
                     let missingIds: [String] = try await dbPool.read { db in
-                        let sqlChunkSize = 500
+                        let sqlChunkSize = SyncConfig.sqlChunkSize
                         var existingIds = Set<String>()
                         for start in stride(from: 0, to: pageIds.count, by: sqlChunkSize) {
                             let end = min(start + sqlChunkSize, pageIds.count)
@@ -434,18 +434,18 @@ extension SyncEngine {
                             )
                         }
                         if let d = oldestDate {
-                            try await dbPool.write { db in
+                            try await AppDatabase.backgroundPool.write { db in
                                 _ = try Folder.filter(Column("id") == folder.id)
                                     .updateAll(db, Column("oldestSyncedDate").set(to: d))
                             }
                         }
                         // Safe to advance — all IDs on this page already exist in GRDB
-                        try await dbPool.write { db in
+                        try await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db, Column("backfillPageToken").set(to: nextToken))
                         }
                         if nextToken == nil {
-                            try? await dbPool.write { db in
+                            try? await AppDatabase.backgroundPool.write { db in
                                 _ = try Folder.filter(Column("id") == folder.id)
                                     .updateAll(db,
                                         Column("backfillComplete").set(to: true),
@@ -551,7 +551,7 @@ extension SyncEngine {
                     // If stream was interrupted (cancellation), don't advance — the
                     // same page will be re-fetched next cycle (dedup handles duplicates).
                     if !streamInterrupted {
-                        try await dbPool.write { db in
+                        try await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db, Column("backfillPageToken").set(to: nextToken))
                         }
@@ -574,7 +574,7 @@ extension SyncEngine {
 
                 // Update oldestSyncedDate from oldest fetched message
                 if let oldest = headers.min(by: { $0.date < $1.date }) {
-                    try await dbPool.write { db in
+                    try await AppDatabase.backgroundPool.write { db in
                         _ = try Folder.filter(Column("id") == folder.id)
                             .updateAll(db, Column("oldestSyncedDate").set(to: oldest.date))
                     }
@@ -582,7 +582,7 @@ extension SyncEngine {
 
                 // Gmail/Exchange: mark folder complete if this was the last page
                 if isLastPage {
-                    try? await dbPool.write { db in
+                    try? await AppDatabase.backgroundPool.write { db in
                         _ = try Folder.filter(Column("id") == folder.id)
                             .updateAll(db,
                                 Column("backfillComplete").set(to: true),

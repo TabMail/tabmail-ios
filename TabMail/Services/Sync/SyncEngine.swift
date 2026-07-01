@@ -42,13 +42,14 @@ actor SyncEngine {
     /// we see even when the query returns 0 rows.
     var recoverIncompleteExplainLogged = false
 
-    /// GRDB DatabasePool — thread-safe. The sync engine writes at `.background`
-    /// by default (backfill, maintenance, FTS self-heal), so its writes yield to
-    /// the merge / user actions in `DatabaseWriteQueue`. FOREGROUND sync (delta /
-    /// full / pagination) is bumped to `.normal` by wrapping its entry points in
-    /// `PriorityGate.normal { }`, so it beats deep backfill but still yields to the
-    /// merge.
-    var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
+    /// GRDB DatabasePool for foreground SYNC — full / delta / pull-down / on-demand /
+    /// pagination — at `.normal` (`AppDatabase.syncPool`), so it beats the deep
+    /// background FILLING queues in `DatabaseWriteQueue` but still yields to the merge
+    /// and to a live user action (`.priority`). `.normal` comes from the POOL (not a
+    /// `PriorityGate.normal { }` override), so it survives the `Task.detached` the
+    /// per-folder fullSync writes run in. Backfill / FTS self-heal / maintenance write
+    /// via `AppDatabase.backgroundPool` directly (`.background`).
+    var dbPool: PrioritizedDatabase { AppDatabase.syncPool }
 
     /// Read current fast sync mode state from AccountManager (MainActor hop).
     func getIsFastSync() async -> Bool {

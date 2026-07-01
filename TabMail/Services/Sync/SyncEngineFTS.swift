@@ -51,7 +51,7 @@ extension SyncEngine {
             }
             // Mark headers as fully indexed — body queue requires headerComplete=1.
             let headerIds = records.map(\.headerId)
-            try await dbPool.write { db in
+            try await AppDatabase.backgroundPool.write { db in
                 for headerId in headerIds {
                     try db.execute(
                         sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
@@ -130,7 +130,7 @@ extension SyncEngine {
         }
         await indexHeadersForFTS(toReindex)
 
-        try await dbPool.write { db in
+        try await AppDatabase.backgroundPool.write { db in
             for chunk in missingIds.chunked(into: 500) {
                 let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
                 try db.execute(
@@ -504,7 +504,7 @@ extension SyncEngine {
                             }
                             // Mark headers as fully indexed
                             let headerIds = records.map(\.headerId)
-                            try? await self?.dbPool.write { db in
+                            try? await AppDatabase.backgroundPool.write { db in
                                 for hid in headerIds {
                                     try db.execute(
                                         sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",

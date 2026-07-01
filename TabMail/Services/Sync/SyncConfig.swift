@@ -222,6 +222,9 @@ enum SyncConfig {
     /// anything outside its floor). Generous on purpose — normal folders sit well under
     /// it; only pathologically large folders (Gmail All Mail / big Archives) trip it.
     static let staleDetectionMaxFullScan = 2000
+    /// Max bound parameters per SQL `IN (...)` chunk — stays under SQLite's variable
+    /// limit. Used to chunk large id lists for membership / dedup queries.
+    static let sqlChunkSize = 500
     /// Page size for inbox list pagination (per folder).
     static let inboxPageSize = 50
     /// Body fetch chunk — how many bodies to fetch at a time during background sync.
