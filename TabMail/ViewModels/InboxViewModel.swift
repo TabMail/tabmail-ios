@@ -1654,11 +1654,17 @@ final class InboxViewModel {
 
     /// Check if inbox qualifies as "large" (100+ messages with some older than 2 weeks).
     /// Updates TipKit parameter and UserDefaults flag (read by sidebar badge + settings).
-    func checkLargeInbox() {
+    func checkLargeInbox() async {
         let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date()
         let folderIds = Set(folders.map(\.id))
 
-        guard let (totalCount, oldCount) = try? dbPool.read({ db -> (Int, Int) in
+        // Run both COUNT(*)s OFF the main actor (async dbPool.read overload). They are
+        // folderId-index-assisted (the `date <` one rides messageHeader_folderId_date),
+        // but on a large All Mail account even an index COUNT is non-trivial — doing it
+        // through the SYNC dbPool.read on @MainActor blocked the UI on EVERY inbox
+        // onAppear (tab switch / nav-back / foreground). Result only feeds a TipKit flag
+        // + UserDefaults, so computing it slightly later off-main is strictly better.
+        guard let (totalCount, oldCount) = try? await dbPool.read({ db -> (Int, Int) in
             let total = try MessageHeader
                 .filter(folderIds.contains(Column("folderId")))
                 .fetchCount(db)

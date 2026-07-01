@@ -683,7 +683,7 @@ struct InboxView: View {
             viewModel.loadInitialPage()
             viewModel.startSync()
             if isInboxView {
-                viewModel.checkLargeInbox()
+                Task { await viewModel.checkLargeInbox() }
                 // Refresh push-enabled parameter so the tip's display rule
                 // reflects the current UserDefaults value. Written here (not
                 // @AppStorage) to keep the tip gate centralized — the Settings
