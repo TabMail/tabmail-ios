@@ -220,10 +220,17 @@ actor ActiveEmbeddingQueue {
     private func repopulateOnDrain() async {
         do {
             let ids: [String] = try await AppDatabase.dbPool.read { db in
+                // ORDER BY MUST match the `messageHeader_embeddingIncomplete` index
+                // (isInInbox DESC, date DESC). This query has NO isInInbox filter, so a
+                // plain `date DESC` can't use the index for ordering — SQLite top-N-sorts
+                // the ENTIRE remaining un-embedded backlog on EVERY drain (~1000 drains
+                // over a large account = GBs of re-read: the read "burst" seen in profiling).
+                // Matching the index makes it a top-500 index seek; bonus: inbox embeds
+                // first, which the index's leading `isInInbox DESC` always intended.
                 try String.fetchAll(db, sql: """
                     SELECT id FROM messageHeader
                     WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0
-                    ORDER BY date DESC
+                    ORDER BY isInInbox DESC, date DESC
                     LIMIT 500
                     """)
             }
