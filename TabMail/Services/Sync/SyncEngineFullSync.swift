@@ -18,7 +18,7 @@ extension SyncEngine {
         print("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
         BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
 
-        let pool = AppDatabase.dbPool
+        let pool = dbPool
         try await pool.write { db in
             let localFolders = try Folder.filter(Column("accountId") == account.id).fetchAll(db)
 
@@ -478,6 +478,48 @@ extension SyncEngine {
         }
     }
 
+    /// Which of `remoteIds` are NEW (not already present locally in `folderId`) —
+    /// i.e. `remoteIds − localIdsInFolder`. Feeds UID-remap detection in `runSyncMessages`.
+    ///
+    /// `newRemoteIds` only ever subtracts from `remoteIds`, so intersecting the local
+    /// set with `remoteIds` FIRST is byte-identical to loading the whole folder and
+    /// subtracting (`remoteIds − local ≡ remoteIds − (local ∩ remoteIds)`) — but WITHOUT
+    /// materializing tens of thousands of rows for a huge folder (All Mail; the old
+    /// unbounded `SELECT messageId WHERE folderId = ?` was ~7s of write execution INSIDE
+    /// the writer). When the caller already loaded the full local-id set for stale
+    /// detection (`cachedLocalIds`, the small-folder branch), reuse it; otherwise do a
+    /// bounded, chunked membership check (same idiom as `SyncEngineSelfHeal`).
+    ///
+    /// `messageId` IS the UID for IMAP — this is pure exact membership, with NO date/UID
+    /// window, so it does NOT touch stale-window semantics (ADR-IOS-042-safe). Empty
+    /// `remoteIds` is a valid no-op (the loop doesn't run; returns empty) — this is why
+    /// the query builder is used over a raw `IN (…)`, which would be invalid SQL for an
+    /// empty list.
+    nonisolated static func newRemoteIds(
+        in db: Database,
+        folderId: String,
+        remoteIds: Set<String>,
+        cachedLocalIds: Set<String>?
+    ) throws -> Set<String> {
+        if let cached = cachedLocalIds {
+            return remoteIds.subtracting(cached)
+        }
+        let sqlChunkSize = 500
+        let remoteArr = Array(remoteIds)
+        var existingLocalIds = Set<String>()
+        for start in stride(from: 0, to: remoteArr.count, by: sqlChunkSize) {
+            let end = min(start + sqlChunkSize, remoteArr.count)
+            let chunk = Array(remoteArr[start..<end])
+            let found = try String.fetchSet(db,
+                MessageHeader
+                    .select(Column("messageId"))
+                    .filter(Column("folderId") == folderId && chunk.contains(Column("messageId")))
+            )
+            existingLocalIds.formUnion(found)
+        }
+        return remoteIds.subtracting(existingLocalIds)
+    }
+
     /// Core message sync logic — runs entirely off the main thread.
     /// Fetches messages from provider, performs stale detection + upsert in a single
     /// DB write transaction. No MainActor state accessed.
@@ -500,6 +542,10 @@ extension SyncEngine {
         // Pending ops are loaded INSIDE the write transaction to prevent TOCTOU races
         // (a user action inserting a PendingOperation between a separate read and this write
         // would cause the pendingDestructiveIds set to be stale, leading to UNIQUE constraint violations).
+        // DIAGNOSTIC (debug-gated): time this per-folder write. The merge waits ≤ ONE
+        // in-flight write (DatabaseWriteQueue can't preempt SQLite), so a single long
+        // folder write here is the residual cap to chunk. Remove once confirmed bounded.
+        let writeStart = CFAbsoluteTimeGetCurrent()
         let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]) = try await dbPool.write { db in
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
@@ -547,9 +593,29 @@ extension SyncEngine {
             // Stale-detection window dimension MUST match the provider's fetch ordering
             // (see selectStaleHeaders): IMAP = UID (archive-time, decorrelated from date),
             // Gmail/Exchange = date. A date window on IMAP over-deletes the Archive.
+            // DIAGNOSTIC (debug-gated): decompose the per-folder write so a residual long
+            // exec (e.g. All Mail) can be attributed to a PHASE, which the whole-tx
+            // `DBwrite EXEC` mark can't. `staleDetect` = the stale-candidate load (:611
+            // fetchAll OR :634 `CAST(messageId AS INTEGER)` scan — both scale with folder
+            // size; the CAST defeats the index so it scans ALL rows). `newRemoteIds` = the
+            // FIX-A bounded membership check. If newRemoteIds is ~ms while staleDetect is
+            // seconds, FIX A is working and the CAST-scan is the residual to bound next.
+            let staleCandT0 = CFAbsoluteTimeGetCurrent()
             let windowMode = provider.staleWindowMode
-            if messages.count < limit {
-                // Got everything — find local messages not in remote set
+            // Complete-knowledge stale detection (treat the fetch as the whole folder and
+            // stale-delete any local row not returned) is only safe AND bounded when the
+            // LOCAL side is also small. A LARGE folder that returns < limit is almost
+            // certainly a truncated/partial fetch, NOT genuine complete knowledge — so gate
+            // on a cheap index-backed COUNT (evaluated ONLY when the fetch came back short,
+            // via `&&` short-circuit) and fall through to the bounded windowed slice when
+            // the folder is large. This bounds the load (no whole-folder fetchAll on All
+            // Mail) AND prevents mass-stale-deleting rows a partial fetch never returned
+            // (ADR-IOS-042). selectStaleHeaders / windowMode are unchanged — this only
+            // decides WHICH candidate set they run against.
+            if messages.count < limit,
+               try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) <= SyncConfig.staleDetectionMaxFullScan {
+                // Got everything AND the folder is small enough to trust — find local
+                // messages not in remote set
                 let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(db)
                 let localIds = Set(allLocal.map(\.messageId))
                 allLocalIds = localIds
@@ -562,7 +628,9 @@ extension SyncEngine {
                 }
                 stale = Self.selectStaleHeaders(candidates: allLocal, fetched: messages, limit: limit, windowMode: windowMode)
             } else {
-                // Folder is larger than the fetch window — load ONLY the bounded
+                // Folder is larger than the fetch window — OR it returned < limit but has
+                // more than `staleDetectionMaxFullScan` local rows, so a "complete" read is
+                // untrustworthy (likely a partial fetch; ADR-IOS-042). Load ONLY the bounded
                 // candidate slice (not the whole folder, per the memory budget) in the
                 // fetch-ordering dimension, then let selectStaleHeaders re-apply the
                 // same floor as the single source of truth.
@@ -588,6 +656,7 @@ extension SyncEngine {
                 }
                 stale = Self.selectStaleHeaders(candidates: candidates, fetched: messages, limit: limit, windowMode: windowMode)
             }
+            BootProfiler.mark("sync[\(folder.name)] staleDetect \(Int((CFAbsoluteTimeGetCurrent() - staleCandT0) * 1000))ms (stale=\(stale.count), remote=\(messages.count))")
             // Don't delete messages with pending operations or recently completed ops.
             // Undo-restored messages are protected by their PendingOp(move-back).
             let isProtectedByPending: (MessageHeader) -> Bool = { msg in
@@ -622,14 +691,14 @@ extension SyncEngine {
             // changes, etc. Migrate the local row in-place to preserve local state (body, AI cache).
             var uidMigratedRemoteIds = Set<String>()
             var uidMigratedOldMsgIds: [String] = []
-            // Reuse allLocalIds from stale detection when available; otherwise fetch just IDs (lightweight)
-            let localMsgIds: Set<String>
-            if let cached = allLocalIds {
-                localMsgIds = cached
-            } else {
-                localMsgIds = try Set(String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ?", arguments: [folderId]))
-            }
-            let newRemoteIds = remoteIds.subtracting(localMsgIds)
+            // Which remote ids are NEW (not already local) — bounded membership check;
+            // see `newRemoteIds(in:folderId:remoteIds:cachedLocalIds:)`. Reuses the
+            // allLocalIds set from stale detection when it was already loaded.
+            let remapT0 = CFAbsoluteTimeGetCurrent()
+            let newRemoteIds = try Self.newRemoteIds(
+                in: db, folderId: folderId, remoteIds: remoteIds, cachedLocalIds: allLocalIds
+            )
+            BootProfiler.mark("sync[\(folder.name)] newRemoteIds \(Int((CFAbsoluteTimeGetCurrent() - remapT0) * 1000))ms")
             // Pre-build lookup by rfc822MessageId for O(1) matching (avoids O(stale × messages) scan)
             var newMessagesByRfc822: [String: [MessageHeaderInfo]] = [:]
             for msg in messages where newRemoteIds.contains(msg.messageId) {
@@ -1138,6 +1207,10 @@ extension SyncEngine {
             // (see ActiveAIQueue.onDrainComplete).
 
             return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys)
+        }
+        let writeMs = Int((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
+        if writeMs > 30 {
+            BootProfiler.mark("fullSync write[\(folder.name)]: \(messages.count) msg in \(writeMs)ms")
         }
 
         return SyncMessagesResult(

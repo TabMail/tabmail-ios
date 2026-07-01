@@ -210,6 +210,18 @@ enum BackfillProfile {
 enum SyncConfig {
     /// How many messages to fetch per folder during sync (fullSync, deltaSync, on-demand).
     static let syncMessageLimit = 50
+    /// Upper bound on local rows for the "complete-knowledge" stale-detection path
+    /// (`runSyncMessages`, the `messages.count < limit` branch). When the fetch returns
+    /// fewer than `syncMessageLimit` we normally treat it as the whole folder and may
+    /// stale-delete any local row not in the remote set. That is only SAFE (and bounded)
+    /// when the LOCAL side is also small: a LARGE folder that returns < limit is almost
+    /// certainly a truncated/partial fetch, and concluding "complete" there would both
+    /// load the whole folder into the writer AND risk mass-stale-deleting rows the
+    /// partial fetch never returned (the ADR-IOS-042 data-loss class). Above this count
+    /// we fall through to the bounded windowed slice instead (which can't conclude
+    /// anything outside its floor). Generous on purpose — normal folders sit well under
+    /// it; only pathologically large folders (Gmail All Mail / big Archives) trip it.
+    static let staleDetectionMaxFullScan = 2000
     /// Page size for inbox list pagination (per folder).
     static let inboxPageSize = 50
     /// Body fetch chunk — how many bodies to fetch at a time during background sync.

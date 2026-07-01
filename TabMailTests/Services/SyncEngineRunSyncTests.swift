@@ -1034,3 +1034,226 @@ struct RunSyncUIDRemapFtsRekeyTests {
         #expect(body?.htmlContent == "<p>kept</p>")
     }
 }
+
+// MARK: - FIX A: bounded newRemoteIds membership (SyncEngine.newRemoteIds)
+
+/// Direct coverage for `SyncEngine.newRemoteIds(in:folderId:remoteIds:cachedLocalIds:)`
+/// — the bounded membership check that replaced an unbounded full-folder load inside
+/// `runSyncMessages` (All Mail was ~7s of write execution). Unlike the rest of this
+/// file (which simulates the sync core), these call the REAL production helper, so they
+/// guard the chunked-stride path, the empty-`remoteIds` no-op (a raw `IN ()` would be
+/// invalid SQL), folder scoping, and equivalence with the full-load subtraction it
+/// replaced.
+@Suite("runSyncMessages — newRemoteIds (bounded membership)")
+struct RunSyncNewRemoteIdsTests {
+
+    @Test("Returns only remote ids not already present locally (DB path)")
+    func newIdsFromDB() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        try TestDatabase.insertMessageHeader(db, messageId: "1")
+        try TestDatabase.insertMessageHeader(db, messageId: "2")
+        try TestDatabase.insertMessageHeader(db, messageId: "3")
+
+        let remote: Set<String> = ["2", "3", "4", "5"]
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: folder.id, remoteIds: remote, cachedLocalIds: nil)
+        }
+        #expect(result == ["4", "5"])
+    }
+
+    @Test("Empty remoteIds is a valid no-op (no IN () crash)")
+    func emptyRemoteIds() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        try TestDatabase.insertMessageHeader(db, messageId: "1")
+
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: folder.id, remoteIds: [], cachedLocalIds: nil)
+        }
+        #expect(result.isEmpty)
+    }
+
+    @Test("All remote already local → empty")
+    func allLocal() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        try TestDatabase.insertMessageHeader(db, messageId: "1")
+        try TestDatabase.insertMessageHeader(db, messageId: "2")
+
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: folder.id, remoteIds: ["1", "2"], cachedLocalIds: nil)
+        }
+        #expect(result.isEmpty)
+    }
+
+    @Test("No local rows → every remote id is new")
+    func noneLocal() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+
+        let remote: Set<String> = ["7", "8", "9"]
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: folder.id, remoteIds: remote, cachedLocalIds: nil)
+        }
+        #expect(result == remote)
+    }
+
+    @Test("cachedLocalIds path bypasses the DB entirely")
+    func cachedPath() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        // No rows inserted for "2"/"3", yet the cache marks them local → they must be
+        // excluded purely from the cache, proving the DB path is not consulted.
+        let remote: Set<String> = ["2", "3", "4"]
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: folder.id, remoteIds: remote, cachedLocalIds: ["2", "3"])
+        }
+        #expect(result == ["4"])
+    }
+
+    @Test("Scoped to the folder — same messageId in another folder is still new")
+    func folderScoped() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let inbox = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        let archive = try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        // messageId "5" exists only in Archive.
+        try TestDatabase.insertMessageHeader(db, messageId: "5", folderId: archive.id, folderPath: "Archive")
+
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: inbox.id, remoteIds: ["5"], cachedLocalIds: nil)
+        }
+        #expect(result == ["5"])
+    }
+
+    @Test("Chunked path (> chunk size) equals full-load subtraction")
+    func chunkedEquivalence() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        // 300 local ids "0".."299".
+        var localIds = Set<String>()
+        for i in 0..<300 {
+            try TestDatabase.insertMessageHeader(db, messageId: "\(i)")
+            localIds.insert("\(i)")
+        }
+        // 601 remote ids "0".."600" → forces two IN chunks (sqlChunkSize = 500).
+        let remote = Set((0...600).map { "\($0)" })
+        let result = try db.read {
+            try SyncEngine.newRemoteIds(in: $0, folderId: folder.id, remoteIds: remote, cachedLocalIds: nil)
+        }
+        #expect(result == remote.subtracting(localIds))
+    }
+}
+
+// MARK: - FIX C: large-folder stale safety (real runSyncMessages)
+
+/// Drives the REAL `SyncEngine.runSyncMessages` via `MockEmailProvider` to lock the
+/// FIX C safeguard: when a fetch returns FEWER than `limit` messages, the
+/// "complete-knowledge" stale path (delete any local row not returned) is taken ONLY
+/// when the local side is <= `SyncConfig.staleDetectionMaxFullScan`. A LARGE folder
+/// that returns < limit is a truncated/partial fetch — treating it as complete would
+/// mass-stale-delete the rows it never returned (the ADR-IOS-042 data-loss class).
+@Suite("runSyncMessages — large-folder stale safety (FIX C)", .serialized)
+struct RunSyncLargeFolderStaleSafetyTests {
+
+    @Test("Large folder + partial (< limit) fetch does NOT mass-stale-delete unreturned rows")
+    func largeFolderPartialFetchNoMassStale() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let oldCount = SyncConfig.staleDetectionMaxFullScan + 50   // exceeds the gate
+        try await pool.write { db in
+            var acc = Account(emailAddress: "arch@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "racc").insert(db)
+            // Many OLD low-UID archive rows (below any realistic fetch floor).
+            for uid in 1...oldCount {
+                var h = MessageHeader(
+                    messageId: "\(uid)", subject: "Old \(uid)", from: "a@x", fromAddress: "a@x",
+                    to: "b@x", date: date, snippet: "s",
+                    folderId: "racc:Archive", accountId: "racc", folderPath: "Archive", isInInbox: false
+                )
+                h.rfc822MessageId = "old-\(uid)@example.com"
+                h.headerComplete = true
+                try h.insert(db)
+            }
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Archive")! }
+        // Simulate a TRUNCATED fetch of a huge folder: only 3 high-UID messages come back
+        // (< limit), none matching the old local rows.
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "900000", rfc822MessageId: "new-900000@example.com", subject: "New", date: date),
+            makeHeaderInfo(messageId: "900001", rfc822MessageId: "new-900001@example.com", subject: "New", date: date),
+            makeHeaderInfo(messageId: "900002", rfc822MessageId: "new-900002@example.com", subject: "New", date: date),
+        ])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+
+        // FIX C: localCount > threshold → bounded windowed path (UID floor = 900000), so
+        // none of the old low-UID rows are candidates → nothing stale-deleted. Without the
+        // gate this would complete-knowledge-delete all `oldCount` rows (ADR-IOS-042).
+        #expect(result.staleIds.isEmpty)
+        let survivors = try await pool.read {
+            try MessageHeader.filter(Column("folderId") == "racc:Archive").fetchCount($0)
+        }
+        #expect(survivors >= oldCount)          // all old rows survive (+ the 3 new inserts)
+        let firstRow = try await pool.read { try MessageHeader.fetchOne($0, key: "racc:Archive:1") }
+        #expect(firstRow != nil)
+    }
+
+    @Test("Small folder + partial (< limit) fetch STILL stale-deletes a genuinely-missing row")
+    func smallFolderCompleteKnowledgePreserved() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "arch@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "racc").insert(db)
+            for uid in 1...5 {
+                var h = MessageHeader(
+                    messageId: "\(uid)", subject: "Msg \(uid)", from: "a@x", fromAddress: "a@x",
+                    to: "b@x", date: date, snippet: "s",
+                    folderId: "racc:Archive", accountId: "racc", folderPath: "Archive", isInInbox: false
+                )
+                h.rfc822MessageId = "m-\(uid)@example.com"
+                h.headerComplete = true
+                try h.insert(db)
+            }
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Archive")! }
+        // Server now returns only UIDs 1-4 (< limit); UID 5 is genuinely gone.
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult((1...4).map { uid in
+            makeHeaderInfo(messageId: "\(uid)", rfc822MessageId: "m-\(uid)@example.com", subject: "Msg \(uid)", date: date)
+        })
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+
+        // localCount (5) <= threshold → complete-knowledge path preserved → UID 5 is stale.
+        #expect(result.staleIds.contains("racc:Archive:5"))
+        #expect(!result.staleIds.contains("racc:Archive:1"))
+    }
+}
