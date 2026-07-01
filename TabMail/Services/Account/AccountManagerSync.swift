@@ -97,8 +97,12 @@ extension AccountManager {
         }
         do {
             try await ensureConnected(account)
+            // Foreground inbox catch-up runs at `.normal` — it beats deep backfill
+            // in the write scheduler but yields to the merge / a live user action.
             let changed = try await withTimeout(seconds: SyncConfig.perAccountSyncTimeoutSeconds) {
-                try await self.syncEngine.sync(account: account)
+                try await PriorityGate.normal {
+                    try await self.syncEngine.sync(account: account)
+                }
             }
             return SyncResult(hadChanges: changed, failed: false)
         } catch is TimeoutError {

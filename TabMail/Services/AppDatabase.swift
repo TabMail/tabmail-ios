@@ -141,20 +141,20 @@ final class AppDatabase: Sendable {
     }
 
     /// The app database chokepoint — every read/write flows through here. Its
-    /// async writes yield to an active privileged section (the NSE→inbox merge /
-    /// boot path) automatically, so essential work isn't queued behind them; the
-    /// privileged context itself is exempt (see `PriorityGate`/`PrioritizedDatabase`).
+    /// async writes run through `DatabaseWriteQueue` at `.priority` (the default
+    /// tier), so foreground work — the NSE→inbox merge, optimistic user actions,
+    /// the badge recount — jumps ahead of queued background writes in the single
+    /// GRDB writer. See `PriorityGate`/`PrioritizedDatabase`/`DatabaseWriteQueue`.
     static var dbPool: PrioritizedDatabase {
         PrioritizedDatabase(pool: rawPool)
     }
 
-    /// Background-tagged chokepoint for the heavy background queues (reply
-    /// precompute, embedding, body/header backfill). Identical to `dbPool` except
-    /// its async writes YIELD to any active priority/privileged section (the
-    /// foreground/UI work — NSE merge, badge recount, inbox reload) instead of
-    /// making that work queue behind them. See `PriorityGate`/`PrioritizedDatabase`.
+    /// `.background`-tier chokepoint for the heavy background queues (reply
+    /// precompute, embedding, body/header backfill, maintenance, FTS self-heal,
+    /// drain-loop reconciliation). Its async writes run last in the write
+    /// scheduler, so foreground/`.normal` work is never queued behind them.
     static var backgroundPool: PrioritizedDatabase {
-        PrioritizedDatabase(pool: rawPool, isBackground: true)
+        PrioritizedDatabase(pool: rawPool, priority: .background)
     }
 
     // MARK: - NSE Staging Database
@@ -1770,6 +1770,34 @@ final class AppDatabase: Sendable {
             try db.alter(table: "account") { t in
                 t.add(column: "calendarSetupFailed", .boolean).notNull().defaults(to: false)
             }
+        }
+
+        migrator.registerMigration("v62_inboxQueryUnreadDateIndex") { db in
+            // The UNREAD-filter inbox query is `WHERE folderId=? AND isRead=false
+            // ORDER BY date DESC LIMIT N` (InboxViewModel fetchPage/fetchFullRange).
+            // `messageHeader_folderId_date` (folderId,date) ALREADY exists and covers
+            // the NON-filtered list; `messageHeader_folderId_isRead` (folderId,isRead,
+            // v21) exists for the unread COUNT but lacks `date`, so the unread LIST
+            // still seeks (folderId,isRead=0) then SORTS by date. This (folderId,
+            // isRead,date) composite lets it seek + scan in date order and stop at
+            // LIMIT — no sort — so a huge folder (Gmail "All Mail") doesn't block the
+            // synchronous @MainActor `fetchPage` read when the unread filter is on.
+            //
+            // ⚠️ DATE here is DISPLAY-ONLY (the list is ordered by date for human
+            // reading). DO NOT reuse a date window/cursor for IMAP *sync* decisions —
+            // UID and message-date are decorrelated and a date window over-deletes the
+            // Archive (ADR-IOS-042 data-loss; CLAUDE.md Data Integrity rule 4). Sync
+            // stale/cursor logic windows by UID via `selectStaleHeaders` /
+            // `staleWindowMode`, NOT this index.
+            //
+            // IF NOT EXISTS is REQUIRED: building a composite index on a HUGE folder
+            // is slow and can be interrupted by DB suspension (ADR-IOS-041) / an app
+            // kill AFTER the index commits but BEFORE GRDB records the migration —
+            // a non-idempotent re-run would hit "index already exists" and BRICK the
+            // whole DB build (stuck on the migration splash). (The original v62 also
+            // tried to CREATE the already-existing `messageHeader_folderId_date` —
+            // that NAME COLLISION is what bricked it; that duplicate is removed here.)
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_isRead_date ON messageHeader(folderId, isRead, date)")
         }
     }
 }

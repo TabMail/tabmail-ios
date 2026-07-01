@@ -576,6 +576,13 @@ enum NSEDataBridge {
                 print("[NSEDataBridge] Merge phase 1 failed (outer tx): \(error)")
             }
 
+            // DIAGNOSTIC (debug-gated): isolate the phase-1 header upsert tx from
+            // the FTS-surface step below. The "found N staged" → "newly visible"
+            // gap has been observed at 2–20s during concurrent background sync;
+            // this localizes whether the cost is the upsert tx (main writer) or
+            // flushHeadersToFTS (main read / FTS actor / flip). Remove once pinned.
+            BootProfiler.mark("merge phase1: header upsert tx done (\(phase1HeaderIds.count) id(s))")
+
             // Surface the headers NOW: index + flip headerComplete=1 (inbox-
             // visible), then render. This is the early paint that decouples
             // visibility from the body blob; phase 2's end-of-merge post is the
@@ -1574,6 +1581,9 @@ enum NSEDataBridge {
         let validHeaders = headerIds.compactMap { headersById[$0] }
         guard !validHeaders.isEmpty else { return 0 }
 
+        // DIAGNOSTIC (debug-gated): step-1 main-pool read done. Remove once pinned.
+        BootProfiler.mark("merge phase1 flush: header read done (\(validHeaders.count))")
+
         // 2. Batch FTS header indexing for ALL merged headers. Idempotent — known
         //    IDs are skipped; header records carry no body, so this is cheap.
         let records = validHeaders.map { header -> FTSHeaderRecord in
@@ -1595,6 +1605,12 @@ enum NSEDataBridge {
             print("[NSEDataBridge] FTS header flush: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
             return 0
         }
+
+        // DIAGNOSTIC (debug-gated): step-2 SearchIndex-actor indexHeaders done. If
+        // the big gap lands between the step-1 mark and THIS one, the stall is the
+        // serial SearchIndex actor contending with background updateBodies/
+        // indexHeaders. Remove once pinned.
+        BootProfiler.mark("merge phase1 flush: FTS indexHeaders done")
 
         // 3. Batch flip headerComplete=1 for the indexed headers that are NOT yet
         //    visible → inbox-visible NOW. The inbox query gates on headerComplete
