@@ -43,19 +43,19 @@ struct SplashView: View {
                     Text("Updating database…")
                         .font(.title3.weight(.semibold))
 
-                    // Indeterminate linear bar — the migrator doesn't expose a
+                    // Indeterminate activity bar — the migrator doesn't expose a
                     // reliable completion fraction (cost is dominated by a few
                     // heavy passes), so an honest indeterminate bar beats a fake
                     // percentage. Can become determinate later if we count
                     // completed migration steps.
-                    ProgressView()
-                        .progressViewStyle(.linear)
+                    IndeterminateActivityBar()
                         .frame(maxWidth: 240)
 
-                    Text("This one-time update may take a moment.\nPlease keep TabMail open.")
+                    Text("This one-time update may take a moment. Please keep TabMail open.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.horizontal, 32)
                 .padding(.top, 8)
@@ -64,5 +64,37 @@ struct SplashView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Indeterminate linear activity bar. On iOS, `ProgressView()` with
+/// `.progressViewStyle(.linear)` and no value renders a STATIC empty track
+/// (UIKit has no indeterminate `UIProgressView`; only the circular style
+/// animates) — which read as a frozen launch, the opposite of what the
+/// migration splash exists to convey. This sweeps a segment across the track
+/// so a long migration always shows visible activity.
+private struct IndeterminateActivityBar: View {
+    @State private var sweeping = false
+
+    private static let barHeight: CGFloat = 4
+    private static let segmentFraction: CGFloat = 0.35
+    private static let sweepDuration: TimeInterval = 1.2
+
+    var body: some View {
+        GeometryReader { geo in
+            let segmentWidth = geo.size.width * Self.segmentFraction
+            Capsule()
+                .fill(.tint)
+                .frame(width: segmentWidth)
+                .offset(x: sweeping ? geo.size.width : -segmentWidth)
+        }
+        .frame(height: Self.barHeight)
+        .background(Capsule().fill(.quaternary))
+        .clipShape(Capsule())
+        .onAppear {
+            withAnimation(.linear(duration: Self.sweepDuration).repeatForever(autoreverses: false)) {
+                sweeping = true
+            }
+        }
     }
 }

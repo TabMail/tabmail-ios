@@ -811,6 +811,13 @@ NOT GRDB schema migrations (those are in `AppDatabase.runMigrations`, the `Datab
 
 ---
 
+## Migration Splash / iOS Indeterminate Linear ProgressView Pitfall (2026-07-01)
+
+- **`ProgressView().progressViewStyle(.linear)` with no value renders a STATIC empty track on iOS** — UIKit has no indeterminate `UIProgressView`, so only the circular style animates when value-less. A value-less linear bar looks frozen (exactly the "frozen launch" impression the migration splash exists to avoid). `SplashView.IndeterminateActivityBar` (a `withAnimation(.repeatForever)` sweeping capsule) is the in-repo replacement — reuse it if another indeterminate linear bar is ever needed.
+- **No hard `\n` inside wrapping `Text`** — a forced break combined with natural wrapping (narrow devices / large Dynamic Type) produces unbalanced orphan lines. Let sentences flow in one string with `.multilineTextAlignment(.center)` + `.fixedSize(horizontal: false, vertical: true)`.
+
+---
+
 ## Zero (BYOK) Plan — IAP Surface (ADR-IOS-040)
 
 - Products `ai.tabmail.byok.monthly`/`.yearly` — tier string "BYOK" everywhere internal; **only display renders "Zero"** via `StoreKitManager.displayPlanName(forTier:)`. Ranks: Unknown=0/BYOK=1/Basic=2/Pro=3 (`tierRank(for:)`/`tierRank(forTier:)`).
