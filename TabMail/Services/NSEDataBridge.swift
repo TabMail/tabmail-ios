@@ -77,43 +77,115 @@ enum NSEDataBridge {
         }
     }
 
-    /// True when the staging DB actually holds a populated (merge-ready) row.
+    /// Change-detection signature of the populated staging set. Every gradual
+    /// stage transition is observable here: a new header row changes `count` +
+    /// `maxProcessedAt` (set on first insert); `stageBody` flips html/text
+    /// NULL→non-NULL (`bodiedCount`); `stageSummary` flips summaryBlurb
+    /// (`summariedCount`); the terminal persist flips `aiCompleted`
+    /// (`aiCompletedCount`), and its post-merge delete drops `count`.
+    /// `processedAt` is NOT bumped by the later stages (first-insert only, it
+    /// anchors the abandon window) — that's exactly why the stage counts are in
+    /// the signature. Anything hypothetically invisible to it (an
+    /// identical-signature content rewrite, a failed merge awaiting retry) is
+    /// bounded by `stagingMergeSignatureTTLSeconds`, after which the read-through
+    /// path merges regardless.
+    struct StagingSignature: Equatable, Sendable {
+        let count: Int
+        let maxProcessedAt: Double
+        let bodiedCount: Int
+        let summariedCount: Int
+        let aiCompletedCount: Int
+    }
+
+    /// Signature of the staged set the last read-through-triggered merge consumed,
+    /// with its completion timestamp. Compared by `mergeIfStagingPending` to skip
+    /// re-merging a KEPT gradual row (`aiCompleted=0` survives the merge by design,
+    /// so the pending-probe would otherwise answer "yes" — and trigger a full
+    /// ~45ms re-merge — on EVERY async read for up to 60s per push).
+    private static let lastMergedStagingSignature = Mutex<(sig: StagingSignature, at: Double)?>(nil)
+
+    /// The populated staging set's signature, or nil when nothing is pending.
     /// COALESCED to at most one cross-process probe per `stagingProbeCoalesceMs`:
     /// reads are frequent and the probe is a non-WAL shared-container read, so
     /// without this every read would pay a cross-process read transaction.
-    /// Between probes it returns false — a freshly-staged row is picked up by the
+    /// Between probes it returns nil — a freshly-staged row is picked up by the
     /// next post-window read (≤ window latency) or the explicit merge triggers
     /// (which call `mergeNSEStagingData` directly, bypassing this probe), and the
-    /// row stays populated=1 so nothing is lost.
-    private static func stagingHasPending() async -> Bool {
+    /// row stays populated=1 so nothing is lost. Probe contention (fail-fast
+    /// `.immediateError`) likewise returns nil — same fail-open-toward-skip
+    /// semantics as before.
+    private static func stagingPendingSignature() async -> StagingSignature? {
         let nowMs = CFAbsoluteTimeGetCurrent() * 1000
         let shouldProbe = lastProbeMs.withLock { last -> Bool in
             guard nowMs - last >= SyncConfig.stagingProbeCoalesceMs else { return false }
             last = nowMs
             return true
         }
-        guard shouldProbe, let db = stagingProbeConnection() else { return false }
-        return (try? await db.read { db -> Bool in
-            guard try db.tableExists("nse_processed_message") else { return false }
-            return try Bool.fetchOne(
-                db, sql: "SELECT EXISTS(SELECT 1 FROM nse_processed_message WHERE populated = 1)"
-            ) ?? false
-        }) ?? false
+        guard shouldProbe, let db = stagingProbeConnection() else { return nil }
+        return (try? await db.read { db -> StagingSignature? in
+            guard try db.tableExists("nse_processed_message") else { return nil }
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT COUNT(*) AS c,
+                       COALESCE(MAX(processedAt), 0) AS maxP,
+                       COALESCE(SUM(CASE WHEN htmlContent IS NOT NULL OR textContent IS NOT NULL THEN 1 ELSE 0 END), 0) AS bodied,
+                       COALESCE(SUM(CASE WHEN summaryBlurb IS NOT NULL THEN 1 ELSE 0 END), 0) AS summaried,
+                       COALESCE(SUM(aiCompleted), 0) AS aiDone
+                FROM nse_processed_message WHERE populated = 1
+                """), (row["c"] as Int? ?? 0) > 0 else { return nil }
+            return StagingSignature(
+                count: row["c"],
+                maxProcessedAt: row["maxP"],
+                bodiedCount: row["bodied"],
+                summariedCount: row["summaried"],
+                aiCompletedCount: row["aiDone"]
+            )
+        }) ?? nil
+    }
+
+    /// Pure skip decision, extracted for unit testing: skip the read-through merge
+    /// iff the current staging signature exactly matches what the last merge
+    /// consumed AND that merge is younger than the TTL. Any mismatch, absence of a
+    /// recorded signature, or TTL expiry → merge.
+    static func shouldSkipReadThroughMerge(
+        current: StagingSignature,
+        last: (sig: StagingSignature, at: Double)?,
+        now: Double,
+        ttl: TimeInterval = SyncConfig.stagingMergeSignatureTTLSeconds
+    ) -> Bool {
+        guard let last else { return false }
+        return last.sig == current && (now - last.at) < ttl
     }
 
     /// READ-PATH entry: drain NSE staging into main GRDB if (and only if) the
-    /// staging DB has a pending row. Treats staging as a read-through delta — any
-    /// read (UI render, silent push, BGAppRefresh, BGProcessing) merges it first,
-    /// with no per-call-site placement. The pending check reads the real staging
-    /// DB (no flag drift) and is ~µs when empty; the full merge runs only when
-    /// there's actually something to merge.
+    /// staging DB has pending work the app hasn't merged yet. Treats staging as a
+    /// read-through delta — any read (UI render, silent push, BGAppRefresh,
+    /// BGProcessing) merges it first, with no per-call-site placement. The pending
+    /// check reads the real staging DB (no flag drift) and is ~µs when empty.
+    ///
+    /// SIGNATURE SKIP: a KEPT gradual row (merged, but retained in staging until
+    /// the NSE finishes AI — ADR-IOS-047) keeps the probe answering "yes" for up
+    /// to 60s, which used to re-run a full merge on every async read (measured 47×
+    /// per push during a sync burst). The skip is deferral-only, never a drop:
+    /// staging rows are deleted ONLY by phase-2 commit, the signature observes
+    /// every stage transition, the TTL re-merges anything it can't see within
+    /// `stagingMergeSignatureTTLSeconds`, and ALL explicit merge triggers
+    /// (foreground, push, syncStartup step-0, AI queue, action-gate ensureDurable)
+    /// call `mergeNSEStagingData`/the coordinator directly — bypassing this skip.
     static func mergeIfStagingPending() async {
         // Recursion guard: the merge does its own GRDB reads (e.g. the FTS flush
         // bulk header read), which run inside `PriorityGate.privileged` — don't
         // re-trigger a merge from within one.
         guard !PriorityGate.inPrivilegedContext else { return }
-        guard await stagingHasPending() else { return }
+        guard let current = await stagingPendingSignature() else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let last = lastMergedStagingSignature.withLock { $0 }
+        if shouldSkipReadThroughMerge(current: current, last: last, now: now) { return }
         await mergeNSEStagingData()
+        // Record the PRE-merge signature (what this merge consumed). If the merge
+        // itself deleted terminal rows or the NSE staged more mid-merge, the next
+        // probe's signature differs → one settling re-merge, which then records
+        // the settled signature. Errs toward merging more, never less.
+        lastMergedStagingSignature.withLock { $0 = (sig: current, at: CFAbsoluteTimeGetCurrent()) }
     }
 
     // MARK: - Mirror (Main App → Shared UserDefaults for NSE)

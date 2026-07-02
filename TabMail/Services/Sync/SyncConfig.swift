@@ -433,6 +433,17 @@ enum SyncConfig {
     /// be imperceptible, large enough that frequent reads don't hammer the file.
     static let stagingProbeCoalesceMs: Double = 100
 
+    /// Max age of a matched staging signature before the read-through path merges
+    /// anyway (see `NSEDataBridge.mergeIfStagingPending`). A KEPT gradual row
+    /// (`aiCompleted=0`, NSE still computing) makes the pending-probe answer "yes"
+    /// for up to 60s; without the signature skip, EVERY async read re-ran a full
+    /// ~45ms merge of an already-merged row (measured: 47 re-merges per push).
+    /// The TTL bounds the worst case for anything the signature can't see
+    /// (identical-signature content change, or a failed merge needing retry):
+    /// it re-merges within this window regardless. Explicit merge triggers
+    /// (foreground, push, syncStartup, action-gate) bypass the skip entirely.
+    static let stagingMergeSignatureTTLSeconds: TimeInterval = 5
+
     /// BGAppRefresh earliest begin date. iOS controls actual timing;
     /// this is the minimum delay we request.
     static let bgAppRefreshIntervalSeconds: TimeInterval = 300 // 5 min
