@@ -17,6 +17,9 @@ struct AccountDetailView: View {
     @State private var showResetConfirmation = false
     @State private var isResetting = false
     @State private var folders: [Folder] = []
+    @State private var signatureText = ""
+    @FocusState private var signatureFocused: Bool
+    @Environment(\.scenePhase) private var scenePhase
 
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
@@ -181,16 +184,13 @@ struct AccountDetailView: View {
             }
 
             Section("Signature") {
-                TextEditor(text: Binding(
-                    get: { account.signature ?? "" },
-                    set: { newValue in
-                        let sig = newValue.isEmpty ? nil : newValue
-                        account.signature = sig
-                        saveAccountField("signature", value: sig)
-                    }
-                ))
-                .scrollDisabled(true)
-                .frame(minHeight: 40)
+                // Bound to local @State and committed on focus loss — saving on
+                // every keystroke (DB write + navigationStore mutation) invalidates
+                // the view mid-edit and resets the TextEditor caret to the end.
+                TextEditor(text: $signatureText)
+                    .focused($signatureFocused)
+                    .scrollDisabled(true)
+                    .frame(minHeight: 40)
 
                 Toggle("Place below quote", isOn: Binding(
                     get: { account.signatureBelowQuote },
@@ -333,9 +333,17 @@ struct AccountDetailView: View {
         .navigationTitle(account.emailAddress)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
+            signatureText = account.signature ?? ""
             reloadAccount()
             reloadFolders()
         }
+        .onChange(of: signatureFocused) { _, focused in
+            if !focused { commitSignature() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { commitSignature() }
+        }
+        .onDisappear { commitSignature() }
         .onReceive(NotificationCenter.default.publisher(for: .unreadCountsDidChange).debounce(for: .seconds(0.3), scheduler: RunLoop.main)) { _ in
             reloadAccount()
             reloadFolders()
@@ -387,6 +395,15 @@ struct AccountDetailView: View {
         if let idx = navigationStore.accounts.firstIndex(where: { $0.id == account.id }) {
             navigationStore.accounts[idx] = account
         }
+    }
+
+    /// Persist the signature if it changed. Called on focus loss, view
+    /// dismissal, and app backgrounding — never per keystroke.
+    private func commitSignature() {
+        let sig = signatureText.isEmpty ? nil : signatureText
+        guard sig != account.signature else { return }
+        account.signature = sig
+        saveAccountField("signature", value: sig)
     }
 
     /// Refresh sync-managed fields (lastSyncedAt, etc.) from DB without
