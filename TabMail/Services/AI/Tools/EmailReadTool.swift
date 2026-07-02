@@ -49,10 +49,15 @@ struct EmailReadTool: AgentTool, Sendable {
             try MessageBody.fetchOne(db, key: realId)
         }
 
-        // Extract plain text from HTML for LLM consumption
+        // Extract plain text from HTML for LLM consumption. The MessageBody row
+        // is an evictable display cache — for older messages it's often absent
+        // while the full body TEXT is still indexed in FTS, so fall back to
+        // that before degrading to the snippet.
         let bodyText: String
         if let html = body?.htmlContent, !html.isEmpty {
             bodyText = EmailFilter.htmlToPlainText(html)
+        } else if let ftsBody = try? await SearchIndex.shared.bodyText(headerId: realId), !ftsBody.isEmpty {
+            bodyText = ftsBody
         } else {
             bodyText = header.snippet
         }

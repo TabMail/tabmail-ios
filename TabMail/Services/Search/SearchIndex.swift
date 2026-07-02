@@ -1675,6 +1675,29 @@ actor SearchIndex {
         }
     }
 
+    /// Which of the given headers have REAL body text indexed in FTS.
+    /// Length-only probe (never materializes body text — the one-time
+    /// bodyComplete restore feeds this thousands of ids at once). A length-1
+    /// body is treated as absent: it's either the " " sentinel or too short to
+    /// distinguish from one — conservative callers refetch it once.
+    func headerIdsWithFTSBody(_ headerIds: [String]) throws -> Set<String> {
+        ensureReady()
+        guard let dbPool, !headerIds.isEmpty else { return [] }
+        return try dbPool.read { [self] db in
+            var result = Set<String>()
+            for headerId in headerIds {
+                guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
+                let table = ftsTableName(year: resolved.year)
+                let length = try Int.fetchOne(db, sql: "SELECT length(body) FROM \(table) WHERE rowid = ?",
+                                              arguments: [resolved.rowid])
+                if let length, length > 1 {
+                    result.insert(headerId)
+                }
+            }
+            return result
+        }
+    }
+
     /// Raw FTS body without sentinel filtering — used by self-heal to distinguish
     /// sentinel values (e.g. " ") from truly empty bodies.
     func rawFTSBody(headerId: String) throws -> String? {

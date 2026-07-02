@@ -237,6 +237,95 @@ extension SyncEngine {
         }
     }
 
+    /// UserDefaults gate for the one-time bodyComplete restore. Repairs the
+    /// damage from the pre-2026-07-02 `BodyAssetMaintenance` conflation, where
+    /// asset-cache eviction flipped `bodyComplete = 0` on thousands of rows
+    /// whose body text was still fully indexed in FTS — re-enqueueing them all
+    /// into the backfill body queue for pointless refetches (the "indexing goes
+    /// backwards" loop). Versioned so a future re-run only needs a key bump.
+    static let bodyCompleteRestoreDoneKey = "bodyCompleteRestore.v1.done"
+
+    /// One-time reverse heal: rows flagged `bodyComplete = 0` whose FTS entry
+    /// HAS real body text get flipped back to `bodyComplete = 1` — zero network,
+    /// restores a truthful `pendingBodyCount` instantly.
+    ///
+    /// Predicate (each condition load-bearing):
+    /// - `headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0` —
+    ///   the body queues' pending population.
+    /// - FTS body text present (`headerIdsWithFTSBody`, length > 1 — excludes
+    ///   the " " sentinel and header-only FTS entries). NSE unresolved-CID mail
+    ///   never writes an FTS body, so it is naturally excluded.
+    /// - NO `messageBody` row. A row that still has cached HTML while flagged
+    ///   incomplete is some "cache present but flagged for re-render" state
+    ///   (e.g. a suspension-aborted `flushBatch` flag write) — skipping it costs
+    ///   one refetch and risks nothing; healing it could freeze a stale render.
+    ///   Asset-eviction victims always had their `messageBody` row deleted, so
+    ///   they all qualify.
+    ///
+    /// The gate is set only after a clean full pass; an interrupted run resumes
+    /// next launch (idempotent). `scopePrefix` restricts to a header-id prefix —
+    /// test isolation only.
+    func oneTimeBodyCompleteRestore(defaults: UserDefaults = .standard, scopePrefix: String? = nil) async {
+        guard !defaults.bool(forKey: Self.bodyCompleteRestoreDoneKey) else { return }
+        do {
+            // Id-only load of the whole candidate population (same trade-off as
+            // BackfillBodyQueue.repopulateFromDatabase: tens of thousands of
+            // short strings, one-time).
+            let candidates: [String] = try await dbPool.read { db in
+                if let prefix = scopePrefix {
+                    return try String.fetchAll(db, sql: """
+                        SELECT id FROM messageHeader
+                        WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                          AND id LIKE ?
+                        """, arguments: ["\(prefix)%"])
+                }
+                return try String.fetchAll(db, sql: """
+                    SELECT id FROM messageHeader
+                    WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0
+                    """)
+            }
+            var healed = 0
+            for chunk in candidates.chunked(into: SyncConfig.sqlChunkSize) {
+                // Abandon on suspension (ADR-IOS-046) — gate stays unset, the
+                // pass restarts next launch.
+                guard !DatabaseSuspension.isSuspended else {
+                    print("[FTS] bodyComplete restore paused by suspension — resuming next launch")
+                    return
+                }
+                let withBody = try await SearchIndex.shared.headerIdsWithFTSBody(chunk)
+                guard !withBody.isEmpty else { continue }
+                let withBodyArr = Array(withBody)
+                let cachedIds: Set<String> = try await dbPool.read { db in
+                    let placeholders = withBodyArr.map { _ in "?" }.joined(separator: ",")
+                    return try Set(String.fetchAll(
+                        db,
+                        sql: "SELECT id FROM messageBody WHERE id IN (\(placeholders))",
+                        arguments: StatementArguments(withBodyArr)
+                    ))
+                }
+                let toHeal = withBodyArr.filter { !cachedIds.contains($0) }
+                guard !toHeal.isEmpty else { continue }
+                try await AppDatabase.backgroundPool.write { db in
+                    let placeholders = toHeal.map { _ in "?" }.joined(separator: ",")
+                    try db.execute(
+                        sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (\(placeholders))",
+                        arguments: StatementArguments(toHeal)
+                    )
+                }
+                healed += toHeal.count
+            }
+            defaults.set(true, forKey: Self.bodyCompleteRestoreDoneKey)
+            if healed > 0 {
+                print("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) rows (FTS body present, no cached HTML)")
+                BackgroundSyncLogger.log("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) rows")
+                BackgroundSyncLogger.logBackfill("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) pending rows without refetch")
+            }
+        } catch {
+            // Gate NOT set — the pass restarts from the beginning next launch.
+            print("[FTS] bodyComplete restore failed: \(error) — resuming next launch")
+        }
+    }
+
     /// Full-history GRDB→FTS membership sweep: rowid-cursor walk over ALL
     /// `bodyComplete = 1 AND headerComplete = 1` headers (no date window),
     /// re-indexing + re-queueing any missing from FTS. Returns healed count.

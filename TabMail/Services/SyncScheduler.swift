@@ -320,7 +320,12 @@ final class SyncScheduler {
             // clean completion).
             await manager.syncEngine.oneTimeFTSReconciliation()
             let hT3 = CFAbsoluteTimeGetCurrent()
-            BackgroundSyncLogger.log("syncStartup: delayed self-heal done — 2b=\(Int((hT1-hT0)*1000))ms 2c=\(Int((hT2-hT1)*1000))ms prune=\(Int((hT3-hT2)*1000))ms")
+            // One-time reverse heal: pending rows whose FTS body already exists
+            // (pre-fix asset-eviction victims) flip back to bodyComplete=1
+            // without refetching (UserDefaults-gated).
+            await manager.syncEngine.oneTimeBodyCompleteRestore()
+            let hT4 = CFAbsoluteTimeGetCurrent()
+            BackgroundSyncLogger.log("syncStartup: delayed self-heal done — 2b=\(Int((hT1-hT0)*1000))ms 2c=\(Int((hT2-hT1)*1000))ms prune=\(Int((hT3-hT2)*1000))ms restore=\(Int((hT4-hT3)*1000))ms")
         }
         _ = healTask // fire-and-forget; no waiters
         stepLog("step3b spawned delayed selfHeal (+5s)")

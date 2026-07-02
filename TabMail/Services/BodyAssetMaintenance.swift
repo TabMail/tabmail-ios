@@ -10,9 +10,18 @@ import GRDB
 /// `messageHeader` tables) which the NSE target can't access.
 ///
 /// `BodyAssetStore` itself is NSE-safe: writes, reads, and bumps run identically
-/// in both targets. The kind=0 path's `bodyComplete = 0` flip + `MessageBody`
-/// row drop, plus the cross-DB orphan sweep, are main-app responsibilities and
-/// live here.
+/// in both targets. The kind=0 path's `MessageBody` row drop, plus the cross-DB
+/// orphan sweep, are main-app responsibilities and live here.
+///
+/// INVARIANT (2026-07-02): eviction NEVER touches `bodyComplete`. That flag is
+/// the FTS-indexed truth (backfill completion / pendingBodyCount / AI + embedding
+/// gating) and eviction doesn't remove FTS text. Flipping it here re-enqueued
+/// every victim into the backfill body queue, which re-fetched the bodies, which
+/// re-filled this cache past its cap, which evicted again — an infinite
+/// refetch loop ("indexing goes backwards"). "HTML cache present" needs no flag:
+/// the `messageBody` row's existence IS that state, and the detail view already
+/// fetches on cache-miss (same contract as `runEvictStaleBodies` /
+/// `runPruneIfOverBudget`, which have always deleted rows without flag flips).
 ///
 /// Triggers (all main-app):
 /// - `evictIfOverCap()` — after-write trigger, foreground sweep, picker change.
@@ -34,22 +43,24 @@ enum BodyAssetMaintenance {
     private static let maxEvictionIterations = 1000
 
     /// LRU eviction. Drops oldest-accessed messages' assets whole until under cap.
-    /// kind=0 victims also get `bodyComplete = 0` + `MessageBody` row drop in
-    /// the main DB (so the body queue refetches on next open).
+    /// kind=0 victims also get their `MessageBody` row dropped in the main DB
+    /// (their cached HTML references the deleted `tabmail-asset://` files; the
+    /// detail view fetches on cache-miss). `bodyComplete` is NOT touched — see
+    /// the type-level invariant.
     static func evictIfOverCap() async {
-        await evict(target: { capBytes in
+        await evict(reason: "overCap", target: { capBytes in
             Int64(Double(capBytes) * evictionHysteresisFactor)
         })
     }
 
     /// Tighter prune for thermal/memory pressure.
     static func pruneForPressure() async {
-        await evict(target: { capBytes in
+        await evict(reason: "pressure", target: { capBytes in
             Int64(Double(capBytes) * thermalPruneRatio)
         })
     }
 
-    private static func evict(target targetFn: (Int64) -> Int64) async {
+    private static func evict(reason: String, target targetFn: (Int64) -> Int64) async {
         let budget = BodyAssetStore.attachmentsBudgetMB
         guard budget != BodyAssetConfig.unlimitedBudgetMB else { return }
 
@@ -59,6 +70,9 @@ enum BodyAssetMaintenance {
         var current = BodyAssetStore.usedBytes
         guard current > capBytes else { return }
 
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let startBytes = current
+        var victims = 0
         var iterations = 0
         while current > target && iterations < maxEvictionIterations {
             iterations += 1
@@ -75,27 +89,33 @@ enum BodyAssetMaintenance {
                     headerId: victim.headerId, inlineCount: victim.inlineCount
                 )
                 current -= bytesReclaimed
+                victims += 1
                 if current <= target { break }
             }
         }
         BodyAssetStore.invalidateUsedBytesCachePublic()
+        let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        let reclaimedMB = Double(startBytes - current) / 1024 / 1024
+        print("[BodyAssetMaintenance] evict(\(reason)): \(victims) messages, \(String(format: "%.1f", reclaimedMB))MB reclaimed in \(ms)ms")
+        BackgroundSyncLogger.logBackfill("[AssetEvict] \(reason): \(victims) messages, \(String(format: "%.1f", reclaimedMB))MB reclaimed in \(ms)ms (budget=\(budget)MB)")
     }
 
     /// Drops a single message's assets. Returns bytes reclaimed (0 on failure).
     /// Order: main-DB write (kind=0 only) → manifest+files via store.
     /// If main-DB write fails, abort — leaving everything in place for retry.
-    /// If manifest delete fails after main-DB write, body queue refetches and
-    /// the old rows get overwritten via INSERT … ON CONFLICT.
-    private static func dropMessage(headerId: String, inlineCount: Int) async -> Int64 {
+    /// If manifest delete fails after main-DB write, the detail view's
+    /// cache-miss fetch re-renders and the old rows get overwritten via
+    /// INSERT … ON CONFLICT.
+    /// `internal` (not private) so tests can pin the "never touches
+    /// bodyComplete" invariant directly.
+    static func dropMessage(headerId: String, inlineCount: Int) async -> Int64 {
         if inlineCount > 0 {
             do {
                 try await AppDatabase.dbPool.write { db in
+                    // Cache-presence is the messageBody row itself — do NOT
+                    // touch bodyComplete here (see type-level invariant).
                     try db.execute(
                         sql: "DELETE FROM messageBody WHERE id = ?",
-                        arguments: [headerId]
-                    )
-                    try db.execute(
-                        sql: "UPDATE messageHeader SET bodyComplete = 0 WHERE id = ?",
                         arguments: [headerId]
                     )
                 }
@@ -109,7 +129,10 @@ enum BodyAssetMaintenance {
 
     /// Wipe all assets for a specific kind.
     /// - `.inlineImage`: deletes manifest rows + files + (in main DB) MessageBody
-    ///   rows + flips `bodyComplete = 0` for every affected header.
+    ///   rows for every affected header. `bodyComplete` is NOT touched (see the
+    ///   type-level invariant) — the user asked for disk space back, not a
+    ///   full-history re-download through the backfill queue; bodies come back
+    ///   lazily on open.
     /// - `.attachment`: deletes manifest rows + files only.
     static func wipeAll(kind: BodyAssetKind) async {
         if kind == .inlineImage {
@@ -125,15 +148,12 @@ enum BodyAssetMaintenance {
                         sql: "DELETE FROM messageBody WHERE id IN (\(placeholders))",
                         arguments: args
                     )
-                    try db.execute(
-                        sql: "UPDATE messageHeader SET bodyComplete = 0 WHERE id IN (\(placeholders))",
-                        arguments: args
-                    )
                 }
             } catch {
                 print("[BodyAssetMaintenance] wipeAll(.inlineImage) main-DB write failed: \(error)")
                 return
             }
+            BackgroundSyncLogger.logBackfill("[AssetEvict] wipeAll(.inlineImage): \(affected.count) messages' cached bodies dropped")
         }
         // Manifest rows + files.
         _ = BodyAssetStore.deleteAllAssets(kind: kind)
