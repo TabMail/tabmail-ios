@@ -111,6 +111,31 @@ enum NSEDataBridge {
     /// empty/drained, which resets it so a future re-stage posts again).
     private static let lastPostedStagedRows = Mutex<[StagedInboxRow]>([])
 
+    /// The snippet a staged row should DISPLAY (in-memory render + phase-1 DB
+    /// seed). Pure, extracted for unit testing.
+    ///
+    /// Preference order (the "weird snippet that then snaps" fix):
+    /// 1. Body-derived (`snippetFromPlainText(textContent)`) — byte-identical to
+    ///    the canonical snippet phase-2 writes, so the row NEVER visibly changes.
+    /// 2. `cleanSnippet(providerSnippet)` — body not staged yet. Gmail's API
+    ///    `snippet` / Graph's `bodyPreview` arrive HTML-ENTITY-ENCODED with the
+    ///    provider's own truncation (`GmailParse.swift` stores `json["snippet"]`
+    ///    RAW into staging); the six sync-path header creators launder it through
+    ///    `cleanSnippet`, but the staged-row display path didn't — the in-memory
+    ///    row briefly showed literal `&#39;`/`&amp;` garbage until the
+    ///    body-derived snippet landed ("weird snippet that then snaps in").
+    ///    Staging deliberately stays RAW and THIS is the single cleaning
+    ///    boundary: entity decoding is not idempotent (`&amp;lt;` → `&lt;` →
+    ///    `<`), so cleaning both at NSE-stage time and here would double-decode.
+    static func stagedDisplaySnippet(providerSnippet: String, textContent: String?) -> String {
+        if let text = textContent, !text.isEmpty {
+            let derived = EmailFilter.snippetFromPlainText(text)
+            if !derived.isEmpty { return derived }
+        }
+        guard !providerSnippet.isEmpty else { return "" }
+        return EmailFilter.cleanSnippet(providerSnippet)
+    }
+
     /// Pure memo compare + update, extracted for unit testing: true iff `rows`
     /// (order-normalized by headerId) differs from what the memo last recorded;
     /// the memo is updated to `rows` either way it changed. In-memory equality
@@ -603,7 +628,9 @@ enum NSEDataBridge {
                 senderName: msg.senderName,
                 senderAddress: msg.senderEmail,
                 to: msg.to,
-                snippet: msg.snippet,
+                snippet: Self.stagedDisplaySnippet(
+                    providerSnippet: msg.snippet, textContent: msg.textContent
+                ),
                 date: msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date(),
                 isRead: msg.isRead,
                 isFlagged: msg.isFlagged,
@@ -664,7 +691,7 @@ enum NSEDataBridge {
             // ============================================================
             var phase1HeaderIds: [String] = []
             do {
-                phase1HeaderIds = try await AppDatabase.dbPool.write { db -> [String] in
+                phase1HeaderIds = try await AppDatabase.dbPool.write(label: "merge.phase1") { db -> [String] in
                     var localIds: [String] = []
                     for msg in processed {
                         // Per-message savepoint: a failure leaves THIS row in
@@ -688,22 +715,31 @@ enum NSEDataBridge {
                                 }
                                 if let id = existingId {
                                     // Already visible (sync or a prior merge). SEED
-                                    // the snippet from the NSE's staged value ONLY if
-                                    // the header has none yet — so the fast header
-                                    // render has something to show. Do NOT overwrite
-                                    // an existing snippet: phase 2 computes the
-                                    // canonical body-derived snippet (matching the
-                                    // sync path), and re-seeding msg.snippet here on
-                                    // every wake would OSCILLATE against phase 2's
-                                    // value (each merge flips it), which both churns
-                                    // the column and defeats the no-op detection that
-                                    // gates the end-of-merge render → redundant
-                                    // reloads. `AND (snippet IS NULL OR snippet = '')`
-                                    // makes the re-seed a one-time, no-oscillation op.
-                                    if !msg.snippet.isEmpty {
+                                    // the snippet ONLY if the header has none yet —
+                                    // so the fast header render has something to
+                                    // show. Do NOT overwrite an existing snippet:
+                                    // phase 2 computes the canonical body-derived
+                                    // snippet (matching the sync path), and
+                                    // re-seeding here on every wake would OSCILLATE
+                                    // against phase 2's value (each merge flips it),
+                                    // which both churns the column and defeats the
+                                    // no-op detection that gates the end-of-merge
+                                    // render → redundant reloads. `AND (snippet IS
+                                    // NULL OR snippet = '')` makes the re-seed a
+                                    // one-time, no-oscillation op.
+                                    // Seed the DISPLAY snippet (body-derived when
+                                    // staged text exists — identical to phase 2's,
+                                    // so it never visibly changes; else the CLEANED
+                                    // provider snippet — raw Gmail/Graph snippets
+                                    // are entity-encoded, the "weird snippet" bug).
+                                    let seed = Self.stagedDisplaySnippet(
+                                        providerSnippet: msg.snippet,
+                                        textContent: msg.textContent
+                                    )
+                                    if !seed.isEmpty {
                                         try db.execute(
                                             sql: "UPDATE messageHeader SET snippet = ? WHERE id = ? AND (snippet IS NULL OR snippet = '')",
-                                            arguments: [msg.snippet, id]
+                                            arguments: [seed, id]
                                         )
                                     }
                                     localIds.append(id)
@@ -831,7 +867,7 @@ enum NSEDataBridge {
                 // late-surfacing residual is writer contention, not the write itself.
                 let writeReqT0 = CFAbsoluteTimeGetCurrent()
                 BootProfiler.mark("merge: requesting GRDB writer for \(processed.count) staged msg(s)")
-                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool) = try await AppDatabase.dbPool.write { db in
+                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
                     BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
                     // Connection-level write counter snapshot. The delta over this
                     // whole transaction tells us whether phase 2 changed anything
@@ -2115,7 +2151,12 @@ enum NSEDataBridge {
             fromAddress: msg.senderEmail,
             to: msg.to,
             date: msgDate,
-            snippet: msg.snippet,
+            // Display snippet, not raw staging value — raw Gmail/Graph provider
+            // snippets are entity-encoded ("weird snippet" bug); body-derived
+            // preferred so it matches what the phase-2/snippet pipeline settles on.
+            snippet: stagedDisplaySnippet(
+                providerSnippet: msg.snippet, textContent: msg.textContent
+            ),
             folderId: folderId,
             accountId: msg.accountId,
             folderPath: msg.folderPath,

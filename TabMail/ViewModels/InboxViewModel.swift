@@ -541,6 +541,9 @@ final class InboxViewModel {
             let ms = Int((CFAbsoluteTimeGetCurrent() - tStart) * 1000)
             if ms >= 50 {
                 BackgroundSyncLogger.logInbox("[\(tag)] flushAIBatch \(ms)ms ids=\(idCount)")
+                // Boot-log mirror: main-actor cost must be correlatable against
+                // ⚠ MAIN THREAD STALL marks in the downloadable boot log.
+                BootProfiler.mark("flushAIBatch \(ms)ms ids=\(idCount)")
             }
         }
         // Batch-read all needed headers in a single ASYNC DB read (suspends, never
@@ -578,8 +581,18 @@ final class InboxViewModel {
                 if let v = mutation.actionTag { snapshot.actionTag = v }
                 if let v = mutation.isInInbox { snapshot.isInInbox = v }
             }
-            // Preserve snippet (not in header, loaded separately)
-            snapshot.snippet = loadedMessages[idx].snippet
+            // Snippet: the fresh DB header's snippet WINS when non-empty — the old
+            // "preserve" unconditionally stomped it with the stale in-memory value,
+            // which held a new IMAP push's snippet EMPTY through every AI repaint
+            // (action tag visible, no snippet) until the terminal-merge reload.
+            // (`MessageSnapshot(from:)` does copy `header.snippet`; the old
+            // comment's "not in header" premise was wrong.) Keep the in-memory
+            // value only as a fallback for the SnippetLoader's in-place fills,
+            // which can be ahead of the DB (tier-1/2 update the row before/without
+            // a header write landing).
+            if snapshot.snippet.isEmpty {
+                snapshot.snippet = loadedMessages[idx].snippet
+            }
             if snapshot != loadedMessages[idx] {
                 loadedMessages[idx] = snapshot
                 changed = true
@@ -905,6 +918,8 @@ final class InboxViewModel {
         requeueVisibleSnippets()
         if diffMs + rebuildMs >= 50 {
             BackgroundSyncLogger.logInbox("[\(instanceTag)] reloadMessages MainActor-sync cost: applyDiff=\(diffMs)ms rebuildGroups=\(rebuildMs)ms (fresh=\(freshMessages.count), loaded=\(loadedMessages.count))")
+            // Boot-log mirror for stall-window correlation.
+            BootProfiler.mark("reloadMessages MainActor-sync applyDiff=\(diffMs)ms rebuildGroups=\(rebuildMs)ms")
         }
     }
 
@@ -1147,6 +1162,10 @@ final class InboxViewModel {
             // Tiny wait + huge query = slow query (fix: query itself)
             if totalMs >= 50 {
                 BackgroundSyncLogger.logInbox("[\(instanceTag)] fetchPage timing wait=\(waitMs)ms query=\(queryMs)ms total=\(totalMs)ms folders=\(folders.count) page=\(pageSize) results=\(allResults.count)")
+                // Boot-log mirror: fetchPage is a SYNC main-actor read (initial
+                // paint + infinite-scroll paging) — the top remaining suspect for
+                // scroll-time stalls; wait= is reader-pool wait ON THE MAIN THREAD.
+                BootProfiler.mark("fetchPage SYNC main-actor wait=\(waitMs)ms query=\(queryMs)ms total=\(totalMs)ms")
             }
         } catch {
             print("[InboxViewModel] fetchPage error: \(error)")
@@ -1286,6 +1305,7 @@ final class InboxViewModel {
         let readMs = Int((CFAbsoluteTimeGetCurrent() - tRead) * 1000)
         if readMs >= 50 {
             BackgroundSyncLogger.logInbox("[\(instanceTag)] snippet batch header read \(readMs)ms (n=\(batch.count))")
+            BootProfiler.mark("snippet batch header read \(readMs)ms (n=\(batch.count))")
         }
         guard !Task.isCancelled else { return }
         // ADR-IOS-049: staged rows rendered in-memory may not be durable in GRDB yet —

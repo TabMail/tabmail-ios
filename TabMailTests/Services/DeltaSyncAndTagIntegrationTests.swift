@@ -821,8 +821,8 @@ struct DeltaSyncUnreadRecountTests {
 
         // Simulate what runSyncMessages does when server says msg0 is now read:
         // Updates existing row (flag change), no new headers inserted, no stale IDs.
-        var newHeaders: [MessageHeader] = []
-        var staleIds: [String] = []
+        let newHeaders: [MessageHeader] = []
+        let staleIds: [String] = []
 
         try db.write { dbConn in
             if var existing = try MessageHeader
@@ -872,7 +872,7 @@ struct DeltaSyncUnreadRecountTests {
         // Simulate mixed delta:
         // 1. Delete msg0 (was unread → -1 unread)
         try db.write {
-            try MessageHeader.filter(Column("messageId") == "msg0").deleteAll($0)
+            _ = try MessageHeader.filter(Column("messageId") == "msg0").deleteAll($0)
         }
 
         // 2. Mark msg1 as read (flag change → -1 unread)

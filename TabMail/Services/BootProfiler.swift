@@ -63,6 +63,55 @@ enum BootProfiler {
         BackgroundSyncLogger.logBoot(line)
     }
 
+    // MARK: - Main-thread stall watchdog
+
+    /// One watchdog thread for the process (armed once from `startStallWatchdog`).
+    private static let watchdogArmed = Mutex<Bool>(false)
+
+    /// Debug-gated main-thread stall watchdog: pings the main queue every
+    /// `pingInterval`; when a ping's turnaround exceeds `stallThreshold` the
+    /// stall lands in the BootProfile timeline as `⚠ MAIN THREAD STALL ~Xms`,
+    /// timestamped at RECOVERY (the ping runs when the main thread frees up, so
+    /// the stall WINDOW is [mark − Xms, mark]). This is the attribution tool for
+    /// user-reported "main actor stall" — correlate the window against the
+    /// surrounding EXEC/merge/sync marks instead of guessing. Costs one ping
+    /// block per 250ms while debug logging is unlocked; never armed otherwise.
+    static func startStallWatchdog(
+        pingInterval: TimeInterval = 0.25,
+        stallThreshold: TimeInterval = 0.5
+    ) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let shouldArm = watchdogArmed.withLock { armed -> Bool in
+            if armed { return false }
+            armed = true
+            return true
+        }
+        guard shouldArm else { return }
+        let thread = Thread {
+            while true {
+                let sent = CFAbsoluteTimeGetCurrent()
+                let done = Mutex<Bool>(false)
+                DispatchQueue.main.async {
+                    let latency = CFAbsoluteTimeGetCurrent() - sent
+                    done.withLock { $0 = true }
+                    if latency > stallThreshold {
+                        mark("⚠ MAIN THREAD STALL ~\(Int(latency * 1000))ms (recovered now; window = the preceding \(Int(latency * 1000))ms)")
+                    }
+                }
+                Thread.sleep(forTimeInterval: pingInterval)
+                // If the ping is still pending after the sleep, the main thread is
+                // CURRENTLY stalled — wait for it rather than piling up pings.
+                while !done.withLock({ $0 }) {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+        }
+        thread.name = "tabmail.mainThreadStallWatchdog"
+        thread.qualityOfService = .utility
+        thread.start()
+        mark("main-thread stall watchdog armed (ping=\(Int(pingInterval * 1000))ms threshold=\(Int(stallThreshold * 1000))ms)")
+    }
+
     /// Read this process's start time from the kernel (`KERN_PROC_PID`) and
     /// convert the `p_starttime` timeval (unix epoch) to `CFAbsoluteTime`.
     private static func kernelProcessStart() -> CFAbsoluteTime? {

@@ -115,6 +115,109 @@ struct InboxViewModelAIBatchTests {
         }
     }
 
+    // MARK: - Snippet semantics
+
+    /// Insert one header with an explicit snippet value; returns its header id.
+    /// Sync helper (matches `insertMessages`) so GRDB's SYNC overloads are chosen —
+    /// an inline call in an async test body selects the async overloads instead.
+    @MainActor
+    private func insertHeader(
+        _ pool: DatabasePool, messageId: String, folderId: String, snippet: String
+    ) throws -> String {
+        let header = MessageHeader(
+            messageId: messageId, subject: "Push", from: "s@example.com",
+            fromAddress: "s@example.com", to: "test@example.com", date: Date(),
+            snippet: snippet, folderId: folderId, accountId: "acc1",
+            folderPath: "INBOX", isInInbox: true
+        )
+        try pool.writeWithoutTransaction { db in
+            var h = header
+            h.headerComplete = true
+            try h.insert(db)
+        }
+        let stored = try pool.read { db in
+            try MessageHeader
+                .filter(Column("messageId") == messageId && Column("accountId") == "acc1")
+                .fetchOne(db)
+        }
+        return stored?.id ?? ""
+    }
+
+    /// Write snippet + actionTag for a message (merge-phase-2 style).
+    @MainActor
+    private func writeSnippetAndTag(
+        _ pool: DatabasePool, headerId: String, snippet: String, tag: ActionTag
+    ) throws {
+        try pool.writeWithoutTransaction { db in
+            guard var msg = try MessageHeader.fetchOne(db, key: headerId) else { return }
+            msg.snippet = snippet
+            msg.actionTag = tag
+            msg.tagSortOrder = tag.sortOrder
+            try msg.save(db)
+        }
+    }
+
+    @Test("flushAIBatch: fresh DB snippet WINS over a stale empty in-memory one (IMAP-push regression)")
+    @MainActor func freshSnippetWins() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Header lands with an EMPTY snippet (an IMAP push: the NSE stages
+        // snippet=""); phase-2 later computes and writes the real snippet.
+        let targetId = try insertHeader(pool, messageId: "2000", folderId: folder.id, snippet: "")
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 message, got \(vm.loadedMessages.count)"); return
+        }
+        #expect(vm.loadedMessages[0].snippet.isEmpty)
+
+        // Merge phase-2 writes snippet + action; AI completion fires the signal.
+        try writeSnippetAndTag(pool, headerId: targetId, snippet: "The real snippet", tag: .reply)
+        NotificationCenter.default.post(name: .messageDataDidChange, object: targetId)
+        try await Task.sleep(for: .milliseconds(450))
+
+        let row = vm.loadedMessages.first(where: { $0.id == targetId })
+        #expect(row?.actionTag == .reply)
+        // The old unconditional "preserve" stomped this back to "" — the row
+        // showed the action tag with no snippet until the terminal reload.
+        #expect(row?.snippet == "The real snippet")
+    }
+
+    @Test("flushAIBatch: in-memory snippet kept when the fresh DB header has none")
+    @MainActor func inMemorySnippetKeptWhenDBEmpty() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Row loads with a snippet (stands in for a SnippetLoader in-place fill —
+        // in-memory state ahead of the DB), then the DB header's snippet is
+        // cleared while AI lands. The flush must keep the in-memory value.
+        let targetId = try insertHeader(pool, messageId: "2001", folderId: folder.id, snippet: "Loader-filled")
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.start()
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 message, got \(vm.loadedMessages.count)"); return
+        }
+        #expect(vm.loadedMessages[0].snippet == "Loader-filled")
+
+        // AI lands but the fresh DB header carries NO snippet.
+        try writeSnippetAndTag(pool, headerId: targetId, snippet: "", tag: .archive)
+        NotificationCenter.default.post(name: .messageDataDidChange, object: targetId)
+        try await Task.sleep(for: .milliseconds(450))
+
+        let row = vm.loadedMessages.first(where: { $0.id == targetId })
+        #expect(row?.actionTag == .archive)
+        #expect(row?.snippet == "Loader-filled")
+    }
+
     // MARK: - Throttle Behavior
 
     @Test("AI notification updates snapshot within throttle window")

@@ -126,7 +126,11 @@ struct NSEMergeFullHeaderTests {
             accountId: msgA.accountId, folderPath: msgA.folderPath, messageId: msgA.messageId
         )
         let headerA = try dbA.read { try MessageHeader.fetchOne($0, key: hidA) }
-        #expect(headerA?.snippet == "snippet preview")   // visible: snippet present
+        // DISPLAY snippet: body-derived wins when staged text exists (identical
+        // to phase-2's canonical value → no visible "snap"); the raw provider
+        // snippet ("snippet preview") is only the no-body fallback, cleaned.
+        // See NSEDataBridge.stagedDisplaySnippet.
+        #expect(headerA?.snippet == "the body")          // visible: snippet present
         #expect(headerA?.summaryBlurb == nil)            // AI deferred to phase 2
         #expect(headerA?.actionTag == nil)               // AI deferred to phase 2
         let bodyCountA = try dbA.read {

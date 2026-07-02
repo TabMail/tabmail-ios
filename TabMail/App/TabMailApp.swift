@@ -593,6 +593,11 @@ final class AppStartup {
         await ensureDatabaseReady()
         // Build failed (failureMessage shown) or the sidebar already loaded.
         guard dbReady, !isReady else { return }
+        // Debug-gated (no-op unless debug logging is unlocked): stamps
+        // "⚠ MAIN THREAD STALL ~Xms" into the BootProfile timeline so a reported
+        // main-actor stall can be correlated against the surrounding merge/sync/
+        // EXEC marks instead of inferred.
+        BootProfiler.startStallWatchdog()
         // Merge NSE staging BEFORE the first read/render so the inbox's FIRST PAINT
         // already contains pushed mail — but via the FAIL-FAST probe path
         // (`mergeIfStagingPending`, immediateError busyMode). If the NSE is still

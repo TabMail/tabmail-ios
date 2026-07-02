@@ -283,6 +283,10 @@ actor BackfillEmbeddingQueue {
         storage.decrementActiveJobs()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         print("[BackfillEmbeddingQueue] Batch done: \(succeeded.count) embedded, \(emptyBodyIds.count) empty in \(ms)ms")
+        // Boot-log mirror (debug-gated): embedding batches are the CoreML-heavy
+        // half of backfill — must be correlatable against ⚠ MAIN THREAD STALL
+        // marks in the downloadable boot log.
+        BootProfiler.mark("backfillEmbed batch done: \(succeeded.count) embedded in \(ms)ms")
 
         // Power-aware inter-batch delay (turbo=0s, normal=3s, low=10s)
         let delay = await BackfillProfile.current().interCycleActiveDelay

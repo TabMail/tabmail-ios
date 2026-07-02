@@ -132,6 +132,31 @@ struct StagedSetRepostSuppressionTests {
         #expect(!settled)
     }
 
+    @Test("staged display snippet: body-derived wins over provider snippet (no visible snap)")
+    func displaySnippetPrefersBodyDerived() {
+        let s = NSEDataBridge.stagedDisplaySnippet(
+            providerSnippet: "Gmail&#39;s own truncation of this",
+            textContent: "The actual body text of the message.\nSecond line."
+        )
+        // Identical to phase-2's canonical snippetFromPlainText output.
+        #expect(s == EmailFilter.snippetFromPlainText("The actual body text of the message.\nSecond line."))
+        #expect(!s.contains("&#39;"))
+    }
+
+    @Test("staged display snippet: provider snippet is CLEANED when no body is staged (entity garbage fix)")
+    func displaySnippetCleansProviderFallback() {
+        let s = NSEDataBridge.stagedDisplaySnippet(
+            providerSnippet: "Don&#39;t miss this &amp; that &quot;deal&quot;",
+            textContent: nil
+        )
+        #expect(s == "Don't miss this & that \"deal\"")
+        // Empty-everything stays empty (IMAP metadata-only staging).
+        #expect(NSEDataBridge.stagedDisplaySnippet(providerSnippet: "", textContent: nil).isEmpty)
+        // Empty/whitespace body falls back to the cleaned provider snippet.
+        let fallback = NSEDataBridge.stagedDisplaySnippet(providerSnippet: "Plain &amp; simple", textContent: "  \n ")
+        #expect(fallback == "Plain & simple")
+    }
+
     @Test("drained set resets the memo — a later identical re-stage posts again")
     func drainResets() {
         let memo = Mutex<[StagedInboxRow]>([])

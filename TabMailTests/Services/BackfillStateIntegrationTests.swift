@@ -207,7 +207,7 @@ struct BackfillBatchTests {
 
         try db.write { dbConn in
             for i in 1...10 {
-                var header = MessageHeader(
+                let header = MessageHeader(
                     messageId: "\(i)",
                     subject: "Message \(i)",
                     from: "sender@example.com",
@@ -474,7 +474,7 @@ struct BackfillBodyFetchTests {
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:1", htmlContent: "<p>First</p>")
 
         try db.write { dbConn in
-            var body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Updated</p>")
+            let body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Updated</p>")
             try body.save(dbConn)
         }
 

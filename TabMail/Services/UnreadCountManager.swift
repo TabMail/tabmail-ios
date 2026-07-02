@@ -80,7 +80,7 @@ actor UnreadCountManager {
         guard !folderIdArray.isEmpty else { return }
 
         do {
-            try await dbPool.write { db in
+            try await dbPool.write(label: "unreadRecount") { db in
                 // Single grouped query: count unread per folder
                 let placeholders = folderIdArray.map { _ in "?" }.joined(separator: ", ")
                 let sql = """

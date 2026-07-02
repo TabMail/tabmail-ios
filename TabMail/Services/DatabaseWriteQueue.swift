@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import os
 
 /// Priority tier for database WRITE scheduling. The single GRDB writer drains
 /// the highest-priority non-empty tier first, so foreground work jumps ahead of
@@ -66,9 +67,21 @@ actor DatabaseWriteQueue {
 
     /// Run `work` as the sole writer once it reaches the front of its tier. The
     /// slot is always released, including on throw.
+    ///
+    /// `label` (diagnostic only): names the write in the EXEC mark so a long
+    /// entry is attributable (boot_logs 10/12 showed repeated multi-second
+    /// foreground `EXEC[priority]` writes no subsystem's own marks claimed).
+    /// `bodyStart` (diagnostic only): set by the caller when the GRDB closure
+    /// actually STARTS executing — splits EXEC into `sched` (queue-slot → closure
+    /// entry, i.e. GRDB writer-queue wait: a bypass sync write or the writer
+    /// connection being otherwise busy) vs `body` (closure execution). A 1-row
+    /// merge phase-1 upsert with EXEC≈5s reads completely differently depending
+    /// on which side the time is on.
     @discardableResult
     func execute<T: Sendable>(
         priority: WritePriority,
+        label: String? = nil,
+        bodyStart: OSAllocatedUnfairLock<Double>? = nil,
         _ work: @Sendable () async throws -> T
     ) async throws -> T {
         await acquire(priority)
@@ -78,7 +91,7 @@ actor DatabaseWriteQueue {
         let execStart = CFAbsoluteTimeGetCurrent()
         do {
             let result = try await work()
-            markExec(priority, execStart)
+            markExec(priority, execStart, label: label, bodyStart: bodyStart)
             release()
             return result
         } catch {
@@ -89,10 +102,21 @@ actor DatabaseWriteQueue {
 
     /// Debug-gated: flag a write whose EXECUTION (not queue-wait) ran long — that's
     /// what a higher-priority write can't preempt. Threshold keeps the noise down.
-    private func markExec(_ priority: WritePriority, _ start: Double) {
-        let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+    private func markExec(
+        _ priority: WritePriority, _ start: Double,
+        label: String?, bodyStart: OSAllocatedUnfairLock<Double>?
+    ) {
+        let end = CFAbsoluteTimeGetCurrent()
+        let ms = Int((end - start) * 1000)
         if ms > 100 {
-            BootProfiler.mark("DBwrite EXEC[\(priority)] in \(ms)ms")
+            var detail = ""
+            if let entry = bodyStart?.withLock({ $0 }), entry > 0 {
+                let sched = Int((entry - start) * 1000)
+                let body = Int((end - entry) * 1000)
+                detail = " (sched=\(sched)ms body=\(body)ms)"
+            }
+            let name = label.map { " \($0)" } ?? ""
+            BootProfiler.mark("DBwrite EXEC[\(priority)]\(name) in \(ms)ms\(detail)")
         }
     }
 

@@ -292,7 +292,6 @@ struct CancelDuringFetchTests {
         let items = makeItems(count: 5)
 
         // Simulate a provider that hangs forever
-        var capturedTask: Task<Void, Never>?
         await queue.dispatchBatch(folderPath: "INBOX", items: items) {
             // This simulates provider.fetchMessagesBatch hanging on a dead IMAP connection
             while !Task.isCancelled {

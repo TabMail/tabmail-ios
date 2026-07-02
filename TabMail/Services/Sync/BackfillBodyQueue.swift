@@ -283,6 +283,11 @@ actor BackfillBodyQueue {
             let batchTask = Task { [self] in
                 let t0 = CFAbsoluteTimeGetCurrent()
                 print("[BackfillBody] Batch START: \(itemCount) items in \(key.folderPath)")
+                // Boot-log mirror (debug-gated): backfill batch windows must be
+                // correlatable against ⚠ MAIN THREAD STALL marks in ONE file —
+                // the "app is sharp once backfill dies" hypothesis needs the
+                // batch boundaries in the downloadable boot log, not just the console.
+                BootProfiler.mark("backfillBody batch START \(itemCount) items [\(key.folderPath)]")
 
                 do {
                     // 1. Batch fetch from provider (single SELECT + bulk BODYSTRUCTURE for IMAP)
@@ -364,6 +369,7 @@ actor BackfillBodyQueue {
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                     print("[BackfillBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
+                    BootProfiler.mark("backfillBody batch DONE \(itemCount) items in \(totalMs)ms (fetch=\(fetchMs)ms process=\(processMs)ms) [\(key.folderPath)]")
                     BackgroundSyncLogger.logBackfill("[BackfillBody] batch DONE \(itemCount) items (\(processedItems.count) with body, \(missedItems.count) missed) in \(totalMs)ms [\(key.folderPath)] pending=\(storage.pendingCount)")
                     await SyncEngine.checkpointWALThrottled()
 
@@ -400,6 +406,11 @@ actor BackfillBodyQueue {
                     } else {
                         // Connection-level error — retry all items
                         print("[BackfillBody] Batch FAILED for \(key.folderPath): \(error)")
+                        // Boot-log mirror: the user-observed "backfill jobs die
+                        // after a while" needs its death timestamped next to the
+                        // stall marks. Error text deliberately not included
+                        // (console print above has it).
+                        BootProfiler.mark("backfillBody batch FAILED [\(key.folderPath)] — items retried")
                         BackgroundSyncLogger.logBackfill("[BackfillBody] batch FAILED [\(key.folderPath)] \(itemCount) items retried: \(error)")
                         for item in items {
                             self.batchItemDone(item: item, shouldRetry: true)
@@ -427,6 +438,10 @@ actor BackfillBodyQueue {
                 if storage.pendingCount > 0 {
                     scheduleDispatch()
                 } else if storage.isEmpty && activeBatchCount == 0 {
+                    // Boot-log mirror: queue went IDLE — if the user-felt "sharp
+                    // again" moments line up with this mark (and stall marks stop
+                    // after it), the backfill-contention hypothesis is confirmed.
+                    BootProfiler.mark("backfillBody queue IDLE (drained) — running drain-time repopulate check")
                     // Drain-time safety net: re-query GRDB for anything missed
                     // by the push path (headerComplete=1 set but enqueue lost,
                     // crash between DB write and enqueue, etc.). Only when this

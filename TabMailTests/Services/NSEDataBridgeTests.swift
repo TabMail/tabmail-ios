@@ -256,14 +256,14 @@ struct NSEDataBridgeTests {
 
     @Test("mirrorAccountMap writes JSON-encoded email→accountId map")
     func accountMapMirrored() throws {
-        let db = try TestDatabase.make()
+        _ = try TestDatabase.make()
         // Temporarily swap dbPool — mirrorAccountMap reads from AppDatabase.dbPool
         // We can't easily swap it, so just verify the function doesn't crash
         // with an empty database
         cleanupSuite()
         NSEDataBridge.mirrorAccountMap()
         // Should have written something (even if empty map)
-        let json = suite?.string(forKey: "nse.accountMap")
+        _ = suite?.string(forKey: "nse.accountMap")
         // May be nil if AppDatabase.dbPool points to a different DB, but should not crash
         // The key test is that the function is callable and doesn't throw
     }
@@ -276,7 +276,7 @@ struct NSEDataBridgeTests {
         NSEDataBridge.mirrorLastHistoryIds()
         // Same limitation as accountMap — reads from AppDatabase.dbPool
         // Verify it doesn't crash and writes to the correct key
-        let key = "nse.lastHistoryIds"
+        _ = "nse.lastHistoryIds"
         // Function should have been called without error
     }
 

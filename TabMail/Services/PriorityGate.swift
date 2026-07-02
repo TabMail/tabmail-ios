@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import os
 
 /// Cooperative gate that lets the privileged NSE→inbox merge run without heavy
 /// BACKGROUND LOOPS (reply precompute, embedding, body/header backfill, FTS
@@ -159,10 +160,24 @@ struct PrioritizedDatabase: Sendable {
     /// Async write — runs through `DatabaseWriteQueue` at `effectivePriority`, so a
     /// higher-tier write jumps the lower-tier backlog instead of waiting behind it
     /// in SQLite's writer FIFO.
+    ///
+    /// `label` (diagnostic): names this write in a long `DBwrite EXEC` mark. The
+    /// closure-entry timestamp captured here splits the EXEC into sched (GRDB
+    /// writer-queue wait — a bypass sync write or busy writer connection) vs body
+    /// (the closure's own execution) — see `DatabaseWriteQueue.execute`.
     @discardableResult
-    func write<T: Sendable>(_ updates: @Sendable (Database) throws -> T) async throws -> T {
-        try await DatabaseWriteQueue.shared.execute(priority: effectivePriority) {
-            try await pool.write(updates)
+    func write<T: Sendable>(
+        label: String? = nil,
+        _ updates: @Sendable (Database) throws -> T
+    ) async throws -> T {
+        let bodyStart = OSAllocatedUnfairLock(initialState: 0.0)
+        return try await DatabaseWriteQueue.shared.execute(
+            priority: effectivePriority, label: label, bodyStart: bodyStart
+        ) {
+            try await pool.write { db in
+                bodyStart.withLock { if $0 == 0 { $0 = CFAbsoluteTimeGetCurrent() } }
+                return try updates(db)
+            }
         }
     }
 
