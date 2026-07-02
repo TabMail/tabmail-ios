@@ -101,6 +101,48 @@ struct InboxStagedInsertTests {
     }
 
     @MainActor
+    @Test("staged reply adopts the on-screen thread's computedThreadId (no singleton flash)")
+    func adoptsThreadId() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        // A durable, on-screen message with a real thread id + rfc822 id.
+        var parent = MessageHeader(
+            messageId: "1000", subject: "Parent", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "p",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        parent.headerComplete = true
+        parent.rfc822MessageId = "<parent@x>"
+        parent.computedThreadId = "thread-A"
+        try pool.writeWithoutTransaction { db in try parent.insert(db) }
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+
+        // Staged reply: In-Reply-To links it to the on-screen parent.
+        var reply = makeStagedRow(messageId: "m-reply")
+        reply = StagedInboxRow(
+            accountId: reply.accountId, folderPath: reply.folderPath, messageId: reply.messageId,
+            rfc822MessageId: "<reply@x>", threadId: nil, inReplyTo: "<parent@x>", references: [],
+            subject: reply.subject, senderName: reply.senderName, senderAddress: reply.senderAddress,
+            to: reply.to, snippet: reply.snippet, date: reply.date,
+            isRead: reply.isRead, isFlagged: reply.isFlagged, hasAttachments: reply.hasAttachments,
+            isReplied: reply.isReplied, isForwarded: reply.isForwarded,
+            actionTag: reply.actionTag, summaryBlurb: reply.summaryBlurb
+        )
+        vm.insertStagedRows([reply])
+
+        #expect(vm.loadedMessages.count == 2)
+        let inserted = vm.loadedMessages.first { $0.messageId == "m-reply" }
+        #expect(inserted?.computedThreadId == "thread-A")
+        // Grouped immediately: one thread group containing both, not two singletons.
+        #expect(vm.displayGroups.count == 1)
+    }
+
+    @MainActor
     @Test("lookupMessage synthesizes from a pending staged row when GRDB has none")
     func lookupSynthesizes() throws {
         let (_, folder, dir, previous) = try makeTestDB()

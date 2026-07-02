@@ -620,6 +620,22 @@ final class InboxViewModel {
                 if let v = m.actionTag { header.actionTag = v }
             }
             if filterUnread && header.isRead { continue }
+            // Adopt an on-screen thread's computedThreadId IN-MEMORY (zero DB I/O)
+            // so a reply animates straight into its group instead of appearing as a
+            // singleton and visibly re-grouping when the durable reload lands with
+            // the real thread id. Uses the same linkage signals insert-time thread
+            // detection does (provider threadId, rfc822 In-Reply-To/References), so
+            // the reconcile normally agrees. A miss or wrong guess self-heals via
+            // the reconcile reload — exactly today's regroup, never worse.
+            if let adopted = loadedMessages.first(where: { snap in
+                guard snap.accountId == row.accountId, !snap.computedThreadId.isEmpty else { return false }
+                if let tid = row.threadId, tid == snap.threadId { return true }
+                if let rfc = snap.rfc822MessageId, !rfc.isEmpty,
+                   row.inReplyTo == rfc || row.references.contains(rfc) { return true }
+                return false
+            })?.computedThreadId {
+                header.computedThreadId = adopted
+            }
             let snapshot = MessageSnapshot(from: header)
             let insertionIndex: Int
             if mode == .triage {
