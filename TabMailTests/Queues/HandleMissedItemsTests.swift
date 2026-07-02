@@ -49,10 +49,25 @@ struct HandleMissedItemsTests {
     }
 
     actor ProbingProvider: EmailProvider, MessageExistenceProbe {
-        private var result: Result<Bool, Error>
-        init(result: Result<Bool, Error>) { self.result = result }
-        func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool {
+        /// Uniform result for every rfc822, unless `uidsByRfc822` has an entry.
+        private var result: Result<[String], Error>
+        /// Per-rfc822 override — for multi-item tests where each message maps
+        /// to a distinct new UID (empty array = gone).
+        private var uidsByRfc822: [String: [String]]
+
+        init(result: Result<[String], Error>, uidsByRfc822: [String: [String]] = [:]) {
+            self.result = result
+            self.uidsByRfc822 = uidsByRfc822
+        }
+
+        func currentUIDs(rfc822MessageId: String, folderPath: String) async throws -> [String] {
+            if let mapped = uidsByRfc822[rfc822MessageId] { return mapped }
             return try result.get()
+        }
+
+        func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool {
+            let uids = try await currentUIDs(rfc822MessageId: rfc822MessageId, folderPath: folderPath)
+            return !uids.isEmpty
         }
         func connect() async throws {}
         func disconnect() async throws {}
@@ -151,7 +166,7 @@ struct HandleMissedItemsTests {
         let item = makeItem(accountId: "hmi-below", folderPath: "INBOX", messageId: "u1", headerId: headerId)
         // Use ProbingProvider that would return .gone if called; test verifies it
         // was NOT called (header kept, counter bumped to 3).
-        let provider = ProbingProvider(result: .success(false))
+        let provider = ProbingProvider(result: .success([]))
 
         await queue.handleMissedItems([item], provider: provider)
 
@@ -178,7 +193,7 @@ struct HandleMissedItemsTests {
         let highItem = makeItem(accountId: "hmi-mixed", folderPath: "INBOX", messageId: "high", headerId: high)
         // Probe returns "not found" → high item confirmed gone, deleted.
         // Low item bumps counter only.
-        let provider = ProbingProvider(result: .success(false))
+        let provider = ProbingProvider(result: .success([]))
 
         await queue.handleMissedItems([lowItem, highItem], provider: provider)
 
@@ -216,32 +231,59 @@ struct HandleMissedItemsTests {
             rfc822: "<r@x>", missFetchCount: 4
         )
         let item = makeItem(accountId: "hmi-thr-pgone", folderPath: "INBOX", messageId: "u1", headerId: headerId)
-        let provider = ProbingProvider(result: .success(false))
+        let provider = ProbingProvider(result: .success([]))
 
         await queue.handleMissedItems([item], provider: provider)
 
         #expect(await headerExists(headerId: headerId) == false)
     }
 
-    @Test("Threshold + probe .stillExists → counter RESET to 0, header kept")
+    @Test("Threshold + probe finds SAME UID → counter RESET to 0, header kept (transient miss)")
     func thresholdStillExistsResetsCounter() async throws {
-        // The UIDVALIDITY-rotation case. rfc822 SEARCH finds the message under
-        // a new UID. We MUST NOT delete; counter resets to 0 so a subsequent
-        // miss doesn't trivially retrigger deletion next cycle (full-sync has
-        // time to realign UIDs first).
+        // rfc822 SEARCH finds the message at the SAME UID we've been fetching —
+        // the miss was transient (partial FETCH / flap). We MUST NOT delete;
+        // counter resets to 0 so the next miss chain starts fresh.
         let queue = BackfillBodyQueue()
         let headerId = try await insertHeader(
             accountId: "hmi-thr-still", folderPath: "INBOX", messageId: "u1",
             rfc822: "<r@x>", missFetchCount: 4
         )
         let item = makeItem(accountId: "hmi-thr-still", folderPath: "INBOX", messageId: "u1", headerId: headerId)
-        let provider = ProbingProvider(result: .success(true))
+        let provider = ProbingProvider(result: .success(["u1"]))
 
         await queue.handleMissedItems([item], provider: provider)
 
-        #expect(await headerExists(headerId: headerId) == true, "UID-remap case MUST NOT delete the header")
-        #expect(await readMissCount(headerId: headerId) == 0, "counter MUST be reset after .stillExists")
+        #expect(await headerExists(headerId: headerId) == true, "same-UID transient miss MUST NOT delete the header")
+        #expect(await readMissCount(headerId: headerId) == 0, "counter MUST be reset after .stillExists(nil)")
         await cleanup(headerId: headerId)
+    }
+
+    @Test("Threshold + probe finds NEW UID → header re-keyed in place (old id gone, new id present, counter 0)")
+    func thresholdRemapRekeysHeader() async throws {
+        // The UIDVALIDITY-rotation / cross-client-move case. rfc822 SEARCH finds
+        // the message under a NEW UID. The header is re-keyed in place so the
+        // body fetch proceeds under the live UID — previously this branch just
+        // reset the counter and retried the dead UID forever (the permanent
+        // "99% indexed" stall).
+        let queue = BackfillBodyQueue()
+        let headerId = try await insertHeader(
+            accountId: "hmi-thr-remap", folderPath: "INBOX", messageId: "u1",
+            rfc822: "<r-remap@x>", missFetchCount: 4
+        )
+        let item = makeItem(accountId: "hmi-thr-remap", folderPath: "INBOX", messageId: "u1", headerId: headerId)
+        let provider = ProbingProvider(result: .success(["777"]))
+
+        await queue.handleMissedItems([item], provider: provider)
+
+        let newHeaderId = MessageIdentity.headerId(accountId: "hmi-thr-remap", folderPath: "INBOX", messageId: "777")
+        #expect(await headerExists(headerId: headerId) == false, "old dead-UID row must be re-keyed away")
+        #expect(await headerExists(headerId: newHeaderId) == true, "re-keyed row must exist under the new UID")
+        #expect(await readMissCount(headerId: newHeaderId) == 0, "re-keyed row starts a fresh miss chain")
+        let newMessageId = try? await AppDatabase.dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT messageId FROM messageHeader WHERE id = ?", arguments: [newHeaderId])
+        }
+        #expect(newMessageId == "777")
+        await cleanup(headerId: newHeaderId)
     }
 
     @Test("Threshold + probe throws → header kept, counter NOT reset")
@@ -276,7 +318,7 @@ struct HandleMissedItemsTests {
         )
         let item = makeItem(accountId: "hmi-thr-nilrfc", folderPath: "INBOX", messageId: "u1", headerId: headerId)
         // Probe would say .stillExists if called, but should not be called.
-        let provider = ProbingProvider(result: .success(true))
+        let provider = ProbingProvider(result: .success(["777"]))
 
         await queue.handleMissedItems([item], provider: provider)
 
@@ -287,32 +329,39 @@ struct HandleMissedItemsTests {
 
     // MARK: - Regression: branch-swap catastrophe
 
-    @Test("REGRESSION: UIDVALIDITY-like mass miss does NOT delete any row when probe says 'still exists'")
+    @Test("REGRESSION: UIDVALIDITY-like mass miss does NOT lose any message when probe finds them under new UIDs")
     func regressionUidValidityMassMissSafety() async throws {
         // If `.gone` and `.stillExists` branches are ever swapped, a
         // UIDVALIDITY rotation that makes ALL UIDs missing would delete every
         // header in the folder. This test pins that scenario: 10 headers, all
-        // missing, all probe-finds-them → 0 deletes, all counters reset.
+        // missing, all probe-finds-them under new UIDs → 0 messages lost —
+        // every row is re-keyed in place (new UID present, counter 0).
         let queue = BackfillBodyQueue()
         var headerIds: [String] = []
+        var uidMap: [String: [String]] = [:]
         for i in 0..<10 {
             let id = try await insertHeader(
                 accountId: "hmi-mass-safety", folderPath: "INBOX", messageId: "u\(i)",
                 rfc822: "<r\(i)@x>", missFetchCount: 4
             )
             headerIds.append(id)
+            uidMap["<r\(i)@x>"] = ["\(1000 + i)"]  // each message remapped to a distinct new UID
         }
         let items = headerIds.enumerated().map { (i, hid) in
             makeItem(accountId: "hmi-mass-safety", folderPath: "INBOX", messageId: "u\(i)", headerId: hid)
         }
-        let provider = ProbingProvider(result: .success(true))  // simulates UID remap
+        let provider = ProbingProvider(result: .success([]), uidsByRfc822: uidMap)
 
         await queue.handleMissedItems(items, provider: provider)
 
-        for hid in headerIds {
-            #expect(await headerExists(headerId: hid) == true, "UID-remap \(hid) must survive")
-            #expect(await readMissCount(headerId: hid) == 0, "counter reset for \(hid)")
-            await cleanup(headerId: hid)
+        for i in 0..<10 {
+            let newId = MessageIdentity.headerId(
+                accountId: "hmi-mass-safety", folderPath: "INBOX", messageId: "\(1000 + i)"
+            )
+            #expect(await headerExists(headerId: newId) == true, "UID-remap message \(i) must survive under its new UID")
+            #expect(await readMissCount(headerId: newId) == 0, "counter reset for re-keyed row \(i)")
+            #expect(await headerExists(headerId: headerIds[i]) == false, "old dead-UID row \(i) re-keyed away")
+            await cleanup(headerId: newId)
         }
     }
 }

@@ -94,6 +94,7 @@ extension SyncEngine {
         guard let workQueue = workQueues[account.id] else { return false }
 
         print("[Backfill] Starting for \(account.emailAddress): \(incompleteFolders.count) folders to backfill")
+        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) walk: \(incompleteFolders.count) incomplete folders")
 
         var consecutiveConnectionFailures = 0
         var connectionBackoffSeconds: TimeInterval = 5  // Exponential backoff: 5, 10, 20, 40, 60 (max)
@@ -349,6 +350,7 @@ extension SyncEngine {
                                 )
                         }
                         print("[Backfill] \(folder.name) fully crawled (all ranges confirmed)")
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (all ranges confirmed)")
                     } else {
                         try? await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
@@ -357,6 +359,7 @@ extension SyncEngine {
                         let hasPending = await cursor.hasPendingWork
                         if hasPending {
                             print("[Backfill] \(folder.name) has failed ranges — will retry next cycle (cursor at \(finalCursor))")
+                            BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) has failed ranges — retry next cycle (cursor at \(finalCursor))")
                         }
                     }
                     didWork = true
@@ -398,6 +401,7 @@ extension SyncEngine {
                                 )
                         }
                         print("[Backfill] \(folder.name) fully crawled (no more pages)")
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (no more pages)")
                         didWork = true
                         await updateBackfillProgressForAccount(account)
                         continue
@@ -590,6 +594,7 @@ extension SyncEngine {
                             )
                     }
                     print("[Backfill] \(folder.name) fully crawled (last page processed)")
+                    BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (last page processed)")
                 }
 
                 if insertedCount > 0 || isLastPage { didWork = true }
@@ -599,6 +604,7 @@ extension SyncEngine {
                 return didWork
             } catch {
                 print("[Backfill] Failed for \(folder.name): \(error)")
+                BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) cycle error: \(error)")
                 if !Self.isConnectionError(error) && !Self.isSelectFailedError(error) {
                     BackgroundSyncLogger.logError("Failed for \(folder.name): \(error)", source: "backfill:\(account.emailAddress)")
                 }
@@ -613,6 +619,7 @@ extension SyncEngine {
                     // next checkout creates a fresh one.
                     consecutiveConnectionFailures += 1
                     print("[Backfill] Connection failure \(consecutiveConnectionFailures) — backing off \(Int(connectionBackoffSeconds))s")
+                    BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) connection failure #\(consecutiveConnectionFailures) — backoff \(Int(connectionBackoffSeconds))s")
                     try? await Task.sleep(for: .seconds(connectionBackoffSeconds))
                     connectionBackoffSeconds = min(60, connectionBackoffSeconds * 2)
                 }

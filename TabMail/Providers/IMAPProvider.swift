@@ -106,6 +106,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         self.smtpHost = smtpHost
         self.smtpPort = smtpPort
         self.useTLS = useTLS
+        // Start from the persisted server limit (learned from a prior
+        // max_userip_connections rejection) so backfill's parallel walk never
+        // re-oversubscribes a server whose cap we already know.
+        self.serverConnectionLimit = Self.persistedServerLimit(host: host, username: username)
     }
 
     // MARK: - Connection Creation
@@ -134,6 +138,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Parse server connection limit from error message.
+    /// The learned limit is persisted per host+username so subsequent launches
+    /// start at the real cap instead of re-oversubscribing (up to 18 parallel
+    /// backfill workers against e.g. Dovecot's 15/user+IP) until the server
+    /// rejects a login again.
     private func parseAndApplyServerLimit(from error: Error) {
         let desc = "\(error)"
         guard desc.contains("max_userip_connections"),
@@ -142,8 +150,28 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         else { return }
         if serverConnectionLimit == nil || limit < serverConnectionLimit! {
             serverConnectionLimit = limit
+            Self.persistServerLimit(limit, host: host, username: username)
             print("[IMAP] Server connection limit detected: \(limit) (folder slots: \(maxFolderConnections))")
+            BackgroundSyncLogger.logBackfill("[IMAP] \(senderEmail) server connection limit detected: \(limit) (folder slots: \(maxFolderConnections))")
         }
+    }
+
+    // MARK: - Server Limit Persistence
+
+    /// UserDefaults key for the learned per-server connection limit. Keyed by
+    /// host+username (the provider doesn't know accountId) so a re-added account
+    /// on the same server reuses the learned cap.
+    static func serverLimitDefaultsKey(host: String, username: String) -> String {
+        "imapServerConnLimit:\(username)@\(host)"
+    }
+
+    static func persistedServerLimit(host: String, username: String) -> Int? {
+        let value = UserDefaults.standard.integer(forKey: serverLimitDefaultsKey(host: host, username: username))
+        return value > 0 ? value : nil
+    }
+
+    static func persistServerLimit(_ limit: Int, host: String, username: String) {
+        UserDefaults.standard.set(limit, forKey: serverLimitDefaultsKey(host: host, username: username))
     }
 
     // MARK: - Folder Connection API
@@ -1296,10 +1324,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// (uidResolutionFailed) AND isn't in the destination folder, the op is confirmed stale.
     /// Returns true if found, false if confirmed not found. Throws on connection error.
     func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool {
+        let uids = try await currentUIDs(rfc822MessageId: rfc822MessageId, folderPath: folderPath)
+        return !uids.isEmpty
+    }
+
+    /// Resolve the CURRENT UID(s) for an rfc822 Message-ID (MessageExistenceProbe).
+    /// Same SEARCH as `messageExistsInFolder`, but returns the UIDs so the backfill
+    /// body queue can re-key a UID-remapped header instead of retrying a dead UID.
+    func currentUIDs(rfc822MessageId: String, folderPath: String) async throws -> [String] {
         try await withFolderConnection(folder: folderPath) { server in
             _ = try await server.selectMailbox(folderPath)
             let results = try await self.searchByMessageId(rfc822MessageId, server: server)
-            return !results.isEmpty
+            return results.toArray().map { "\($0.value)" }
         }
     }
 

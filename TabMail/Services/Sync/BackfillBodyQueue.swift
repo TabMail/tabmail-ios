@@ -115,6 +115,7 @@ actor BackfillBodyQueue {
             } else {
                 print("[BackfillBody] Repopulate: 0 non-inbox messages need body fetch (\(ms)ms)")
             }
+            BackgroundSyncLogger.logBackfill("[BackfillBody] repopulate loaded=\(totalAdded) pending=\(storage.pendingCount) (\(ms)ms)")
             // Re-kick on every wake. `totalAdded` counts only NEW rows; items left
             // pending by a suspend-abandoned cycle (ADR-IOS-046) are already
             // enqueued, so they'd be dropped from `totalAdded` and never
@@ -363,6 +364,7 @@ actor BackfillBodyQueue {
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                     print("[BackfillBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
+                    BackgroundSyncLogger.logBackfill("[BackfillBody] batch DONE \(itemCount) items (\(processedItems.count) with body, \(missedItems.count) missed) in \(totalMs)ms [\(key.folderPath)] pending=\(storage.pendingCount)")
                     await SyncEngine.checkpointWALThrottled()
 
                     // Success — restore folder batch size if it was halved
@@ -377,6 +379,7 @@ actor BackfillBodyQueue {
                         if current <= 1 {
                             // Single message too large — mark all items as empty
                             print("[BackfillBody] Single item too large for \(key.folderPath) — marking bodyEmptyConfirmed")
+                            BackgroundSyncLogger.logBackfill("[BackfillBody] oversized single item(s) in \(key.folderPath) — marking \(items.count) bodyEmptyConfirmed")
                             for item in items {
                                 try? await AppDatabase.backgroundPool.write { db in
                                     try db.execute(
@@ -397,6 +400,7 @@ actor BackfillBodyQueue {
                     } else {
                         // Connection-level error — retry all items
                         print("[BackfillBody] Batch FAILED for \(key.folderPath): \(error)")
+                        BackgroundSyncLogger.logBackfill("[BackfillBody] batch FAILED [\(key.folderPath)] \(itemCount) items retried: \(error)")
                         for item in items {
                             self.batchItemDone(item: item, shouldRetry: true)
                         }
@@ -449,12 +453,15 @@ actor BackfillBodyQueue {
     /// Success path (fetch returns a body) resets `missFetchCount` to 0, so a
     /// transient blip followed by recovery won't accidentally delete the header.
     /// Outcome of the pre-delete "is the message actually gone?" check at threshold.
-    enum GoneConfirmation {
+    enum GoneConfirmation: Equatable {
         /// Server confirmed the message is gone. Safe to delete the local header.
         case gone
-        /// Message still exists under a different identifier (e.g. IMAP UID remap
-        /// after UIDVALIDITY change). Do NOT delete — full-sync will realign.
-        case stillExists
+        /// Message still exists in the folder. `newUID` carries the server's
+        /// current UID when it differs from the stored one (IMAP UID remap after
+        /// UIDVALIDITY change / cross-client move) — the caller re-keys the header
+        /// in place. nil = the stored UID itself is still present (transient fetch
+        /// miss) — reset the counter and retry.
+        case stillExists(newUID: String?)
         /// Could not verify (no rfc822MessageId on file, or SEARCH failed). Do NOT
         /// delete. Defer the decision to the next cycle or to full-sync.
         case cannotConfirm
@@ -462,8 +469,8 @@ actor BackfillBodyQueue {
 
     /// Exposed as `internal` (not private) so tests can verify the full wiring:
     /// counter increment, threshold partitioning, and per-branch action
-    /// (delete on `.gone`, reset-counter on `.stillExists`, keep-as-is on
-    /// `.cannotConfirm`).
+    /// (delete on `.gone`, re-key on `.stillExists(newUID:)`, reset-counter on
+    /// `.stillExists(nil)`, keep-as-is on `.cannotConfirm`).
     func handleMissedItems(_ missedItems: [Item], provider: any EmailProvider) async {
         let threshold = SyncConfig.backfillBodyMissThreshold
         let partitioned: (toDelete: [Item], toRetry: [Item])
@@ -513,22 +520,45 @@ actor BackfillBodyQueue {
             switch confirmation {
             case .gone:
                 print("[BackfillBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
+                BackgroundSyncLogger.logBackfill("[BackfillBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
                 await AccountManager.shared.deleteConfirmedGoneHeader(
                     headerId: item.headerId,
                     reason: "backfill miss>=\(threshold)"
                 )
                 self.batchItemDone(item: item, shouldRetry: false)
-            case .stillExists:
-                print("[BackfillBody] Threshold reached but rfc822 FOUND \(item.messageId) in \(item.folderPath) — UID remap, resetting counter (full-sync will realign)")
-                try? await dbPool.write { db in
-                    try db.execute(
-                        sql: "UPDATE messageHeader SET missFetchCount = 0 WHERE id = ?",
-                        arguments: [item.headerId]
-                    )
+            case .stillExists(let newUID):
+                if let newUID {
+                    // UID remap: the stored UID is dead but the message lives under
+                    // newUID. Re-key the header NOW — full-sync's remap window only
+                    // covers recent messages, so deep-history remaps would retry the
+                    // dead UID forever otherwise.
+                    switch await self.rekeyRemappedHeader(item: item, newUID: newUID) {
+                    case .migrated(let newItem):
+                        print("[BackfillBody] UID remap re-key \(item.messageId)→\(newUID) in \(item.folderPath) — fetching under new UID")
+                        BackgroundSyncLogger.logBackfill("[BackfillBody] UID remap re-key \(item.messageId)→\(newUID) folder=\(item.folderPath)")
+                        self.batchItemDone(item: item, shouldRetry: false)
+                        enqueueSingle(newItem)
+                    case .duplicateDropped:
+                        print("[BackfillBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
+                        BackgroundSyncLogger.logBackfill("[BackfillBody] UID remap duplicate dropped \(item.messageId)→\(newUID) folder=\(item.folderPath)")
+                        self.batchItemDone(item: item, shouldRetry: false)
+                    case .failed:
+                        self.batchItemDone(item: item, shouldRetry: true)
+                    }
+                } else {
+                    // Same UID still present on the server — the miss was transient.
+                    print("[BackfillBody] Threshold reached but \(item.messageId) still at same UID in \(item.folderPath) — transient miss, resetting counter")
+                    try? await dbPool.write { db in
+                        try db.execute(
+                            sql: "UPDATE messageHeader SET missFetchCount = 0 WHERE id = ?",
+                            arguments: [item.headerId]
+                        )
+                    }
+                    self.batchItemDone(item: item, shouldRetry: true)
                 }
-                self.batchItemDone(item: item, shouldRetry: true)
             case .cannotConfirm:
                 print("[BackfillBody] Threshold reached for \(item.messageId) but cannot confirm gone — keeping for retry / full-sync")
+                BackgroundSyncLogger.logBackfill("[BackfillBody] cannotConfirm \(item.messageId) folder=\(item.folderPath) — keeping for retry")
                 self.batchItemDone(item: item, shouldRetry: true)
             }
         }
@@ -566,12 +596,89 @@ actor BackfillBodyQueue {
             return .cannotConfirm
         }
         do {
-            let exists = try await prober.messageExistsInFolder(rfc822MessageId: rfc822, folderPath: item.folderPath)
-            return exists ? .stillExists : .gone
+            let uids = try await prober.currentUIDs(rfc822MessageId: rfc822, folderPath: item.folderPath)
+            guard !uids.isEmpty else { return .gone }
+            if uids.contains(item.messageId) {
+                // The stored UID itself is still on the server — the batch miss
+                // was transient, not a remap.
+                return .stillExists(newUID: nil)
+            }
+            // UID remap. When duplicates exist, the highest UID is the newest copy
+            // (UIDs are monotonic per folder).
+            let newUID = uids.max { (UInt32($0) ?? 0) < (UInt32($1) ?? 0) }
+            return .stillExists(newUID: newUID)
         } catch {
             print("[BackfillBody] confirmGone: existence probe failed for \(rfc822): \(error)")
             return .cannotConfirm
         }
+    }
+
+    /// Outcome of re-keying a UID-remapped header to its current server UID.
+    enum RekeyOutcome {
+        /// Header migrated to the new UID — fetch the body under the new identity.
+        case migrated(Item)
+        /// The new UID already has its own header row (or the old row was already
+        /// gone) — the old duplicate has been removed; nothing left to fetch under
+        /// the old identity.
+        case duplicateDropped
+        /// DB write failed — keep the old item for retry.
+        case failed
+    }
+
+    /// Re-key a header whose stored UID is dead to the server's current UID,
+    /// preserving body/flags. Mirrors full-sync's UID-remap migration
+    /// (SyncEngineFullSync UID remap block): delete + reinsert because
+    /// messageBody's FK CASCADE forbids a PK UPDATE, then move the FTS entry
+    /// IN PLACE via `SearchIndex.rekeyHeaders` (preserves the indexed body text
+    /// and the embedding). Without this, a deep-history remap retries the dead
+    /// UID forever — full-sync's remap window only covers recent messages, so
+    /// `pendingBodyCount` never reaches 0 (the permanent "99% indexed" stall).
+    ///
+    /// Exposed as `internal` (not private) so tests can drive it directly.
+    func rekeyRemappedHeader(item: Item, newUID: String) async -> RekeyOutcome {
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: item.accountId, folderPath: item.folderPath, messageId: newUID
+        )
+        let outcome: RekeyOutcome
+        do {
+            outcome = try await dbPool.write { db -> RekeyOutcome in
+                guard var header = try MessageHeader.fetchOne(db, key: item.headerId) else {
+                    // Row already gone (raced with sync/prune) — nothing to migrate.
+                    return .duplicateDropped
+                }
+                // Fetch body BEFORE deleting the header — FK CASCADE deletes it too.
+                let oldBody = try MessageBody.fetchOne(db, key: item.headerId)
+                try header.delete(db)
+                guard try MessageHeader.fetchOne(db, key: newHeaderId) == nil else {
+                    // The new UID was independently backfilled — old row was a duplicate.
+                    return .duplicateDropped
+                }
+                header.id = newHeaderId
+                header.messageId = newUID
+                header.missFetchCount = 0
+                try header.insert(db)
+                if var body = oldBody {
+                    body.id = newHeaderId
+                    try body.insert(db)
+                }
+                return .migrated(Item(
+                    headerId: newHeaderId, accountId: item.accountId,
+                    folderPath: item.folderPath, messageId: newUID,
+                    isInInbox: item.isInInbox
+                ))
+            }
+        } catch {
+            if !error.isDatabaseSuspensionAbort {
+                print("[BackfillBody] UID remap re-key failed for \(item.messageId)→\(newUID): \(error)")
+                BackgroundSyncLogger.logBackfill("[BackfillBody] UID remap re-key FAILED \(item.messageId)→\(newUID) folder=\(item.folderPath): \(error)")
+            }
+            return .failed
+        }
+        // Move the FTS entry to the new id IN PLACE. rekeyHeaders' collision
+        // branch drops the old entry when the new id is already indexed — which
+        // is exactly the duplicateDropped case.
+        try? await SearchIndex.shared.rekeyHeaders([(oldId: item.headerId, newId: newHeaderId, newMessageId: newUID)])
+        return outcome
     }
 
     /// Drain-time self-repopulate: re-run the work-remaining query and enqueue any

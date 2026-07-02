@@ -53,19 +53,24 @@ struct ConfirmGoneAtThresholdTests {
         func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
     }
 
-    /// Probe-conforming provider — controls `messageExistsInFolder` return value
-    /// and `recordedCall` for assertion.
+    /// Probe-conforming provider — controls `currentUIDs` return value
+    /// (empty = gone, non-empty = still exists) and `recordedCalls` for assertion.
     actor ProbingProvider: EmailProvider, MessageExistenceProbe {
-        private var result: Result<Bool, Error>
+        private var result: Result<[String], Error>
         private(set) var recordedCalls: [(rfc822: String, folder: String)] = []
 
-        init(result: Result<Bool, Error>) { self.result = result }
+        init(result: Result<[String], Error>) { self.result = result }
 
-        func setResult(_ r: Result<Bool, Error>) { result = r }
+        func setResult(_ r: Result<[String], Error>) { result = r }
 
-        func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool {
+        func currentUIDs(rfc822MessageId: String, folderPath: String) async throws -> [String] {
             recordedCalls.append((rfc822: rfc822MessageId, folder: folderPath))
             return try result.get()
+        }
+
+        func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool {
+            let uids = try await currentUIDs(rfc822MessageId: rfc822MessageId, folderPath: folderPath)
+            return !uids.isEmpty
         }
 
         // EmailProvider stubs (not exercised here)
@@ -165,27 +170,61 @@ struct ConfirmGoneAtThresholdTests {
         await cleanupHeader(headerId)
     }
 
-    @Test("Probe provider + rfc822 found → .stillExists (UID remap case, no delete)")
+    @Test("Probe provider + rfc822 found under NEW UID → .stillExists(newUID:) (UID remap, no delete)")
     func proberFoundReturnsStillExists() async throws {
         // UIDVALIDITY rotated: UID not in current BODYSTRUCTURE, but rfc822
         // search finds the message under a new UID. We must NOT delete the
-        // local header — full-sync's remap flow will realign the UID.
+        // local header — the caller re-keys it to the new UID in place.
         let queue = BackfillBodyQueue()
         let headerId = try await insertHeader(
             accountId: "acc-found", folderPath: "INBOX", messageId: "u-1", rfc822: "<r-found@x>"
         )
 
         let item = makeItem(headerId: headerId, accountId: "acc-found", folderPath: "INBOX", messageId: "u-1")
-        let provider = ProbingProvider(result: .success(true))
+        let provider = ProbingProvider(result: .success(["77"]))
 
         let result = await queue.confirmGoneAtThreshold(item: item, provider: provider)
-        #expect(result == .stillExists)
+        #expect(result == .stillExists(newUID: "77"))
 
         let calls = await provider.recordedCalls
         #expect(calls.count == 1)
         guard calls.count == 1 else { return }
         #expect(calls[0].rfc822 == "<r-found@x>")
         #expect(calls[0].folder == "INBOX")
+        await cleanupHeader(headerId)
+    }
+
+    @Test("Probe provider + rfc822 found at SAME UID → .stillExists(nil) (transient miss)")
+    func proberFoundSameUIDReturnsNilNewUID() async throws {
+        // The stored UID is still on the server — the batch miss was transient
+        // (partial FETCH response, flap). No re-key; caller resets the counter.
+        let queue = BackfillBodyQueue()
+        let headerId = try await insertHeader(
+            accountId: "acc-same", folderPath: "INBOX", messageId: "u-1", rfc822: "<r-same@x>"
+        )
+
+        let item = makeItem(headerId: headerId, accountId: "acc-same", folderPath: "INBOX", messageId: "u-1")
+        let provider = ProbingProvider(result: .success(["u-1"]))
+
+        let result = await queue.confirmGoneAtThreshold(item: item, provider: provider)
+        #expect(result == .stillExists(newUID: nil))
+        await cleanupHeader(headerId)
+    }
+
+    @Test("Probe provider + multiple UIDs → highest numeric UID wins (newest copy)")
+    func proberMultipleUIDsPicksHighest() async throws {
+        // Duplicate copies in the folder (e.g. re-APPEND after a flaky move):
+        // UIDs are monotonic per folder, so the highest is the newest copy.
+        let queue = BackfillBodyQueue()
+        let headerId = try await insertHeader(
+            accountId: "acc-multi", folderPath: "INBOX", messageId: "u-1", rfc822: "<r-multi@x>"
+        )
+
+        let item = makeItem(headerId: headerId, accountId: "acc-multi", folderPath: "INBOX", messageId: "u-1")
+        let provider = ProbingProvider(result: .success(["9", "123", "45"]))
+
+        let result = await queue.confirmGoneAtThreshold(item: item, provider: provider)
+        #expect(result == .stillExists(newUID: "123"))
         await cleanupHeader(headerId)
     }
 
@@ -199,7 +238,7 @@ struct ConfirmGoneAtThresholdTests {
         )
 
         let item = makeItem(headerId: headerId, accountId: "acc-gone", folderPath: "INBOX", messageId: "u-1")
-        let provider = ProbingProvider(result: .success(false))
+        let provider = ProbingProvider(result: .success([]))
 
         let result = await queue.confirmGoneAtThreshold(item: item, provider: provider)
         #expect(result == .gone)
@@ -234,7 +273,7 @@ struct ConfirmGoneAtThresholdTests {
         )
 
         let item = makeItem(headerId: headerId, accountId: "acc-nilrfc", folderPath: "INBOX", messageId: "u-1")
-        let provider = ProbingProvider(result: .success(true))  // would otherwise succeed
+        let provider = ProbingProvider(result: .success(["77"]))  // would otherwise succeed
 
         let result = await queue.confirmGoneAtThreshold(item: item, provider: provider)
         #expect(result == .cannotConfirm)
@@ -256,7 +295,7 @@ struct ConfirmGoneAtThresholdTests {
         )
 
         let item = makeItem(headerId: headerId, accountId: "acc-empty", folderPath: "INBOX", messageId: "u-1")
-        let provider = ProbingProvider(result: .success(true))
+        let provider = ProbingProvider(result: .success(["77"]))
 
         let result = await queue.confirmGoneAtThreshold(item: item, provider: provider)
         #expect(result == .cannotConfirm)

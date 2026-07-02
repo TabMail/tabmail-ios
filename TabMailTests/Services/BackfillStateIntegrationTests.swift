@@ -64,47 +64,10 @@ struct BackfillCursorTests {
         #expect(fetched?.backfillComplete == true)
     }
 
-    @Test("resetForFastSync: clears cursors for incomplete folders, preserves complete ones")
-    func resetForFastSync() async throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-
-        // Create an incomplete folder with cursors
-        var incomplete = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        incomplete.backfillUidCursor = 100
-        incomplete.backfillPageToken = "tok1"
-        let incompleteToSave = incomplete
-        try await db.write { try incompleteToSave.update($0) }
-
-        // Create a complete folder with cursors
-        var complete = try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        complete.backfillComplete = true
-        complete.backfillUidCursor = 200
-        complete.backfillPageToken = "tok2"
-        let completeToSave = complete
-        try await db.write { try completeToSave.update($0) }
-
-        // Simulate resetForFastSync logic
-        try await db.write { dbConn in
-            _ = try Folder.filter(
-                Column("backfillComplete") == false &&
-                Column("path") != ""
-            ).updateAll(dbConn,
-                Column("backfillUidCursor").set(to: nil as Int?),
-                Column("backfillPageToken").set(to: nil as String?)
-            )
-        }
-
-        let incompleteId = incomplete.id
-        let completeId = complete.id
-        let fetchedIncomplete = try await db.read { try Folder.fetchOne($0, key: incompleteId) }
-        #expect(fetchedIncomplete?.backfillUidCursor == nil)
-        #expect(fetchedIncomplete?.backfillPageToken == nil)
-
-        let fetchedComplete = try await db.read { try Folder.fetchOne($0, key: completeId) }
-        #expect(fetchedComplete?.backfillUidCursor == 200)
-        #expect(fetchedComplete?.backfillPageToken == "tok2")
-    }
+    // NOTE: the "resetForFastSync clears cursors" test was removed with
+    // resetForFastSync() itself — fast sync no longer resets walk cursors
+    // (it restarted partially walked folders from the top on every
+    // FastSyncView appearance).
 
     @Test("resetCrawlState: resets ALL folders, sets oldestSyncedDate=now, clears cursors")
     func resetCrawlState() async throws {

@@ -162,8 +162,10 @@ struct FastSyncView: View {
         .onAppear {
             Task { await manager.setFastSyncMode(true) }
             Task {
-                await manager.syncEngine.resetForFastSync()
-                // Restart backfill workers — they may have already exited before fast sync was activated
+                // Restart backfill workers — they may have already exited before
+                // fast sync was activated. Walks resume from their stored cursors;
+                // no cursor reset (the old resetForFastSync() restarted partially
+                // walked folders from the top on every screen open).
                 for account in navigationStore.accounts {
                     await manager.syncEngine.startBackfill(account: account)
                 }

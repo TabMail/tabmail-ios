@@ -139,26 +139,13 @@ extension SyncEngine {
 
     // MARK: - Unified Background Backfill
 
-    /// Reset backfill state for fast sync mode. Called once when fast sync is activated.
-    /// Clears in-memory tracking so the worker restarts.
-    /// Does NOT reset backfillComplete on already-crawled folders — fast sync focuses
-    /// on body indexing, not re-crawling headers. Only incomplete folders get cursor reset.
-    func resetForFastSync() {
-        // Don't reset backfillComplete — folders already crawled stay crawled.
-        // Only reset cursors for incomplete folders so they retry from scratch.
-        Task {
-            // Background-tagged: bulk folder-cursor reset yields to foreground/UI work.
-            try? await AppDatabase.backgroundPool.write { db in
-                _ = try Folder.filter(
-                    Column("backfillComplete") == false &&
-                    Column("path") != ""
-                ).updateAll(db,
-                    Column("backfillUidCursor").set(to: nil as Int?),
-                    Column("backfillPageToken").set(to: nil as String?)
-                )
-            }
-        }
-    }
+    // NOTE: fast sync deliberately does NOT reset backfill cursors. The removed
+    // `resetForFastSync()` nulled backfillUidCursor/backfillPageToken on every
+    // incomplete folder each time FastSyncView appeared, restarting partially
+    // walked folders from the top (IMAP re-fetched every existing header; REST
+    // re-paged through all known pages) and racing the running workers' cursor
+    // snapshots. Fast sync just flips the profile to .turbo — walks resume from
+    // their stored cursors.
 
     /// Smart Reindex: reset crawl cursors so backfill re-walks from top.
     /// Anchors oldestSyncedDate to now and clears cursors so IMAP walks from UIDNEXT
@@ -209,6 +196,7 @@ extension SyncEngine {
 
         if headerBackfillTasks[accountId] == nil {
             print("[Backfill] Starting for \(account.emailAddress)")
+            BackgroundSyncLogger.logBackfill("[Backfill] worker START \(account.emailAddress)")
             let gen = (backfillGeneration[accountId] ?? 0) + 1
             backfillGeneration[accountId] = gen
             // QoS: `.medium` (= .default QoS 21). See ADR-IOS-031. `.low`
@@ -228,6 +216,7 @@ extension SyncEngine {
                 while !Task.isCancelled {
                     // Pause backfill entirely when battery is low (<20%) and not charging
                     if await self?.getShouldPauseBackfill() == true {
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) PAUSED — low battery / Low Power Mode (retry in 60s)")
                         try? await Task.sleep(for: .seconds(60))
                         continue
                     }
@@ -245,6 +234,7 @@ extension SyncEngine {
                     let wifiOnly = UserDefaults.standard.object(forKey: "backgroundSyncWiFiOnly") as? Bool ?? true
                     if wifiOnly && NetworkMonitor.checkExpensive() {
                         print("[Backfill] \(account.emailAddress) paused — WiFi-only enabled, on cellular")
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) PAUSED — WiFi-only enabled, on cellular (retry in 30s)")
                         try? await Task.sleep(for: .seconds(30))
                         continue
                     }
@@ -253,12 +243,14 @@ extension SyncEngine {
 
                     let profile = await self?.getBackfillProfile() ?? .low
                     print("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
+                    BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
                     let didWork = await self?.runBackfill(account: account) ?? false
                     await self?.updateBackfillProgressForAccount(account)
 
                     if !didWork {
                         let walkDone = await self?.isFolderWalkComplete(account: account) ?? false
                         print("[Backfill] \(account.emailAddress) no work, walkDone=\(walkDone)")
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle no work, walkDone=\(walkDone)")
                         guard walkDone else {
                             let sleepDelay = profile.interCycleActiveDelay
                             try? await Task.sleep(for: .seconds(sleepDelay))
@@ -281,6 +273,7 @@ extension SyncEngine {
 
                 // Only clear dictionary if this task is still the current generation.
                 print("[Backfill] \(account.emailAddress) walk loop ended")
+                BackgroundSyncLogger.logBackfill("[Backfill] worker EXIT \(account.emailAddress) (cancelled=\(Task.isCancelled))")
                 await self?.clearBackfillTaskIfCurrent(accountId: accountId, generation: gen)
             }
         } else {

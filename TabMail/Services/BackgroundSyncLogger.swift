@@ -299,6 +299,37 @@ enum BackgroundSyncLogger {
         try? "".write(to: backfillAIFileURL, atomically: true, encoding: .utf8)
     }
 
+    // MARK: - Backfill Log (header walk + body queue)
+
+    private static let backfillFileName = "backfill.log"
+
+    private static var backfillFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TabMail", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(backfillFileName)
+    }
+
+    /// Log a backfill lifecycle event (worker start/exit, cycle start, pause reason,
+    /// folder complete, connection backoff, body-queue batch/miss/confirm-gone outcomes).
+    /// The header/body backfill previously logged via `print()` only, which made
+    /// exported debug logs useless for diagnosing stalls — this is the file channel.
+    /// Only writes to disk when debug mode is unlocked by an allowed user.
+    static func logBackfill(_ message: String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let entry = "[\(Date().iso8601String())] \(message)\n"
+        appendAsync(to: backfillFileURL, entry: entry)
+    }
+
+    static func readBackfillLog() -> String {
+        flushPendingWrites()
+        return (try? String(contentsOf: backfillFileURL, encoding: .utf8)) ?? "(no backfill log)"
+    }
+
+    static func clearBackfillLog() {
+        try? "".write(to: backfillFileURL, atomically: true, encoding: .utf8)
+    }
+
     // MARK: - Inbox ViewModel Log
 
     private static let inboxFileName = "inbox.log"

@@ -306,9 +306,13 @@ actor ActiveBodyQueue {
                         }
                         return collected
                     }
-                    // Handle items not in fetch result (retry)
-                    for item in items where fetched[item.messageId] == nil {
-                        self.batchItemDone(item: item, shouldRetry: true)
+                    // Handle items not in fetch result — same miss-count + confirm-gone
+                    // machinery as BackfillBodyQueue. Inbox rows count toward
+                    // pendingBodyCount too; a plain retry here let a dead UID
+                    // (remap / deletion outside the sync window) cycle forever.
+                    let missedItems = items.filter { fetched[$0.messageId] == nil }
+                    if !missedItems.isEmpty {
+                        await self.handleMissedItems(missedItems, provider: provider)
                     }
                     let processMs = Int((CFAbsoluteTimeGetCurrent() - tProcess) * 1000)
 
@@ -388,6 +392,104 @@ actor ActiveBodyQueue {
 
     private func batchItemDone(item: Item, shouldRetry: Bool) {
         _ = storage.batchItemCompleted(item, shouldRetry: shouldRetry, maxRetries: SyncConfig.maxQueueRetries)
+    }
+
+    /// Missed-UID handling for inbox items — the same counter / confirm-gone /
+    /// re-key wiring as `BackfillBodyQueue.handleMissedItems`, applied to THIS
+    /// queue's storage. Classification (`confirmGoneAtThreshold`) and the UID
+    /// re-key (`rekeyRemappedHeader`) are reused from `BackfillBodyQueue.shared`
+    /// — both only touch the DB/FTS, never queue storage, so cross-actor reuse
+    /// is safe.
+    func handleMissedItems(_ missedItems: [Item], provider: any EmailProvider) async {
+        let threshold = SyncConfig.backfillBodyMissThreshold
+        let partitioned: (toConfirm: [Item], toRetry: [Item])
+        do {
+            partitioned = try await dbPool.write { db -> (toConfirm: [Item], toRetry: [Item]) in
+                var toConfirm: [Item] = []
+                var toRetry: [Item] = []
+                for item in missedItems {
+                    let newCount = (try Int.fetchOne(
+                        db,
+                        sql: "SELECT missFetchCount FROM messageHeader WHERE id = ?",
+                        arguments: [item.headerId]
+                    ) ?? 0) + 1
+                    try db.execute(
+                        sql: "UPDATE messageHeader SET missFetchCount = ? WHERE id = ?",
+                        arguments: [newCount, item.headerId]
+                    )
+                    if newCount >= threshold {
+                        toConfirm.append(item)
+                    } else {
+                        toRetry.append(item)
+                    }
+                }
+                return (toConfirm, toRetry)
+            }
+        } catch {
+            // Idempotent fallback for ANY failure (incl. a benign ADR-IOS-041
+            // suspension abort — retries next wake).
+            if !error.isDatabaseSuspensionAbort {
+                print("[ActiveBody] missFetchCount update failed: \(error) — treating all as retry")
+            }
+            for item in missedItems { self.batchItemDone(item: item, shouldRetry: true) }
+            return
+        }
+
+        for item in partitioned.toRetry {
+            print("[ActiveBody] UID miss \(item.messageId) folder=\(item.folderPath) — retrying")
+            self.batchItemDone(item: item, shouldRetry: true)
+        }
+        for item in partitioned.toConfirm {
+            let backfillItem = BackfillBodyQueue.Item(
+                headerId: item.headerId, accountId: item.accountId,
+                folderPath: item.folderPath, messageId: item.messageId,
+                isInInbox: item.isInInbox
+            )
+            let confirmation = await BackfillBodyQueue.shared.confirmGoneAtThreshold(item: backfillItem, provider: provider)
+            switch confirmation {
+            case .gone:
+                print("[ActiveBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
+                BackgroundSyncLogger.logBackfill("[ActiveBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
+                await AccountManager.shared.deleteConfirmedGoneHeader(
+                    headerId: item.headerId,
+                    reason: "activeBody miss>=\(threshold)"
+                )
+                self.batchItemDone(item: item, shouldRetry: false)
+            case .stillExists(let newUID):
+                if let newUID {
+                    switch await BackfillBodyQueue.shared.rekeyRemappedHeader(item: backfillItem, newUID: newUID) {
+                    case .migrated(let migrated):
+                        print("[ActiveBody] UID remap re-key \(item.messageId)→\(newUID) in \(item.folderPath) — fetching under new UID")
+                        BackgroundSyncLogger.logBackfill("[ActiveBody] UID remap re-key \(item.messageId)→\(newUID) folder=\(item.folderPath)")
+                        self.batchItemDone(item: item, shouldRetry: false)
+                        let newItem = Item(
+                            headerId: migrated.headerId, accountId: migrated.accountId,
+                            folderPath: migrated.folderPath, messageId: migrated.messageId,
+                            isInInbox: migrated.isInInbox
+                        )
+                        if storage.enqueue(newItem) { scheduleDispatch() }
+                    case .duplicateDropped:
+                        print("[ActiveBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
+                        self.batchItemDone(item: item, shouldRetry: false)
+                    case .failed:
+                        self.batchItemDone(item: item, shouldRetry: true)
+                    }
+                } else {
+                    // Same UID still present on the server — the miss was transient.
+                    print("[ActiveBody] Threshold reached but \(item.messageId) still at same UID in \(item.folderPath) — transient miss, resetting counter")
+                    try? await dbPool.write { db in
+                        try db.execute(
+                            sql: "UPDATE messageHeader SET missFetchCount = 0 WHERE id = ?",
+                            arguments: [item.headerId]
+                        )
+                    }
+                    self.batchItemDone(item: item, shouldRetry: true)
+                }
+            case .cannotConfirm:
+                print("[ActiveBody] Threshold reached for \(item.messageId) but cannot confirm gone — keeping for retry / full-sync")
+                self.batchItemDone(item: item, shouldRetry: true)
+            }
+        }
     }
 
     /// Drain-time self-repopulate: re-run the work-remaining query and enqueue any

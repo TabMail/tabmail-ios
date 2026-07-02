@@ -125,6 +125,14 @@ struct FullMessageInfo: Sendable {
 /// signal from `fetchMessagesBatch` and don't need this probe.
 protocol MessageExistenceProbe: Sendable {
     func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool
+
+    /// Resolve the CURRENT server UID(s) for an RFC 2822 Message-ID in a folder.
+    /// Empty array = confirmed not present (same signal as `messageExistsInFolder`
+    /// returning false). Used by the backfill body queue to re-key a UID-remapped
+    /// header in place (old UID dead, message alive under a new UID) instead of
+    /// retrying the dead UID forever — deep-history remaps are never realigned by
+    /// full-sync, whose stale/remap window only covers recent messages.
+    func currentUIDs(rfc822MessageId: String, folderPath: String) async throws -> [String]
 }
 
 /// How a provider's windowed `fetchMessages(limit:)` orders its results, which
