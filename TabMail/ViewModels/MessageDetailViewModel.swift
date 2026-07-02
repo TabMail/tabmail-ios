@@ -219,6 +219,18 @@ final class MessageDetailViewModel {
                     print("[MessageDetail] Body found immediately on poll start for \(rid.prefix(40))")
                     return
                 }
+                // Staged-body fast-path (ADR-IOS-049): loadBody got cancelled by
+                // the deep-link reload/navigation churn and deferred here — the
+                // body may be sitting in NSE staging, not yet durable. Same
+                // display-only synthesis as loadBody's fast-path.
+                if let stagedBody = NSEDataBridge.stagedBodyFallback(headerId: rid) {
+                    BootProfiler.mark("detail body from STAGED snapshot (poll entry) \(rid.prefix(24))")
+                    self.messageBody = stagedBody
+                    self.isLoading = false
+                    self.error = nil
+                    self.loadThreadMessagesAsync()
+                    return
+                }
             }
             var fetchAttempt = 0
             while !Task.isCancelled {
@@ -267,6 +279,16 @@ final class MessageDetailViewModel {
     func loadBody() async {
         guard !loadBodyCalled else { return }
         loadBodyCalled = true
+        // Tap-timeline mark (debug-gated): pairs with "notifTap:" marks so an
+        // open-lag decomposes into resolve vs body-load vs render in one file.
+        let loadT0 = CFAbsoluteTimeGetCurrent()
+        BootProfiler.mark("detail loadBody START \(messageId.prefix(24))")
+        defer {
+            let ms = Int((CFAbsoluteTimeGetCurrent() - loadT0) * 1000)
+            if ms >= 50 {
+                BootProfiler.mark("detail loadBody DONE in \(ms)ms (body=\(messageBody != nil))")
+            }
+        }
 
         // Resolve message from DB with proper error handling.
         // GRDB 7.x throws CancellationError on async reads when the Task is
@@ -338,6 +360,7 @@ final class MessageDetailViewModel {
                 // Body already loaded — trigger priority AI processing if needed.
                 // Matches TB's onMessagesDisplayed direct path: when user opens a message
                 // with a body but missing AI state, process immediately (bypasses queue).
+                BootProfiler.mark("detail body CACHE HIT \(rid.prefix(24))")
                 messageBody = existingBody
                 isLoading = false
                 Task { await manager.enqueueWrite { [manager] in
@@ -353,6 +376,24 @@ final class MessageDetailViewModel {
         } catch {
             print("[MoveTrace] loadBody — body read error: \(error)")
         }
+        // ADR-IOS-049 (notification tap): GRDB missed, but the NSE already
+        // fetched + rendered this body into staging — synthesize it for DISPLAY
+        // now instead of waiting on phase-2's durable write (1.5–5.6s measured
+        // under backfill I/O), the 2s body-poll cadence, or a needless network
+        // re-fetch. Durability stays phase-2's job; the staged bytes are the
+        // SAME ones it will commit, so the later durable row is value-identical
+        // (no poll needed — AI-field refreshes reach the open detail view via
+        // the existing `.messageDataDidChange` observers).
+        if let stagedBody = NSEDataBridge.stagedBodyFallback(headerId: rid) {
+            BootProfiler.mark("detail body from STAGED snapshot (phase-2 not durable yet) \(rid.prefix(24))")
+            messageBody = stagedBody
+            isLoading = false
+            Task { await manager.enqueueWrite { [manager] in
+                await manager.processOpenedMessage(msg)
+            }}
+            loadThreadMessagesAsync()
+            return
+        }
         // If the body queue is already fetching this message, don't compete for the
         // IMAP connection — just poll until the background fetch completes. Competing
         // causes "cannot connect" errors because the folder connection is locked.
@@ -365,6 +406,7 @@ final class MessageDetailViewModel {
         }
 
         isLoading = true
+        BootProfiler.mark("detail body MISS everywhere → SERVER fetch \(rid.prefix(24))")
         do {
             if let override = _fetchBodyOverride {
                 try await override(msg)

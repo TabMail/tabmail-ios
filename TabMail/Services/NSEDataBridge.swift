@@ -105,6 +105,37 @@ enum NSEDataBridge {
     /// consulted only on a GRDB miss. ADR-IOS-049.
     static let latestStagedRows = Mutex<[StagedInboxRow]>([])
 
+    /// Display-ready body content of the most recent merge's staged rows, keyed
+    /// by headerId. Companion to `latestStagedRows` for the notification-tap
+    /// path: the NSE already fetched + rendered the pushed message's body into
+    /// staging, but `MessageDetailViewModel.loadBody` only reads GRDB — so a tap
+    /// seconds after the push waited on the merge's phase-2 durable write
+    /// (measured 1.5–5.6s under backfill I/O), fell to the 2s body-poll cadence,
+    /// or re-FETCHED the body from the network. This snapshot lets the detail
+    /// view synthesize a transient `MessageBody` for DISPLAY immediately;
+    /// durability stays phase-2's job (same bytes, so the later durable read is
+    /// value-identical). Replace-all per merge, like `latestStagedRows` (drained
+    /// staging clears it); bounded by the staged-set size. Unresolved-CID bodies
+    /// are excluded — the main app must re-fetch + re-render those properly.
+    struct StagedBodySnapshot: Sendable {
+        let htmlContent: String
+        let attachmentsJSON: String?
+        let icsText: String?
+    }
+    static let latestStagedBodies = Mutex<[String: StagedBodySnapshot]>([:])
+
+    /// Synthesize a display-only `MessageBody` from the staged snapshot, or nil
+    /// when the message isn't staged / has no usable rendered body. GRDB always
+    /// wins — call ONLY on a GRDB `messageBody` miss (mirrors
+    /// `stagedRowFallback`'s contract for headers).
+    static func stagedBodyFallback(headerId: String) -> MessageBody? {
+        guard let snap = latestStagedBodies.withLock({ $0[headerId] }) else { return nil }
+        var body = MessageBody.create(headerId: headerId, htmlBody: snap.htmlContent)
+        body.attachmentsJSON = snap.attachmentsJSON
+        body.icsText = snap.icsText
+        return body
+    }
+
     /// The staged set (headerId-sorted) of the last `.messagesStaged` post — a
     /// re-merge of a KEPT gradual row re-reads an unchanged set; posting it again
     /// is pure churn for the VM. Memo compared/replaced on EVERY merge (including
@@ -646,6 +677,20 @@ enum NSEDataBridge {
         // including empty (drained staging clears it). Serialized by the merge
         // coordinator, so this always reflects the last-read staging content.
         latestStagedRows.withLock { $0 = stagedRows }
+        // Companion body snapshot (same replace-all lifecycle): lets a
+        // notification-tap render the staged body IMMEDIATELY instead of waiting
+        // for phase-2's durable write / the 2s body-poll / a network re-fetch.
+        // Unresolved-CID bodies excluded — the app must re-render those.
+        let stagedBodies: [String: StagedBodySnapshot] = processed.reduce(into: [:]) { acc, msg in
+            guard let html = msg.htmlContent, !html.isEmpty, !msg.hasUnresolvedCIDs else { return }
+            let headerId = MessageIdentity.headerId(
+                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+            )
+            acc[headerId] = StagedBodySnapshot(
+                htmlContent: html, attachmentsJSON: msg.attachmentsJSON, icsText: msg.icsText
+            )
+        }
+        latestStagedBodies.withLock { $0 = stagedBodies }
         // RE-POST suppression: a KEPT gradual row (ADR-IOS-047, NSE still computing
         // AI) survives the merge, so every re-merge re-read the SAME staged set and
         // re-posted it (observed ~5s cadence for 43+s while NSE AI ran) — each post

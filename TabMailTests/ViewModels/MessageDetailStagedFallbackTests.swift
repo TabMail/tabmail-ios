@@ -34,6 +34,11 @@ struct MessageDetailStagedFallbackTests {
         return (pool, dir, previous)
     }
 
+    @MainActor
+    private func insertDurableHeader(_ header: MessageHeader, into pool: DatabasePool) throws {
+        try pool.writeWithoutTransaction { db in try header.insert(db) }
+    }
+
     private func stagedRow(messageId: String) -> StagedInboxRow {
         StagedInboxRow(
             accountId: "acc1", folderPath: "INBOX", messageId: messageId,
@@ -96,5 +101,57 @@ struct MessageDetailStagedFallbackTests {
         NSEDataBridge.latestStagedRows.withLock { $0 = [stagedRow(messageId: "m-other")] }
         let vm = MessageDetailViewModel(messageId: "acc1:INBOX:m-nope", dbPool: pool, fetchBodyOverride: { _ in })
         #expect(vm.message == nil)
+    }
+
+    // MARK: - Staged BODY fast-path (notification-tap open lag)
+
+    @MainActor
+    @Test("stagedBodyFallback synthesizes a display MessageBody; unknown id is nil")
+    func stagedBodyFallbackSynthesizes() {
+        defer { NSEDataBridge.latestStagedBodies.withLock { $0 = [:] } }
+        NSEDataBridge.latestStagedBodies.withLock {
+            $0 = ["acc1:INBOX:m-tap": NSEDataBridge.StagedBodySnapshot(
+                htmlContent: "<p>staged body</p>", attachmentsJSON: nil, icsText: nil
+            )]
+        }
+        let body = NSEDataBridge.stagedBodyFallback(headerId: "acc1:INBOX:m-tap")
+        #expect(body?.htmlContent == "<p>staged body</p>")
+        #expect(body?.id == "acc1:INBOX:m-tap")
+        #expect(NSEDataBridge.stagedBodyFallback(headerId: "acc1:INBOX:m-nope") == nil)
+    }
+
+    @MainActor
+    @Test("loadBody renders the staged body immediately — no server fetch, no poll wait")
+    func loadBodyUsesStagedBody() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Header durable (the common few-seconds-after-push case: phase 1
+        // landed, phase 2's body write hasn't), body ONLY in the staged snapshot.
+        let row = stagedRow(messageId: "m-body")
+        // Sync helper — an inline call in this async test body would select
+        // GRDB's ASYNC writeWithoutTransaction overload (needs await).
+        try insertDurableHeader(row.toMessageHeader(), into: pool)
+        NSEDataBridge.latestStagedBodies.withLock {
+            $0 = [row.headerId: NSEDataBridge.StagedBodySnapshot(
+                htmlContent: "<p>from staging</p>", attachmentsJSON: nil, icsText: nil
+            )]
+        }
+
+        var serverFetchCalled = false
+        let vm = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in
+            serverFetchCalled = true
+        })
+        await vm.loadBody()
+
+        #expect(vm.messageBody?.htmlContent == "<p>from staging</p>")
+        #expect(vm.isLoading == false)
+        // The whole point: the on-device staged bytes render without a network
+        // round-trip or the 2s body-poll cadence.
+        #expect(!serverFetchCalled)
     }
 }

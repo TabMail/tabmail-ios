@@ -638,6 +638,11 @@ struct MailNavigationView: View {
         // messageId can exist in multiple folders under Gmail's label model
         // — the tap always means "open the inbox row".
         Task { @MainActor in
+            // Tap-timeline mark (debug-gated): anchors the notification-tap →
+            // body-visible sequence in the boot log so any residual open-lag is
+            // attributable (resolve vs body-load vs render).
+            let tapT0 = CFAbsoluteTimeGetCurrent()
+            BootProfiler.mark("notifTap: deep link received \(messageId.prefix(24))")
             // ADR-IOS-049 (notification tap): resolve WITHOUT waiting for the
             // durable merge — the old drain-then-lookup gated navigation on the
             // full merge (phase-1 header + phase-2 body writes; 1.5–10s on a
@@ -647,8 +652,9 @@ struct MailNavigationView: View {
             //    merge already published the staged snapshot (in-memory) before
             //    its slow write — resolve the composite id from it instantly.
             //    MessageDetailViewModel synthesizes its header from the same
-            //    snapshot, and the body lands via the existing body-poll once
-            //    phase 2 commits.
+            //    snapshot, and the body renders from `latestStagedBodies` (or
+            //    the body-poll once phase 2 commits, for unresolved-CID bodies).
+            var resolveTier = "staged"
             var compositeId: String? = NSEDataBridge.latestStagedRows.withLock { rows in
                 rows.first { $0.messageId == messageId }?.headerId
             }
@@ -657,6 +663,7 @@ struct MailNavigationView: View {
             //    read-through staging merge first, re-introducing the very wait
             //    this path removes.
             if compositeId == nil {
+                resolveTier = "durable"
                 compositeId = try? await AppDatabase.rawPool.read { db in
                     try MessageHeader
                         .filter(Column("messageId") == messageId && Column("isInInbox") == true)
@@ -666,6 +673,7 @@ struct MailNavigationView: View {
             // 3. Fallback (rare — e.g. cold launch where the first merge hasn't
             //    read staging yet): the original drain-then-lookup.
             if compositeId == nil {
+                resolveTier = "mergeFallback"
                 await NSEDataBridge.mergeNSEStagingData()
                 compositeId = try? await AppDatabase.dbPool.read { db in
                     try MessageHeader
@@ -673,6 +681,7 @@ struct MailNavigationView: View {
                         .fetchOne(db)?.id
                 }
             }
+            BootProfiler.mark("notifTap: resolved via \(resolveTier) in \(Int((CFAbsoluteTimeGetCurrent() - tapT0) * 1000))ms (hit=\(compositeId != nil))")
 
             // Commit both state changes in the same tick. Raise the flag
             // first so `.onChange(of: selection)` skips its
