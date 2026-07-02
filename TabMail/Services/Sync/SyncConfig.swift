@@ -444,6 +444,16 @@ enum SyncConfig {
     /// (foreground, push, syncStartup, action-gate) bypass the skip entirely.
     static let stagingMergeSignatureTTLSeconds: TimeInterval = 5
 
+    /// How long a staged row inserted in-memory (ADR-IOS-049,
+    /// `InboxViewModel.pendingStagedRows`) is protected from reload eviction while
+    /// its durable write hasn't landed. Normally the durable header write lands in
+    /// ms–seconds and the guard clears itself on the next reload; a PHANTOM row
+    /// (headerId skew vs the merge's identity dedup) never appears in a GRDB reload
+    /// and would otherwise be protected forever. Generous enough to survive a
+    /// suspension-delayed merge write (40s observed, boot_logs 10); small enough to
+    /// bound a phantom's lifetime. Display-only — expiry never touches staging/GRDB.
+    static let stagedRowEvictionGuardSeconds: TimeInterval = 60
+
     /// BGAppRefresh earliest begin date. iOS controls actual timing;
     /// this is the minimum delay we request.
     static let bgAppRefreshIntervalSeconds: TimeInterval = 300 // 5 min

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -65,5 +66,82 @@ struct StagingSignatureSkipTests {
         // Merge's own terminal delete shrinks the set (settling re-merge).
         #expect(!NSEDataBridge.shouldSkipReadThroughMerge(
             current: sig(count: 0, maxProcessedAt: 0), last: last, now: now, ttl: 5))
+    }
+}
+
+/// `.messagesStaged` re-post suppression (`NSEDataBridge.stagedSetChangedSinceLastPost`):
+/// a re-merge of a KEPT gradual row re-reads an UNCHANGED staged set and must not
+/// re-post it (observed ~5s cadence for 43+s while NSE AI ran). Pure in-memory
+/// memo — no DB read on the render path.
+@Suite("Staged-set re-post suppression")
+struct StagedSetRepostSuppressionTests {
+
+    private func row(_ messageId: String, snippet: String = "snip") -> StagedInboxRow {
+        StagedInboxRow(
+            accountId: "acc1", folderPath: "INBOX", messageId: messageId,
+            rfc822MessageId: "<\(messageId)@x>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "S", senderName: "N", senderAddress: "s@example.com",
+            to: "me@example.com", snippet: snippet, date: Date(),
+            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+            isForwarded: false, actionTag: nil, summaryBlurb: nil
+        )
+    }
+
+    // NOTE: results are bound to locals before `#expect` — the macro captures call
+    // arguments for failure diagnostics, which requires Copyable, and `Mutex` isn't.
+
+    @Test("first post fires; identical re-read is suppressed")
+    func identicalSetSuppressed() {
+        let memo = Mutex<[StagedInboxRow]>([])
+        // Reuse the SAME row value — `row()` stamps `Date()`, so two builds differ.
+        // A real re-merge re-reads identical staging content, i.e. equal rows.
+        let m1 = row("m1")
+        let first = NSEDataBridge.stagedSetChangedSinceLastPost([m1], memo: memo)
+        let second = NSEDataBridge.stagedSetChangedSinceLastPost([m1], memo: memo)
+        #expect(first)
+        #expect(!second)
+    }
+
+    @Test("order changes don't count as a change (headerId-normalized)")
+    func orderInsensitive() {
+        let memo = Mutex<[StagedInboxRow]>([])
+        let m1 = row("m1")
+        let m2 = row("m2")
+        let first = NSEDataBridge.stagedSetChangedSinceLastPost([m1, m2], memo: memo)
+        let reordered = NSEDataBridge.stagedSetChangedSinceLastPost([m2, m1], memo: memo)
+        #expect(first)
+        #expect(!reordered)
+    }
+
+    @Test("content or membership change re-posts")
+    func changedSetPosts() {
+        let memo = Mutex<[StagedInboxRow]>([])
+        let m1 = row("m1")
+        let m2 = row("m2")
+        let m1Snippeted = row("m1", snippet: "new")
+        let first = NSEDataBridge.stagedSetChangedSinceLastPost([m1], memo: memo)
+        // New member (m1 unchanged — the growth alone must trigger the post).
+        let grown = NSEDataBridge.stagedSetChangedSinceLastPost([m1, m2], memo: memo)
+        // Same members, one row's content changed (e.g. NSE snippet update).
+        let mutated = NSEDataBridge.stagedSetChangedSinceLastPost([m1Snippeted, m2], memo: memo)
+        // And an unchanged re-read of that same set is suppressed again.
+        let settled = NSEDataBridge.stagedSetChangedSinceLastPost([m1Snippeted, m2], memo: memo)
+        #expect(first)
+        #expect(grown)
+        #expect(mutated)
+        #expect(!settled)
+    }
+
+    @Test("drained set resets the memo — a later identical re-stage posts again")
+    func drainResets() {
+        let memo = Mutex<[StagedInboxRow]>([])
+        let m1 = row("m1")
+        let first = NSEDataBridge.stagedSetChangedSinceLastPost([m1], memo: memo)
+        // Drained merge (empty read) — no post happens (caller gates on isEmpty),
+        // but the memo must reset: the SAME row value must post again after it.
+        _ = NSEDataBridge.stagedSetChangedSinceLastPost([], memo: memo)
+        let restaged = NSEDataBridge.stagedSetChangedSinceLastPost([m1], memo: memo)
+        #expect(first)
+        #expect(restaged)
     }
 }

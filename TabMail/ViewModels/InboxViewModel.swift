@@ -6,6 +6,7 @@ import Foundation
 import GRDB
 @preconcurrency import Combine
 import SwiftUI
+import Synchronization
 
 @Observable
 @MainActor
@@ -71,13 +72,31 @@ final class InboxViewModel {
     /// overlapping Tasks.
     @ObservationIgnored private var isSyncPending = false
     private var loadedIds: Set<String> = []
-    /// ADR-IOS-049: staged rows inserted in-memory (via `.messagesStaged`) whose
-    /// durable GRDB write hasn't landed yet. Keyed by headerId. A reload MUST NOT
-    /// evict these (they aren't in GRDB yet — see the Pass-1 guard in
-    /// `reloadMessages`), and `lookupMessage` synthesizes from them so actions
-    /// resolve. Cleared per-row once the row is durable (a reload sees it) or the
-    /// user acts on it (overlay mutation exists), and wholesale on `resetMessages`.
-    private var pendingStagedRows: [String: StagedInboxRow] = [:]
+    /// ADR-IOS-049: a staged row inserted in-memory (via `.messagesStaged`) whose
+    /// durable GRDB write hasn't landed yet, plus its insertion time. The Pass-1
+    /// guard in `reloadMessages` protects it from eviction ONLY until
+    /// `SyncConfig.stagedRowEvictionGuardSeconds` — a PHANTOM row (headerId skew vs
+    /// the merge's (accountId, messageId)/(rfc822MessageId) dedup: UID remap,
+    /// folderPath variant, durable copy outside the window) never appears in a GRDB
+    /// reload, so an unbounded guard would protect it forever. Expiry evicts the
+    /// DISPLAY row only — staging/GRDB are never touched (never-drop-intention:
+    /// staging rows are deleted only by phase-2 commit).
+    private struct PendingStagedRow {
+        let row: StagedInboxRow
+        let insertedAt: TimeInterval
+    }
+    /// Keyed by headerId. A reload must not evict these while the guard is fresh
+    /// (they aren't in GRDB yet — see the Pass-1 guard in `reloadMessages`), and
+    /// `lookupMessage` synthesizes from them so actions resolve. Cleared per-row
+    /// once the row is durable (a reload sees it), the user acts on it (overlay
+    /// mutation exists), or the guard expires; wholesale on `resetMessages`.
+    private var pendingStagedRows: [String: PendingStagedRow] = [:]
+    /// Tombstones for expiry-evicted phantom staged rows: a KEPT gradual row's
+    /// later stage transition (summary/action flip) changes the staged set, which
+    /// defeats the `.messagesStaged` re-post suppression — without this, the
+    /// re-post would re-insert the evicted phantom with a fresh guard window.
+    /// Cleared on `resetMessages` (a full reset re-evaluates from scratch).
+    private var expiredStagedIds: Set<String> = []
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // On-demand snippet loading state
@@ -285,7 +304,7 @@ final class InboxViewModel {
         // synthesize so the action resolves instead of silently no-op'ing
         // (`guard let message = lookupMessage(id) else { return }`). The action's
         // `ensureDurable` gate drains the merge before the optimistic write lands.
-        return pendingStagedRows[id]?.toMessageHeader()
+        return pendingStagedRows[id]?.row.toMessageHeader()
     }
 
     /// Synchronous folder role lookup — no suspension points.
@@ -472,19 +491,44 @@ final class InboxViewModel {
                 self.pendingAIBatch.insert(messageId)
                 // Throttle (not debounce): flush every 300ms regardless of new arrivals.
                 // With the overlay, flushAIBatch is always safe — no freeze gate needed.
-                if self.aiBatchTask == nil {
-                    self.aiBatchTask = Task { @MainActor [weak self] in
-                        try? await Task.sleep(for: .milliseconds(300))
-                        guard !Task.isCancelled, let self else { return }
-                        self.flushAIBatch()
-                    }
-                }
+                self.scheduleAIFlushTick()
             }
         }
     }
 
+    /// One throttle tick: flush 300ms from now unless a tick is already armed.
+    private func scheduleAIFlushTick() {
+        guard aiBatchTask == nil else { return }
+        aiBatchTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, let self else { return }
+            await self.flushAIBatch()
+        }
+    }
+
+    /// True while a flush is past its drain point (possibly suspended at the async
+    /// read). Prevents a second flush from interleaving — two concurrent flushes
+    /// could apply stale headers out of order (the `snapshot != existing` check
+    /// doesn't protect ordering). The pre-async version was synchronous and could
+    /// never interleave; this restores that invariant.
+    private var isFlushingAIBatch = false
+
     /// Flush batched AI updates — applies all pending snapshot refreshes in one pass.
-    private func flushAIBatch() {
+    private func flushAIBatch() async {
+        guard !isFlushingAIBatch else {
+            // A flush is mid-await. Leave ids in pendingAIBatch and re-arm a tick so
+            // they're picked up next pass (aiBatchTask still points at THIS task —
+            // clear it first so the re-arm isn't a no-op).
+            aiBatchTask = nil
+            scheduleAIFlushTick()
+            return
+        }
+        isFlushingAIBatch = true
+        defer {
+            isFlushingAIBatch = false
+            // Ids that arrived during the await stayed in pendingAIBatch — re-arm.
+            if !pendingAIBatch.isEmpty { scheduleAIFlushTick() }
+        }
         let ids = pendingAIBatch
         pendingAIBatch.removeAll()
         aiBatchTask = nil
@@ -499,8 +543,14 @@ final class InboxViewModel {
                 BackgroundSyncLogger.logInbox("[\(tag)] flushAIBatch \(ms)ms ids=\(idCount)")
             }
         }
-        // Batch-read all needed headers in a single DB read (not one read per message)
-        let freshHeaders: [String: MessageHeader] = (try? dbPool.read { db in
+        // Batch-read all needed headers in a single ASYNC DB read (suspends, never
+        // blocks). This was a synchronous `dbPool.read` on the @MainActor — it fires
+        // ~300ms after AI results land on freshly-merged rows, i.e. inside the same
+        // post-merge write burst as the snippet loader, and a contended reader pool
+        // blocked the main thread here (part of the "stall when snippet shows up").
+        // rawPool deliberately — no read-through staging merge on this path (AI chips
+        // don't need post-merge freshness; the reconcile reload covers them).
+        let freshHeaders: [String: MessageHeader] = (try? await AppDatabase.rawPool.read { db in
             var result: [String: MessageHeader] = [:]
             for id in ids {
                 if let header = try MessageHeader.fetchOne(db, key: id) {
@@ -608,8 +658,26 @@ final class InboxViewModel {
             let id = row.headerId
             // Already shown (durable, or a prior staged insert) — skip.
             guard !loadedIds.contains(id) else { continue }
+            // Expiry-evicted phantom — don't re-arm it with a fresh guard window.
+            guard !expiredStagedIds.contains(id) else { continue }
             // Only for a currently-displayed inbox folder.
             guard folderIds.contains(row.folderId) else { continue }
+            // IDENTITY dedup (phantom-row fix): `loadedIds` dedups by exact headerId,
+            // but the merge dedups by (accountId, messageId) with rfc822MessageId
+            // fallback — any skew (IMAP UID remap, folderPath variant, durable copy
+            // already on screen under a different headerId) would insert a DUPLICATE
+            // phantom row that no GRDB reload ever evicts. Match the merge's
+            // identity in-memory (zero DB I/O on the render path). Account-scoped:
+            // messageId alone collides across accounts.
+            let isDuplicateIdentity = loadedMessages.contains { snap in
+                guard snap.accountId == row.accountId else { return false }
+                if !row.messageId.isEmpty, snap.messageId == row.messageId { return true }
+                if let rfc = row.rfc822MessageId, !rfc.isEmpty,
+                   let snapRfc = snap.rfc822MessageId, !snapRfc.isEmpty,
+                   rfc == snapRfc { return true }
+                return false
+            }
+            guard !isDuplicateIdentity else { continue }
             var header = row.toMessageHeader()
             // Layer the optimistic mutation overlay (mirrors insertUndoneMessages) —
             // if a mutation moved it out of the displayed folders, don't insert.
@@ -648,7 +716,7 @@ final class InboxViewModel {
             }
             loadedMessages.insert(snapshot, at: insertionIndex)
             loadedIds.insert(id)
-            pendingStagedRows[id] = row
+            pendingStagedRows[id] = PendingStagedRow(row: row, insertedAt: CFAbsoluteTimeGetCurrent())
             insertedCount += 1
         }
         if insertedCount > 0 {
@@ -659,6 +727,18 @@ final class InboxViewModel {
         }
     }
 
+    #if DEBUG
+    /// Test hook (guard-expiry tests): backdate a pending staged row's insertion
+    /// timestamp so `SyncConfig.stagedRowEvictionGuardSeconds` expiry can be
+    /// exercised without waiting wall-clock time. No-op for unknown ids.
+    func _testBackdateStagedGuard(id: String, by seconds: TimeInterval) {
+        guard let pending = pendingStagedRows[id] else { return }
+        pendingStagedRows[id] = PendingStagedRow(
+            row: pending.row, insertedAt: pending.insertedAt - seconds
+        )
+    }
+    #endif
+
     /// Full reset — drops all loaded state and fetches page 1.
     /// Use for semantic changes where the data set itself changes:
     /// folder switch, filter toggle, mode switch, initial load.
@@ -667,6 +747,7 @@ final class InboxViewModel {
         resetSnippetState()
         loadedIds = []
         pendingStagedRows.removeAll()
+        expiredStagedIds.removeAll()
         targetWindowSize = SyncConfig.inboxPageSize
         loadedMessages = fetchPage(before: nil)
         loadedIds = Set(loadedMessages.map(\.id))
@@ -674,6 +755,15 @@ final class InboxViewModel {
         // Full assign — no diff needed since the data set changed entirely
         displayGroups = ThreadGroupBuilder.buildDisplayGroups(from: loadedMessages, mode: mode)
         requeueVisibleSnippets()
+        // Re-seed staged-but-not-yet-durable rows from the merge's in-memory
+        // snapshot (zero DB I/O). `.messagesStaged` re-posts are now suppressed
+        // for an UNCHANGED staged set, so a VM that missed the one post (recreated
+        // by nav churn, cold boot before any InboxView existed, or reset by a
+        // filter/folder change) would otherwise not show a pushed row until its
+        // phase-1 durable write lands. All of insertStagedRows' guards apply
+        // (folder membership, overlay, identity dedup, unread filter), so durable
+        // rows already in page 1 are skipped and foreign-folder rows drop out.
+        insertStagedRows(NSEDataBridge.latestStagedRows.withLock { $0 })
     }
 
     /// Diff-based reload — re-fetches the currently loaded date range and diffs in-place.
@@ -749,15 +839,32 @@ final class InboxViewModel {
                     survivingIds.insert(existing.id)
                     // ADR-IOS-049: it's now durable in GRDB → drop the guard.
                     pendingStagedRows.removeValue(forKey: existing.id)
-                } else if pendingStagedRows[existing.id] != nil && overlay[existing.id] == nil {
+                } else if let pending = pendingStagedRows[existing.id],
+                          overlay[existing.id] == nil,
+                          CFAbsoluteTimeGetCurrent() - pending.insertedAt
+                              < SyncConfig.stagedRowEvictionGuardSeconds {
                     // ADR-IOS-049: a staged row whose durable write hasn't landed AND the
                     // user hasn't acted on it — DON'T let this (competing) reload evict the
                     // just-surfaced row, or it flickers away until the write lands. An
                     // overlay mutation means the user acted (e.g. archived) → let it go.
+                    // BOUNDED: past the guard window the row is a phantom (its headerId
+                    // never appeared in a GRDB reload) — let eviction win, and drop the
+                    // guard entry so it can't resurrect. Display-only; staging/GRDB
+                    // untouched.
                     survivingIds.insert(existing.id)
                 } else {
                     indicesToRemove.append(i)
-                    pendingStagedRows.removeValue(forKey: existing.id)
+                    if let pending = pendingStagedRows.removeValue(forKey: existing.id),
+                       overlay[existing.id] == nil,
+                       CFAbsoluteTimeGetCurrent() - pending.insertedAt
+                           >= SyncConfig.stagedRowEvictionGuardSeconds {
+                        // Guard-EXPIRED eviction (phantom): tombstone the id so a
+                        // later re-post (staged-set change defeats the suppression
+                        // memo) can't re-insert it with a fresh guard window.
+                        // Overlay-released rows are NOT tombstoned — the user acted
+                        // on a real row; its lifecycle is the action's business.
+                        expiredStagedIds.insert(existing.id)
+                    }
                 }
             }
             for i in indicesToRemove.reversed() {
@@ -1152,15 +1259,48 @@ final class InboxViewModel {
 
         // Tier 0: DB check — snippet may already be in messageHeader (written by fetchBody
         // or ActiveBodyQueue) but the in-memory snapshot is stale. Idempotent self-heal.
+        //
+        // ONE async batched read (suspends, never blocks the main thread). This used
+        // to be up to 15 SYNCHRONOUS per-id `dbPool.read` calls on the @MainActor —
+        // during a post-merge/sync write burst (reader-pool contention + large WAL)
+        // each could block, and the loop stalled the main actor exactly when new
+        // rows were getting their snippets (the "stall when snippet shows up").
+        // Same fix shape as FIX B (checkLargeInbox) / reloadMessages (fetchFullRange).
+        //
+        // rawPool DELIBERATELY: `PrioritizedDatabase.read` front-runs a read-through
+        // staging merge (`mergeIfStagingPending`) — snippets don't need post-merge
+        // freshness (the reconcile reload covers them), and going through it would
+        // (a) queue this read behind an in-flight multi-second merge and (b) add a
+        // new trigger source for TTL re-merges during a gradual staging window.
+        // Precedent: the notification-tap resolution in MailNavigationView.
+        let tRead = CFAbsoluteTimeGetCurrent()
+        let dbHeaders: [String: MessageHeader] = (try? await AppDatabase.rawPool.read { db in
+            var result: [String: MessageHeader] = [:]
+            for id in batch {
+                if let header = try MessageHeader.fetchOne(db, key: id) {
+                    result[id] = header
+                }
+            }
+            return result
+        }) ?? [:]
+        let readMs = Int((CFAbsoluteTimeGetCurrent() - tRead) * 1000)
+        if readMs >= 50 {
+            BackgroundSyncLogger.logInbox("[\(instanceTag)] snippet batch header read \(readMs)ms (n=\(batch.count))")
+        }
+        guard !Task.isCancelled else { return }
+        // ADR-IOS-049: staged rows rendered in-memory may not be durable in GRDB yet —
+        // fall back to pendingStagedRows so a just-surfaced row isn't blacklisted.
+        let headerFor: (String) -> MessageHeader? = { [self] id in
+            dbHeaders[id] ?? pendingStagedRows[id]?.row.toMessageHeader()
+        }
         for headerId in batch {
-            guard !Task.isCancelled else { return }
-            if let header = lookupMessage(headerId), !header.snippet.isEmpty {
+            if let header = headerFor(headerId), !header.snippet.isEmpty {
                 snippetUpdates.append((headerId: headerId, snippet: header.snippet))
             } else {
                 needsFTS.append(headerId)
             }
         }
-        print("[SnippetLoader] Batch \(batch.count): tier0=\(snippetUpdates.count) needsFTS=\(needsFTS.count)")
+        print("[SnippetLoader] Batch \(batch.count): tier0=\(snippetUpdates.count) needsFTS=\(needsFTS.count) readMs=\(readMs)")
 
         var networkNeeded: [(headerId: String, header: MessageHeader)] = []
 
@@ -1177,8 +1317,8 @@ final class InboxViewModel {
                     continue
                 }
             }
-            // Need network fetch
-            if let header = lookupMessage(headerId) {
+            // Need network fetch — reuse the tier-0 batched read (no sync re-read on main)
+            if let header = headerFor(headerId) {
                 networkNeeded.append((headerId: headerId, header: header))
             } else {
                 snippetFailed.insert(headerId)

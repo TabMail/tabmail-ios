@@ -143,6 +143,105 @@ struct InboxStagedInsertTests {
     }
 
     @MainActor
+    @Test("identity dedup: staged row with remapped UID but same rfc822MessageId is NOT double-inserted")
+    func identityDedupRfc822() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        // Durable, on-screen copy under headerId acc1:INBOX:1000.
+        var durable = MessageHeader(
+            messageId: "1000", subject: "Dup", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        durable.headerComplete = true
+        durable.rfc822MessageId = "<dup@example.com>"
+        try pool.writeWithoutTransaction { db in try durable.insert(db) }
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+        // Same message re-staged after an IMAP UID remap: different messageId
+        // (→ different headerId, so loadedIds does NOT catch it), same rfc822 id.
+        vm.insertStagedRows([makeStagedRow(messageId: "2000", rfc822: "<dup@example.com>")])
+        #expect(vm.loadedMessages.count == 1)
+    }
+
+    @MainActor
+    @Test("identity dedup: staged row with same (accountId, messageId) in a sibling displayed folder is NOT double-inserted")
+    func identityDedupMessageId() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in var f = updates; try f.insert(db) }
+        var durable = MessageHeader(
+            messageId: "1000", subject: "Dup", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        durable.headerComplete = true
+        try pool.writeWithoutTransaction { db in try durable.insert(db) }
+        let vm = InboxViewModel(folders: [folder, updates])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+        // Same account + messageId, different folderPath → different headerId.
+        vm.insertStagedRows([makeStagedRow(folderPath: "Updates", messageId: "1000")])
+        #expect(vm.loadedMessages.count == 1)
+    }
+
+    @MainActor
+    @Test("identity dedup is account-scoped: same messageId on ANOTHER account still inserts")
+    func identityDedupAccountScoped() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "two@example.com", displayName: "Two", provider: .gmail)
+            acc.id = "acc2"
+            try acc.insert(db)
+        }
+        let inbox2 = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc2")
+        try pool.writeWithoutTransaction { db in var f = inbox2; try f.insert(db) }
+        var durable = MessageHeader(
+            messageId: "1000", subject: "A1", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        durable.headerComplete = true
+        try pool.writeWithoutTransaction { db in try durable.insert(db) }
+        let vm = InboxViewModel(folders: [folder, inbox2])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+        vm.insertStagedRows([makeStagedRow(accountId: "acc2", messageId: "1000")])
+        #expect(vm.loadedMessages.count == 2)
+    }
+
+    @MainActor
+    @Test("guard expiry: a fresh staged row survives a reload; an expired phantom is evicted")
+    func guardExpiryEvictsPhantom() async throws {
+        let (_, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        // Staged row with NO durable GRDB write ever landing (phantom scenario).
+        vm.insertStagedRows([makeStagedRow(messageId: "m-phantom")])
+        #expect(vm.loadedMessages.count == 1)
+        // Fresh guard: a reload must NOT evict it (anti-flicker contract).
+        await vm.reloadMessages()
+        #expect(vm.loadedMessages.count == 1)
+        // Expired guard: the reload's Pass-1 removal wins and cleans the row.
+        let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-phantom")
+        vm._testBackdateStagedGuard(id: id, by: SyncConfig.stagedRowEvictionGuardSeconds + 1)
+        await vm.reloadMessages()
+        #expect(vm.loadedMessages.isEmpty)
+        // And the guard entry is gone — the row cannot resurrect via lookupMessage.
+        #expect(vm.lookupMessage(id) == nil)
+    }
+
+    @MainActor
     @Test("lookupMessage synthesizes from a pending staged row when GRDB has none")
     func lookupSynthesizes() throws {
         let (_, folder, dir, previous) = try makeTestDB()

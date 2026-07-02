@@ -105,6 +105,34 @@ enum NSEDataBridge {
     /// consulted only on a GRDB miss. ADR-IOS-049.
     static let latestStagedRows = Mutex<[StagedInboxRow]>([])
 
+    /// The staged set (headerId-sorted) of the last `.messagesStaged` post — a
+    /// re-merge of a KEPT gradual row re-reads an unchanged set; posting it again
+    /// is pure churn for the VM. Memo compared/replaced on EVERY merge (including
+    /// empty/drained, which resets it so a future re-stage posts again).
+    private static let lastPostedStagedRows = Mutex<[StagedInboxRow]>([])
+
+    /// Pure memo compare + update, extracted for unit testing: true iff `rows`
+    /// (order-normalized by headerId) differs from what the memo last recorded;
+    /// the memo is updated to `rows` either way it changed. In-memory equality
+    /// only — deliberately NOT a DB read (the pre-write `surfacesNew` read was a
+    /// regression made once and reverted).
+    ///
+    /// Fail-open edge: a staged row with a nil `date` gets a fresh `Date()` at
+    /// each merge's row build (`msg.date ?? Date()` above), so it never compares
+    /// equal → suppression doesn't fire for it and every re-merge re-posts (the
+    /// pre-suppression behavior; the VM's dedup absorbs it). Erring toward
+    /// posting more, never less.
+    static func stagedSetChangedSinceLastPost(
+        _ rows: [StagedInboxRow], memo: borrowing Mutex<[StagedInboxRow]>
+    ) -> Bool {
+        let normalized = rows.sorted { $0.headerId < $1.headerId }
+        return memo.withLock { last -> Bool in
+            guard last != normalized else { return false }
+            last = normalized
+            return true
+        }
+    }
+
     /// Signature of the staged set the last read-through-triggered merge consumed,
     /// with its completion timestamp. Compared by `mergeIfStagingPending` to skip
     /// re-merging a KEPT gradual row (`aiCompleted=0` survives the merge by design,
@@ -591,10 +619,23 @@ enum NSEDataBridge {
         // including empty (drained staging clears it). Serialized by the merge
         // coordinator, so this always reflects the last-read staging content.
         latestStagedRows.withLock { $0 = stagedRows }
+        // RE-POST suppression: a KEPT gradual row (ADR-IOS-047, NSE still computing
+        // AI) survives the merge, so every re-merge re-read the SAME staged set and
+        // re-posted it (observed ~5s cadence for 43+s while NSE AI ran) — each post
+        // re-runs the VM's insert/dedup pass for nothing. Post only when the staged
+        // set CHANGED since the last post (pure in-memory equality, order-normalized
+        // by headerId — deliberately NOT a DB read: the pre-write `surfacesNew` read
+        // was tried once and reverted). Replace-all like `latestStagedRows`, so a
+        // drained set resets the memo and a future re-stage posts again.
+        let setChanged = Self.stagedSetChangedSinceLastPost(stagedRows, memo: lastPostedStagedRows)
         if !stagedRows.isEmpty {
-            BootProfiler.mark("merge: posted .messagesStaged (\(stagedRows.count) row(s)) — inbox renders IN-MEMORY pre-write")
-            Task { @MainActor in
-                NotificationCenter.default.post(name: .messagesStaged, object: stagedRows)
+            if setChanged {
+                BootProfiler.mark("merge: posted .messagesStaged (\(stagedRows.count) row(s)) — inbox renders IN-MEMORY pre-write")
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: .messagesStaged, object: stagedRows)
+                }
+            } else {
+                BootProfiler.mark("merge: .messagesStaged suppressed — staged set unchanged (\(stagedRows.count) row(s))")
             }
         }
 
