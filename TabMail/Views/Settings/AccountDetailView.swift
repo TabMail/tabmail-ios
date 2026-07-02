@@ -330,6 +330,8 @@ struct AccountDetailView: View {
         }
         .scrollContentBackground(.hidden)
         .background(Palette.previewPaneBg)
+        .dismissKeyboardOnTap()
+        .scrollDismissesKeyboard(.interactively)
         .navigationTitle(account.emailAddress)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
