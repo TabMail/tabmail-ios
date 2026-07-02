@@ -19,7 +19,27 @@ extension AccountManager {
     // If the server state changed after queueing (message moved/deleted remotely),
     // the queued operation is dropped (conflict detection in drainPendingQueue).
 
+    /// ADR-IOS-049: before an optimistic action writes GRDB, ensure every target
+    /// message is durably in GRDB. A row surfaced in-memory via `.messagesStaged`
+    /// (`InboxViewModel.insertStagedRows`) isn't in GRDB yet, so the optimistic UPDATE
+    /// would hit 0 rows and the NSE merge would later resurrect it as inbox. Draining
+    /// the merge first makes the row real so optimistic-state wins. Cheap indexed
+    /// existence read on the action path (NOT the render path); no-op + zero
+    /// coordinator hop for the ~all case where every target is already durable.
+    func ensureDurable(_ messages: [MessageHeader]) async {
+        let anyMissing = (try? await dbPool.read { db -> Bool in
+            for m in messages {
+                let exists = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageHeader WHERE id = ?)", arguments: [m.id]) ?? false
+                if !exists { return true }
+            }
+            return false
+        }) ?? false
+        guard anyMissing else { return }
+        await NSEMergeCoordinator.shared.merge()
+    }
+
     func markRead(_ messages: [MessageHeader]) async {
+        await ensureDurable(messages)
 
         let affectedFolderIds: Set<String>
         do {
@@ -65,6 +85,7 @@ extension AccountManager {
     }
 
     func markUnread(_ messages: [MessageHeader]) async {
+        await ensureDurable(messages)
 
         let affectedFolderIds: Set<String>
         do {
@@ -241,6 +262,7 @@ extension AccountManager {
         // MOVE has provider-dependent effects (e.g. archive-from-Archive).
         let movable = messages.filter { $0.folderPath != destinationPath }
         guard !movable.isEmpty else { return }
+        await ensureDurable(movable)
 
         let grouped = Dictionary(grouping: movable) { "\($0.accountId)|\($0.folderPath)" }
         let affectedFolderIds: Set<String>
@@ -268,6 +290,7 @@ extension AccountManager {
     }
 
     func markFlagged(_ messages: [MessageHeader], flagged: Bool) async {
+        await ensureDurable(messages)
 
         let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
         do {

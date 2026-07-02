@@ -846,6 +846,10 @@ extension Notification.Name {
     /// Posted when undo restores dismissed messages.
     /// Object is [String] array of message IDs to un-dismiss.
     static let messagesUndone = Notification.Name("messagesUndone")
+    /// Posted by the NSE merge with just-read staged mail so the inbox can render
+    /// it IN-MEMORY without waiting for the durable header write (ADR-IOS-049).
+    /// Object is `[StagedInboxRow]`.
+    static let messagesStaged = Notification.Name("messagesStaged")
     /// Posted when the server confirms the user's account no longer exists (deleted or token permanently revoked).
     /// RootView shows an explanatory alert and then signs out.
     static let tabMailAccountGone = Notification.Name("tabMailAccountGone")

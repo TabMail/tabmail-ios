@@ -1564,3 +1564,28 @@ So the user-visible sequence is: header+snippet → render → body+AI → rende
 - Also tuned `nseMergeHerdSettleSeconds` 1.0 → 0.5 (the detached post-merge reply/embedding-enqueue delay; off the display path, so purely shifts when the AI herd starts).
 
 **Tests:** `NSEMergeFullHeaderTests.headerOnlyDefersBodyAndAI` (headerOnly writes NO `MessageBody` row + nil AI fields; the default writes both). `NSEGradualMergeTests` post-count updated to the two immediate renders. 54 NSE tests green.
+
+---
+
+## ADR-IOS-049: Instant Inbox Insert — Render NSE-Staged Mail In-Memory, Before the Durable Merge Write
+
+**Context:** On foreground return, newly-pushed mail didn't appear until the merge's phase-1 header WRITE finished — measured at ~1.5s after a ~3-min background (resume-time I/O throttle + fsync on a just-woken app), up to ~10s after a long suspension. Priority controls write *ordering*, not I/O speed; the merge already runs first, so being first just means it eats the fault/fsync cost. The only way to beat it is to stop gating the render on the write. Full design: `PLAN_INBOX_INSTANT_INSERT.md`.
+
+*(A prior variant — ADR-IOS-048 "staging-union overlay" — was prototyped and REVERTED, so its number is intentionally skipped. It kept a GRDB read on the render path (`foldStagingOverlay`) and added a pre-write existence read, both resume-time-cold, which made the observed delay WORSE. Lesson baked into this ADR: the render path must do ZERO DB I/O.)*
+
+**Decision:** On new staged mail, insert the rows straight into `InboxViewModel.loadedMessages` **in memory** (no GRDB read/write); the durable write lands in the background; a normal reload reconciles. Reuses the shipped `insertUndoneMessages` targeted-insert pattern, sourced from staged data instead of a GRDB read. **Scope: inbox list only** — badge and body render keep lagging to the merge.
+
+1. **Merge → VM signal.** `performMerge` posts `.messagesStaged` with `[StagedInboxRow]` (a `Sendable` header projection) right after reading staging, before the phase-1 write. Separate from `.inboxDataDidChange`, so the merge's 2-post contract (ADR-IOS-047, `NSEGradualMergeTests`) is untouched. The VM dedups, so re-posting on a no-op re-merge inserts nothing — no gating read needed.
+2. **In-memory insert.** `InboxView` → `InboxViewModel.insertStagedRows`: dedup vs `loadedIds`, folder + unread-filter guard, sorted insert, `rebuildDisplayGroups`. Zero DB I/O. Tracked in `pendingStagedRows` (keyed by headerId).
+3. **Anti-flicker guard (the crux).** A just-inserted row isn't in GRDB, so `reloadMessages` Pass-1 would evict it (it removes any loaded row absent from the fresh GRDB set) if a competing reload (sync, backfill, badge recount, 2nd push) fires before the durable write. Guard: **keep** a not-in-fresh row iff `pendingStagedRows[id] != nil && overlay[id] == nil`. The `overlay[id] == nil` clause drops the guard once the user acts (archive → `registerMutation` exists), preventing archived-row resurrection. Cleared per-row when the row appears durable (in the fresh set) or is acted on; wholesale on `resetMessages`.
+4. **Actions gate on durability.** A surfaced-but-not-durable row has no GRDB header: `lookupMessage` synthesizes from `pendingStagedRows` (else the action silently `guard`-returns); `ensureDurable` (a cheap existence read on the action path, NOT the render path) drains the merge first if any target is absent, so the optimistic write lands on a real row instead of hitting 0 rows and being resurrected as inbox. The instant `registerMutation` overlay stays the acknowledgment — never-drop-intention (ADR-IOS-001) preserved.
+
+**Consequences:**
+- New `StagedInboxRow.swift`; `.messagesStaged` notification; `NSEDataBridge.performMerge` posts it; `InboxViewModel.insertStagedRows` + `pendingStagedRows` + Pass-1 guard + `lookupMessage` synthesis + `resetMessages` clear; `InboxView` receiver (extracted to a `StagedRowsReceiver` `ViewModifier` so the large body stays under the SwiftUI type-check limit); `AccountManagerActions.ensureDurable` on markRead/markUnread/move/markFlagged.
+- Render path does ZERO DB I/O — the win the reverted overlay couldn't deliver. No global singleton store (`pendingStagedRows` is VM-local, so no cross-test contamination).
+- Badge, body, search, filters reflect a just-arrived message only after the merge (≤ merge delay). Deliberate.
+- Staged rows render as thread singletons until merged (`computedThreadId` empty → `ThreadGroupBuilder` id fallback).
+
+**Tests:** `InboxStagedInsertTests` (synthesis, insert, dedup, folder-guard, `lookupMessage` synthesis). `NSEGradualMergeTests` 2-post `.inboxDataDidChange` contract unchanged. Full suite green.
+
+**Relates:** builds on ADR-IOS-047 (two-phase merge); supersedes the reverted ADR-IOS-048 intent.

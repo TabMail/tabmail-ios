@@ -476,6 +476,43 @@ enum NSEDataBridge {
         print("[NSEDataBridge] mergeNSEStagingData: found \(processed.count) staged message(s) (\(aiCount) with AI)")
         BootProfiler.mark("mergeNSEStagingData: found \(processed.count) staged (\(aiCount) AI-complete)")
 
+        // ADR-IOS-049: hand the just-read staged rows to the inbox NOW — before the
+        // (resume-time-slow) phase-1 durable write — so the list renders them
+        // IN-MEMORY (`InboxViewModel.insertStagedRows`) instead of gating on the
+        // write. Separate signal from `.inboxDataDidChange` (doesn't touch its
+        // 2-post contract); the VM dedups against `loadedIds`, so re-posting the
+        // same rows on a no-op re-merge inserts nothing. Body/badge unaffected.
+        if !processed.isEmpty {
+            let stagedRows = processed.map { msg in
+                StagedInboxRow(
+                    accountId: msg.accountId,
+                    folderPath: msg.folderPath,
+                    messageId: msg.messageId,
+                    rfc822MessageId: msg.rfc822MessageId,
+                    threadId: msg.threadId,
+                    inReplyTo: msg.inReplyTo,
+                    references: msg.references,
+                    subject: msg.subject,
+                    senderName: msg.senderName,
+                    senderAddress: msg.senderEmail,
+                    to: msg.to,
+                    snippet: msg.snippet,
+                    date: msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date(),
+                    isRead: msg.isRead,
+                    isFlagged: msg.isFlagged,
+                    hasAttachments: msg.hasAttachments,
+                    isReplied: msg.isReplied,
+                    isForwarded: msg.isForwarded,
+                    actionTag: msg.actionTag,
+                    summaryBlurb: msg.summaryBlurb
+                )
+            }
+            BootProfiler.mark("merge: posted .messagesStaged (\(stagedRows.count) row(s)) — inbox renders IN-MEMORY pre-write")
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .messagesStaged, object: stagedRows)
+            }
+        }
+
         if !processed.isEmpty {
             // ============================================================
             // TWO-PHASE MERGE.

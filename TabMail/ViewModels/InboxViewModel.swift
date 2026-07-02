@@ -71,6 +71,13 @@ final class InboxViewModel {
     /// overlapping Tasks.
     @ObservationIgnored private var isSyncPending = false
     private var loadedIds: Set<String> = []
+    /// ADR-IOS-049: staged rows inserted in-memory (via `.messagesStaged`) whose
+    /// durable GRDB write hasn't landed yet. Keyed by headerId. A reload MUST NOT
+    /// evict these (they aren't in GRDB yet — see the Pass-1 guard in
+    /// `reloadMessages`), and `lookupMessage` synthesizes from them so actions
+    /// resolve. Cleared per-row once the row is durable (a reload sees it) or the
+    /// user acts on it (overlay mutation exists), and wholesale on `resetMessages`.
+    private var pendingStagedRows: [String: StagedInboxRow] = [:]
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // On-demand snippet loading state
@@ -271,7 +278,14 @@ final class InboxViewModel {
     /// Look up a MessageHeader by ID from GRDB.
     /// Returns a freshly-fetched value — never stale.
     func lookupMessage(_ id: String) -> MessageHeader? {
-        try? dbPool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        if let header = try? dbPool.read({ db in try MessageHeader.fetchOne(db, key: id) }) {
+            return header
+        }
+        // ADR-IOS-049: staged row inserted in-memory but not yet durable in GRDB —
+        // synthesize so the action resolves instead of silently no-op'ing
+        // (`guard let message = lookupMessage(id) else { return }`). The action's
+        // `ensureDurable` gate drains the merge before the optimistic write lands.
+        return pendingStagedRows[id]?.toMessageHeader()
     }
 
     /// Synchronous folder role lookup — no suspension points.
@@ -580,6 +594,55 @@ final class InboxViewModel {
         }
     }
 
+    /// ADR-IOS-049: insert NSE-staged rows into the loaded list IN-MEMORY (no GRDB
+    /// read/write) so just-pushed mail appears instantly, before the merge's durable
+    /// header write. Sourced from the `.messagesStaged` payload, not GRDB. Mirrors
+    /// `insertUndoneMessages`. Each inserted id is tracked in `pendingStagedRows` so a
+    /// competing reload can't evict it before its durable write lands (see the Pass-1
+    /// guard in `reloadMessages`).
+    func insertStagedRows(_ rows: [StagedInboxRow]) {
+        let folderIds = Set(folders.map(\.id))
+        let overlay = manager.snapshotOverlay()
+        var insertedCount = 0
+        for row in rows {
+            let id = row.headerId
+            // Already shown (durable, or a prior staged insert) — skip.
+            guard !loadedIds.contains(id) else { continue }
+            // Only for a currently-displayed inbox folder.
+            guard folderIds.contains(row.folderId) else { continue }
+            var header = row.toMessageHeader()
+            // Layer the optimistic mutation overlay (mirrors insertUndoneMessages) —
+            // if a mutation moved it out of the displayed folders, don't insert.
+            if let m = overlay[id] {
+                if let v = m.folderId, !folderIds.contains(v) { continue }
+                if let v = m.isRead { header.isRead = v }
+                if let v = m.isFlagged { header.isFlagged = v }
+                if let v = m.actionTag { header.actionTag = v }
+            }
+            if filterUnread && header.isRead { continue }
+            let snapshot = MessageSnapshot(from: header)
+            let insertionIndex: Int
+            if mode == .triage {
+                insertionIndex = loadedMessages.firstIndex {
+                    $0.tagSortOrder > snapshot.tagSortOrder ||
+                    ($0.tagSortOrder == snapshot.tagSortOrder && $0.date < snapshot.date)
+                } ?? loadedMessages.endIndex
+            } else {
+                insertionIndex = loadedMessages.firstIndex { $0.date < snapshot.date } ?? loadedMessages.endIndex
+            }
+            loadedMessages.insert(snapshot, at: insertionIndex)
+            loadedIds.insert(id)
+            pendingStagedRows[id] = row
+            insertedCount += 1
+        }
+        if insertedCount > 0 {
+            BootProfiler.mark("insertStagedRows: +\(insertedCount) staged row(s) rendered IN-MEMORY (inbox=\(loadedMessages.count)) — no DB I/O, durable write lands later")
+            withAnimation(.easeInOut(duration: 0.25)) {
+                rebuildDisplayGroups()
+            }
+        }
+    }
+
     /// Full reset — drops all loaded state and fetches page 1.
     /// Use for semantic changes where the data set itself changes:
     /// folder switch, filter toggle, mode switch, initial load.
@@ -587,6 +650,7 @@ final class InboxViewModel {
         selfHealFolders()
         resetSnippetState()
         loadedIds = []
+        pendingStagedRows.removeAll()
         targetWindowSize = SyncConfig.inboxPageSize
         loadedMessages = fetchPage(before: nil)
         loadedIds = Set(loadedMessages.map(\.id))
@@ -667,8 +731,17 @@ final class InboxViewModel {
                         loadedMessages[i] = fresh
                     }
                     survivingIds.insert(existing.id)
+                    // ADR-IOS-049: it's now durable in GRDB → drop the guard.
+                    pendingStagedRows.removeValue(forKey: existing.id)
+                } else if pendingStagedRows[existing.id] != nil && overlay[existing.id] == nil {
+                    // ADR-IOS-049: a staged row whose durable write hasn't landed AND the
+                    // user hasn't acted on it — DON'T let this (competing) reload evict the
+                    // just-surfaced row, or it flickers away until the write lands. An
+                    // overlay mutation means the user acted (e.g. archived) → let it go.
+                    survivingIds.insert(existing.id)
                 } else {
                     indicesToRemove.append(i)
+                    pendingStagedRows.removeValue(forKey: existing.id)
                 }
             }
             for i in indicesToRemove.reversed() {

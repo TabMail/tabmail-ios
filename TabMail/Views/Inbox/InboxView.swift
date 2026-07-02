@@ -645,6 +645,10 @@ struct InboxView: View {
                 }
             }
         }
+        // ADR-IOS-049: render NSE-staged mail IN-MEMORY before the merge's durable
+        // write. Extracted to a ViewModifier so the (already-heavy) body's modifier
+        // chain stays under the SwiftUI type-checker's complexity limit.
+        .modifier(StagedRowsReceiver(viewModel: viewModel))
         .onReceive(NotificationCenter.default.publisher(for: .messagesUndone).receive(on: DispatchQueue.main)) { notification in
             if let ids = notification.object as? [String] {
                 print("[MoveTrace] InboxView.messagesUndone — ids=\(ids) dismissedMessages=\(dismissedMessages)")
@@ -1677,6 +1681,23 @@ private struct TemplatePillCollapseChatModifier: ViewModifier {
         ) { _ in
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false
+            }
+        }
+    }
+}
+
+/// ADR-IOS-049: receives `.messagesStaged` (NSE-staged mail) and inserts the rows
+/// into the inbox IN-MEMORY, before the merge's durable write. Extracted to a
+/// `ViewModifier` so `InboxView`'s large body stays under the SwiftUI type-checker
+/// complexity limit (an inline `.onReceive` tipped it over).
+private struct StagedRowsReceiver: ViewModifier {
+    let viewModel: InboxViewModel
+    func body(content: Content) -> some View {
+        content.onReceive(
+            NotificationCenter.default.publisher(for: .messagesStaged).receive(on: DispatchQueue.main)
+        ) { notification in
+            if let rows = notification.object as? [StagedInboxRow] {
+                viewModel.insertStagedRows(rows)
             }
         }
     }
