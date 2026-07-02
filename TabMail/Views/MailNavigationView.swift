@@ -628,13 +628,7 @@ struct MailNavigationView: View {
         }
 
         // Resolve BEFORE toggling selection so the inbox/detail views don't
-        // flash "inbox only" for the duration of the async merge+lookup.
-        //
-        // Drain-then-lookup: if the NSE merge hasn't run yet (common on cold
-        // launch from notification tap), the row we want to open is still
-        // sitting in the NSE staging DB. Running the merge first materializes
-        // it into GRDB before we probe — otherwise we fall through to the
-        // inbox even though the message is about to exist.
+        // flash "inbox only" for the duration of the lookup.
         //
         // Lookup shape: the push payload's `messageId` is the PROVIDER
         // messageId (Gmail id / Graph AQMk… / IMAP UID), NOT the composite
@@ -644,11 +638,40 @@ struct MailNavigationView: View {
         // messageId can exist in multiple folders under Gmail's label model
         // — the tap always means "open the inbox row".
         Task { @MainActor in
-            await NSEDataBridge.mergeNSEStagingData()
-            let compositeId: String? = try? await AppDatabase.dbPool.read { db in
-                try MessageHeader
-                    .filter(Column("messageId") == messageId && Column("isInInbox") == true)
-                    .fetchOne(db)?.id
+            // ADR-IOS-049 (notification tap): resolve WITHOUT waiting for the
+            // durable merge — the old drain-then-lookup gated navigation on the
+            // full merge (phase-1 header + phase-2 body writes; 1.5–10s on a
+            // resume-time-cold DB).
+            //
+            // 1. Freshest case: the pushed message is still staging-only. The
+            //    merge already published the staged snapshot (in-memory) before
+            //    its slow write — resolve the composite id from it instantly.
+            //    MessageDetailViewModel synthesizes its header from the same
+            //    snapshot, and the body lands via the existing body-poll once
+            //    phase 2 commits.
+            var compositeId: String? = NSEDataBridge.latestStagedRows.withLock { rows in
+                rows.first { $0.messageId == messageId }?.headerId
+            }
+            // 2. Already-durable case (most taps): direct indexed lookup. Uses
+            //    rawPool deliberately — PrioritizedDatabase.read would run the
+            //    read-through staging merge first, re-introducing the very wait
+            //    this path removes.
+            if compositeId == nil {
+                compositeId = try? await AppDatabase.rawPool.read { db in
+                    try MessageHeader
+                        .filter(Column("messageId") == messageId && Column("isInInbox") == true)
+                        .fetchOne(db)?.id
+                }
+            }
+            // 3. Fallback (rare — e.g. cold launch where the first merge hasn't
+            //    read staging yet): the original drain-then-lookup.
+            if compositeId == nil {
+                await NSEDataBridge.mergeNSEStagingData()
+                compositeId = try? await AppDatabase.dbPool.read { db in
+                    try MessageHeader
+                        .filter(Column("messageId") == messageId && Column("isInInbox") == true)
+                        .fetchOne(db)?.id
+                }
             }
 
             // Commit both state changes in the same tick. Raise the flag

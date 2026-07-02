@@ -97,6 +97,14 @@ enum NSEDataBridge {
         let aiCompletedCount: Int
     }
 
+    /// The staged rows the most recent merge read (replace-all per merge; empty
+    /// when staging is drained). Consumers are the NON-render fallbacks that need
+    /// to resolve a message that is staged but not yet durable in GRDB: the
+    /// notification deep-link id resolution (`MailNavigationView`) and
+    /// `MessageDetailViewModel`'s header synthesis. GRDB always wins — these are
+    /// consulted only on a GRDB miss. ADR-IOS-049.
+    static let latestStagedRows = Mutex<[StagedInboxRow]>([])
+
     /// Signature of the staged set the last read-through-triggered merge consumed,
     /// with its completion timestamp. Compared by `mergeIfStagingPending` to skip
     /// re-merging a KEPT gradual row (`aiCompleted=0` survives the merge by design,
@@ -554,31 +562,36 @@ enum NSEDataBridge {
         // write. Separate signal from `.inboxDataDidChange` (doesn't touch its
         // 2-post contract); the VM dedups against `loadedIds`, so re-posting the
         // same rows on a no-op re-merge inserts nothing. Body/badge unaffected.
-        if !processed.isEmpty {
-            let stagedRows = processed.map { msg in
-                StagedInboxRow(
-                    accountId: msg.accountId,
-                    folderPath: msg.folderPath,
-                    messageId: msg.messageId,
-                    rfc822MessageId: msg.rfc822MessageId,
-                    threadId: msg.threadId,
-                    inReplyTo: msg.inReplyTo,
-                    references: msg.references,
-                    subject: msg.subject,
-                    senderName: msg.senderName,
-                    senderAddress: msg.senderEmail,
-                    to: msg.to,
-                    snippet: msg.snippet,
-                    date: msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date(),
-                    isRead: msg.isRead,
-                    isFlagged: msg.isFlagged,
-                    hasAttachments: msg.hasAttachments,
-                    isReplied: msg.isReplied,
-                    isForwarded: msg.isForwarded,
-                    actionTag: msg.actionTag,
-                    summaryBlurb: msg.summaryBlurb
-                )
-            }
+        let stagedRows = processed.map { msg in
+            StagedInboxRow(
+                accountId: msg.accountId,
+                folderPath: msg.folderPath,
+                messageId: msg.messageId,
+                rfc822MessageId: msg.rfc822MessageId,
+                threadId: msg.threadId,
+                inReplyTo: msg.inReplyTo,
+                references: msg.references,
+                subject: msg.subject,
+                senderName: msg.senderName,
+                senderAddress: msg.senderEmail,
+                to: msg.to,
+                snippet: msg.snippet,
+                date: msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date(),
+                isRead: msg.isRead,
+                isFlagged: msg.isFlagged,
+                hasAttachments: msg.hasAttachments,
+                isReplied: msg.isReplied,
+                isForwarded: msg.isForwarded,
+                actionTag: msg.actionTag,
+                summaryBlurb: msg.summaryBlurb
+            )
+        }
+        // Replace-all snapshot for the non-render fallbacks (notification deep-link
+        // resolution, MessageDetailViewModel synthesis). Updated on EVERY merge —
+        // including empty (drained staging clears it). Serialized by the merge
+        // coordinator, so this always reflects the last-read staging content.
+        latestStagedRows.withLock { $0 = stagedRows }
+        if !stagedRows.isEmpty {
             BootProfiler.mark("merge: posted .messagesStaged (\(stagedRows.count) row(s)) — inbox renders IN-MEMORY pre-write")
             Task { @MainActor in
                 NotificationCenter.default.post(name: .messagesStaged, object: stagedRows)

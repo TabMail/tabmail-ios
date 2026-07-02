@@ -815,8 +815,28 @@ final class MessageDetailViewModel {
     /// 1. Direct composite ID lookup (fastest)
     /// 2. Cross-folder search by messageId + accountId (finds moved messages)
     /// 3. Search by rfc822MessageId (handles UID changes after IMAP MOVE)
+    /// ADR-IOS-049: a message that is staged (NSE) but not yet durable in GRDB —
+    /// e.g. a notification tapped seconds after the push, or an instant-inserted
+    /// inbox row opened before its merge write lands — has no GRDB header yet.
+    /// Synthesize one from the merge's latest staged snapshot so the detail view
+    /// renders immediately (subject/sender/snippet); the body arrives via the
+    /// existing body-poll once phase 2 commits, and later GRDB re-reads replace
+    /// the synthesized header with the durable one. GRDB always wins — this runs
+    /// ONLY on a GRDB miss.
+    private func stagedRowFallback(compositeId: String) -> MessageHeader? {
+        let parts = compositeId.split(separator: ":", maxSplits: 2)
+        let accountId = parts.count == 3 ? String(parts[0]) : nil
+        let msgId = parts.count == 3 ? String(parts[2]) : nil
+        return NSEDataBridge.latestStagedRows.withLock { rows in
+            rows.first {
+                $0.headerId == compositeId ||
+                (accountId != nil && $0.accountId == accountId && $0.messageId == msgId)
+            }
+        }?.toMessageHeader()
+    }
+
     private func resolveMessage(compositeId: String) -> MessageHeader? {
-        return try? dbPool.read { db in
+        let dbHit: MessageHeader? = try? dbPool.read { db in
             // 1. Direct primary key lookup
             if let msg = try MessageHeader.fetchOne(db, key: compositeId) { return msg }
 
@@ -848,6 +868,8 @@ final class MessageDetailViewModel {
             print("[MoveTrace] resolveMessage — not found locally: \(compositeId)")
             return nil
         }
+        if let dbHit { return dbHit }
+        return stagedRowFallback(compositeId: compositeId)
     }
 
     /// Async version of resolveMessage for use in async contexts.
@@ -856,7 +878,7 @@ final class MessageDetailViewModel {
     /// but skipping the read avoids misleading "not found" log entries.
     private func resolveMessageAsync(compositeId: String) async -> MessageHeader? {
         guard !Task.isCancelled else { return nil }
-        return try? await dbPool.read { db in
+        let dbHit: MessageHeader? = try? await dbPool.read { db in
             if let msg = try MessageHeader.fetchOne(db, key: compositeId) { return msg }
 
             let parts = compositeId.split(separator: ":", maxSplits: 2)
@@ -881,6 +903,11 @@ final class MessageDetailViewModel {
 
             return nil
         }
+        if let dbHit { return dbHit }
+        // Cancellation makes the read return nil without meaning "not found" —
+        // don't synthesize from a cancelled read; the caller defers to the poll.
+        guard !Task.isCancelled else { return nil }
+        return stagedRowFallback(compositeId: compositeId)
     }
 
     /// Sync the original folder from the composite ID to pick up the message with its new UID.
