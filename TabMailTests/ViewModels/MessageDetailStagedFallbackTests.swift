@@ -70,8 +70,15 @@ struct MessageDetailStagedFallbackTests {
     }
 
     @MainActor
-    @Test("GRDB wins over the staged snapshot when both exist")
-    func grdbWins() throws {
+    @Test("init prefers the staged snapshot when both exist (zero-I/O main-actor resolve)")
+    func initPrefersStagedSnapshot() throws {
+        // Deliberate ordering flip (2026-07-03, boot_logs 6): init's resolve is a
+        // SYNC main-actor read — for a staged id it used to pay a DB read (PK
+        // miss + fallback queries faulting cold pages behind the in-flight
+        // phase-1 fsync; measured ~4.3s MAIN THREAD STALL) before consulting the
+        // in-memory snapshot. Init now checks the snapshot FIRST; durable-only
+        // freshness (main-app AI fields, synced flags) is healed by the async
+        // refresh paths, which remain GRDB-first.
         let (pool, dir, previous) = try makePool()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -86,7 +93,13 @@ struct MessageDetailStagedFallbackTests {
         try pool.writeWithoutTransaction { db in try durable.insert(db) }
 
         let vm = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
-        #expect(vm.message?.subject == "Durable m-dual")
+        #expect(vm.message?.subject == "Staged m-dual")
+
+        // Once the staged snapshot is drained (next merge replaces it), the same
+        // init resolves the durable row via the DB path.
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        let vm2 = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
+        #expect(vm2.message?.subject == "Durable m-dual")
     }
 
     @MainActor

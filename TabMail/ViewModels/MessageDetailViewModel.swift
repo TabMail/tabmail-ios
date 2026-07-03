@@ -870,8 +870,9 @@ final class MessageDetailViewModel {
     /// Synthesize one from the merge's latest staged snapshot so the detail view
     /// renders immediately (subject/sender/snippet); the body arrives via the
     /// existing body-poll once phase 2 commits, and later GRDB re-reads replace
-    /// the synthesized header with the durable one. GRDB always wins — this runs
-    /// ONLY on a GRDB miss.
+    /// the synthesized header with the durable one. On the ASYNC resolve GRDB
+    /// always wins (this runs only on a GRDB miss); the SYNC init-path resolve
+    /// checks this FIRST — see `resolveMessage`.
     private func stagedRowFallback(compositeId: String) -> MessageHeader? {
         let parts = compositeId.split(separator: ":", maxSplits: 2)
         let accountId = parts.count == 3 ? String(parts[0]) : nil
@@ -885,6 +886,25 @@ final class MessageDetailViewModel {
     }
 
     private func resolveMessage(compositeId: String) -> MessageHeader? {
+        // In-memory staged snapshot FIRST — the only zero-I/O source. This sync
+        // resolve runs in `init` ON THE MAIN ACTOR (tap → detail construction):
+        // when the tapped row is one the NSE just staged, the durable header
+        // either doesn't exist yet (phase-1 write still grinding — the PK
+        // lookup MISSES and the fallback queries then fault cold pages behind
+        // that same write's fsync storm; measured as a ~4.3s MAIN THREAD STALL,
+        // boot_logs 6 2026-07-03) or was seeded milliseconds ago from this very
+        // snapshot. Freshness the durable row gains later (main-app AI fields,
+        // synced flag flips) is healed by the existing refresh paths (AI-update
+        // listener, post-body header refetch). The DB read below remains the
+        // path for every non-staged open (warm PK hit, ~ms).
+        if let staged = stagedRowFallback(compositeId: compositeId) { return staged }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        defer {
+            let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            if ms >= 50 {
+                BootProfiler.mark("detail init resolveMessage sync read \(ms)ms \(compositeId.prefix(24))")
+            }
+        }
         let dbHit: MessageHeader? = try? dbPool.read { db in
             // 1. Direct primary key lookup
             if let msg = try MessageHeader.fetchOne(db, key: compositeId) { return msg }
@@ -917,8 +937,7 @@ final class MessageDetailViewModel {
             print("[MoveTrace] resolveMessage — not found locally: \(compositeId)")
             return nil
         }
-        if let dbHit { return dbHit }
-        return stagedRowFallback(compositeId: compositeId)
+        return dbHit
     }
 
     /// Async version of resolveMessage for use in async contexts.
