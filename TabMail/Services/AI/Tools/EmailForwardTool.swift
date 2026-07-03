@@ -42,6 +42,13 @@ struct EmailForwardTool: AgentTool, Sendable {
             return ComposeOutcome.failed("Email with id \(realId) no longer exists").describeForLLM
         }
 
+        // Demo boundary (ADR-IOS-038): a demo chat must never forward a real
+        // email (and vice versa) — stale translator IDs can cross the line.
+        guard DemoToolGuard.headerAccessible(header) else {
+            print("[EmailForwardTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
+        }
+
         // Parse recipients (required for forward)
         let to = EmailComposeTool.parseStringArray(arguments["to"]) ?? EmailComposeTool.parseStringArray(arguments["recipients"]) ?? []
         let cc = EmailComposeTool.parseStringArray(arguments["cc"]) ?? []

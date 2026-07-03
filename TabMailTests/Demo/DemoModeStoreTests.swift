@@ -63,6 +63,96 @@ struct DemoModeStoreTests {
         #expect(store.callsConsumed == 0)
     }
 
+    @Test("resetCallBudget zeroes the counter and persists (debug-menu reset)")
+    func resetCallBudgetZeroes() {
+        DemoModeStore.shared._resetForTests()
+        let store = DemoModeStore.shared
+        for _ in 0..<7 { store.consumeCall() }
+        #expect(store.callsConsumed == 7)
+
+        store.resetCallBudget()
+        #expect(store.callsConsumed == 0)
+        #expect(store.callsRemaining == 50)
+        #expect(!store.isCallBudgetExhausted)
+        #expect(UserDefaults.standard.integer(forKey: "demo.callsConsumed") == 0)
+    }
+
+    // MARK: - Session ID scoping
+
+    @Test("scopedSessionId adds the demo: prefix only while demo is active")
+    func scopedSessionIdPrefixing() {
+        DemoModeStore.shared._resetForTests()
+        // Inactive: pass-through for every session shape.
+        #expect(DemoModeStore.scopedSessionId("msg:acct:stable") == "msg:acct:stable")
+        #expect(DemoModeStore.scopedSessionId("compose:d1") == "compose:d1")
+        #expect(DemoModeStore.scopedSessionId("ABC-UUID") == "ABC-UUID")
+
+        DemoModeStore.shared.isActive = true
+        #expect(DemoModeStore.scopedSessionId("msg:acct:stable") == "demo:msg:acct:stable")
+        #expect(DemoModeStore.scopedSessionId("compose:d1") == "demo:compose:d1")
+        #expect(DemoModeStore.scopedSessionId("ABC-UUID") == "demo:ABC-UUID")
+        DemoModeStore.shared._resetForTests()
+    }
+
+    // MARK: - Prompt overlay (ADR-IOS-038)
+
+    @Test("PromptStore demo overlay: writes route to demo keys; real prompts untouched; exit restores")
+    func promptStoreDemoOverlayRoundtrip() {
+        let d = UserDefaults.standard
+        let store = PromptStore.shared
+        let realKBBefore = store.rawKB
+        DemoModeStore.shared._resetForTests()
+        DemoModeStore.shared.isActive = true
+        defer {
+            DemoModeStore.shared._resetForTests()
+            PromptStore.removeDemoOverlayKeys()
+        }
+
+        // Key redirection while demo active
+        #expect(PromptStore.storageKey("x") == "demo.x")
+
+        store.enterDemoOverlay()
+        store.rawKB = "- demo kb edit"
+        // Snapshot (the chat KB injection path) sees the demo overlay…
+        #expect(PromptStore.kbTextSnapshot() == "- demo kb edit")
+        // …while the REAL key is untouched.
+        #expect(d.string(forKey: "user_prompts:user_kb.md") == realKBBefore)
+
+        // Exit (still demo-active per contract) restores the real values and
+        // deletes the demo keys.
+        store.exitDemoOverlay()
+        #expect(store.rawKB == realKBBefore)
+        #expect(d.object(forKey: "demo.user_prompts:user_kb.md") == nil)
+
+        DemoModeStore.shared.isActive = false
+        #expect(PromptStore.storageKey("x") == "x")
+        #expect(PromptStore.kbTextSnapshot() == realKBBefore)
+    }
+
+    @Test("DisabledRemindersStore: demo dismissals live in a separate demo map")
+    func disabledRemindersDemoScoped() {
+        let suiteName = "test.demo.disabledReminders"
+        let suite = UserDefaults(suiteName: suiteName)!
+        suite.removePersistentDomain(forName: suiteName)
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+
+        DisabledRemindersStore.withTestDefaults(suite) {
+            DisabledRemindersStore.setEnabled(hash: "m:real-reminder", enabled: false)
+            #expect(DisabledRemindersStore.getDisabledHashes() == ["m:real-reminder"])
+
+            // Demo map starts empty and collects demo dismissals only.
+            DemoModeStore.shared.isActive = true
+            #expect(DisabledRemindersStore.getDisabledHashes().isEmpty)
+            DisabledRemindersStore.setEnabled(hash: "m:demo-reminder", enabled: false)
+            #expect(DisabledRemindersStore.getDisabledHashes() == ["m:demo-reminder"])
+
+            // Back to normal: real map intact, demo hash invisible.
+            DemoModeStore.shared.isActive = false
+            #expect(DisabledRemindersStore.getDisabledHashes() == ["m:real-reminder"])
+        }
+    }
+
     // MARK: - Refund matrix
 
     @Test("Refund: URLError.notConnectedToInternet")

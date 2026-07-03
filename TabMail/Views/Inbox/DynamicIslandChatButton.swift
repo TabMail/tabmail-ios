@@ -388,7 +388,10 @@ struct DynamicIslandChat: View {
                     // raw `content` is the template name "chat_converse" (not human text).
                     let expiringTurns = sessionTurns
                     let expiringSid = currentSessionId
-                    if !expiringTurns.isEmpty, let sid = expiringSid {
+                    // Demo sessions never refine the user's KB — a demo chat
+                    // feeding kb refinement would pollute the real KB (and the
+                    // reminders parsed from it) with demo content.
+                    if !expiringTurns.isEmpty, let sid = expiringSid, !sid.hasPrefix("demo:") {
                         let snapshot = KBRefineSnapshot(
                             sessionId: sid,
                             enqueuedAt: Int64(Date().timeIntervalSince1970 * 1000),
@@ -434,7 +437,7 @@ struct DynamicIslandChat: View {
                 // This restores previous chat when reopening the same email.
                 // Uses stableMessageKey (rfc822MessageId for IMAP) so chat survives folder moves.
                 if let msg = message, chatMessages.isEmpty, let stableKey = stableMessageKey {
-                    let msgSessionId = "msg:\(stableKey)"
+                    let msgSessionId = DemoModeStore.scopedSessionId("msg:\(stableKey)")
                     Task {
                         if let session = try? await ChatStore.shared.loadContextSession(sessionId: msgSessionId) {
                             if chatMessages.isEmpty { // Double-check (avoid race)
@@ -495,7 +498,7 @@ struct DynamicIslandChat: View {
                 // Compose: load existing session from GRDB if in-memory is empty.
                 // This restores previous edit chat when reopening the same reply/forward.
                 if isComposeMode, chatMessages.isEmpty, let did = draftId {
-                    let composeSessionId = "compose:\(did)"
+                    let composeSessionId = DemoModeStore.scopedSessionId("compose:\(did)")
                     Task {
                         if let session = try? await ChatStore.shared.loadContextSession(sessionId: composeSessionId) {
                             if chatMessages.isEmpty {
@@ -1109,10 +1112,13 @@ struct DynamicIslandChat: View {
         hasLoadedHistory = true
         let maxSessions = UserDefaults.standard.integer(forKey: ChatPillState.maxSessionsKey)
         let limit = maxSessions > 0 ? maxSessions : ChatPillState.defaultMaxSessions
+        // Demo isolation: demo mode lists ONLY demo sessions; normal mode
+        // never lists them.
+        let demoActive = DemoModeStore.shared.isActive
 
         Task {
             do {
-                var sessions = try await ChatStore.shared.loadSessions(limit: limit)
+                var sessions = try await ChatStore.shared.loadSessions(limit: limit, demoActive: demoActive)
 
                 // If there's a live session with messages not yet in GRDB (or the current
                 // session is already the last loaded one), ensure it's represented.
@@ -1222,9 +1228,10 @@ struct DynamicIslandChat: View {
 
         print("[DynamicIslandChat] sendComposeEdit START: instruction=\(instruction.prefix(60))")
 
-        // Generate deterministic sessionId for compose (tied to draft)
+        // Generate deterministic sessionId for compose (tied to draft).
+        // Demo-prefixed while demo mode is active (wiped on demo exit).
         if currentSessionId == nil, let did = draftId {
-            currentSessionId = "compose:\(did)"
+            currentSessionId = DemoModeStore.scopedSessionId("compose:\(did)")
         }
         let sid = currentSessionId
 
@@ -1592,11 +1599,14 @@ struct DynamicIslandChat: View {
         // Generate a sessionId for this session if not yet created.
         // Message-detail: deterministic "msg:{accountId}:{stableId}" (tied to email, survives IMAP MOVE).
         // Inbox: random UUID (new session each time).
+        // In demo mode every sessionId gets the "demo:" prefix (via
+        // scopedSessionId) so demo turns are wiped on exit and never mix with
+        // the user's session history.
         if currentSessionId == nil {
             if let key = stableMessageKey {
-                currentSessionId = "msg:\(key)"
+                currentSessionId = DemoModeStore.scopedSessionId("msg:\(key)")
             } else {
-                currentSessionId = UUID().uuidString
+                currentSessionId = DemoModeStore.scopedSessionId(UUID().uuidString)
             }
             // In multi-session mode: transform __new__ into live, append new __new__
             if hasSessionHistory, activeSessionIndex < loadedSessions.count,

@@ -562,6 +562,16 @@ actor MemoryIndex {
 
     // MARK: - Search (hybrid FTS + vec, per-turn)
 
+    /// SQL predicate scoping memory rows per demo state (ADR-IOS-038). Demo
+    /// chat turns carry the `demo:` sessionId prefix: demo mode searches ONLY
+    /// them; normal mode never sees them (NULL sessionId = legacy real rows).
+    /// Index-friendly half-open range form; static + pure for tests.
+    nonisolated static func demoScopeSQL(demoActive: Bool, alias: String) -> String {
+        demoActive
+            ? "\(alias).sessionId >= 'demo:' AND \(alias).sessionId < 'demo;'"
+            : "(\(alias).sessionId IS NULL OR \(alias).sessionId < 'demo:' OR \(alias).sessionId >= 'demo;')"
+    }
+
     /// Hybrid memory search with FTS5 + sqlite-vec, returning per-turn hits.
     /// Each `MemoryHit` corresponds to a single chatHistory turn. A session
     /// with three matching turns produces three independently-ranked hits.
@@ -574,6 +584,8 @@ actor MemoryIndex {
         let candidateLimit = limit * SearchConfig.candidateMultiplier
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return [] }
+        // Demo isolation: snapshot once per call so both legs use the same scope.
+        let demoActive = DemoModeStore.isDemoActive
 
         // FTS5 candidates — ORDER BY rank ASC, meta.dateMs DESC.
         var ftsCandidates: [(rowid: Int64, rank: Double, snippet: String, content: String, chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64)] = []
@@ -586,6 +598,7 @@ actor MemoryIndex {
                     FROM memory_fts fts
                     JOIN memory_meta meta ON fts.rowid = meta.rowid
                     WHERE memory_fts MATCH ?
+                      AND \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))
                     """
                 var args: [DatabaseValueConvertible?] = [ftsQuery(trimmed)]
                 if let fromMs {
@@ -622,7 +635,7 @@ actor MemoryIndex {
         if let embedService = EmbeddingService.shared {
             do {
                 let qVec = try embedService.embed(trimmed)
-                vecCandidates = searchVecCandidates(queryEmbedding: qVec, limit: candidateLimit)
+                vecCandidates = searchVecCandidates(queryEmbedding: qVec, limit: candidateLimit, demoActive: demoActive)
             } catch {
                 print("[MemoryIndex] Query embedding failed: \(error)")
             }
@@ -765,13 +778,20 @@ actor MemoryIndex {
 
     /// Vector KNN query. Uses writer connection to avoid sqlite-vec vtab lifecycle issues
     /// (matches `SearchIndex.searchVecCandidates`).
-    private func searchVecCandidates(queryEmbedding: [Float], limit: Int) -> [(Int64, Double)] {
+    private func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
         do {
             let (pairs, distances) = try dbPool.writeWithoutTransaction { db -> ([(Int64, Double)], [Double]) in
+                // KNN runs in the inner select (vec0 MATCH + k constraint);
+                // the demo scope filters the k results via a meta join. Demo
+                // isolation over recall: out-of-scope KNN hits are dropped
+                // rather than backfilled.
                 let rows = try Row.fetchAll(db, sql: """
-                    SELECT rowid, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?
+                    SELECT v.rowid AS rowid, v.distance AS distance
+                    FROM (SELECT rowid, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?) v
+                    JOIN memory_meta meta ON meta.rowid = v.rowid
+                    WHERE \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))
                     """, arguments: [blob, limit])
                 var pairs: [(Int64, Double)] = []
                 var ds: [Double] = []
@@ -825,6 +845,9 @@ actor MemoryIndex {
         guard let dbPool else { return [] }
         let lowerBound = timestampMs - toleranceMs
         let upperBound = timestampMs + toleranceMs
+        // Demo isolation: the matched turn (and therefore the session window)
+        // must come from the current mode's rows only.
+        let scope = Self.demoScopeSQL(demoActive: DemoModeStore.isDemoActive, alias: "memory_meta")
         print("[MemoryIndex] readByTimestamp target=\(timestampMs) tolMs=\(toleranceMs) maxTurns=\(maxTurns) window=[\(lowerBound), \(upperBound)]")
 
         do {
@@ -835,13 +858,13 @@ actor MemoryIndex {
                 let beforeRow = try Row.fetchOne(db, sql: """
                     SELECT rowid, chatHistoryId, sessionId, role, dateMs
                     FROM memory_meta
-                    WHERE dateMs >= ? AND dateMs <= ?
+                    WHERE dateMs >= ? AND dateMs <= ? AND \(scope)
                     ORDER BY dateMs DESC LIMIT 1
                     """, arguments: [lowerBound, timestampMs])
                 let afterRow = try Row.fetchOne(db, sql: """
                     SELECT rowid, chatHistoryId, sessionId, role, dateMs
                     FROM memory_meta
-                    WHERE dateMs > ? AND dateMs <= ?
+                    WHERE dateMs > ? AND dateMs <= ? AND \(scope)
                     ORDER BY dateMs ASC LIMIT 1
                     """, arguments: [timestampMs, upperBound])
 
@@ -889,12 +912,14 @@ actor MemoryIndex {
                     // Merge chronologically.
                     windowRows = beforeTurns.reversed() + afterTurns
                 } else {
-                    // NULL sessionId: fall back to pure time-window walk.
+                    // NULL sessionId: fall back to pure time-window walk
+                    // (same demo scope — the window must not straddle modes).
                     windowRows = try Row.fetchAll(db, sql: """
                         SELECT meta.chatHistoryId, meta.sessionId, meta.role, meta.dateMs, fts.content
                         FROM memory_meta meta
                         JOIN memory_fts fts ON fts.rowid = meta.rowid
                         WHERE meta.dateMs >= ? AND meta.dateMs <= ?
+                          AND \(Self.demoScopeSQL(demoActive: DemoModeStore.isDemoActive, alias: "meta"))
                         ORDER BY meta.dateMs ASC LIMIT ?
                         """, arguments: [lowerBound, upperBound, maxTurns])
                 }

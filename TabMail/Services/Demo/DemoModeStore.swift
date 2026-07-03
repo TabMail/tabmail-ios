@@ -4,6 +4,7 @@
 
 import Foundation
 import Observation
+import Synchronization
 
 /// Demo Mode runtime state. See `DECISIONS.md` (ADR-IOS-038).
 ///
@@ -36,7 +37,26 @@ final class DemoModeStore {
     }
 
     /// Whether demo mode is currently active for this app session.
-    var isActive: Bool = false
+    var isActive: Bool = false {
+        didSet { Self.activeMirror.withLock { $0 = isActive } }
+    }
+
+    /// Nonisolated mirror of `isActive` for readers that cannot hop to the
+    /// main actor (PromptStore snapshots, DisabledRemindersStore,
+    /// SearchIndex / MemoryIndex query scoping). Updated ONLY by the
+    /// `isActive.didSet` above — never write it directly.
+    nonisolated private static let activeMirror = Mutex(false)
+
+    /// Nonisolated read of `isActive` (see `activeMirror`).
+    nonisolated static var isDemoActive: Bool {
+        activeMirror.withLock { $0 }
+    }
+
+    /// True when the current demo session was entered from the hidden debug
+    /// menu (demo recording). Hides the bottom `DemoBanner` so recordings are
+    /// clean — exit + counter reset live in the debug menu instead. In-memory
+    /// like `isActive` (demo never survives a relaunch). Cleared on exit.
+    var enteredFromDebugMenu: Bool = false
 
     /// Mid-flight JWT mint flag. Login button disables while true.
     var startInProgress: Bool = false
@@ -131,6 +151,28 @@ final class DemoModeStore {
         return false
     }
 
+    /// Debug-menu only: reset the persistent call counter to zero so demo
+    /// recordings always start with the full budget. Not reachable from any
+    /// user-facing UI — the counter otherwise persists across exit/re-entry
+    /// by design (anti-abuse).
+    func resetCallBudget() {
+        callsConsumed = 0
+        UserDefaults.standard.set(0, forKey: Keys.callsConsumed)
+        NotificationCenter.default.post(name: .demoCallsRemainingChanged, object: nil)
+    }
+
+    // MARK: - Chat session scoping
+
+    /// Prefix a GRDB chat sessionId with `demo:` while demo mode is active.
+    /// This is THE invariant that keeps demo chat turns wipeable by prefix
+    /// (`DemoSeed.wipe` chatTurn/chatHistory range delete +
+    /// `MemoryIndex.purgeForSessionPrefix("demo:")`) and lets `ChatStore`
+    /// scope the session-history UI per mode. Every site that constructs a
+    /// chat sessionId for mint OR lookup must route through this.
+    static func scopedSessionId(_ base: String) -> String {
+        shared.isActive ? "demo:\(base)" : base
+    }
+
     // MARK: - Test helpers
 
     /// Test-only — reset counter and flags. Not exposed to release UI.
@@ -141,6 +183,7 @@ final class DemoModeStore {
         UserDefaults.standard.set(false, forKey: Keys.hasSeenAIConsent)
         UserDefaults.standard.set(false, forKey: Keys.aiEnabled)
         isActive = false
+        enteredFromDebugMenu = false
         startInProgress = false
     }
 }

@@ -42,6 +42,13 @@ struct EmailReplyTool: AgentTool, Sendable {
             return ComposeOutcome.failed("Email with id \(realId) no longer exists").describeForLLM
         }
 
+        // Demo boundary (ADR-IOS-038): a demo chat must never reply to a real
+        // email (and vice versa) — stale translator IDs can cross the line.
+        guard DemoToolGuard.headerAccessible(header) else {
+            print("[EmailReplyTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
+        }
+
         // Parse delta-shaped overrides: per-field add/remove lists applied on top of reply-all
         // defaults. See email_reply-v1.5.16.json. Absent key = no delta (empty).
         let addTo = EmailComposeTool.parseStringArray(arguments["add_recipients"]) ?? []

@@ -72,12 +72,15 @@ final class DemoModeService {
     /// exactly like the login-screen path. Demo data is namespaced
     /// (`accountId == "demo-account"`) and wiped on exit; the live account,
     /// session, and real data are never touched.
+    /// The bottom DemoBanner is suppressed for this entry mode (demo recording)
+    /// — exit + call-counter reset live in the debug menu instead.
     func startFromDebugMenu() async throws {
         let store = DemoModeStore.shared
         store.hasCompletedConsentGate = true
         store.hasSeenAIConsent = true
         store.aiEnabled = true
         try await start()
+        store.enteredFromDebugMenu = true
     }
 
     /// Phase 2 of entry — runs AFTER the user passes the consent + AI gates
@@ -114,6 +117,23 @@ final class DemoModeService {
         if DemoModeStore.shared.aiEnabled {
             AISubscriptionGate.shared.openGate()
         }
+
+        // Drop ALL in-memory chat pill state so the demo chat never shows the
+        // live user's in-flight session (debug-menu coexistence entry). The
+        // demo view tree is still behind the seeding splash here, and RootView
+        // swaps the routing branch on demo entry, so views re-create their
+        // Session objects on next access.
+        ChatPillState.shared.removeAllSessions()
+
+        // Prompt overlay (ADR-IOS-038): swap KB / composition / action /
+        // templates to bundled defaults so demo tools (kb_add, reminder_add,
+        // template edits) operate on demo-scoped storage and the real prompts
+        // never surface in a demo. Device Sync is disconnected first — an
+        // existing connection (debug-menu coexistence) could otherwise push
+        // incoming peer state into the overlay. connect() is demo-guarded, so
+        // it stays down until exit.
+        DeviceSyncService.shared.disconnect()
+        PromptStore.shared.enterDemoOverlay()
 
         // Notify the search index / nav store so reactive UI picks up demo
         // folders + headers immediately. NavigationStore is a pull-model
@@ -160,8 +180,24 @@ final class DemoModeService {
         // (net-new). Demo session ids start with "demo:".
         await MemoryIndex.shared.purgeForSessionPrefix("demo:")
 
+        // Drop ALL in-memory chat pill state — demo session pages, live demo
+        // turns, and reminder buffers must not survive into the real user's
+        // chat pill (they'd resurrect wiped GRDB rows on screen).
+        ChatPillState.shared.removeAllSessions()
+
+        // Restore the real prompts + delete the overlay keys. MUST run while
+        // isActive is still true (see PromptStore.exitDemoOverlay). The demo
+        // disabled-reminders map is deleted the same way.
+        PromptStore.shared.exitDemoOverlay()
+        UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
+
         store.isActive = false
+        store.enteredFromDebugMenu = false
         // Note: callsConsumed and demo gate flags persist.
+
+        // Re-establish Device Sync (disconnected on demo entry). connect()
+        // internally no-ops unless the user has sync enabled.
+        DeviceSyncService.shared.forceReconnect()
 
         // Symmetric to completeSetup(): NavigationStore is pull-model and
         // doesn't notice the GRDB account/folder wipe on its own. Without
@@ -185,6 +221,10 @@ final class DemoModeService {
         }
         await SearchIndex.shared.purgeForAccount(DemoSeed.demoAccountId)
         await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        // Stale demo overlay keys from a force-quit mid-demo (harmless while
+        // demo is inactive — all readers use the real keys — but clean up).
+        PromptStore.removeDemoOverlayKeys()
+        UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
     }
 
     // MARK: - FTS indexing

@@ -102,11 +102,23 @@ enum ReminderBuilder {
     }
 
     /// The full build — GRDB query, KB parse, hashing, sort, GC. Called only on cache miss.
+    ///
+    /// Demo isolation (ADR-IOS-038): while demo mode is active, message
+    /// reminders are scoped to the demo account and KB reminders/tasks come
+    /// from the DEMO prompt overlay (kbTextSnapshot is demo-aware) — both
+    /// directions: real reminders never surface in demo, demo reminders never
+    /// surface for the user. The cache is invalidated on demo entry/exit via
+    /// the `.remindersDidChange` posts in DemoModeService.
     private static func performBuild() async -> [Reminder] {
         print("[ReminderBuilder] Building complete reminder list...")
 
-        // Collect reminders from both sources
-        let messageReminders = await collectMessageReminders()
+        let demoActive = await MainActor.run { DemoModeStore.shared.isActive }
+
+        // Collect reminders from both sources. kbTextSnapshot is demo-aware
+        // (PromptStore demo overlay): in demo it returns the demo KB, so
+        // reminders the demo agent adds via reminder_add DO show as cards,
+        // while the user's real KB reminders never do.
+        let messageReminders = await collectMessageReminders(demoActive: demoActive)
         let kbText = PromptStore.kbTextSnapshot()
         let kbParsed = KBReminderParser.parse(kbText)
         var disabledHashes = DisabledRemindersStore.getDisabledHashes()
@@ -475,13 +487,21 @@ enum ReminderBuilder {
 
     /// Collect message reminders from GRDB inbox (messages with non-nil reminderContent).
     /// Matches TB's `collectMessageReminders()`.
-    private static func collectMessageReminders() async -> [MessageReminderRaw] {
+    /// `demoActive` scopes by account: demo mode reads ONLY demo-seeded rows;
+    /// normal mode excludes them (a stray demo row must never remind the user).
+    /// This is an extra AND predicate on the existing reminder query, not a new
+    /// scan — the accountId filter applies to rows the query already reads.
+    private static func collectMessageReminders(demoActive: Bool) async -> [MessageReminderRaw] {
         do {
             let messages: [MessageHeader] = try await AppDatabase.dbPool.read { db in
-                try MessageHeader
+                let accountScope = demoActive
+                    ? Column("accountId") == DemoSeed.demoAccountId
+                    : Column("accountId") != DemoSeed.demoAccountId
+                return try MessageHeader
                     .filter(Column("isInInbox") == true)
                     .filter(Column("reminderContent") != nil)
                     .filter(Column("isReplied") == false)
+                    .filter(accountScope)
                     .fetchAll(db)
             }
 

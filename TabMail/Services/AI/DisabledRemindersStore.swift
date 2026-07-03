@@ -17,6 +17,17 @@ enum DisabledRemindersStore {
     private static let storageKeyV1 = "disabled_reminders"
     private static let storageKeyV2 = "disabled_reminders_v2"
 
+    /// Demo-scoped map key (ADR-IOS-038). Deleted on demo exit by
+    /// `DemoModeService`. Public so the service can remove it.
+    static let demoStorageKeyV2 = "demo.disabled_reminders_v2"
+
+    /// Active map key: demo mode operates entirely on its own (initially
+    /// empty) map so demo dismiss/snooze never touches — or broadcasts —
+    /// the real user's disabled-reminder state.
+    private static var activeKeyV2: String {
+        DemoModeStore.isDemoActive ? demoStorageKeyV2 : storageKeyV2
+    }
+
     /// GC age threshold — entries not in fresh set and older than this are removed.
     private static let gcAgeDays = 90
 
@@ -100,6 +111,8 @@ enum DisabledRemindersStore {
 
     /// Migrate v1 array to v2 map on first access.
     private static func migrateIfNeeded() {
+        // Never migrate into (or based on) the demo map.
+        guard !DemoModeStore.isDemoActive else { return }
         let d = defaults
         guard d.data(forKey: storageKeyV2) == nil else { return }
 
@@ -118,7 +131,7 @@ enum DisabledRemindersStore {
     /// Get the full CRDT map.
     static func getDisabledMap() -> [String: DisabledEntry] {
         migrateIfNeeded()
-        guard let data = defaults.data(forKey: storageKeyV2),
+        guard let data = defaults.data(forKey: activeKeyV2),
               let map = try? JSONDecoder().decode([String: DisabledEntry].self, from: data) else {
             return [:]
         }
@@ -128,7 +141,7 @@ enum DisabledRemindersStore {
     /// Save the CRDT map.
     private static func saveDisabledMap(_ map: [String: DisabledEntry]) {
         if let data = try? JSONEncoder().encode(map) {
-            defaults.set(data, forKey: storageKeyV2)
+            defaults.set(data, forKey: activeKeyV2)
         }
     }
 
@@ -149,9 +162,13 @@ enum DisabledRemindersStore {
         saveDisabledMap(map)
         print("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
 
-        // Broadcast to Device Sync peers
-        Task { @MainActor in
-            DeviceSyncService.shared.debouncedBroadcast(fields: [.disabledReminders])
+        // Broadcast to Device Sync peers. Demo dismiss/snooze stays local to
+        // the demo map — broadcasting would also stamp the real
+        // device_sync_ts:disabledReminders bookkeeping.
+        if !DemoModeStore.isDemoActive {
+            Task { @MainActor in
+                DeviceSyncService.shared.debouncedBroadcast(fields: [.disabledReminders])
+            }
         }
 
         // Notify local observers (chat pill regenerates reminders)

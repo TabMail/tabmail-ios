@@ -31,9 +31,15 @@ struct InboxReadTool: AgentTool, Sendable {
             pageIndex = 1
         }
 
-        // Query inbox: count + single page via LIMIT/OFFSET (bounded memory)
+        // Query inbox: count + single page via LIMIT/OFFSET (bounded memory).
+        // Demo boundary (ADR-IOS-038): demo lists ONLY demo rows; normal mode
+        // never lists them (real rows are also isInInbox during coexistence).
+        let demoActive = DemoModeStore.isDemoActive
         let totalCount = try await ctx.db.read { db in
-            try MessageHeader.filter(Column("isInInbox") == true).fetchCount(db)
+            try MessageHeader
+                .filter(Column("isInInbox") == true)
+                .filter(DemoToolGuard.accountScope(demoActive: demoActive))
+                .fetchCount(db)
         }
         let totalPages = max(1, (totalCount + Config.pageSize - 1) / Config.pageSize)
         let safePage = min(max(pageIndex - 1, 0), totalPages - 1)
@@ -42,6 +48,7 @@ struct InboxReadTool: AgentTool, Sendable {
         let pageItems: [MessageHeader] = try await ctx.db.read { db in
             try MessageHeader
                 .filter(Column("isInInbox") == true)
+                .filter(DemoToolGuard.accountScope(demoActive: demoActive))
                 .order(Column("date").desc)
                 .limit(Config.pageSize, offset: offset)
                 .fetchAll(db)

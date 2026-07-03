@@ -326,10 +326,23 @@ actor ChatStore {
         let emailContext: EmailContextSnapshot?  // v22: email being discussed in message-detail sessions
     }
 
+    /// SQL predicate scoping the inbox-session list per mode. Demo chat
+    /// sessions always carry the `demo:` sessionId prefix (see
+    /// `DemoModeStore.scopedSessionId`): in demo mode ONLY demo sessions are
+    /// listed (minus demo msg/compose contexts, which have their own load
+    /// paths); in normal mode demo sessions are excluded entirely.
+    /// Static + pure so tests can run it against an in-memory DB.
+    nonisolated static func inboxSessionScopeSQL(demoActive: Bool) -> String {
+        demoActive
+            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
+            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
+    }
+
     /// Load the last K distinct **inbox** sessions, ordered newest-last (rightmost in swipe UI).
     /// Excludes message-detail sessions (sessionId LIKE 'msg:%') and compose sessions
     /// (sessionId LIKE 'compose:%') — those are loaded separately via loadContextSession().
-    func loadSessions(limit: Int) throws -> [ChatSession] {
+    /// `demoActive` scopes the list to demo-only / demo-free (see inboxSessionScopeSQL).
+    func loadSessions(limit: Int, demoActive: Bool) throws -> [ChatSession] {
         try AppDatabase.dbPool.read { db in
             // Get distinct sessionIds ordered by max timestamp DESC, limited to K
             // Filter out msg-detail and compose sessions (they have their own load paths)
@@ -337,8 +350,7 @@ actor ChatStore {
                 SELECT sessionId, MAX(timestamp) as maxTs
                 FROM chatTurn
                 WHERE sessionId IS NOT NULL
-                  AND sessionId NOT LIKE 'msg:%'
-                  AND sessionId NOT LIKE 'compose:%'
+                  AND \(Self.inboxSessionScopeSQL(demoActive: demoActive))
                 GROUP BY sessionId
                 ORDER BY maxTs DESC
                 LIMIT ?
@@ -442,10 +454,14 @@ actor ChatStore {
     // MARK: - StableId Helpers
 
     /// Extract the stableId component from a msg-detail sessionId.
-    /// Format: "msg:{accountId}:{stableId}" → returns "{stableId}".
+    /// Format: "msg:{accountId}:{stableId}" (optionally "demo:"-prefixed in
+    /// demo mode) → returns "{stableId}".
     /// Returns nil if the sessionId doesn't match the expected format.
     private static func extractStableId(from sessionId: String) -> String? {
-        let after = String(sessionId.dropFirst(4)) // drop "msg:"
+        var sid = sessionId
+        if sid.hasPrefix("demo:") { sid = String(sid.dropFirst(5)) }
+        guard sid.hasPrefix("msg:") else { return nil }
+        let after = String(sid.dropFirst(4)) // drop "msg:"
         guard let ci = after.firstIndex(of: ":") else { return nil }
         let stableId = String(after[after.index(after: ci)...])
         return stableId.isEmpty ? nil : stableId
@@ -466,12 +482,14 @@ actor ChatStore {
 
     private static func evictInboxSessionsImpl(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         try dbPool.write { db in
+            // Demo sessions are excluded (demoActive: false scope): they are
+            // wiped wholesale on demo exit and must not crowd out (or be
+            // counted against) the user's inbox-session limit.
             let sessionRows = try Row.fetchAll(db, sql: """
                 SELECT sessionId, MAX(timestamp) as maxTs
                 FROM chatTurn
                 WHERE sessionId IS NOT NULL
-                  AND sessionId NOT LIKE 'msg:%'
-                  AND sessionId NOT LIKE 'compose:%'
+                  AND \(inboxSessionScopeSQL(demoActive: false))
                 GROUP BY sessionId
                 ORDER BY maxTs DESC
             """)

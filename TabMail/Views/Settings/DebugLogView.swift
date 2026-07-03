@@ -11,6 +11,7 @@ struct DebugMenuView: View {
     @State private var reminderTestStatus: String?
     @State private var showTouchRings = TouchVisualizer.shared.isEnabled
     @State private var demoEnterError: String?
+    @Bindable private var demoStore = DemoModeStore.shared
     @State private var stuckScanStatus: String?
     @Environment(NavigationStore.self) private var navigationStore
 
@@ -27,23 +28,36 @@ struct DebugMenuView: View {
             }
 
             Section("Demo Mode") {
-                Button {
-                    Task {
-                        do {
-                            try await DemoModeService.shared.startFromDebugMenu()
-                        } catch {
-                            demoEnterError = error.localizedDescription
-                        }
+                if demoStore.isActive {
+                    Button(role: .destructive) {
+                        Task { await DemoModeService.shared.exit() }
+                    } label: {
+                        Label("Exit Demo Mode", systemImage: "stop.rectangle.on.rectangle")
                     }
-                } label: {
-                    Label("Enter Demo Mode", systemImage: "play.rectangle.on.rectangle")
+                } else {
+                    Button {
+                        Task {
+                            do {
+                                try await DemoModeService.shared.startFromDebugMenu()
+                            } catch {
+                                demoEnterError = error.localizedDescription
+                            }
+                        }
+                    } label: {
+                        Label("Enter Demo Mode", systemImage: "play.rectangle.on.rectangle")
+                    }
                 }
                 if let demoEnterError {
                     Text(demoEnterError)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
-                Text("Launches demo inboxes without logging out your live account. Demo data is namespaced (accountId 'demo-account'), real sync is paused, and everything is wiped on exit (tap the demo banner at the bottom). Your real accounts and data are untouched.")
+                Button {
+                    demoStore.resetCallBudget()
+                } label: {
+                    Label("Reset AI Call Limit (\(demoStore.callsConsumed)/\(DemoModeStore.totalCallBudget) used)", systemImage: "arrow.counterclockwise.circle")
+                }
+                Text("Demo entered here is for demo recording: no demo banner is shown, and your live account stays logged in. Demo data is namespaced (accountId 'demo-account'), real sync is paused, and everything is wiped when you exit from this menu. Your real accounts and data are untouched.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

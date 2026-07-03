@@ -110,12 +110,28 @@ struct EmailComposeTool: AgentTool, Sendable {
         db: (any DatabaseReader & Sendable)? = nil
     ) async throws -> InlineEditResult {
         let dbReader = db ?? AppDatabase.rawPool
-        // Get sender info from primary account (matching TB's user identity resolution)
+        // Get sender info from primary account (matching TB's user identity
+        // resolution). Demo boundary (ADR-IOS-038): in demo, compose MUST use
+        // the demo account — during debug-menu coexistence the real primary is
+        // ALSO isPrimary, so an unscoped lookup could pick (and send via) the
+        // real account. Normal mode excludes the demo row symmetrically.
+        let demoActive = DemoModeStore.isDemoActive
         let account: Account? = try? await dbReader.read { db in
-            if let primary = try Account.filter(Column("isActive") == true && Column("isPrimary") == true).fetchOne(db) {
+            if demoActive {
+                return try Account
+                    .filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true)
+                    .fetchOne(db)
+            }
+            if let primary = try Account
+                .filter(Column("isActive") == true && Column("isPrimary") == true)
+                .filter(Column("id") != DemoSeed.demoAccountId)
+                .fetchOne(db) {
                 return primary
             }
-            return try Account.filter(Column("isActive") == true).fetchOne(db)
+            return try Account
+                .filter(Column("isActive") == true)
+                .filter(Column("id") != DemoSeed.demoAccountId)
+                .fetchOne(db)
         }
 
         // Get composition prompt and KB text (MainActor-isolated)

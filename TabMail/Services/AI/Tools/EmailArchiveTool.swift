@@ -37,7 +37,9 @@ struct EmailArchiveTool: AgentTool, Sendable {
             let header: MessageHeader? = try await ctx.db.read { db in
                 try MessageHeader.fetchOne(db, key: realId)
             }
-            if let header {
+            // Demo boundary (ADR-IOS-038): headerAccessible blocks acting on a
+            // real email from demo (and vice versa) via stale translator IDs.
+            if let header, DemoToolGuard.headerAccessible(header) {
                 resolved.append(header)
                 emailDetails.append(.init(
                     numericId: numericId,

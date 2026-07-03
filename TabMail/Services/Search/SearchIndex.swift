@@ -1062,6 +1062,23 @@ actor SearchIndex {
         }
     }
 
+    /// SQL predicate scoping search results by account per demo state
+    /// (ADR-IOS-038): demo mode searches ONLY the demo account's rows; normal
+    /// mode never sees them. `qualifier` is the table alias prefix (e.g.
+    /// "meta." or "" for unaliased message_meta). Uses the indexed
+    /// message_meta.accountId column. Static + pure for tests.
+    nonisolated static func demoAccountScopeSQL(demoActive: Bool, qualifier: String) -> String {
+        demoActive
+            ? "\(qualifier)accountId = '\(DemoSeed.demoAccountId)'"
+            : "\(qualifier)accountId != '\(DemoSeed.demoAccountId)'"
+    }
+
+    /// Demo-scope check for results assembled without SQL scoping (vector-only
+    /// hybrid hits). FTS headerIds are `accountId:folderPath:messageId`.
+    nonisolated static func headerIdInDemoScope(_ headerId: String, demoActive: Bool) -> Bool {
+        headerId.hasPrefix("\(DemoSeed.demoAccountId):") == demoActive
+    }
+
     /// FTS5-only search across all year shards using a single UNION ALL query.
     /// Matching TB's search_fts_only() — sorts by dateMs DESC, rank ASC.
     func keywordSearch(query: String, fromDateMs: Int64? = nil, toDateMs: Int64? = nil,
@@ -1169,8 +1186,12 @@ actor SearchIndex {
                     snippet: fts.snippet, rank: -hr.finalScore, dateMs: fts.dateMs
                 ))
             } else {
-                // Vector-only result — fetch metadata, apply date filter
+                // Vector-only result — fetch metadata, apply date filter.
+                // Demo scope: the KNN leg has no SQL account predicate, so
+                // out-of-scope vector hits are dropped here (headerId is
+                // accountId-prefixed).
                 if let meta = try fetchMeta(rowid: hr.rowid) {
+                    guard Self.headerIdInDemoScope(meta.headerId, demoActive: DemoModeStore.isDemoActive) else { continue }
                     if let from = fromDateMs, meta.dateMs < from { continue }
                     if let to = toDateMs, meta.dateMs > to { continue }
                     results.append(FTSSearchResult(
@@ -1225,6 +1246,7 @@ actor SearchIndex {
                     FROM \(table) fts
                     JOIN message_meta meta ON fts.rowid = meta.rowid
                     WHERE \(table) MATCH ?1
+                      AND \(Self.demoAccountScopeSQL(demoActive: DemoModeStore.isDemoActive, qualifier: "meta."))
                     """
                 if let p = fromParam { sq += " AND meta.dateMs >= ?\(p)" }
                 if let p = toParam { sq += " AND meta.dateMs <= ?\(p)" }
@@ -1280,6 +1302,7 @@ actor SearchIndex {
                     FROM \(table) fts
                     JOIN message_meta meta ON fts.rowid = meta.rowid
                     WHERE \(table) MATCH ?1
+                      AND \(Self.demoAccountScopeSQL(demoActive: DemoModeStore.isDemoActive, qualifier: "meta."))
                     """
                 if let p = fromParam { sq += " AND meta.dateMs >= ?\(p)" }
                 if let p = toParam { sq += " AND meta.dateMs <= ?\(p)" }
@@ -1315,7 +1338,8 @@ actor SearchIndex {
                                   limit: Int, folderIds: [String]? = nil) throws -> [FTSSearchResult] {
         guard let dbPool else { return [] }
         return try dbPool.read { db in
-            var sql = "SELECT headerId, dateMs FROM message_meta WHERE 1=1"
+            var sql = "SELECT headerId, dateMs FROM message_meta WHERE "
+                + Self.demoAccountScopeSQL(demoActive: DemoModeStore.isDemoActive, qualifier: "")
             var args: [DatabaseValueConvertible] = []
             if let from = fromDateMs { sql += " AND dateMs >= ?"; args.append(from) }
             if let to = toDateMs { sql += " AND dateMs <= ?"; args.append(to) }

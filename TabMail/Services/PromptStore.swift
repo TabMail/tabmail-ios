@@ -118,7 +118,10 @@ final class PromptStore {
     /// Set this directly when receiving sync data from another TabMail instance.
     var rawComposition: String {
         didSet {
-            defaults.set(rawComposition, forKey: Keys.composition)
+            defaults.set(rawComposition, forKey: Self.storageKey(Keys.composition))
+            // Demo overlay (ADR-IOS-038): demo writes go to the demo key only —
+            // no NSE mirror, no Device Sync broadcast/timestamps, no history.
+            guard !DemoModeStore.isDemoActive else { return }
             NSEDataBridge.mirrorPrompts()
             if !isSyncApplying {
                 DeviceSyncService.shared.debouncedBroadcast(fields: [.composition])
@@ -131,7 +134,9 @@ final class PromptStore {
     /// Set this directly when receiving sync data from another TabMail instance.
     var rawAction: String {
         didSet {
-            defaults.set(rawAction, forKey: Keys.action)
+            defaults.set(rawAction, forKey: Self.storageKey(Keys.action))
+            // Demo overlay — see rawComposition.
+            guard !DemoModeStore.isDemoActive else { return }
             NSEDataBridge.mirrorPrompts()
             if !isSyncApplying {
                 DeviceSyncService.shared.debouncedBroadcast(fields: [.action])
@@ -145,7 +150,9 @@ final class PromptStore {
     var rawKB: String {
         didSet {
             ReminderBuilder.invalidateCache()
-            defaults.set(rawKB, forKey: Keys.kb)
+            defaults.set(rawKB, forKey: Self.storageKey(Keys.kb))
+            // Demo overlay — see rawComposition.
+            guard !DemoModeStore.isDemoActive else { return }
             NSEDataBridge.mirrorPrompts()
             if !isSyncApplying {
                 DeviceSyncService.shared.debouncedBroadcast(fields: [.kb])
@@ -158,6 +165,8 @@ final class PromptStore {
     var templates: [ReplyTemplate] {
         didSet {
             saveTemplates()
+            // Demo overlay — see rawComposition.
+            guard !DemoModeStore.isDemoActive else { return }
             if !isSyncApplying {
                 DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
                 debouncedRecordHistory(field: "templates")
@@ -272,17 +281,31 @@ final class PromptStore {
         rawKB
     }
 
+    // MARK: - Demo overlay key redirection (ADR-IOS-038)
+
+    /// Demo-scoped storage key: while demo mode is active every prompt field
+    /// persists to (and snapshots read from) a `demo.`-prefixed key, so demo
+    /// chat tools (kb_add, reminder_add, template edits, …) can never touch
+    /// the real prompts, and the real prompts can never leak into a demo
+    /// recording. Identity outside demo. Nonisolated so the static snapshot
+    /// readers honor the overlay too (chat KB injection reads the snapshot,
+    /// not the MainActor property).
+    nonisolated static func storageKey(_ base: String) -> String {
+        DemoModeStore.isDemoActive ? "demo.\(base)" : base
+    }
+
     // MARK: - Nonisolated Read Accessors (for background actors)
 
     /// Read KB text from any isolation context without MainActor hop.
-    /// Reads directly from UserDefaults (thread-safe).
+    /// Reads directly from UserDefaults (thread-safe). Demo-aware (storageKey).
     nonisolated static func kbTextSnapshot() -> String {
-        UserDefaults.standard.string(forKey: "user_prompts:user_kb.md") ?? ""
+        UserDefaults.standard.string(forKey: storageKey("user_prompts:user_kb.md")) ?? ""
     }
 
     /// Read action prompt from any isolation context without MainActor hop.
+    /// Demo-aware (storageKey).
     nonisolated static func actionMarkdownSnapshot() -> String {
-        UserDefaults.standard.string(forKey: "user_prompts:user_action.md") ?? ""
+        UserDefaults.standard.string(forKey: storageKey("user_prompts:user_action.md")) ?? ""
     }
 
     /// Note: compositionMarkdown() includes template injection and must stay on MainActor.
@@ -318,6 +341,9 @@ final class PromptStore {
     // so defaults never overwrite customized rules on other devices via Device Sync.
 
     func resetComposition() {
+        // Demo overlay: reset the overlay only — no history, no sync-reset
+        // timestamps (those belong to the real prompts).
+        if DemoModeStore.isDemoActive { rawComposition = Defaults.composition; return }
         recordHistory(source: "reset", fields: ["composition"])
         isSyncApplying = true
         rawComposition = Defaults.composition
@@ -326,6 +352,7 @@ final class PromptStore {
     }
 
     func resetAction() {
+        if DemoModeStore.isDemoActive { rawAction = Defaults.action; return }
         recordHistory(source: "reset", fields: ["action"])
         isSyncApplying = true
         rawAction = Defaults.action
@@ -334,6 +361,7 @@ final class PromptStore {
     }
 
     func resetKB() {
+        if DemoModeStore.isDemoActive { rawKB = Defaults.kb; return }
         recordHistory(source: "reset", fields: ["kb"])
         isSyncApplying = true
         rawKB = Defaults.kb
@@ -342,6 +370,7 @@ final class PromptStore {
     }
 
     func resetTemplates() {
+        if DemoModeStore.isDemoActive { templates = Defaults.templates; return }
         recordHistory(source: "reset", fields: ["templates"])
         isSyncApplying = true
         templates = Defaults.templates
@@ -423,6 +452,13 @@ final class PromptStore {
     /// Wrapped in `isSyncApplying` to prevent echo broadcasting.
     /// Records pre-sync state in history for rollback.
     func applySync(composition: String? = nil, action: String? = nil, kb: String? = nil, templates: [ReplyTemplate]? = nil, skipHistory: Bool = false) {
+        // Demo overlay: incoming sync must never be applied while demo is
+        // active — it would land in the demo keys and be deleted on exit.
+        // Device Sync is disconnected on demo entry, so this is defensive.
+        guard !DemoModeStore.isDemoActive else {
+            print("[PromptStore] applySync ignored during demo mode")
+            return
+        }
         if !skipHistory {
             // Only record fields that actually differ from current state
             var changedFields: [String] = []
@@ -445,6 +481,53 @@ final class PromptStore {
         if let action { rawAction = action }
         if let kb { rawKB = kb }
         if let templates { self.templates = templates }
+    }
+
+    // MARK: - Demo overlay lifecycle (ADR-IOS-038)
+
+    /// Enter the demo prompt overlay: swap all four prompt fields to the
+    /// bundled defaults. MUST be called with demo already active
+    /// (`DemoModeStore.isDemoActive == true`) so the `didSet`s persist to the
+    /// demo keys and skip NSE mirror / Device Sync / history. The real values
+    /// stay untouched in their real UserDefaults keys.
+    func enterDemoOverlay() {
+        assert(DemoModeStore.isDemoActive, "enterDemoOverlay requires demo active")
+        rawComposition = Defaults.composition
+        rawAction = Defaults.action
+        rawKB = Defaults.kb
+        templates = Defaults.templates
+        print("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
+    }
+
+    /// Exit the demo prompt overlay: restore the real values from the real
+    /// keys and delete the demo keys. MUST be called while demo is STILL
+    /// active (before `DemoModeStore.isActive` flips false) — the restore
+    /// writes then route to the about-to-be-deleted demo keys instead of
+    /// re-firing NSE mirror / Device Sync / history with unchanged real values.
+    func exitDemoOverlay() {
+        assert(DemoModeStore.isDemoActive, "exitDemoOverlay requires demo still active")
+        rawComposition = defaults.string(forKey: Keys.composition) ?? Defaults.composition
+        rawAction = defaults.string(forKey: Keys.action) ?? Defaults.action
+        rawKB = defaults.string(forKey: Keys.kb) ?? Defaults.kb
+        if let data = defaults.data(forKey: Keys.templates),
+           let decoded = try? JSONDecoder().decode([ReplyTemplate].self, from: data) {
+            templates = decoded
+        } else {
+            templates = []
+        }
+        Self.removeDemoOverlayKeys()
+        print("[PromptStore] Demo prompt overlay REMOVED (real prompts restored)")
+    }
+
+    /// Delete the demo overlay UserDefaults keys. Safe to call anytime —
+    /// also used by `DemoModeService.purgeOrphanedDemoData` to clean up after
+    /// a force-quit mid-demo.
+    nonisolated static func removeDemoOverlayKeys() {
+        let d = UserDefaults.standard
+        for base in ["user_prompts:user_composition.md", "user_prompts:user_action.md",
+                     "user_prompts:user_kb.md", "user_templates"] {
+            d.removeObject(forKey: "demo.\(base)")
+        }
     }
 
     // MARK: - History
@@ -492,7 +575,10 @@ final class PromptStore {
     }
 
     /// Load all history entries (newest last).
+    /// Empty during demo — the real prompt history must not be visible (or
+    /// restorable) from a demo recording.
     func loadHistory() -> [PromptHistoryEntry] {
+        guard !DemoModeStore.isDemoActive else { return [] }
         migrateBackupsIfNeeded()
         guard let data = defaults.data(forKey: Self.historyKey),
               let entries = try? JSONDecoder().decode([PromptHistoryEntry].self, from: data) else {
@@ -505,6 +591,9 @@ final class PromptStore {
     /// Applies as a sync (suppresses broadcast), then writes fresh timestamps
     /// so the restore propagates to other devices as a normal edit.
     func restoreFromHistory(_ entry: PromptHistoryEntry) {
+        // Demo overlay: unreachable in practice (loadHistory is empty in demo)
+        // but guard anyway — a restore would write real timestamps + broadcast.
+        guard !DemoModeStore.isDemoActive else { return }
         recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"])
         applySync(
             composition: entry.composition,
@@ -525,7 +614,7 @@ final class PromptStore {
 
     private func saveTemplates() {
         if let data = try? JSONEncoder().encode(templates) {
-            defaults.set(data, forKey: Keys.templates)
+            defaults.set(data, forKey: Self.storageKey(Keys.templates))
         }
     }
 

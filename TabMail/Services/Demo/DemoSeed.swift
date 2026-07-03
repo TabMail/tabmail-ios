@@ -66,8 +66,18 @@ enum DemoSeed {
         try db.execute(sql: "DELETE FROM folder WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM messageAICache WHERE key >= 'demo-account:' AND key < 'demo-account;'")
         try db.execute(sql: "DELETE FROM chatTurn WHERE sessionId >= 'demo:' AND sessionId < 'demo;'")
+        // chatHistory gets a parallel dereferenced copy of every turn
+        // (ChatStore.appendTurn) — wipe it too, or demo turns would surface in
+        // Settings > Chat History and Stage A self-heal would re-index them
+        // into memory.db right after the exit purge.
+        try db.execute(sql: "DELETE FROM chatHistory WHERE sessionId >= 'demo:' AND sessionId < 'demo;'")
         try db.execute(sql: "DELETE FROM outboxMessage WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM pendingOperation WHERE accountId = ?", arguments: [demoAccountId])
+        try db.execute(sql: "DELETE FROM pendingCalendarOperation WHERE accountId = ?", arguments: [demoAccountId])
+        // ChatIdTranslator persists numeric-ID mappings; demo header ids are
+        // 'demo-account:{folder}:{msgId}' so the same index-friendly range
+        // form applies. Prevents dangling demo mappings after exit.
+        try db.execute(sql: "DELETE FROM chatIdMapping WHERE realId >= 'demo-account:' AND realId < 'demo-account;'")
         try? db.execute(sql: "DELETE FROM demoCalendarEvent")
         try db.execute(sql: "DELETE FROM account WHERE id = ?", arguments: [demoAccountId])
     }
@@ -461,5 +471,30 @@ enum DemoSeedError: Error, LocalizedError {
         case .databaseUnavailable: return "Database not initialized."
         case .seedFailed(let msg): return "Seed failed: \(msg)"
         }
+    }
+}
+
+// MARK: - Demo tool guard (ADR-IOS-038)
+
+/// Shared demo-boundary primitives for the agent tool layer.
+enum DemoToolGuard {
+    /// Tool-result error returned by tools that are blocked in demo mode
+    /// (contacts, settings). The LLM relays it to the demo user.
+    static let blockedMessage = #"{"error": "This feature is not available in demo mode."}"#
+
+    /// GRDB predicate scoping a table's `accountId` column per demo state:
+    /// demo mode sees ONLY demo rows; normal mode NEVER sees them.
+    static func accountScope(demoActive: Bool) -> SQLExpression {
+        demoActive
+            ? Column("accountId") == DemoSeed.demoAccountId
+            : Column("accountId") != DemoSeed.demoAccountId
+    }
+
+    /// Whether an email tool may act on this header in the current mode.
+    /// Blocks BOTH directions: a demo chat must never touch a real email
+    /// (stale ChatIdTranslator numeric IDs can reference real headers), and
+    /// a real chat must never touch a leftover demo row.
+    static func headerAccessible(_ header: MessageHeader) -> Bool {
+        (header.accountId == DemoSeed.demoAccountId) == DemoModeStore.isDemoActive
     }
 }

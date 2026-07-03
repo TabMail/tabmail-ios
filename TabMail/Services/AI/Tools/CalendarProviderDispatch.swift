@@ -11,6 +11,8 @@ enum CalendarBackend: Sendable {
     case google(provider: GoogleCalendarProvider, account: Account)
     case outlook(provider: ExchangeCalendarProvider, account: Account)
     case caldav(provider: CalDAVProvider, account: Account)
+    /// Demo mode's local mock calendar (ADR-IOS-038) — GRDB-backed, no network.
+    case demo(provider: DemoCalendarProvider, account: Account)
     case none
 
     /// Returns the provider and account, regardless of backend type.
@@ -19,6 +21,7 @@ enum CalendarBackend: Sendable {
         case .google(let p, let a): return (p, a)
         case .outlook(let p, let a): return (p, a)
         case .caldav(let p, let a): return (p, a)
+        case .demo(let p, let a): return (p, a)
         case .none: return nil
         }
     }
@@ -79,14 +82,30 @@ enum CalendarProviderDispatch {
         let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.rawPool
         let manager = AccountManager.shared
 
+        // Snapshot calendarProviders from actor
+        let calProviders = await manager.calendarProviders
+
+        // Demo boundary (ADR-IOS-038): demo calendar tools MUST resolve the
+        // DemoCalendarProvider only — during debug-menu coexistence the real
+        // user's calendar providers stay registered and would otherwise be
+        // picked (real reads AND real event writes from a demo chat).
+        if DemoModeStore.isDemoActive {
+            if let demoProvider = calProviders[DemoSeed.demoAccountId],
+               let account = try? await dbReader.read({ db in
+                   try Account.filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true).fetchOne(db)
+               }) {
+                return backendFor(provider: demoProvider, account: account)
+            }
+            return .none
+        }
+
         // Use preferred account if set and still active
         // Check new key first, fall back to legacy Google-specific key
         let preferredAccountId = UserDefaults.standard.string(forKey: preferredCalendarAccountKey)
             ?? UserDefaults.standard.string(forKey: preferredGoogleAccountKey)
             ?? ""
-        // Snapshot calendarProviders from actor
-        let calProviders = await manager.calendarProviders
         if !preferredAccountId.isEmpty,
+           preferredAccountId != DemoSeed.demoAccountId,
            let calProvider = calProviders[preferredAccountId],
            let account = try? await dbReader.read({ db in
                try Account.filter(Column("id") == preferredAccountId && Column("isActive") == true).fetchOne(db)
@@ -94,8 +113,8 @@ enum CalendarProviderDispatch {
             return backendFor(provider: calProvider, account: account)
         }
 
-        // Fall back to first account with a calendar provider.
-        for (accountId, calProvider) in calProviders {
+        // Fall back to first account with a calendar provider (never demo).
+        for (accountId, calProvider) in calProviders where accountId != DemoSeed.demoAccountId {
             if let account = try? await dbReader.read({ db in
                 try Account.filter(Column("id") == accountId && Column("isActive") == true).fetchOne(db)
             }) {
@@ -112,9 +131,13 @@ enum CalendarProviderDispatch {
         let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.rawPool
         // One instant main-actor hop to snapshot the dict
         let calProviders = await AccountManager.shared.calendarProviders
+        // Demo boundary (ADR-IOS-038): demo enumerates ONLY the demo provider;
+        // normal mode never includes it (see resolve()).
+        let demoActive = DemoModeStore.isDemoActive
         // Rest runs off-main — GRDB is thread-safe
         var results: [(provider: any CalendarProvider, account: Account)] = []
-        for (accountId, calProvider) in calProviders {
+        for (accountId, calProvider) in calProviders
+        where (accountId == DemoSeed.demoAccountId) == demoActive {
             if let account = try? await dbReader.read({ db in
                 try Account.filter(Column("id") == accountId && Column("isActive") == true).fetchOne(db)
             }) {
@@ -136,6 +159,8 @@ enum CalendarProviderDispatch {
             return .outlook(provider: exchange, account: account)
         } else if let caldav = provider as? CalDAVProvider {
             return .caldav(provider: caldav, account: account)
+        } else if let demo = provider as? DemoCalendarProvider {
+            return .demo(provider: demo, account: account)
         }
         return .none
     }

@@ -43,6 +43,20 @@ final class ChatPillState {
         sessions.removeValue(forKey: key)
     }
 
+    /// Drop ALL in-memory sessions. Called on demo entry/exit
+    /// (`DemoModeService`) so the demo and real chat pills never share
+    /// in-memory state (loaded session pages, live turns, reminder buffers).
+    /// Views re-create Session objects lazily via `session(for:)` — RootView
+    /// swaps the routing branch on demo entry/exit, so the chat pill views
+    /// (and their reminder observation `.task`) are recreated as well.
+    func removeAllSessions() {
+        let count = sessions.count
+        sessions.removeAll()
+        if count > 0 {
+            print("[ChatPillState] Removed all \(count) in-memory sessions (demo entry/exit)")
+        }
+    }
+
     /// Evict in-memory sessions that are idle (no active task, no recent activity).
     /// Called periodically to prevent unbounded growth of the sessions dictionary.
     /// The "inbox" session is never evicted here (it has its own 30s idle TTL on expand).

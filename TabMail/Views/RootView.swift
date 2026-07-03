@@ -252,9 +252,10 @@ struct RootView: View {
         }
         // Demo Mode banner — bottom overlay; persists across all in-app
         // navigation. Compose's `fullScreenCover` covers it during edit;
-        // banner re-appears on dismiss.
+        // banner re-appears on dismiss. Suppressed for debug-menu entry
+        // (demo recording) — exit + counter reset live in the debug menu.
         .overlay(alignment: .bottom) {
-            if demoStore.isActive && demoSeedingComplete {
+            if demoStore.isActive && demoSeedingComplete && !demoStore.enteredFromDebugMenu {
                 DemoBanner(aiEnabled: demoAiEnabled)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .ignoresSafeArea(.container, edges: .bottom)

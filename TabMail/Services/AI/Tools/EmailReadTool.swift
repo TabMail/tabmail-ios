@@ -44,6 +44,13 @@ struct EmailReadTool: AgentTool, Sendable {
             return #"{"error": "message not found"}"#
         }
 
+        // Demo boundary (ADR-IOS-038): never read across the demo/real line
+        // (stale ChatIdTranslator numeric IDs can reference the other side).
+        guard DemoToolGuard.headerAccessible(header) else {
+            print("[EmailReadTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            return #"{"error": "message not found"}"#
+        }
+
         // Fetch MessageBody (full HTML content)
         let body: MessageBody? = try await ctx.db.read { db in
             try MessageBody.fetchOne(db, key: realId)

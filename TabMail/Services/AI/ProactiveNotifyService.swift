@@ -70,6 +70,13 @@ actor ProactiveNotifyService {
     /// Matches TB's `onInboxUpdated()` in `proactiveCheckin.js`.
     func onInboxUpdated() async {
         guard isEnabled else { return }
+        // Demo guard: while demo is active the reminder list is demo-scoped
+        // (ReminderBuilder) — rescheduling from it would replace the user's
+        // pending notification schedule with demo content and pollute
+        // ReachedOutStore with demo hashes. The user's schedule rebuilds on
+        // the first reminder-list change after exit.
+        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
+        guard !inDemo else { return }
 
         // Sync any notifications iOS delivered while we weren't running
         await syncDeliveredToStore()
@@ -137,6 +144,9 @@ actor ProactiveNotifyService {
     /// Skips if onInboxUpdated/onForegroundReturn already refreshed within 60s
     /// to avoid a redundant buildReminderList() GRDB query + MainActor hop.
     func refreshActiveReminders() async {
+        // Demo guard — see onInboxUpdated.
+        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
+        guard !inDemo else { return }
         if let last = lastTTLRefreshDate, Date().timeIntervalSince(last) < 60 {
             return
         }
@@ -294,6 +304,9 @@ actor ProactiveNotifyService {
     /// On foreground return, sync delivered notifications and fire overdue ones.
     func onForegroundReturn() async {
         guard isEnabled else { return }
+        // Demo guard — see onInboxUpdated.
+        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
+        guard !inDemo else { return }
         guard !isRateLimited() else { return }
 
         await syncDeliveredToStore()

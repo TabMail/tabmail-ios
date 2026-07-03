@@ -82,9 +82,12 @@ actor DraftStore {
     private static func applyDelete(id: String, db: Database) throws {
         // Delete the draft record
         _ = try Draft.deleteOne(db, key: id)
-        // Delete associated chat turns (sessionId = "compose:{draftKey}")
-        let sessionId = "compose:\(id)"
-        _ = try ChatTurn.filter(Column("sessionId") == sessionId).deleteAll(db)
+        // Delete associated chat turns (sessionId = "compose:{draftKey}", or
+        // "demo:compose:{draftKey}" when the draft was edited in demo mode).
+        // Both variants are targeted unconditionally so the delete is correct
+        // regardless of the current demo state.
+        let sessionIds = ["compose:\(id)", "demo:compose:\(id)"]
+        _ = try ChatTurn.filter(sessionIds.contains(Column("sessionId"))).deleteAll(db)
     }
 
     /// Delete a draft by its key (without deleting chat turns).
@@ -419,8 +422,9 @@ actor DraftStore {
                     if let dirName = draft.attachmentsDirName {
                         attachmentDirsToDelete.append(dirName)
                     }
-                    let sessionId = "compose:\(draft.id)"
-                    _ = try ChatTurn.filter(Column("sessionId") == sessionId).deleteAll(db)
+                    // Both plain and demo-prefixed variants (see applyDelete).
+                    let sessionIds = ["compose:\(draft.id)", "demo:compose:\(draft.id)"]
+                    _ = try ChatTurn.filter(sessionIds.contains(Column("sessionId"))).deleteAll(db)
                     try draft.delete(db)
                     evicted += 1
                 }

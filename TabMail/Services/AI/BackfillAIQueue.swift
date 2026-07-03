@@ -204,6 +204,16 @@ actor BackfillAIQueue {
     private func dispatchBatch() async {
         debounceTask = nil
 
+        // Demo gate (ADR-IOS-038): defer ALL refinement drains while demo is
+        // active. A real session's queued KB/action refine would otherwise run
+        // against the DEMO prompt overlay (wrong merge base, result written to
+        // the soon-deleted demo keys) and authenticate via the demo token.
+        // Rows stay queued; the next dispatch trigger after exit drains them.
+        guard DemoModeStore.isDemoActive == false else {
+            BackgroundSyncLogger.logBackfillAI("dispatch deferred: demo mode active")
+            return
+        }
+
         // Network gate.
         guard NetworkMonitor.checkConnected() else {
             if !storage.isEmpty { scheduleDispatchOnReconnect() }

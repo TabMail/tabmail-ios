@@ -28,8 +28,11 @@ struct DemoIsolationTests {
             try db.execute(sql: "CREATE TABLE folder (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE messageAICache (key TEXT)")
             try db.execute(sql: "CREATE TABLE chatTurn (sessionId TEXT)")
+            try db.execute(sql: "CREATE TABLE chatHistory (sessionId TEXT)")
             try db.execute(sql: "CREATE TABLE outboxMessage (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE pendingOperation (accountId TEXT)")
+            try db.execute(sql: "CREATE TABLE pendingCalendarOperation (accountId TEXT)")
+            try db.execute(sql: "CREATE TABLE chatIdMapping (numericId INTEGER, realId TEXT)")
             try db.execute(sql: "CREATE TABLE demoCalendarEvent (id TEXT)")
 
             let demo = DemoSeed.demoAccountId  // "demo-account"
@@ -40,9 +43,13 @@ struct DemoIsolationTests {
             try db.execute(sql: "INSERT INTO messageBody (id) VALUES ('real-1:m1')")
             try db.execute(sql: "INSERT INTO folder (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO messageAICache (key) VALUES ('real-1:k')")
-            try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('real-session')")
+            // Every real session shape must survive: inbox UUID, msg-detail, compose.
+            try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('real-session'), ('msg:real-1:stable'), ('compose:d1')")
+            try db.execute(sql: "INSERT INTO chatHistory (sessionId) VALUES ('real-session')")
             try db.execute(sql: "INSERT INTO outboxMessage (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO pendingOperation (accountId) VALUES ('real-1')")
+            try db.execute(sql: "INSERT INTO pendingCalendarOperation (accountId) VALUES ('real-1')")
+            try db.execute(sql: "INSERT INTO chatIdMapping (numericId, realId) VALUES (1, 'real-1:INBOX:100')")
 
             // Demo (must be wiped)
             try db.execute(sql: "INSERT INTO account (id) VALUES (?)", arguments: [demo])
@@ -50,9 +57,13 @@ struct DemoIsolationTests {
             try db.execute(sql: "INSERT INTO messageBody (id) VALUES (?)", arguments: ["\(demo):m1"])
             try db.execute(sql: "INSERT INTO folder (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO messageAICache (key) VALUES (?)", arguments: ["\(demo):k"])
-            try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('demo:s1')")
+            // Every demo session shape (scopedSessionId output): inbox, msg-detail, compose.
+            try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('demo:s1'), ('demo:msg:demo-account:stable'), ('demo:compose:d2')")
+            try db.execute(sql: "INSERT INTO chatHistory (sessionId) VALUES ('demo:s1')")
             try db.execute(sql: "INSERT INTO outboxMessage (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO pendingOperation (accountId) VALUES (?)", arguments: [demo])
+            try db.execute(sql: "INSERT INTO pendingCalendarOperation (accountId) VALUES (?)", arguments: [demo])
+            try db.execute(sql: "INSERT INTO chatIdMapping (numericId, realId) VALUES (2, '\(demo):INBOX:1')")
             try db.execute(sql: "INSERT INTO demoCalendarEvent (id) VALUES ('e1')")
         }
         return queue
@@ -79,6 +90,9 @@ struct DemoIsolationTests {
                 "demoFolders": try count(db, "folder", "accountId = '\(demo)'"),
                 "demoCache": try count(db, "messageAICache", "key LIKE '\(demo):%'"),
                 "demoChats": try count(db, "chatTurn", "sessionId LIKE 'demo:%'"),
+                "demoHistory": try count(db, "chatHistory", "sessionId LIKE 'demo:%'"),
+                "demoCalOps": try count(db, "pendingCalendarOperation", "accountId = '\(demo)'"),
+                "demoIdMap": try count(db, "chatIdMapping", "realId LIKE '\(demo):%'"),
                 "demoOutbox": try count(db, "outboxMessage", "accountId = '\(demo)'"),
                 "demoPending": try count(db, "pendingOperation", "accountId = '\(demo)'"),
                 "demoCalendar": try count(db, "demoCalendarEvent", "1=1"),
@@ -87,7 +101,10 @@ struct DemoIsolationTests {
                 "realBodies": try count(db, "messageBody", "id = 'real-1:m1'"),
                 "realFolders": try count(db, "folder", "accountId = 'real-1'"),
                 "realCache": try count(db, "messageAICache", "key = 'real-1:k'"),
-                "realChats": try count(db, "chatTurn", "sessionId = 'real-session'"),
+                "realChats": try count(db, "chatTurn", "sessionId IN ('real-session', 'msg:real-1:stable', 'compose:d1')"),
+                "realHistory": try count(db, "chatHistory", "sessionId = 'real-session'"),
+                "realCalOps": try count(db, "pendingCalendarOperation", "accountId = 'real-1'"),
+                "realIdMap": try count(db, "chatIdMapping", "realId = 'real-1:INBOX:100'"),
                 "realOutbox": try count(db, "outboxMessage", "accountId = 'real-1'"),
                 "realPending": try count(db, "pendingOperation", "accountId = 'real-1'"),
             ]
@@ -100,6 +117,9 @@ struct DemoIsolationTests {
         #expect(c["demoFolders"] == 0)
         #expect(c["demoCache"] == 0)
         #expect(c["demoChats"] == 0)
+        #expect(c["demoHistory"] == 0)
+        #expect(c["demoCalOps"] == 0)
+        #expect(c["demoIdMap"] == 0)
         #expect(c["demoOutbox"] == 0)
         #expect(c["demoPending"] == 0)
         #expect(c["demoCalendar"] == 0)
@@ -109,9 +129,111 @@ struct DemoIsolationTests {
         #expect(c["realBodies"] == 1)
         #expect(c["realFolders"] == 1)
         #expect(c["realCache"] == 1)
-        #expect(c["realChats"] == 1)
+        #expect(c["realChats"] == 3)
+        #expect(c["realHistory"] == 1)
+        #expect(c["realCalOps"] == 1)
+        #expect(c["realIdMap"] == 1)
         #expect(c["realOutbox"] == 1)
         #expect(c["realPending"] == 1)
+    }
+
+    // MARK: - Memory / email search demo scope predicates
+
+    @Test("MemoryIndex.demoScopeSQL — demo sees only demo: sessions; normal excludes them (NULL = real)")
+    func memoryDemoScopePredicate() throws {
+        let queue = try DatabaseQueue()
+        try queue.write { db in
+            try db.execute(sql: "CREATE TABLE memory_meta (sessionId TEXT)")
+            try db.execute(sql: "INSERT INTO memory_meta VALUES ('demo:s1'), ('demo:msg:demo-account:x'), ('real-uuid'), ('msg:real-1:y'), (NULL)")
+        }
+        func rows(demoActive: Bool) throws -> Int {
+            try queue.read { db in
+                try Int.fetchOne(db, sql: """
+                    SELECT COUNT(*) FROM memory_meta meta
+                    WHERE \(MemoryIndex.demoScopeSQL(demoActive: demoActive, alias: "meta"))
+                    """) ?? -1
+            }
+        }
+        #expect(try rows(demoActive: true) == 2)   // both demo: rows
+        #expect(try rows(demoActive: false) == 3)  // real-uuid + msg: + NULL
+    }
+
+    @Test("SearchIndex demo account scope — SQL predicate + headerId prefix check")
+    func searchIndexDemoScope() throws {
+        let queue = try DatabaseQueue()
+        try queue.write { db in
+            try db.execute(sql: "CREATE TABLE message_meta (accountId TEXT, headerId TEXT)")
+            try db.execute(sql: "INSERT INTO message_meta VALUES ('demo-account', 'demo-account:INBOX:1'), ('real-1', 'real-1:INBOX:9')")
+        }
+        func ids(demoActive: Bool) throws -> [String] {
+            try queue.read { db in
+                try String.fetchAll(db, sql: """
+                    SELECT headerId FROM message_meta meta
+                    WHERE \(SearchIndex.demoAccountScopeSQL(demoActive: demoActive, qualifier: "meta."))
+                    """)
+            }
+        }
+        #expect(try ids(demoActive: true) == ["demo-account:INBOX:1"])
+        #expect(try ids(demoActive: false) == ["real-1:INBOX:9"])
+
+        // Vector-leg assembly check (no SQL scoping there — prefix based)
+        #expect(SearchIndex.headerIdInDemoScope("demo-account:INBOX:1", demoActive: true))
+        #expect(!SearchIndex.headerIdInDemoScope("real-1:INBOX:9", demoActive: true))
+        #expect(SearchIndex.headerIdInDemoScope("real-1:INBOX:9", demoActive: false))
+        #expect(!SearchIndex.headerIdInDemoScope("demo-account:INBOX:1", demoActive: false))
+    }
+
+    @Test("DemoToolGuard.accountScope filters by demo account in both modes")
+    func toolGuardAccountScope() throws {
+        let queue = try DatabaseQueue()
+        try queue.write { db in
+            try db.execute(sql: "CREATE TABLE messageHeader (accountId TEXT, isInInbox INTEGER)")
+            try db.execute(sql: "INSERT INTO messageHeader VALUES ('demo-account', 1), ('real-1', 1)")
+        }
+        let demoRows = try queue.read { db in
+            try Row.fetchAll(db, SQLRequest<Row>(literal: "SELECT * FROM messageHeader WHERE \(DemoToolGuard.accountScope(demoActive: true))"))
+        }
+        let realRows = try queue.read { db in
+            try Row.fetchAll(db, SQLRequest<Row>(literal: "SELECT * FROM messageHeader WHERE \(DemoToolGuard.accountScope(demoActive: false))"))
+        }
+        #expect(demoRows.count == 1 && (demoRows.first?["accountId"] as String?) == "demo-account")
+        #expect(realRows.count == 1 && (realRows.first?["accountId"] as String?) == "real-1")
+    }
+
+    // MARK: - Inbox session list scope
+
+    /// Runs `ChatStore.inboxSessionScopeSQL` (the predicate `loadSessions` and
+    /// inbox-session eviction share) against a mixed chatTurn table: one of
+    /// every session shape in both modes, plus a task session.
+    @Test("Inbox session list scope — demo lists only demo inbox sessions; normal mode excludes all demo sessions")
+    func inboxSessionScopeIsolatesDemo() throws {
+        let queue = try DatabaseQueue()
+        try queue.write { db in
+            try db.execute(sql: "CREATE TABLE chatTurn (sessionId TEXT, timestamp DOUBLE)")
+            let sessions = [
+                "user-inbox-uuid", "msg:real-1:stable", "compose:d1", "task:h1",
+                "demo:inbox-uuid", "demo:msg:demo-account:stable", "demo:compose:d2",
+            ]
+            for (i, sid) in sessions.enumerated() {
+                try db.execute(sql: "INSERT INTO chatTurn VALUES (?, ?)", arguments: [sid, Double(i)])
+            }
+        }
+
+        func listed(demoActive: Bool) throws -> Set<String> {
+            try queue.read { db in
+                let sql = """
+                    SELECT DISTINCT sessionId FROM chatTurn
+                    WHERE sessionId IS NOT NULL
+                      AND \(ChatStore.inboxSessionScopeSQL(demoActive: demoActive))
+                    """
+                return Set(try String.fetchAll(db, sql: sql))
+            }
+        }
+
+        // Demo mode: ONLY demo inbox sessions (msg/compose contexts have their own load paths).
+        #expect(try listed(demoActive: true) == ["demo:inbox-uuid"])
+        // Normal mode: user inbox + task sessions; no demo sessions of any shape.
+        #expect(try listed(demoActive: false) == ["user-inbox-uuid", "task:h1"])
     }
 
     // MARK: - Sidebar account filter

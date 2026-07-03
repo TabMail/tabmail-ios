@@ -17,6 +17,9 @@ struct ContactSearchTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // Demo boundary (ADR-IOS-038): device contacts / real app settings
+        // are outside the demo sandbox — block with a relayable error.
+        if DemoModeStore.isDemoActive { return DemoToolGuard.blockedMessage }
         guard case .string(let query) = arguments["query"],
               !query.trimmingCharacters(in: .whitespaces).isEmpty else {
             return #"{"error": "missing query"}"#

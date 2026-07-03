@@ -65,6 +65,9 @@ struct ChangeSettingTool: AgentTool, Sendable {
     ]
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // Demo boundary (ADR-IOS-038): device contacts / real app settings
+        // are outside the demo sandbox — block with a relayable error.
+        if DemoModeStore.isDemoActive { return DemoToolGuard.blockedMessage }
         guard case .string(let settingKey) = arguments["setting"] else {
             print("[ChangeSettingTool] Missing 'setting' argument")
             return ToolJSON.string(from: ["error": "missing 'setting' argument"])

@@ -44,6 +44,12 @@ struct EmailOpenTool: AgentTool, Sendable {
             return #"{"error": "message not found"}"#
         }
 
+        // Demo boundary (ADR-IOS-038): never navigate across the demo/real line.
+        guard DemoToolGuard.headerAccessible(header) else {
+            print("[EmailOpenTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            return #"{"error": "message not found"}"#
+        }
+
         // Navigate to the email via notification (handled by MailNavigationView + InboxView)
         await MainActor.run {
             NotificationCenter.default.post(
