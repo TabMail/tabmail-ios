@@ -304,7 +304,9 @@ struct MarkReadOnOpenTests {
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )
-        #expect(vm.message?.isRead == false, "Precondition: message starts unread")
+        // Zero-I/O init: the durable row is NOT resolved at construction, so
+        // this exercises markReadOnOpen's async-resolve fallback path.
+        #expect(vm.message == nil, "Precondition: zero-I/O init leaves message unresolved")
 
         await vm.markReadOnOpenIfNeeded()
 
@@ -322,6 +324,9 @@ struct MarkReadOnOpenTests {
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )
+        // Seed the resolved message (zero-I/O init) to exercise the fast path's
+        // already-read guard.
+        vm._testSeedMessage(header)
 
         await vm.markReadOnOpenIfNeeded()
 
@@ -399,28 +404,39 @@ struct MessageDetailOverlayTests {
         AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
     }
 
-    @Test("init layers overlay isRead=true on top of DB row that has isRead=false")
+    @Test("init layers overlay isRead=true on top of a staged seed that has isRead=false")
     @MainActor
     func initAppliesOverlay() async throws {
+        // Init is zero-I/O: its ONLY resolve source is the staged snapshot, so
+        // that's the assignment site to cover here. The durable-resolve
+        // assignments (loadBody / markReadOnOpen fallback) have their own
+        // overlay-survival tests below.
         let (pool, _) = try makeTestPool()
-        defer { clearOverlay() }
+        defer {
+            clearOverlay()
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        }
         clearOverlay()
 
-        let header = try await insertFixtures(
-            pool,
-            messageId: "mdo_init_\(Int(Date().timeIntervalSince1970))",
-            isRead: false
+        let row = StagedInboxRow(
+            accountId: "acc1", folderPath: "INBOX", messageId: "mdo-init-staged",
+            rfc822MessageId: "<mdo-init@x>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "Staged", senderName: "Sender", senderAddress: "s@example.com",
+            to: "me@example.com", snippet: "", date: Date(),
+            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+            isForwarded: false, actionTag: nil, summaryBlurb: nil
         )
-        AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: true))
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        AccountManager.shared.registerMutation(id: row.headerId, mutation: .init(isRead: true))
 
         let vm = MessageDetailViewModel(
-            messageId: header.id,
+            messageId: row.headerId,
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )
 
         #expect(vm.message?.isRead == true,
-                "init's resolveMessage result must be layered with overlay before assignment")
+                "init's staged-snapshot seed must be layered with overlay before assignment")
     }
 
     @Test("loadBody cached-body path: `message = msg` does not revert overlay isRead")

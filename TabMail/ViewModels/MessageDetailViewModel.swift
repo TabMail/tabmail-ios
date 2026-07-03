@@ -52,10 +52,18 @@ final class MessageDetailViewModel {
 
     init(messageId: String) {
         self.messageId = messageId
-        // Fetch initial message state from DB (with cross-folder fallback),
-        // then layer the optimistic overlay so a just-toggled isRead survives
-        // view recreation before the queued write commits.
-        if var m = resolveMessage(compositeId: messageId) {
+        // ZERO-I/O init (2026-07-03): seed only from the in-memory staged
+        // snapshot. This init runs ON THE MAIN ACTOR at tap → view
+        // construction, and the previous sync `dbPool.read` here is unbounded
+        // under I/O pressure (page faults queue behind whatever the disk is
+        // doing — measured ~4.3s MAIN THREAD STALL under an in-flight merge
+        // fsync, boot_logs 6). Durable resolution is loadBody's async chain
+        // (PK → cross-folder/rfc822 → server-sync fallback), which populates
+        // `message` moments later; the view shows the loading skeleton until
+        // then. `markReadOnOpenIfNeeded` has its own async resolve fallback,
+        // and the optimistic overlay (`applyOverlay` on every resolve) keeps
+        // a just-toggled isRead correct across the async gap.
+        if var m = stagedRowFallback(compositeId: messageId) {
             applyOverlay(to: &m)
             self.message = m
         }
@@ -69,7 +77,7 @@ final class MessageDetailViewModel {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
-        if var m = resolveMessage(compositeId: messageId) {
+        if var m = stagedRowFallback(compositeId: messageId) {
             applyOverlay(to: &m)
             self.message = m
         }
@@ -80,6 +88,15 @@ final class MessageDetailViewModel {
         if let obs = previewFreezeReleasedObserver { NotificationCenter.default.removeObserver(obs) }
         bodyPollTask?.cancel()
     }
+
+    #if DEBUG
+    /// Test seam: seed `message` directly. `init` is zero-I/O (staged snapshot
+    /// only), so move/read tests that need a focused message set it here
+    /// instead of driving the full async `loadBody` resolve.
+    func _testSeedMessage(_ msg: MessageHeader) {
+        self.message = msg
+    }
+    #endif
 
     /// Listen for AI processing completion and refresh the message in-place.
     /// Ensures SummaryBubbleView updates from "Analyzing..." to actual content
@@ -750,10 +767,11 @@ final class MessageDetailViewModel {
         guard !markReadOnOpenCalled else { return }
         markReadOnOpenCalled = true
 
-        // Fast path: `self.message` is populated synchronously in `init` via
-        // `resolveMessage(compositeId:)`. Use it to flip the detail-view state
-        // and register the overlay BEFORE any await — eliminates the
-        // perceived "popped back to inbox, row still unread" beat.
+        // Fast path: `self.message` is already populated — seeded at init from
+        // the staged snapshot, or an earlier resolve (loadBody) landed first.
+        // Use it to flip the detail-view state and register the overlay BEFORE
+        // any await — eliminates the perceived "popped back to inbox, row
+        // still unread" beat.
         if let msg = self.message {
             guard !msg.isRead else { return }
             self.message?.isRead = true
@@ -765,8 +783,10 @@ final class MessageDetailViewModel {
             return
         }
 
-        // Fallback: init's sync resolve returned nil (rare — composite id
-        // didn't match any local row at init time). Retry asynchronously.
+        // Fallback: message not resolved yet — init is zero-I/O (staged
+        // snapshot only) and loadBody's async resolve may not have landed.
+        // Resolve here independently so the read-flip never depends on the
+        // body-load path's timing.
         guard let msg = await resolveMessageAsync(compositeId: messageId) else { return }
         guard !msg.isRead else { return }
         // Layer any concurrent pending mutations (e.g. user just flagged this
@@ -871,8 +891,8 @@ final class MessageDetailViewModel {
     /// renders immediately (subject/sender/snippet); the body arrives via the
     /// existing body-poll once phase 2 commits, and later GRDB re-reads replace
     /// the synthesized header with the durable one. On the ASYNC resolve GRDB
-    /// always wins (this runs only on a GRDB miss); the SYNC init-path resolve
-    /// checks this FIRST — see `resolveMessage`.
+    /// always wins (this runs only on a GRDB miss); `init` seeds from this
+    /// directly (its only zero-I/O source — init never touches the DB).
     private func stagedRowFallback(compositeId: String) -> MessageHeader? {
         let parts = compositeId.split(separator: ":", maxSplits: 2)
         let accountId = parts.count == 3 ? String(parts[0]) : nil
@@ -885,62 +905,9 @@ final class MessageDetailViewModel {
         }?.toMessageHeader()
     }
 
-    private func resolveMessage(compositeId: String) -> MessageHeader? {
-        // In-memory staged snapshot FIRST — the only zero-I/O source. This sync
-        // resolve runs in `init` ON THE MAIN ACTOR (tap → detail construction):
-        // when the tapped row is one the NSE just staged, the durable header
-        // either doesn't exist yet (phase-1 write still grinding — the PK
-        // lookup MISSES and the fallback queries then fault cold pages behind
-        // that same write's fsync storm; measured as a ~4.3s MAIN THREAD STALL,
-        // boot_logs 6 2026-07-03) or was seeded milliseconds ago from this very
-        // snapshot. Freshness the durable row gains later (main-app AI fields,
-        // synced flag flips) is healed by the existing refresh paths (AI-update
-        // listener, post-body header refetch). The DB read below remains the
-        // path for every non-staged open (warm PK hit, ~ms).
-        if let staged = stagedRowFallback(compositeId: compositeId) { return staged }
-        let t0 = CFAbsoluteTimeGetCurrent()
-        defer {
-            let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            if ms >= 50 {
-                BootProfiler.mark("detail init resolveMessage sync read \(ms)ms \(compositeId.prefix(24))")
-            }
-        }
-        let dbHit: MessageHeader? = try? dbPool.read { db in
-            // 1. Direct primary key lookup
-            if let msg = try MessageHeader.fetchOne(db, key: compositeId) { return msg }
-
-            // Parse composite ID: "accountId:folderPath:messageId"
-            let parts = compositeId.split(separator: ":", maxSplits: 2)
-            guard parts.count == 3 else { return nil }
-            let accountId = String(parts[0])
-            let msgId = String(parts[2])
-
-            // 2. Cross-folder search by messageId
-            if let msg = try MessageHeader
-                .filter(Column("messageId") == msgId && Column("accountId") == accountId && Column("folderId") != "")
-                .fetchOne(db) {
-                print("[MoveTrace] resolveMessage — found via cross-folder: \(msg.id) (original: \(compositeId))")
-                return msg
-            }
-
-            // 3. Search by rfc822MessageId (handles UID changes after IMAP MOVE).
-            // The rfc822MessageId may be stored normalized — try searching by the msgId
-            // as a potential rfc822 value (for IMAP where stableId == rfc822MessageId).
-            let normalizedMsgId = EmailFilter.normalizeMessageId(msgId)
-            if let msg = try MessageHeader
-                .filter(Column("rfc822MessageId") == normalizedMsgId && Column("accountId") == accountId && Column("folderId") != "")
-                .fetchOne(db) {
-                print("[MoveTrace] resolveMessage — found via rfc822MessageId: \(msg.id) (original: \(compositeId))")
-                return msg
-            }
-
-            print("[MoveTrace] resolveMessage — not found locally: \(compositeId)")
-            return nil
-        }
-        return dbHit
-    }
-
-    /// Async version of resolveMessage for use in async contexts.
+    /// Async multi-strategy resolve — the ONLY DB-touching resolve. `init` is
+    /// deliberately zero-I/O (staged snapshot only); every durable lookup runs
+    /// here, off the main-actor construction path.
     /// Returns nil immediately if the Task is cancelled — GRDB 7.x would throw
     /// CancellationError on the async read, which try? converts to nil anyway,
     /// but skipping the read avoids misleading "not found" log entries.

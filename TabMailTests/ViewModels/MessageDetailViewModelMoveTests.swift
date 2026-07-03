@@ -108,6 +108,7 @@ struct MessageDetailViewModelMoveTests {
         let thread = try insertHeader(pool, messageId: "thread-1", folderPath: Self.archivePath, isInInbox: false)
 
         let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
         vm.threadMessages = [thread]
 
         vm.moveMessage(thread, toFolderPath: Self.inboxPath)
@@ -148,6 +149,7 @@ struct MessageDetailViewModelMoveTests {
         let thread = try insertHeader(pool, messageId: "thread-2", folderPath: Self.inboxPath, isInInbox: true)
 
         let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
         vm.threadMessages = [thread]
 
         vm.moveMessage(thread, toFolderPath: Self.archivePath)
@@ -179,6 +181,7 @@ struct MessageDetailViewModelMoveTests {
         let threadB = try insertHeader(pool, messageId: "thread-3b", folderPath: Self.inboxPath, isInInbox: true)
 
         let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
         vm.threadMessages = [threadA, threadB]
 
         vm.moveMessage(threadA, toFolderPath: Self.archivePath)
@@ -211,6 +214,7 @@ struct MessageDetailViewModelMoveTests {
         let thread = try insertHeader(pool, messageId: "thread-4", folderPath: Self.inboxPath, isInInbox: true)
 
         let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
         vm.threadMessages = [thread]
 
         vm.move(toFolderPath: Self.archivePath)

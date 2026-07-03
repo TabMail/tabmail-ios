@@ -157,7 +157,10 @@ struct MessageDetailView: View {
                     }
                 }
             } else {
-                ProgressView("Loading...")
+                // Zero-I/O init: `message` resolves asynchronously (loadBody),
+                // typically within the push animation — skeleton, not a spinner,
+                // so the swap to content doesn't jump.
+                MessageDetailSkeleton()
             }
         }
         .fullScreenCover(isPresented: Binding(

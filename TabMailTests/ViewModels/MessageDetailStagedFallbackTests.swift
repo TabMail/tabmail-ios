@@ -70,15 +70,14 @@ struct MessageDetailStagedFallbackTests {
     }
 
     @MainActor
-    @Test("init prefers the staged snapshot when both exist (zero-I/O main-actor resolve)")
-    func initPrefersStagedSnapshot() throws {
-        // Deliberate ordering flip (2026-07-03, boot_logs 6): init's resolve is a
-        // SYNC main-actor read — for a staged id it used to pay a DB read (PK
-        // miss + fallback queries faulting cold pages behind the in-flight
-        // phase-1 fsync; measured ~4.3s MAIN THREAD STALL) before consulting the
-        // in-memory snapshot. Init now checks the snapshot FIRST; durable-only
-        // freshness (main-app AI fields, synced flags) is healed by the async
-        // refresh paths, which remain GRDB-first.
+    @Test("init is zero-I/O: staged snapshot seeds it; durable rows resolve via loadBody")
+    func initIsZeroIO() async throws {
+        // Init never touches the DB (2026-07-03, boot_logs 6): its former SYNC
+        // main-actor read is unbounded under I/O pressure (PK miss + fallback
+        // queries faulting cold pages behind an in-flight phase-1 fsync;
+        // measured ~4.3s MAIN THREAD STALL). Init seeds only from the
+        // in-memory staged snapshot; every durable lookup is loadBody's async
+        // resolve, with the skeleton on screen until it lands.
         let (pool, dir, previous) = try makePool()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -90,15 +89,18 @@ struct MessageDetailStagedFallbackTests {
 
         var durable = row.toMessageHeader()
         durable.subject = "Durable m-dual"
-        try pool.writeWithoutTransaction { db in try durable.insert(db) }
+        try insertDurableHeader(durable, into: pool)
 
+        // Staged id present → init seeds from the snapshot (zero I/O).
         let vm = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
         #expect(vm.message?.subject == "Staged m-dual")
 
-        // Once the staged snapshot is drained (next merge replaces it), the same
-        // init resolves the durable row via the DB path.
+        // Snapshot drained → init leaves message nil (no DB read)…
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         let vm2 = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
+        #expect(vm2.message == nil)
+        // …and loadBody's async resolve populates the durable row.
+        await vm2.loadBody()
         #expect(vm2.message?.subject == "Durable m-dual")
     }
 
