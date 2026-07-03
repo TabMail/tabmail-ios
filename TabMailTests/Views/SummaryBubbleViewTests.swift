@@ -7,6 +7,7 @@ import Foundation
 @testable import TabMail
 
 @Suite("SummaryBubbleView — display gate")
+@MainActor
 struct SummaryBubbleViewTests {
 
     // MARK: - Inbox + content → .content
