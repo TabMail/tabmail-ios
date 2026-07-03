@@ -217,6 +217,7 @@ final class MessageDetailViewModel {
                     self.error = nil
                     self.loadThreadMessagesAsync()
                     print("[MessageDetail] Body found immediately on poll start for \(rid.prefix(40))")
+                    BootProfiler.mark("detail body via poll IMMEDIATE check \(rid.prefix(24))")
                     return
                 }
                 // Staged-body fast-path (ADR-IOS-049): loadBody got cancelled by
@@ -245,6 +246,7 @@ final class MessageDetailViewModel {
                     self.error = nil
                     self.loadThreadMessagesAsync()
                     print("[MessageDetail] Body found via poll for \(rid.prefix(40))")
+                    BootProfiler.mark("detail body via poll (DB, 2s cadence) \(rid.prefix(24))")
                     return
                 }
                 // 2. Re-attempt server fetch (connection may have recovered)
@@ -267,6 +269,7 @@ final class MessageDetailViewModel {
                         }
                         self.loadThreadMessagesAsync()
                         print("[MessageDetail] Body fetched via poll for \(rid.prefix(40))")
+                        BootProfiler.mark("detail body via poll SERVER fetch \(rid.prefix(24))")
                         return
                     }
                 } catch {
@@ -299,6 +302,7 @@ final class MessageDetailViewModel {
             msg = try await dbPool.read { db in try MessageHeader.fetchOne(db, key: messageId) }
         } catch is CancellationError {
             print("[MoveTrace] loadBody — task cancelled during initial DB read, deferring to body poll")
+            BootProfiler.mark("detail loadBody CANCELLED (initial read) → poll")
             startBodyPoll()
             return
         } catch {
@@ -323,6 +327,7 @@ final class MessageDetailViewModel {
                 // Don't mark as "not found" — defer to bodyPoll which runs in an
                 // independent Task immune to parent cancellation.
                 print("[MoveTrace] loadBody — task cancelled, deferring to body poll")
+                BootProfiler.mark("detail loadBody CANCELLED (resolve) → poll")
                 startBodyPoll()
                 return
             }
@@ -371,6 +376,7 @@ final class MessageDetailViewModel {
             }
         } catch is CancellationError {
             print("[MoveTrace] loadBody — task cancelled during body check, deferring to body poll")
+            BootProfiler.mark("detail loadBody CANCELLED (body check) → poll")
             startBodyPoll()
             return
         } catch {
@@ -415,6 +421,7 @@ final class MessageDetailViewModel {
             }
         } catch is CancellationError {
             print("[MoveTrace] loadBody — task cancelled during fetch, deferring to body poll")
+            BootProfiler.mark("detail loadBody CANCELLED (fetch) → poll")
             startBodyPoll()
             return
         } catch {

@@ -266,7 +266,7 @@ struct FTSOrphanPruneTests {
                 let folder = Folder(name: folderPath, path: folderPath, role: .inbox, accountId: accountId)
                 try folder.insert(db)
             }
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: messageId,
                 subject: "live", from: "a@x", fromAddress: "a@x", to: "b@x",
                 date: Date(), snippet: "",
@@ -352,7 +352,7 @@ struct FTSOrphanPruneTests {
             if try Folder.fetchOne(db, key: folderId) == nil {
                 try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
             }
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: msgId, subject: "moved", from: "a@x", fromAddress: "a@x", to: "b@x",
                 date: Date(), snippet: "", folderId: folderId, accountId: accountId,
                 folderPath: "Archive", isInInbox: false)
@@ -405,7 +405,7 @@ struct FTSOrphanPruneTests {
             if try Folder.fetchOne(db, key: folderId) == nil {
                 try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
             }
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: uid, subject: "a totally different message", from: "a@x", fromAddress: "a@x", to: "b@x",
                 date: Date(), snippet: "", folderId: folderId, accountId: accountId,
                 folderPath: "Archive", isInInbox: false)
