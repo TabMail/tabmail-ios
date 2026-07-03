@@ -11,6 +11,7 @@ import UserNotifications
 /// only the static helpers that decide whether/what to show given an iOS
 /// authorization status and the in-app toggle state.
 @Suite("RemindersNotificationWarning")
+@MainActor
 struct RemindersNotificationWarningTests {
 
     // MARK: - iosNotificationsBlocked

@@ -448,7 +448,7 @@ struct MessageAICacheFullTests {
             try c1.insert(db)
 
             var c2 = MessageAICache(key: "acc1:Sent:<probe@test.com>", rfc822MessageId: "<probe@test.com>")
-            c2.actionTag = .none
+            c2.actionTag = nil
             try c2.insert(db)
 
             var c3 = MessageAICache(key: "acc1:INBOX:<other@test.com>", rfc822MessageId: "<other@test.com>")
@@ -468,7 +468,7 @@ struct MessageAICacheFullTests {
         let db = try TestDatabase.make()
 
         try db.write {
-            var c = MessageAICache(key: "k1", rfc822MessageId: "<exists@test.com>")
+            let c = MessageAICache(key: "k1", rfc822MessageId: "<exists@test.com>")
             try c.insert($0)
         }
 

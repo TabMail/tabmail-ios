@@ -45,11 +45,11 @@ struct SameFolderNoOpTests {
         let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
         let trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
         try pool.writeWithoutTransaction { db in
-            var i = inbox
+            let i = inbox
             try i.insert(db)
-            var a = archive
+            let a = archive
             try a.insert(db)
-            var t = trash
+            let t = trash
             try t.insert(db)
         }
 
@@ -305,7 +305,7 @@ struct SameFolderNoOpTests {
         // Second trash-role folder, mirroring the known iCloud situation.
         let deletedMessages = Folder(name: "Deleted Messages", path: "Deleted Messages", role: .trash, accountId: "acc1")
         try await pool.writeWithoutTransaction { db in
-            var f = deletedMessages
+            let f = deletedMessages
             try f.insert(db)
         }
 
@@ -341,7 +341,7 @@ struct SameFolderNoOpTests {
 
         let deletedMessages = Folder(name: "Deleted Messages", path: "Deleted Messages", role: .trash, accountId: "acc1")
         try await pool.writeWithoutTransaction { db in
-            var f = deletedMessages
+            let f = deletedMessages
             try f.insert(db)
         }
 

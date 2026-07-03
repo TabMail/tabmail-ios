@@ -17,7 +17,7 @@ struct MessageDetailViewTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        var header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
         // Update cc with multiple addresses
         let ccValue = "alice@example.com, bob@example.com, carol@example.com"
@@ -38,7 +38,7 @@ struct MessageDetailViewTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        var header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
         let bccValue = "secret1@example.com, secret2@example.com"
         try db.write { dbConn in
@@ -58,7 +58,7 @@ struct MessageDetailViewTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        var header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
         let replyToValue = "noreply@example.com"
         try db.write { dbConn in
@@ -244,7 +244,7 @@ struct MessageDetailViewTests {
         #expect(beforeBody == nil)
 
         // After body fetch — bodyFor returns the body
-        let body = try TestDatabase.insertMessageBody(db, headerId: msg.id, htmlContent: "<p>Hello</p>")
+        _ = try TestDatabase.insertMessageBody(db, headerId: msg.id, htmlContent: "<p>Hello</p>")
         let afterBody = try db.read { try MessageBody.fetchOne($0, key: msg.id) }
         #expect(afterBody != nil)
         #expect(afterBody?.htmlContent == "<p>Hello</p>")

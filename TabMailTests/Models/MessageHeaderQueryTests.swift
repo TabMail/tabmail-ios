@@ -238,7 +238,7 @@ struct MessageHeaderQueryTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        var header = try TestDatabase.insertMessageHeader(db, messageId: "12345", rfc822MessageId: "<test@example.com>")
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "12345", rfc822MessageId: "<test@example.com>")
 
         #expect(header.stableId == "<test@example.com>")
     }

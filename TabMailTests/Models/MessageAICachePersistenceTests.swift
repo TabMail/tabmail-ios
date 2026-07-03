@@ -288,7 +288,7 @@ struct MessageAICachePersistenceTests {
                 reminderDate: "2026-03-20",
                 reminderTime: "14:00",
                 reminderContent: "Review meeting slides",
-                actionTag: .none,
+                actionTag: nil,
                 cachedReply: "Will review by Friday",
                 replyGeneratedAt: now,
                 db: $0
@@ -303,7 +303,7 @@ struct MessageAICachePersistenceTests {
         #expect(fetched.reminderDate == "2026-03-20")
         #expect(fetched.reminderTime == "14:00")
         #expect(fetched.reminderContent == "Review meeting slides")
-        #expect(fetched.actionTag == .none)
+        #expect(fetched.actionTag == nil)
         #expect(fetched.cachedReply == "Will review by Friday")
         #expect(fetched.replyGeneratedAt != nil)
     }
