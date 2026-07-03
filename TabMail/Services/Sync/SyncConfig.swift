@@ -454,6 +454,18 @@ enum SyncConfig {
     /// bound a phantom's lifetime. Display-only — expiry never touches staging/GRDB.
     static let stagedRowEvictionGuardSeconds: TimeInterval = 60
 
+    /// Notification-tap resolve: how long to poll the in-memory staged snapshot
+    /// + the indexed durable lookup before falling back to awaiting a full
+    /// `mergeNSEStagingData` behind the coordinator. A tap at foreground-return
+    /// races the syncStartup merge by MILLISECONDS: the merge publishes
+    /// `latestStagedRows` within ~15ms of reading staging, but its phase-1 write
+    /// can then run 4s+ under cold/saturated I/O — losing the race used to mean
+    /// serializing behind that write (observed: `resolved via mergeFallback in
+    /// 5658ms` where the snapshot appeared 14ms after the first check).
+    static let notifTapStagedResolveWaitSeconds: TimeInterval = 1.5
+    /// Poll step for the above wait.
+    static let notifTapStagedResolvePollMs = 50
+
     /// BGAppRefresh earliest begin date. iOS controls actual timing;
     /// this is the minimum delay we request.
     static let bgAppRefreshIntervalSeconds: TimeInterval = 300 // 5 min

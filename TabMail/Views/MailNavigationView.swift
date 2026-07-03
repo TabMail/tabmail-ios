@@ -670,8 +670,33 @@ struct MailNavigationView: View {
                         .fetchOne(db)?.id
                 }
             }
-            // 3. Fallback (rare — e.g. cold launch where the first merge hasn't
-            //    read staging yet): the original drain-then-lookup.
+            // 2.5 Bounded re-check: a tap at foreground-return races the
+            //     syncStartup merge by MILLISECONDS — the merge publishes the
+            //     staged snapshot ~15ms after reading staging, but awaiting the
+            //     FULL merge (tier 3) serializes behind its phase-1 write, which
+            //     runs 4s+ under cold/saturated I/O (boot_logs 3: 5658ms
+            //     mergeFallback for a snapshot that appeared 14ms too late).
+            //     Poll the two cheap lookups briefly before paying tier 3.
+            if compositeId == nil {
+                resolveTier = "stagedWait"
+                let deadline = CFAbsoluteTimeGetCurrent() + SyncConfig.notifTapStagedResolveWaitSeconds
+                while compositeId == nil, CFAbsoluteTimeGetCurrent() < deadline {
+                    try? await Task.sleep(for: .milliseconds(SyncConfig.notifTapStagedResolvePollMs))
+                    compositeId = NSEDataBridge.latestStagedRows.withLock { rows in
+                        rows.first { $0.messageId == messageId }?.headerId
+                    }
+                    if compositeId == nil {
+                        // Phase-1 may have committed mid-wait — indexed point read.
+                        compositeId = try? await AppDatabase.rawPool.read { db in
+                            try MessageHeader
+                                .filter(Column("messageId") == messageId && Column("isInInbox") == true)
+                                .fetchOne(db)?.id
+                        }
+                    }
+                }
+            }
+            // 3. Fallback (rare — no merge in flight ever read staging, e.g. a
+            //    cold launch tap): the original drain-then-lookup.
             if compositeId == nil {
                 resolveTier = "mergeFallback"
                 await NSEDataBridge.mergeNSEStagingData()
