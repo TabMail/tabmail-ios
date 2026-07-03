@@ -580,6 +580,25 @@ enum SyncConfig {
     /// next to the recipient field. Below this, counter is hidden.
     static let outboxMaxRecipientsWarnThreshold: Int = 45
 
+    // MARK: - IMAP External-Deletion Reconcile (ADR-IOS-051)
+
+    /// Tolerance for the deletion-reconcile trigger predicate
+    /// (`localHeaderCount > serverCount + tolerance`). Local GRDB is a partial
+    /// mirror of the server folder (optimistic local deletes remove rows
+    /// immediately, so pending user deletions only LOWER local count), which
+    /// makes ANY excess provable ghost evidence — hence default 0. Exists only
+    /// to absorb transient in-flight appends; tune only with evidence.
+    static let deletionReconcileCountTolerance = 0
+    /// UID SEARCH chunk size for the deletion-reconcile walk. Aligned with the
+    /// backfill walk's UID-SEARCH sizing: ~500 UIDs keeps both the explicit
+    /// `UID SEARCH UID <set>` command and its response far below the 1MB NIO
+    /// buffer limit even in dense folders.
+    static let deletionReconcileChunkSize = 500
+    /// Yield between reconcile-walk chunks (seconds) — mirrors the backfill
+    /// worker's etiquette: the pool connection is checked out per chunk, and
+    /// this gap lets user actions grab connections between chunks.
+    static let deletionReconcileInterChunkDelaySeconds: TimeInterval = 0.1
+
     // MARK: - Sent-Reply Parent Discovery
 
     /// When sync discovers a Sent-folder reply, we mark the parent message's

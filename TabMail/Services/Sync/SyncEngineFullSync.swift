@@ -237,6 +237,38 @@ extension SyncEngine {
         BootProfiler.mark("fullSync[\(acctTag)] DONE in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (inbox headers synced)")
         await SyncEngine.checkpointWALThrottled()
 
+        // ADR-IOS-051 Phase 2: evaluate the deletion-reconcile predicate per
+        // IMAP folder during full sync too — ghosts below the windowed sync's
+        // UID floor are otherwise invisible when delta's STATUS-change gating
+        // skips the folder (the cached totalCount already matches the server).
+        // `folder.totalCount` here is the fresh STATUS count from fetchFolders
+        // above; the local count is read live AFTER the windowed pass.
+        if provider.staleWindowMode == .uid, let imapProvider = provider as? IMAPProvider {
+            for folder in syncableFolders where !folder.path.isEmpty {
+                do {
+                    let folderId = folder.id
+                    let localCount = try await pool.read { db in
+                        try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
+                    }
+                    if Self.shouldReconcileDeletions(
+                        localCount: localCount,
+                        serverCount: folder.totalCount,
+                        tolerance: SyncConfig.deletionReconcileCountTolerance
+                    ) {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[FullSync] \(folder.name): local=\(localCount) > server=\(folder.totalCount) — reconciling external deletions")
+                        }
+                        await reconcileExternallyDeletedMessages(folder: folder, provider: imapProvider)
+                    }
+                } catch {
+                    // Best-effort — the evidence is durable and re-fires next sync.
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[FullSync] reconcile trigger check failed for \(folder.name): \(error)")
+                    }
+                }
+            }
+        }
+
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
         // Unread recount is now handled per-folder inside syncMessages, immediately after header commit.

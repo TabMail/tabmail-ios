@@ -596,7 +596,21 @@ final class SyncScheduler {
                 await provider.startIdle { [weak self] event, email in
                     guard let self else { return }
                     switch event {
-                    case .exists, .expunge, .vanished:
+                    case .vanished(let uidSet):
+                        // RFC 7162: the server NAMES the deleted UIDs — consume
+                        // them for targeted deletes (ADR-IOS-051 Phase 1), then
+                        // still poll so counts/flags refresh through the normal
+                        // sync path.
+                        let uids = uidSet.toArray().map { UInt32($0.value) }
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SyncScheduler:IDLE] \(email) event: vanished (\(uids.count) UIDs) — targeted delete + syncing")
+                        }
+                        await self.manager.syncEngine.handleVanishedUIDs(accountEmail: email, uids: uids)
+                        await self.backgroundPoll(accountEmail: email)
+                    case .exists, .expunge:
+                        // .expunge carries a SEQUENCE number, not a UID — it
+                        // cannot be mapped to a local row safely; keep it as a
+                        // generic poll trigger (ADR-IOS-051).
                         print("[SyncScheduler:IDLE] \(email) event: \(event) — syncing")
                         await self.backgroundPoll(accountEmail: email)
                     default:

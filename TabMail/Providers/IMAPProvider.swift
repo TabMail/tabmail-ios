@@ -12,6 +12,16 @@ struct IMAPFolderStatus: Sendable {
     let unreadCount: Int
 }
 
+/// Result of an explicit-UID-set existence SEARCH (deletion reconcile, ADR-IOS-051).
+struct UIDExistenceResult: Sendable {
+    /// UIDs from the queried set that still exist server-side.
+    let found: Set<UInt32>
+    /// UIDVALIDITY reported by the SELECT that preceded the SEARCH.
+    /// 0 = the server did not report a value (callers must treat as unknown
+    /// and abort any deletion decision — never delete on uncertainty).
+    let uidValidity: UInt32
+}
+
 actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// IMAP `fetchMessages(limit:)` returns the highest UIDs (archive-time order,
     /// decorrelated from message date) → stale detection must use a UID window.
@@ -1727,6 +1737,33 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 identifierSet: searchSet, criteria: [.all]
             )
             return extResult.asSet.toArray().map { UInt32($0.value) }
+        }
+    }
+
+    /// Check which of an EXPLICIT set of UIDs still exist in a folder via
+    /// `UID SEARCH UID <set>` (deletion reconcile, ADR-IOS-051). Unlike the
+    /// range variant above, the response can only ever name UIDs from the
+    /// queried set, so with chunks of `SyncConfig.deletionReconcileChunkSize`
+    /// both the command and the response stay far below the 1MB NIO buffer
+    /// limit even in dense folders. Also returns the SELECT's UIDVALIDITY so
+    /// the caller can abort when the folder's UID numbering was invalidated
+    /// (a UIDVALIDITY change makes every local UID meaningless — deleting on
+    /// a "not found" result would then be unsafe).
+    func searchExistingUIDs(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult {
+        guard !uids.isEmpty else { return UIDExistenceResult(found: [], uidValidity: 0) }
+        try Task.checkCancellation()
+
+        return try await withFolderConnection(folder: folder) { server in
+            let selection = try await server.selectMailbox(folder)
+            var searchSet = UIDSet()
+            for uid in uids { searchSet.insert(UID(uid)) }
+            let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
+                identifierSet: searchSet, criteria: [.all]
+            )
+            return UIDExistenceResult(
+                found: Set(extResult.asSet.toArray().map { UInt32($0.value) }),
+                uidValidity: selection.uidValidity.value
+            )
         }
     }
 

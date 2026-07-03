@@ -53,6 +53,12 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     var backfillUidCursor: Int?
     /// Gmail/Exchange: page token for cursor-based backfill. Resumes listing from stored position.
     var backfillPageToken: String?
+    /// IMAP: last observed UIDVALIDITY, used as the deletion-reconcile walk's
+    /// abort guard (ADR-IOS-051). Bootstrapped by the walk's first SELECT; a
+    /// later mismatch means every local UID is from an invalidated numbering,
+    /// so the walk ABORTS (never delete on uncertainty — the UID-remap/resync
+    /// machinery owns that case). Nil until the first walk runs.
+    var lastKnownUidValidity: Int?
 
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"

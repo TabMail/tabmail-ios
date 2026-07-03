@@ -1819,5 +1819,15 @@ final class AppDatabase: Sendable {
             // that NAME COLLISION is what bricked it; that duplicate is removed here.)
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_isRead_date ON messageHeader(folderId, isRead, date)")
         }
+
+        migrator.registerMigration("v63_addFolderUidValidity") { db in
+            // ADR-IOS-051: UIDVALIDITY abort guard for the IMAP deletion-reconcile
+            // walk. Nullable — bootstrapped by the folder's first reconcile walk;
+            // a later mismatch aborts the walk (local UIDs would be from an
+            // invalidated numbering — never delete on uncertainty).
+            try db.alter(table: "folder") { t in
+                t.add(column: "lastKnownUidValidity", .integer)
+            }
+        }
     }
 }

@@ -36,6 +36,15 @@ actor SyncEngine {
     /// suspension point), so it is race-free under actor reentrancy.
     var ftsReconcileInFlight = false
 
+    /// Folder ids with a deletion-reconcile walk in flight (ADR-IOS-051).
+    /// Prevents overlapping walks for the same folder when full sync and a
+    /// delta poll both trip the count-mismatch trigger on a slow server.
+    /// Actor-isolated; the check-and-insert in
+    /// `reconcileExternallyDeletedMessages` is synchronous, so it is
+    /// race-free under actor reentrancy. Duplicate walks would be idempotent
+    /// (delete-twice is a no-op) but waste a full-folder SEARCH pass.
+    var deletionReconcileInFlight: Set<String> = []
+
     /// Embedding rebuild task (one at a time).
 
     /// One-shot flag so the `recoverIncompleteHeaders` EXPLAIN QUERY PLAN probe

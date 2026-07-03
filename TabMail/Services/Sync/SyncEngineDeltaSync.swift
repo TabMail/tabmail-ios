@@ -770,6 +770,36 @@ extension SyncEngine {
                     )
             }
 
+            // ADR-IOS-051 Phase 2 trigger: compare the LIVE local header count
+            // against the just-fetched STATUS count (NOT the cached totalCount,
+            // which the overwrite above consumes). Local GRDB is a partial
+            // mirror — optimistic local deletes only LOWER local count — so
+            // localCount > serverCount proves ghost rows below the windowed
+            // sync's UID floor. `local < server` is backfill-normal and never
+            // triggers.
+            do {
+                let folderId = folder.id
+                let localCount = try await dbPool.read { db in
+                    try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
+                }
+                if Self.shouldReconcileDeletions(
+                    localCount: localCount,
+                    serverCount: status.messageCount,
+                    tolerance: SyncConfig.deletionReconcileCountTolerance
+                ) {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] IMAP delta: \(folder.name) local=\(localCount) > server=\(status.messageCount) — reconciling external deletions")
+                    }
+                    await reconcileExternallyDeletedMessages(folder: folder, provider: provider)
+                }
+            } catch {
+                // Trigger evaluation is best-effort — the evidence is durable
+                // and re-fires on the next delta/full sync pass.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] IMAP delta: reconcile trigger check failed for \(folder.name): \(error)")
+                }
+            }
+
             // syncGeneration advanced inside syncMessages() — no need to advance here.
             anyChanged = true
         }
