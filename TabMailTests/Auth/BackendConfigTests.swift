@@ -41,14 +41,14 @@ struct BackendConfigTests {
     }
 
     #if DEBUG
-    @Test("Debug builds use dev endpoints when debug mode unlocked")
-    func debugUsesDevEndpoints() {
-        // useDevServers requires debug_mode_unlocked to be true in UserDefaults
+    @Test("Unlocked debug builds default to PROD; dev endpoints require the explicit override")
+    func unlockedDefaultsToProdDevRequiresOverride() {
+        // Since bfc7b70 ("prod-default backend for debug builds"), ALL builds
+        // default to production endpoints — unlocking the debug menu no longer
+        // silently flips DEBUG builds to dev. Dev requires the explicit
+        // `debug_use_dev_servers` override on top of the unlock.
         let previousUnlocked = UserDefaults.standard.object(forKey: "debug_mode_unlocked") as? Bool
         let previousOverride = UserDefaults.standard.object(forKey: "debug_use_dev_servers") as? Bool
-        UserDefaults.standard.set(true, forKey: "debug_mode_unlocked")
-        // Remove any explicit override so the DEBUG default (true) takes effect
-        UserDefaults.standard.removeObject(forKey: "debug_use_dev_servers")
         defer {
             if let prev = previousUnlocked {
                 UserDefaults.standard.set(prev, forKey: "debug_mode_unlocked")
@@ -61,7 +61,16 @@ struct BackendConfigTests {
                 UserDefaults.standard.removeObject(forKey: "debug_use_dev_servers")
             }
         }
-        #expect(BackendConfig.apiBaseURL.host?.contains("dev") == true)
+        UserDefaults.standard.set(true, forKey: "debug_mode_unlocked")
+        // Unlocked, no explicit override → PROD default.
+        UserDefaults.standard.removeObject(forKey: "debug_use_dev_servers")
+        #expect(BackendConfig.apiBaseURL.host == "api.tabmail.ai")
+        // Unlocked + explicit override → dev.
+        UserDefaults.standard.set(true, forKey: "debug_use_dev_servers")
+        #expect(BackendConfig.apiBaseURL.host == "dev.tabmail.ai")
+        // Locked → always PROD, even with the override still set.
+        UserDefaults.standard.set(false, forKey: "debug_mode_unlocked")
+        #expect(BackendConfig.apiBaseURL.host == "api.tabmail.ai")
     }
     #endif
 }
