@@ -790,7 +790,11 @@ extension SyncEngine {
                     if DebugModeManager.isLoggingEnabled() {
                         print("[Sync] IMAP delta: \(folder.name) local=\(localCount) > server=\(status.messageCount) — reconciling external deletions")
                     }
-                    await reconcileExternallyDeletedMessages(folder: folder, provider: provider)
+                    await reconcileExternallyDeletedMessages(
+                        folder: folder,
+                        provider: provider,
+                        expectedGhosts: localCount - status.messageCount
+                    )
                 }
             } catch {
                 // Trigger evaluation is best-effort — the evidence is durable

@@ -147,13 +147,15 @@ struct DeletionReconcileWalkTests {
         script: [ChunkScript],
         recorder: WalkRecorder,
         deleteThrows: Bool = false,
-        persistThrows: Bool = false
+        persistThrows: Bool = false,
+        maxDeletions: Int = Int.max
     ) async -> DeletionReconcileOutcome {
         let callIndex = Mutex<Int>(0)
         return await SyncEngine.runDeletionReconcileWalk(
             localUIDs: localUIDs,
             chunkSize: chunkSize,
             storedUidValidity: storedUidValidity,
+            maxDeletions: maxDeletions,
             interChunkDelaySeconds: 0,
             search: { chunk in
                 recorder.recordSearch(chunk)
@@ -339,6 +341,75 @@ struct DeletionReconcileWalkTests {
         #expect(outcome.aborted)
         #expect(outcome.deletedCount == 0)
         #expect(recorder.searchCalls.count == 1) // aborted before the second chunk
+    }
+
+    // MARK: Deletion circuit breaker (cap = expected mismatch + slack)
+
+    @Test("deletions within the cap proceed across chunks")
+    func deletionsWithinCapProceed() async {
+        let recorder = WalkRecorder()
+        // 4 UIDs, 2 chunks; server reports every UID gone → 4 ghosts, cap 4.
+        let outcome = await runWalk(
+            localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: 3,
+            script: [
+                .found([], uidValidity: 3),
+                .found([], uidValidity: 3),
+            ],
+            recorder: recorder,
+            maxDeletions: 4
+        )
+        #expect(!outcome.aborted)
+        #expect(outcome.deletedCount == 4)
+        #expect(recorder.deleteCalls.count == 2)
+    }
+
+    @Test("chunk that would exceed the cap aborts with nothing deleted from it")
+    func capExceededAbortsBeforeOffendingChunk() async {
+        let recorder = WalkRecorder()
+        // Chunk 1 deletes 2 (within cap=3); chunk 2's 2 ghosts would total 4
+        // > cap → abort BEFORE deleting anything from chunk 2. This is the
+        // falsely-empty-SEARCH worst-case firewall.
+        let outcome = await runWalk(
+            localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: 3,
+            script: [
+                .found([], uidValidity: 3),
+                .found([], uidValidity: 3),
+            ],
+            recorder: recorder,
+            maxDeletions: 3
+        )
+        #expect(outcome.aborted)
+        #expect(outcome.abortReason?.contains("deletion cap exceeded") == true)
+        #expect(outcome.deletedCount == 2)       // only chunk 1's ghosts
+        #expect(recorder.deleteCalls.count == 1) // chunk 2 never reached deleteGhosts
+    }
+
+    @Test("first chunk larger than the cap deletes nothing at all")
+    func capSmallerThanFirstChunkDeletesNothing() async {
+        let recorder = WalkRecorder()
+        let outcome = await runWalk(
+            localUIDs: [1, 2, 3, 4], chunkSize: 4, storedUidValidity: 3,
+            script: [.found([], uidValidity: 3)],
+            recorder: recorder,
+            maxDeletions: 2
+        )
+        #expect(outcome.aborted)
+        #expect(outcome.deletedCount == 0)
+        #expect(recorder.deleteCalls.isEmpty)
+    }
+
+    @Test("exactly-at-cap boundary is allowed")
+    func exactCapBoundaryAllowed() async {
+        let recorder = WalkRecorder()
+        // 3 ghosts against cap 3 — boundary must pass (cap is inclusive).
+        let outcome = await runWalk(
+            localUIDs: [1, 2, 3], chunkSize: 3, storedUidValidity: 3,
+            script: [.found([], uidValidity: 3)],
+            recorder: recorder,
+            maxDeletions: 3
+        )
+        #expect(!outcome.aborted)
+        #expect(outcome.deletedCount == 3)
     }
 }
 

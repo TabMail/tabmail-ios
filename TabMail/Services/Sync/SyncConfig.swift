@@ -598,6 +598,16 @@ enum SyncConfig {
     /// worker's etiquette: the pool connection is checked out per chunk, and
     /// this gap lets user actions grab connections between chunks.
     static let deletionReconcileInterChunkDelaySeconds: TimeInterval = 0.1
+    /// Circuit-breaker slack on top of the trigger's expected mismatch
+    /// (`localCount − serverCount`): the walk may delete at most
+    /// expected + slack rows, then aborts. Slack absorbs additional
+    /// LEGITIMATE external deletions landing between the trigger's count
+    /// snapshot and the walk's chunks (each slack deletion is still
+    /// individually server-confirmed-absent). The breaker exists for the
+    /// falsely-empty-SEARCH-response worst case — without it a parsing or
+    /// protocol regression could read entire chunks as ghosts and wipe a
+    /// folder; with it the walk aborts before the offending chunk.
+    static let deletionReconcileCapSlack = 50
 
     // MARK: - Sent-Reply Parent Discovery
 

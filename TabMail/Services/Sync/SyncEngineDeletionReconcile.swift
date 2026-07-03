@@ -89,10 +89,19 @@ extension SyncEngine {
     ///   exists, the first observation is persisted via `persistUidValidity`.
     /// - A failed deletion (e.g. DB suspension, ADR-IOS-041/046) aborts —
     ///   abandon and let the trigger predicate re-fire next sync.
+    /// - Deletion circuit breaker: `maxDeletions` caps cumulative deletions at
+    ///   what the count evidence supports (expected mismatch + slack). The
+    ///   walk's per-ghost proof is a single source — the SEARCH response — so
+    ///   a response that ever parsed as falsely EMPTY (server quirk, protocol
+    ///   regression) would read the whole chunk as ghosts. The cap turns that
+    ///   worst case from "folder wiped" into "walk aborted before the
+    ///   offending chunk, logged"; the fresh evidence next sync re-derives a
+    ///   correct cap if deletions were legitimate.
     nonisolated static func runDeletionReconcileWalk(
         localUIDs: [UInt32],
         chunkSize: Int,
         storedUidValidity: Int?,
+        maxDeletions: Int,
         interChunkDelaySeconds: TimeInterval,
         search: @Sendable ([UInt32]) async throws -> UIDExistenceResult,
         deleteGhosts: @Sendable ([UInt32]) async throws -> Int,
@@ -156,6 +165,16 @@ extension SyncEngine {
 
             let ghosts = selectGhostUIDs(localChunk: chunk, serverFound: result.found)
             if !ghosts.isEmpty {
+                // Circuit breaker: deleting this chunk would exceed what the
+                // count evidence supports — abort BEFORE deleting anything
+                // from it (never delete on inconsistent evidence). If the
+                // excess ghosts are real, next sync's fresh counts raise the
+                // cap and the re-triggered walk finishes the job.
+                if outcome.deletedCount + ghosts.count > maxDeletions {
+                    outcome.aborted = true
+                    outcome.abortReason = "deletion cap exceeded (cap=\(maxDeletions), alreadyDeleted=\(outcome.deletedCount), chunkGhosts=\(ghosts.count))"
+                    break
+                }
                 do {
                     outcome.deletedCount += try await deleteGhosts(ghosts)
                 } catch {
@@ -324,7 +343,12 @@ extension SyncEngine {
     /// server did not list via the shared deletion path. Walk progress is NOT
     /// persisted: the trigger predicate is durable evidence, and per-chunk
     /// deletion shrinks the mismatch monotonically.
-    func reconcileExternallyDeletedMessages(folder: Folder, provider: IMAPProvider) async {
+    ///
+    /// `expectedGhosts` is the trigger's `localCount − serverCount` — the walk
+    /// may never delete more than this plus `SyncConfig
+    /// .deletionReconcileCapSlack` (circuit breaker; see
+    /// `runDeletionReconcileWalk`).
+    func reconcileExternallyDeletedMessages(folder: Folder, provider: IMAPProvider, expectedGhosts: Int) async {
         guard let workQueue = workQueues[folder.accountId] else { return }
         // Synchronous check-and-insert (no suspension point) — race-free under
         // actor reentrancy; prevents overlapping walks for the same folder.
@@ -354,8 +378,9 @@ extension SyncEngine {
         }
         guard !snapshot.uids.isEmpty else { return }
 
+        let maxDeletions = max(expectedGhosts, 0) + SyncConfig.deletionReconcileCapSlack
         if DebugModeManager.isLoggingEnabled() {
-            print("[Reconcile] \(folder.name): walk START — \(snapshot.uids.count) local UIDs, chunk=\(SyncConfig.deletionReconcileChunkSize), storedUidValidity=\(snapshot.storedValidity.map(String.init) ?? "nil")")
+            print("[Reconcile] \(folder.name): walk START — \(snapshot.uids.count) local UIDs, chunk=\(SyncConfig.deletionReconcileChunkSize), storedUidValidity=\(snapshot.storedValidity.map(String.init) ?? "nil"), deletionCap=\(maxDeletions)")
         }
 
         let folderPath = folder.path
@@ -364,6 +389,7 @@ extension SyncEngine {
             localUIDs: snapshot.uids,
             chunkSize: SyncConfig.deletionReconcileChunkSize,
             storedUidValidity: snapshot.storedValidity,
+            maxDeletions: maxDeletions,
             interChunkDelaySeconds: SyncConfig.deletionReconcileInterChunkDelaySeconds,
             search: { chunk in
                 // Backfill etiquette (ADR-IOS-014 successor): route through the

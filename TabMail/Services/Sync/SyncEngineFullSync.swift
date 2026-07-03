@@ -258,7 +258,11 @@ extension SyncEngine {
                         if DebugModeManager.isLoggingEnabled() {
                             print("[FullSync] \(folder.name): local=\(localCount) > server=\(folder.totalCount) — reconciling external deletions")
                         }
-                        await reconcileExternallyDeletedMessages(folder: folder, provider: imapProvider)
+                        await reconcileExternallyDeletedMessages(
+                            folder: folder,
+                            provider: imapProvider,
+                            expectedGhosts: localCount - folder.totalCount
+                        )
                     }
                 } catch {
                     // Best-effort — the evidence is durable and re-fires next sync.
