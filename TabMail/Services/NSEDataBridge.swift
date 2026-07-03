@@ -263,7 +263,9 @@ enum NSEDataBridge {
     /// `stagingMergeSignatureTTLSeconds`, and ALL explicit merge triggers
     /// (foreground, push, syncStartup step-0, AI queue, action-gate ensureDurable)
     /// call `mergeNSEStagingData`/the coordinator directly — bypassing this skip.
-    static func mergeIfStagingPending() async {
+    static func mergeIfStagingPending(
+        onSnapshotPublished: (@Sendable () -> Void)? = nil
+    ) async {
         // Recursion guard: the merge does its own GRDB reads (e.g. the FTS flush
         // bulk header read), which run inside `PriorityGate.privileged` — don't
         // re-trigger a merge from within one.
@@ -272,12 +274,44 @@ enum NSEDataBridge {
         let now = CFAbsoluteTimeGetCurrent()
         let last = lastMergedStagingSignature.withLock { $0 }
         if shouldSkipReadThroughMerge(current: current, last: last, now: now) { return }
-        await mergeNSEStagingData()
+        await mergeNSEStagingData(onSnapshotPublished: onSnapshotPublished)
         // Record the PRE-merge signature (what this merge consumed). If the merge
         // itself deleted terminal rows or the NSE staged more mid-merge, the next
         // probe's signature differs → one settling re-merge, which then records
         // the settled signature. Errs toward merging more, never less.
         lastMergedStagingSignature.withLock { $0 = (sig: current, at: CFAbsoluteTimeGetCurrent()) }
+    }
+
+    /// BOOT-PATH paint gate: run the read-through merge, but suspend the caller
+    /// ONLY until the merge has published its in-memory staged snapshot
+    /// (`latestStagedRows`/`latestStagedBodies` replaced, `.messagesStaged`
+    /// queued) — or returned without one (nothing pending / staging unreadable),
+    /// whichever comes first. The merge itself continues un-awaited and lands
+    /// durably post-paint.
+    ///
+    /// Why: `runIfNeeded` used to await the FULL merge before FIRST PAINT, so a
+    /// slow phase-1 header write gated the inbox — measured 7.6s on a cold-I/O
+    /// boot (killed-mid-sync WAL debt + cold FS caches, boot_logs 5 2026-07-03)
+    /// while the snapshot the first frame actually renders from had been ready
+    /// since +700ms. `InboxViewModel.resetMessages` (run at VM init, i.e. at
+    /// paint) seeds from `latestStagedRows`, so "pushed message in first frame"
+    /// needs only the snapshot; the durable write is invisible to paint — the
+    /// same two-phase contract (ADR-IOS-049) as every foreground merge.
+    static func mergeIfStagingPendingPaintGate() async {
+        let gate = OneShotGate()
+        Task {
+            await mergeIfStagingPending(onSnapshotPublished: {
+                if gate.open() {
+                    BootProfiler.mark("bootMerge: paint gate released on SNAPSHOT publish (merge continues post-paint)")
+                }
+            })
+            // Covers every no-snapshot exit: nothing pending, signature skip,
+            // privileged recursion, staging file missing/locked. All are fast.
+            if gate.open() {
+                BootProfiler.mark("bootMerge: paint gate released on merge completion (no snapshot published)")
+            }
+        }
+        await gate.wait()
     }
 
     // MARK: - Mirror (Main App → Shared UserDefaults for NSE)
@@ -480,14 +514,23 @@ enum NSEDataBridge {
     /// silent push, AI queue) funnel through `NSEMergeCoordinator` so they
     /// serialize into one in-flight run instead of each opening the staging DB
     /// and waiting out the 2s/5s `busyMode` timeout behind the others.
-    static func mergeNSEStagingData(stagingPathOverride: String? = nil) async {
-        await NSEMergeCoordinator.shared.merge(stagingPathOverride: stagingPathOverride)
+    static func mergeNSEStagingData(
+        stagingPathOverride: String? = nil,
+        onSnapshotPublished: (@Sendable () -> Void)? = nil
+    ) async {
+        await NSEMergeCoordinator.shared.merge(
+            stagingPathOverride: stagingPathOverride,
+            onSnapshotPublished: onSnapshotPublished
+        )
     }
 
     /// The actual merge work. NEVER call directly — go through
     /// `mergeNSEStagingData` so the coordinator's serialization holds. (Only the
     /// coordinator calls this.)
-    static func performMerge(stagingPathOverride: String? = nil) async {
+    static func performMerge(
+        stagingPathOverride: String? = nil,
+        onSnapshotPublished: (@Sendable () -> Void)? = nil
+    ) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         print("[NSEDataBridge] mergeNSEStagingData: START")
         BootProfiler.mark("mergeNSEStagingData START")
@@ -710,6 +753,12 @@ enum NSEDataBridge {
                 BootProfiler.mark("merge: .messagesStaged suppressed — staged set unchanged (\(stagedRows.count) row(s))")
             }
         }
+        // Paint-gate callback (`mergeIfStagingPendingPaintGate`): everything the
+        // first frame needs is now in memory — `latestStagedRows` /
+        // `latestStagedBodies` replaced and the `.messagesStaged` post queued.
+        // Fires BEFORE phase-1's durable write, the proven-slow part on cold I/O
+        // (7.6s measured), which must never gate first paint.
+        onSnapshotPublished?()
 
         if !processed.isEmpty {
             // ============================================================
@@ -2377,7 +2426,10 @@ actor NSEMergeCoordinator {
     /// chained after it.
     private var generation = 0
 
-    func merge(stagingPathOverride: String? = nil) async {
+    func merge(
+        stagingPathOverride: String? = nil,
+        onSnapshotPublished: (@Sendable () -> Void)? = nil
+    ) async {
         let previous = tail
         generation += 1
         let gen = generation
@@ -2392,7 +2444,10 @@ actor NSEMergeCoordinator {
             // cooperative pool. This is what makes "single-threaded" actually hold
             // against an in-flight backfill, not just against other merges.
             await PriorityGate.privileged {
-                await NSEDataBridge.performMerge(stagingPathOverride: stagingPathOverride)
+                await NSEDataBridge.performMerge(
+                    stagingPathOverride: stagingPathOverride,
+                    onSnapshotPublished: onSnapshotPublished
+                )
             }
         }
         tail = mine
@@ -2400,5 +2455,45 @@ actor NSEMergeCoordinator {
         // If nobody chained after us, drop the (now-completed) tail so the next
         // merge starts a fresh chain instead of awaiting a dead task.
         if generation == gen { tail = nil }
+    }
+}
+
+/// Minimal one-shot async gate for the boot paint gate: `wait()` suspends until
+/// the first `open()`; `open()` returns true only on the first call (so the
+/// call sites can attribute WHICH path released the gate). Single-waiter by
+/// contract — the boot path calls `wait()` exactly once. A `wait()` after the
+/// gate is already open returns immediately.
+final class OneShotGate: Sendable {
+    private struct State {
+        var opened = false
+        var waiter: CheckedContinuation<Void, Never>?
+    }
+    private let state = Mutex<State>(State())
+
+    /// Opens the gate, resuming a suspended `wait()`. Returns true iff this
+    /// call transitioned the gate (first open); later calls are no-ops.
+    @discardableResult
+    func open() -> Bool {
+        let (transitioned, waiter) = state.withLock { s -> (Bool, CheckedContinuation<Void, Never>?) in
+            guard !s.opened else { return (false, nil) }
+            s.opened = true
+            let w = s.waiter
+            s.waiter = nil
+            return (true, w)
+        }
+        waiter?.resume()
+        return transitioned
+    }
+
+    /// Suspends until the first `open()` (returns immediately if already open).
+    func wait() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let resumeNow = state.withLock { s -> Bool in
+                guard !s.opened else { return true }
+                s.waiter = c
+                return false
+            }
+            if resumeNow { c.resume() }
+        }
     }
 }

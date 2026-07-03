@@ -1713,6 +1713,8 @@ So the user-visible sequence is: header+snippet → render → body+AI → rende
 
 **Tests:** `InboxStagedInsertTests` (synthesis, insert, dedup, folder-guard, `lookupMessage` synthesis). `NSEGradualMergeTests` 2-post `.inboxDataDidChange` contract unchanged. Full suite green.
 
+**Amendment (2026-07-03) — boot paint gate:** cold-boot FIRST PAINT was still gated on the FULL boot merge (`runIfNeeded` awaited `mergeIfStagingPending()` to completion), so a slow phase-1 write gated the inbox — measured 8.4s to paint (7.6s phase-1 header upsert on a killed-mid-sync WAL-debt + cold-I/O boot, boot_logs 5) while the in-memory snapshot was ready at +700ms. The 2026-06-29 fail-fast probe protected paint from the NSE's *lock*, not from a slow *write*. Fix: `NSEDataBridge.mergeIfStagingPendingPaintGate()` — boot awaits a `OneShotGate` released by a new `onSnapshotPublished` callback (threaded through the coordinator into `performMerge`, fired right after the `latestStagedRows`/`latestStagedBodies` replace + `.messagesStaged` post decision, BEFORE phase-1) or by merge completion on every no-snapshot exit; the merge continues un-awaited and lands durably post-paint. Safe because `InboxViewModel.resetMessages` (VM init, i.e. at paint) seeds from `latestStagedRows` — the pre-paint notification was already being dropped (VM not yet constructed) — and the Pass-1 guard/dedup reconcile the durable write exactly as on foreground merges. Tests: `NSEPaintGateTests` (callback strictly precedes the durable header write; fires under re-post suppression; gate releases with nothing pending; `OneShotGate` semantics).
+
 **Relates:** builds on ADR-IOS-047 (two-phase merge); supersedes the reverted ADR-IOS-048 intent.
 
 ---

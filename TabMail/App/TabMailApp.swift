@@ -612,8 +612,17 @@ final class AppStartup {
         // 2026-06-29 after cold-boot-OOO reports — the pre-paint merge must never
         // wait on the NSE's lock (same principle as FIX 6d's probe). The later
         // foreground/push merges remain as belt-and-suspenders.
-        await NSEDataBridge.mergeIfStagingPending()
-        BootProfiler.mark("runIfNeeded: NSE staging merge (fail-fast, pre-first-paint)")
+        //
+        // PAINT GATE (2026-07-03): await only until the merge publishes its
+        // IN-MEMORY staged snapshot — not the full merge. The fail-fast probe
+        // protected paint from the NSE's *lock* but not from a slow *write*:
+        // phase-1's header upsert measured 7.6s on a cold-I/O boot (boot_logs 5)
+        // while the snapshot the first frame renders from was ready at +700ms.
+        // `InboxViewModel.resetMessages` (VM init, at paint) seeds from
+        // `latestStagedRows`, so paint needs only the snapshot; phase-1/phase-2
+        // land post-paint exactly like every foreground merge (ADR-IOS-049).
+        await NSEDataBridge.mergeIfStagingPendingPaintGate()
+        BootProfiler.mark("runIfNeeded: NSE staging merge gate (snapshot-or-done, pre-first-paint)")
         BootProfiler.mark("loadInitialData (sidebar: accounts/folders/outbox) START — @MainActor sync read")
         navigationStore.loadInitialData()
         BootProfiler.mark("loadInitialData DONE (accounts=\(navigationStore.accounts.count) folders=\(navigationStore.folders.count))")
