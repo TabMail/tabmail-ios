@@ -182,7 +182,7 @@ struct ActiveAIQueueTests {
         storage.enqueue(item2)
 
         // Fail item1 once
-        let candidates = storage.collectCandidates(maxJobs: Int.max)
+        _ = storage.collectCandidates(maxJobs: Int.max)
         storage.incrementActiveJobs()
         storage.incrementActiveJobs()
         _ = storage.jobCompleted(item1, shouldRetry: true, maxRetries: 3)

@@ -122,7 +122,7 @@ struct SyncEngineMaintenanceTests {
         try TestDatabase.insertFolder(db)
 
         let rfc822 = "<msg1@example.com>"
-        let header = try TestDatabase.insertMessageHeader(
+        _ = try TestDatabase.insertMessageHeader(
             db, messageId: "1", isInInbox: true, rfc822MessageId: rfc822
         )
 
@@ -170,9 +170,9 @@ struct SyncEngineMaintenanceTests {
         try TestDatabase.insertFolder(db)
 
         let now = Date()
-        let msg1 = try TestDatabase.insertMessageHeader(db, messageId: "1", date: now.addingTimeInterval(-3600))
-        let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "2", date: now.addingTimeInterval(-7200))
-        let msg3 = try TestDatabase.insertMessageHeader(db, messageId: "3", date: now)
+        _ = try TestDatabase.insertMessageHeader(db, messageId: "1", date: now.addingTimeInterval(-3600))
+        _ = try TestDatabase.insertMessageHeader(db, messageId: "2", date: now.addingTimeInterval(-7200))
+        _ = try TestDatabase.insertMessageHeader(db, messageId: "3", date: now)
 
         let ordered = try db.read { dbConn in
             try MessageHeader

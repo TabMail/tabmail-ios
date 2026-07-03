@@ -157,8 +157,8 @@ struct PruneAlgorithmTests {
         try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
 
         let floor = 2
-        try insertHeaders(db, count: 5, folderId: "acc1:INBOX", folderPath: "INBOX")
-        try insertHeaders(db, count: 4, folderId: "acc1:Sent", folderPath: "Sent", isInInbox: false)
+        _ = try insertHeaders(db, count: 5, folderId: "acc1:INBOX", folderPath: "INBOX")
+        _ = try insertHeaders(db, count: 4, folderId: "acc1:Sent", folderPath: "Sent", isInInbox: false)
 
         // Insert bodies for all
         let allHeaders = try db.read { dbConn in try MessageHeader.fetchAll(dbConn) }
@@ -221,7 +221,7 @@ struct PruneAlgorithmTests {
         try TestDatabase.insertFolder(db)
 
         let floor = 5
-        try insertHeaders(db, count: floor)
+        _ = try insertHeaders(db, count: floor)
 
         let totalInFolder = try db.read { dbConn in
             try MessageHeader.filter(Column("folderId") == "acc1:INBOX").fetchCount(dbConn)
@@ -305,7 +305,7 @@ struct BodyCacheEvictionTests {
 
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date())!
         let undoProtected: Set<String> = []
-        let recentPerFolder = 3
+        _ = 3
 
         // Replicate eviction logic
         var evicted = 0
@@ -726,7 +726,7 @@ struct AICachePurgeTests {
         let chunkSize = 2
         var purged = 0
         var rescued = 0
-        var skipCount = 0
+        let skipCount = 0
 
         while true {
             let batchResult = try db.write { dbConn -> (purged: Int, rescued: Int, batchEmpty: Bool) in
@@ -778,7 +778,7 @@ struct StaleTagSweepTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-        let msg = try TestDatabase.insertMessageHeader(
+        _ = try TestDatabase.insertMessageHeader(
             db, messageId: "1", folderId: "acc1:Archive", folderPath: "Archive",
             isInInbox: false, actionTag: .reply
         )

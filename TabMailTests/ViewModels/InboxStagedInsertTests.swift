@@ -28,7 +28,7 @@ struct InboxStagedInsertTests {
             try acc.insert(db)
         }
         let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try pool.writeWithoutTransaction { db in var f = folder; try f.insert(db) }
+        try pool.writeWithoutTransaction { db in let f = folder; try f.insert(db) }
         return (pool, folder, dir, previous)
     }
 
@@ -173,7 +173,7 @@ struct InboxStagedInsertTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
         let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
-        try pool.writeWithoutTransaction { db in var f = updates; try f.insert(db) }
+        try pool.writeWithoutTransaction { db in let f = updates; try f.insert(db) }
         var durable = MessageHeader(
             messageId: "1000", subject: "Dup", from: "Sender", fromAddress: "s@example.com",
             to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",
@@ -202,7 +202,7 @@ struct InboxStagedInsertTests {
             try acc.insert(db)
         }
         let inbox2 = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc2")
-        try pool.writeWithoutTransaction { db in var f = inbox2; try f.insert(db) }
+        try pool.writeWithoutTransaction { db in let f = inbox2; try f.insert(db) }
         var durable = MessageHeader(
             messageId: "1000", subject: "A1", from: "Sender", fromAddress: "s@example.com",
             to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",

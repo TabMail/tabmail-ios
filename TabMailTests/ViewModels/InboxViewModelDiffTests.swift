@@ -40,7 +40,7 @@ struct InboxViewModelDiffTests {
 
         let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         try pool.writeWithoutTransaction { db in
-            var f = folder
+            let f = folder
             try f.insert(db)
         }
 
@@ -184,7 +184,7 @@ struct InboxViewModelDiffTests {
             try? FileManager.default.removeItem(at: dir)
         }
 
-        let ids = try insertMessages(pool, specs: [
+        _ = try insertMessages(pool, specs: [
             ("m1", "First", baseDate, "s1", "alice@test.com"),
             ("m2", "Second", baseDate.addingTimeInterval(60), "s2", "bob@test.com"),
         ], folderId: folder.id)
@@ -579,7 +579,7 @@ struct InboxViewModelDiffTests {
         try await pool.writeWithoutTransaction { db in
             try db.execute(sql: "DELETE FROM messageHeader WHERE id = ?", arguments: [ids[1]])
         }
-        let newIds = try insertMessages(pool, specs: [
+        _ = try insertMessages(pool, specs: [
             ("m4", "D", baseDate.addingTimeInterval(90), "s4", "dave@test.com"),
         ], folderId: folder.id)
 

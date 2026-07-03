@@ -168,7 +168,7 @@ struct QueueStorageJobCompletionTests {
         q.enqueue("a")
 
         // Simulate 3 retries (maxRetries = 2)
-        for i in 0..<3 {
+        for _ in 0..<3 {
             _ = q.collectCandidates(maxJobs: 1)
             q.incrementActiveJobs()
             q.jobCompleted("a", shouldRetry: true, maxRetries: 2)
