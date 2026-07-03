@@ -123,25 +123,33 @@ enum DisabledRemindersStore {
             for hash in oldHashes {
                 map[hash] = DisabledEntry(enabled: false, ts: now)
             }
-            saveDisabledMap(map)
+            saveDisabledMap(map, key: storageKeyV2)
             print("[DisabledRemindersStore] Migrated \(oldHashes.count) entries from v1 to v2 CRDT format")
         }
     }
 
     /// Get the full CRDT map.
     static func getDisabledMap() -> [String: DisabledEntry] {
+        getDisabledMap(key: activeKeyV2)
+    }
+
+    /// Keyed load — read-modify-write callers capture `activeKeyV2` ONCE and
+    /// pass it to both load and save, so a demo entry/exit flipping the mode
+    /// between the read and the write can't route a real map into the demo
+    /// key (or vice versa).
+    private static func getDisabledMap(key: String) -> [String: DisabledEntry] {
         migrateIfNeeded()
-        guard let data = defaults.data(forKey: activeKeyV2),
+        guard let data = defaults.data(forKey: key),
               let map = try? JSONDecoder().decode([String: DisabledEntry].self, from: data) else {
             return [:]
         }
         return map
     }
 
-    /// Save the CRDT map.
-    private static func saveDisabledMap(_ map: [String: DisabledEntry]) {
+    /// Save the CRDT map (see getDisabledMap(key:) for the key contract).
+    private static func saveDisabledMap(_ map: [String: DisabledEntry], key: String) {
         if let data = try? JSONEncoder().encode(map) {
-            defaults.set(data, forKey: activeKeyV2)
+            defaults.set(data, forKey: key)
         }
     }
 
@@ -157,9 +165,10 @@ enum DisabledRemindersStore {
     /// Matches TB's `setEnabled()`.
     /// Broadcasts change to Device Sync peers (local user action).
     static func setEnabled(hash: String, enabled: Bool) {
-        var map = getDisabledMap()
+        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        var map = getDisabledMap(key: key)
         map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
-        saveDisabledMap(map)
+        saveDisabledMap(map, key: key)
         print("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
 
         // Broadcast to Device Sync peers. Demo dismiss/snooze stays local to
@@ -178,7 +187,8 @@ enum DisabledRemindersStore {
     /// CRDT merge: per-hash, newer timestamp wins.
     /// Does NOT trigger a broadcast (used for incoming Device Sync).
     static func mergeIncoming(_ incomingMap: [String: DisabledEntry]) {
-        var localMap = getDisabledMap()
+        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        var localMap = getDisabledMap(key: key)
         var merged = 0
 
         for (hash, inEntry) in incomingMap {
@@ -194,7 +204,7 @@ enum DisabledRemindersStore {
         }
 
         if merged > 0 {
-            saveDisabledMap(localMap)
+            saveDisabledMap(localMap, key: key)
         }
         print("[DisabledRemindersStore] CRDT merge: \(merged) entries adopted from \(incomingMap.count) incoming (local total: \(localMap.count))")
     }
@@ -204,7 +214,8 @@ enum DisabledRemindersStore {
     /// Does NOT broadcast to Device Sync or post notifications — caller handles that.
     static func bulkDisableWithEpochZero(hashes: [String]) {
         guard !hashes.isEmpty else { return }
-        var map = getDisabledMap()
+        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        var map = getDisabledMap(key: key)
         let epochZero = "1970-01-01T00:00:00Z"
         for hash in hashes {
             // Only write if no existing entry — preserve any prior state from sync/user action
@@ -212,14 +223,15 @@ enum DisabledRemindersStore {
                 map[hash] = DisabledEntry(enabled: false, ts: epochZero)
             }
         }
-        saveDisabledMap(map)
+        saveDisabledMap(map, key: key)
         print("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
     }
 
     /// Time-based GC: remove entries NOT in fresh set AND older than gcAgeDays.
     /// Replaces the old aggressive `syncState()` which immediately removed orphans.
     static func gcStaleEntries(freshHashes: Set<String>) {
-        var map = getDisabledMap()
+        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        var map = getDisabledMap(key: key)
         guard !map.isEmpty else { return }
 
         let now = Date()
@@ -236,7 +248,7 @@ enum DisabledRemindersStore {
         }
 
         if removed > 0 {
-            saveDisabledMap(map)
+            saveDisabledMap(map, key: key)
             print("[DisabledRemindersStore] GC removed \(removed) entries older than \(gcAgeDays) days")
         }
     }

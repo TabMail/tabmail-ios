@@ -67,6 +67,15 @@ actor TaskEvaluationService {
         isEvaluating = true
         defer { isEvaluating = false }
 
+        // Demo guard (ADR-IOS-038): tasks are a real-user feature. With the
+        // demo prompt overlay active, kbTextSnapshot returns the DEMO KB (no
+        // tasks) — running the loop would GC the user's task execution states
+        // + cache against an empty active set (duplicate fires after exit).
+        guard !DemoModeStore.isDemoActive else {
+            print("[TaskEval] Skipped — demo mode active")
+            return
+        }
+
         // Check task.enabled setting (defaults to true if never set)
         let isEnabled = await MainActor.run {
             UserDefaults.standard.object(forKey: "task.enabled") == nil || UserDefaults.standard.bool(forKey: "task.enabled")
@@ -353,6 +362,10 @@ actor TaskEvaluationService {
     /// Called on each foreground return to refresh the 48h TTL.
     /// The client computes absolute UTC wake times — the push worker is a dumb alarm clock.
     func registerAlarmsWithPushWorker() async {
+        // Demo guard (ADR-IOS-038): the demo KB overlay would yield demo task
+        // wake times (or none) — never touch the real user's push-worker alarm
+        // registration from demo. TTL is 48h; a demo session won't outlast it.
+        guard !DemoModeStore.isDemoActive else { return }
         let kbText = PromptStore.kbTextSnapshot()
         let tasks = KBTaskParser.parse(kbText)
         let disabledHashes = DisabledRemindersStore.getDisabledHashes()

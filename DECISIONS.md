@@ -1315,6 +1315,35 @@ fix gates at shared chokepoints, not per-tool patches:
 - Boot cost unchanged: everything is either an extra predicate on existing
   queries or gated behind `isDemoActive`; the wipe stays behind the
   `hasDemoData` PK short-circuit with indexed range deletes.
+
+**Post-commit audit findings (2026-07-02, all fixed same day):**
+- Fork path (`forkFromMessage`) minted an UNscoped sessionId — wrapped in
+  `scopedSessionId` (the invariant: EVERY sessionId mint/lookup routes
+  through it; grep for `UUID().uuidString` near chat code when touching).
+- `ChatPillState.removeAllSessions()` now CANCELS `activeChatTask` (and
+  drops resume checkpoints): a streaming agent loop re-samples the demo
+  flag per tool call, so a task surviving the mode flip executes tools on
+  the wrong side of the boundary. Teardown (+ Device Sync disconnect)
+  moved from `completeSetup` to `start()` so the entry window is closed
+  the instant `isActive` flips.
+- In-flight refinements that complete DURING demo are dropped at their
+  save sites (`KBRefinementService`, `AIPromptLearning`) — else the real
+  refined KB/action text would be spliced into the demo overlay (visible
+  in a recording). `registerAlarmsWithPushWorker` +
+  `TaskEvaluationService.evaluate` are demo-guarded (empty demo KB would
+  GC real task execution state / clobber alarm registrations).
+- `DisabledRemindersStore` RMW ops capture `activeKeyV2` once (read+write
+  same key even if the mode flips mid-operation).
+- `DemoSeed.wipe` also deletes `draft` rows (demo compose autosaves).
+- `MemoryIndexTests.vecCandidates_demoScope` pins the vec0 KNN
+  subquery+JOIN shape (a planner rejection would silently degrade memory
+  search to FTS-only in normal mode).
+- Separately (same session): `BackendConfig.useDevServers` no longer
+  defaults to dev on DEBUG builds once the debug menu is unlocked — ALL
+  builds default to prod, dev is toggle-only. The old default silently
+  pointed debug builds at dev.tabmail.ai, whose environment auth gate
+  blocks `/demo/start` (not in `publicPaths`) → "Could not start demo:
+  HTTP 401". Demo mint is prod-only by decision.
 - Debug-menu entry (`startFromDebugMenu`) sets
   `DemoModeStore.enteredFromDebugMenu` (in-memory): RootView suppresses
   the DemoBanner for clean demo recordings; "Exit Demo Mode" and

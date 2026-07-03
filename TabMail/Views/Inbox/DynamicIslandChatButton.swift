@@ -2135,10 +2135,13 @@ struct DynamicIslandChat: View {
         lastFailedMessage = nil
         sessionTurns = contextTurns
 
-        // Transform __new__ into live session
+        // Transform __new__ into live session.
+        // Demo-prefixed via scopedSessionId — fork must honor the same
+        // invariant as sendMessage's mint, or forked demo turns escape the
+        // demo: namespace (never wiped, leak into real session history).
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {
-            let newId = UUID().uuidString
+            let newId = DemoModeStore.scopedSessionId(UUID().uuidString)
             currentSessionId = newId
             loadedSessions[activeSessionIndex] = ChatStore.ChatSession(
                 id: newId, turns: [], lastActivity: Date(), remindersSnapshot: nil, emailContext: nil

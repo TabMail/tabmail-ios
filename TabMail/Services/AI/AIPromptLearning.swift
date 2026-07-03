@@ -111,10 +111,17 @@ extension AIService {
                 return
             }
 
-            // Persist updated guidelines — must happen on MainActor since PromptStore is @MainActor
+            // Persist updated guidelines — must happen on MainActor since PromptStore is @MainActor.
+            // Demo guard (ADR-IOS-038): a refine dispatched before demo entry can
+            // complete during demo — saving would write into the demo overlay
+            // (discarded on exit). Drop instead.
             let beforeLen = currentUserActionMd.count
             let afterLen = updated.count
             await MainActor.run {
+                guard !DemoModeStore.shared.isActive else {
+                    print("[AIService] autoUpdatePrompt: dropped — demo mode became active mid-flight")
+                    return
+                }
                 PromptStore.shared.rawAction = updated
                 print("[AIService] autoUpdatePrompt: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen))")
             }

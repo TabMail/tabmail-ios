@@ -108,6 +108,45 @@ struct MemoryIndexTests {
         #expect(MemoryIndex.memoryText(for: historyTurn(role: "assistant", content: "")) == nil)
     }
 
+    // MARK: - Vec KNN demo scope (ADR-IOS-038)
+
+    /// The demo-scope change rewrote the KNN query as a vec0 subquery JOINed
+    /// to memory_meta. If the planner rejected that shape, the vector leg
+    /// would silently die (do/catch → []) in NORMAL mode too — so this test
+    /// asserts the query executes and returns rows, and that the demo scope
+    /// filters both directions.
+    @Test("searchVecCandidates: KNN subquery+JOIN executes; demo scope filters both ways")
+    func vecCandidates_demoScope() async throws {
+        let dir = try await makeIndex()
+        defer { Task { await cleanup(dir) } }
+
+        await MemoryIndex.shared.indexTurn(
+            chatHistoryId: "real1", sessionId: "real-session", role: "user",
+            dateMs: 1_700_000_000_000, text: "real turn about budget"
+        )
+        await MemoryIndex.shared.indexTurn(
+            chatHistoryId: "demo1", sessionId: "demo:abc", role: "user",
+            dateMs: 1_700_000_001_000, text: "demo turn about budget"
+        )
+        let vec = Array(repeating: Float(0.5), count: SearchConfig.embeddingDims)
+        _ = await MemoryIndex.shared.storeEmbeddings([
+            (chatHistoryId: "real1", observedEpoch: 1, embedding: vec),
+            (chatHistoryId: "demo1", observedEpoch: 1, embedding: vec),
+        ])
+        #expect(await MemoryIndex.shared._testVecRowCount() == 2)
+
+        let normalHits = await MemoryIndex.shared.searchVecCandidates(
+            queryEmbedding: vec, limit: 10, demoActive: false)
+        let demoHits = await MemoryIndex.shared.searchVecCandidates(
+            queryEmbedding: vec, limit: 10, demoActive: true)
+
+        // Each mode sees exactly its own row — and crucially neither is empty,
+        // proving the subquery+JOIN shape is accepted by the vendored vec0.
+        #expect(normalHits.count == 1)
+        #expect(demoHits.count == 1)
+        #expect(Set(normalHits.map(\.0)).isDisjoint(with: Set(demoHits.map(\.0))))
+    }
+
     // MARK: - indexTurn writes FTS + meta (no vec)
 
     @Test("indexTurn writes single row: meta + fts, epoch=1, embeddingComplete=0, no vec")

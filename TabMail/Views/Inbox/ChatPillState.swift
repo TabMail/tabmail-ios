@@ -49,11 +49,22 @@ final class ChatPillState {
     /// Views re-create Session objects lazily via `session(for:)` — RootView
     /// swaps the routing branch on demo entry/exit, so the chat pill views
     /// (and their reminder observation `.task`) are recreated as well.
+    ///
+    /// Any in-flight chat task is CANCELLED first: a streaming agent loop
+    /// re-samples the demo flag on every tool call, so a task surviving the
+    /// mode flip would execute its remaining tools on the WRONG side of the
+    /// demo/real boundary (e.g. a demo-authored compose resolving the real
+    /// account after exit). Resume checkpoints are dropped with the session.
     func removeAllSessions() {
         let count = sessions.count
+        for (_, session) in sessions {
+            session.activeChatTask?.cancel()
+            session.activeChatTask = nil
+            session.pendingResumeRequest = nil
+        }
         sessions.removeAll()
         if count > 0 {
-            print("[ChatPillState] Removed all \(count) in-memory sessions (demo entry/exit)")
+            print("[ChatPillState] Cancelled tasks + removed all \(count) in-memory sessions (demo entry/exit)")
         }
     }
 

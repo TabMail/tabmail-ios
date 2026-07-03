@@ -30,6 +30,7 @@ struct DemoIsolationTests {
             try db.execute(sql: "CREATE TABLE chatTurn (sessionId TEXT)")
             try db.execute(sql: "CREATE TABLE chatHistory (sessionId TEXT)")
             try db.execute(sql: "CREATE TABLE outboxMessage (accountId TEXT)")
+            try db.execute(sql: "CREATE TABLE draft (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE pendingOperation (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE pendingCalendarOperation (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE chatIdMapping (numericId INTEGER, realId TEXT)")
@@ -47,6 +48,7 @@ struct DemoIsolationTests {
             try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('real-session'), ('msg:real-1:stable'), ('compose:d1')")
             try db.execute(sql: "INSERT INTO chatHistory (sessionId) VALUES ('real-session')")
             try db.execute(sql: "INSERT INTO outboxMessage (accountId) VALUES ('real-1')")
+            try db.execute(sql: "INSERT INTO draft (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO pendingOperation (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO pendingCalendarOperation (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO chatIdMapping (numericId, realId) VALUES (1, 'real-1:INBOX:100')")
@@ -61,6 +63,7 @@ struct DemoIsolationTests {
             try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('demo:s1'), ('demo:msg:demo-account:stable'), ('demo:compose:d2')")
             try db.execute(sql: "INSERT INTO chatHistory (sessionId) VALUES ('demo:s1')")
             try db.execute(sql: "INSERT INTO outboxMessage (accountId) VALUES (?)", arguments: [demo])
+            try db.execute(sql: "INSERT INTO draft (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO pendingOperation (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO pendingCalendarOperation (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO chatIdMapping (numericId, realId) VALUES (2, '\(demo):INBOX:1')")
@@ -93,6 +96,7 @@ struct DemoIsolationTests {
                 "demoHistory": try count(db, "chatHistory", "sessionId LIKE 'demo:%'"),
                 "demoCalOps": try count(db, "pendingCalendarOperation", "accountId = '\(demo)'"),
                 "demoIdMap": try count(db, "chatIdMapping", "realId LIKE '\(demo):%'"),
+                "demoDrafts": try count(db, "draft", "accountId = '\(demo)'"),
                 "demoOutbox": try count(db, "outboxMessage", "accountId = '\(demo)'"),
                 "demoPending": try count(db, "pendingOperation", "accountId = '\(demo)'"),
                 "demoCalendar": try count(db, "demoCalendarEvent", "1=1"),
@@ -105,6 +109,7 @@ struct DemoIsolationTests {
                 "realHistory": try count(db, "chatHistory", "sessionId = 'real-session'"),
                 "realCalOps": try count(db, "pendingCalendarOperation", "accountId = 'real-1'"),
                 "realIdMap": try count(db, "chatIdMapping", "realId = 'real-1:INBOX:100'"),
+                "realDrafts": try count(db, "draft", "accountId = 'real-1'"),
                 "realOutbox": try count(db, "outboxMessage", "accountId = 'real-1'"),
                 "realPending": try count(db, "pendingOperation", "accountId = 'real-1'"),
             ]
@@ -120,6 +125,7 @@ struct DemoIsolationTests {
         #expect(c["demoHistory"] == 0)
         #expect(c["demoCalOps"] == 0)
         #expect(c["demoIdMap"] == 0)
+        #expect(c["demoDrafts"] == 0)
         #expect(c["demoOutbox"] == 0)
         #expect(c["demoPending"] == 0)
         #expect(c["demoCalendar"] == 0)
@@ -133,6 +139,7 @@ struct DemoIsolationTests {
         #expect(c["realHistory"] == 1)
         #expect(c["realCalOps"] == 1)
         #expect(c["realIdMap"] == 1)
+        #expect(c["realDrafts"] == 1)
         #expect(c["realOutbox"] == 1)
         #expect(c["realPending"] == 1)
     }

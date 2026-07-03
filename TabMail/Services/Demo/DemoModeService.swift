@@ -60,6 +60,18 @@ final class DemoModeService {
         }
 
         store.isActive = true
+
+        // Boundary hygiene runs the INSTANT demo activates (not in
+        // completeSetup, which is seconds later behind consent gates + splash):
+        // - Cancel + drop all in-memory chat state. A real chat task
+        //   surviving into demo would run its remaining tool calls with the
+        //   demo flag set (writes into the soon-deleted overlay).
+        // - Tear down Device Sync. An open coexistence socket could apply an
+        //   incoming disabledReminders merge into the demo map during the
+        //   entry window. connect() is demo-guarded, so it stays down.
+        ChatPillState.shared.removeAllSessions()
+        DeviceSyncService.shared.disconnect()
+
         print("[DemoMode] start(): demo mode active")
     }
 
@@ -118,21 +130,11 @@ final class DemoModeService {
             AISubscriptionGate.shared.openGate()
         }
 
-        // Drop ALL in-memory chat pill state so the demo chat never shows the
-        // live user's in-flight session (debug-menu coexistence entry). The
-        // demo view tree is still behind the seeding splash here, and RootView
-        // swaps the routing branch on demo entry, so views re-create their
-        // Session objects on next access.
-        ChatPillState.shared.removeAllSessions()
-
         // Prompt overlay (ADR-IOS-038): swap KB / composition / action /
         // templates to bundled defaults so demo tools (kb_add, reminder_add,
         // template edits) operate on demo-scoped storage and the real prompts
-        // never surface in a demo. Device Sync is disconnected first — an
-        // existing connection (debug-menu coexistence) could otherwise push
-        // incoming peer state into the overlay. connect() is demo-guarded, so
-        // it stays down until exit.
-        DeviceSyncService.shared.disconnect()
+        // never surface in a demo. Chat-state teardown + Device Sync
+        // disconnect already happened at the top of start().
         PromptStore.shared.enterDemoOverlay()
 
         // Notify the search index / nav store so reactive UI picks up demo

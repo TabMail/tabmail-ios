@@ -72,6 +72,7 @@ enum DemoSeed {
         // into memory.db right after the exit purge.
         try db.execute(sql: "DELETE FROM chatHistory WHERE sessionId >= 'demo:' AND sessionId < 'demo;'")
         try db.execute(sql: "DELETE FROM outboxMessage WHERE accountId = ?", arguments: [demoAccountId])
+        try db.execute(sql: "DELETE FROM draft WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM pendingOperation WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM pendingCalendarOperation WHERE accountId = ?", arguments: [demoAccountId])
         // ChatIdTranslator persists numeric-ID mappings; demo header ids are

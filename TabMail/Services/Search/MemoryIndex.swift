@@ -778,7 +778,10 @@ actor MemoryIndex {
 
     /// Vector KNN query. Uses writer connection to avoid sqlite-vec vtab lifecycle issues
     /// (matches `SearchIndex.searchVecCandidates`).
-    private func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool) -> [(Int64, Double)] {
+    /// Internal (not private) so tests can exercise the KNN-subquery + meta
+    /// JOIN shape against a real vec0 table — a planner rejection here would
+    /// otherwise degrade to FTS-only silently (do/catch → []).
+    func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
         do {

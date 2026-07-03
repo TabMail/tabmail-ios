@@ -116,7 +116,15 @@ actor KBRefinementService {
             // Persist merged KB — this triggers Device Sync broadcast + UI reactivity via PromptStore.rawKB didSet.
             // PromptStore.rawKB didSet also triggers reminder re-parse via .onChange(of: rawKB) in DynamicIslandChat,
             // which calls ReminderBuilder.getRandomReminders() (parses KB reminders on demand).
+            // Demo guard (ADR-IOS-038): a refine dispatched BEFORE demo entry can
+            // complete DURING demo — saving would splice the user's real refined
+            // KB into the demo overlay (visible in a recording). Drop instead;
+            // the refine result is expendable.
             await MainActor.run {
+                guard !DemoModeStore.shared.isActive else {
+                    print("[KBRefine] Dropped refine result — demo mode became active mid-flight")
+                    return
+                }
                 PromptStore.shared.rawKB = mergedKB
             }
 
