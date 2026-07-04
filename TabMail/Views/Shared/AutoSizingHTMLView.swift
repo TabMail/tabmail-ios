@@ -254,6 +254,11 @@ private struct HTMLWebView: UIViewRepresentable {
         // correction fires; its own load listeners coexist with the height
         // monitor's (a single <img> can carry multiple load listeners).
         let aspectFix = WKUserScript(source: fixImageAspectRatioJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        // After heightMonitor: re-checks horizontal overflow once the deferred
+        // images have all settled — fit() measures with them hidden, so an
+        // image-driven width overflow is invisible to it (see the doc comment
+        // on postImageWidthRecheckJS).
+        let widthRefit = WKUserScript(source: postImageWidthRecheckJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let debugReport = WKUserScript(source: htmlDebugReportJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightDiag = WKUserScript(source: heightDiagnosticJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(idStamp)
@@ -268,6 +273,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(eatMargins)
         config.userContentController.addUserScript(heightMonitor)
         config.userContentController.addUserScript(aspectFix)
+        config.userContentController.addUserScript(widthRefit)
         config.userContentController.addUserScript(debugReport)
         config.userContentController.addUserScript(heightDiag)
         config.userContentController.add(context.coordinator, name: "heightChanged")
@@ -550,6 +556,21 @@ private struct HTMLWebView: UIViewRepresentable {
             }
         }
 
+        /// Reset the viewport to device-width and re-run the full fit in a
+        /// SINGLE JS turn. This is the ADR-IOS-039 sanctioned re-fit (same
+        /// mechanism as updateUIView's width-change path): viewportResetJS
+        /// clears window.__tmLayoutVp so fitViewportJS's idempotency guard
+        /// lets the re-fit through, and re-stamps __tmDeviceWidth. One
+        /// evaluateJavaScript call — NOT reset-then-fit in two turns — so
+        /// WebKit commits a single layout/scale change and the already-revealed
+        /// content never paints an intermediate device-width frame. Used by the
+        /// post-image-load width recheck (requestWidthRefit).
+        func resetAndFit(_ webView: WKWebView? = nil) {
+            guard let webView = webView ?? self.webView, webView.bounds.width > 50 else { return }
+            let resetJS = viewportResetJS(deviceWidth: Int(webView.bounds.width.rounded()))
+            webView.evaluateJavaScript(resetJS + ";" + fitViewportJS) { _, _ in }
+        }
+
         /// Wrap `rawHTML` OFF the main thread, then load it into the web view.
         ///
         /// `EmailHTMLWrapper.wrapHTML` is a pure, isolation-free transform, but
@@ -691,6 +712,16 @@ private struct HTMLWebView: UIViewRepresentable {
                 // sets __tmFitDone and re-posts the final height through here.
                 if dict["requestFit"] as? Bool == true {
                     fit(webView)
+                    return
+                }
+                // Post-image-load width recheck (postImageWidthRecheckJS): the
+                // deferred images finished loading and the settled layout now
+                // overflows the fitted viewport — fit() measured with those
+                // images hidden. Re-run the fit through the sanctioned reset
+                // path. One-shot: the JS side sets __tmWidthRefitRequested
+                // before posting, so this cannot loop.
+                if dict["requestWidthRefit"] as? Bool == true {
+                    resetAndFit(webView)
                     return
                 }
                 h = (dict["h"] as? NSNumber).map { CGFloat(truncating: $0) } ?? 0
@@ -2157,6 +2188,93 @@ private var fixImageAspectRatioJS: String {
     """
 }
 
+/// Post-image-load width recheck (injected at documentEnd, after monitorHeightJS).
+///
+/// `fitViewportJS` measures horizontal overflow with the DEFERRED remote images
+/// hidden (`measureMaxRight`'s phantom-overflow fix), so an email whose true
+/// width is IMAGE-DRIVEN under-widens: the FleetOptics delivery template's
+/// centered 515px table measured only 307px at vw=288 with its 12 remote images
+/// hidden, fit converged at 400 — then the images loaded, the table re-expanded
+/// to 515px, and the extra ~115px stayed clipped behind html{overflow-x:clip}
+/// forever, because the idempotency guard (window.__tmLayoutVp) blocks any
+/// fit re-entry (logmain.log 2026-07-04). Height had re-report paths for
+/// exactly this post-load staleness (postWiden timers, img load listeners);
+/// width had none.
+///
+/// This closes that gap EVENT-DRIVEN: arm load/error listeners on every image
+/// that is not yet displayable at documentEnd (deferred data-tmsrc/data-tmsrcset,
+/// or !complete in-flight — the same keying as measureMaxRight's hide). When the
+/// LAST such image settles, re-measure the true rightmost edge; if it overflows
+/// the committed layout viewport by more than fitViewportJS's OVERFLOW_SLOP,
+/// post ONE {requestWidthRefit:true}. Swift re-runs the fit through the
+/// SANCTIONED reset path (viewportResetJS + fitViewportJS in a single JS turn —
+/// ADR-IOS-039's rotation/resize path), where the now-loaded images measure at
+/// their real size. One-shot (__tmWidthRefitRequested) so a pathological
+/// document can never loop reset/fit. Images all loaded BEFORE fit() ran need
+/// nothing — fit measured them un-hidden already. Images that never fire
+/// load/error keep today's behavior (no refit).
+/// Exposed for unit tests via `_postImageWidthRecheckJS`.
+internal var _postImageWidthRecheckJS: String { postImageWidthRecheckJS }
+private var postImageWidthRecheckJS: String {
+    let logFn = DebugModeManager.isLoggingEnabled()
+        ? "function log(s) { try { window.webkit.messageHandlers.consoleLog.postMessage('[WidthRefit] ' + s); } catch(_){} }"
+        : "function log(s) {}"
+    return """
+    (function() {
+        \(logFn)
+        function pendingImgs() {
+            var imgs = document.getElementsByTagName('img');
+            var n = 0;
+            for (var i = 0; i < imgs.length; i++) {
+                var im = imgs[i];
+                if (im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset') || !im.complete) n++;
+            }
+            return n;
+        }
+        function check() {
+            if (window.__tmWidthRefitRequested) return;
+            // fit() commits the baseline this compares against; if it hasn't run
+            // yet, it will measure the (already loaded) images itself — nothing
+            // to recheck. No later event re-fires check in that case, which is
+            // correct: fit-after-load sees the true widths un-hidden.
+            if (!window.__tmFitDone || !document.body) return;
+            if (pendingImgs() > 0) return;
+            // Committed layout viewport — NEVER bare innerWidth (WebKit bug
+            // 170595); same fallback chain as monitorHeightJS.
+            var vp = window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth;
+            var mr = 0;
+            var all = document.body.getElementsByTagName('*');
+            for (var k = 0; k < all.length; k++) {
+                var rr = all[k].getBoundingClientRect().right;
+                if (rr > mr) mr = rr;
+            }
+            // Same slop as fitViewportJS's OVERFLOW_SLOP — sub-pixel/ceil noise
+            // must not trigger a re-fit of a fitting email.
+            if (mr <= vp + 8) { log('images settled, no overflow (maxRight=' + Math.round(mr) + ' vp=' + vp + ')'); return; }
+            window.__tmWidthRefitRequested = true;
+            log('images settled, overflow: maxRight=' + Math.round(mr) + ' > vp=' + vp + ' — requesting re-fit');
+            try { window.webkit.messageHandlers.heightChanged.postMessage({ requestWidthRefit: true }); } catch(_) {}
+        }
+        var imgs = document.getElementsByTagName('img');
+        var armed = 0;
+        for (var i = 0; i < imgs.length; i++) {
+            var im = imgs[i];
+            // A loaded, non-deferred image is already in fit()'s measurement —
+            // only not-yet-displayable images can change the layout later.
+            if (im.complete && !im.hasAttribute('data-tmsrc') && !im.hasAttribute('data-tmsrcset')) continue;
+            // NOT {once}: a deferred img fires load only after
+            // deferredImageLoadJS swaps its real src in; check() is
+            // flag-guarded so extra fires are cheap no-ops. The 60ms delay
+            // lets the post-load reflow settle before measuring.
+            im.addEventListener('load', function() { setTimeout(check, 60); });
+            im.addEventListener('error', function() { setTimeout(check, 60); });
+            armed++;
+        }
+        if (armed) log('armed ' + armed + ' image listener(s)');
+    })();
+    """
+}
+
 /// Debug report JS — logs DOM state after all other scripts have run.
 /// Gated by DebugModeManager so it's a no-op in production.
 private var htmlDebugReportJS: String {
@@ -2818,17 +2936,25 @@ private let fitViewportJS: String = {
                 var rr = all[k].getBoundingClientRect().right;
                 if (rr > mr) { mr = rr; cp = all[k]; }
             }
+            // Culprit's own width, measured while the deferred images are STILL
+            // hidden (same discipline as maxRight — a phantom descendant must
+            // not inflate it; restoring first would fold the hidden images'
+            // boxes back into the number). The widen loop needs it because a
+            // CENTERED culprit's rect.right only closes half its overflow per
+            // pass, while its own width is the exact viewport that contains it.
+            var cw = cp ? cp.getBoundingClientRect().width : 0;
             // Restore each hidden image's original inline display value + priority.
             for (var ri = 0; ri < hiddenImgs.length; ri++) {
                 var rEl = hiddenImgs[ri][0], rVal = hiddenImgs[ri][1], rPri = hiddenImgs[ri][2];
                 if (rVal) rEl.style.setProperty('display', rVal, rPri);
                 else rEl.style.removeProperty('display');
             }
-            return { maxRight: mr, culprit: cp };
+            return { maxRight: mr, culprit: cp, culpritWidth: cw };
         }
         var measured = measureMaxRight();
         var maxRight = measured.maxRight;
         var culprit = measured.culprit;
+        var culpritWidth = measured.culpritWidth;
         log('maxRight=' + Math.round(maxRight) + ' vs vw=' + vw);
         if (culprit && maxRight > vw + 10) {
             var culpritInfo = (culprit.tagName + '.' + (culprit.className || '') + ' w=' + Math.round(culprit.getBoundingClientRect().width)
@@ -2930,7 +3056,18 @@ private let fitViewportJS: String = {
         var targetWidth = 0;
         var converged = false;
         for (var pass = 0; pass < MAX_PASSES; pass++) {
-            var want = Math.min(Math.max(Math.ceil(maxRight), STANDARD_MIN), 1200);
+            // Target the culprit's own width as well as the rightmost edge. A
+            // margin:auto / align=center culprit RE-CENTERS on every widen, so
+            // its rect.right only closes HALF the remaining overflow per pass
+            // (FleetOptics 515px centered table at vw=288: right edge would walk
+            // 402→459→487→501 and exhaust the pass budget still clipped — and a
+            // not-converged end state can trip the runaway guard into reverting
+            // a genuinely fixed-width email to 1.0x). The culprit's width is the
+            // exact one-pass viewport for centered content; for left-anchored
+            // content (left >= 0) width <= rect.right so the max() is a no-op,
+            // and fluid width:100% content measures == the viewport and never
+            // enters this loop.
+            var want = Math.min(Math.max(Math.ceil(Math.max(maxRight, culpritWidth)), STANDARD_MIN), 1200);
             // Stop once we're not asking for materially more than already set.
             // The slop absorbs sub-pixel/ceil creep on width:100% content, which
             // otherwise re-measures ~1px wider every pass and runs out the whole
@@ -2958,6 +3095,7 @@ private let fitViewportJS: String = {
             var re = measureMaxRight();
             maxRight = re.maxRight;
             culprit = re.culprit;
+            culpritWidth = re.culpritWidth;
             log('WIDEN pass ' + pass + ': set ' + targetWidth + 'px → remeasured maxRight=' + Math.round(maxRight)
                 + (culprit ? ' culprit=' + culprit.tagName + '.' + (culprit.className || '') : ''));
             if (targetWidth >= 1200) { log('widen hit 1200px cap'); break; }

@@ -1450,6 +1450,31 @@ pipeline would have cached drifting values (why this was sequenced last).
 Width changes are accepted as a one-snap correction (~200 ms) rather than
 keying the cache by width.
 
+**Addendum (2026-07-04 — post-image-load width recheck):** hiding deferred
+images during `measureMaxRight` (the 2026-06-29 phantom-overflow fix) makes
+an IMAGE-DRIVEN width invisible to `fit()`: FleetOptics' centered 515px
+table measured 307px with its 12 remote images hidden → fit committed a
+400px layout viewport → the images loaded, the table re-expanded to 515px,
+and the overflow stayed clipped forever (the idempotency guard correctly
+blocks bare re-entry; height had post-load re-report paths, width had
+none). Fix adds a THIRD sanctioned re-fit trigger alongside rotation/sheet
+resize: `postImageWidthRecheckJS` waits (event-driven, load/error listeners
+keyed exactly like the measure-hide) for the LAST deferred/in-flight image
+to settle, re-measures the rightmost edge against `__tmLayoutVp ||
+__tmDeviceWidth` with the same 8px slop, and posts a ONE-SHOT
+`{requestWidthRefit:true}`; `Coordinator.resetAndFit()` then runs
+`viewportResetJS + fitViewportJS` in a SINGLE JS turn (one WebKit
+layout/scale commit — no intermediate device-width paint of the revealed
+content). This preserves purity: the final state is still a function of
+(content INCLUDING loaded images, device width); the one-shot flag plus the
+reset-path discipline prevent loops. Companion widen-loop fix: the target
+now includes the culprit's own width (`max(maxRight, culpritWidth)`,
+measured while images are hidden) because a centered (`margin:auto`)
+culprit re-centers on every pass and its `rect.right` closes only half the
+overflow per pass — it exhausted `MAX_PASSES` still clipped and could trip
+the runaway guard into reverting a fixed-width email to 1.0×. Tests:
+`fitViewportWidenTargetsCulpritWidth`, `postImageWidthRecheckPolicy`.
+
 ## ADR-IOS-040: Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming
 
 **Date:** 2026-06-10
@@ -1714,6 +1739,8 @@ So the user-visible sequence is: header+snippet → render → body+AI → rende
 **Tests:** `InboxStagedInsertTests` (synthesis, insert, dedup, folder-guard, `lookupMessage` synthesis). `NSEGradualMergeTests` 2-post `.inboxDataDidChange` contract unchanged. Full suite green.
 
 **Amendment (2026-07-03) — boot paint gate:** cold-boot FIRST PAINT was still gated on the FULL boot merge (`runIfNeeded` awaited `mergeIfStagingPending()` to completion), so a slow phase-1 write gated the inbox — measured 8.4s to paint (7.6s phase-1 header upsert on a killed-mid-sync WAL-debt + cold-I/O boot, boot_logs 5) while the in-memory snapshot was ready at +700ms. The 2026-06-29 fail-fast probe protected paint from the NSE's *lock*, not from a slow *write*. Fix: `NSEDataBridge.mergeIfStagingPendingPaintGate()` — boot awaits a `OneShotGate` released by a new `onSnapshotPublished` callback (threaded through the coordinator into `performMerge`, fired right after the `latestStagedRows`/`latestStagedBodies` replace + `.messagesStaged` post decision, BEFORE phase-1) or by merge completion on every no-snapshot exit; the merge continues un-awaited and lands durably post-paint. Safe because `InboxViewModel.resetMessages` (VM init, i.e. at paint) seeds from `latestStagedRows` — the pre-paint notification was already being dropped (VM not yet constructed) — and the Pass-1 guard/dedup reconcile the durable write exactly as on foreground merges. Tests: `NSEPaintGateTests` (callback strictly precedes the durable header write; fires under re-post suppression; gate releases with nothing pending; `OneShotGate` semantics).
+
+**Amendment (2026-07-04) — merge-commit signal for the open detail view (`.nseMergeDidCommit`):** the quick-render open path (staged header + `stagedBodyFallback` body) runs `loadThreadMessagesAsync` → `ThreadDetection.findRelatedMessages` against GRDB *before* the merge has written the header + `messageReference` junction rows, so related messages that are themselves staging-only (e.g. earlier thread members from the same push batch) come up empty — and nothing re-ran thread detection after the merge landed (`applyRefresh` only updates thread members *already present* in `threadMessages`). Fix: `performMerge` posts a new **`.nseMergeDidCommit`** (no payload) at exactly the two existing render points — phase-1 surface (`newlyVisible > 0`; headers + junctions are queryable from here) and end-of-merge (`endOfMergeChanged`) — bounded at two per wake, mirroring the `.inboxDataDidChange` contract. `MessageDetailViewModel` observes it (both inits): re-reads the focused header via `applyRefresh(for: resolvedId)` (durable row supersedes the staged synthesis) and re-runs `loadThreadMessagesAsync()`. Preview-freeze safe: while `PreviewFreezeGate` is frozen the refresh buffers as `pendingMergeCommitRefresh` and replays on `.previewFreezeReleased`, same contract as `pendingRefreshIds`. Deliberately NOT reusing `.inboxDataDidChange` in the VM (fires from sync/backfill/compose — would re-run thread queries on every inbox tick) nor `.messageDataDidChange` (fires per AI-field update — same waste, and its `applyRefresh` semantics are per-id, not wholesale). Tests: `NSEGradualMergeTests.mergePostsMergeCommitSignal` (2 posts per merge wake, 0 on empty re-merge), `MessageDetailStagedFallbackTests.mergeCommitRefreshesThreadMessages` (staged-only open → post → related messages appear).
 
 **Relates:** builds on ADR-IOS-047 (two-phase merge); supersedes the reverted ADR-IOS-048 intent.
 

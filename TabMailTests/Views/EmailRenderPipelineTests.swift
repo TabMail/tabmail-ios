@@ -223,6 +223,243 @@ struct EmailRenderPipelineTests {
         #expect(abortIdx < stampIdx)
     }
 
+    @Test("fitViewportJS widen target includes the culprit's own width (centered content)")
+    func fitViewportWidenTargetsCulpritWidth() {
+        let js = _fitViewportJS
+        // A margin:auto / align=center culprit RE-CENTERS on every widen pass,
+        // so its rect.right only closes half the remaining overflow per pass —
+        // a 515px centered table at vw=288 walks 402→459→487→501, exhausts
+        // MAX_PASSES still clipped, and the not-converged end state can trip
+        // the runaway guard into reverting a fixed-width email to 1.0x
+        // (FleetOptics delivery template, logmain.log 2026-07-04). The
+        // culprit's own width is the exact one-pass viewport for centered
+        // content; for left-anchored content width <= rect.right so the max()
+        // is a no-op.
+        #expect(js.contains("Math.ceil(Math.max(maxRight, culpritWidth))"))
+        // Measured while the deferred images are still hidden — the same
+        // phantom-overflow discipline as maxRight itself.
+        #expect(js.contains("culpritWidth: cw"))
+        // Refreshed on every remeasure pass, not just the initial measure.
+        #expect(js.contains("culpritWidth = re.culpritWidth"))
+    }
+
+    @Test("post-image width recheck — event-driven, one-shot, requests the sanctioned re-fit")
+    func postImageWidthRecheckPolicy() {
+        let js = _postImageWidthRecheckJS
+        // fit() measures with the deferred images HIDDEN (phantom-overflow fix),
+        // so an image-driven width (FleetOptics: centered 515px table, 12 remote
+        // imgs) under-widens and then clips forever once the images load — the
+        // idempotency guard blocks fit re-entry. This script re-measures once
+        // the LAST deferred/in-flight image settles and asks Swift for a re-fit
+        // through the viewportResetJS path.
+        // Only after fit() committed a baseline:
+        #expect(js.contains("window.__tmFitDone"))
+        // One-shot — can never loop reset/fit:
+        #expect(js.contains("__tmWidthRefitRequested"))
+        // Waits for the last pending image, keyed exactly like measureMaxRight's
+        // hide (deferred data-tmsrc/srcset or in-flight !complete):
+        #expect(js.contains("data-tmsrc"))
+        #expect(js.contains("data-tmsrcset"))
+        #expect(js.contains("!im.complete"))
+        // Compares against the committed layout viewport, never bare innerWidth
+        // (WebKit bug 170595) — same fallback chain as monitorHeightJS:
+        #expect(js.contains("window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth"))
+        // Same 8px slop as fitViewportJS's OVERFLOW_SLOP:
+        #expect(js.contains("vp + 8"))
+        // Requests the Swift-side reset+fit; never mutates the viewport itself
+        // (no meta writes, no direct fit() re-entry from JS):
+        #expect(js.contains("requestWidthRefit"))
+        #expect(!js.contains("setAttribute('content'"))
+    }
+
+    // MARK: - Post-image-load width pipeline (behavioral, via JSContext + mock DOM)
+    //
+    // Runs the PRODUCTION fitViewportJS → postImageWidthRecheckJS →
+    // deferredImageLoadJS → viewportResetJS+fitViewportJS lifecycle against a
+    // synthetic DOM that reproduces the 2026-07-04 clipped-right bug with
+    // GENERIC content: a delivery-notification-style template whose CENTERED
+    // (margin:auto) fixed-width table is sized by remote images — a 326px
+    // skeleton while the deferred images are hidden/unloaded, `trueWidth`
+    // (515px) once they load. Every rect is computed from the CURRENT layout
+    // viewport (`_vw`, driven by the viewport meta), so the scripts get the
+    // same layout feedback a real WebKit pass gives them: widening re-centers
+    // the table, the fluid wrapper tracks the viewport, hiding an image
+    // shrinks the table back to its skeleton width.
+    //
+    // Timers and rAF run synchronously in the mock, so the recheck script is
+    // evaluated (arms its listeners) BEFORE deferredImageLoadJS — in
+    // production the swap is deferred until after all documentEnd scripts.
+    private static func widthPipelineHarness(trueWidth: Int) -> String {
+        """
+        var DEVICE_W = 288, TRUE_W = \(trueWidth), SKELETON_W = 326;
+        var _vw = DEVICE_W;      // current layout viewport (CSS px) — driven by the meta
+        var _msgs = [];
+        var _imgs = [];
+        function _imgsDriveFullWidth() {
+            for (var i = 0; i < _imgs.length; i++) { if (!_imgs[i]._loaded || _imgs[i]._hidden) return false; }
+            return true;
+        }
+        function _tableW() { return _imgsDriveFullWidth() ? TRUE_W : SKELETON_W; }
+        function _centered(w) { return { left: (_vw - w) / 2, right: (_vw + w) / 2, width: w, height: 100 }; }
+        function _mkStyle(el) { return {
+            getPropertyValue: function (k) { return ''; },
+            getPropertyPriority: function (k) { return ''; },
+            setProperty: function (k, v, p) { if (k === 'display' && v === 'none') el._hidden = true; },
+            removeProperty: function (k) { if (k === 'display') el._hidden = false; }
+        }; }
+        function _baseEl(tag, cls) {
+            var el = {
+                tagName: tag, className: cls || '', innerText: '', outerHTML: '<' + tag.toLowerCase() + '>',
+                parentElement: null, naturalWidth: 0, naturalHeight: 0, offsetWidth: 0, offsetHeight: 0,
+                _attrs: {}, _hidden: false, _listeners: {},
+                getAttribute: function (k) { return (k in el._attrs) ? el._attrs[k] : null; },
+                setAttribute: function (k, v) { el._attrs[k] = v; if (el.tagName === 'IMG' && k === 'src') el.complete = false; },
+                removeAttribute: function (k) { delete el._attrs[k]; },
+                hasAttribute: function (k) { return (k in el._attrs); },
+                querySelectorAll: function (s) { return []; },
+                addEventListener: function (t, fn) { (el._listeners[t] = el._listeners[t] || []).push(fn); }
+            };
+            el.style = _mkStyle(el);
+            return el;
+        }
+        var fluidDiv = _baseEl('DIV', 'wrapper');           // width:100% — tracks the viewport
+        fluidDiv.getBoundingClientRect = function () { return { left: 0, right: _vw, width: _vw, height: 400 }; };
+        var table = _baseEl('TABLE', 'main');               // centered, image-driven width
+        table.getBoundingClientRect = function () { return _centered(_tableW()); };
+        table.parentElement = fluidDiv;
+        function _mkImg() {
+            var img = _baseEl('IMG', '');
+            img._attrs['data-tmsrc'] = 'https://example.com/banner.png';
+            img.complete = true;      // deferred: no src yet, nothing pending
+            img._loaded = false;
+            img.getBoundingClientRect = function () {
+                if (img._hidden) return { left: 0, right: 0, width: 0, height: 0 };
+                return _centered(_tableW());
+            };
+            img.parentElement = table;
+            _imgs.push(img);
+            return img;
+        }
+        _mkImg(); _mkImg();
+        var _all = [fluidDiv, table].concat(_imgs);
+        var _meta = {
+            _content: 'width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes',
+            getAttribute: function (k) { return _meta._content; },
+            setAttribute: function (k, v) {
+                _meta._content = v;
+                var m = v.match(/width=(device-width|\\d+)/);
+                if (m) _vw = (m[1] === 'device-width') ? DEVICE_W : parseInt(m[1], 10);
+            }
+        };
+        var document = {
+            readyState: 'complete',
+            documentElement: { offsetHeight: 100, style: { setProperty: function () {} } },
+            querySelector: function (s) { return s.indexOf('meta') >= 0 ? _meta : null; },
+            querySelectorAll: function (s) { return _imgs.filter(function (im) { return im.hasAttribute('data-tmsrc') || im.hasAttribute('data-tmsrcset'); }); },
+            getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _all.slice(); },
+            body: {
+                scrollHeight: 1200,
+                scrollTop: 0,
+                style: { setProperty: function () {} },
+                getBoundingClientRect: function () { return { left: 0, right: _vw, width: _vw, height: 1200 }; },
+                getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _all.slice(); },
+                querySelectorAll: function (s) { return [fluidDiv]; }
+            }
+        };
+        var window = {
+            innerWidth: DEVICE_W, innerHeight: 800, devicePixelRatio: 3,
+            screen: { width: DEVICE_W },
+            addEventListener: function () {},
+            getComputedStyle: function (el) { return { width: '', height: '', maxWidth: '' }; },
+            webkit: { messageHandlers: {
+                consoleLog: { postMessage: function (s) {} },
+                heightChanged: { postMessage: function (m) { _msgs.push(m); } }
+            } }
+        };
+        function requestAnimationFrame(fn) { fn(); }
+        function setTimeout(fn, t) { fn(); }
+        function fireImgEvent(idx, type) {
+            var img = _imgs[idx];
+            if (type === 'load') { img.complete = true; img._loaded = true; }
+            if (type === 'error') { img.complete = true; }
+            var ls = img._listeners[type] || [];
+            for (var i = 0; i < ls.length; i++) ls[i]();
+        }
+        function refitRequests() {
+            var n = 0;
+            for (var i = 0; i < _msgs.length; i++) { if (_msgs[i] && _msgs[i].requestWidthRefit === true) n++; }
+            return n;
+        }
+        """
+    }
+
+    private func makeWidthPipelineContext(trueWidth: Int) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.widthPipelineHarness(trueWidth: trueWidth))
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    private func layoutVp(_ ctx: JSContext) -> Int32 {
+        ctx.evaluateScript("window.__tmLayoutVp || 0")?.toInt32() ?? -1
+    }
+
+    private func refitRequests(_ ctx: JSContext) -> Int32 {
+        ctx.evaluateScript("refitRequests()")?.toInt32() ?? -1
+    }
+
+    @Test("image-driven wide email: first fit under-widens, recheck requests ONE refit, refit converges to the true width")
+    func widthPipelineRecheckRefitsImageDrivenWidth() {
+        let ctx = makeWidthPipelineContext(trueWidth: 515)
+
+        // Phase 1 — first fit at device width 288 (what Coordinator.fit runs).
+        // The deferred images are hidden for measurement, so only the 326px
+        // skeleton overflows → the widen floors at STANDARD_MIN (400). This IS
+        // the under-widened state: the true 515px layout is invisible to fit.
+        ctx.evaluateScript("window.__tmDeviceWidth = 288;" + _fitViewportJS)
+        #expect(ctx.exception == nil, "phase-1 fit threw: \(ctx.exception?.toString() ?? "")")
+        #expect(layoutVp(ctx) == 400)
+
+        // Phase 2 — recheck arms its listeners (documentEnd), then the deferred
+        // swap runs and the images stream in one at a time.
+        ctx.evaluateScript(_postImageWidthRecheckJS)
+        ctx.evaluateScript(_deferredImageLoadJS)
+        #expect(ctx.exception == nil, "phase-2 scripts threw: \(ctx.exception?.toString() ?? "")")
+        #expect(refitRequests(ctx) == 0)
+        ctx.evaluateScript("fireImgEvent(0, 'load')")
+        #expect(refitRequests(ctx) == 0)                 // second image still pending — no refit yet
+        ctx.evaluateScript("fireImgEvent(1, 'load')")
+        #expect(refitRequests(ctx) == 1)                 // LAST image settled → overflow detected
+        ctx.evaluateScript("fireImgEvent(1, 'load')")
+        #expect(refitRequests(ctx) == 1)                 // one-shot — a re-fire can never loop
+
+        // Phase 3 — what Coordinator.resetAndFit evaluates, in one JS turn.
+        ctx.evaluateScript(viewportResetJS(deviceWidth: 288) + ";" + _fitViewportJS)
+        #expect(ctx.exception == nil, "phase-3 refit threw: \(ctx.exception?.toString() ?? "")")
+        // Converges to EXACTLY the table's width, in one pass, via the
+        // culpritWidth target. A rect.right-only target would stall (the
+        // centered table re-centers each pass: 402→459→487→501) and leave the
+        // right edge clipped — this assertion fails if that regresses.
+        #expect(layoutVp(ctx) == 515)
+        let metaContent = ctx.evaluateScript("_meta._content")?.toString() ?? ""
+        #expect(metaContent.contains("width=515"))
+    }
+
+    @Test("images that load without changing the layout width never trigger a refit")
+    func widthPipelineNoRefitWhenImagesFit() {
+        // Loaded width == skeleton width: the images add no horizontal extent,
+        // so after the last one settles the 326px table sits well inside the
+        // 400px viewport (right edge 363) and no refit request may be posted.
+        let ctx = makeWidthPipelineContext(trueWidth: 326)
+        ctx.evaluateScript("window.__tmDeviceWidth = 288;" + _fitViewportJS)
+        #expect(layoutVp(ctx) == 400)
+        ctx.evaluateScript(_postImageWidthRecheckJS)
+        ctx.evaluateScript(_deferredImageLoadJS)
+        ctx.evaluateScript("fireImgEvent(0, 'load'); fireImgEvent(1, 'load')")
+        #expect(ctx.exception == nil, "scripts threw: \(ctx.exception?.toString() ?? "")")
+        #expect(refitRequests(ctx) == 0)
+    }
+
     @Test("eatGutterMarginsJS measures the email's inset and posts a reduced gutter (min-indent, no content fiddle)")
     func eatGutterMeasuresAndPostsReducedGutter() {
         let js = _eatGutterMarginsJS
@@ -427,7 +664,7 @@ struct EmailRenderPipelineTests {
         // re-measures are guarded too (not just the first measurement).
         guard let fnIdx = js.range(of: "function measureMaxRight()")?.lowerBound,
               let hideIdx = js.range(of: "hm.hasAttribute('data-tmsrc')")?.lowerBound,
-              let retIdx = js.range(of: "return { maxRight: mr, culprit: cp };")?.lowerBound else {
+              let retIdx = js.range(of: "return { maxRight: mr, culprit: cp, culpritWidth: cw };")?.lowerBound else {
             Issue.record("expected the image-hide guard to live inside measureMaxRight")
             return
         }
