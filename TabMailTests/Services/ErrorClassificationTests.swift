@@ -95,6 +95,22 @@ struct IsConnectionErrorTests {
         #expect(SyncEngine.isConnectionError(error) == true)
     }
 
+    @Test("NSError with NIOCore.IOError domain is a connection error")
+    func nioIOErrorByDomain() {
+        // Mirrors how a raw NIO IOError (syscall errno failure, e.g. read/write/connect)
+        // bridges into NSError when it leaks past SwiftMail's IMAPError wrapping.
+        // Structs always bridge with code 1 — the reported banner: "(NIOCore.IOError error 1.)".
+        let error = NSError(domain: "NIOCore.IOError", code: 1, userInfo: nil)
+        #expect(SyncEngine.isConnectionError(error) == true)
+    }
+
+    @Test("Error description containing 'NIOCore.IOError' is a connection error")
+    func nioIOErrorByString() {
+        // Catches the localizedDescription form: "(NIOCore.IOError error N.)"
+        let error = TestError(description: "The operation couldn't be completed. (NIOCore.IOError error 1.)")
+        #expect(SyncEngine.isConnectionError(error) == true)
+    }
+
     @Test("String containing 'DNS error' is a connection error")
     func dnsError() {
         let error = TestError(description: "DNS error: unknown(host: \"imap.mail.me.com\", port: 993)")

@@ -701,6 +701,13 @@ actor SyncEngine {
         // ("The operation couldn't be completed. (NIOCore.ChannelError error N.)") which leaks to the
         // UI when this predicate misses it. Domain check covers every case without importing NIO.
         if (error as NSError).domain == "NIOCore.ChannelError" { return true }
+        // NIOCore.IOError — raw syscall failure (read/write/connect errno) that escaped SwiftMail's
+        // IMAPError wrapping, same leak class as ChannelError above. Its description embeds strerror
+        // text for an arbitrary errno (e.g. "Operation not permitted (errno: 1)"), which the substrings
+        // below cannot enumerate, and the bridged NSError form is
+        // "The operation couldn't be completed. (NIOCore.IOError error 1.)" (structs always bridge
+        // code 1). Seen surfacing verbatim in the inbox error banner during a foreground poll (2026-07-04).
+        if (error as NSError).domain == "NIOCore.IOError" { return true }
         let msg = "\(error)"
         return msg.contains("notConnected") || msg.contains("not connected")
             || msg.contains("Connection reset") || msg.contains("command failed")
@@ -712,6 +719,7 @@ actor SyncEngine {
             || msg.contains("IMAPDecoderError") || msg.contains("IMAPDecodeError")
             || msg.contains("NIOConnectionError") // NIOPosix.NIOConnectionError — TCP connection failed
             || msg.contains("ChannelError") // NIOCore.ChannelError (already-bridged string form)
+            || msg.contains("NIOCore.IOError") // NIOCore.IOError (already-bridged string form)
             || msg.contains("DNS error") // NIO DNS resolution failure (no internet, DNS unreachable)
             || msg.contains("connection appears to be offline") // URLSession offline description
             || msg.contains("max_userip_connections") // Server rejected — too many IMAP connections (handled by adaptive concurrency)
