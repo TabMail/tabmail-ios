@@ -612,9 +612,19 @@ final class NotificationService: UNNotificationServiceExtension {
                 actionPrompt: NSEState.getActionPrompt() ?? ""
             )
 
-            os_log(.error, log: log, "NSE step6a: calling summary")
+            // "cc" needs positive evidence: the RECEIVING account's address (push
+            // payload email) in the Cc header (claim set). All mirrored account
+            // addresses feed the suppress set only — a cross-account To/From hit
+            // prevents a claim, never makes one.
+            let recipientStatus = PromptVariables.classifyRecipientStatus(
+                toField: msg.to, ccField: msg.cc, fromField: msg.senderEmail,
+                claimEmails: [accountEmail], suppressEmails: NSEState.getAllAccountEmails()
+            )
+            os_log(.error, log: log, "NSE step6a: calling summary (recipient_status=%{public}@)",
+                   recipientStatus.isEmpty ? "omitted" : recipientStatus)
             let summaryVars = PromptVariables.summaryVariables(
-                metadata: sharedMetadata, body: sharedBody, account: account
+                metadata: sharedMetadata, body: sharedBody, account: account,
+                recipientStatus: recipientStatus
             )
             if let resp = await BackendNSEClient.sendCompletions(
                 promptAlias: "system_prompt_summary",

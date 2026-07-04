@@ -36,7 +36,8 @@ extension AIService {
         bodyText: String,
         htmlContent: String?,
         userName: String,
-        kbText: String
+        kbText: String,
+        recipientStatus: String = ""
     ) async throws -> SummaryResult {
         guard !disableLLMCalls else {
             return SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil)
@@ -58,7 +59,9 @@ extension AIService {
             attachments: [], icsText: nil, hasUnresolvedCIDs: false, hasUnresolvedICS: false
         )
         let account = AccountContext(userName: userName, kbText: kbText, actionPrompt: "")
-        let rawVars = PromptVariables.summaryVariables(metadata: metadata, body: body, account: account)
+        let rawVars = PromptVariables.summaryVariables(
+            metadata: metadata, body: body, account: account, recipientStatus: recipientStatus
+        )
         let vars: [String: JSONValue] = rawVars.mapValues { JSONValue.fromAny($0) }
 
         let message = CompletionsMessage(
@@ -74,7 +77,7 @@ extension AIService {
             disable_tools: false  // TB sends disableTools: false for summary (tools enabled)
         )
 
-        if DebugModeManager.isLoggingEnabled() { print("[AIService] Summary payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), date=\(rawVars["email_date"] ?? "?"), body.len=\(bodyText.count), noReply=\(rawVars["is_noreply_address"] ?? "?"), unsub=\(rawVars["has_unsubscribe_link"] ?? "?")") }
+        if DebugModeManager.isLoggingEnabled() { print("[AIService] Summary payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), date=\(rawVars["email_date"] ?? "?"), body.len=\(bodyText.count), noReply=\(rawVars["is_noreply_address"] ?? "?"), unsub=\(rawVars["has_unsubscribe_link"] ?? "?"), recipient_status=\(recipientStatus.isEmpty ? "omitted" : "\"\(recipientStatus)\" (SENT)")") }
 
         // Single attempt — failed messages stay unprocessed and get re-queued
         // on the next sync cycle (natural retry via queue loop).

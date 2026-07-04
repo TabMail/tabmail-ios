@@ -82,6 +82,16 @@ extension AccountManager {
         let toRecipients = message.to
         let folderPath = message.folderPath
         let userName = account.displayName
+        // "cc" needs positive evidence: the RECEIVING account's address in the
+        // Cc header (claim set). All registered accounts feed the suppress set
+        // only — a cross-account To/From hit prevents a claim, never makes one.
+        let allAccountEmails = (try? await dbPool.read { db in
+            try Account.fetchAll(db).map(\.emailAddress)
+        }) ?? []
+        let recipientStatus = PromptVariables.classifyRecipientStatus(
+            toField: toRecipients, ccField: message.cc, fromField: message.fromAddress,
+            claimEmails: [account.emailAddress], suppressEmails: allAccountEmails
+        )
         let kbText = PromptStore.kbTextSnapshot()
         let actionPrompt = PromptStore.actionMarkdownSnapshot()
         let compositionPrompt = await MainActor.run { PromptStore.shared.compositionMarkdown() }
@@ -138,7 +148,8 @@ extension AccountManager {
                             hasExistingAction: hasExistingAction,
                             userName: userName,
                             kbText: kbText,
-                            actionPrompt: actionPrompt
+                            actionPrompt: actionPrompt,
+                            recipientStatus: recipientStatus
                         ) else {
                             return // in-flight dedup (AIService level)
                         }

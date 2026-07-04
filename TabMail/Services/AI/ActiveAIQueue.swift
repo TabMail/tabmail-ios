@@ -859,6 +859,17 @@ actor ActiveAIQueue {
         let t0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Summary START \(Self.logId(job.headerId))")
 
+        // "cc" needs positive evidence: the RECEIVING account's address in the
+        // Cc header (claim set). All registered accounts feed the suppress set
+        // only — a cross-account To/From hit prevents a claim, never makes one.
+        let allAccountEmails = (try? await dbPool.read { db in
+            try Account.fetchAll(db).map(\.emailAddress)
+        }) ?? []
+        let recipientStatus = PromptVariables.classifyRecipientStatus(
+            toField: message.to, ccField: message.cc, fromField: message.fromAddress,
+            claimEmails: [account.emailAddress], suppressEmails: allAccountEmails
+        )
+
         do {
             let summary = try await config.aiService.generateSummary(
                 subject: message.subject,
@@ -868,7 +879,8 @@ actor ActiveAIQueue {
                 bodyText: plainText,
                 htmlContent: nil,
                 userName: account.displayName,
-                kbText: config.kbText
+                kbText: config.kbText,
+                recipientStatus: recipientStatus
             )
 
             guard let blurb = summary.blurb, !blurb.isEmpty else {
