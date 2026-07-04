@@ -15,8 +15,9 @@ import SwiftUI
 /// deliberately NOT added: `loadBody` flips to the Message-Not-Found state as
 /// soon as its resolve + server fallback fail (fast in the preview canvas, no
 /// live providers), so the skeleton only flashes — useless for look-debugging
-/// and nondeterministic. The shimmer sweep (`aiWorkingShimmer`) animates live
-/// in the canvas.
+/// and nondeterministic. The opacity pulse (compose-editor `bodyBlink`
+/// pattern, 1 ↔ 0.35) animates live in the canvas; the blurred fake card
+/// replicates the focused `MessageCardView` layout.
 #Preview("MessageDetailSkeleton — light") {
     NavigationStack {
         MessageDetailSkeleton()

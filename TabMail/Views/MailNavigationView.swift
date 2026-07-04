@@ -627,104 +627,38 @@ struct MailNavigationView: View {
             return
         }
 
-        // Resolve BEFORE toggling selection so the inbox/detail views don't
-        // flash "inbox only" for the duration of the lookup.
-        //
-        // Lookup shape: the push payload's `messageId` is the PROVIDER
-        // messageId (Gmail id / Graph AQMk… / IMAP UID), NOT the composite
-        // MessageHeader.id (`accountId:folderPath:messageId`) that the detail
-        // view expects. Resolve via a column filter then hand the composite
-        // id downstream. Scoped to `isInInbox=true` because the same
-        // messageId can exist in multiple folders under Gmail's label model
-        // — the tap always means "open the inbox row".
-        Task { @MainActor in
-            // Tap-timeline mark (debug-gated): anchors the notification-tap →
-            // body-visible sequence in the boot log so any residual open-lag is
-            // attributable (resolve vs body-load vs render).
-            let tapT0 = CFAbsoluteTimeGetCurrent()
-            BootProfiler.mark("notifTap: deep link received \(messageId.prefix(24))")
-            // ADR-IOS-049 (notification tap): resolve WITHOUT waiting for the
-            // durable merge — the old drain-then-lookup gated navigation on the
-            // full merge (phase-1 header + phase-2 body writes; 1.5–10s on a
-            // resume-time-cold DB).
-            //
-            // 1. Freshest case: the pushed message is still staging-only. The
-            //    merge already published the staged snapshot (in-memory) before
-            //    its slow write — resolve the composite id from it instantly.
-            //    MessageDetailViewModel synthesizes its header from the same
-            //    snapshot, and the body renders from `latestStagedBodies` (or
-            //    the body-poll once phase 2 commits, for unresolved-CID bodies).
-            var resolveTier = "staged"
-            var compositeId: String? = NSEDataBridge.latestStagedRows.withLock { rows in
-                rows.first { $0.messageId == messageId }?.headerId
-            }
-            // 2. Already-durable case (most taps): direct indexed lookup. Uses
-            //    rawPool deliberately — PrioritizedDatabase.read would run the
-            //    read-through staging merge first, re-introducing the very wait
-            //    this path removes.
-            if compositeId == nil {
-                resolveTier = "durable"
-                compositeId = try? await AppDatabase.rawPool.read { db in
-                    try MessageHeader
-                        .filter(Column("messageId") == messageId && Column("isInInbox") == true)
-                        .fetchOne(db)?.id
-                }
-            }
-            // 2.5 Bounded re-check: a tap at foreground-return races the
-            //     syncStartup merge by MILLISECONDS — the merge publishes the
-            //     staged snapshot ~15ms after reading staging, but awaiting the
-            //     FULL merge (tier 3) serializes behind its phase-1 write, which
-            //     runs 4s+ under cold/saturated I/O (boot_logs 3: 5658ms
-            //     mergeFallback for a snapshot that appeared 14ms too late).
-            //     Poll the two cheap lookups briefly before paying tier 3.
-            if compositeId == nil {
-                resolveTier = "stagedWait"
-                let deadline = CFAbsoluteTimeGetCurrent() + SyncConfig.notifTapStagedResolveWaitSeconds
-                while compositeId == nil, CFAbsoluteTimeGetCurrent() < deadline {
-                    try? await Task.sleep(for: .milliseconds(SyncConfig.notifTapStagedResolvePollMs))
-                    compositeId = NSEDataBridge.latestStagedRows.withLock { rows in
-                        rows.first { $0.messageId == messageId }?.headerId
-                    }
-                    if compositeId == nil {
-                        // Phase-1 may have committed mid-wait — indexed point read.
-                        compositeId = try? await AppDatabase.rawPool.read { db in
-                            try MessageHeader
-                                .filter(Column("messageId") == messageId && Column("isInInbox") == true)
-                                .fetchOne(db)?.id
-                        }
-                    }
-                }
-            }
-            // 3. Fallback (rare — no merge in flight ever read staging, e.g. a
-            //    cold launch tap): the original drain-then-lookup.
-            if compositeId == nil {
-                resolveTier = "mergeFallback"
-                await NSEDataBridge.mergeNSEStagingData()
-                compositeId = try? await AppDatabase.dbPool.read { db in
-                    try MessageHeader
-                        .filter(Column("messageId") == messageId && Column("isInInbox") == true)
-                        .fetchOne(db)?.id
-                }
-            }
-            BootProfiler.mark("notifTap: resolved via \(resolveTier) in \(Int((CFAbsoluteTimeGetCurrent() - tapT0) * 1000))ms (hit=\(compositeId != nil))")
-
-            // Commit both state changes in the same tick. Raise the flag
-            // first so `.onChange(of: selection)` skips its
-            // `selectedMessageId = nil` wipe — otherwise the wipe fires
-            // between our two assignments and the detail view momentarily
-            // goes blank.
-            if let id = compositeId {
-                isHandlingNotificationDeepLink = true
-                selection = .unified(.inbox)
-                selectedMessageId = id
-                print("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
-            } else {
-                // Message genuinely gone (deleted/moved off-device before tap).
-                // Safe to let the default onChange behavior clear the detail.
-                selection = .unified(.inbox)
-                print("[MailNav] Notification deep link: message gone, falling back to inbox")
-            }
+        // Push the detail view IMMEDIATELY — no resolve gates navigation
+        // (2026-07-04, boot_logs 7: the old resolve-then-push held the user on
+        // the inbox for the whole ladder — 586ms stagedWait, 1.5s+ merge
+        // fallback — with nothing on screen). The push payload's `messageId`
+        // is the PROVIDER id (Gmail id / Graph AQMk… / IMAP UID), NOT the
+        // composite MessageHeader.id the detail view expects:
+        // - In-memory staged snapshot hit (fresh push, the common case) →
+        //   push the composite id directly, content in the first frame.
+        // - Miss → push the sentinel-prefixed provider id; the detail view
+        //   shows the loading skeleton while MessageDetailViewModel runs the
+        //   resolve ladder (`resolveProviderTap` — durable indexed read →
+        //   bounded staged/durable poll → merge fallback) and dissolves to
+        //   content. A genuinely-gone message now shows Message-Not-Found
+        //   (with Retry) instead of silently landing on the inbox.
+        BootProfiler.mark("notifTap: deep link received \(messageId.prefix(24))")
+        let stagedComposite = NSEDataBridge.latestStagedRows.withLock { rows in
+            rows.first { $0.messageId == messageId }?.headerId
         }
+        // Commit both state changes in the same tick. Raise the flag first so
+        // `.onChange(of: selection)` skips its `selectedMessageId = nil` wipe —
+        // otherwise the wipe fires between the two assignments and the detail
+        // view momentarily goes blank.
+        isHandlingNotificationDeepLink = true
+        selection = .unified(.inbox)
+        if let id = stagedComposite {
+            BootProfiler.mark("notifTap: pushed instantly (staged) \(messageId.prefix(24))")
+            selectedMessageId = id
+        } else {
+            BootProfiler.mark("notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))")
+            selectedMessageId = MessageDetailViewModel.notificationTapIdPrefix + messageId
+        }
+        print("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
 
     // MARK: - Helpers

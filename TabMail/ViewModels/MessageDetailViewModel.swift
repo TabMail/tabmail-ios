@@ -9,7 +9,16 @@ import SwiftUI
 @Observable
 @MainActor
 final class MessageDetailViewModel {
-    let messageId: String
+    /// Sentinel prefix for a notification-tap open whose PROVIDER messageId has
+    /// not yet been resolved to a composite header id. The deep-link handler
+    /// pushes the detail view IMMEDIATELY (skeleton on screen) with
+    /// `"\(notificationTapIdPrefix)<providerMessageId>"` instead of blocking
+    /// navigation on the resolve ladder; the VM resolves it asynchronously
+    /// (`resolveTapIfNeeded`) and rewrites `messageId` to the composite.
+    /// Cannot collide with real composite ids — those start with an accountId.
+    static let notificationTapIdPrefix = "notifTap::"
+
+    private(set) var messageId: String
     private(set) var message: MessageHeader?
     private(set) var messageBody: MessageBody?
     var isLoading = true
@@ -50,6 +59,17 @@ final class MessageDetailViewModel {
     /// Flushed by `flushPendingRefreshes()` when `.previewFreezeReleased` fires.
     @ObservationIgnored private var pendingRefreshIds: Set<String> = []
 
+    /// Provider messageId of a notification tap that hasn't resolved to a
+    /// composite header id yet (set iff `init` received the sentinel-prefixed
+    /// id and the staged snapshot didn't match). Cleared by
+    /// `resolveTapIfNeeded` when the ladder resolves and `messageId` is
+    /// rewritten to the composite.
+    @ObservationIgnored private var pendingProviderTapId: String?
+    /// Single-flight resolve for `pendingProviderTapId` — UNSTRUCTURED so a
+    /// cancelled `loadBody` (deep-link nav churn cancels `.task`) doesn't kill
+    /// the resolve; `markReadOnOpenIfNeeded` awaits the same task.
+    @ObservationIgnored private var tapResolveTask: Task<String?, Never>?
+
     init(messageId: String) {
         self.messageId = messageId
         // ZERO-I/O init (2026-07-03): seed only from the in-memory staged
@@ -63,10 +83,7 @@ final class MessageDetailViewModel {
         // then. `markReadOnOpenIfNeeded` has its own async resolve fallback,
         // and the optimistic overlay (`applyOverlay` on every resolve) keeps
         // a just-toggled isRead correct across the async gap.
-        if var m = stagedRowFallback(compositeId: messageId) {
-            applyOverlay(to: &m)
-            self.message = m
-        }
+        seedAtInit()
         startAIUpdateListener()
         startPreviewFreezeReleasedListener()
     }
@@ -77,10 +94,110 @@ final class MessageDetailViewModel {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
-        if var m = stagedRowFallback(compositeId: messageId) {
+        seedAtInit()
+    }
+
+    /// Zero-I/O init seed, shared by both inits. Handles the two id shapes:
+    /// - Sentinel-prefixed notification tap (`notifTap::<providerId>`): match
+    ///   the staged snapshot by PROVIDER id — a fresh push usually hits here
+    ///   (the NSE staged it before notifying) and resolves instantly; a miss
+    ///   leaves `pendingProviderTapId` for the async ladder.
+    /// - Composite header id: match the staged snapshot as before.
+    private func seedAtInit() {
+        if messageId.hasPrefix(Self.notificationTapIdPrefix) {
+            let providerId = String(messageId.dropFirst(Self.notificationTapIdPrefix.count))
+            let stagedRow = NSEDataBridge.latestStagedRows.withLock { rows in
+                rows.first { $0.messageId == providerId }
+            }
+            if var m = stagedRow?.toMessageHeader() {
+                applyOverlay(to: &m)
+                self.message = m
+                self.messageId = m.id
+            } else {
+                self.pendingProviderTapId = providerId
+            }
+        } else if var m = stagedRowFallback(compositeId: messageId) {
             applyOverlay(to: &m)
             self.message = m
         }
+    }
+
+    /// Resolve a pending notification-tap provider id to a composite header id
+    /// and rewrite `messageId`. Returns false only when the full ladder
+    /// (indexed durable read → bounded staged/durable poll → merge fallback)
+    /// exhausts — the message is genuinely gone. Single-flight: concurrent
+    /// callers (`loadBody`, `markReadOnOpenIfNeeded`) share one ladder run.
+    /// No-op (true) when nothing is pending.
+    private func resolveTapIfNeeded() async -> Bool {
+        guard let providerId = pendingProviderTapId else { return true }
+        let task: Task<String?, Never>
+        if let existing = tapResolveTask {
+            task = existing
+        } else {
+            let t = Task { await Self.resolveProviderTap(providerId) }
+            tapResolveTask = t
+            task = t
+        }
+        guard let composite = await task.value else { return false }
+        if pendingProviderTapId != nil {
+            self.messageId = composite
+            self.pendingProviderTapId = nil
+        }
+        return true
+    }
+
+    /// The notification-tap resolve ladder (moved from
+    /// `MailNavigationView.handleNotificationDeepLink`, which now pushes the
+    /// detail view IMMEDIATELY instead of blocking navigation on this — the
+    /// skeleton is on screen while it runs). The push payload's `messageId` is
+    /// the PROVIDER id (Gmail id / Graph id / IMAP UID), not the composite
+    /// `MessageHeader.id`. Scoped to `isInInbox=true` — the tap always means
+    /// "open the inbox row".
+    ///
+    /// Tiers (marks preserved from the old handler for log continuity):
+    /// 1. staged snapshot (in-memory, instant),
+    /// 2. durable indexed lookup (rawPool — PrioritizedDatabase.read would run
+    ///    the read-through staging merge first, re-introducing the wait),
+    /// 2.5 bounded re-poll of both (a foreground-return tap races the
+    ///    syncStartup merge's snapshot publish by milliseconds),
+    /// 3. merge fallback (rare — no merge in flight ever read staging).
+    nonisolated static func resolveProviderTap(
+        _ providerId: String,
+        waitSeconds: TimeInterval = SyncConfig.notifTapStagedResolveWaitSeconds,
+        pollMs: Int = SyncConfig.notifTapStagedResolvePollMs
+    ) async -> String? {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        func mark(_ tier: String, hit: Bool) {
+            BootProfiler.mark("notifTap: resolved via \(tier) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (hit=\(hit))")
+        }
+        func stagedMatch() -> String? {
+            NSEDataBridge.latestStagedRows.withLock { rows in
+                rows.first { $0.messageId == providerId }?.headerId
+            }
+        }
+        @Sendable func durableMatch(_ db: Database) throws -> String? {
+            try MessageHeader
+                .filter(Column("messageId") == providerId && Column("isInInbox") == true)
+                .fetchOne(db)?.id
+        }
+        if let id = stagedMatch() { mark("staged", hit: true); return id }
+        if let id = (try? await AppDatabase.rawPool.read(durableMatch)) ?? nil {
+            mark("durable", hit: true)
+            return id
+        }
+        let deadline = CFAbsoluteTimeGetCurrent() + waitSeconds
+        while CFAbsoluteTimeGetCurrent() < deadline {
+            try? await Task.sleep(for: .milliseconds(pollMs))
+            if let id = stagedMatch() { mark("stagedWait", hit: true); return id }
+            if let id = (try? await AppDatabase.rawPool.read(durableMatch)) ?? nil {
+                mark("stagedWait", hit: true)
+                return id
+            }
+        }
+        await NSEDataBridge.mergeNSEStagingData()
+        let id = (try? await AppDatabase.dbPool.read(durableMatch)) ?? nil
+        mark("mergeFallback", hit: id != nil)
+        return id
     }
 
     deinit {
@@ -310,13 +427,24 @@ final class MessageDetailViewModel {
             }
         }
 
+        // Pending notification tap: resolve the PROVIDER id to a composite
+        // header id first (single-flight ladder; the skeleton is on screen).
+        // On failure the message is genuinely gone — Not-Found, with Retry.
+        guard await resolveTapIfNeeded() else {
+            print("[MoveTrace] loadBody — notification-tap resolve exhausted for \(messageId)")
+            isLoading = false
+            messageNotFound = true
+            return
+        }
+
         // Resolve message from DB with proper error handling.
         // GRDB 7.x throws CancellationError on async reads when the Task is
         // cancelled (e.g., SwiftUI .task during bg→fg transitions). Using try?
         // would mask this as "not found", so we use do/catch to distinguish.
         var msg: MessageHeader?
         do {
-            msg = try await dbPool.read { db in try MessageHeader.fetchOne(db, key: messageId) }
+            let mid = messageId
+            msg = try await dbPool.read { db in try MessageHeader.fetchOne(db, key: mid) }
         } catch is CancellationError {
             print("[MoveTrace] loadBody — task cancelled during initial DB read, deferring to body poll")
             BootProfiler.mark("detail loadBody CANCELLED (initial read) → poll")
@@ -358,7 +486,14 @@ final class MessageDetailViewModel {
         // real (unmoved) folderPath, not an optimistic overlay value.
         var displayMsg = msg
         applyOverlay(to: &displayMsg)
-        message = displayMsg
+        if message == nil {
+            // Skeleton → content: dissolve (withAnimation at the mutation site,
+            // NEVER .animation(_:value:) on the List's ancestors — feedback-loop
+            // hang, see UX rules). Later refreshes assign without animation.
+            withAnimation(.easeInOut(duration: 0.35)) { message = displayMsg }
+        } else {
+            message = displayMsg
+        }
 
         // User tap on a message body counts as "accessed" — bump LRU on every
         // asset (kind=0 inline images + kind=1 attachments) belonging to this
@@ -786,7 +921,9 @@ final class MessageDetailViewModel {
         // Fallback: message not resolved yet — init is zero-I/O (staged
         // snapshot only) and loadBody's async resolve may not have landed.
         // Resolve here independently so the read-flip never depends on the
-        // body-load path's timing.
+        // body-load path's timing. A pending notification tap resolves its
+        // provider id first (shares loadBody's single-flight ladder).
+        guard await resolveTapIfNeeded() else { return }
         guard let msg = await resolveMessageAsync(compositeId: messageId) else { return }
         guard !msg.isRead else { return }
         // Layer any concurrent pending mutations (e.g. user just flagged this
@@ -796,7 +933,12 @@ final class MessageDetailViewModel {
         var displayMsg = msg
         applyOverlay(to: &displayMsg)
         displayMsg.isRead = true
-        self.message = displayMsg
+        if self.message == nil {
+            // Skeleton → content dissolve (same rule as loadBody's assignment).
+            withAnimation(.easeInOut(duration: 0.35)) { self.message = displayMsg }
+        } else {
+            self.message = displayMsg
+        }
         manager.registerMutation(id: msg.id, mutation: .init(isRead: true))
         Task { await manager.enqueueWrite { [manager] in
             await manager.markRead([msg])
