@@ -131,6 +131,10 @@ enum ICSCalendarImporter {
 
     @MainActor
     static func presentCalendarImport(icsData: Data) {
+        // Clean the invite before it reaches the OS: strip pathological bloat
+        // (e.g. a 79 KB X-ALT-DESC) and repair RFC violations that otherwise wedge
+        // iOS↔Google calendar sync. Covers both the real and demo paths below.
+        let icsData = ICSSanitizer.sanitize(icsData)
         print("[ICSImport] presentCalendarImport called, activeSafari=\(activeSafari != nil)")
         // In demo mode, ICS imports MUST NOT touch the
         // real EKEventStore (would persist past demo exit). Route to the
