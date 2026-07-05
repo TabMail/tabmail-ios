@@ -98,7 +98,7 @@ enum ActionTag: String, Codable, CaseIterable, Sendable {
     }
 }
 
-struct MessageHeader: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
+struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
     static let databaseTableName = "messageHeader"
 
     var id: String

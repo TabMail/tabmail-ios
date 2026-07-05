@@ -851,6 +851,17 @@ extension Notification.Name {
     /// it IN-MEMORY without waiting for the durable header write (ADR-IOS-049).
     /// Object is `[StagedInboxRow]`.
     static let messagesStaged = Notification.Name("messagesStaged")
+    /// Posted by the NSE merge when staged rows have become DURABLE and queryable
+    /// in GRDB — at the phase-1 header surface (headers + reference junctions
+    /// newly visible) and again at end-of-merge (bodies/AI/removals landed).
+    /// Companion to `.messagesStaged` (ADR-IOS-049): a quick-rendered open
+    /// (header/body synthesized from the staged snapshot) ran thread detection
+    /// against GRDB BEFORE the merge wrote the rows, so related messages came up
+    /// empty. `MessageDetailViewModel` observes this to re-run thread detection
+    /// once the rows are actually queryable (it deliberately does NOT re-read
+    /// the focused header — phase-1 rows are header-only with nil AI fields and
+    /// would wipe the staged summary/tag; see `refreshAfterMergeCommit`).
+    static let nseMergeDidCommit = Notification.Name("nseMergeDidCommit")
     /// Posted when the server confirms the user's account no longer exists (deleted or token permanently revoked).
     /// RootView shows an explanatory alert and then signs out.
     static let tabMailAccountGone = Notification.Name("tabMailAccountGone")

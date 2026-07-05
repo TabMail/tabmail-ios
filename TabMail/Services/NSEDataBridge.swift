@@ -897,6 +897,11 @@ enum NSEDataBridge {
                             object: nil,
                             userInfo: [Notification.Name.inboxReloadImmediateKey: true]
                         )
+                        // Headers + reference junctions are durable/queryable as
+                        // of this flip — an open quick-rendered detail view can
+                        // now re-run thread detection and find related messages
+                        // that were staging-only at first render (ADR-IOS-049).
+                        NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
                     }
                 } else {
                     BootProfiler.mark("merge phase1: \(phase1HeaderIds.count) header(s) already visible — no extra render")
@@ -1464,6 +1469,10 @@ enum NSEDataBridge {
                     object: nil,
                     userInfo: [Notification.Name.inboxReloadImmediateKey: true]
                 )
+                // Everything (headers, bodies, AI, removals) is durable — same
+                // re-run signal as phase 1's for the open detail view; also
+                // covers merges whose changes landed only in phase 2.
+                NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
             }
         }
 

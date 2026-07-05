@@ -48,6 +48,7 @@ final class MessageDetailViewModel {
 
     @ObservationIgnored nonisolated(unsafe) private var aiUpdateObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var previewFreezeReleasedObserver: NSObjectProtocol?
+    @ObservationIgnored nonisolated(unsafe) private var nseMergeObserver: NSObjectProtocol?
     /// Poll task that checks for MessageBody in DB when body is missing.
     /// Catches cases where fetchBody succeeds but the ViewModel missed the read
     /// (e.g., lock contention caused a timeout, but a later retry wrote the body).
@@ -58,6 +59,49 @@ final class MessageDetailViewModel {
     /// burst of notifications during a preview replays as one refresh per id.
     /// Flushed by `flushPendingRefreshes()` when `.previewFreezeReleased` fires.
     @ObservationIgnored private var pendingRefreshIds: Set<String> = []
+
+    /// Set when a wholesale thread-detection re-run must replay on
+    /// `.previewFreezeReleased` (same contract as `pendingRefreshIds`): either
+    /// `.nseMergeDidCommit` arrived while the `PreviewFreezeGate` was active,
+    /// or an in-flight `loadThreadMessagesAsync` hit the frozen gate at its
+    /// mutation site (its computed results are discarded, not applied — the
+    /// replay recomputes from current DB state). A `Bool` (not a set): the
+    /// reload is wholesale.
+    @ObservationIgnored private var pendingThreadRefreshOnRelease = false
+
+    /// Monotonic token for `loadThreadMessagesAsync` runs. Each call bumps it;
+    /// a completion may apply only if it is newer than the last APPLIED run
+    /// (`lastAppliedThreadGeneration`). Needed because detached-query
+    /// completions are unordered and an empty result now CLEARS
+    /// `threadMessages` — a stale pre-merge empty completing after the
+    /// merge-triggered reload would wipe the bubbles it just populated.
+    /// Compared against last-APPLIED (not last-started) so that when the
+    /// newest run THROWS (transient read error), an older successful result
+    /// still applies instead of being discarded with nothing to replace it.
+    @ObservationIgnored private var threadLoadGeneration = 0
+    /// Generation of the last `loadThreadMessagesAsync` result actually
+    /// assigned to `threadMessages`. See `threadLoadGeneration`.
+    @ObservationIgnored private var lastAppliedThreadGeneration = 0
+
+    /// Bubble ids the user moved IN PLACE via `updateThreadMessageFolder`
+    /// (archive/delete/move keeps the card visible showing its new location
+    /// at ACTION time). The pin window is EXACTLY the move OPERATION's
+    /// lifetime: set when the in-place mutation happens, removed by
+    /// `completeLocalMove` when that op's `enqueueWrite` continuation runs
+    /// (the optimistic local DB write has landed). While pinned, reloads
+    /// carry the local folder fields (and re-append the card if the fresh
+    /// query already excludes it); once un-pinned, the DB is authoritative —
+    /// a trashed card drops as on a fresh open, an undone card heals, a
+    /// UID-re-keyed row appears only under its new id. Two earlier keyings
+    /// were tried and abandoned (ADR-IOS-049 rounds 4–8): view-lifetime
+    /// (permanent duplicates under UID re-key, unhealable undo) and
+    /// overlay-entry lifetime (the overlay coalesces ONE entry per id, so a
+    /// sibling op's drain ended the window early and an undo's own entry
+    /// extended it). A REFCOUNT, not a Set: two OVERLAPPING move ops on the
+    /// SAME bubble (archive, then delete of the still-visible card) each
+    /// pin/un-pin independently — a Set collapsed them, so the first op's
+    /// completion ended the window while the second move was still queued.
+    @ObservationIgnored private var localMovePins: [String: Int] = [:]
 
     /// Provider messageId of a notification tap that hasn't resolved to a
     /// composite header id yet (set iff `init` received the sentinel-prefixed
@@ -86,15 +130,37 @@ final class MessageDetailViewModel {
         seedAtInit()
         startAIUpdateListener()
         startPreviewFreezeReleasedListener()
+        startNSEMergeCommitListener()
     }
 
     /// Test-only init that accepts a DatabasePool override and fetch closure.
     /// Must be set before `loadBody()` accesses `dbPool`.
-    init(messageId: String, dbPool: DatabasePool, fetchBodyOverride: @escaping (MessageHeader) async throws -> Void) {
+    ///
+    /// `observeNotifications` is opt-in (default OFF) so pre-existing
+    /// test-init consumers keep their notification-free behavior: with it on,
+    /// any cross-suite `.nseMergeDidCommit` (NSE merge tests post `object:
+    /// nil` from real merges) would trigger wholesale thread reloads against
+    /// the test's seeded state. Tests exercising the merge-commit / refresh
+    /// paths pass true — the flag registers ALL of the production init's
+    /// listeners (AI-update, freeze-release, merge-commit) because they form
+    /// one contract: a merge-commit buffered while the global gate is frozen
+    /// needs the release listener to replay, and the AI-update listener's
+    /// `applyRefresh` shares the preserve/freeze machinery under test.
+    init(
+        messageId: String,
+        dbPool: DatabasePool,
+        fetchBodyOverride: @escaping (MessageHeader) async throws -> Void,
+        observeNotifications: Bool = false
+    ) {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
         seedAtInit()
+        if observeNotifications {
+            startAIUpdateListener()
+            startPreviewFreezeReleasedListener()
+            startNSEMergeCommitListener()
+        }
     }
 
     /// Zero-I/O init seed, shared by both inits. Handles the two id shapes:
@@ -203,6 +269,7 @@ final class MessageDetailViewModel {
     deinit {
         if let obs = aiUpdateObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = previewFreezeReleasedObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = nseMergeObserver { NotificationCenter.default.removeObserver(obs) }
         bodyPollTask?.cancel()
     }
 
@@ -237,6 +304,47 @@ final class MessageDetailViewModel {
             }
         }
         aiUpdateObserver = obs
+    }
+
+    /// Listen for the NSE merge committing staged rows to GRDB. A quick-rendered
+    /// open (ADR-IOS-049: header/body synthesized from the in-memory staged
+    /// snapshot) ran thread detection BEFORE the merge wrote the header +
+    /// reference-junction rows, so related messages came up empty — they simply
+    /// weren't queryable yet. When the merge lands (phase-1 surface and
+    /// end-of-merge), re-run thread detection so the related-message bubbles
+    /// appear (the focused header is deliberately NOT re-read here — see
+    /// `refreshAfterMergeCommit`). Bounded: at most two posts per merge wake,
+    /// and merges only run on push/foreground/boot.
+    private func startNSEMergeCommitListener() {
+        let obs = NotificationCenter.default.addObserver(
+            forName: .nseMergeDidCommit,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                // Preview freeze: same buffering contract as the
+                // `.messageDataDidChange` observer — replay on release.
+                if PreviewFreezeGate.shared.isFrozen {
+                    self.pendingThreadRefreshOnRelease = true
+                    return
+                }
+                self.refreshAfterMergeCommit()
+            }
+        }
+        nseMergeObserver = obs
+    }
+
+    /// The merge-commit refresh: re-run thread detection against the rows the
+    /// merge just made queryable. Deliberately does NOT re-read the focused
+    /// header: phase-1 writes header-ONLY rows (AI fields nil, ADR-IOS-047),
+    /// so an `applyRefresh` here would REGRESS a staged-synthesized `message`
+    /// that already carries the NSE's summary/action tag — the summary bubble
+    /// would flash back to "Analyzing…" until phase 2 lands. AI-field updates
+    /// reach the open view via the existing `.messageDataDidChange` observer.
+    @MainActor
+    private func refreshAfterMergeCommit() {
+        loadThreadMessagesAsync()
     }
 
     /// Layer the AccountManager optimistic overlay on top of a DB-derived header.
@@ -283,6 +391,13 @@ final class MessageDetailViewModel {
         if updatedId == originalId || updatedId == self.message?.id {
             let rid = self.resolvedId
             if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) }) {
+                // Freeze re-check at the mutation site: a preview can begin
+                // during the awaited read above. Re-buffer instead of mutating
+                // @Observable state under the frozen gate.
+                if PreviewFreezeGate.shared.isFrozen {
+                    self.pendingRefreshIds.insert(updatedId)
+                    return
+                }
                 applyOverlay(to: &updated)
                 self.message = updated
             }
@@ -290,12 +405,48 @@ final class MessageDetailViewModel {
 
         // Update thread message if it matches (fixes "Analyzing..." stuck forever
         // when AI completes after thread detection snapshot was taken)
-        if let idx = self.threadMessages.firstIndex(where: { $0.id == updatedId }) {
+        if self.threadMessages.contains(where: { $0.id == updatedId }) {
             if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: updatedId) }) {
+                if PreviewFreezeGate.shared.isFrozen {
+                    self.pendingRefreshIds.insert(updatedId)
+                    return
+                }
                 applyOverlay(to: &updated)
-                self.threadMessages[idx] = updated
+                // Re-find the index AFTER the awaited read: a merge-commit
+                // wholesale reload (including clear-on-empty) can replace or
+                // shrink `threadMessages` during the suspension — a stale
+                // index would subscript out of bounds or overwrite the wrong
+                // row.
+                if let idx = self.threadMessages.firstIndex(where: { $0.id == updatedId }) {
+                    // Field-level move preserve: AI/display fields always flow
+                    // from the fresh row; local folder fields survive only
+                    // while the move op is in flight (see preservingLocalMove).
+                    self.threadMessages[idx] = self.preservingLocalMove(
+                        fresh: updated, current: self.threadMessages[idx]
+                    )
+                }
             }
         }
+    }
+
+    /// Field-level preserve for a locally-moved thread bubble
+    /// (`localMovePins`). While the move op is in flight (pin present
+    /// — see `completeLocalMove` for the window's exact bounds) the DB row
+    /// still shows the pre-move folder, so the local folder fields
+    /// (`folderPath`/`folderId`/`isInInbox`) are carried onto the fresh row —
+    /// but AI/display fields flow from the DB (a whole-row pin starved pinned
+    /// bubbles of AI updates: "Analyzing…" stuck forever). Un-pinned rows
+    /// pass through untouched: the DB is authoritative once the op executed.
+    private func preservingLocalMove(
+        fresh: MessageHeader,
+        current: MessageHeader
+    ) -> MessageHeader {
+        guard localMovePins[fresh.id] != nil else { return fresh }
+        var merged = fresh
+        merged.folderPath = current.folderPath
+        merged.folderId = current.folderId
+        merged.isInInbox = current.isInInbox
+        return merged
     }
 
     /// Listen for the `PreviewFreezeGate` release signal so any
@@ -310,12 +461,45 @@ final class MessageDetailViewModel {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                // Re-check the SHARED gate before consuming the buffers: a
+                // release post can arrive while the gate is (still or again)
+                // frozen — e.g. a non-shared `PreviewFreezeGate` instance's
+                // `end()` posts the same global notification, or a new preview
+                // begins between the post and this hop. Consuming here would
+                // silently drop the buffered refreshes; leave them for the
+                // next genuine release instead.
+                guard !PreviewFreezeGate.shared.isFrozen else { return }
                 let ids = self.pendingRefreshIds
-                guard !ids.isEmpty else { return }
+                let threadRefresh = self.pendingThreadRefreshOnRelease
+                guard !ids.isEmpty || threadRefresh else { return }
                 self.pendingRefreshIds.removeAll()
-                print("[PreviewFreeze] flushing \(ids.count) buffered .messageDataDidChange ids")
-                for id in ids {
+                self.pendingThreadRefreshOnRelease = false
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[PreviewFreeze] flushing \(ids.count) buffered .messageDataDidChange ids (threadRefresh=\(threadRefresh))")
+                }
+                var remaining = Array(ids)
+                while let id = remaining.popLast() {
+                    // A NEW preview can begin during an awaited applyRefresh —
+                    // re-buffer the unapplied remainder (this id included)
+                    // instead of mutating @Observable state under the
+                    // re-frozen gate; the next release replays it.
+                    if PreviewFreezeGate.shared.isFrozen {
+                        self.pendingRefreshIds.formUnion(remaining + [id])
+                        if threadRefresh { self.pendingThreadRefreshOnRelease = true }
+                        return
+                    }
                     await self.applyRefresh(for: id)
+                }
+                if threadRefresh {
+                    // A preview may have begun during the LAST applyRefresh's
+                    // await — re-buffer instead of launching a thread query
+                    // whose result would only be discarded and re-buffered at
+                    // the mutation site anyway.
+                    if PreviewFreezeGate.shared.isFrozen {
+                        self.pendingThreadRefreshOnRelease = true
+                    } else {
+                        self.refreshAfterMergeCommit()
+                    }
                 }
             }
         }
@@ -755,10 +939,7 @@ final class MessageDetailViewModel {
             accountId: msg.accountId, timestamp: Date()
         ))
         manager.registerMutation(id: msg.id, mutation: .init(folderId: archiveFolder.id))
-        Task { await manager.enqueueWrite { [manager] in
-            await manager.move([msg], to: archiveFolder.path)
-            manager.removeOverlayEntries(ids: [msg.id])
-        }}
+        enqueueMove(msg, to: archiveFolder.path)
         updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
         return true
     }
@@ -786,10 +967,7 @@ final class MessageDetailViewModel {
             accountId: msg.accountId, timestamp: Date()
         ))
         manager.registerMutation(id: msg.id, mutation: .init(folderId: trashFolder.id))
-        Task { await manager.enqueueWrite { [manager] in
-            await manager.move([msg], to: trashFolder.path)
-            manager.removeOverlayEntries(ids: [msg.id])
-        }}
+        enqueueMove(msg, to: trashFolder.path)
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
         return true
     }
@@ -798,12 +976,54 @@ final class MessageDetailViewModel {
     /// The card stays visible but shows the new location. `isInInbox` reflects the
     /// destination: archive/delete move OUT of inbox (false); a generic move may target
     /// the Inbox (true), which must re-enable inbox-only UI (tags, summary, triage).
-    private func updateThreadMessageFolder(_ msg: MessageHeader, newFolderPath: String, newFolderId: String, isInInbox newIsInInbox: Bool = false) {
+    /// Internal (not `private`) so tests can drive the locally-moved-bubble
+    /// preserve contract without a full archive/delete flow (folders + IMAP drain).
+    func updateThreadMessageFolder(_ msg: MessageHeader, newFolderPath: String, newFolderId: String, isInInbox newIsInInbox: Bool = false) {
         guard let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) else { return }
         threadMessages[idx].folderPath = newFolderPath
         threadMessages[idx].folderId = newFolderId
         threadMessages[idx].isInInbox = newIsInInbox
         threadMessages[idx].actionTag = nil
+        localMovePins[msg.id, default: 0] += 1
+    }
+
+    /// The single queued-move protocol shared by archive/delete/move: execute
+    /// the move, drop the (coalesced) overlay entry, then end THIS op's pin
+    /// window — all INSIDE the queued closure. `enqueueWrite` returns at
+    /// ENQUEUE time ("Never blocks caller"), so a continuation after it would
+    /// un-pin before the move has executed (zero-width pin window — the
+    /// round-9 defect, which shipped in three hand-kept copies; one helper
+    /// keeps the protocol in lockstep).
+    private func enqueueMove(_ msg: MessageHeader, to folderPath: String) {
+        let manager = manager
+        Task { await manager.enqueueWrite { [weak self, manager] in
+            await manager.move([msg], to: folderPath)
+            manager.removeOverlayEntries(ids: [msg.id])
+            await self?.completeLocalMove(msg.id)
+        }}
+    }
+
+    /// Ends a bubble move's pin window — called INSIDE the archive/delete/move
+    /// `enqueueWrite` closures once THIS move op has fully executed (the
+    /// optimistic local DB write landed inside `manager.move`). It must NOT be
+    /// called after `enqueueWrite` RETURNS — that is enqueue time ("Never
+    /// blocks caller", AccountManager.enqueueWrite), which makes the pin
+    /// window zero-width. The pin is
+    /// deliberately keyed to the OPERATION's lifetime, NOT to the shared
+    /// overlay entry: `optimisticOverlay` coalesces one `PendingMutation` per
+    /// id and every op's drain calls `removeOverlayEntries(ids:)` on the whole
+    /// entry — so a sibling op draining first (e.g. a mark-read queued before
+    /// the archive) would end an overlay-keyed pin while the move hasn't run
+    /// (card snaps back), and an undo registering its own entry under the same
+    /// id would extend it (stale folder fields clobber the undo).
+    /// Internal (not `private`) so tests can simulate drain completion.
+    func completeLocalMove(_ id: String) {
+        guard let count = localMovePins[id] else { return }
+        if count <= 1 {
+            localMovePins.removeValue(forKey: id)
+        } else {
+            localMovePins[id] = count - 1
+        }
     }
 
     /// True when the given folder path is the account's Inbox (role-based, not name-based).
@@ -828,10 +1048,7 @@ final class MessageDetailViewModel {
             originalFolderPath: msg.folderPath,
             accountId: msg.accountId, timestamp: Date()
         ))
-        Task { await manager.enqueueWrite { [manager] in
-            await manager.move([msg], to: toFolderPath)
-            manager.removeOverlayEntries(ids: [msg.id])
-        }}
+        enqueueMove(msg, to: toFolderPath)
         updateThreadMessageFolder(
             msg, newFolderPath: toFolderPath, newFolderId: destFolderId,
             isInInbox: isInboxFolder(accountId: msg.accountId, path: toFolderPath)
@@ -1117,57 +1334,143 @@ final class MessageDetailViewModel {
     /// Fire-and-forget async thread detection — does not block message rendering.
     private func loadThreadMessagesAsync() {
         guard let msg = message else { return }
-        let refsStr = msg.references.isEmpty ? "[]" : "[\(msg.references.joined(separator: ", "))]"
-        print("[ThreadDebug] Finding related for: id=\(msg.id.prefix(40)) rfc822=\(msg.rfc822MessageId ?? "nil") inReplyTo=\(msg.inReplyTo ?? "nil") threadId=\(msg.threadId ?? "nil") computedThreadId=\(msg.computedThreadId) references=\(refsStr) folder=\(msg.folderPath)")
+        threadLoadGeneration += 1
+        let generation = threadLoadGeneration
+        if DebugModeManager.isLoggingEnabled() {
+            let refsStr = msg.references.isEmpty ? "[]" : "[\(msg.references.joined(separator: ", "))]"
+            print("[ThreadDebug] Finding related for: id=\(msg.id.prefix(40)) rfc822=\(msg.rfc822MessageId ?? "nil") inReplyTo=\(msg.inReplyTo ?? "nil") threadId=\(msg.threadId ?? "nil") computedThreadId=\(msg.computedThreadId) references=\(refsStr) folder=\(msg.folderPath)")
+        }
         let pool = dbPool
         Task {
             // Probe the DB for *any* messages that could plausibly be thread-related,
-            // to distinguish "no candidates exist" from "candidates exist but chain lookup missed them".
-            do {
-                try await Task.detached {
-                    try pool.read { db in
-                        // 1. Same subject-based threadId (other messages that would group by subject)
-                        if let tid = msg.threadId, !tid.isEmpty {
-                            let sameTid = try MessageHeader
-                                .filter(Column("threadId") == tid && Column("id") != msg.id)
-                                .fetchAll(db)
-                            print("[ThreadDebug]   probe sameThreadId(\(tid.prefix(60))...) count=\(sameTid.count)")
-                            for r in sameTid.prefix(5) {
-                                let rRefs = r.references.isEmpty ? "[]" : "[\(r.references.joined(separator: ", "))]"
-                                print("[ThreadDebug]     sameTid: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil") ctid=\(r.computedThreadId) references=\(rRefs)")
+            // to distinguish "no candidates exist" from "candidates exist but chain
+            // lookup missed them". Debug-gated: the probe exists ONLY to feed the
+            // [ThreadDebug] prints and runs two unbounded fetchAll scans — with
+            // `.nseMergeDidCommit` now re-running this per merge post, production
+            // must not pay that cost for discarded output.
+            if DebugModeManager.isLoggingEnabled() {
+                do {
+                    try await Task.detached {
+                        try pool.read { db in
+                            // 1. Same subject-based threadId (other messages that would group by subject)
+                            if let tid = msg.threadId, !tid.isEmpty {
+                                let sameTid = try MessageHeader
+                                    .filter(Column("threadId") == tid && Column("id") != msg.id)
+                                    .fetchAll(db)
+                                print("[ThreadDebug]   probe sameThreadId(\(tid.prefix(60))...) count=\(sameTid.count)")
+                                for r in sameTid.prefix(5) {
+                                    let rRefs = r.references.isEmpty ? "[]" : "[\(r.references.joined(separator: ", "))]"
+                                    print("[ThreadDebug]     sameTid: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil") ctid=\(r.computedThreadId) references=\(rRefs)")
+                                }
+                            }
+                            // 2. Same computedThreadId (the actual grouping key used by the inbox)
+                            if !msg.computedThreadId.isEmpty {
+                                let sameCtid = try MessageHeader
+                                    .filter(Column("computedThreadId") == msg.computedThreadId && Column("id") != msg.id)
+                                    .fetchAll(db)
+                                print("[ThreadDebug]   probe sameComputedThreadId(\(msg.computedThreadId.prefix(60))) count=\(sameCtid.count)")
+                                for r in sameCtid.prefix(5) {
+                                    print("[ThreadDebug]     sameCtid: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil")")
+                                }
                             }
                         }
-                        // 2. Same computedThreadId (the actual grouping key used by the inbox)
-                        if !msg.computedThreadId.isEmpty {
-                            let sameCtid = try MessageHeader
-                                .filter(Column("computedThreadId") == msg.computedThreadId && Column("id") != msg.id)
-                                .fetchAll(db)
-                            print("[ThreadDebug]   probe sameComputedThreadId(\(msg.computedThreadId.prefix(60))) count=\(sameCtid.count)")
-                            for r in sameCtid.prefix(5) {
-                                print("[ThreadDebug]     sameCtid: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil")")
-                            }
-                        }
-                    }
-                }.value
-            } catch {
-                print("[ThreadDebug] probe failed: \(error)")
+                    }.value
+                } catch {
+                    print("[ThreadDebug] probe failed: \(error)")
+                }
             }
             do {
                 let results = try await Task.detached {
                     try ThreadDetection.findRelatedMessages(for: msg, in: pool.pool)
                 }.value
-                print("[ThreadDebug] Found \(results.count) related messages for \(msg.id.prefix(40))")
-                for r in results {
-                    print("[ThreadDebug]   related: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil") folder=\(r.folderPath)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ThreadDebug] Found \(results.count) related messages for \(msg.id.prefix(40))")
+                    for r in results {
+                        print("[ThreadDebug]   related: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil") folder=\(r.folderPath)")
+                    }
                 }
-                if !results.isEmpty {
-                    var overlayed = results
-                    self.applyOverlay(to: &overlayed)
-                    self.threadMessages = overlayed
-                    self.recomputeThreadSplit()
+                // Ordering guard: apply only if newer than the last APPLIED
+                // run. Detached completions are unordered, and clear-on-empty
+                // (below) made ordering destructive — a stale pre-merge empty
+                // result completing after the merge-triggered reload would
+                // wipe the bubbles it just populated, with no further signal
+                // to heal. Compared against last-APPLIED (not last-started):
+                // if the newest run throws, an older successful result still
+                // applies rather than being discarded for nothing.
+                guard generation > self.lastAppliedThreadGeneration else { return }
+                // Empty→empty is a no-op for DISPLAY — but still record the
+                // generation: this run successfully observed "no related
+                // messages", and a STALE older in-flight run with a
+                // pre-removal non-empty snapshot must not pass the guard
+                // afterwards and resurrect bubbles for deleted messages.
+                if results.isEmpty && self.threadMessages.isEmpty {
+                    self.lastAppliedThreadGeneration = generation
+                    return
                 }
+                // Freeze re-check at the MUTATION site: the detached thread
+                // query can outlast a QuickLook preview appearing, and the
+                // caller's entry check cannot see a freeze that began during
+                // the await. Discard these results and buffer a wholesale
+                // reload for the release flush.
+                if PreviewFreezeGate.shared.isFrozen {
+                    self.pendingThreadRefreshOnRelease = true
+                    return
+                }
+                // Remote state wins for CONTENT: an EMPTY result CLEARS stale
+                // bubbles (e.g. an end-of-merge `.nseMergeDidCommit` after
+                // inbox removals deleted every related member). In-flight
+                // optimistic mutations survive via applyOverlay (display
+                // fields) plus the FIELD-LEVEL move preserve for locally-moved
+                // bubbles — folder fields are deliberately NOT in applyOverlay;
+                // see preservingLocalMove for the full contract (the pin ends
+                // when the move op's queued closure runs completeLocalMove).
+                var overlayed = results
+                self.applyOverlay(to: &overlayed)
+                // The pin window is the move OP's lifetime (completeLocalMove
+                // removes it when the op's continuation runs) — no overlay-
+                // based pruning here: the overlay coalesces one entry per id,
+                // so a sibling op's drain would end the window early and an
+                // undo's own entry would extend it (ADR-IOS-049 round-8).
+                if !self.localMovePins.isEmpty {
+                    for i in overlayed.indices where self.localMovePins[overlayed[i].id] != nil {
+                        if let current = self.threadMessages.first(where: { $0.id == overlayed[i].id }) {
+                            overlayed[i] = self.preservingLocalMove(
+                                fresh: overlayed[i], current: current
+                            )
+                        }
+                    }
+                    // An IN-FLIGHT moved bubble may already be EXCLUDED from
+                    // fresh results (the optimistic local write can land the
+                    // row in Trash before the op's continuation un-pins) —
+                    // re-append its current in-memory row so the card doesn't
+                    // flicker out mid-drain. Post-completion reloads (pin
+                    // removed) follow fresh results: a trashed card drops,
+                    // same as a fresh open of this view would show.
+                    for id in self.localMovePins.keys where !overlayed.contains(where: { $0.id == id }) {
+                        if let current = self.threadMessages.first(where: { $0.id == id }) {
+                            overlayed.append(current)
+                        }
+                    }
+                }
+                // No-op guard: an UNRELATED merge re-runs this reload but
+                // ThreadDetection returns the same set, so reassigning the
+                // @Observable array + recomputing the splits would invalidate
+                // the thread view for nothing (merges fire 2 posts on every
+                // push/foreground/boot). Full-value equality — never a field
+                // subset, which could silently drop a real thread update.
+                // Still record the generation so a later stale run can't apply
+                // over this confirmed-current set.
+                guard overlayed != self.threadMessages else {
+                    self.lastAppliedThreadGeneration = generation
+                    return
+                }
+                self.threadMessages = overlayed
+                self.recomputeThreadSplit()
+                self.lastAppliedThreadGeneration = generation
             } catch {
-                print("[ThreadDebug] Failed to load thread messages: \(error)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ThreadDebug] Failed to load thread messages: \(error)")
+                }
             }
         }
     }

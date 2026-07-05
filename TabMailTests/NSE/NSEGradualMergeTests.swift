@@ -375,6 +375,45 @@ struct NSEGradualMergeTests {
         #expect(captured.allSatisfy { $0 == true })
     }
 
+    @Test("Merge posts .nseMergeDidCommit at phase-1 surface and end-of-merge; none on an empty re-merge")
+    @MainActor func mergePostsMergeCommitSignal() async throws {
+        let (dir, _, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        try stageAIRow(q, action: "archive")
+
+        let posts = Mutex<Int>(0)
+        let obs = NotificationCenter.default.addObserver(
+            forName: .nseMergeDidCommit, object: nil, queue: .main
+        ) { note in
+            // Production posts carry `object: nil`; detail-VM tests in a
+            // concurrently-running suite post with a sentinel object — exclude
+            // those so this count contract can't flake cross-suite.
+            guard note.object == nil else { return }
+            posts.withLock { $0 += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        // Mirrors the two-render contract of `.inboxDataDidChange`: one when
+        // phase 1 makes headers + reference junctions queryable (the open
+        // detail view can re-run thread detection NOW), one at end-of-merge.
+        #expect(posts.withLock { $0 } == 2)
+
+        // The terminal row was deleted from staging — an empty re-merge commits
+        // nothing and must not fire the signal (no redundant thread re-runs).
+        posts.withLock { $0 = 0 }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0 } == 0)
+    }
+
     @Test("Re-merge with nothing new emits NO extra inboxDataDidChange (no redundant reload)")
     @MainActor func reMergeWithoutChangesEmitsNoSignal() async throws {
         let (dir, _, previous) = try makeAppDatabase()
