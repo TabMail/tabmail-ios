@@ -116,6 +116,13 @@ final class InboxViewModel {
     /// after it (see `runReloadCoalesced`).
     private var isReloadingMessages: Bool = false
     private var reloadRequestedAgain: Bool = false
+    /// DIAGNOSTIC (debug-gated, emitted via `BootProfiler`): CFAbsoluteTime of the
+    /// FIRST `.inboxDataDidChange` that armed the current throttled reload cycle.
+    /// Lets `reloadMessages` emit the end-to-end "change signal → inbox repainted"
+    /// latency (500ms debounce + merge-gated async read + paint) — the
+    /// user-perceived unread-bubble / new-arrival lag. Reset to nil once the
+    /// cycle's first reload logs it.
+    private var firstDirtySignalAt: Double?
     @ObservationIgnored nonisolated(unsafe) private var backgroundChangeObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var aiUpdateObserver: NSObjectProtocol?
     @ObservationIgnored private var folderObservationCancellable: AnyCancellable?
@@ -435,6 +442,9 @@ final class InboxViewModel {
                 // sleep OR during reloadMessages triggers a follow-up reload.
                 self.backgroundChangeDirty = true
                 if self.backgroundChangeTask == nil {
+                    // DIAGNOSTIC: stamp the first signal of this reload cycle so the
+                    // reload can emit the end-to-end perceived repaint latency below.
+                    if self.firstDirtySignalAt == nil { self.firstDirtySignalAt = CFAbsoluteTimeGetCurrent() }
                     self.backgroundChangeTask = Task { @MainActor [weak self] in
                         while let self, self.backgroundChangeDirty {
                             try? await Task.sleep(for: .milliseconds(500))
@@ -820,9 +830,27 @@ final class InboxViewModel {
         // Snapshot overlay BEFORE DB read — ensures correct timing for all cases.
         let overlay = manager.snapshotOverlay()
 
+        // REPAINT DECOUPLING: kick the read-through NSE merge OFF the repaint critical
+        // path (non-awaited). The reload's read below now uses `rawPool` (no inline
+        // merge), so the unread-bubble / new-arrival repaint no longer blocks on a
+        // multi-second merge. Draining is preserved: `mergeIfStagingPending` self-skips
+        // when nothing is staged (~µs, coalesced/signature-gated), and on a real mutation
+        // it posts `.inboxDataDidChange` → a reconcile reload picks up the durable rows.
+        Task { await NSEDataBridge.mergeIfStagingPending() }
+
         // Fetch fresh data off MainActor — async GRDB read suspends (not blocks) the main thread.
         // This prevents UI hangs when heavy sync writes trigger WAL auto-checkpoint.
+        // DIAGNOSTIC: time the async read. Now reads `rawPool` (merge kicked off-path
+        // above), so this should be FAST even while a multi-second merge runs
+        // concurrently — the same-timeline before/after proof that the merge was the
+        // bubble-lag cause. If this mark still fires ≥250ms post-fix, the READ itself
+        // (not the merge) is slow — a distinct signal worth chasing.
+        let tFetch = CFAbsoluteTimeGetCurrent()
         var freshMessages = await fetchFullRange()
+        let fetchMs = Int((CFAbsoluteTimeGetCurrent() - tFetch) * 1000)
+        if fetchMs >= 250 {
+            BootProfiler.mark("[\(instanceTag)] reloadMessages async fetch (rawPool, merge OFF critical path) \(fetchMs)ms fresh=\(freshMessages.count)")
+        }
 
         // Apply optimistic overlay on top of DB results
         let folderIds = Set(folders.map(\.id))
@@ -916,6 +944,18 @@ final class InboxViewModel {
         rebuildDisplayGroups()
         let rebuildMs = Int((CFAbsoluteTimeGetCurrent() - tRebuild) * 1000)
         requeueVisibleSnippets()
+        // DIAGNOSTIC: end-to-end perceived latency — first `.inboxDataDidChange` of
+        // this throttled cycle → inbox now repainted (500ms debounce + the
+        // merge-gated async read timed as `fetchMs` above + paint). This is the
+        // user-visible unread-bubble / new-arrival lag. Only the throttled path
+        // stamps `firstDirtySignalAt`; the immediate NSE-merge and appear paths skip it.
+        if let firstSignal = firstDirtySignalAt {
+            firstDirtySignalAt = nil
+            let e2eMs = Int((CFAbsoluteTimeGetCurrent() - firstSignal) * 1000)
+            if e2eMs >= 300 {
+                BootProfiler.mark("[\(instanceTag)] inbox repaint latency \(e2eMs)ms since first change signal (debounce+fetch+paint) fetch=\(fetchMs)ms rebuild=\(rebuildMs)ms")
+            }
+        }
         if diffMs + rebuildMs >= 50 {
             BackgroundSyncLogger.logInbox("[\(instanceTag)] reloadMessages MainActor-sync cost: applyDiff=\(diffMs)ms rebuildGroups=\(rebuildMs)ms (fresh=\(freshMessages.count), loaded=\(loadedMessages.count))")
             // Boot-log mirror for stall-window correlation.
@@ -998,7 +1038,16 @@ final class InboxViewModel {
 
         var allResults: [MessageSnapshot] = []
         do {
-            allResults = try await dbPool.read { db in
+            // REPAINT DECOUPLING (2026-07-06): read `rawPool`, NOT `dbPool`. The async
+            // `dbPool.read` overload AWAITS the read-through NSE merge first
+            // (PriorityGate.read → mergeIfStagingPending), whose phase-1 header upsert is
+            // routinely multi-second under WAL/lock pressure (boot_logs 9: mean 3s, up to
+            // 27.8s) — that was the multi-second unread-bubble / new-arrival lag. The merge
+            // is now kicked OFF this critical path in `reloadMessages`; just-arrived mail is
+            // already shown via the in-memory `.messagesStaged` staged-rows path, and the
+            // merge's post-commit `.inboxDataDidChange` drives a reconcile reload for durable
+            // rows. Mirrors `flushAIBatch`'s deliberate rawPool read.
+            allResults = try await AppDatabase.rawPool.read { db in
                 var allHeaders: [MessageHeader] = []
                 for folder in foldersCopy {
                     let fid = folder.id
