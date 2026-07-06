@@ -239,6 +239,162 @@ struct MessageDetailStagedFallbackTests {
     }
 
     @MainActor
+    @Test("merge-commit adopts a newly-durable body — no 2s poll wait (boot_logs 8)")
+    func mergeCommitAdoptsNewlyDurableBody() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Notification-tap open: header synthesized from the staged snapshot (so
+        // the detail view renders a card) but the BODY is neither durable yet NOR
+        // in the staged-body snapshot — the exact merge-timing race where
+        // `startBodyPoll`'s entry fast-paths BOTH miss and the body would
+        // otherwise strand on the 2s poll cadence (~2.6s open-lag, boot_logs 8).
+        let row = stagedRow(messageId: "m-mergebody")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        try insertDurableHeader(row.toMessageHeader(), into: pool)
+
+        let vm = MessageDetailViewModel(
+            messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: true
+        )
+        #expect(vm.message != nil)
+        #expect(vm.messageBody == nil)
+
+        // The merge writes the body durable, THEN posts the end-of-merge signal
+        // (production order: MessageBody insert → main tx commit → .nseMergeDidCommit).
+        try await pool.write { db in
+            try MessageBody(headerId: row.headerId, htmlContent: "<p>durable merge body</p>").insert(db)
+        }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+
+        // Event-driven: the body appears WELL under the 2s poll floor. Without
+        // the catch-up it stays nil (nothing drives a body read — startBodyPoll
+        // is not running in this open), so this assertion pins the fix.
+        try await waitUntil { vm.messageBody != nil }
+        #expect(vm.messageBody?.htmlContent == "<p>durable merge body</p>")
+        #expect(vm.isLoading == false)
+    }
+
+    @MainActor
+    @Test("adoptReadyBody bails during pull-to-refresh — no mid-refresh clobber")
+    func adoptReadyBodyBailsDuringRefetch() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Durable body present (or a concurrent merge just re-committed it), but
+        // refetchBody() deleted the row + set messageBody=nil for its refresh
+        // window and is awaiting a fresh server fetch: a .nseMergeDidCommit / poll
+        // driven adopt must NOT flash the stale body back mid-refresh.
+        let row = stagedRow(messageId: "m-refetch-guard")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        try insertDurableHeader(row.toMessageHeader(), into: pool)
+        try await pool.write { db in
+            try MessageBody(headerId: row.headerId, htmlContent: "<p>durable body</p>").insert(db)
+        }
+        let vm = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
+        #expect(vm.messageBody == nil)
+
+        vm.isRefetchingBody = true
+        let adoptedDuringRefresh = await vm.adoptReadyBody(source: "test")
+        #expect(adoptedDuringRefresh == false)
+        #expect(vm.messageBody == nil)
+
+        // Window closes → the same call now adopts.
+        vm.isRefetchingBody = false
+        let adoptedAfter = await vm.adoptReadyBody(source: "test")
+        #expect(adoptedAfter == true)
+        #expect(vm.messageBody?.htmlContent == "<p>durable body</p>")
+    }
+
+    @MainActor
+    @Test("adoptReadyBody(allowStagedFallback: false) ignores staged bytes — poll falls through to persist")
+    func adoptReadyBodyDurableOnlyIgnoresStaged() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Header durable, body ONLY in the staged snapshot (no durable MessageBody).
+        let row = stagedRow(messageId: "m-durable-only")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        try insertDurableHeader(row.toMessageHeader(), into: pool)
+        NSEDataBridge.latestStagedBodies.withLock {
+            $0 = [row.headerId: NSEDataBridge.StagedBodySnapshot(
+                htmlContent: "<p>staged only</p>", attachmentsJSON: nil, icsText: nil
+            )]
+        }
+        let vm = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
+        #expect(vm.messageBody == nil)
+
+        // Durable-only (the 2s poll loop's mode): staged bytes are IGNORED so the
+        // caller falls through to its persisting server fetch (round-3 audit).
+        let adoptedDurableOnly = await vm.adoptReadyBody(source: "test", allowStagedFallback: false)
+        #expect(adoptedDurableOnly == false)
+        #expect(vm.messageBody == nil)
+
+        // Default (entry / merge-commit mode): staged bytes ARE adopted for instant display.
+        let adoptedWithStaged = await vm.adoptReadyBody(source: "test")
+        #expect(adoptedWithStaged == true)
+        #expect(vm.messageBody?.htmlContent == "<p>staged only</p>")
+    }
+
+    @MainActor
+    @Test("merge-commit catch-up is durable-only — a staged-only body does NOT end the poll early")
+    func mergeCommitCatchUpIgnoresStagedOnly() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Header durable, body ONLY staged (phase-1 committed the header but the
+        // phase-2 durable body write hasn't landed). The phase-1 .nseMergeDidCommit
+        // fires here — the catch-up must NOT adopt the display-only staged bytes
+        // (round-4: that would end the persisting poll before a durable body exists).
+        let row = stagedRow(messageId: "m-mergecatchup-staged")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        try insertDurableHeader(row.toMessageHeader(), into: pool)
+        NSEDataBridge.latestStagedBodies.withLock {
+            $0 = [row.headerId: NSEDataBridge.StagedBodySnapshot(
+                htmlContent: "<p>staged only</p>", attachmentsJSON: nil, icsText: nil
+            )]
+        }
+        let vm = MessageDetailViewModel(
+            messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: true
+        )
+        #expect(vm.messageBody == nil)
+
+        // Phase-1-style post: body only staged, not durable → the durable-only
+        // catch-up must IGNORE it.
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        // The body then becomes durable and an end-of-merge-style post fires.
+        try await pool.write { db in
+            try MessageBody(headerId: row.headerId, htmlContent: "<p>durable now</p>").insert(db)
+        }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+
+        // Robust check (no fragile fixed-sleep negative): the catch-up adopts the
+        // DURABLE body. Had it wrongly adopted the staged bytes on the FIRST post,
+        // messageBody would be "<p>staged only</p>" (and the second post's
+        // `if messageBody == nil` would never re-fire) — so asserting the DURABLE
+        // content catches that regression even under CI load.
+        try await waitUntil { vm.messageBody != nil }
+        #expect(vm.messageBody?.htmlContent == "<p>durable now</p>")
+    }
+
+    @MainActor
     @Test("merge-commit during preview freeze buffers and replays on release — refresh never dropped")
     func mergeCommitBuffersDuringPreviewFreeze() async throws {
         let (pool, dir, previous) = try makePool()

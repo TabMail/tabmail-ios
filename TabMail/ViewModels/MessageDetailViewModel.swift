@@ -54,6 +54,15 @@ final class MessageDetailViewModel {
     /// (e.g., lock contention caused a timeout, but a later retry wrote the body).
     	@ObservationIgnored nonisolated(unsafe) private var bodyPollTask: Task<Void, Never>?
 
+    /// True while `refetchBody` (pull-to-refresh) is in flight: it deliberately
+    /// deletes the durable body + sets `messageBody = nil` to show "Loading…"
+    /// until its own fresh server fetch lands. Any OTHER `messageBody == nil`
+    /// consumer (`adoptReadyBody`, driven by `.nseMergeDidCommit` or the poll
+    /// entry) MUST NOT re-adopt a durable/staged body during that window — doing
+    /// so flashes the stale body back and clears the spinner mid-refresh,
+    /// defeating the user's explicit refresh. Internal for the guard's unit test.
+    @ObservationIgnored var isRefetchingBody = false
+
     /// Message IDs whose `.messageDataDidChange` notifications arrived while the
     /// global `PreviewFreezeGate` was active. `Set` coalesces duplicate ids so a
     /// burst of notifications during a preview replays as one refresh per id.
@@ -344,6 +353,32 @@ final class MessageDetailViewModel {
     /// reach the open view via the existing `.messageDataDidChange` observer.
     @MainActor
     private func refreshAfterMergeCommit() {
+        // Body catch-up (boot_logs 8, 2026-07-05): a notification-tap open whose
+        // loadBody got cancelled defers body-load to `startBodyPoll`, whose entry
+        // fast-paths (durable read + staged snapshot) can BOTH miss when a FAST
+        // merge writes the body and drains staging in the narrow window between
+        // the poll's entry check and the body commit — stranding the body on the
+        // fixed 2s poll cadence (measured ~2.6s open-lag: body durable at +…960ms
+        // but not shown until the +…989ms poll tick). This end-of-merge signal
+        // fires the instant the merge makes the body durable, so adopt it NOW,
+        // event-driven. Body-only (never the header — see this method's doc
+        // above): a nil → content transition is additive and cannot regress the
+        // staged-synthesized AI fields. `adoptReadyBody` owns the adoption
+        // invariants at its post-await mutation site (body still missing, not mid
+        // pull-to-refresh) and re-runs no thread detection — the tail
+        // `loadThreadMessagesAsync()` below is the SINGLE scan for this post.
+        // DURABLE-ONLY (allowStagedFallback: false, round-4 audit): this fires at
+        // BOTH the phase-1 and end-of-merge posts, and phase-1 precedes the phase-2
+        // body write — adopting display-only STAGED bytes there would end the
+        // still-running persisting poll on a body that isn't durable yet (no
+        // hasBody/FTS/AI if phase-2 then fails). Adopt only once the body is
+        // durable; the end-of-merge post (or the poll) covers it.
+        if messageBody == nil {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.adoptReadyBody(source: "merge-commit catch-up", allowStagedFallback: false)
+            }
+        }
         loadThreadMessagesAsync()
     }
 
@@ -506,6 +541,62 @@ final class MessageDetailViewModel {
         previewFreezeReleasedObserver = obs
     }
 
+    /// One-shot, display-only body adoption from already-available bytes: the
+    /// durable `MessageBody` in GRDB, or (on a durable miss) the NSE staged
+    /// snapshot. Pure reads — NO server fetch, so it never competes for the IMAP
+    /// connection (the risky retry stays on `startBodyPoll`'s 2s cadence).
+    /// Body-only: it NEVER touches `self.message`, so it cannot regress a
+    /// staged-synthesized header's AI fields (the invariant `refreshAfterMergeCommit`
+    /// relies on). Adoption is decided at the MUTATION SITE (`adopt`), AFTER the
+    /// awaited read — the caller's pre-await guard is stale by then (a pull-to-
+    /// refresh can start, or another path can set the body, during the
+    /// suspension). Does NOT re-run thread detection — the caller
+    /// owns that, so a merge-commit that also refreshes the thread doesn't scan
+    /// twice. Returns true iff a body was adopted. Shared by `startBodyPoll`'s
+    /// entry check and the `.nseMergeDidCommit` catch-up; `source` labels the
+    /// boot-timeline mark so the two entry points stay distinguishable.
+    /// `allowStagedFallback` (default true) controls the durable-miss branch:
+    /// the entry / merge-commit callers want the in-memory staged bytes for an
+    /// instant DISPLAY (the merge that staged them persists the durable row in
+    /// phase 2). The 2s POLL loop passes `false` — a staged adoption is
+    /// display-only and would END the poll before its server-fetch branch (the
+    /// only path that PERSISTS a durable MessageBody), so a durable miss must
+    /// fall through to that fetch, leaving hasBody/FTS/AI intact (round-3 audit).
+    @MainActor
+    @discardableResult
+    func adoptReadyBody(source: String, allowStagedFallback: Bool = true) async -> Bool {
+        let rid = resolvedId
+        if let body = try? await dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
+            return adopt(body, source: source, rid: rid, mark: "detail body via \(source)")
+        }
+        if allowStagedFallback, let stagedBody = NSEDataBridge.stagedBodyFallback(headerId: rid) {
+            return adopt(stagedBody, source: source, rid: rid, mark: "detail body from STAGED snapshot (\(source))")
+        }
+        return false
+    }
+
+    /// Mutation-site adoption: re-verify the invariants that `adoptReadyBody`'s
+    /// awaited read may have invalidated, then adopt for display. Bails (false,
+    /// no mutation) if the body already landed via another path, or a pull-to-
+    /// refresh is in flight (it owns the body until its fresh fetch lands). No
+    /// `PreviewFreezeGate` check: adoption's `messageBody == nil` precondition
+    /// means no body is rendered in this view, so no attachment preview can be
+    /// on screen to have frozen the gate (round-2 audit — the freeze re-check
+    /// added in round 1 guarded an unreachable state; the merge-commit path is
+    /// additionally freeze-gated at the `.nseMergeDidCommit` observer).
+    @MainActor
+    private func adopt(_ body: MessageBody, source: String, rid: String, mark: String) -> Bool {
+        guard messageBody == nil, !isRefetchingBody else { return false }
+        messageBody = body
+        isLoading = false
+        error = nil
+        BootProfiler.mark("\(mark) \(rid.prefix(24))")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[MessageDetail] Body adopted (\(source)) for \(rid.prefix(40))")
+        }
+        return true
+    }
+
     /// Poll for MessageBody while body is missing. First checks DB (catches cases
     /// where a background path wrote the body), then re-attempts a server fetch.
     /// Primary scenario: app resumed from background with stale IMAP connection —
@@ -528,25 +619,12 @@ final class MessageDetailViewModel {
             // present. Pure DB read — NO server fetch, so it doesn't compete for the
             // IMAP connection (the risky retry path stays on the 2s cadence below).
             if let self, self.messageBody == nil {
-                let rid = self.resolvedId
-                if let body = try? await self.dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
-                    self.messageBody = body
-                    self.isLoading = false
-                    self.error = nil
-                    self.loadThreadMessagesAsync()
-                    print("[MessageDetail] Body found immediately on poll start for \(rid.prefix(40))")
-                    BootProfiler.mark("detail body via poll IMMEDIATE check \(rid.prefix(24))")
-                    return
-                }
-                // Staged-body fast-path (ADR-IOS-049): loadBody got cancelled by
-                // the deep-link reload/navigation churn and deferred here — the
-                // body may be sitting in NSE staging, not yet durable. Same
-                // display-only synthesis as loadBody's fast-path.
-                if let stagedBody = NSEDataBridge.stagedBodyFallback(headerId: rid) {
-                    BootProfiler.mark("detail body from STAGED snapshot (poll entry) \(rid.prefix(24))")
-                    self.messageBody = stagedBody
-                    self.isLoading = false
-                    self.error = nil
+                // Entry fast-path (shared with the `.nseMergeDidCommit` catch-up):
+                // the deep-link's own NSE merge usually wrote the body (durable or
+                // still-staged, ADR-IOS-049) before loadBody's task got cancelled
+                // by the inbox-reload/nav churn and deferred here — adopt it NOW
+                // instead of waiting on the first 2s tick.
+                if await self.adoptReadyBody(source: "poll IMMEDIATE check") {
                     self.loadThreadMessagesAsync()
                     return
                 }
@@ -556,30 +634,65 @@ final class MessageDetailViewModel {
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self else { return }
                 guard self.messageBody == nil else { return }
+                // Pull-to-refresh (refetchBody) owns the body for its window — it
+                // deletes the durable row, nils messageBody, and runs its OWN fetch.
+                // Skip this whole tick so the poll neither adopts/flashes a body nor
+                // competes with refetch's IMAP fetch, and STAY ALIVE to resume next
+                // tick. The poll is NOT cancelled, so it needs no restart (rounds
+                // 2-5: cancelling+restarting resurrected stale staged bytes and
+                // dropped the retry on the not-found early return; skipping ticks is
+                // the simple provably-correct version).
+                guard !self.isRefetchingBody else { continue }
                 let rid = self.resolvedId
-                // 1. Check if body appeared in DB (written by another path)
-                if let body = try? await self.dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
-                    self.messageBody = body
-                    self.isLoading = false
-                    self.error = nil
+                // 1. Body appeared in DB (written by another path) — adopt via the
+                // shared mutation-site helper. DURABLE-ONLY (allowStagedFallback:
+                // false): a staged adoption is display-only and would end the poll
+                // before the persisting server fetch below (round-3 audit) — a
+                // durable miss must fall through so hasBody/FTS/AI get a real body.
+                if await self.adoptReadyBody(source: "poll (DB, 2s cadence)", allowStagedFallback: false) {
                     self.loadThreadMessagesAsync()
-                    print("[MessageDetail] Body found via poll for \(rid.prefix(40))")
-                    BootProfiler.mark("detail body via poll (DB, 2s cadence) \(rid.prefix(24))")
                     return
                 }
+                // `adoptReadyBody` returns false EITHER on a durable miss OR because
+                // `adopt` bailed on a concurrent set (e.g. the merge-commit catch-up
+                // won the durable read during step-1's await). Only the former should
+                // fall through to the server fetch — re-check so a body that already
+                // landed doesn't trigger a redundant IMAP round-trip on the serial
+                // folder lock (round-6 audit).
+                guard self.messageBody == nil else { return }
+                // The loop-top `!isRefetchingBody` (above) goes STALE across step-1's
+                // await: a pull-to-refresh that began during that read now owns the
+                // body and is running its OWN fetch. Re-check before starting ours so
+                // we don't compete on the serial folder connection lock ("cannot
+                // connect", cf. loadBody). `continue` (not `return`) keeps the poll
+                // alive to resume after the refresh (round-7 audit). Residual: a
+                // refresh that begins DURING the fetch below still competes for one
+                // round-trip (`manager.fetchBody` is not cancellable); the post-fetch
+                // mutation-site guard skips our write and the loop-top guard blocks
+                // every subsequent tick.
+                guard !self.isRefetchingBody else { continue }
                 // 2. Re-attempt server fetch (connection may have recovered)
                 guard let msg = self.message else { continue }
                 fetchAttempt += 1
                 print("[MessageDetail] Poll fetch attempt \(fetchAttempt) for \(rid.prefix(40))")
                 do {
                     try await self.manager.fetchBody(for: msg)
-                    // Fetch succeeded — read from DB
-                    if let body = try? await self.dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
-                        self.messageBody = body
+                    // Read BOTH the fetched body AND the refreshed header, THEN gate
+                    // on a single mutation-site `!isRefetchingBody` and write
+                    // SYNCHRONOUSLY — there is no `await` between the guard and the
+                    // `return`, so a concurrent pull-to-refresh cannot interleave to
+                    // clobber the body or blank the header (round-4/5 audit: guarding
+                    // BEFORE the reads left a window; a refresh that begins during the
+                    // fetch/reads bails us to `continue`, poll stays alive).
+                    let freshBody = try? await self.dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) })
+                    let freshHeader = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
+                    guard !self.isRefetchingBody else { continue }
+                    if let freshBody {
+                        self.messageBody = freshBody
                         self.isLoading = false
                         self.error = nil
-                        // Refetch header (AI processing may have updated it)
-                        if var refreshed = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) }) {
+                        // Header refresh (AI processing may have updated it)
+                        if var refreshed = freshHeader {
                             self.applyOverlay(to: &refreshed)
                             self.message = refreshed
                         } else {
@@ -788,6 +901,14 @@ final class MessageDetailViewModel {
     }
 
     func refetchBody() async {
+        // Guard the whole refresh window: from the durable-row delete + in-memory
+        // `messageBody = nil` below until the fresh fetch lands, a concurrent
+        // `.nseMergeDidCommit` catch-up must NOT re-adopt a body (`adopt`), and a
+        // running `startBodyPoll` skips its ticks (loop-top `!isRefetchingBody`
+        // guard) — so the poll stays alive and resumes after, no cancel/restart
+        // needed (rounds 2-5). `defer` covers every exit, incl. the not-found path.
+        isRefetchingBody = true
+        defer { isRefetchingBody = false }
         let rid = resolvedId
         print("[Refetch] Starting refetchBody for rid=\(rid.prefix(40))")
         // Delete existing body and reset body-fetch state. Pull-to-refresh is the
