@@ -4,6 +4,7 @@
 
 import Foundation
 import os
+import Darwin
 
 /// Priority tier for database WRITE scheduling. The single GRDB writer drains
 /// the highest-priority non-empty tier first, so foreground work jumps ahead of
@@ -89,9 +90,17 @@ actor DatabaseWriteQueue {
         // so this excludes queue-wait). A `.priority` write waits ≤ ONE in-flight
         // execution, so the longest exec here is the residual cap on merge latency.
         let execStart = CFAbsoluteTimeGetCurrent()
+        // STALL ATTRIBUTION (debug-gated): sample process CPU + sleep-excluding
+        // uptime at write START so `markExec` can split a long wall time into
+        // computing vs blocked vs device-asleep — the "why does a 3-row merge.phase1
+        // upsert take multiple seconds" question (boot_logs 9). Zero cost when debug
+        // logging is locked (production default): one gate check, no syscalls.
+        let measure = DebugModeManager.isLoggingEnabled()
+        let cpuStart = measure ? Self.processCPUSeconds() : 0
+        let upStart = measure ? Self.uptimeSeconds() : 0
         do {
             let result = try await work()
-            markExec(priority, execStart, label: label, bodyStart: bodyStart)
+            markExec(priority, execStart, cpuStart: cpuStart, upStart: upStart, label: label, bodyStart: bodyStart)
             release()
             return result
         } catch {
@@ -104,6 +113,7 @@ actor DatabaseWriteQueue {
     /// what a higher-priority write can't preempt. Threshold keeps the noise down.
     private func markExec(
         _ priority: WritePriority, _ start: Double,
+        cpuStart: Double, upStart: Double,
         label: String?, bodyStart: OSAllocatedUnfairLock<Double>?
     ) {
         let end = CFAbsoluteTimeGetCurrent()
@@ -115,9 +125,53 @@ actor DatabaseWriteQueue {
                 let body = Int((end - entry) * 1000)
                 detail = " (sched=\(sched)ms body=\(body)ms)"
             }
+            // STALL ATTRIBUTION (present only when the start-side samples were taken,
+            // i.e. debug logging on): split the wall time.
+            //   cpu≈0 on a multi-second write ⇒ the writer was BLOCKED (fsync / SQLite
+            //     lock / WAL checkpoint), not computing — a 3-row upsert is never CPU.
+            //   slept isolates device-sleep wall time (a txn held across screen-lock)
+            //     from an AWAKE I/O/lock stall (slept≈0).
+            //   wal is the -wal size at commit; a persistently huge WAL fingerprints
+            //     checkpoint starvation (reader pinning an old snapshot) as the
+            //     write-amplifier. Reads a single stat off the critical path's tail.
+            var stall = ""
+            if cpuStart > 0, upStart > 0 {
+                let cpuMs = Int((Self.processCPUSeconds() - cpuStart) * 1000)
+                let awakeMs = Int((Self.uptimeSeconds() - upStart) * 1000)
+                let sleptMs = max(0, ms - awakeMs)
+                let walKB = Self.mainWALSizeBytes().map { $0 / 1024 } ?? -1
+                stall = " cpu=\(cpuMs)ms slept=\(sleptMs)ms wal=\(walKB)KB"
+            }
             let name = label.map { " \($0)" } ?? ""
-            BootProfiler.mark("DBwrite EXEC[\(priority)]\(name) in \(ms)ms\(detail)")
+            BootProfiler.mark("DBwrite EXEC[\(priority)]\(name) in \(ms)ms\(detail)\(stall)")
         }
+    }
+
+    // MARK: - Stall attribution helpers (debug-gated callers only)
+
+    /// Process CPU time (user+system, summed across threads) in seconds, via
+    /// `getrusage`. A multi-second write whose CPU delta is ~0 was BLOCKED
+    /// (I/O / lock / fsync / checkpoint), not computing.
+    private static func processCPUSeconds() -> Double {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+        let user = Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
+        let system = Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
+        return user + system
+    }
+
+    /// Monotonic uptime EXCLUDING device sleep (`CLOCK_UPTIME_RAW`), in seconds.
+    /// `wall − uptime` over a window = time the device spent asleep during it.
+    private static func uptimeSeconds() -> Double {
+        Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000
+    }
+
+    /// Size of the main DB's `-wal` file in bytes — a checkpoint-starvation signal.
+    /// Best-effort: nil if the file is absent (fresh DB, or mid-checkpoint truncate).
+    private static func mainWALSizeBytes() -> Int? {
+        let walPath = AppDatabase.databaseURL.path + "-wal"
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: walPath) else { return nil }
+        return (attrs[.size] as? NSNumber)?.intValue
     }
 
     // MARK: - Privileged (merge) section
