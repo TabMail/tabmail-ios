@@ -1474,6 +1474,23 @@ enum NSEDataBridge {
                 // covers merges whose changes landed only in phase 2.
                 NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
             }
+            // Body-less NSE pushes need a PROACTIVE body fetch. The merge persists
+            // a durable MessageBody ONLY for fully-resolved bodies
+            // (`persistRenderedBodyFromStaging` drops unresolved-CID/inline-image
+            // bodies, and an NSE that didn't render leaves none), so those land
+            // `bodyComplete = 0`. Sync-discovered headers get enqueued into
+            // `ActiveBodyQueue` by SyncEngine, but NSE-merged rows never were — so a
+            // just-arrived inline-image message was body-fetched only on a cold user
+            // open (server fetch — the "recently-arrived message is slow to render"
+            // report) or whenever the queue next incidentally drained and re-scanned.
+            // Kick the queue's self-scan (`bodyComplete=0 AND isInInbox=1`, dedup'd)
+            // so a CID push is precached like any other inbox row.
+            let mergedBodyLessRow = processed.contains {
+                $0.hasUnresolvedCIDs || ($0.htmlContent == nil && $0.textContent == nil)
+            }
+            if mergedBodyLessRow {
+                Task { await ActiveBodyQueue.shared.repopulateFromDatabase() }
+            }
         }
 
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)

@@ -336,6 +336,25 @@ struct NSEGradualMergeTests {
             try MessageBody.filter(Column("id") == headerId()).fetchCount($0)
         }
         #expect(bodyCount == 0)
+
+        // The merge now kicks `ActiveBodyQueue.repopulateFromDatabase()` for body-less
+        // pushes so a CID/inline-image message is PRECACHED (body fetched proactively)
+        // instead of waiting for a cold user open (a recently-arrived inline-image
+        // message rendered slowly). Confirm the merged row matches that queue's
+        // candidate filter — `BodyFetchQueueRepopulateTests` proves the queue enqueues
+        // such rows; this pins the merge's end-state that feeds it. (The actor dispatch
+        // itself isn't driven here — it starts a real IMAP body fetch the unit host
+        // can't service.)
+        let isBodyFetchCandidate = try await pool.read { db in
+            try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(
+                    SELECT 1 FROM messageHeader
+                    WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
+                      AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                )
+                """, arguments: [headerId()]) ?? false
+        }
+        #expect(isBodyFetchCandidate, "CID push must match ActiveBodyQueue's precache filter")
     }
 
     @Test("Two-phase merge emits TWO immediate inboxDataDidChange (header render, then body/AI)")
