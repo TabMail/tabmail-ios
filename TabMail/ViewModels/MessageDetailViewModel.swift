@@ -257,9 +257,12 @@ final class MessageDetailViewModel {
     /// 1. staged snapshot (in-memory, instant),
     /// 2. durable indexed lookup (rawPool — PrioritizedDatabase.read would run
     ///    the read-through staging merge first, re-introducing the wait),
-    /// 2.5 bounded re-poll of both (a foreground-return tap races the
+    /// 2.5 DIRECT staging-file read (ADR-IOS-049 decoupling: the NSE staged the
+    ///    header before notifying, so serve it with zero merge dependency —
+    ///    needs accountId for the PK),
+    /// 3. bounded re-poll of tiers 1+2 (a foreground-return tap races the
     ///    syncStartup merge's snapshot publish by milliseconds),
-    /// 3. merge fallback (rare — no merge in flight ever read staging).
+    /// 4. merge fallback (rare — no merge in flight ever read staging).
     nonisolated static func resolveProviderTap(
         _ providerId: String,
         accountId: String? = nil,
@@ -291,6 +294,21 @@ final class MessageDetailViewModel {
         if let id = (try? await AppDatabase.rawPool.read(durableMatch)) ?? nil {
             mark("durable", hit: true)
             return id
+        }
+        // Tier 2.5 (2026-07-07, ADR-IOS-049 decoupling): DIRECT read of the NSE
+        // staging FILE. The two tiers above read merge-populated state
+        // (`latestStagedRows` / durable GRDB) — both EMPTY for a tap that lands
+        // before any merge runs, which is exactly the slow case (the poll below
+        // then spins ~400-600ms waiting for the foreground merge). But the NSE
+        // already staged this message's header (`populated=1`) BEFORE posting the
+        // notification, so read it straight from staging — no merge dependency,
+        // no poll. Needs accountId to form the PK (`<accountId>:<providerId>`);
+        // a legacy account-less tap skips to the poll (today's behavior).
+        if let accountId {
+            let (row, _) = await NSEDataBridge.readStagedForDisplay(
+                accountId: accountId, messageId: providerId
+            )
+            if let row { mark("staged-direct", hit: true); return row.headerId }
         }
         let deadline = CFAbsoluteTimeGetCurrent() + waitSeconds
         while CFAbsoluteTimeGetCurrent() < deadline {
@@ -608,7 +626,39 @@ final class MessageDetailViewModel {
         if allowStagedFallback, let stagedBody = NSEDataBridge.stagedBodyFallback(headerId: rid) {
             return adopt(stagedBody, source: source, rid: rid, mark: "detail body from STAGED snapshot (\(source))")
         }
+        // In-memory staged cache missed (no merge ran yet) — read the staging
+        // FILE directly (ADR-IOS-049 decoupling, 2026-07-07). Gated on
+        // `allowStagedFallback` (same as the in-memory fallback): the durable-only
+        // 2s poll must NOT end on display-only bytes before its persisting server
+        // fetch. On a hit, kick a background merge so the body becomes durable.
+        if allowStagedFallback, let directBody = await directStagedBody(headerId: rid) {
+            let ok = adopt(directBody, source: source, rid: rid,
+                           mark: "detail body from STAGED-direct (\(source))")
+            if ok { kickDurabilityMerge() }
+            return ok
+        }
         return false
+    }
+
+    /// Read this message's rendered body straight from the NSE staging FILE
+    /// (bypasses the merge), or nil when nothing usable is staged. `headerId` is
+    /// the composite `<accountId>:<folderPath>:<messageId>`; the staging PK needs
+    /// accountId + the provider messageId (parts 0 and 2).
+    private func directStagedBody(headerId rid: String) async -> MessageBody? {
+        let parts = rid.split(separator: ":", maxSplits: 2)
+        guard parts.count == 3 else { return nil }
+        let (_, snap) = await NSEDataBridge.readStagedForDisplay(
+            accountId: String(parts[0]), messageId: String(parts[2])
+        )
+        return snap?.toMessageBody(headerId: rid)
+    }
+
+    /// Fire-and-forget merge so a body served display-only from staging still
+    /// becomes durable + FTS-indexed + AI-processed (data-integrity: never leave
+    /// content display-only). Independent Task — a durability action, not tied to
+    /// this view's lifecycle.
+    private func kickDurabilityMerge() {
+        Task { await NSEDataBridge.mergeNSEStagingData() }
     }
 
     /// Mutation-site adoption: re-verify the invariants that `adoptReadyBody`'s
@@ -720,8 +770,11 @@ final class MessageDetailViewModel {
                     // clobber the body or blank the header (round-4/5 audit: guarding
                     // BEFORE the reads left a window; a refresh that begins during the
                     // fetch/reads bails us to `continue`, poll stays alive).
-                    let freshBody = try? await self.dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) })
-                    let freshHeader = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
+                    // `dbPool.pool` (raw), NOT `dbPool.read`: read back what the
+                    // server fetch just wrote durably; no reason to block behind
+                    // an in-flight merge. Matches loadBody's post-fetch reads.
+                    let freshBody = try? await self.dbPool.pool.read({ db in try MessageBody.fetchOne(db, key: rid) })
+                    let freshHeader = try? await self.dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
                     guard !self.isRefetchingBody else { continue }
                     if let freshBody {
                         self.messageBody = freshBody
@@ -902,6 +955,21 @@ final class MessageDetailViewModel {
             loadThreadMessagesAsync()
             return
         }
+        // In-memory staged cache missed (no merge ran yet), but the NSE staged
+        // this body into the staging FILE — read it directly (ADR-IOS-049
+        // decoupling, 2026-07-07): DISPLAY now, no merge / poll / network wait.
+        // Kick a background merge so durability (MessageBody + FTS + AI) follows.
+        if let directBody = await directStagedBody(headerId: rid) {
+            BootProfiler.mark("detail body from STAGED-direct (pre-merge) \(rid.prefix(24))")
+            messageBody = directBody
+            isLoading = false
+            Task { await manager.enqueueWrite { [manager] in
+                await manager.processOpenedMessage(msg)
+            }}
+            kickDurabilityMerge()
+            loadThreadMessagesAsync()
+            return
+        }
         // If the body queue is already fetching this message, don't compete for the
         // IMAP connection — just poll until the background fetch completes. Competing
         // causes "cannot connect" errors because the folder connection is locked.
@@ -933,15 +1001,19 @@ final class MessageDetailViewModel {
         }
         isLoading = false
 
-        // Refetch message in case AI processing updated it during body fetch
+        // Refetch message in case AI processing updated it during body fetch.
+        // `dbPool.pool` (raw), NOT `dbPool.read`: these read back what the server
+        // fetch above just wrote durably — no reason to block behind an in-flight
+        // merge (`PrioritizedDatabase.read` awaits `mergeIfStagingPending` first).
+        // Matches the header/body-cache reads at the top of `loadBody`.
         let postFetchId = resolvedId
-        if var refreshed = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: postFetchId) }) {
+        if var refreshed = try? await dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: postFetchId) }) {
             applyOverlay(to: &refreshed)
             message = refreshed
         } else {
             message = nil
         }
-        messageBody = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: postFetchId) }
+        messageBody = try? await dbPool.pool.read { db in try MessageBody.fetchOne(db, key: postFetchId) }
         loadThreadMessagesAsync()
 
         // If body is still nil after all attempts, start polling as a safety net.

@@ -129,11 +129,7 @@ enum NSEDataBridge {
     /// wins — call ONLY on a GRDB `messageBody` miss (mirrors
     /// `stagedRowFallback`'s contract for headers).
     static func stagedBodyFallback(headerId: String) -> MessageBody? {
-        guard let snap = latestStagedBodies.withLock({ $0[headerId] }) else { return nil }
-        var body = MessageBody.create(headerId: headerId, htmlBody: snap.htmlContent)
-        body.attachmentsJSON = snap.attachmentsJSON
-        body.icsText = snap.icsText
-        return body
+        latestStagedBodies.withLock { $0[headerId] }?.toMessageBody(headerId: headerId)
     }
 
     /// The staged set (headerId-sorted) of the last `.messagesStaged` post — a
@@ -505,6 +501,53 @@ enum NSEDataBridge {
         return try? DatabaseQueue(path: stagingPath, configuration: config)
     }
 
+    /// Direct read of ONE staged message from the NSE staging file for the
+    /// notification-tap DISPLAY path (ADR-IOS-049). Serves the just-pushed
+    /// message from the NSE's own source of truth WITHOUT waiting on the durable
+    /// merge — the decoupling the merge drift broke (`latestStagedRows` /
+    /// `latestStagedBodies` are populated ONLY as a side-effect of a merge
+    /// running, so a tap that arrives before a merge misses every in-memory
+    /// tier). Reads by PRIMARY KEY `id = "<accountId>:<messageId>"`
+    /// (`NSEStagingDB.stageHeader` flips `populated=1` FIRST, before body/AI —
+    /// so a tapped message's header is present by construction).
+    ///
+    /// Returns the display header whenever a `populated=1` row exists, and the
+    /// body ONLY when a usable (non-empty, non-CID) rendered body is staged
+    /// (else nil → the caller falls to the server fetch, unchanged).
+    ///
+    /// `stagingPathOverride` is the unit-test seam (mirrors
+    /// `mergeNSEStagingData(stagingPathOverride:)`) so tests seed a temp staging
+    /// file with no App Group entitlement. MUST only be called from a FOREGROUND
+    /// context (a tap): `openStagingDB()` observes suspension, so a suspended
+    /// read is rejected — never call from a background/suspended path.
+    static func readStagedForDisplay(
+        accountId: String,
+        messageId: String,
+        stagingPathOverride: String? = nil
+    ) async -> (row: StagedInboxRow?, body: StagedBodySnapshot?) {
+        let queue: DatabaseQueue?
+        if let stagingPathOverride {
+            guard FileManager.default.fileExists(atPath: stagingPathOverride) else { return (nil, nil) }
+            var config = Configuration()
+            config.busyMode = .timeout(2.0)
+            config.observesSuspensionNotifications = true
+            queue = try? DatabaseQueue(path: stagingPathOverride, configuration: config)
+        } else {
+            queue = openStagingDB()
+        }
+        guard let queue else { return (nil, nil) }
+        let id = "\(accountId):\(messageId)"
+        let staged: StagedMessage? = try? await queue.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM nse_processed_message WHERE id = ? AND populated = 1 LIMIT 1",
+                arguments: [id]
+            ).map { StagedMessage(row: $0) }
+        }
+        guard let staged else { return (nil, nil) }
+        return (staged.toInboxRow(), staged.toBodySnapshot())
+    }
+
     /// Public entry point. The NSE→inbox merge is a PRIVILEGED, single-threaded
     /// step of the boot / foreground sequence — it must run ALONE (no concurrent
     /// sibling merge fighting the staging-DB busy lock, and ideally ahead of the
@@ -600,18 +643,6 @@ enum NSEDataBridge {
         // can construct it and drive `insertNewHeaderFromStaging` against an
         // in-memory GRDB without going through the App Group staging file.)
 
-        // Decode a JSON-array column, tolerating nil / malformed / non-array
-        // content (e.g. legacy rows written before the column existed).
-        // @Sendable: captured by the (now async) `nseDB.read` closure.
-        @Sendable func decodeJSONArray(_ s: String?) -> [String] {
-            guard let s, !s.isEmpty,
-                  let data = s.data(using: .utf8),
-                  let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else {
-                return []
-            }
-            return arr
-        }
-
         // Explicit do/catch on the staging read — log on failure, continue
         // with an empty `processed`. The helper sub-paths
         // (`mergeInboxRemovals`, `consumePendingTaskResults`, orphan reap)
@@ -620,56 +651,11 @@ enum NSEDataBridge {
         let processed: [StagedMessage]
         do {
             processed = try await nseDB.read { db in
-                try Row.fetchAll(db, sql: "SELECT * FROM nse_processed_message WHERE populated = 1").map { row in
-                    StagedMessage(
-                        id: row["id"],
-                        accountId: row["accountId"],
-                        accountEmail: row["accountEmail"] ?? "",
-                        provider: row["provider"] ?? "",
-                        messageId: row["messageId"],
-                        rfc822MessageId: row["rfc822MessageId"],
-                        threadId: row["threadId"],
-                        // New `folderPath` column (AppDatabase migration v3); fall
-                        // back to the legacy `folderId` column for DBs that were
-                        // written before the rename landed. Either way, default
-                        // to "INBOX" so pre-migration rows that only had Gmail's
-                        // hardcoded value still merge correctly.
-                        folderPath: (row["folderPath"] as String?)
-                            ?? (row["folderId"] as String?)
-                            ?? "INBOX",
-                        subject: row["subject"] ?? "",
-                        senderName: row["senderName"] ?? "",
-                        senderEmail: row["senderEmail"] ?? "",
-                        snippet: row["snippet"] ?? "",
-                        date: row["date"],
-                        to: row["toRaw"] ?? "",
-                        cc: row["ccRaw"] ?? "",
-                        bcc: row["bccRaw"] ?? "",
-                        replyTo: row["replyToRaw"],
-                        inReplyTo: row["inReplyTo"],
-                        references: decodeJSONArray(row["referencesJSON"]),
-                        isRead: (row["isRead"] as Int? ?? 0) == 1,
-                        isFlagged: (row["isFlagged"] as Int? ?? 0) == 1,
-                        hasAttachments: (row["hasAttachments"] as Int? ?? 0) == 1,
-                        isReplied: (row["isReplied"] as Int? ?? 0) == 1,
-                        isForwarded: (row["isForwarded"] as Int? ?? 0) == 1,
-                        providerLabels: decodeJSONArray(row["providerLabelsJSON"]),
-                        summaryBlurb: row["summaryBlurb"],
-                        summaryTodos: row["summaryTodos"],
-                        actionTag: row["actionTag"],
-                        reminderDate: row["reminderDate"],
-                        reminderTime: row["reminderTime"],
-                        reminderContent: row["reminderContent"],
-                        processedAt: row["processedAt"],
-                        aiCompleted: row["aiCompleted"] == 1,
-                        notified: row["notified"] == 1,
-                        htmlContent: row["htmlContent"],
-                        textContent: row["textContent"],
-                        attachmentsJSON: row["attachmentsJSON"],
-                        icsText: row["icsText"],
-                        hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1
-                    )
-                }
+                // Row→StagedMessage decode is the SINGLE SOURCE OF TRUTH in
+                // `StagedMessage(row:)` — shared with the tap-path
+                // `readStagedForDisplay` so a column change lands in ONE place.
+                try Row.fetchAll(db, sql: "SELECT * FROM nse_processed_message WHERE populated = 1")
+                    .map { StagedMessage(row: $0) }
             }
         } catch {
             // Log + fall through with empty `processed`. The helpers below
@@ -689,32 +675,8 @@ enum NSEDataBridge {
         // write. Separate signal from `.inboxDataDidChange` (doesn't touch its
         // 2-post contract); the VM dedups against `loadedIds`, so re-posting the
         // same rows on a no-op re-merge inserts nothing. Body/badge unaffected.
-        let stagedRows = processed.map { msg in
-            StagedInboxRow(
-                accountId: msg.accountId,
-                folderPath: msg.folderPath,
-                messageId: msg.messageId,
-                rfc822MessageId: msg.rfc822MessageId,
-                threadId: msg.threadId,
-                inReplyTo: msg.inReplyTo,
-                references: msg.references,
-                subject: msg.subject,
-                senderName: msg.senderName,
-                senderAddress: msg.senderEmail,
-                to: msg.to,
-                snippet: Self.stagedDisplaySnippet(
-                    providerSnippet: msg.snippet, textContent: msg.textContent
-                ),
-                date: msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date(),
-                isRead: msg.isRead,
-                isFlagged: msg.isFlagged,
-                hasAttachments: msg.hasAttachments,
-                isReplied: msg.isReplied,
-                isForwarded: msg.isForwarded,
-                actionTag: msg.actionTag,
-                summaryBlurb: msg.summaryBlurb
-            )
-        }
+        // `toInboxRow()` is the SINGLE builder shared with `readStagedForDisplay`.
+        let stagedRows = processed.map { $0.toInboxRow() }
         // Replace-all snapshot for the non-render fallbacks (notification deep-link
         // resolution, MessageDetailViewModel synthesis). Updated on EVERY merge —
         // including empty (drained staging clears it). Serialized by the merge
@@ -723,15 +685,13 @@ enum NSEDataBridge {
         // Companion body snapshot (same replace-all lifecycle): lets a
         // notification-tap render the staged body IMMEDIATELY instead of waiting
         // for phase-2's durable write / the 2s body-poll / a network re-fetch.
-        // Unresolved-CID bodies excluded — the app must re-render those.
+        // Unresolved-CID bodies excluded (`toBodySnapshot()` returns nil) — the
+        // app must re-render those.
         let stagedBodies: [String: StagedBodySnapshot] = processed.reduce(into: [:]) { acc, msg in
-            guard let html = msg.htmlContent, !html.isEmpty, !msg.hasUnresolvedCIDs else { return }
-            let headerId = MessageIdentity.headerId(
+            guard let snap = msg.toBodySnapshot() else { return }
+            acc[MessageIdentity.headerId(
                 accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
-            )
-            acc[headerId] = StagedBodySnapshot(
-                htmlContent: html, attachmentsJSON: msg.attachmentsJSON, icsText: msg.icsText
-            )
+            )] = snap
         }
         latestStagedBodies.withLock { $0 = stagedBodies }
         // RE-POST suppression: a KEPT gradual row (ADR-IOS-047, NSE still computing
@@ -2568,5 +2528,129 @@ final class OneShotGate: Sendable {
             }
             if resumeNow { c.resume() }
         }
+    }
+}
+
+// MARK: - StagedMessage: row decode + display projections
+//
+// SINGLE SOURCE OF TRUTH for turning a `nse_processed_message` staging row into
+// the display projections, shared by `mergeNSEStagingData` (batch) and the
+// tap-path `readStagedForDisplay` (single row). In an extension (not the struct
+// body) so `StagedMessage`'s memberwise `init(id:…)` — used by the merge helpers
+// and their tests — stays synthesized.
+extension NSEDataBridge.StagedMessage {
+    /// Decode a `nse_processed_message` staging row. Any column change lands
+    /// HERE once (see `StagedMessage`'s keep-in-sync doc).
+    init(row: GRDB.Row) {
+        self.init(
+            id: row["id"],
+            accountId: row["accountId"],
+            accountEmail: row["accountEmail"] ?? "",
+            provider: row["provider"] ?? "",
+            messageId: row["messageId"],
+            rfc822MessageId: row["rfc822MessageId"],
+            threadId: row["threadId"],
+            // New `folderPath` column (AppDatabase migration v3); fall back to the
+            // legacy `folderId` column for DBs written before the rename landed.
+            // Default "INBOX" so pre-migration Gmail rows still merge correctly.
+            folderPath: (row["folderPath"] as String?)
+                ?? (row["folderId"] as String?)
+                ?? "INBOX",
+            subject: row["subject"] ?? "",
+            senderName: row["senderName"] ?? "",
+            senderEmail: row["senderEmail"] ?? "",
+            snippet: row["snippet"] ?? "",
+            date: row["date"],
+            to: row["toRaw"] ?? "",
+            cc: row["ccRaw"] ?? "",
+            bcc: row["bccRaw"] ?? "",
+            replyTo: row["replyToRaw"],
+            inReplyTo: row["inReplyTo"],
+            references: Self.decodeJSONArray(row["referencesJSON"]),
+            isRead: (row["isRead"] as Int? ?? 0) == 1,
+            isFlagged: (row["isFlagged"] as Int? ?? 0) == 1,
+            hasAttachments: (row["hasAttachments"] as Int? ?? 0) == 1,
+            isReplied: (row["isReplied"] as Int? ?? 0) == 1,
+            isForwarded: (row["isForwarded"] as Int? ?? 0) == 1,
+            providerLabels: Self.decodeJSONArray(row["providerLabelsJSON"]),
+            summaryBlurb: row["summaryBlurb"],
+            summaryTodos: row["summaryTodos"],
+            actionTag: row["actionTag"],
+            reminderDate: row["reminderDate"],
+            reminderTime: row["reminderTime"],
+            reminderContent: row["reminderContent"],
+            processedAt: row["processedAt"],
+            aiCompleted: row["aiCompleted"] == 1,
+            notified: row["notified"] == 1,
+            htmlContent: row["htmlContent"],
+            textContent: row["textContent"],
+            attachmentsJSON: row["attachmentsJSON"],
+            icsText: row["icsText"],
+            hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1
+        )
+    }
+
+    /// Decode a JSON-array column, tolerating nil / malformed / non-array content
+    /// (e.g. legacy rows written before the column existed).
+    static func decodeJSONArray(_ s: String?) -> [String] {
+        guard let s, !s.isEmpty,
+              let data = s.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+            return []
+        }
+        return arr
+    }
+
+    /// The display+action inbox projection (ADR-IOS-049). Snippet laundered via
+    /// `stagedDisplaySnippet`; a nil date maps to a fresh `Date()` (matches the
+    /// merge's `?? Date()`, which the re-post memo tolerates — see
+    /// `stagedSetChangedSinceLastPost`). SINGLE builder shared by the merge and
+    /// `readStagedForDisplay`.
+    func toInboxRow() -> StagedInboxRow {
+        StagedInboxRow(
+            accountId: accountId,
+            folderPath: folderPath,
+            messageId: messageId,
+            rfc822MessageId: rfc822MessageId,
+            threadId: threadId,
+            inReplyTo: inReplyTo,
+            references: references,
+            subject: subject,
+            senderName: senderName,
+            senderAddress: senderEmail,
+            to: to,
+            snippet: NSEDataBridge.stagedDisplaySnippet(
+                providerSnippet: snippet, textContent: textContent
+            ),
+            date: date.map { Date(timeIntervalSince1970: $0) } ?? Date(),
+            isRead: isRead,
+            isFlagged: isFlagged,
+            hasAttachments: hasAttachments,
+            isReplied: isReplied,
+            isForwarded: isForwarded,
+            actionTag: actionTag,
+            summaryBlurb: summaryBlurb
+        )
+    }
+
+    /// The display-only body snapshot, or nil when no usable rendered body is
+    /// staged (empty html or unresolved inline CIDs — the app must re-render
+    /// those). Matches the merge's `stagedBodies` reduce guard.
+    func toBodySnapshot() -> NSEDataBridge.StagedBodySnapshot? {
+        guard let html = htmlContent, !html.isEmpty, !hasUnresolvedCIDs else { return nil }
+        return NSEDataBridge.StagedBodySnapshot(
+            htmlContent: html, attachmentsJSON: attachmentsJSON, icsText: icsText
+        )
+    }
+}
+
+extension NSEDataBridge.StagedBodySnapshot {
+    /// Synthesize a display-only `MessageBody` from the staged body snapshot.
+    /// Shared by `stagedBodyFallback` (in-memory) and the tap-path direct read.
+    func toMessageBody(headerId: String) -> MessageBody {
+        var body = MessageBody.create(headerId: headerId, htmlBody: htmlContent)
+        body.attachmentsJSON = attachmentsJSON
+        body.icsText = icsText
+        return body
     }
 }
