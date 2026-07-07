@@ -784,14 +784,20 @@ enum NSEDataBridge {
             // and phase 2 still has the row to write the body from.
             // ============================================================
             var phase1HeaderIds: [String] = []
-            // DIAGNOSTIC (debug-gated): split the phase-1 write into body (upserts) vs
-            // commit+fsync. On synchronous=FULL the single COMMIT fsyncs the WAL; a slow
-            // cold-disk fsync shows as commit ≫ body, settling whether the multi-second
-            // stall is the fsync (⇒ the synchronous lever) or the upserts themselves.
+            // DIAGNOSTIC (debug-gated): split the phase-1 write into THREE parts so a
+            // multi-second EXEC can be attributed precisely:
+            //   acquireWriter = queue + SQLite writer-lock wait (e.g. blocked behind a
+            //                   checkpoint or a long reader) — writeT0 → inside-closure entry
+            //   loop(upserts) = the actual per-message reads+writes (cold-disk reads show here)
+            //   commit+fsync  = COMMIT (≈0 under synchronous=NORMAL)
+            // The earlier single `body` conflated acquireWriter with loop; this disambiguates.
             let phase1WriteT0 = CFAbsoluteTimeGetCurrent()
+            let phase1LoopStart = Mutex<Double>(0)
             let phase1BodyEnd = Mutex<Double>(0)
             do {
                 phase1HeaderIds = try await AppDatabase.dbPool.write(label: "merge.phase1") { db -> [String] in
+                    // Writer acquired — everything before here was queue + writer-lock wait.
+                    phase1LoopStart.withLock { $0 = CFAbsoluteTimeGetCurrent() }
                     var localIds: [String] = []
                     for msg in processed {
                         // Per-message savepoint: a failure leaves THIS row in
@@ -870,11 +876,13 @@ enum NSEDataBridge {
                     return localIds
                 }
                 if DebugModeManager.isLoggingEnabled() {
+                    let loopStart = phase1LoopStart.withLock { $0 }
                     let bodyEnd = phase1BodyEnd.withLock { $0 }
-                    if bodyEnd > 0 {
-                        let bodyMs = Int((bodyEnd - phase1WriteT0) * 1000)
+                    if bodyEnd > 0, loopStart > 0 {
+                        let acquireMs = Int((loopStart - phase1WriteT0) * 1000)
+                        let loopMs = Int((bodyEnd - loopStart) * 1000)
                         let commitMs = Int((CFAbsoluteTimeGetCurrent() - bodyEnd) * 1000)
-                        BootProfiler.mark("merge.phase1 SPLIT: body(upserts)=\(bodyMs)ms commit+fsync=\(commitMs)ms (\(processed.count) msg)")
+                        BootProfiler.mark("merge.phase1 SPLIT: acquireWriter=\(acquireMs)ms loop(upserts)=\(loopMs)ms commit+fsync=\(commitMs)ms (\(processed.count) msg)")
                     }
                 }
             } catch {
