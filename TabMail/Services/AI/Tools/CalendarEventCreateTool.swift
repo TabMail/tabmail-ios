@@ -16,6 +16,12 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// ADR-IOS-053: real entry point — delivers the confirmation card to the
+    /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         let title = CalendarToolHelpers.stringArg(arguments, "title")
         let startIso = CalendarToolHelpers.stringArg(arguments, "start_iso")
         let endIso = CalendarToolHelpers.stringArg(arguments, "end_iso")
@@ -93,7 +99,8 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
                 attendees: attendeeNames,
                 timeZoneId: CalendarToolHelpers.stringArgOpt(arguments, "timezone"),
                 notes: CalendarToolHelpers.stringArgOpt(arguments, "description")
-            )]
+            )],
+            via: invocation.uiSink
         )
 
         guard confirmed else {

@@ -17,6 +17,12 @@ struct EmailDeleteTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// ADR-IOS-053: real entry point — delivers the confirmation card to the
+    /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse unique_ids array (numeric IDs from ChatIdTranslator)
         let numericIds = Self.parseUniqueIds(arguments)
         guard !numericIds.isEmpty else {
@@ -59,7 +65,8 @@ struct EmailDeleteTool: AgentTool, Sendable {
         // Suspend until user confirms or declines (cancellation-safe).
         let (confirmed, _) = await AgentToolRouter.ActionConfirmation.awaitConfirmation(
             action: .delete,
-            emails: emailDetails
+            emails: emailDetails,
+            via: invocation.uiSink
         )
 
         guard confirmed else {

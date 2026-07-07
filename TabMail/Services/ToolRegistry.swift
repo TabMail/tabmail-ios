@@ -18,6 +18,22 @@ protocol AgentTool: Sendable {
     /// Execute the tool with the given arguments.
     /// Returns a JSON-encodable result string, matching TB's `{ call_id, output, ok }` pattern.
     func execute(arguments: [String: JSONValue]) async throws -> String
+
+    /// Execute with the invoking chat session's UI channel (ADR-IOS-053).
+    /// Confirmation ("FSM") tools override this to deliver their card to the
+    /// session that launched the call. Every other tool inherits the default
+    /// below, which ignores `invocation` and calls `execute(arguments:)`.
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String
+}
+
+extension AgentTool {
+    /// Default invocation-aware entry point for tools that don't confirm: drop
+    /// `invocation` and run the plain path. Because this is a protocol
+    /// requirement (not just an extension member), FSM tools that provide their
+    /// own implementation are dispatched dynamically through the witness table.
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        try await execute(arguments: arguments)
+    }
 }
 
 /// Central registry for client-side tools available to the AI agent.
@@ -126,14 +142,14 @@ actor ToolRegistry {
 
     /// Execute a tool call. Returns the result string and success flag.
     /// Matches TB's `executeToolByName()` in `core.js`.
-    func execute(name: String, arguments: [String: JSONValue]) async -> ToolExecutionResult {
+    func execute(name: String, arguments: [String: JSONValue], invocation: ToolInvocation = .noninteractive) async -> ToolExecutionResult {
         guard let tool = tools[name] else {
             print("[ToolRegistry] Unknown tool: \(name)")
             return ToolExecutionResult(output: "Error: unknown tool '\(name)'", ok: false)
         }
 
         do {
-            let output = try await tool.execute(arguments: arguments)
+            let output = try await tool.execute(arguments: arguments, invocation: invocation)
             return ToolExecutionResult(output: output, ok: true)
         } catch let declined as ToolDeclinedError {
             print("[ToolRegistry] Tool '\(name)' declined by user")

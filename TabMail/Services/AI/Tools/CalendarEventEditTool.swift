@@ -16,6 +16,12 @@ struct CalendarEventEditTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// ADR-IOS-053: real entry point — delivers the confirmation card to the
+    /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         guard case .string(let rawEventId) = arguments["event_id"],
               !rawEventId.trimmingCharacters(in: .whitespaces).isEmpty else {
             return #"{"error": "missing event_id — use calendar_event_read or calendar_search to look up the event first"}"#
@@ -258,7 +264,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 attendees: attendeeNames,
                 timeZoneId: CalendarToolHelpers.stringArgOpt(arguments, "timezone"),
                 notes: CalendarToolHelpers.stringArgOpt(arguments, "description")
-            )]
+            )],
+            via: invocation.uiSink
         )
 
         guard confirmed else {

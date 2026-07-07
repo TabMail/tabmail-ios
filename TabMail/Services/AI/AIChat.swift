@@ -27,7 +27,8 @@ extension AIService {
     func sendChatMessage(
         userText: String,
         history: [ChatTurn],
-        onSSEEvent: BackendClient.SSEEventHandler? = nil
+        onSSEEvent: BackendClient.SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> ChatResponse? {
         // Per-user-turn pagination cache reset — matches TB resetPaginationSessions()
         // (memory_search.js:11-16). Each user message starts a fresh turn; within that
@@ -105,7 +106,8 @@ extension AIService {
         do {
             response = try await sendWithToolsDirect(
                 messages: messages,
-                onSSEEvent: onSSEEvent
+                onSSEEvent: onSSEEvent,
+                invocation: invocation
             )
         } catch {
             // Demo refund on transient errors.
@@ -160,7 +162,8 @@ extension AIService {
     /// already accounted for this turn.
     func resumeChatMessage(
         request: CompletionsRequest,
-        onSSEEvent: BackendClient.SSEEventHandler? = nil
+        onSSEEvent: BackendClient.SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> ChatResponse? {
         guard !disableLLMCalls else {
             print("[AIService] resumeChatMessage: SKIP — LLM calls disabled")
@@ -195,7 +198,7 @@ extension AIService {
         )
         let response: CompletionsResponse
         do {
-            response = try await sendWithToolsDirect(request: refreshed, onSSEEvent: onSSEEvent)
+            response = try await sendWithToolsDirect(request: refreshed, onSSEEvent: onSSEEvent, invocation: invocation)
         } catch {
             if inDemo, DemoModeStore.shouldRefund(for: error) {
                 await MainActor.run { DemoModeStore.shared.refundCall() }

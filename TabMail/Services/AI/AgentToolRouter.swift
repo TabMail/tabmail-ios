@@ -131,10 +131,6 @@ final class AgentToolRouter {
     /// this directly — use `enqueueCompose(_:)` to respect FIFO ordering. See ADR-IOS-030.
     var pendingCompose: ComposeRequest?
 
-    /// Pending action awaiting user confirmation (archive/delete/contact/calendar).
-    /// Set by tool via continuation, consumed by DynamicIslandChat. See ADR-IOS-024.
-    var pendingAction: ActionConfirmation?
-
     /// Short-TTL cache of recently-successful sends keyed by the replied/forwarded
     /// message. See `RecentlyCompletedComposeCache` for rationale.
     /// `@ObservationIgnored` — it's an internal dedup table, not observable state.
@@ -231,7 +227,7 @@ final class AgentToolRouter {
     }
 
     /// Test-only: reset queue + counters between tests. Does NOT touch `pendingCompose`
-    /// or `pendingAction` so existing tests are unaffected.
+    /// so existing tests are unaffected.
     func resetComposeQueueForTesting() {
         composeQueue.removeAll()
         presentationCount = 0
@@ -418,33 +414,37 @@ final class AgentToolRouter {
         /// drives the SwiftUI card immediately.
         static func awaitConfirmation(
             action: ActionType,
-            emails: [EmailDetail]
+            emails: [EmailDetail],
+            via sink: (any AgentUISink)?
         ) async -> (accepted: Bool, state: ResponseState) {
-            await awaitConfirmationInternal(action: action, emails: emails, contacts: [], calendarEvents: [], templates: [])
+            await awaitConfirmationInternal(action: action, emails: emails, contacts: [], calendarEvents: [], templates: [], via: sink)
         }
 
         /// Suspends the calling tool until the user accepts or declines (contact actions).
         static func awaitConfirmation(
             action: ActionType,
-            contacts: [ContactDetail]
+            contacts: [ContactDetail],
+            via sink: (any AgentUISink)?
         ) async -> (accepted: Bool, state: ResponseState) {
-            await awaitConfirmationInternal(action: action, emails: [], contacts: contacts, calendarEvents: [], templates: [])
+            await awaitConfirmationInternal(action: action, emails: [], contacts: contacts, calendarEvents: [], templates: [], via: sink)
         }
 
         /// Suspends the calling tool until the user accepts or declines (calendar event actions).
         static func awaitConfirmation(
             action: ActionType,
-            calendarEvents: [CalendarEventDetail]
+            calendarEvents: [CalendarEventDetail],
+            via sink: (any AgentUISink)?
         ) async -> (accepted: Bool, state: ResponseState) {
-            await awaitConfirmationInternal(action: action, emails: [], contacts: [], calendarEvents: calendarEvents, templates: [])
+            await awaitConfirmationInternal(action: action, emails: [], contacts: [], calendarEvents: calendarEvents, templates: [], via: sink)
         }
 
         /// Suspends the calling tool until the user accepts or declines (template actions).
         static func awaitConfirmation(
             action: ActionType,
-            templates: [TemplateDetail]
+            templates: [TemplateDetail],
+            via sink: (any AgentUISink)?
         ) async -> (accepted: Bool, state: ResponseState) {
-            await awaitConfirmationInternal(action: action, emails: [], contacts: [], calendarEvents: [], templates: templates)
+            await awaitConfirmationInternal(action: action, emails: [], contacts: [], calendarEvents: [], templates: templates, via: sink)
         }
 
         private static func awaitConfirmationInternal(
@@ -452,12 +452,24 @@ final class AgentToolRouter {
             emails: [EmailDetail],
             contacts: [ContactDetail],
             calendarEvents: [CalendarEventDetail],
-            templates: [TemplateDetail]
+            templates: [TemplateDetail],
+            via sink: (any AgentUISink)?
         ) async -> (accepted: Bool, state: ResponseState) {
             // Build the state up front so the caller's tuple carries the same
             // instance the card observes — letting the tool flip `failureReason`
             // after the user accepts and the queued execution later fails.
             let state = ResponseState()
+
+            // Nil sink → no interactive chat session to confirm in (reply
+            // precompute, inline edit, task eval, BYOK smoke). Fast-fail as
+            // declined WITHOUT suspending — the tool's decline branch returns
+            // `ok:false`. A preset `failureReason` lets a tool surface a
+            // distinct message if it chooses to read it. See ADR-IOS-053.
+            guard let sink else {
+                await MainActor.run { state.failureReason = "no interactive chat session to confirm in" }
+                return (false, state)
+            }
+
             let guard_ = ContinuationGuard()
             let accepted = await withTaskCancellationHandler {
                 await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
@@ -478,8 +490,12 @@ final class AgentToolRouter {
                         },
                         responseState: state
                     )
+                    // Deliver to the invoking session's owned channel (ADR-IOS-053).
+                    // Replaces the old global `AgentToolRouter.shared.pendingAction`
+                    // slot: no cross-view race, rendered level-triggered by the pill
+                    // bound to that session.
                     Task { @MainActor in
-                        AgentToolRouter.shared.pendingAction = confirmation
+                        sink.deliverConfirmation(confirmation)
                     }
                 }
             } onCancel: {

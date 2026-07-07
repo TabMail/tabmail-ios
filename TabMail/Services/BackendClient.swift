@@ -1086,20 +1086,22 @@ extension BackendClient {
     /// Returns the final `CompletionsResponse` after all tool rounds complete.
     func sendCompletionsWithTools(
         _ request: CompletionsRequest,
-        onSSEEvent: SSEEventHandler? = nil
+        onSSEEvent: SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
         await llmSemaphore.acquire()
         defer { llmSemaphore.release() }
-        return try await sendCompletionsWithToolsInternal(request, onSSEEvent: onSSEEvent)
+        return try await sendCompletionsWithToolsInternal(request, onSSEEvent: onSSEEvent, invocation: invocation)
     }
 
     /// Direct variant — bypasses the LLM semaphore. Use for user-initiated calls
     /// (agent chat, inline edit) that should not wait behind background AI.
     func sendCompletionsWithToolsDirect(
         _ request: CompletionsRequest,
-        onSSEEvent: SSEEventHandler? = nil
+        onSSEEvent: SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
-        return try await sendCompletionsWithToolsInternal(request, onSSEEvent: onSSEEvent)
+        return try await sendCompletionsWithToolsInternal(request, onSSEEvent: onSSEEvent, invocation: invocation)
     }
 
     /// Build the terminal `CompletionsResponse` from a tool-loop `finalEvent`,
@@ -1126,7 +1128,8 @@ extension BackendClient {
     /// Shared implementation for both semaphore-gated and direct tool-loop completions calls.
     private func sendCompletionsWithToolsInternal(
         _ request: CompletionsRequest,
-        onSSEEvent: SSEEventHandler?
+        onSSEEvent: SSEEventHandler?,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
         // Stamp app-level defaults (e.g., user's global web-search toggle) once on
         // the entry request. The tool loop's continuation rounds rebuild
@@ -1227,7 +1230,7 @@ extension BackendClient {
                     arguments = [:]
                 }
 
-                let result = await toolRegistry.execute(name: toolName, arguments: arguments)
+                let result = await toolRegistry.execute(name: toolName, arguments: arguments, invocation: invocation)
                 toolResults.append(ToolResult(call_id: toolCall.id, output: result.output, ok: result.ok))
 
                 // Fire tool-completed event for client-side tools

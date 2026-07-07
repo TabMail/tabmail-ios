@@ -16,6 +16,12 @@ struct ContactDeleteTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// ADR-IOS-053: real entry point — delivers the confirmation card to the
+    /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Demo boundary (ADR-IOS-038): device contacts / real app settings
         // are outside the demo sandbox — block with a relayable error.
         if DemoModeStore.isDemoActive { return DemoToolGuard.blockedMessage }
@@ -54,7 +60,8 @@ struct ContactDeleteTool: AgentTool, Sendable {
                 contactId: contactId,
                 name: contactName.isEmpty ? "(No name)" : contactName,
                 email: contactEmail
-            )]
+            )],
+            via: invocation.uiSink
         )
 
         guard confirmed else {

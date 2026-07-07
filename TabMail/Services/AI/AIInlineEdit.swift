@@ -88,7 +88,8 @@ extension AIService {
         context: ComposeEditContext,
         instruction: String,
         chatHistory: [InlineEditTurn],
-        onSSEEvent: BackendClient.SSEEventHandler? = nil
+        onSSEEvent: BackendClient.SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> InlineEditResult {
         guard !disableLLMCalls else {
             print("[AIService] performInlineEdit: SKIP — LLM calls disabled")
@@ -220,7 +221,7 @@ extension AIService {
         print("[AIService] performInlineEdit: calling sendCompletionsWithToolsDirect...")
         let response: CompletionsResponse
         do {
-            response = try await backend.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent)
+            response = try await backend.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
         } catch {
             if inDemo, DemoModeStore.shouldRefund(for: error) {
                 await MainActor.run { DemoModeStore.shared.refundCall() }

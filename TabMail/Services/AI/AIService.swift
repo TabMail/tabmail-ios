@@ -227,7 +227,8 @@ actor AIService {
     func sendWithTools(
         messages: [CompletionsMessage],
         disableTools: Bool = false,
-        onSSEEvent: BackendClient.SSEEventHandler? = nil
+        onSSEEvent: BackendClient.SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
         guard !disableLLMCalls else {
             return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
@@ -242,7 +243,8 @@ actor AIService {
 
         return try await backendClient.sendCompletionsWithTools(
             request,
-            onSSEEvent: onSSEEvent
+            onSSEEvent: onSSEEvent,
+            invocation: invocation
         )
     }
 
@@ -251,7 +253,8 @@ actor AIService {
     func sendWithToolsDirect(
         messages: [CompletionsMessage],
         disableTools: Bool = false,
-        onSSEEvent: BackendClient.SSEEventHandler? = nil
+        onSSEEvent: BackendClient.SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
         guard !disableLLMCalls else {
             return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
@@ -266,7 +269,8 @@ actor AIService {
 
         return try await backendClient.sendCompletionsWithToolsDirect(
             request,
-            onSSEEvent: onSSEEvent
+            onSSEEvent: onSSEEvent,
+            invocation: invocation
         )
     }
 
@@ -277,11 +281,12 @@ actor AIService {
     /// extension) because `backendClient` is file-private to AIService.
     func sendWithToolsDirect(
         request: CompletionsRequest,
-        onSSEEvent: BackendClient.SSEEventHandler? = nil
+        onSSEEvent: BackendClient.SSEEventHandler? = nil,
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
         guard !disableLLMCalls else {
             return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
         }
-        return try await backendClient.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent)
+        return try await backendClient.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
     }
 }

@@ -599,16 +599,6 @@ struct DynamicIslandChat: View {
             guard !isComposeMode && message == nil else { return }
             regenerateReminders()
         }
-        .onChange(of: AgentToolRouter.shared.pendingAction?.id) { _, newId in
-            guard newId != nil, let action = AgentToolRouter.shared.pendingAction else { return }
-            AgentToolRouter.shared.pendingAction = nil
-            chatMessages.append(ChatMessage(
-                role: .agent,
-                content: "",
-                timestamp: Date(),
-                actionConfirmation: action
-            ))
-        }
         .onChange(of: ActiveAgentTracker.shared.workingSessions) { _, sessions in
             // Restore working state when view is recreated and agent is still running,
             // or clear it when the agent finishes while this view is active.
@@ -1268,7 +1258,11 @@ struct DynamicIslandChat: View {
                 context: ctx,
                 instruction: instruction,
                 chatHistory: editHistory,
-                onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking...")
+                onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
+                // Owned UI delivery (ADR-IOS-053): compose inline edit enables
+                // calendar/contact tools, so route their confirmation cards to
+                // THIS compose session's pill rather than fast-failing.
+                invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
             )
         }
         let timeoutTask = Task {
@@ -1736,10 +1730,15 @@ struct DynamicIslandChat: View {
             sessionTurns.append(userTurn)
 
             do {
+                // Owned UI delivery (ADR-IOS-053): bind the confirmation channel to
+                // THIS session so any FSM tool's card is delivered to (and rendered
+                // by) the session that launched the turn — never a global slot that
+                // other mounted pills race for.
                 let response = try await AIService.shared.sendChatMessage(
                     userText: enrichedText,
                     history: history,
-                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking...")
+                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
+                    invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
@@ -1903,7 +1902,8 @@ struct DynamicIslandChat: View {
             do {
                 let response = try await AIService.shared.resumeChatMessage(
                     request: request,
-                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking...")
+                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
+                    invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."

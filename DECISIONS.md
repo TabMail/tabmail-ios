@@ -577,6 +577,8 @@ Currently applies to: `email_archive`, `email_delete`, `contacts_edit`, `contact
 - Confirmation cards become non-interactive after response (prevents double-tapping)
 - Task cancellation (Stop button) safely resumes pending confirmations as declined
 
+**SUPERSEDED (delivery mechanism) by ADR-IOS-053:** Step 2 above (a global `pendingAction` slot observed by `DynamicIslandChatButton` via `.onChange`) caused a cross-view delivery race that hung calendar/confirmation tools. Delivery now goes through an owned, explicit, invocation-scoped `AgentUISink` into the invoking session's model, rendered level-triggered. The `ToolDeclinedError` contract (steps 3–6) and Stop-cancel safety are unchanged.
+
 ---
 
 ## Template for New Decisions
@@ -885,6 +887,8 @@ ComposeView contains `.alert`, `.popover`, `.photosPicker`, `.fileImporter`, and
 - `TabMail/Services/AI/Tools/EmailComposeTool.swift`, `EmailReplyTool.swift`, `EmailForwardTool.swift` — call `enqueueCompose` instead of writing `pendingCompose` directly
 - `TabMail/Views/Compose/ComposeView.swift` — `onAppear`/`onDisappear` lifecycle hooks on the body root
 - `TabMail/Views/Compose/DraftComposePresenter.swift` — same hooks on its body root, to close the loading-window race before the inner `ComposeView` renders
+
+**PARTIALLY SUPERSEDED (routing) by ADR-IOS-053:** the InboxView/MessageDetailView `pendingCompose` observer race noted in the Consequences is slated to be fixed (Phase 2) by re-homing compose routing to the owned `AgentUISink`. The cover-serialization FIFO (`composeQueue`/`presentationCount`/`awaitingAppear`) is retained — it solves the distinct "SwiftUI can't stack two fullScreenCovers" constraint, which owned routing does not address.
 
 ---
 
@@ -1824,3 +1828,29 @@ The flip conflated two independent facts:
 **Tests:** `TabMailTests/Shared/ICSSanitizerTests.swift` (16 cases, synthetic fixtures with generic domains + dynamic dates): trigger pathology (X-ALT-DESC dropped, semantics preserved, size under cap), DISPLAY-alarm repair + no-double-DESCRIPTION, EMAIL/PROCEDURE alarm drop with sibling DISPLAY kept, oversized-ATTACH drop, DESCRIPTION truncation at escape-safe boundary, tab/LF folding normalization to ≤75-octet CRLF, multi-byte fold safety, clean-invite preservation, idempotence, non-UTF-8 + non-calendar passthrough, `ICSBuilder.parseIncoming` round-trip parity, control-char strip, organizer-as-attendee drop (keeps organizer + other attendees), and no-drop-when-no-organizer-duplicate.
 
 **Relates:** global CLAUDE.md rule 11 (never truncate stored user content), ADR-IOS-045 (imperative QuickLook/import presentation), `PLAN_ICS_SANITIZER.md`. No TB counterpart — Thunderbird handles incoming invites natively (Lightning); our addon is not in that path.
+
+---
+
+## ADR-IOS-053: Owned, Level-Triggered Delivery for FSM Tool UI Requests (Supersedes the delivery mechanism of ADR-IOS-024 and ADR-IOS-030)
+
+**Context:** Confirmation-based ("FSM") agent tools suspend a chat turn while a UI request (a confirmation card, or a compose window) is shown, then resume on the user's response. The original mechanism (ADR-IOS-024, ADR-IOS-030) handed the request off through a single global slot on `AgentToolRouter` (`pendingAction` / `pendingCompose`) observed by every mounted `DynamicIslandChat` / `InboxView` / `MessageDetailView` via `.onChange`. Because ≥2 of those views are mounted at once in a NavigationStack (the inbox pill stays alive under the message-detail pill), the write raced: the first observer to fire consumed and nilled the slot and delivered the card to *its own* session — possibly an off-screen session the user was not looking at. `.onChange` is edge-triggered and never replays a value already set when a view mounts, so a request written while no correct observer was live was lost outright. The suspended continuation had no owner and no timeout, so a mis-delivered card produced an infinite "creating/editing calendar" spinner and wasted the LLM round. Reproduced on `calendar_event_create`, which does zero pre-card work — proving the fault is delivery, not any provider/network/timeout path.
+
+**Decision:**
+1. **Owned routing, explicit seam.** The invoking chat session's delivery channel (`AgentUISink`, holding the `ChatPillState.Session` captured at send time) is passed as an explicit invocation-scoped parameter (`ToolInvocation`) threaded alongside the existing `onSSEEvent` handler: `AIService.sendChatMessage`/`resumeChatMessage` → `sendWithTools[Direct]` → `BackendClient.sendCompletionsWithTools[Direct]`/`…Internal` → `ToolRegistry.execute` → `AgentTool.execute`. It is NOT ambient (no `@TaskLocal`) and NOT part of `ToolContext` (which stays construction-scoped for global deps). A confirmation tool invoked with a nil sink (non-interactive callers: reply precompute, inline edit, task eval, BYOK smoke) returns `ok:false` immediately — a visible structural failure, never a hang.
+2. **Level-triggered rendering.** The pending UI request is stored in the owning `ChatPillState.Session` (which outlives pill expand/collapse and view teardown) as a `ChatMessage(actionConfirmation:)` and rendered declaratively by the pill's `ChatBubble` → `ActionConfirmationCard`. No global slot, no `.onChange` edge event. A request in the model is shown whenever that session's pill is on screen and cannot be missed or raced. `AgentToolRouter.pendingAction` and its observer are removed.
+3. **No timeouts.** Delivery is now reliable and level-triggered, so the card is never lost; the continuation's only resolvers are the user's response and Stop (task cancellation → declined via `withTaskCancellationHandler` + `ContinuationGuard`, unchanged). Timeouts are prohibited on this path.
+4. **Applies to all FSM tooling.** Confirmation cards (Phase 1, implemented — the 12 confirmation tools) and compose windows (Phase 2, planned — keeps ADR-IOS-030's cover-serialization FIFO but re-homes routing to the owned channel).
+
+**Implementation shape (minimal-churn form of the sub-decision):** `AgentTool.execute(arguments:invocation:)` is a protocol requirement with an extension default that forwards to `execute(arguments:)`, so **non-FSM tools are untouched** (they inherit the default). `invocation` params are **defaulted** to `.noninteractive` through the completion chain, so **non-interactive callers are untouched**. FSM tools implement `execute(arguments:invocation:)` (real logic using `invocation.uiSink`) plus a trivial `execute(arguments:)` forwarder to `.noninteractive`.
+
+**Rationale:**
+- A missing delivery channel must fail at compile time or as an immediate `ok:false`, never as a silent hang. Explicit threading + the nil-sink check make the missing-channel case loud; `@TaskLocal` would reintroduce the same silent-wiring failure class and is at odds with the codebase's explicit-concurrency stance.
+- Level-triggered rendering from owned session state is structurally immune to the edge-triggered / no-replay / cross-view-race failure modes of the global slot, and additionally routes concurrent turns in different sessions correctly.
+- Construction-scoped deps (`ToolContext`) and invocation-scoped routing (`ToolInvocation`) are different lifetimes, kept separate.
+
+**Consequences:**
+- The observer races on `pendingAction` (and, after Phase 2, `pendingCompose`) are eliminated.
+- Non-interactive completion paths pass `ToolInvocation.noninteractive`.
+- In-memory only: app kill still loses an in-flight turn (consistent with ADR-IOS-030) — acceptable; these are session-scoped agent intents, not durable user actions (contrast ADR-IOS-018/019).
+- **Tests:** `TabMailTests/Tools/FSMToolDeliveryTests.swift` — owned routing (card reaches only the invoking sink, not another session's), nil-sink fast-fail without suspension, accept/decline resume, and `SessionUISink` level-triggered append.
+- **Files:** `TabMail/Services/AI/Tools/ToolInvocation.swift` (new: `ToolInvocation`, `AgentUISink`, `SessionUISink`); `ToolRegistry.swift`, `AgentToolRouter.swift`, `BackendClient.swift`, `AIService.swift`, `AIChat.swift`, `DynamicIslandChatButton.swift`, and the 12 confirmation tools.
