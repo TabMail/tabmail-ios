@@ -339,6 +339,25 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // 0xdead10cc defense: suspend GRDB databases just before process
         // suspension, resume on foreground/push/BGTask (ADR-IOS-041).
         DatabaseSuspension.shared.start()
+        // synchronous=NORMAL durability valve: fsync the WAL just before the app suspends,
+        // so committed user intent (PendingOperation / OutboxMessage) survives an unclean
+        // power-off while backgrounded (NORMAL doesn't fsync per commit). `beginBackgroundWork`
+        // keeps the DB resumed + defers the quiesce until the checkpoint finishes; the
+        // UIBackgroundTask assertion asks iOS for the brief time to run it. Best-effort.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                let bgTask = UIApplication.shared.beginBackgroundTask(withName: "wal-durability-checkpoint")
+                DatabaseSuspension.shared.beginBackgroundWork("wal-durability-checkpoint")
+                Task { @MainActor in
+                    await AppDatabase.checkpointForDurability()
+                    DatabaseSuspension.shared.endBackgroundWork("wal-durability-checkpoint")
+                    if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+                }
+            }
+        }
         // Build the database OFF the synchronous launch path, on EVERY launch
         // type. `didFinishLaunching` always runs — including cold BACKGROUND
         // launches (silent push / BGTask / notification action) where the

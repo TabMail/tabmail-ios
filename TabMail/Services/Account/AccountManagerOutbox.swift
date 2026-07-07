@@ -51,6 +51,13 @@ extension AccountManager {
             // Notify MessageDetailViewModel so reply/forward indicator updates immediately
             NotificationCenter.default.post(name: .messageDataDidChange, object: resolvedOriginalId)
         }
+        // synchronous=NORMAL durability: the OutboxMessage row is committed, but NORMAL
+        // does not fsync per commit. Harden the send NOW (async, off the compose-dismiss
+        // path) so it survives an unclean power-off before the drain runs — a dropped send
+        // is the outbox's cardinal sin. Skip on dedup (no new row was written).
+        if !result.deduped {
+            Task { await AppDatabase.checkpointForDurability() }
+        }
         Task { await self.drainOutbox() }
         return result.outboxId
     }

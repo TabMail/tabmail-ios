@@ -33,8 +33,10 @@ final class AppDatabase: Sendable {
     /// cheaply probe for pending migration work (`hasPendingMigrationWork`) and
     /// decide whether to show the "Updating…" splash BEFORE paying for the
     /// (possibly slow) migration passes. See `AppStartup`.
-    static func makePool() throws -> DatabasePool {
-        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+    /// The production DB configuration (WAL, synchronous=NORMAL, suspension-aware, manual
+    /// checkpointing). Extracted from `makePool` so tests can assert the pragmas against a
+    /// temp-path pool without touching the real DB file.
+    static func makeConfiguration() -> Configuration {
         var config = Configuration()
         config.journalMode = .wal
         config.busyMode = .timeout(5)
@@ -71,8 +73,24 @@ final class AppDatabase: Sendable {
         // Now checkpoints land only on `.background`, keeping the foreground path fast.
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+            // synchronous=NORMAL: WAL commits no longer fsync (only checkpoints do),
+            // removing the per-commit fsync that stalled `merge.phase1` ~5s on cold-disk
+            // foreground-return (that one commit's WAL fsync WAS the stall — see 4f3dacb).
+            // NORMAL is corruption-safe and always consistent; a committed txn is durable
+            // across app CRASH / KILL / clean reboot (the WAL is a persisted file, held by
+            // the OS regardless of `synchronous`). It risks ONLY the last un-checkpointed
+            // commits on an UNCLEAN power loss / kernel panic. That window is closed for
+            // USER INTENT (PendingOperation / OutboxMessage) by `checkpointForDurability()`:
+            // forced on `didEnterBackground` (fsync before the app suspends) and right after
+            // `queueSend`. Cache writes (merge / sync / FTS-header) simply get fast commits.
+            try db.execute(sql: "PRAGMA synchronous = NORMAL")
         }
-        return try DatabasePool(path: databaseURL.path, configuration: config)
+        return config
+    }
+
+    static func makePool() throws -> DatabasePool {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        return try DatabasePool(path: databaseURL.path, configuration: makeConfiguration())
     }
 
     /// True if migrating `pool` will do real work: pending GRDB schema
@@ -175,6 +193,23 @@ final class AppDatabase: Sendable {
     /// scheduler, so foreground/`.normal` work is never queued behind them.
     static var backgroundPool: PrioritizedDatabase {
         PrioritizedDatabase(pool: rawPool, priority: .background)
+    }
+
+    /// Force-fsync the WAL so `synchronous=NORMAL` commits become durable on disk NOW.
+    /// NORMAL never fsyncs per commit (only checkpoints do), so an un-checkpointed commit
+    /// can be lost on an UNCLEAN power loss. This closes that window for USER INTENT by
+    /// checkpointing at the two moments intent must be hardened: just before the app
+    /// suspends (`didEnterBackground`) and right after a send is queued. TRUNCATE also
+    /// shrinks the WAL; it degrades to a partial checkpoint if readers pin frames but
+    /// still fsyncs what it flushes. Runs on the RAW pool (immediate, SQLite-serialized —
+    /// not queued behind `.background` work) and is best-effort: a suspended DB skips it
+    /// (the next checkpoint covers it). Not throttled — unlike `checkpointWALThrottled`,
+    /// these two callsites are rare and durability-critical.
+    static func checkpointForDurability() async {
+        guard !DatabaseSuspension.isSuspended else { return }
+        _ = try? await rawPool.writeWithoutTransaction { db in
+            try? Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+        }
     }
 
     // MARK: - NSE Staging Database
