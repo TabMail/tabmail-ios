@@ -566,7 +566,11 @@ final class MessageDetailViewModel {
     @discardableResult
     func adoptReadyBody(source: String, allowStagedFallback: Bool = true) async -> Bool {
         let rid = resolvedId
-        if let body = try? await dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
+        // `dbPool.pool` (raw pool), NOT `dbPool.read`: same reason as loadBody's cache-check —
+        // the read-through merge would block this durable read behind an in-flight merge and
+        // defeat the staged fallback below. Raw read = durable body instantly, else nil-fast
+        // → staged fallback. `.pool` (not `AppDatabase.rawPool`) keeps `_dbPoolOverride` honored.
+        if let body = try? await dbPool.pool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
             return adopt(body, source: source, rid: rid, mark: "detail body via \(source)")
         }
         if allowStagedFallback, let stagedBody = NSEDataBridge.stagedBodyFallback(headerId: rid) {
@@ -741,7 +745,15 @@ final class MessageDetailViewModel {
         var msg: MessageHeader?
         do {
             let mid = messageId
-            msg = try await dbPool.read { db in try MessageHeader.fetchOne(db, key: mid) }
+            // `dbPool.pool` (raw), NOT `dbPool.read`: the async `dbPool.read` awaits
+            // `mergeIfStagingPending()` first (PriorityGate :203), so it BLOCKS this header
+            // resolve behind an in-flight merge — and it runs SEQUENTIALLY before the body
+            // read below, so it gates the entire open (the ~5s that preceded the body on a
+            // notif-tap, boot_logs 3). The header is already on screen from seedAtInit's
+            // staged snapshot; this is the durable refresh, so a nil-fast raw read →
+            // resolveMessageAsync (raw + staged fallback) keeps the open off the merge path.
+            // `.pool` honors a `_dbPoolOverride` test pool.
+            msg = try await dbPool.pool.read { db in try MessageHeader.fetchOne(db, key: mid) }
         } catch is CancellationError {
             print("[MoveTrace] loadBody — task cancelled during initial DB read, deferring to body poll")
             BootProfiler.mark("detail loadBody CANCELLED (initial read) → poll")
@@ -810,7 +822,16 @@ final class MessageDetailViewModel {
         // Check if body already loaded (use resolvedId which may differ from messageId)
         let rid = resolvedId
         do {
-            if let existingBody = try await dbPool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
+            // `dbPool.pool` (raw DatabasePool), NOT `dbPool.read`: the read-through
+            // `PrioritizedDatabase.read` runs the staging merge FIRST, blocking this body
+            // cache-check behind an in-flight merge — measured 7.8s on a notif-tap during
+            // the cold-start foreground herd (merge.phase1 stalled 5s, then the read queued
+            // behind the fullSync writes). Reading the raw pool: a durable body returns
+            // instantly; a not-yet-merged body returns nil FAST so we fall through to the
+            // STAGED fallback below (value-identical bytes the merge will commit). Uses
+            // `dbPool.pool` (NOT `AppDatabase.rawPool`) so a `_dbPoolOverride` test pool is
+            // still honored. Mirrors `resolveProviderTap`, whose tiers rawPool for this reason.
+            if let existingBody = try await dbPool.pool.read({ db in try MessageBody.fetchOne(db, key: rid) }) {
                 // Body already loaded — trigger priority AI processing if needed.
                 // Matches TB's onMessagesDisplayed direct path: when user opens a message
                 // with a body but missing AI state, process immediately (bypasses queue).
@@ -1393,7 +1414,13 @@ final class MessageDetailViewModel {
     /// but skipping the read avoids misleading "not found" log entries.
     private func resolveMessageAsync(compositeId: String) async -> MessageHeader? {
         guard !Task.isCancelled else { return nil }
-        let dbHit: MessageHeader? = try? await dbPool.read { db in
+        // `dbPool.pool` (raw), NOT `dbPool.read`: same reason as loadBody's header read —
+        // `dbPool.read` would block on `mergeIfStagingPending()`. Raw-read the durable copy
+        // (PK → cross-folder → rfc822), then fall through to `stagedRowFallback` below for a
+        // not-yet-merged (staged) message. Keeps notif-tap resolution off the merge path;
+        // a UID-remap that lands only in the pending merge self-heals via the merge-commit
+        // catch-up. `.pool` honors a `_dbPoolOverride` test pool.
+        let dbHit: MessageHeader? = try? await dbPool.pool.read { db in
             if let msg = try MessageHeader.fetchOne(db, key: compositeId) { return msg }
 
             let parts = compositeId.split(separator: ":", maxSplits: 2)
