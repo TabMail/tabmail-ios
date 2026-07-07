@@ -199,16 +199,21 @@ final class AppDatabase: Sendable {
     /// NORMAL never fsyncs per commit (only checkpoints do), so an un-checkpointed commit
     /// can be lost on an UNCLEAN power loss. This closes that window for USER INTENT by
     /// checkpointing at the two moments intent must be hardened: just before the app
-    /// suspends (`didEnterBackground`) and right after a send is queued. TRUNCATE also
-    /// shrinks the WAL; it degrades to a partial checkpoint if readers pin frames but
-    /// still fsyncs what it flushes. Runs on the RAW pool (immediate, SQLite-serialized —
-    /// not queued behind `.background` work) and is best-effort: a suspended DB skips it
-    /// (the next checkpoint covers it). Not throttled — unlike `checkpointWALThrottled`,
-    /// these two callsites are rare and durability-critical.
+    /// suspends (`didEnterBackground`) and right after a send is queued.
+    ///
+    /// PASSIVE, not TRUNCATE: on synchronous=NORMAL every checkpoint fsyncs the WAL first
+    /// (SQLite: "the WAL file is synchronized before each checkpoint"), so PASSIVE already
+    /// hardens every committed frame — which is all durability needs. TRUNCATE additionally
+    /// RESETS the WAL, which BLOCKS on all readers draining: a device capture showed
+    /// TRUNCATE taking 7.6s while the 5-account sync herd held read snapshots. This runs on
+    /// the RAW pool (SQLite-serialized with the writer), so a blocking TRUNCATE after a send
+    /// would stall the next merge/sync write for seconds. PASSIVE never waits on readers.
+    /// WAL shrink stays the background maintenance's job (`checkpointWALThrottled(truncate:)`).
+    /// Best-effort: a suspended DB skips it (the next checkpoint covers it).
     static func checkpointForDurability() async {
         guard !DatabaseSuspension.isSuspended else { return }
         _ = try? await rawPool.writeWithoutTransaction { db in
-            try? Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+            try? Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(PASSIVE)")
         }
     }
 
