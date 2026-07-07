@@ -894,14 +894,19 @@ extension SyncEngine {
                     // normally via the dedup + stale-check paths above; this guard
                     // only prevents destructive metadata refresh on existing rows.
                     if folder.role == .drafts || folder.role == .sent {
-                        upsDraftSentSkip += 1
-                        // Debug-gated: this fired a RAW print per sent/draft message on
-                        // EVERY full sync (the sent-folder log spam that grew across a
-                        // session). The count is now folded into the aggregate
+                        // Preserve local drafts/sent content — the server's drafts.list /
+                        // summary metadata lags behind the real message right after a local
+                        // push. Counted in `upsDraftSentSkip`, reported in the aggregate
                         // `fullSync upsert[...]` mark below.
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[Sync] DraftUpsertSkip: preserving local content for \(info.messageId) (folder=\(folder.role.rawValue)) — sync summary may be stale from drafts.list cache")
-                        }
+                        //
+                        // NO per-message log here: it fired ~50×/full-sync INSIDE the write
+                        // transaction. Even debug-gated, when logging was ON each print cost
+                        // ~80ms of (stdout→file) I/O — measured loop=4130ms vs recon=11ms for
+                        // a 50-skip Sent sync (boot/logmain 2026-07-06), i.e. ~4s of the
+                        // single GRDB writer held per Sent sync, plus hundreds of piled log
+                        // lines. The aggregate count is the diagnostic; the per-id detail
+                        // isn't worth holding the writer.
+                        upsDraftSentSkip += 1
                         continue
                     }
                     // Update existing message with latest data from server.
