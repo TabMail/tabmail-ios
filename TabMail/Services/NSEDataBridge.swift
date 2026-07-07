@@ -501,52 +501,13 @@ enum NSEDataBridge {
         return try? DatabaseQueue(path: stagingPath, configuration: config)
     }
 
-    /// Direct read of ONE staged message from the NSE staging file for the
-    /// notification-tap DISPLAY path (ADR-IOS-049). Serves the just-pushed
-    /// message from the NSE's own source of truth WITHOUT waiting on the durable
-    /// merge — the decoupling the merge drift broke (`latestStagedRows` /
-    /// `latestStagedBodies` are populated ONLY as a side-effect of a merge
-    /// running, so a tap that arrives before a merge misses every in-memory
-    /// tier). Reads by PRIMARY KEY `id = "<accountId>:<messageId>"`
-    /// (`NSEStagingDB.stageHeader` flips `populated=1` FIRST, before body/AI —
-    /// so a tapped message's header is present by construction).
-    ///
-    /// Returns the display header whenever a `populated=1` row exists, and the
-    /// body ONLY when a usable (non-empty, non-CID) rendered body is staged
-    /// (else nil → the caller falls to the server fetch, unchanged).
-    ///
-    /// `stagingPathOverride` is the unit-test seam (mirrors
-    /// `mergeNSEStagingData(stagingPathOverride:)`) so tests seed a temp staging
-    /// file with no App Group entitlement. MUST only be called from a FOREGROUND
-    /// context (a tap): `openStagingDB()` observes suspension, so a suspended
-    /// read is rejected — never call from a background/suspended path.
-    static func readStagedForDisplay(
-        accountId: String,
-        messageId: String,
-        stagingPathOverride: String? = nil
-    ) async -> (row: StagedInboxRow?, body: StagedBodySnapshot?) {
-        let queue: DatabaseQueue?
-        if let stagingPathOverride {
-            guard FileManager.default.fileExists(atPath: stagingPathOverride) else { return (nil, nil) }
-            var config = Configuration()
-            config.busyMode = .timeout(2.0)
-            config.observesSuspensionNotifications = true
-            queue = try? DatabaseQueue(path: stagingPathOverride, configuration: config)
-        } else {
-            queue = openStagingDB()
-        }
-        guard let queue else { return (nil, nil) }
-        let id = "\(accountId):\(messageId)"
-        let staged: StagedMessage? = try? await queue.read { db in
-            try Row.fetchOne(
-                db,
-                sql: "SELECT * FROM nse_processed_message WHERE id = ? AND populated = 1 LIMIT 1",
-                arguments: [id]
-            ).map { StagedMessage(row: $0) }
-        }
-        guard let staged else { return (nil, nil) }
-        return (staged.toInboxRow(), staged.toBodySnapshot())
-    }
+    // NOTE (2026-07-07): a `readStagedForDisplay` direct staging-FILE read for the
+    // notification-tap path existed here briefly and was REMOVED: consumers reading
+    // the file directly RACE the merge's in-memory snapshot publish
+    // (`latestStagedRows`/`latestStagedBodies`), resolving ids before the snapshot
+    // exists and starving every downstream snapshot consumer (header seed,
+    // mark-read, staged body). The contract is: the merge is the snapshot's ONLY
+    // publisher; consumers read the snapshot (or react to `.messagesStaged`).
 
     /// Public entry point. The NSE→inbox merge is a PRIVILEGED, single-threaded
     /// step of the boot / foreground sequence — it must run ALONE (no concurrent
@@ -652,8 +613,7 @@ enum NSEDataBridge {
         do {
             processed = try await nseDB.read { db in
                 // Row→StagedMessage decode is the SINGLE SOURCE OF TRUTH in
-                // `StagedMessage(row:)` — shared with the tap-path
-                // `readStagedForDisplay` so a column change lands in ONE place.
+                // `StagedMessage(row:)` — a column change lands in ONE place.
                 try Row.fetchAll(db, sql: "SELECT * FROM nse_processed_message WHERE populated = 1")
                     .map { StagedMessage(row: $0) }
             }
@@ -675,7 +635,7 @@ enum NSEDataBridge {
         // write. Separate signal from `.inboxDataDidChange` (doesn't touch its
         // 2-post contract); the VM dedups against `loadedIds`, so re-posting the
         // same rows on a no-op re-merge inserts nothing. Body/badge unaffected.
-        // `toInboxRow()` is the SINGLE builder shared with `readStagedForDisplay`.
+        // `toInboxRow()` is the SINGLE StagedMessage→row builder.
         let stagedRows = processed.map { $0.toInboxRow() }
         // Replace-all snapshot for the non-render fallbacks (notification deep-link
         // resolution, MessageDetailViewModel synthesis). Updated on EVERY merge —
@@ -2534,10 +2494,9 @@ final class OneShotGate: Sendable {
 // MARK: - StagedMessage: row decode + display projections
 //
 // SINGLE SOURCE OF TRUTH for turning a `nse_processed_message` staging row into
-// the display projections, shared by `mergeNSEStagingData` (batch) and the
-// tap-path `readStagedForDisplay` (single row). In an extension (not the struct
-// body) so `StagedMessage`'s memberwise `init(id:…)` — used by the merge helpers
-// and their tests — stays synthesized.
+// the display projections `mergeNSEStagingData` publishes. In an extension (not
+// the struct body) so `StagedMessage`'s memberwise `init(id:…)` — used by the
+// merge helpers and their tests — stays synthesized.
 extension NSEDataBridge.StagedMessage {
     /// Decode a `nse_processed_message` staging row. Any column change lands
     /// HERE once (see `StagedMessage`'s keep-in-sync doc).
@@ -2604,8 +2563,7 @@ extension NSEDataBridge.StagedMessage {
     /// The display+action inbox projection (ADR-IOS-049). Snippet laundered via
     /// `stagedDisplaySnippet`; a nil date maps to a fresh `Date()` (matches the
     /// merge's `?? Date()`, which the re-post memo tolerates — see
-    /// `stagedSetChangedSinceLastPost`). SINGLE builder shared by the merge and
-    /// `readStagedForDisplay`.
+    /// `stagedSetChangedSinceLastPost`). SINGLE StagedMessage→row builder.
     func toInboxRow() -> StagedInboxRow {
         StagedInboxRow(
             accountId: accountId,

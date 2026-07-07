@@ -7,22 +7,20 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// Covers the notification-tap DECOUPLING from the NSE merge (ADR-IOS-049,
-/// 2026-07-07):
-///   1. Refactor safety — the merge still builds identical `latestStagedRows` /
-///      `latestStagedBodies` after the `StagedMessage(row:)` / `.toInboxRow()` /
-///      `.toBodySnapshot()` extraction (behavior-preserving).
-///   2. `NSEDataBridge.readStagedForDisplay` — the direct staging-file read that
-///      serves a tap WITHOUT waiting on the merge: header whenever `populated=1`,
-///      body only when a usable (non-empty, non-CID) rendered body is staged,
-///      PK-scoped so it can't return another account's row.
+/// Refactor safety for the `StagedMessage(row:)` / `.toInboxRow()` /
+/// `.toBodySnapshot()` extraction: the merge must build the SAME
+/// `latestStagedRows` / `latestStagedBodies` snapshot the inline code built
+/// before the extraction. These snapshots are the single read-model every
+/// staged-not-yet-durable consumer relies on (inbox `insertStagedRows`, the
+/// detail view's `seedAtInit` + `.messagesStaged` seed, `stagedBodyFallback`),
+/// so a field drift here silently breaks the reveal path.
 ///
 /// Drives the REAL merge + REAL staging file via the `stagingPathOverride` seam
 /// (unit-test host has no App Group entitlement), same harness as
 /// `NSEGradualMergeTests`.
-@Suite("Staged direct read + merge snapshot parity", .serialized)
+@Suite("Merge staged-snapshot parity", .serialized)
 @MainActor
-struct StagedDirectReadTests {
+struct StagedSnapshotParityTests {
 
     // MARK: - Harness (mirrors NSEGradualMergeTests)
 
@@ -57,7 +55,7 @@ struct StagedDirectReadTests {
     /// Stage 1 — header only (`populated=1`), mirroring `NSEStagingDB.stageHeader`.
     private func stageHeaderRow(
         _ q: DatabaseQueue, accountId: String = "acc1", messageId: String = "msg-1",
-        subject: String = "Subject under test", populated: Int = 1
+        subject: String = "Subject under test"
     ) throws {
         try q.write { db in
             try db.execute(sql: """
@@ -67,10 +65,10 @@ struct StagedDirectReadTests {
                      processedAt, aiCompleted, notified, populated)
                 VALUES (?, ?, 'user@example.com', 'gmail', ?, ?, 'INBOX',
                         ?, 'Alice', 'alice@example.com', 'snippet preview', ?,
-                        ?, 0, 0, ?)
+                        ?, 0, 0, 1)
                 """, arguments: [
                     "\(accountId):\(messageId)", accountId, messageId, "rfc-\(messageId)@example.com",
-                    subject, Double(1_710_000_000), Date().timeIntervalSince1970, populated
+                    subject, Double(1_710_000_000), Date().timeIntervalSince1970
                 ])
         }
     }
@@ -108,7 +106,7 @@ struct StagedDirectReadTests {
         MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: messageId)
     }
 
-    // MARK: - 1. Merge snapshot parity (refactor safety)
+    // MARK: - Snapshot parity
 
     @Test("merge builds the staged row + body snapshot for a header+body row")
     func mergeParityHeaderAndBody() async throws {
@@ -156,107 +154,5 @@ struct StagedDirectReadTests {
         #expect(rows.count == 1, "header still surfaces")
         let bodies = NSEDataBridge.latestStagedBodies.withLock { $0 }
         #expect(bodies[headerId("msg-1")] == nil, "CID body excluded from snapshot")
-    }
-
-    // MARK: - 2. readStagedForDisplay (the direct read)
-
-    @Test("readStagedForDisplay returns the header for a populated=1 row, no body when none staged")
-    func directReadHeaderOnly() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let staging = try makeStagingFile(in: dir)
-        try stageHeaderRow(staging.queue, subject: "Header only")
-
-        let (row, body) = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "msg-1", stagingPathOverride: staging.path
-        )
-        #expect(row?.subject == "Header only")
-        #expect(row?.headerId == headerId("msg-1"))
-        #expect(body == nil, "no body staged yet → nil (caller falls to server fetch)")
-    }
-
-    @Test("readStagedForDisplay returns the body once a usable rendered body is staged")
-    func directReadWithBody() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let staging = try makeStagingFile(in: dir)
-        try stageHeaderRow(staging.queue)
-        try stageBodyRow(staging.queue, html: "<p>direct body</p>")
-
-        let (row, body) = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "msg-1", stagingPathOverride: staging.path
-        )
-        #expect(row != nil)
-        #expect(body?.htmlContent == "<p>direct body</p>")
-    }
-
-    @Test("readStagedForDisplay excludes an unresolved-CID body (header still returned)")
-    func directReadExcludesCID() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let staging = try makeStagingFile(in: dir)
-        try stageHeaderRow(staging.queue)
-        try stageCIDBodyRow(staging.queue)
-
-        let (row, body) = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "msg-1", stagingPathOverride: staging.path
-        )
-        #expect(row != nil, "header surfaces")
-        #expect(body == nil, "CID body excluded → server re-render")
-    }
-
-    @Test("readStagedForDisplay returns nil for an absent id and for a populated=0 row")
-    func directReadAbsentAndUnpopulated() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let staging = try makeStagingFile(in: dir)
-        try stageHeaderRow(staging.queue, messageId: "present", populated: 1)
-        try stageHeaderRow(staging.queue, messageId: "lease", populated: 0) // AI lease placeholder
-
-        let absent = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "missing", stagingPathOverride: staging.path
-        )
-        #expect(absent.row == nil && absent.body == nil)
-
-        let unpopulated = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "lease", stagingPathOverride: staging.path
-        )
-        #expect(unpopulated.row == nil, "populated=0 lease placeholder is invisible")
-    }
-
-    @Test("readStagedForDisplay is PK-scoped: same UID in two accounts resolves the right account")
-    func directReadAccountScoped() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let staging = try makeStagingFile(in: dir)
-        // Same provider id "100" (an IMAP UID) staged under two accounts.
-        try stageHeaderRow(staging.queue, accountId: "acc1", messageId: "100", subject: "A1 msg")
-        try stageHeaderRow(staging.queue, accountId: "acc2", messageId: "100", subject: "A2 msg")
-
-        let a1 = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "100", stagingPathOverride: staging.path
-        )
-        let a2 = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc2", messageId: "100", stagingPathOverride: staging.path
-        )
-        #expect(a1.row?.subject == "A1 msg")
-        #expect(a1.row?.accountId == "acc1")
-        #expect(a2.row?.subject == "A2 msg")
-        #expect(a2.row?.accountId == "acc2")
-    }
-
-    @Test("readStagedForDisplay returns nil when the staging file does not exist")
-    func directReadNoFile() async throws {
-        let missing = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString).appendingPathComponent("nope.sqlite").path
-        let (row, body) = await NSEDataBridge.readStagedForDisplay(
-            accountId: "acc1", messageId: "x", stagingPathOverride: missing
-        )
-        #expect(row == nil && body == nil)
     }
 }
