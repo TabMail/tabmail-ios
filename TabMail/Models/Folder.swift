@@ -59,6 +59,14 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// so the walk ABORTS (never delete on uncertainty — the UID-remap/resync
     /// machinery owns that case). Nil until the first walk runs.
     var lastKnownUidValidity: Int?
+    /// IMAP CONDSTORE (RFC 7162): last observed HIGHESTMODSEQ — the flag-aware
+    /// change cursor for delta/full sync. When `uidNext`+`totalCount` are unchanged
+    /// but this bumped, a \Seen/flag change happened on an EXISTING message (which
+    /// STATUS-count-only detection misses today). Only comparable WITHIN one
+    /// UIDVALIDITY epoch — reset when `lastKnownUidValidity` changes. Nil until the
+    /// first STATUS on a CONDSTORE server; nil also means "no CONDSTORE" → callers
+    /// fall back to the uidNext+count comparison.
+    var lastKnownHighestModSeq: Int?
 
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"

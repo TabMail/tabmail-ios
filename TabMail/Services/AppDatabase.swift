@@ -1866,5 +1866,16 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_accountId_messageId ON messageHeader(accountId, messageId)")
             try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_accountId")
         }
+
+        migrator.registerMigration("v65_addFolderHighestModSeq") { db in
+            // IMAP CONDSTORE (RFC 7162) flag-aware change cursor. Lets delta sync detect
+            // \Seen/flag changes on EXISTING messages (which uidNext+count miss — the
+            // latent "read-on-another-client doesn't propagate on IMAP" bug) and lets
+            // full sync SKIP fetching provably-unchanged folders. Nullable; bootstrapped
+            // by the first STATUS on a CONDSTORE server (nil → uidNext+count fallback).
+            try db.alter(table: "folder") { t in
+                t.add(column: "lastKnownHighestModSeq", .integer)
+            }
+        }
     }
 }

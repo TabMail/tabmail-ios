@@ -707,6 +707,18 @@ extension SyncEngine {
         return (true, true)
     }
 
+    /// CONDSTORE (RFC 7162) flag-change signal for IMAP delta: does the server's
+    /// current HIGHESTMODSEQ indicate a change since our cached cursor? True ONLY when
+    /// both are present AND differ. A nil `server` (server doesn't advertise CONDSTORE)
+    /// or nil `cached` (first observation / not yet recorded) yields false → the caller
+    /// falls back to its uidNext+count comparison (exactly today's behavior). Pure +
+    /// nonisolated for unit testing; the epoch (UIDVALIDITY) subtlety is handled safely
+    /// upstream because this only gates FETCHING, never deletion.
+    nonisolated static func modSeqIndicatesChange(server: Int?, cached: Int?) -> Bool {
+        guard let server, let cached else { return false }
+        return server != cached
+    }
+
     /// IMAP delta sync using STATUS-based change detection.
     /// Calls STATUS on each folder to check uidNext/messageCount — skips unchanged folders.
     private func imapDeltaSync(account: Account, provider: IMAPProvider, inboxOnly: Bool = false) async throws -> (succeeded: Bool, hadChanges: Bool) {
@@ -737,9 +749,22 @@ extension SyncEngine {
 
             let uidNextChanged = folder.lastKnownUidNext != nil && status.uidNext != folder.lastKnownUidNext
             let countChanged = status.messageCount != folder.totalCount
+            // CONDSTORE flag-awareness (RFC 7162): HIGHESTMODSEQ bumps on \Seen/flag
+            // changes to EXISTING messages that leave uidNext+count unchanged — which the
+            // two checks above MISS today (a message read on another client stays "unread"
+            // on iOS until an unrelated add/delete happens to trip a resync, or never, if
+            // it's below the top-N window). This gate only decides whether we FETCH, never
+            // whether we delete (stale/reconcile own deletions, with their own UIDVALIDITY
+            // guards), so it's safe by construction: a wrong result at worst delays a flag
+            // update one cycle. Non-CONDSTORE servers (nil modseq) and the first
+            // observation (nil cursor) yield no modseq signal → exactly today's behavior.
+            // A UIDVALIDITY change resets the server's modseq, but that also moves
+            // uidNext/count → caught by those; we still refresh the cursor below.
+            let modSeqChanged = Self.modSeqIndicatesChange(
+                server: status.highestModSeq, cached: folder.lastKnownHighestModSeq)
 
-            if !uidNextChanged && !countChanged {
-                print("[Sync] IMAP delta: \(folder.name) unchanged (uidNext=\(status.uidNext), count=\(status.messageCount))")
+            if !uidNextChanged && !countChanged && !modSeqChanged {
+                print("[Sync] IMAP delta: \(folder.name) unchanged (uidNext=\(status.uidNext), count=\(status.messageCount), modseq=\(status.highestModSeq.map(String.init) ?? "-"))")
                 continue
             }
 
@@ -763,11 +788,17 @@ extension SyncEngine {
 
             // Update cached state (uidNext, totalCount) — unread recount handled by UnreadCountManager
             try await dbPool.write { db in
-                _ = try Folder.filter(Column("id") == folder.id)
-                    .updateAll(db,
-                        Column("lastKnownUidNext").set(to: status.uidNext),
-                        Column("totalCount").set(to: status.messageCount)
-                    )
+                var assignments: [ColumnAssignment] = [
+                    Column("lastKnownUidNext").set(to: status.uidNext),
+                    Column("totalCount").set(to: status.messageCount)
+                ]
+                // Refresh the CONDSTORE cursor so the NEXT delta can detect flag-only
+                // changes. A UIDVALIDITY change moves uidNext/count (→ this path re-runs),
+                // so a stale-epoch modseq self-corrects on the following cycle.
+                if let modseq = status.highestModSeq {
+                    assignments.append(Column("lastKnownHighestModSeq").set(to: modseq))
+                }
+                _ = try Folder.filter(Column("id") == folder.id).updateAll(db, assignments)
             }
 
             // ADR-IOS-051 Phase 2 trigger: compare the LIVE local header count

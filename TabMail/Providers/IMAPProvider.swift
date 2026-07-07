@@ -10,6 +10,16 @@ struct IMAPFolderStatus: Sendable {
     let messageCount: Int
     let uidNext: Int
     let unreadCount: Int
+    /// RFC 7162 CONDSTORE HIGHESTMODSEQ — increments on ANY change including
+    /// \Seen/flag updates that leave `uidNext`/`messageCount` unchanged (which
+    /// STATUS-count delta sync misses today). nil when the server doesn't
+    /// advertise CONDSTORE → callers fall back to the uidNext+count comparison.
+    let highestModSeq: Int?
+    /// UIDVALIDITY — MODSEQ (and UIDs) are only comparable within one UIDVALIDITY
+    /// epoch. A change means the mailbox was recreated: callers MUST force a full
+    /// sync and reset any cached modseq, never trust a lower/equal value. nil when
+    /// not reported (no UIDPLUS).
+    let uidValidity: Int?
 }
 
 /// Result of an explicit-UID-set existence SEARCH (deletion reconcile, ADR-IOS-051).
@@ -1538,7 +1548,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             return IMAPFolderStatus(
                 messageCount: status.messageCount ?? 0,
                 uidNext: status.uidNext.map { Int($0.value) } ?? 0,
-                unreadCount: status.unseenCount ?? 0
+                unreadCount: status.unseenCount ?? 0,
+                // Non-nil only when the server advertised CONDSTORE / UIDPLUS
+                // (SwiftMail conditionally requests these STATUS attributes).
+                highestModSeq: status.highestModSequence,
+                uidValidity: status.uidValidity.map { Int($0.value) }
             )
         }
     }
