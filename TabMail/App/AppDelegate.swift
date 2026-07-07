@@ -11,7 +11,11 @@ import GRDB
 /// Stored in `PendingDeepLink.pending` so cold-start taps (before views mount)
 /// are not lost — `MailNavigationView` consumes on appear.
 enum PendingDeepLink: Sendable {
-    case message(id: String)
+    /// `id` is the PROVIDER message id (Gmail id / Graph id / IMAP UID) from the
+    /// push payload. `accountId` is the local `Account.id` the NSE stamped into
+    /// the notification (`EmailNotificationBuilder`), carried so the tap resolve
+    /// can disambiguate a provider id that collides across accounts (IMAP UIDs).
+    case message(id: String, accountId: String?)
     case inbox
     case taskResult(taskHash: String)
 }
@@ -91,6 +95,31 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         }
 
         return [.banner, .sound, .list]
+    }
+
+    /// Build the deep-link forwarding for an NSE new-mail notification TAP. Pure
+    /// + testable (the inline version dropped `accountId`, so the wrong-account
+    /// resolve + the staging-direct tier were dead on the real tap path).
+    ///
+    /// The DELIVERED notification's userInfo carries the local `Account.id`
+    /// (`EmailNotificationBuilder.fill` sets `info["accountId"] = accountId`); the
+    /// `.proactiveNotificationTapped` repost and the cold-start `PendingDeepLink`
+    /// MUST forward it so `handleNotificationDeepLink` can account-scope the
+    /// resolve. Returns nil when this isn't an NSE message tap (no messageId /
+    /// no `provider` marker). Legacy payloads without `accountId` → nil accountId
+    /// (messageId-only resolve, unchanged behavior).
+    /// Returns the cold-start `link` plus the Sendable primitives the warm-path
+    /// repost needs. NOTE: returns primitives (not a built `[AnyHashable: Any]`)
+    /// so the `DispatchQueue.main.async` repost can build the userInfo INSIDE the
+    /// closure — a non-Sendable `[AnyHashable: Any]` captured across the hop is a
+    /// Swift-6 `sending` data-race error.
+    static func nseMessageDeepLink(
+        from userInfo: [AnyHashable: Any]
+    ) -> (link: PendingDeepLink, messageId: String, accountId: String?)? {
+        guard let messageId = userInfo["messageId"] as? String, !messageId.isEmpty,
+              userInfo["provider"] != nil else { return nil }
+        let accountId = userInfo["accountId"] as? String
+        return (.message(id: messageId, accountId: accountId), messageId, accountId)
     }
 
     /// Handle notification tap — deep link to relevant message or chat.
@@ -239,14 +268,17 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         }
 
         // Handle NSE notification tap — deep link to message
-        if let messageId = userInfo["messageId"] as? String,
-           userInfo["provider"] != nil {  // NSE notification (has provider field)
-            PendingDeepLinkStore.store(.message(id: messageId))
+        if let (link, messageId, accountId) = Self.nseMessageDeepLink(from: userInfo) {
+            PendingDeepLinkStore.store(link)
             DispatchQueue.main.async {
+                // Build the userInfo INSIDE the closure — a captured
+                // `[AnyHashable: Any]` is non-Sendable (Swift-6 `sending` error).
+                var post: [AnyHashable: Any] = ["messageId": messageId]
+                if let accountId { post["accountId"] = accountId }
                 NotificationCenter.default.post(
                     name: .proactiveNotificationTapped,
                     object: nil,
-                    userInfo: ["messageId": messageId]
+                    userInfo: post
                 )
                 finish()
             }
@@ -259,11 +291,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             let messageId = userInfo["messageId"] as? String
             let source = userInfo["source"] as? String
             let taskHash = userInfo["sessionId"] as? String
+            let reminderAccountId = userInfo["accountId"] as? String
             let deepLink: PendingDeepLink
             if source == "task", let taskHash {
                 deepLink = .taskResult(taskHash: taskHash)
             } else if let messageId, !messageId.isEmpty, source == "message" {
-                deepLink = .message(id: messageId)
+                deepLink = .message(id: messageId, accountId: reminderAccountId)
             } else {
                 deepLink = .inbox
             }
@@ -273,11 +306,13 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
             DispatchQueue.main.async {
                 switch deepLink {
-                case .message(let id):
+                case .message(let id, let accountId):
+                    var info: [AnyHashable: Any] = ["messageId": id]
+                    if let accountId { info["accountId"] = accountId }
                     NotificationCenter.default.post(
                         name: .proactiveNotificationTapped,
                         object: nil,
-                        userInfo: ["messageId": id]
+                        userInfo: info
                     )
                 case .taskResult(let taskHash):
                     NotificationCenter.default.post(

@@ -19,15 +19,16 @@ struct PendingDeepLinkStoreTests {
         #expect(result == nil)
     }
 
-    @Test("store and consume message deep link")
+    @Test("store and consume message deep link (accountId round-trips)")
     func storeAndConsumeMessage() {
-        PendingDeepLinkStore.store(.message(id: "acct1:INBOX:msg123"))
+        PendingDeepLinkStore.store(.message(id: "msg123", accountId: "acct1"))
         let result = PendingDeepLinkStore.consume()
-        guard case .message(let id) = result else {
+        guard case .message(let id, let accountId) = result else {
             Issue.record("Expected .message deep link")
             return
         }
-        #expect(id == "acct1:INBOX:msg123")
+        #expect(id == "msg123")
+        #expect(accountId == "acct1", "accountId must survive store→consume for account-scoped resolve")
     }
 
     @Test("store and consume inbox deep link")
@@ -50,10 +51,10 @@ struct PendingDeepLinkStoreTests {
 
     @Test("store overwrites previous value")
     func storeOverwrites() {
-        PendingDeepLinkStore.store(.message(id: "first"))
-        PendingDeepLinkStore.store(.message(id: "second"))
+        PendingDeepLinkStore.store(.message(id: "first", accountId: nil))
+        PendingDeepLinkStore.store(.message(id: "second", accountId: nil))
         let result = PendingDeepLinkStore.consume()
-        guard case .message(let id) = result else {
+        guard case .message(let id, _) = result else {
             Issue.record("Expected .message deep link")
             return
         }
@@ -62,7 +63,7 @@ struct PendingDeepLinkStoreTests {
 
     @Test("store message then overwrite with inbox")
     func storeMessageThenInbox() {
-        PendingDeepLinkStore.store(.message(id: "msg1"))
+        PendingDeepLinkStore.store(.message(id: "msg1", accountId: nil))
         PendingDeepLinkStore.store(.inbox)
         let result = PendingDeepLinkStore.consume()
         guard case .inbox = result else {

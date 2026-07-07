@@ -154,6 +154,56 @@ struct NotificationDeepLinkThreadingTests {
         _ = cancellable
     }
 
+    // MARK: - Producer forwards accountId (regression for the dropped-accountId bug)
+
+    @Test("nseMessageDeepLink forwards accountId into BOTH the repost and the cold-start link")
+    func nseDeepLinkForwardsAccountId() {
+        // The delivered notification carries the local Account.id (EmailNotificationBuilder).
+        // The tap path MUST forward it or the wrong-account resolve + staging-direct tier
+        // are dead (they gate on accountId). Regression: the old inline path reposted only
+        // messageId.
+        guard let (link, messageId, accountId) = NotificationDelegate.nseMessageDeepLink(
+            from: ["messageId": "100", "provider": "imap", "accountId": "acc-uuid-1"]
+        ) else {
+            Issue.record("expected an NSE message deep link")
+            return
+        }
+        #expect(messageId == "100")
+        #expect(accountId == "acc-uuid-1",
+                "accountId must be forwarded so the tap resolve can disambiguate accounts")
+        guard case .message(let linkId, let linkAccountId) = link else {
+            Issue.record("expected .message")
+            return
+        }
+        #expect(linkId == "100")
+        #expect(linkAccountId == "acc-uuid-1", "cold-start link must also carry accountId")
+    }
+
+    @Test("nseMessageDeepLink tolerates a legacy payload with no accountId")
+    func nseDeepLinkLegacyNoAccountId() {
+        guard let (link, messageId, accountId) = NotificationDelegate.nseMessageDeepLink(
+            from: ["messageId": "100", "provider": "imap"]
+        ) else {
+            Issue.record("expected a deep link")
+            return
+        }
+        #expect(messageId == "100")
+        #expect(accountId == nil, "no accountId when the payload omits it")
+        guard case .message(_, let linkAccountId) = link else {
+            Issue.record("expected .message")
+            return
+        }
+        #expect(linkAccountId == nil)
+    }
+
+    @Test("nseMessageDeepLink returns nil for a non-NSE-message notification")
+    func nseDeepLinkRejectsNonMessage() {
+        #expect(NotificationDelegate.nseMessageDeepLink(from: ["messageId": "100"]) == nil,
+                "no provider marker → not an NSE new-mail tap")
+        #expect(NotificationDelegate.nseMessageDeepLink(from: ["provider": "imap"]) == nil,
+                "no messageId → not a message deep link")
+    }
+
     @Test("deep link store integrates correctly with notification flow")
     func deepLinkStoreIntegrationWithNotification() async {
         // Clear any leftover state
@@ -173,7 +223,7 @@ struct NotificationDeepLinkThreadingTests {
 
         // Simulate what NotificationDelegate.didReceive does:
         // 1. Store the deep link
-        PendingDeepLinkStore.store(.message(id: "notif-msg-xyz"))
+        PendingDeepLinkStore.store(.message(id: "notif-msg-xyz", accountId: nil))
 
         // 2. Post notification from background (mimics didReceive on arbitrary thread)
         DispatchQueue.global(qos: .utility).async {

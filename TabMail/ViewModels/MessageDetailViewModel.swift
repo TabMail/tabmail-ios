@@ -118,10 +118,29 @@ final class MessageDetailViewModel {
     /// `resolveTapIfNeeded` when the ladder resolves and `messageId` is
     /// rewritten to the composite.
     @ObservationIgnored private var pendingProviderTapId: String?
+    /// The account the pending notification tap belongs to, decoded from the
+    /// sentinel (`notifTap::<accountId>::<providerId>`). Disambiguates the
+    /// resolve when the same provider id (an IMAP UID) exists in more than one
+    /// account. `nil` for legacy sentinels (`notifTap::<providerId>`) → the
+    /// resolve falls back to messageId-only (today's behavior).
+    @ObservationIgnored private var pendingTapAccountId: String?
     /// Single-flight resolve for `pendingProviderTapId` — UNSTRUCTURED so a
     /// cancelled `loadBody` (deep-link nav churn cancels `.task`) doesn't kill
     /// the resolve; `markReadOnOpenIfNeeded` awaits the same task.
     @ObservationIgnored private var tapResolveTask: Task<String?, Never>?
+
+    /// Decode a notification-tap sentinel payload (everything after
+    /// `notificationTapIdPrefix`) into `(accountId?, providerId)`. New shape is
+    /// `<accountId>::<providerId>`; `accountId` is `:`-free (MessageIdentity
+    /// contract) so the FIRST `::` is the unambiguous boundary. A payload with
+    /// no interior `::` is a legacy account-less sentinel → `(nil, payload)`.
+    static func decodeTapSentinel(_ payload: String) -> (accountId: String?, providerId: String) {
+        if let sep = payload.range(of: "::") {
+            return (String(payload[payload.startIndex..<sep.lowerBound]),
+                    String(payload[sep.upperBound...]))
+        }
+        return (nil, payload)
+    }
 
     init(messageId: String) {
         self.messageId = messageId
@@ -180,9 +199,12 @@ final class MessageDetailViewModel {
     /// - Composite header id: match the staged snapshot as before.
     private func seedAtInit() {
         if messageId.hasPrefix(Self.notificationTapIdPrefix) {
-            let providerId = String(messageId.dropFirst(Self.notificationTapIdPrefix.count))
+            let payload = String(messageId.dropFirst(Self.notificationTapIdPrefix.count))
+            let (tapAccountId, providerId) = Self.decodeTapSentinel(payload)
             let stagedRow = NSEDataBridge.latestStagedRows.withLock { rows in
-                rows.first { $0.messageId == providerId }
+                rows.first {
+                    $0.messageId == providerId && (tapAccountId == nil || $0.accountId == tapAccountId)
+                }
             }
             if var m = stagedRow?.toMessageHeader() {
                 applyOverlay(to: &m)
@@ -190,6 +212,7 @@ final class MessageDetailViewModel {
                 self.messageId = m.id
             } else {
                 self.pendingProviderTapId = providerId
+                self.pendingTapAccountId = tapAccountId
             }
         } else if var m = stagedRowFallback(compositeId: messageId) {
             applyOverlay(to: &m)
@@ -205,11 +228,12 @@ final class MessageDetailViewModel {
     /// No-op (true) when nothing is pending.
     private func resolveTapIfNeeded() async -> Bool {
         guard let providerId = pendingProviderTapId else { return true }
+        let accountId = pendingTapAccountId
         let task: Task<String?, Never>
         if let existing = tapResolveTask {
             task = existing
         } else {
-            let t = Task { await Self.resolveProviderTap(providerId) }
+            let t = Task { await Self.resolveProviderTap(providerId, accountId: accountId) }
             tapResolveTask = t
             task = t
         }
@@ -238,6 +262,7 @@ final class MessageDetailViewModel {
     /// 3. merge fallback (rare — no merge in flight ever read staging).
     nonisolated static func resolveProviderTap(
         _ providerId: String,
+        accountId: String? = nil,
         waitSeconds: TimeInterval = SyncConfig.notifTapStagedResolveWaitSeconds,
         pollMs: Int = SyncConfig.notifTapStagedResolvePollMs
     ) async -> String? {
@@ -245,15 +270,22 @@ final class MessageDetailViewModel {
         func mark(_ tier: String, hit: Bool) {
             BootProfiler.mark("notifTap: resolved via \(tier) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (hit=\(hit))")
         }
+        // accountId disambiguates the same provider id (an IMAP UID is a
+        // per-mailbox small integer → COLLIDES across accounts) so account A's
+        // push never opens account B's message. `nil` (legacy sentinel) →
+        // messageId-only match, today's behavior.
         func stagedMatch() -> String? {
             NSEDataBridge.latestStagedRows.withLock { rows in
-                rows.first { $0.messageId == providerId }?.headerId
+                rows.first {
+                    $0.messageId == providerId && (accountId == nil || $0.accountId == accountId)
+                }?.headerId
             }
         }
         @Sendable func durableMatch(_ db: Database) throws -> String? {
-            try MessageHeader
+            var request = MessageHeader
                 .filter(Column("messageId") == providerId && Column("isInInbox") == true)
-                .fetchOne(db)?.id
+            if let accountId { request = request.filter(Column("accountId") == accountId) }
+            return try request.fetchOne(db)?.id
         }
         if let id = stagedMatch() { mark("staged", hit: true); return id }
         if let id = (try? await AppDatabase.rawPool.read(durableMatch)) ?? nil {

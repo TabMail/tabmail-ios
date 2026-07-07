@@ -572,22 +572,22 @@ struct MailNavigationView: View {
             // Consume any deep link stored during cold start (notification tap
             // before MailNavigationView was mounted).
             if let pending = PendingDeepLinkStore.consume() {
-                selection = .unified(.inbox)
                 switch pending {
-                case .message(let id):
-                    let exists = (try? AppDatabase.dbPool.read { db in
-                        try MessageHeader.fetchOne(db, key: id) != nil
-                    }) ?? false
-                    if exists {
-                        selectedMessageId = id
-                        print("[MailNav] Cold-start deep link: navigating to message \(id.prefix(30))")
-                    } else {
-                        print("[MailNav] Cold-start deep link: message gone, falling back to inbox")
-                    }
+                case .message(let id, let accountId):
+                    // Route cold-start message taps through the SAME handler as the
+                    // warm path (`.proactiveNotificationTapped`) so they get the
+                    // provider-id resolve ladder + account scoping. The old naive
+                    // `fetchOne(key: id)` used the PROVIDER id as a composite PK
+                    // (never matched) and silently fell back to inbox.
+                    var info: [AnyHashable: Any] = ["messageId": id]
+                    if let accountId { info["accountId"] = accountId }
+                    handleNotificationDeepLink(info)
                 case .taskResult(let taskHash):
                     // Navigate to inbox — InboxView handles expanding chat pill via notification
+                    selection = .unified(.inbox)
                     print("[MailNav] Cold-start deep link: navigating to inbox for task result \(taskHash)")
                 case .inbox:
+                    selection = .unified(.inbox)
                     print("[MailNav] Cold-start deep link: navigating to inbox")
                 }
             }
@@ -642,21 +642,41 @@ struct MailNavigationView: View {
         //   content. A genuinely-gone message now shows Message-Not-Found
         //   (with Retry) instead of silently landing on the inbox.
         BootProfiler.mark("notifTap: deep link received \(messageId.prefix(24))")
+        // `accountId` disambiguates the provider id: an IMAP UID is a per-mailbox
+        // small integer that COLLIDES across accounts, so without it a tap on
+        // account A's push could open account B's message. Present in the push
+        // payload (proven by MARK_READ, `AppDelegate.swift:124`); `nil` only for
+        // legacy payloads, which fall back to messageId-only (today's behavior).
+        let accountId = userInfo?["accountId"] as? String
         let stagedComposite = NSEDataBridge.latestStagedRows.withLock { rows in
-            rows.first { $0.messageId == messageId }?.headerId
+            rows.first {
+                $0.messageId == messageId && (accountId == nil || $0.accountId == accountId)
+            }?.headerId
         }
         // Commit both state changes in the same tick. Raise the flag first so
         // `.onChange(of: selection)` skips its `selectedMessageId = nil` wipe —
         // otherwise the wipe fires between the two assignments and the detail
-        // view momentarily goes blank.
-        isHandlingNotificationDeepLink = true
-        selection = .unified(.inbox)
+        // view momentarily goes blank. ONLY raise it when `selection` actually
+        // changes: if it's already `.inbox` (cold-start default, or a tap while
+        // already on the inbox), the assignment is a no-op → `.onChange` never
+        // fires to lower the flag → it stays stuck `true` and suppresses the NEXT
+        // genuine folder-nav wipe, stranding the detail pane on a stale message
+        // (multi-column layouts).
+        if selection != .unified(.inbox) {
+            isHandlingNotificationDeepLink = true
+            selection = .unified(.inbox)
+        }
         if let id = stagedComposite {
             BootProfiler.mark("notifTap: pushed instantly (staged) \(messageId.prefix(24))")
             selectedMessageId = id
         } else {
             BootProfiler.mark("notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))")
-            selectedMessageId = MessageDetailViewModel.notificationTapIdPrefix + messageId
+            // Sentinel carries accountId so the async resolve ladder stays
+            // account-scoped: `notifTap::<accountId>::<providerId>` (accountId is
+            // `:`-free per MessageIdentity, so the first `::` is the boundary).
+            // Legacy shape `notifTap::<providerId>` when accountId is absent.
+            let sentinelPayload = accountId.map { "\($0)::\(messageId)" } ?? messageId
+            selectedMessageId = MessageDetailViewModel.notificationTapIdPrefix + sentinelPayload
         }
         print("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
