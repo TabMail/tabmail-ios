@@ -784,6 +784,12 @@ enum NSEDataBridge {
             // and phase 2 still has the row to write the body from.
             // ============================================================
             var phase1HeaderIds: [String] = []
+            // DIAGNOSTIC (debug-gated): split the phase-1 write into body (upserts) vs
+            // commit+fsync. On synchronous=FULL the single COMMIT fsyncs the WAL; a slow
+            // cold-disk fsync shows as commit ≫ body, settling whether the multi-second
+            // stall is the fsync (⇒ the synchronous lever) or the upserts themselves.
+            let phase1WriteT0 = CFAbsoluteTimeGetCurrent()
+            let phase1BodyEnd = Mutex<Double>(0)
             do {
                 phase1HeaderIds = try await AppDatabase.dbPool.write(label: "merge.phase1") { db -> [String] in
                     var localIds: [String] = []
@@ -860,7 +866,16 @@ enum NSEDataBridge {
                             print("[NSEDataBridge] Merge phase 1 failed for \(msg.id): \(error) — left in staging for retry")
                         }
                     }
+                    phase1BodyEnd.withLock { $0 = CFAbsoluteTimeGetCurrent() }
                     return localIds
+                }
+                if DebugModeManager.isLoggingEnabled() {
+                    let bodyEnd = phase1BodyEnd.withLock { $0 }
+                    if bodyEnd > 0 {
+                        let bodyMs = Int((bodyEnd - phase1WriteT0) * 1000)
+                        let commitMs = Int((CFAbsoluteTimeGetCurrent() - bodyEnd) * 1000)
+                        BootProfiler.mark("merge.phase1 SPLIT: body(upserts)=\(bodyMs)ms commit+fsync=\(commitMs)ms (\(processed.count) msg)")
+                    }
                 }
             } catch {
                 // Outer write threw — nothing durable from phase 1. Phase 2 below
