@@ -20,6 +20,17 @@ struct DatabaseIndexTests {
         // The DB should have indexes for the most common query patterns
         // Exact index names may vary, but we verify the query doesn't full-scan
         #expect(!indexes.isEmpty)
+        // v64: BOTH messageId composites are REQUIRED — without them the on-device
+        // planner folder/account-scans the per-message lookups on huge folders/accounts
+        // (Gmail All Mail: ~94ms/lookup, boot_logs 7).
+        #expect(indexes.contains("messageHeader_folderId_messageId"),
+                "v64 (folderId, messageId) composite missing — folderId+messageId lookups will folder-scan")
+        #expect(indexes.contains("messageHeader_accountId_messageId"),
+                "v64 (accountId, messageId) composite missing — accountId+messageId lookups (NSE merge / AppDelegate) will account-scan")
+        // v64 drops the now-redundant single-column accountId index (the composite's
+        // leading column serves accountId-only queries).
+        #expect(!indexes.contains("messageHeader_accountId"),
+                "messageHeader_accountId should be dropped by v64 (superseded by the accountId,messageId composite)")
     }
 
     @Test("Canonicalize upsert lookup (messageId + folderId) uses an index, not a scan")
@@ -37,6 +48,33 @@ struct DatabaseIndexTests {
         let plan = details.joined(separator: " | ")
         #expect(plan.contains("USING INDEX"), "expected index seek, got: \(plan)")
         #expect(!plan.contains("SCAN messageHeader"), "full scan on hot upsert path: \(plan)")
+        // KEY assertion (boot_logs 7): the seek must key on messageId. A plan that keys
+        // on folderId alone and post-filters messageId is a covering-index FOLDER SCAN —
+        // "USING INDEX / not SCAN" passes, yet it's ~94ms/lookup on Gmail All Mail. The
+        // v64 (folderId, messageId) composite makes it a direct 2-column seek.
+        #expect(plan.contains("messageId=?"),
+                "lookup must SEEK on messageId, not folder-scan-and-filter it: \(plan)")
+    }
+
+    @Test("Account-scoped lookup (accountId + messageId) seeks on messageId, not account-scans")
+    func accountLookupUsesIndex() throws {
+        // NSE merge (:801/1024/1560/2364) + AppDelegate (:143) + Search/Undo look up by
+        // (accountId, messageId) — searching by ACCOUNT to catch UID-remapped moves.
+        // Same covering-scan trap as the folderId path (boot_logs 7): the seek must key
+        // on messageId, else it account-scans (Gmail account = thousands of rows). The
+        // v64 (accountId, messageId) composite makes it a direct 2-column seek.
+        let db = try TestDatabase.make()
+        let details: [String] = try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM messageHeader WHERE accountId = 'acc1' AND messageId = 'x'
+                """).map { row in row["detail"] as String }
+        }
+        let plan = details.joined(separator: " | ")
+        #expect(plan.contains("USING INDEX"), "expected index seek, got: \(plan)")
+        #expect(!plan.contains("SCAN messageHeader"), "full scan on hot merge path: \(plan)")
+        #expect(plan.contains("messageId=?"),
+                "lookup must SEEK on messageId, not account-scan-and-filter it: \(plan)")
     }
 
     @Test("Query by folderId + isRead uses index effectively")
@@ -82,6 +120,25 @@ struct DatabaseIndexTests {
         }
         #expect(a1Count == 10)
         #expect(a2Count == 5)
+
+        // DROP SAFETY (v64 removed the single-column messageHeader_accountId): prove the
+        // (accountId, messageId) composite's LEADING column can still serve an
+        // account-only `WHERE accountId=?` query. `INDEXED BY` FORCES the index — SQLite
+        // raises "no query solution" (→ this read throws → test fails) if the index
+        // can't satisfy the predicate. This is table-size-INDEPENDENT: a plain EXPLAIN
+        // would SCAN on this 15-row table regardless (accountId matches most rows, so a
+        // scan is genuinely cheaper there), which is exactly why a naive plan assertion
+        // would false-fail. A successful USING-INDEX plan here proves seekability on a
+        // real (large) device table.
+        let forcedPlan = try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM messageHeader INDEXED BY messageHeader_accountId_messageId
+                WHERE accountId = 'a1'
+                """).map { $0["detail"] as String }.joined(separator: " | ")
+        }
+        #expect(forcedPlan.contains("USING INDEX messageHeader_accountId_messageId"),
+                "the composite's leading accountId column must serve account-only queries (drop safety): \(forcedPlan)")
     }
 
     @Test("MessageHeader ordered by date DESC for inbox view")

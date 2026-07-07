@@ -1829,5 +1829,42 @@ final class AppDatabase: Sendable {
                 t.add(column: "lastKnownUidValidity", .integer)
             }
         }
+
+        migrator.registerMigration("v64_messageIdCompositeIndexes") { db in
+            // Sync/NSE HOT PATH: two-column-equality lookups keyed on `messageId` run
+            // ONCE PER fetched/pushed message inside write transactions. The predicate
+            // is indexed only on the OTHER column (folderId or accountId), so the
+            // on-device planner seeks that single column and SCANS-AND-FILTERS messageId
+            // — a covering-index folder/account scan. Harmless on small folders;
+            // catastrophic on Gmail "All Mail" (tens of thousands of rows): boot_logs 7
+            // measured recon≈loop≈4233ms for 45 msgs (~94ms per 1-ROW lookup), which
+            // holds the single GRDB writer and serializes every other write behind it.
+            // (The `canonicalizeLookupUsesIndex` test passed regardless: "USING INDEX
+            // messageHeader_folderId" satisfies "not a SCAN" — yet it IS a folder scan.)
+            //
+            // Two lookup shapes → two composites, each an EXACT 2-column-equality match
+            // the planner prefers over the single-column index → a direct seek:
+            //   • WHERE folderId=? AND messageId=?  — SyncEngineFullSync canonicalize
+            //     (:385) / recon (:856), SyncEngine (:579), delta (:165), plus the
+            //     `folderId=? AND messageId IN(…)` chunk lookups (reconcile/self-heal/
+            //     backfill).
+            //   • WHERE accountId=? AND messageId=? — NSE merge (:801/1024/1560/2364),
+            //     AppDelegate (:143), Search/Undo/InboxView/FTS by-account lookups.
+            //     These search by ACCOUNT deliberately (to find a header that MOVED
+            //     folders via UID remap) — they must NOT be narrowed to folderId.
+            //
+            // (accountId, messageId)'s LEADING column serves every accountId-only query
+            // the single-column `messageHeader_accountId` did (and `messageHeader_
+            // accountId_bodyComplete` already leads with accountId too), so that index
+            // is redundant → dropped. Net +1 index, not +2 — minimizing write
+            // amplification on the very table this migration is speeding up.
+            //
+            // IF (NOT) EXISTS is REQUIRED (see v62): a suspension/kill AFTER a statement
+            // commits but BEFORE GRDB records the migration would re-run and hit
+            // "already exists" / "no such index", bricking the DB build.
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_messageId ON messageHeader(folderId, messageId)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_accountId_messageId ON messageHeader(accountId, messageId)")
+            try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_accountId")
+        }
     }
 }

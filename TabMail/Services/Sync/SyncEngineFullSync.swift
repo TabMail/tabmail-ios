@@ -829,12 +829,27 @@ extension SyncEngine {
             if !skippedByRecentIds.isEmpty {
                 print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByRecentIds.count) msgs recently completed: \(skippedByRecentIds)")
             }
+            // DIAGNOSTIC (emitted as a debug-gated mark before this closure returns):
+            // per-folder upsert churn. `noop` = existing rows whose server data did NOT
+            // actually change — the redundant UPDATEs that churned the WAL on every full
+            // sync before the change-detection (updateChanges) below was added.
+            var upsUpdated = 0, upsNoop = 0, upsDraftSentSkip = 0
+            // DIAGNOSTIC: pinpoint the residual multi-second per-folder write (boot_logs
+            // 6: Sent Messages 50 msg / 3.3s, cpu-bound). `loop` = total upsert-loop wall
+            // time; `recon` = time in the per-message existence lookup
+            // (canonicalizeLocalRows / drafts-sent fetchOne). If loop≈writeMs the loop is
+            // the cost; if recon≈loop the lookup is (planner not using the index on-device
+            // despite DatabaseIndexTests); else the cost is the mutation side (updateChanges
+            // / FTS / AI cache) or pre-loop stale processing (loop ≪ writeMs).
+            var upsReconSeconds = 0.0
+            let upsLoopT0 = CFAbsoluteTimeGetCurrent()
             for info in messages where !allSkippedIds.contains(info.messageId) && !uidMigratedRemoteIds.contains(info.messageId) {
                 // Canonicalize PKs + merge duplicate rows (optimistic-move
                 // remnants keep their old "accountId:<oldPath>:<msgId>" PK
                 // forever for stable-id providers — see canonicalizeLocalRows).
                 // Drafts/Sent are exempt: DraftStore's push migration manages
                 // their row identity.
+                let reconT0 = CFAbsoluteTimeGetCurrent()
                 let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?)
                 if folder.role == .drafts || folder.role == .sent {
                     recon = (try MessageHeader
@@ -847,6 +862,7 @@ extension SyncEngine {
                         isInInbox: isInInbox, db: db
                     )
                 }
+                upsReconSeconds += CFAbsoluteTimeGetCurrent() - reconT0
                 if !recon.removedIds.isEmpty {
                     staleIds.append(contentsOf: recon.removedIds)
                 }
@@ -856,6 +872,9 @@ extension SyncEngine {
                     ftsRekeys.append((oldId: rekey.oldId, newId: rekey.newId, newMessageId: nil))
                 }
                 if var existing = recon.row {
+                    // Pre-mutation snapshot so the write below can be SKIPPED when the
+                    // server data changed nothing (change-detection — see updateChanges).
+                    let original = existing
                     // Drafts/Sent special case: the server's drafts.list / equivalent
                     // summary metadata (date, snippet, to, rfc822) lags behind the
                     // actual message resource right after a local push. We already
@@ -867,7 +886,14 @@ extension SyncEngine {
                     // normally via the dedup + stale-check paths above; this guard
                     // only prevents destructive metadata refresh on existing rows.
                     if folder.role == .drafts || folder.role == .sent {
-                        print("[Sync] DraftUpsertSkip: preserving local content for \(info.messageId) (folder=\(folder.role.rawValue)) — sync summary may be stale from drafts.list cache")
+                        upsDraftSentSkip += 1
+                        // Debug-gated: this fired a RAW print per sent/draft message on
+                        // EVERY full sync (the sent-folder log spam that grew across a
+                        // session). The count is now folded into the aggregate
+                        // `fullSync upsert[...]` mark below.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] DraftUpsertSkip: preserving local content for \(info.messageId) (folder=\(folder.role.rawValue)) — sync summary may be stale from drafts.list cache")
+                        }
                         continue
                     }
                     // Update existing message with latest data from server.
@@ -922,7 +948,17 @@ extension SyncEngine {
                         replyDetectIds.append(existing.id)
                         print("[ReplyDetect] Sync update: reply→none for \(info.messageId) (already replied)")
                     }
-                    try existing.update(db)
+                    // Change-detection: write ONLY when the server actually changed a
+                    // column. The old unconditional `existing.update(db)` rewrote every
+                    // existing row on every full sync (e.g. Archive: 50 rows × N syncs of
+                    // no-op writes) — pure WAL churn. `updateChanges(from:)` is
+                    // end-state-identical but skips the write (and returns false) when
+                    // nothing differs.
+                    if try existing.updateChanges(db, from: original) {
+                        upsUpdated += 1
+                    } else {
+                        upsNoop += 1
+                    }
                     continue
                 }
 
@@ -1243,6 +1279,14 @@ extension SyncEngine {
             // MainActor user actions. TTL is now refreshed lazily after AI queue drains
             // (see ActiveAIQueue.onDrainComplete).
 
+            // DIAGNOSTIC: per-folder upsert breakdown. `noop` should now dominate for
+            // steady-state re-syncs (Archive/etc.) — it counts the redundant writes the
+            // change-detection above eliminated. A stuck-high `upd` with unchanged mail
+            // fingerprints an always-dirty column to normalize.
+            if upsUpdated + upsNoop + upsDraftSentSkip > 0 || !newHeaders.isEmpty {
+                let loopMs = Int((CFAbsoluteTimeGetCurrent() - upsLoopT0) * 1000)
+                BootProfiler.mark("fullSync upsert[\(folder.name)]: ins=\(newHeaders.count) upd=\(upsUpdated) noop=\(upsNoop) dsSkip=\(upsDraftSentSkip) stale=\(staleIds.count) loop=\(loopMs)ms recon=\(Int(upsReconSeconds * 1000))ms")
+            }
             return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys)
         }
         let writeMs = Int((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
