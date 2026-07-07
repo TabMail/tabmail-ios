@@ -1296,6 +1296,30 @@ enum NSEDataBridge {
                 BootProfiler.mark("merge: main tx committed (\(committedCount) merged) — FTS flush next")
                 print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
+                // STALE-DETECTION RACE FIX: a message that just became durable via this
+                // push-merge is NOT registered in pending-ops / recentlyCompleted, so a
+                // concurrent/next sync whose server fetch TRANSIENTLY misses it (STATUS/
+                // fetch propagation lag — the thing flushServerState fights) STALE-DELETES
+                // it. Symptom: insta-merge shows the new mail, a sync drops it, a later
+                // sync brings it back. Register the merged ids as recently-arrived so
+                // stale detection (fullSync + reconcile + delta all read
+                // AccountManager.shared.recentlyCompleted) SKIPS them for the 30s TTL, by
+                // which point the server reliably returns them. Protecting-from-deletion
+                // is the safe direction (never deletes; worst case a genuinely-gone
+                // message lingers one extra TTL). Keys: provider messageId (exact) +
+                // normalized rfc822 (survives UID-remap), matching both stale-check paths.
+                if !processed.isEmpty {
+                    var protectIds: [String] = []
+                    for m in processed {
+                        protectIds.append(m.messageId)
+                        if let rfc = m.rfc822MessageId, !rfc.isEmpty {
+                            protectIds.append(EmailFilter.normalizeMessageId(rfc))
+                        }
+                    }
+                    await AccountManager.shared.recordRecentlyCompleted(messageIds: protectIds)
+                    BootProfiler.mark("merge: stale-protected \(processed.count) recently-arrived msg(s) (30s) — prevents pre-verify drop")
+                }
+
                 // NOTE: no UI-refresh post here anymore. performMerge posts its
                 // end-of-flow `.inboxDataDidChange` (immediate) at the very end,
                 // after the synchronous FTS flush below has flipped

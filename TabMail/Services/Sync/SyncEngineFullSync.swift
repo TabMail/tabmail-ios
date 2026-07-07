@@ -721,6 +721,14 @@ extension SyncEngine {
             if !pendingSkipped.isEmpty {
                 print("[MoveTrace] fullSync \(folder.name) — skipping stale delete for \(pendingSkipped.count) msgs with pending/recent ops: \(pendingSkipped.map(\.messageId))")
             }
+            // CONFIRMING INSTRUMENT (stale-race fix): a stale candidate saved ONLY by the
+            // recent-arrival/completed guard (not a pending op) is a message the server
+            // fetch transiently missed. A hit here right after a `merge: stale-protected …`
+            // mark IS the pre-verify drop race — now caught instead of dropped. Debug-gated.
+            let recentSaved = stale.filter { !isProtectedByPending($0) && isProtectedByRecent($0) }.count
+            if recentSaved > 0 {
+                BootProfiler.mark("fullSync \(folder.name): stale-delete SKIPPED for \(recentSaved) recently-arrived/completed msg(s) — pre-verify drop prevented")
+            }
 
             // UID remap detection: before deleting stale messages, check if any have
             // rfc822MessageId matching a NEW remote message in the same folder. This catches
