@@ -43,4 +43,35 @@ struct SyncModSeqTests {
         // Default is nil (non-CONDSTORE / not yet observed) — the fallback path.
         #expect(Folder(name: "X", path: "X", role: .inbox, accountId: "acc1").lastKnownHighestModSeq == nil)
     }
+
+    // MARK: - Fix B task 4 — full-sync fetch-skip
+
+    @Test("shouldSkipFolderFetch: skips ONLY non-inbox CONDSTORE folders with unchanged modseq")
+    func fullSyncSkipDecision() {
+        // Unchanged HIGHESTMODSEQ on a non-inbox CONDSTORE folder → skip the re-fetch.
+        #expect(SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false))
+        #expect(SyncEngine.shouldSkipFolderFetch(role: .archive, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false))
+        // Changed modseq → NEVER skip (there's a change to fetch).
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 101, cachedModSeq: 100, isDeepSync: false))
+        // Inbox → NEVER skip, even when unchanged (always fully synced).
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .inbox, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false))
+        // Deep pass → NEVER skip (the self-healing net).
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: true))
+        // Non-CONDSTORE (nil fresh) or no cursor yet (nil cached) → NEVER skip (fetch, today's behavior).
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: nil, cachedModSeq: 100, isDeepSync: false))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: nil, isDeepSync: false))
+    }
+
+    @Test("fullSyncIsDeepPass: forces a deep (never-skip) pass every Nth call")
+    func deepPassCadence() {
+        // Unique id so the shared streak Mutex isn't polluted by other tests.
+        let fid = "deeppass-\(UUID().uuidString)"
+        // everyN=3 → calls 1,2 shallow; 3 deep (resets); 4,5 shallow; 6 deep.
+        #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+        #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+        #expect(SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+        #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+        #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+        #expect(SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+    }
 }

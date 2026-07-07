@@ -4,8 +4,44 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 extension SyncEngine {
+
+    // MARK: - Full-sync MODSEQ fetch-skip (Fix B task 4)
+
+    /// Per-folder counter of full syncs since the last deep pass. Forces a DEEP
+    /// (never-skip) pass every `SyncConfig.fullSyncDeepEveryN` so a buggy / quirky server
+    /// HIGHESTMODSEQ can't permanently strand a folder — the ADR-IOS-009 self-healing net.
+    /// In-memory: resets on launch (a MODSEQ-equal skip is provably safe anyway — modseq
+    /// is monotonic within a UIDVALIDITY epoch, so equal means nothing changed).
+    private static let fullSyncSkipStreak = Mutex<[String: Int]>([:])
+
+    /// Is THIS full sync of `folderId` a deep (never-skip) pass? Deep every Nth; a deep
+    /// pass resets the streak. Called once per candidate folder per full sync.
+    nonisolated static func fullSyncIsDeepPass(folderId: String, everyN: Int) -> Bool {
+        fullSyncSkipStreak.withLock { streak in
+            let n = (streak[folderId] ?? 0) + 1
+            if n >= max(1, everyN) { streak[folderId] = 0; return true }
+            streak[folderId] = n
+            return false
+        }
+    }
+
+    /// Full-sync fetch-skip decision. Skip re-fetching a folder ONLY when CONDSTORE proves
+    /// nothing changed since our last sync: HIGHESTMODSEQ (which RFC 7162 bumps on ANY
+    /// add / delete / flag change) is present on BOTH sides and equal. NEVER skip the
+    /// inbox (always fully synced), a deep pass, or a non-CONDSTORE folder (nil modseq →
+    /// fetch, exactly today's behavior). Deletion safety is unaffected: MODSEQ gates only
+    /// the FETCH (never a delete), and the deletion-reconcile check still runs for skipped
+    /// folders. Pure + nonisolated for unit testing.
+    nonisolated static func shouldSkipFolderFetch(
+        role: FolderRole, freshModSeq: Int?, cachedModSeq: Int?, isDeepSync: Bool
+    ) -> Bool {
+        guard role != .inbox, !isDeepSync else { return false }
+        guard let freshModSeq, let cachedModSeq else { return false }
+        return freshModSeq == cachedModSeq
+    }
 
     // MARK: - Full Sync
 
@@ -19,14 +55,28 @@ extension SyncEngine {
         BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
 
         let pool = dbPool
-        try await pool.write { db in
+        // Fix B task 4: folders whose CONDSTORE HIGHESTMODSEQ is unchanged since last sync
+        // — RFC 7162 guarantees nothing changed (add/delete/flag), so the per-folder fetch
+        // below is skipped. Computed HERE, before the cursor overwrite destroys the cached
+        // modseq. NEVER includes the inbox or a deep pass (see shouldSkipFolderFetch); the
+        // deletion-reconcile check still runs for skipped folders (safety net).
+        let skippablePaths: Set<String> = try await pool.write { db in
+            var skippable: Set<String> = []
             let localFolders = try Folder.filter(Column("accountId") == account.id).fetchAll(db)
 
             for info in remoteFolders {
                 if var existing = localFolders.first(where: { $0.path == info.path }) {
+                    let deep = Self.fullSyncIsDeepPass(
+                        folderId: existing.id, everyN: SyncConfig.fullSyncDeepEveryN)
+                    if Self.shouldSkipFolderFetch(
+                        role: existing.role, freshModSeq: info.highestModSeq,
+                        cachedModSeq: existing.lastKnownHighestModSeq, isDeepSync: deep) {
+                        skippable.insert(info.path)
+                    }
                     existing.name = info.name
                     existing.totalCount = info.totalCount
                     if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
+                    if let modseq = info.highestModSeq { existing.lastKnownHighestModSeq = modseq }
                     try existing.update(db)
                 } else {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
@@ -71,8 +121,12 @@ extension SyncEngine {
                         .deleteAll(db)
                 }
             }
+            return skippable
         }
 
+        if !skippablePaths.isEmpty {
+            BootProfiler.mark("fullSync[\(acctTag)]: skipped \(skippablePaths.count) MODSEQ-unchanged folder(s) — no re-fetch (reconcile still runs)")
+        }
         print("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
 
         // Fetch fresh folder list after upsert
@@ -161,7 +215,10 @@ extension SyncEngine {
 
         let uidMigratedOldIds: [String] = try await Task.detached {
             var allMigratedIds: [String] = []
-            for folder in syncableFolders where !folder.path.isEmpty {
+            // `!skippablePaths.contains` — Fix B task 4: a CONDSTORE-unchanged non-inbox
+            // folder is not re-fetched (its HIGHESTMODSEQ proves nothing changed). The
+            // reconcile loop below still visits it, so external deletions are never missed.
+            for folder in syncableFolders where !folder.path.isEmpty && !skippablePaths.contains(folder.path) {
                 let ft0 = CFAbsoluteTimeGetCurrent()
                 do {
                     let result = try await Self.runSyncMessages(

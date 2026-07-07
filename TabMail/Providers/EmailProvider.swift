@@ -23,14 +23,16 @@ struct FolderInfo: Sendable {
     let unreadCount: Int
     let totalCount: Int
     let uidNext: Int? // IMAP only — for delta sync change detection
+    let highestModSeq: Int? // IMAP CONDSTORE only — full-sync fetch-skip (Fix B task 4). nil = no CONDSTORE
 
-    init(name: String, path: String, role: FolderRole, unreadCount: Int, totalCount: Int, uidNext: Int? = nil) {
+    init(name: String, path: String, role: FolderRole, unreadCount: Int, totalCount: Int, uidNext: Int? = nil, highestModSeq: Int? = nil) {
         self.name = name
         self.path = path
         self.role = role
         self.unreadCount = unreadCount
         self.totalCount = totalCount
         self.uidNext = uidNext
+        self.highestModSeq = highestModSeq
     }
 }
 

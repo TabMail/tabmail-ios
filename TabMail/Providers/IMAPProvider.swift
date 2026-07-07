@@ -765,11 +765,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 var unread = 0
                 var total = 0
                 var uidNextVal: Int?
+                var highestModSeqVal: Int?
                 do {
                     let status = try await server.mailboxStatus(info.name)
                     unread = status.unseenCount ?? 0
                     total = status.messageCount ?? 0
                     uidNextVal = status.uidNext.map { Int($0.value) }
+                    // CONDSTORE HIGHESTMODSEQ (nil unless the server advertises it) — the
+                    // full-sync fetch-skip signal (Fix B task 4).
+                    highestModSeqVal = status.highestModSequence
                 } catch {
                     print("[IMAP] STATUS failed for \(info.name): \(error)")
                 }
@@ -780,7 +784,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         role: IMAPProvider.mapRole(attributes: info.attributes, name: info.name),
                         unreadCount: unread,
                         totalCount: total,
-                        uidNext: uidNextVal
+                        uidNext: uidNextVal,
+                        highestModSeq: highestModSeqVal
                     ),
                     attributes: info.attributes
                 ))

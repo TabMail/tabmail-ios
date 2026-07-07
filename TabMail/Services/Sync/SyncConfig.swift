@@ -210,6 +210,11 @@ enum BackfillProfile {
 enum SyncConfig {
     /// How many messages to fetch per folder during sync (fullSync, deltaSync, on-demand).
     static let syncMessageLimit = 50
+    /// Fix B task 4: force a DEEP (never-skip) full sync of a non-inbox CONDSTORE folder
+    /// every Nth full sync, even when HIGHESTMODSEQ says nothing changed — the ADR-IOS-009
+    /// self-healing net against a buggy server modseq. With full sync ~every 10 min, 6 ≈
+    /// hourly. Inbox is never skipped regardless.
+    static let fullSyncDeepEveryN = 6
     /// Upper bound on local rows for the "complete-knowledge" stale-detection path
     /// (`runSyncMessages`, the `messages.count < limit` branch). When the fetch returns
     /// fewer than `syncMessageLimit` we normally treat it as the whole folder and may
