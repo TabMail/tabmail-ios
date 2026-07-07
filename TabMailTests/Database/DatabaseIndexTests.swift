@@ -31,6 +31,28 @@ struct DatabaseIndexTests {
         // leading column serves accountId-only queries).
         #expect(!indexes.contains("messageHeader_accountId"),
                 "messageHeader_accountId should be dropped by v64 (superseded by the accountId,messageId composite)")
+        // v66: expression index for the IMAP UID-window stale slice.
+        #expect(indexes.contains("messageHeader_folderId_uidInt"),
+                "v66 (folderId, CAST(messageId AS INTEGER)) expression index missing — the stale slice will folder-scan")
+    }
+
+    @Test("UID-window stale slice seeks via the CAST expression index, not a folder scan")
+    func uidWindowUsesExpressionIndex() throws {
+        // SyncEngineFullSync :737 — WHERE folderId=? AND CAST(messageId AS INTEGER) >= ?.
+        // v66 adds an expression index on (folderId, CAST(messageId AS INTEGER)). INDEXED BY
+        // forces it: SQLite errors ("no query solution") if it can't serve the query, so a
+        // USING-INDEX plan proves seekability independent of table size (a plain EXPLAIN
+        // would SCAN this tiny test table regardless).
+        let db = try TestDatabase.make()
+        let plan: String = try db.read { dbConn in
+            try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM messageHeader INDEXED BY messageHeader_folderId_uidInt
+                WHERE folderId = 'acc1:INBOX' AND CAST(messageId AS INTEGER) >= 100
+                """).map { $0["detail"] as String }.joined(separator: " | ")
+        }
+        #expect(plan.contains("USING INDEX messageHeader_folderId_uidInt"),
+                "the CAST-range stale slice must seek via the v66 expression index: \(plan)")
     }
 
     @Test("Canonicalize upsert lookup (messageId + folderId) uses an index, not a scan")

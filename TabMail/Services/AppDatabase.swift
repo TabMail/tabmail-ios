@@ -1877,5 +1877,20 @@ final class AppDatabase: Sendable {
                 t.add(column: "lastKnownHighestModSeq", .integer)
             }
         }
+
+        migrator.registerMigration("v66_folderIdUidIntIndex") { db in
+            // Stale-detection windowed slice (SyncEngineFullSync :737) for LARGE IMAP
+            // folders: `WHERE folderId=? AND CAST(messageId AS INTEGER) >= ?` — a numeric
+            // UID range that NO text index serves (v64's (folderId, messageId) is
+            // lexicographic, not numeric), so it SCANNED the whole folder (tens of
+            // thousands of rows on Archive / All Mail) and held the GRDB writer through
+            // stale detection. This EXPRESSION index turns it into a folderId seek + UID
+            // range-scan. Non-numeric messageIds (Gmail/Exchange) index as CAST=0 — benign;
+            // those providers use the `.date` stale window, not this query.
+            //
+            // IF NOT EXISTS is REQUIRED (see v62): a suspension/kill after the index
+            // commits but before GRDB records the migration would re-run and brick.
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_uidInt ON messageHeader(folderId, CAST(messageId AS INTEGER))")
+        }
     }
 }
