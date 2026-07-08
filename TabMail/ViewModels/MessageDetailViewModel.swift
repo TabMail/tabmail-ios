@@ -736,6 +736,36 @@ final class MessageDetailViewModel {
         return true
     }
 
+    /// Header recovery for the poll (the designated un-cancelled recovery
+    /// task): a cancelled `loadBody` (`CANCELLED (initial read) → poll`)
+    /// latches `loadBodyCalled` and never runs the header-resolve ladder, and
+    /// for a NON-staged open (e.g. chat email pill → composite id of an older
+    /// message) `seedAtInit`/`seedFromStagedPublish` can't seed either — so
+    /// nothing sets `message`, and the detail view's skeleton (gated on the
+    /// HEADER) pulses forever (boot_logs 8, +4026513/+4058827). Resolve the
+    /// same way the cancelled `loadBody` would have (PK → cross-folder →
+    /// rfc822 → staged fallback via `resolveMessageAsync`), then seed for
+    /// display. Body-only recovery stays `adoptReadyBody`'s job — its
+    /// header-untouched contract is load-bearing for `refreshAfterMergeCommit`.
+    @MainActor
+    private func recoverHeaderIfMissing() async {
+        guard message == nil, pendingProviderTapId == nil else { return }
+        guard var m = await resolveMessageAsync(compositeId: messageId) else { return }
+        // Re-check across the await: a concurrent path (staged-publish seed,
+        // merge-commit refresh) may have set the header while we read.
+        guard message == nil else { return }
+        applyOverlay(to: &m)
+        // Skeleton → content dissolve, same as loadBody/seedFromStagedPublish.
+        withAnimation(.easeInOut(duration: 0.35)) { message = m }
+        messageNotFound = false
+        BootProfiler.mark("detail header recovered via poll \(m.id.prefix(24))")
+        // Body-adoption's thread load no-ops while `message` is nil — re-run
+        // now that the header exists.
+        if messageBody != nil {
+            loadThreadMessagesAsync()
+        }
+    }
+
     /// Poll for MessageBody while body is missing. First checks DB (catches cases
     /// where a background path wrote the body), then re-attempts a server fetch.
     /// Primary scenario: app resumed from background with stale IMAP connection —
@@ -758,6 +788,10 @@ final class MessageDetailViewModel {
             // present. Pure DB read — NO server fetch, so it doesn't compete for the
             // IMAP connection (the risky retry path stays on the 2s cadence below).
             if let self, self.messageBody == nil {
+                // Cancelled-open header recovery FIRST (see recoverHeaderIfMissing) —
+                // ordered before body adoption so the adopt-and-return below cannot
+                // end the poll with a nil header (skeleton is gated on the header).
+                await self.recoverHeaderIfMissing()
                 // Entry fast-path (shared with the `.nseMergeDidCommit` catch-up):
                 // the deep-link's own NSE merge usually wrote the body (durable or
                 // still-staged, ADR-IOS-049) before loadBody's task got cancelled
@@ -765,14 +799,24 @@ final class MessageDetailViewModel {
                 // instead of waiting on the first 2s tick.
                 if await self.adoptReadyBody(source: "poll IMMEDIATE check") {
                     self.loadThreadMessagesAsync()
-                    return
+                    if self.message != nil { return }
+                    // Body adopted but the header is still missing (cancelled
+                    // non-staged open): fall into the loop, which keeps
+                    // recovering the header until it lands.
                 }
             }
             var fetchAttempt = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self else { return }
-                guard self.messageBody == nil else { return }
+                if self.message == nil { await self.recoverHeaderIfMissing() }
+                guard self.messageBody == nil else {
+                    // Body already landed (entry fast-path above, merge-commit
+                    // catch-up, …): the poll's only remaining job is the header
+                    // (cancelled-open recovery) — done once it's set.
+                    if self.message != nil { return }
+                    continue
+                }
                 // Pull-to-refresh (refetchBody) owns the body for its window — it
                 // deletes the durable row, nils messageBody, and runs its OWN fetch.
                 // Skip this whole tick so the poll neither adopts/flashes a body nor
