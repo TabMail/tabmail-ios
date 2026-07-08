@@ -1110,7 +1110,11 @@ private var constrainLeftOverflowJS: String {
 }
 
 /// Dark mode fix (injected as WKUserScript at document end — no blink).
-/// - Near-white (bright + low saturation) backgrounds → stripped to transparent.
+/// - Near-white (bright + low saturation) backgrounds → stripped to transparent,
+///   OR darkened into a sunken panel — which of the two depends on the
+///   PAGE_DOMINANCE pre-pass below (see the two-regime comment inside the
+///   nearWhite branch: page-color-repeated-everywhere goes transparent,
+///   an individual bright card stays a panel).
 /// - Colored backgrounds → dimmed to ~brightness 80 so white text is readable.
 /// - Dark inline text → forced to light #fbfbfe.
 /// - Links inside colored-bg elements → forced to white (overrides CSS blue).
@@ -1133,7 +1137,88 @@ private var fixDarkModeColorsJS: String {
         }
         function lum(r,g,b) { return (r*299+g*587+b*114)/1000; }
         function sat(r,g,b) { return Math.max(r,g,b) - Math.min(r,g,b); }
+        // "Chrome" = a deliberate box: a visible border, rounded corners, or a
+        // shadow. Shared by the PAGE_DOMINANCE pre-pass below and the main
+        // loop so both apply the identical predicate.
+        function computeHasChrome(cs) {
+            var hasBorder = (parseFloat(cs.borderTopWidth) || 0) > 0 || (parseFloat(cs.borderRightWidth) || 0) > 0
+                || (parseFloat(cs.borderBottomWidth) || 0) > 0 || (parseFloat(cs.borderLeftWidth) || 0) > 0;
+            return hasBorder || (parseFloat(cs.borderTopLeftRadius) || 0) > 0 || (!!cs.boxShadow && cs.boxShadow !== 'none');
+        }
         var els = document.querySelectorAll('body, body *');
+
+        // PAGE-COLOR dominance pre-pass — mirrors the dominance-guard idiom
+        // used by normalizeIndentJS (the OWA whole-column-indent fix): one
+        // cheap global measurement gates a DIFFERENT per-element treatment
+        // below, instead of trying to decide "is THIS ONE near-white surface
+        // a page background" locally — a single element can't see how many
+        // sibling elements carry the identical fill.
+        //
+        // Why this exists: the nearWhite branch's own comment names case (a)
+        // — "a full-bleed wrapper that should DISAPPEAR" — but every
+        // near-white surface used to be treated as case (b) (a distinct
+        // panel), because "outermost near-white" was the only signal. A
+        // cloud-console notification email bakes `background-color:
+        // rgb(250,250,248)` inline on EVERY paragraph/heading — no single
+        // shared wrapper carries the page color — so each block is
+        // independently "outermost" (no OTHER near-white is its ancestor)
+        // and got its own sunken-panel overlay: 103 rgba(0,0,0,0.22) hits
+        // stacking into dark stripes behind every line of text (logmain.log
+        // 2026-07-07). The panel treatment is correct for a bright card
+        // WITHIN a page — e.g. Scholar's paper-card digest, guarded by
+        // darkModeNearWhitePanelDarkening — wrong when the near-white IS the
+        // email's own page color, repeated block-by-block.
+        //
+        // Discriminator: what SHARE of the body's area do near-white,
+        // CHROME-LESS (a bordered/rounded/shadowed box is always a
+        // deliberate card, never "the page") surfaces jointly cover, keeping
+        // only the OUTERMOST of them so a nested repeat of the same fill
+        // isn't double-counted.
+        var PAGE_DOMINANCE = 0.6; // A multi-card email's near-white area stays
+            // well under half the page (individual cards); a page-color email
+            // (the cloud-console case) covers most/all of it. 0.6 keeps a
+            // clear margin above "roughly half the page happens to be light".
+        var pageColorMode = false;
+        if (document.body) {
+            var bodyRect = document.body.getBoundingClientRect();
+            var bodyArea = bodyRect.width * bodyRect.height;
+            if (bodyArea > 0) {
+                var pageCandidates = [];
+                for (var pi = 0; pi < els.length; pi++) {
+                    var pgEl = els[pi];
+                    var pgCs = window.getComputedStyle(pgEl);
+                    var pgBg = parseRGB(pgCs.backgroundColor);
+                    var pgHasBg = pgBg && pgBg.a > 0.1;
+                    var pgL = pgHasBg ? lum(pgBg.r, pgBg.g, pgBg.b) : 256;
+                    var pgS = pgHasBg ? sat(pgBg.r, pgBg.g, pgBg.b) : 0;
+                    var pgNearWhite = pgHasBg && pgL > 220 && pgS < 10;
+                    if (!pgNearWhite || computeHasChrome(pgCs)) continue;
+                    pgEl.__tmPageColorCandidate = true;
+                    pageCandidates.push(pgEl);
+                }
+                var pageSum = 0, pageOuterCount = 0;
+                for (var pj = 0; pj < pageCandidates.length; pj++) {
+                    var pcEl = pageCandidates[pj];
+                    var pcNested = false;
+                    for (var pp = pcEl.parentElement; pp; pp = pp.parentElement) {
+                        if (pp.__tmPageColorCandidate) { pcNested = true; break; }
+                    }
+                    if (pcNested) continue;
+                    pageOuterCount++;
+                    var pcRect = pcEl.getBoundingClientRect();
+                    pageSum += Math.min(pcRect.width * pcRect.height, bodyArea);
+                }
+                var pageShare = pageSum / bodyArea;
+                pageColorMode = pageShare >= PAGE_DOMINANCE;
+                dl('pageColorMode=' + pageColorMode + ' share=' + pageShare.toFixed(2)
+                    + ' outerCandidates=' + pageOuterCount + ' totalCandidates=' + pageCandidates.length);
+            } else {
+                dl('pageColorMode=false (zero body area)');
+            }
+        } else {
+            dl('pageColorMode=false (no body)');
+        }
+
         for (var i = 0; i < els.length; i++) {
             var el = els[i];
             var cs = window.getComputedStyle(el);
@@ -1148,9 +1233,7 @@ private var fixDarkModeColorsJS: String {
             // must stay DISTINCT from their surroundings in dark mode — otherwise a
             // cream callout inside a cream section both collapse to the same dimmed
             // luminance and the box's fill "disappears", leaving only its border.
-            var hasBorder = (parseFloat(cs.borderTopWidth) || 0) > 0 || (parseFloat(cs.borderRightWidth) || 0) > 0
-                || (parseFloat(cs.borderBottomWidth) || 0) > 0 || (parseFloat(cs.borderLeftWidth) || 0) > 0;
-            var hasChrome = hasBorder || (parseFloat(cs.borderTopLeftRadius) || 0) > 0 || (!!cs.boxShadow && cs.boxShadow !== 'none');
+            var hasChrome = computeHasChrome(cs);
             if (hasBg) {
                 dl((nearWhite ? 'nearWhite' : 'colored') + ' ' + el.tagName + '.' + (el.className || '')
                     + ' bg=rgb(' + bg.r + ',' + bg.g + ',' + bg.b + ') L=' + Math.round(bgL) + ' S=' + Math.round(bgS)
@@ -1161,34 +1244,57 @@ private var fixDarkModeColorsJS: String {
             }
             if (nearWhite) {
                 // A near-white surface is one of two things in dark mode:
-                //   (a) a full-bleed wrapper that should DISAPPEAR so the dark card
+                //   (a) a full-bleed wrapper (or a wholesale page color repeated
+                //       block-by-block) that should DISAPPEAR so the dark card
                 //       bubble shows through, or
                 //   (b) a distinct PANEL (a bright card in light mode) that should
                 //       stay visible — and, per design, render DARKER than its
                 //       surroundings rather than blending in (Scholar's white paper
                 //       cards were vanishing because we forced transparent).
-                // The OUTERMOST near-white surface (no already-converted near-white
-                // ancestor) gets a translucent-black overlay so it reads as a
-                // slightly sunken panel, darker than whatever is behind it (the
-                // dimmed section bg, or the card). NESTED near-whites stay
-                // transparent so overlays can't stack into mud on white-heavy
-                // emails (Anthropic/Amazon receipts). Translucent (not opaque) so it
-                // composites over the real backdrop — that is what makes it "darker
-                // than the surrounding" for free.
-                // Darken (= make a visible sunken panel) if this is a distinct
-                // surface: the OUTERMOST near-white, OR a CHROME box (border/radius/
-                // shadow) even when nested (a bordered callout must keep a fill, not
-                // just its border). Only PLAIN nested wrappers (no chrome) go
-                // transparent, so overlays can't stack into mud on white-heavy emails.
-                var ancestorPanel = el.parentElement && el.parentElement.closest('[data-tm-panel]');
-                if (ancestorPanel && !hasChrome) {
+                //
+                // Two regimes, gated by the PAGE_DOMINANCE pre-pass above:
+                //
+                //   pageColorMode = true — the near-white IS this email's page
+                //   color (see the pre-pass comment for the cloud-console/103-panel
+                //   failure case, logmain.log 2026-07-07). Case (a) applies
+                //   unconditionally to every CHROME-LESS near-white block: go
+                //   transparent, never mark data-tm-panel — regardless of whether
+                //   THIS block happens to be nested under another near-white block,
+                //   because in this regime there is no "outermost card", only
+                //   repeated page background. A CHROME box (border/radius/shadow —
+                //   a deliberate card) is never page color, so it always falls
+                //   through to the case (b) treatment below, unchanged.
+                //
+                //   pageColorMode = false — the ordinary case (Scholar's paper
+                //   cards, Anthropic/Amazon receipts): per-element case (b) logic,
+                //   EXACTLY as before this pre-pass was added. The OUTERMOST
+                //   near-white surface (no already-converted near-white ancestor)
+                //   gets a translucent-black overlay so it reads as a slightly
+                //   sunken panel, darker than whatever is behind it (the dimmed
+                //   section bg, or the card). NESTED near-whites stay transparent
+                //   so overlays can't stack into mud on white-heavy emails.
+                //   Translucent (not opaque) so it composites over the real
+                //   backdrop — that is what makes it "darker than the surrounding"
+                //   for free. Darken (= make a visible sunken panel) if this is a
+                //   distinct surface: the OUTERMOST near-white, OR a CHROME box
+                //   even when nested (a bordered callout must keep a fill, not
+                //   just its border). Only PLAIN nested wrappers (no chrome) go
+                //   transparent.
+                if (pageColorMode && !hasChrome) {
                     el.style.setProperty('background-color', 'transparent', 'important');
                     if (el.style.background) el.style.setProperty('background', 'transparent', 'important');
+                    dl('pageColor→transparent ' + el.tagName + '.' + (el.className || '') + ' w=' + Math.round(el.getBoundingClientRect().width));
                 } else {
-                    el.style.setProperty('background-color', 'rgba(0,0,0,0.22)', 'important');
-                    if (el.style.background) el.style.setProperty('background', 'rgba(0,0,0,0.22)', 'important');
-                    el.setAttribute('data-tm-panel', '1');
-                    dl('panel→darken ' + el.tagName + '.' + (el.className || '') + ' chrome=' + (hasChrome ? 1 : 0) + ' w=' + Math.round(el.getBoundingClientRect().width));
+                    var ancestorPanel = el.parentElement && el.parentElement.closest('[data-tm-panel]');
+                    if (ancestorPanel && !hasChrome) {
+                        el.style.setProperty('background-color', 'transparent', 'important');
+                        if (el.style.background) el.style.setProperty('background', 'transparent', 'important');
+                    } else {
+                        el.style.setProperty('background-color', 'rgba(0,0,0,0.22)', 'important');
+                        if (el.style.background) el.style.setProperty('background', 'rgba(0,0,0,0.22)', 'important');
+                        el.setAttribute('data-tm-panel', '1');
+                        dl('panel→darken ' + el.tagName + '.' + (el.className || '') + ' chrome=' + (hasChrome ? 1 : 0) + ' w=' + Math.round(el.getBoundingClientRect().width));
+                    }
                 }
                 if (el.hasAttribute('bgcolor')) el.removeAttribute('bgcolor');
             }

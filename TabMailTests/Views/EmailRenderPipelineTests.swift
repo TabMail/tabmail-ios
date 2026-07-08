@@ -1134,6 +1134,164 @@ struct EmailRenderPipelineTests {
         #expect(fnIdx < hideIdx && hideIdx < retIdx)
     }
 
+    // MARK: - fixDarkModeColorsJS PAGE_DOMINANCE pre-pass (behavioral, via JSContext + mock DOM)
+    //
+    // These run the PRODUCTION `fixDarkModeColorsJS` source against a minimal
+    // synthetic DOM — the same zero-drift pattern as `runLeftFix`/`runIndentCrop`
+    // above. Elements are flat siblings of a stubbed `document.body` (no nesting
+    // needed for these scenarios); `textContent`/`innerText` are plain strings
+    // (no text-node walk in this script, unlike normalizeIndentJS). `applied(key)`
+    // / `attrOf(key)` are the SAME helper names/shapes used by the indent-crop
+    // harness, so the existing `appliedValue`/`attrValue` Swift helpers work
+    // unchanged. Content is generic (no real senders/domains).
+    private static let darkModeDomHarness = """
+    var _applied = {}, _appliedPriority = {}, _byKey = {}, _roots = [];
+    function _el(tag, o) {
+        o = o || {};
+        var key = o.key || ('k' + Object.keys(_byKey).length);
+        var n = {
+            tagName: tag.toUpperCase(), className: o.cls || '', textContent: o.text || '', innerText: o.text || '',
+            parentElement: null, _attrs: {},
+            _comp: {
+                backgroundColor: o.bg || 'rgba(0, 0, 0, 0)',
+                color: o.color || 'rgb(0,0,0)',
+                borderTopWidth: (o.border ? '1px' : '0px'), borderRightWidth: (o.border ? '1px' : '0px'),
+                borderBottomWidth: (o.border ? '1px' : '0px'), borderLeftWidth: (o.border ? '1px' : '0px'),
+                borderTopLeftRadius: '0px', boxShadow: 'none'
+            },
+            _rect: { width: (o.w == null ? 288 : o.w), height: (o.h == null ? 20 : o.h) },
+            getBoundingClientRect: function () { return this._rect; },
+            getAttribute: function (k) { return (k in n._attrs) ? n._attrs[k] : null; },
+            setAttribute: function (k, v) { n._attrs[k] = v; },
+            hasAttribute: function (k) { return (k in n._attrs); },
+            removeAttribute: function (k) { delete n._attrs[k]; },
+            querySelectorAll: function () { return []; },
+            closest: function (sel) {
+                var cur = this;
+                while (cur) {
+                    if (sel === 'a' && cur.tagName === 'A') return cur;
+                    if (sel === '[data-tm-panel]' && cur._attrs && ('data-tm-panel' in cur._attrs)) return cur;
+                    cur = cur.parentElement;
+                }
+                return null;
+            },
+            style: { background: '', setProperty: function (k, v, p) {
+                (_applied[key] = _applied[key] || {})[k] = v;
+                (_appliedPriority[key] = _appliedPriority[key] || {})[k] = p;
+            } }
+        };
+        _byKey[key] = n; return n;
+    }
+    var _bodyRect = { width: 288, height: 1000 };
+    var _body = {
+        tagName: 'BODY', className: '', _attrs: {},
+        _comp: { backgroundColor: 'rgba(0, 0, 0, 0)', color: 'rgb(0,0,0)', borderTopWidth: '0px', borderRightWidth: '0px',
+                 borderBottomWidth: '0px', borderLeftWidth: '0px', borderTopLeftRadius: '0px', boxShadow: 'none' },
+        getBoundingClientRect: function () { return _bodyRect; },
+        getAttribute: function (k) { return (k in _body._attrs) ? _body._attrs[k] : null; },
+        setAttribute: function (k, v) { _body._attrs[k] = v; },
+        hasAttribute: function (k) { return (k in _body._attrs); },
+        removeAttribute: function (k) { delete _body._attrs[k]; },
+        closest: function () { return null; },
+        style: { background: '', setProperty: function () {} }
+    };
+    function setBodyRect(w, h) { _bodyRect = { width: w, height: h }; }
+    function setBody(elements) {
+        _roots = elements;
+        for (var i = 0; i < elements.length; i++) elements[i].parentElement = _body;
+    }
+    var document = {
+        body: _body,
+        querySelectorAll: function () { return [_body].concat(_roots); }
+    };
+    var window = {
+        matchMedia: function () { return { matches: true }; },
+        getComputedStyle: function (el) { return el._comp; },
+        webkit: { messageHandlers: { consoleLog: { postMessage: function () {} } } }
+    };
+    function applied(key) { return _applied[key] || {}; }
+    function attrOf(key) { return _byKey[key]._attrs; }
+    """
+
+    /// Fresh JSContext with the DOM mock + the tree built by `bodyJS` (which must
+    /// call `setBodyRect(w, h)` then `setBody([...])`), then runs the production
+    /// `fixDarkModeColorsJS` pass. Mirrors `runLeftFix`/`runIndentCrop`.
+    private func runDarkMode(_ bodyJS: String) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.darkModeDomHarness)
+        ctx.evaluateScript(bodyJS)
+        ctx.evaluateScript(_fixDarkModeColorsJS)
+        #expect(ctx.exception == nil, "dark mode JS threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    @Test("fixDarkModeColorsJS PAGE_DOMINANCE: chrome-less near-white blocks covering most of the body all go transparent, none becomes a panel")
+    func darkModePageColorModeMakesChromelessBlocksTransparent() {
+        // A cloud-console notification bakes background-color: rgb(250,250,248)
+        // inline on every paragraph/heading (logmain.log 2026-07-07) — no shared
+        // wrapper carries the page color, so each block is independently
+        // "outermost". Before the fix each got its own sunken-panel overlay (103
+        // hits); after the fix the dominance pre-pass recognizes this as the
+        // email's PAGE color and every chrome-less block goes transparent instead.
+        let ctx = runDarkMode("""
+        setBodyRect(288, 1000);
+        setBody([
+            _el('p', { key: 'p1', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'First paragraph of a notification email.' }),
+            _el('p', { key: 'p2', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'Second paragraph, same inline background.' }),
+            _el('h2', { key: 'h1', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'A heading, also carrying the page background.' }),
+            _el('p', { key: 'p3', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'Third paragraph, still the page color.' }),
+            _el('p', { key: 'p4', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'Fourth paragraph, still the page color.' })
+        ]);
+        """)
+        for key in ["p1", "p2", "h1", "p3", "p4"] {
+            #expect(appliedValue(ctx, key, "background-color") == "transparent")
+            #expect(attrValue(ctx, key, "data-tm-panel") == nil)
+        }
+    }
+
+    @Test("fixDarkModeColorsJS PAGE_DOMINANCE regression guard: a single bounded near-white panel below the dominance threshold still gets the sunken-panel treatment")
+    func darkModeMinorityPanelStaysPanelized() {
+        // Scholar-style case: ONE bright paper card covering a minority of the
+        // body area. Dominance share stays well under 0.6, so pageColorMode is
+        // false and the pre-existing outermost-near-white → panel behavior is
+        // unchanged (darkModeNearWhitePanelDarkening covers the same treatment
+        // at the string level; this exercises it behaviorally end-to-end).
+        let ctx = runDarkMode("""
+        setBodyRect(288, 1000);
+        setBody([
+            _el('div', { key: 'card', bg: 'rgb(255,255,255)', w: 200, h: 100, text: 'A single bright paper-style citation card.' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "card", "background-color") == "rgba(0,0,0,0.22)")
+        #expect(attrValue(ctx, "card", "data-tm-panel") == "1")
+    }
+
+    @Test("fixDarkModeColorsJS PAGE_DOMINANCE: a bordered/chrome near-white box stays panelized even inside page-color mode")
+    func darkModeChromeBoxStaysPanelizedInPageColorMode() {
+        // Four page-color paragraphs trip pageColorMode on their own (share
+        // 0.72 >= 0.6). A fifth near-white element carries a border (chrome) —
+        // a deliberate card/callout, e.g. an "Important" note — and must stay
+        // panelized regardless of the page-color regime: chrome boxes are
+        // excluded from the dominance measurement (never "page color") and
+        // always fall through to the panel treatment.
+        let ctx = runDarkMode("""
+        setBodyRect(288, 1000);
+        setBody([
+            _el('p', { key: 'p1', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'First paragraph carrying the page background.' }),
+            _el('p', { key: 'p2', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'Second paragraph, same inline background.' }),
+            _el('p', { key: 'p3', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'Third paragraph, still the page color.' }),
+            _el('p', { key: 'p4', bg: 'rgb(250,250,248)', w: 288, h: 180, text: 'Fourth paragraph, still the page color.' }),
+            _el('div', { key: 'callout', bg: 'rgb(255,255,255)', border: true, w: 250, h: 80, text: 'A deliberately bordered callout box.' })
+        ]);
+        """)
+        for key in ["p1", "p2", "p3", "p4"] {
+            #expect(appliedValue(ctx, key, "background-color") == "transparent")
+            #expect(attrValue(ctx, key, "data-tm-panel") == nil)
+        }
+        #expect(appliedValue(ctx, "callout", "background-color") == "rgba(0,0,0,0.22)")
+        #expect(attrValue(ctx, "callout", "data-tm-panel") == "1")
+    }
+
     // MARK: - Clip-aware overflow measurement (author overflow-x ancestor)
 
     /// Minimal DOM stub for `measureMaxRight()`'s clip-aware ancestor walk: a
