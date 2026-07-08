@@ -226,9 +226,43 @@ enum EmailHTMLWrapper {
                clipping. Apple Mail / Thunderbird keep such logos small by
                honoring the height attribute — so do we. A width-less image keeps
                height:auto behavior implicitly anyway (height defaults to auto
-               when only width or neither is specified). */
-            img { max-width: 100%; }
+               when only width or neither is specified).
+
+               `max-width: 100%` is now `!important` (2026-07-07, webmail-
+               composer "cafe note" email): the email shipped a composer CSS
+               reset alongside its body — `#cafe-note-contents,
+               #cafe-note-contents * { ...; max-height: none; max-width: none;
+               ...; }` (no !important of its own) — which, at plain
+               specificity, beat our cap on a 900px-wide banner
+               `<img style="display:inline-block;border:0px solid;
+               width:900px;height:274px">`. The image laid out at its full
+               900px, and once images settled postImageWidthRecheckJS
+               requested a re-fit that widened the whole (otherwise-fitting)
+               email to 910px → 0.34x shrink (logmain.log 2026-07-07). The
+               cap is a non-negotiable mobile-rendering invariant: an author
+               reset that removes it always ends in a whole-email shrink,
+               which is strictly worse for the author too — so !important
+               wins over any author reset regardless of the reset's own
+               specificity.
+
+               `img[style*="width"][style*="height"] { height: auto !important; }`
+               is the inline-style analog of `img[width] { height: auto; }`
+               below: when the !important cap clamps an inline-styled image
+               that also carries a fixed inline pixel height (like the
+               900x274 banner above), that height must not stay fixed once
+               the width is capped, or the image distorts. Requiring BOTH
+               substrings keeps the loose `[style*=]` match harmless on false
+               positives — an inline `max-width`/`max-height` (not
+               `width`/`height`) also satisfies the substring check, but
+               `height: auto` on an image that HAS loaded is aspect-correct,
+               and on one that never loads it just collapses the box instead
+               of leaving a fixed-height hole. Do NOT touch
+               `img[width] { height: auto; }` itself — no evidence motivates
+               changing it, and the comment above already covers its own
+               hazard (Apple Support survey logo). */
+            img { max-width: 100% !important; }
             img[width] { height: auto; }
+            img[style*="width"][style*="height"] { height: auto !important; }
             a { color: #0060df; word-break: break-all; overflow-wrap: anywhere; }
             pre, code { overflow-x: auto; max-width: 100%; white-space: pre-wrap; word-break: break-all; }
             table, div, p { max-width: 100% !important; box-sizing: border-box !important; }

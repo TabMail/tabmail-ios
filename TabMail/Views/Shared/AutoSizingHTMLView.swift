@@ -2431,11 +2431,36 @@ private var postImageWidthRecheckJS: String {
             // Committed layout viewport — NEVER bare innerWidth (WebKit bug
             // 170595); same fallback chain as monitorHeightJS.
             var vp = window.__tmLayoutVp || window.__tmDeviceWidth || window.innerWidth;
+            // Same clip-aware discipline as fitViewportJS's measureMaxRight
+            // (AutoSizingHTMLView, logmain.log 2026-07-07): an element
+            // contained by an author ancestor's overflow-x auto/scroll/
+            // hidden/clip (strictly below document.body) cannot widen the
+            // page even after its own images finish settling, so it must not
+            // drive this recheck's re-widen decision either.
+            function findClippingAncestor(el) {
+                var anc = el.parentElement;
+                while (anc && anc !== document.body) {
+                    var ov = window.getComputedStyle(anc).overflowX;
+                    if (ov === 'auto' || ov === 'scroll' || ov === 'hidden' || ov === 'clip') {
+                        return anc;
+                    }
+                    anc = anc.parentElement;
+                }
+                return null;
+            }
             var mr = 0;
             var all = document.body.getElementsByTagName('*');
             for (var k = 0; k < all.length; k++) {
                 var rr = all[k].getBoundingClientRect().right;
-                if (rr > mr) mr = rr;
+                if (rr > mr) {
+                    var clipAnc = findClippingAncestor(all[k]);
+                    if (clipAnc) {
+                        log('skipping would-be culprit ' + all[k].tagName + '.' + (all[k].className || '')
+                            + ' w=' + Math.round(rr) + ' — clipped by ancestor ' + clipAnc.tagName + '.' + (clipAnc.className || ''));
+                        continue;
+                    }
+                    mr = rr;
+                }
             }
             // Same slop as fitViewportJS's OVERFLOW_SLOP — sub-pixel/ceil noise
             // must not trigger a re-fit of a fitting email.
@@ -3125,11 +3150,55 @@ private let fitViewportJS: String = {
                     hm.style.setProperty('display', 'none', 'important');
                 }
             }
+            // CLIP-AWARE MEASUREMENT: an element whose horizontal overflow is
+            // contained by an AUTHOR ancestor (strictly below document.body)
+            // with overflow-x auto/scroll/hidden/clip CANNOT widen the page —
+            // its visible extent is the clipping ancestor's own box, and that
+            // ancestor already participates in this scan as an element itself.
+            // Without this, a notification email's markdown-render pricing
+            // table (491px, nowrap cells) sitting inside its own sender-authored
+            // DIV.w-full.overflow-auto scroller (286px — the standard
+            // markdown-render horizontal-pan pattern) measured as the
+            // rightmost edge and widened the whole email to 493px → 0.58x
+            // shrink, even though on the web the table just pans inside its
+            // own box and never touches the page width (logmain.log
+            // 2026-07-07: OVERFLOW CULPRIT: TABLE.w-max min-w-full ...
+            // ancestor[0] DIV.w-full overflow-auto w=286,
+            // __aliyun_email_body_block markup). Only walk ancestors when a
+            // candidate would BECOME the new max — the monotonic-increase
+            // gate keeps the added per-candidate cost negligible. The walk
+            // stops BEFORE document.body: our own wrapper sets
+            // `overflow-x: clip` on html/body (EmailHTMLWrapper), so
+            // including body in the walk would make every candidate look
+            // contained. Undefined/empty/'visible' overflowX (the JSContext
+            // test harnesses that stub getComputedStyle without an overflowX
+            // field) is treated as non-containing — it must NOT match any of
+            // the four listed values, or the 55 pre-existing tests break.
+            function findClippingAncestor(el) {
+                var anc = el.parentElement;
+                while (anc && anc !== document.body) {
+                    var ov = window.getComputedStyle(anc).overflowX;
+                    if (ov === 'auto' || ov === 'scroll' || ov === 'hidden' || ov === 'clip') {
+                        return anc;
+                    }
+                    anc = anc.parentElement;
+                }
+                return null;
+            }
             var mr = 0, cp = null;
             var all = document.body.getElementsByTagName('*');
             for (var k = 0; k < all.length; k++) {
                 var rr = all[k].getBoundingClientRect().right;
-                if (rr > mr) { mr = rr; cp = all[k]; }
+                if (rr > mr) {
+                    var clipAnc = findClippingAncestor(all[k]);
+                    if (clipAnc) {
+                        log('measureMaxRight: skipping would-be culprit ' + all[k].tagName + '.' + (all[k].className || '')
+                            + ' w=' + Math.round(rr) + ' — clipped by ancestor ' + clipAnc.tagName + '.' + (clipAnc.className || '')
+                            + ' overflow-x=' + window.getComputedStyle(clipAnc).overflowX);
+                        continue;
+                    }
+                    mr = rr; cp = all[k];
+                }
             }
             // Culprit's own width, measured while the deferred images are STILL
             // hidden (same discipline as maxRight — a phantom descendant must

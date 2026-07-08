@@ -156,10 +156,52 @@ struct EmailRenderPipelineTests {
         // height attribute. Fix: cap all images with max-width:100% but force
         // height:auto ONLY for images that carry an explicit width attribute
         // (where capping the width must scale height to avoid distortion).
-        #expect(out.contains("img { max-width: 100%; }"))
+        // The cap itself is `!important` (2026-07-07 composer-reset fix,
+        // see imgMaxWidthCapIsImportant below) — assert the `!important`
+        // form here too so this test doesn't drift from the real output.
+        #expect(out.contains("img { max-width: 100% !important; }"))
         #expect(out.contains("img[width] { height: auto; }"))
         // The unscoped form that stripped width-less images' height must be gone.
         #expect(!out.contains("img { max-width: 100%; height: auto; }"))
+    }
+
+    @Test("img max-width cap is !important — an author reset cannot defeat the responsive cap")
+    func imgMaxWidthCapIsImportant() {
+        let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
+        // A webmail-composer email shipped a body-scoped reset —
+        // `#note-contents, #note-contents * { ...; max-width: none;
+        // ...; }` (no !important of its own) — that beat the plain-
+        // specificity `img { max-width: 100%; }` cap on a 900px-wide inline-
+        // styled banner. The image laid out at its full 900px and, once
+        // images settled, postImageWidthRecheckJS requested a re-fit that
+        // widened the whole (otherwise-fitting) email to 910px → 0.34x
+        // shrink (logmain.log 2026-07-07). The cap is now !important so no
+        // author reset — regardless of its own specificity — can remove it.
+        #expect(out.contains("img { max-width: 100% !important; }"))
+        // Guard against the pre-fix plain-specificity form silently returning.
+        #expect(!out.contains("img { max-width: 100%; }"))
+    }
+
+    @Test("img[style*=width][style*=height] forces height:auto — inline-style analog of img[width]")
+    func imgInlineStyleHeightAutoAnalog() {
+        let out = EmailHTMLWrapper.wrapHTML("<p>X</p>")
+        // The attribute-selector rule `img[width] { height: auto; }` only
+        // matches images sized via the `width=` HTML attribute. An email
+        // that sizes images entirely via an inline `style="width:900px;
+        // height:274px"` (the composer-reset banner above) isn't covered by
+        // it, so once the !important cap clamps the width, the inline
+        // height:274px stays fixed and the image distorts. This rule is the
+        // inline-style analog, also !important so it survives the same kind
+        // of author reset. Requiring BOTH `width` and `height` substrings
+        // keeps the loose [style*=] match harmless: an inline max-width /
+        // max-height also contains "width"/"height" as substrings, but
+        // forcing height:auto on those is harmless (aspect-correct once
+        // loaded, collapses instead of leaving a fixed-height hole if never
+        // loaded).
+        #expect(out.contains("img[style*=\"width\"][style*=\"height\"] { height: auto !important; }"))
+        // Do NOT touch the existing width-attribute rule (no evidence to
+        // change it — see imgHeightAutoScopedToWidthAttr above).
+        #expect(out.contains("img[width] { height: auto; }"))
     }
 
     @Test("fitViewportJS re-measures and widens again after a breakpoint flip")
@@ -457,6 +499,103 @@ struct EmailRenderPipelineTests {
         ctx.evaluateScript(_deferredImageLoadJS)
         ctx.evaluateScript("fireImgEvent(0, 'load'); fireImgEvent(1, 'load')")
         #expect(ctx.exception == nil, "scripts threw: \(ctx.exception?.toString() ?? "")")
+        #expect(refitRequests(ctx) == 0)
+    }
+
+    // MARK: - postImageWidthRecheckJS clip-aware discipline (mirrors measureMaxRight)
+
+    /// Minimal DOM stub for `postImageWidthRecheckJS`'s `check()`: a 490px
+    /// TABLE inside a DIV.w-full.overflow-auto "scroller" (286px), plus one
+    /// deferred `<img>` inside the table whose settle event is what drives
+    /// `check()` to run. `scrollerOverflowX` controls whether the scroller
+    /// clips (nil models a genuine desktop-width email with no clipping
+    /// ancestor — the regression guard that a real overflow still refits).
+    private static func clipAwareRecheckHarness(scrollerOverflowX: String?) -> String {
+        let overflowAssignment = scrollerOverflowX.map { "scroller._overflowX = '\($0)';" } ?? ""
+        return """
+        var _msgs = [];
+        function _baseEl(tag, cls) {
+            var el = {
+                tagName: tag, className: cls || '', parentElement: null, complete: true,
+                _attrs: {}, _overflowX: undefined, _listeners: {},
+                getAttribute: function (k) { return (k in el._attrs) ? el._attrs[k] : null; },
+                setAttribute: function (k, v) { el._attrs[k] = v; },
+                hasAttribute: function (k) { return (k in el._attrs); },
+                addEventListener: function (t, fn) { (el._listeners[t] = el._listeners[t] || []).push(fn); }
+            };
+            return el;
+        }
+        // Sender's own horizontal-scroll wrapper (markdown-render table pattern).
+        var scroller = _baseEl('DIV', 'w-full overflow-auto');
+        scroller.getBoundingClientRect = function () { return { left: 0, right: 286, width: 286, height: 120 }; };
+        \(overflowAssignment)
+        // The 490px pricing table, wider than the 288pt viewport, INSIDE the
+        // scroller — the cloud-console notification pattern (logmain.log 2026-07-07).
+        var table = _baseEl('TABLE', 'w-max min-w-full');
+        table.getBoundingClientRect = function () { return { left: 0, right: 490, width: 490, height: 100 }; };
+        table.parentElement = scroller;
+        // One deferred image inside the table — just enough to drive
+        // postImageWidthRecheckJS's settle-then-check() event; the table's
+        // own width does not depend on the image loading.
+        var img = _baseEl('IMG', '');
+        img._attrs['data-tmsrc'] = 'https://example.com/thumb.png';
+        img.getBoundingClientRect = function () { return { left: 0, right: 10, width: 10, height: 10 }; };
+        img.parentElement = table;
+        var _all = [scroller, table, img];
+        var _imgs = [img];
+        var document = {
+            getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _all.slice(); },
+            body: {
+                getElementsByTagName: function (t) { return t === 'img' ? _imgs.slice() : _all.slice(); }
+            }
+        };
+        var window = {
+            innerWidth: 288,
+            getComputedStyle: function (el) { return { width: '', height: '', maxWidth: '', overflowX: el._overflowX }; },
+            webkit: { messageHandlers: {
+                consoleLog: { postMessage: function (s) {} },
+                heightChanged: { postMessage: function (m) { _msgs.push(m); } }
+            } }
+        };
+        function setTimeout(fn, t) { fn(); }
+        // Simulates deferredImageLoadJS's swap (data-tmsrc → src) firing the
+        // image's real 'load' event once the swapped-in resource resolves.
+        function fireImgEvent(type) {
+            img._attrs['src'] = img._attrs['data-tmsrc'];
+            delete img._attrs['data-tmsrc'];
+            img.complete = true;
+            var ls = img._listeners[type] || [];
+            for (var i = 0; i < ls.length; i++) ls[i]();
+        }
+        function refitRequests() {
+            var n = 0;
+            for (var i = 0; i < _msgs.length; i++) { if (_msgs[i] && _msgs[i].requestWidthRefit === true) n++; }
+            return n;
+        }
+        """
+    }
+
+    private func makeClipAwareRecheckContext(scrollerOverflowX: String?) -> JSContext {
+        let ctx = JSContext()!
+        // Harness first — it defines `var window`; a bare JSContext has no
+        // window global, so setting the fit flags before it throws.
+        ctx.evaluateScript(Self.clipAwareRecheckHarness(scrollerOverflowX: scrollerOverflowX))
+        ctx.evaluateScript("window.__tmFitDone = true; window.__tmDeviceWidth = 288;")
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    @Test("post-image width recheck stays quiet when the settled overflow is entirely inside a clipped author container")
+    func widthPipelineRecheckSkipsClippedOverflow() {
+        // Same clip-aware discipline as measureMaxRight (fitViewportJS): the
+        // 490px table is contained by its own DIV.w-full.overflow-auto
+        // scroller (286px), so even after the table's image settles and
+        // `check()` re-measures, the overflow must not trigger a re-fit.
+        let ctx = makeClipAwareRecheckContext(scrollerOverflowX: "auto")
+        ctx.evaluateScript(_postImageWidthRecheckJS)
+        #expect(ctx.exception == nil, "recheck script threw: \(ctx.exception?.toString() ?? "")")
+        ctx.evaluateScript("fireImgEvent('load')")
+        #expect(ctx.exception == nil, "fire threw: \(ctx.exception?.toString() ?? "")")
         #expect(refitRequests(ctx) == 0)
     }
 
@@ -993,6 +1132,122 @@ struct EmailRenderPipelineTests {
             return
         }
         #expect(fnIdx < hideIdx && hideIdx < retIdx)
+    }
+
+    // MARK: - Clip-aware overflow measurement (author overflow-x ancestor)
+
+    /// Minimal DOM stub for `measureMaxRight()`'s clip-aware ancestor walk: a
+    /// 490px-wide TABLE (a cloud-console notification's pricing table,
+    /// nowrap cells) sitting inside a DIV.w-full.overflow-auto "scroller"
+    /// (286px — the sender's own markdown-render horizontal-pan wrapper,
+    /// logmain.log 2026-07-07). `scrollerOverflowX` controls whether
+    /// `getComputedStyle(scroller).overflowX` reports a containing value —
+    /// nil models a genuine desktop-width email with no clipping ancestor
+    /// (the regression guard: must still widen).
+    private func makeClipAwareContext(deviceWidth: Int = 288, scrollerOverflowX: String?) -> JSContext {
+        let ctx = JSContext()!
+        let overflowAssignment = scrollerOverflowX.map { "scroller._overflowX = '\($0)';" } ?? ""
+        ctx.evaluateScript("""
+        var DEVICE_W = \(deviceWidth);
+        var _vw = DEVICE_W;
+        var _msgs = [];
+        function _baseEl(tag, cls) {
+            var el = {
+                tagName: tag, className: cls || '', innerText: '', outerHTML: '<' + tag.toLowerCase() + '>',
+                parentElement: null, complete: true, _attrs: {}, _overflowX: undefined,
+                getAttribute: function (k) { return (k in el._attrs) ? el._attrs[k] : null; },
+                setAttribute: function (k, v) { el._attrs[k] = v; },
+                hasAttribute: function (k) { return (k in el._attrs); },
+                querySelectorAll: function () { return []; }
+            };
+            el.style = {
+                setProperty: function () {},
+                getPropertyValue: function () { return ''; },
+                getPropertyPriority: function () { return ''; },
+                removeProperty: function () {}
+            };
+            return el;
+        }
+        // The sender's own horizontal-scroll wrapper (markdown-render table
+        // pattern) — fits the 288pt viewport on its own.
+        var scroller = _baseEl('DIV', 'w-full overflow-auto');
+        scroller.getBoundingClientRect = function () { return { left: 0, right: 286, width: 286, height: 120 }; };
+        \(overflowAssignment)
+        // The 490px pricing table with nowrap cells, INSIDE the scroller —
+        // never widens the page on the web because the scroller clips/pans it.
+        var table = _baseEl('TABLE', 'w-max min-w-full');
+        table.getBoundingClientRect = function () { return { left: 0, right: 490, width: 490, height: 100 }; };
+        table.parentElement = scroller;
+        var _all = [scroller, table];
+        var _meta = {
+            _content: 'width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes',
+            getAttribute: function (k) { return _meta._content; },
+            setAttribute: function (k, v) {
+                _meta._content = v;
+                var m = v.match(/width=(device-width|\\d+)/);
+                if (m) _vw = (m[1] === 'device-width') ? DEVICE_W : parseInt(m[1], 10);
+            }
+        };
+        var document = {
+            readyState: 'complete',
+            documentElement: { offsetHeight: 100, style: { setProperty: function () {} } },
+            querySelector: function (s) { return s.indexOf('meta') >= 0 ? _meta : null; },
+            body: {
+                scrollHeight: 300,
+                style: { setProperty: function () {} },
+                getBoundingClientRect: function () { return { left: 0, right: _vw, width: _vw, height: 300 }; },
+                getElementsByTagName: function (t) { return t === 'img' ? [] : _all.slice(); },
+                querySelectorAll: function (sel) {
+                    var tags = sel.split(',').map(function (s) { return s.trim().toUpperCase(); });
+                    return _all.filter(function (el) { return tags.indexOf(el.tagName) >= 0; });
+                }
+            }
+        };
+        var window = {
+            innerWidth: DEVICE_W, innerHeight: 800, devicePixelRatio: 3,
+            screen: { width: DEVICE_W },
+            addEventListener: function () {},
+            getComputedStyle: function (el) { return { width: '', height: '', maxWidth: '', overflowX: el._overflowX }; },
+            webkit: { messageHandlers: {
+                consoleLog: { postMessage: function (s) {} },
+                heightChanged: { postMessage: function (m) { _msgs.push(m); } }
+            } }
+        };
+        function requestAnimationFrame(fn) { fn(); }
+        function setTimeout(fn, t) { fn(); }
+        """)
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    @Test("measureMaxRight skips a would-be culprit contained by an author overflow-x:auto ancestor — no widen")
+    func fitViewportSkipsClippedAncestorOverflow() {
+        // cloud-console notification email: 491px pricing table (nowrap cells) inside
+        // its own DIV.w-full.overflow-auto scroller (286px) — on the web the
+        // table pans inside its box and never widens the page. Pre-fix,
+        // measureMaxRight saw the table as the rightmost edge (maxRight=492)
+        // and widened to 493px → 0.58x shrink (logmain.log 2026-07-07).
+        let ctx = makeClipAwareContext(scrollerOverflowX: "auto")
+        ctx.evaluateScript("window.__tmDeviceWidth = 288;" + _fitViewportJS)
+        #expect(ctx.exception == nil, "fit threw: \(ctx.exception?.toString() ?? "")")
+        // No widen: the clipped table never becomes the measured max, so the
+        // scroller (286px, fits) is the only candidate — no overflow.
+        #expect(layoutVp(ctx) == 0)
+        let metaContent = ctx.evaluateScript("_meta._content")?.toString() ?? ""
+        #expect(metaContent.contains("device-width"))
+    }
+
+    @Test("measureMaxRight still widens the SAME overflow with no clipping ancestor (regression guard)")
+    func fitViewportWidensWithoutClippingAncestor() {
+        // Identical geometry to the test above, MINUS the ancestor's
+        // overflow-x:auto — this is what a genuine desktop-width email looks
+        // like, and it must still trigger the scale-to-fit widen.
+        let ctx = makeClipAwareContext(scrollerOverflowX: nil)
+        ctx.evaluateScript("window.__tmDeviceWidth = 288;" + _fitViewportJS)
+        #expect(ctx.exception == nil, "fit threw: \(ctx.exception?.toString() ?? "")")
+        #expect(layoutVp(ctx) == 490)
+        let metaContent = ctx.evaluateScript("_meta._content")?.toString() ?? ""
+        #expect(metaContent.contains("width=490"))
     }
 
     // MARK: - monitorHeightJS regressions
