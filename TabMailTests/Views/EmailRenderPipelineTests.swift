@@ -750,6 +750,205 @@ struct EmailRenderPipelineTests {
         #expect(appliedValue(ctx, "ok-p", "text-indent") == nil)
     }
 
+    // MARK: - normalizeIndentJS (behavioral, via JSContext + mock DOM)
+    //
+    // These run the PRODUCTION `normalizeIndentJS` source against a minimal
+    // synthetic DOM — the same zero-drift pattern as `runLeftFix` above. Direct
+    // text is modeled as a REAL text node (nodeType 3) linked via
+    // firstChild/nextSibling so `hasDirectText`'s walk exercises the actual
+    // production code path, not a stand-in. `applied(key)` / `priorityOf(key,
+    // prop)` return what the pass set via `style.setProperty`; `attrOf(key)`
+    // returns the `data-tm-indentcrop` marker set via `setAttribute`. Body width
+    // is fixed at 288 (matches the other harnesses' device viewport), so
+    // WIDE = 172.8 — every element below defaults to rect width 250 (a "wide"
+    // text leaf) unless overridden. Content is generic (no real senders/domains).
+    private static let indentCropDomHarness = """
+    var _applied = {}, _appliedPriority = {}, _byKey = {}, _roots = [];
+    function _txtNode(text) { return { nodeType: 3, textContent: text }; }
+    function _el(tag, o, kids) {
+        o = o || {}; kids = kids || [];
+        var key = o.key || ('k' + Object.keys(_byKey).length);
+        var chain = [];
+        if (o.text !== undefined) chain.push(_txtNode(o.text));
+        for (var i = 0; i < kids.length; i++) chain.push(kids[i]);
+        for (var j = 0; j < chain.length; j++) chain[j].nextSibling = (j + 1 < chain.length) ? chain[j + 1] : null;
+        var n = {
+            tagName: tag.toUpperCase(), className: o.cls || '', children: kids,
+            firstChild: chain.length ? chain[0] : null, parentElement: null, _attrs: {},
+            _comp: { marginLeft: (o.ml || 0) + 'px', marginRight: (o.mr != null ? o.mr : 0) + 'px', direction: o.dir || 'ltr' },
+            _rect: { left: (o.left || 0), width: (o.w == null ? 250 : o.w), height: (o.h == null ? 20 : o.h) },
+            getBoundingClientRect: function () { return this._rect; },
+            setAttribute: function (k, v) { n._attrs[k] = v; },
+            getAttribute: function (k) { return (k in n._attrs) ? n._attrs[k] : null; },
+            style: { setProperty: function (k, v, p) {
+                (_applied[key] = _applied[key] || {})[k] = v;
+                (_appliedPriority[key] = _appliedPriority[key] || {})[k] = p;
+            } }
+        };
+        for (var m = 0; m < kids.length; m++) kids[m].parentElement = n;
+        _byKey[key] = n; return n;
+    }
+    function _flatten(node, out) { for (var i = 0; i < node.children.length; i++) { out.push(node.children[i]); _flatten(node.children[i], out); } return out; }
+    function _allDesc() { var out = []; for (var i = 0; i < _roots.length; i++) { out.push(_roots[i]); _flatten(_roots[i], out); } return out; }
+    var document = { body: {
+        getBoundingClientRect: function () { return { left: 0, width: 288, height: 2000 }; },
+        getElementsByTagName: function (t) { return _allDesc(); }
+    } };
+    var window = {
+        getComputedStyle: function (el) { return (el === document.body) ? { direction: 'ltr' } : el._comp; },
+        webkit: { messageHandlers: { consoleLog: { postMessage: function () {} } } }
+    };
+    function applied(key) { return _applied[key] || {}; }
+    function priorityOf(key, prop) { return (_appliedPriority[key] || {})[prop]; }
+    function attrOf(key) { return _byKey[key]._attrs; }
+    function setBody(roots) { _roots = roots; for (var i = 0; i < roots.length; i++) roots[i].parentElement = document.body; }
+    """
+
+    /// Fresh JSContext with the DOM mock + the tree built by `bodyJS` (which must
+    /// call `setBody([...])`), then runs the production per-region indent-crop
+    /// pass. Mirrors `runLeftFix`.
+    private func runIndentCrop(_ bodyJS: String) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.indentCropDomHarness)
+        ctx.evaluateScript(bodyJS)
+        ctx.evaluateScript(_normalizeIndentJS)
+        #expect(ctx.exception == nil, "indent-crop JS threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    private func attrValue(_ ctx: JSContext, _ key: String, _ attr: String) -> String? {
+        let v = ctx.evaluateScript("attrOf('\(key)')['\(attr)']")
+        return (v?.isUndefined ?? true) ? nil : v?.toString()
+    }
+
+    private func appliedPriority(_ ctx: JSContext, _ key: String, _ prop: String) -> String? {
+        let v = ctx.evaluateScript("priorityOf('\(key)', '\(prop)')")
+        return (v?.isUndefined ?? true) ? nil : v?.toString()
+    }
+
+    @Test("normalizeIndentJS crops a uniform OWA-style whole-column indent to 0 — the full-width footer at inset 0 stays untouched")
+    func indentCropCropsUniformOwaIndent() {
+        // The OWA idiom: every main-content block carries margin: 0px 0px 16px
+        // 40px, but a mailing-list footer sits at inset 0 — the exact shape that
+        // defeats eatGutterMarginsJS's global min-inset measurement (its min
+        // pins to the footer's 0, so it correctly does nothing). Per-region
+        // cropping fixes this: all three indented paragraphs collapse to 0
+        // (dominance share 3/4 = 0.75), the footer is never touched.
+        let ctx = runIndentCrop("""
+        setBody([
+            _el('p', { key: 'p1', ml: 40, text: 'First paragraph of the message body with real content.' }),
+            _el('p', { key: 'p2', ml: 40, text: 'Second paragraph, indented the OWA way as well.' }),
+            _el('p', { key: 'p3', ml: 40, text: 'Third paragraph, same indent as the first two.' }),
+            _el('p', { key: 'footer', ml: 0, mr: 0, text: 'Unsubscribe from this mailing list at example.com/unsubscribe.' })
+        ]);
+        """)
+        for key in ["p1", "p2", "p3"] {
+            #expect(appliedValue(ctx, key, "margin-left") == "0px")
+            #expect(appliedPriority(ctx, key, "margin-left") == "important")
+            #expect(attrValue(ctx, key, "data-tm-indentcrop") == "1")
+        }
+        #expect(appliedValue(ctx, "footer", "margin-left") == nil)
+        #expect(attrValue(ctx, "footer", "data-tm-indentcrop") == nil)
+    }
+
+    @Test("normalizeIndentJS preserves relative indent deltas — 40px/80px carriers become 0px/40px")
+    func indentCropPreservesRelativeDeltas() {
+        // Crop is a SHIFT (subtract the tightest bounding inset), not a flatten
+        // to zero — a mixed-depth email keeps its intentional relative nesting.
+        let ctx = runIndentCrop("""
+        setBody([
+            _el('p', { key: 'shallow', ml: 40, text: 'Shallow indented paragraph with real content.' }),
+            _el('p', { key: 'deep', ml: 80, text: 'Deeply indented paragraph with real content too.' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "shallow", "margin-left") == "0px")
+        #expect(appliedValue(ctx, "deep", "margin-left") == "40px")
+    }
+
+    @Test("normalizeIndentJS dominance guard leaves a single indented aside alone among normal paragraphs")
+    func indentCropDominanceGuardLeavesMinorityIndentAlone() {
+        // Only ONE of five wide text leaves is indented (share 1/5 = 0.2 <
+        // DOMINANCE 0.6) — a deliberately indented aside among normal body
+        // paragraphs is meaningful indentation, not compose-tool chrome, so
+        // nothing is touched.
+        let ctx = runIndentCrop("""
+        setBody([
+            _el('p', { key: 'para1', ml: 0, text: 'Normal paragraph one with regular body text.' }),
+            _el('p', { key: 'para2', ml: 0, text: 'Normal paragraph two with regular body text.' }),
+            _el('p', { key: 'para3', ml: 0, text: 'Normal paragraph three with regular body text.' }),
+            _el('p', { key: 'para4', ml: 0, text: 'Normal paragraph four with regular body text.' }),
+            _el('div', { key: 'aside', ml: 40, text: 'A deliberately indented aside, such as a pull quote.' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "aside", "margin-left") == nil)
+        for key in ["para1", "para2", "para3", "para4"] {
+            #expect(appliedValue(ctx, key, "margin-left") == nil)
+        }
+    }
+
+    @Test("normalizeIndentJS excludes centered content (equal left/right margins) from carrier detection")
+    func indentCropExcludesCenteredContent() {
+        // margin:auto centering produces EQUAL left/right margins — the
+        // asymmetry test (margin-left - margin-right >= INDENT_MIN) must reject
+        // it even though margin-left alone clears INDENT_MIN. Genuinely
+        // asymmetric siblings still get cropped, proving the exclusion is the
+        // asymmetry check and not an early bail.
+        let ctx = runIndentCrop("""
+        setBody([
+            _el('table', { key: 'centered', ml: 40, mr: 40, text: 'A centered table using margin:auto styling.' }),
+            _el('p', { key: 'p1', ml: 40, text: 'An indented paragraph carrying real content.' }),
+            _el('p', { key: 'p2', ml: 40, text: 'Another indented paragraph, same indent as above.' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "centered", "margin-left") == nil)
+        #expect(appliedValue(ctx, "p1", "margin-left") == "0px")
+        #expect(appliedValue(ctx, "p2", "margin-left") == "0px")
+    }
+
+    @Test("normalizeIndentJS leaves BLOCKQUOTE and UL/OL/LI margins untouched (owned by other passes)")
+    func indentCropExcludesBlockquoteAndLists() {
+        // BLOCKQUOTE is real quote semantics (owned by the quote-collapse pass);
+        // UL/OL/LI list geometry belongs to constrainLeftOverflowJS. Both are
+        // excluded from carrier candidacy regardless of their margin-left. Four
+        // genuinely indented paragraphs keep dominance above threshold so the
+        // exclusion is proven structural, not an incidental dominance bail.
+        let ctx = runIndentCrop("""
+        setBody([
+            _el('blockquote', { key: 'quote', ml: 40, text: 'A genuinely quoted reply, indented on purpose.' }),
+            _el('ul', { key: 'list', ml: 40 }, [ _el('li', { key: 'item', ml: 40, text: 'A list item with a large indent.' }) ]),
+            _el('p', { key: 'p1', ml: 40, text: 'Indented paragraph one carrying real content.' }),
+            _el('p', { key: 'p2', ml: 40, text: 'Indented paragraph two carrying real content.' }),
+            _el('p', { key: 'p3', ml: 40, text: 'Indented paragraph three carrying real content.' }),
+            _el('p', { key: 'p4', ml: 40, text: 'Indented paragraph four carrying real content.' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "quote", "margin-left") == nil)
+        #expect(appliedValue(ctx, "list", "margin-left") == nil)
+        #expect(appliedValue(ctx, "item", "margin-left") == nil)
+        for key in ["p1", "p2", "p3", "p4"] {
+            #expect(appliedValue(ctx, key, "margin-left") == "0px")
+        }
+    }
+
+    @Test("normalizeIndentJS crops only the OUTERMOST carrier when one is nested inside another")
+    func indentCropCropsOutermostOnly() {
+        // A 40px carrier nested inside another 40px carrier: only the outer one
+        // is cropped (its wide-text-leaf qualification comes from the nested
+        // paragraph's content) — the inner carrier is left with its own margin
+        // untouched, preserving its delta relative to the (now-zeroed) outer.
+        let ctx = runIndentCrop("""
+        setBody([
+            _el('div', { key: 'outer', ml: 40, w: 260 }, [
+                _el('p', { key: 'inner', ml: 40, text: 'A nested indented paragraph inside an indented wrapper.' })
+            ]),
+            _el('p', { key: 'p2', ml: 40, text: 'A sibling indented paragraph with its own direct text.' })
+        ]);
+        """)
+        #expect(appliedValue(ctx, "outer", "margin-left") == "0px")
+        #expect(appliedValue(ctx, "inner", "margin-left") == nil)
+        #expect(appliedValue(ctx, "p2", "margin-left") == "0px")
+    }
+
     @Test("fixDarkModeColorsJS makes the outermost near-white surface a darker panel (not erased)")
     func darkModeNearWhitePanelDarkening() {
         let js = _fixDarkModeColorsJS

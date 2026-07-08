@@ -248,6 +248,10 @@ private struct HTMLWebView: UIViewRepresentable {
         // After the layout-affecting transforms (quote/ics collapse, eml cleanup)
         // and before height monitoring/fit, so it measures the settled layout.
         let leftFix = WKUserScript(source: constrainLeftOverflowJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        // Crops a WHOLESALE per-region indent (e.g. OWA's margin:0 0 16px 40px on
+        // every content block) BEFORE eatGutterMarginsJS/fitViewportJS measure, so
+        // both see the post-crop layout. See normalizeIndentJS's doc comment.
+        let indentCrop = WKUserScript(source: normalizeIndentJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let eatMargins = WKUserScript(source: eatGutterMarginsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         let heightMonitor = WKUserScript(source: monitorHeightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         // After heightMonitor so window.__tmReportHeight is defined when a
@@ -270,6 +274,7 @@ private struct HTMLWebView: UIViewRepresentable {
         config.userContentController.addUserScript(icsCollapse)
         config.userContentController.addUserScript(deferImages)
         config.userContentController.addUserScript(leftFix)
+        config.userContentController.addUserScript(indentCrop)
         config.userContentController.addUserScript(eatMargins)
         config.userContentController.addUserScript(heightMonitor)
         config.userContentController.addUserScript(aspectFix)
@@ -1862,6 +1867,190 @@ private let deferredImageLoadJS = """
         setTimeout(swap, 1500);
     })();
     """
+
+/// Crop a WHOLESALE per-region content indent — the case `eatGutterMarginsJS`
+/// (below) and the negative-body-margin approach it replaced (2026-06-30) can
+/// never fix, because both are bounded by the SMALLEST inset anywhere in the
+/// email. An Outlook/OWA compose styles EVERY main-content block with the OWA
+/// idiom `margin: 0px 0px 16px 40px` (margin-left:40px) — on a 288pt phone
+/// that's 14% of the width, stacked on our own 16pt gutter → ~56pt left vs
+/// 16pt right. The same email also carries a full-width mailing-list footer
+/// at inset 0, so `eatGutterMarginsJS`'s min-inset measurement is (correctly)
+/// 0 and it does nothing (`logmain.log` 2026-07-07: `emailInset L=0 R=0`
+/// while every content block carried `margin: 0px 0px 16px 40px`). A GLOBAL
+/// fix is structurally incapable here — it has to see the footer as the
+/// floor. Fixing this needs to work PER-REGION instead.
+///
+/// Algorithm: find "indent carriers" — elements whose margin-left clears
+/// `INDENT_MIN` (24px: comfortably past the 16pt SwiftUI gutter, and Gmail's
+/// ~0.8ex / 4px quote indent must never trigger this) AND is ASYMMETRIC vs
+/// margin-right (`margin:auto`-centered tables/sections have EQUAL used
+/// margins and must not read as an indent). Keep only the OUTERMOST carriers
+/// (a carrier nested inside another selected carrier is left untouched — its
+/// delta relative to the outer one is exactly what step further down
+/// preserves) whose subtree actually contains a wide (≥60% of body width,
+/// same main-column test as `eatGutterMarginsJS`) text leaf — an indented
+/// icon/spacer with no real column text isn't worth normalizing.
+///
+/// DOMINANCE GUARD — the safety net that makes this safe to run unconditionally:
+/// count every wide text leaf in the body and how many sit inside selected
+/// carriers. Only crop when that share is ≥60% (`DOMINANCE`). An email with
+/// ONE intentionally indented aside among normal paragraphs is a deliberate,
+/// meaningful indent — it keeps its aside. Only emails whose main column is
+/// WHOLESALE indented (compose-tool chrome, not information) get cropped.
+///
+/// Exclusions: UL/OL/LI (list geometry is `constrainLeftOverflowJS`'s job, not
+/// ours), BLOCKQUOTE (real quote semantics, owned by the quote-collapse
+/// pass), and any element — or the whole body — computed RTL (this pass is
+/// LTR-only scope; an RTL body skips the entire run).
+///
+/// Crop is a SHIFT, not a flatten: `reduction` = the tightest bounding inset
+/// (the MIN margin-left) across selected carriers. Subtracting it from every
+/// selected carrier preserves RELATIVE deltas: a uniform 40px OWA email
+/// collapses every carrier to 0 (the SwiftUI 16pt gutter remains the total
+/// indent, same as any un-indented email); a mixed 40px/80px email becomes
+/// 0px/40px. Only `margin-left` is touched — the idiom's own
+/// `margin-bottom:16px` etc. survive untouched. Each cropped element is
+/// marked `data-tm-indentcrop` for debuggability.
+///
+/// Runs once per document load (WKUserScript, `.atDocumentEnd`) — appearance-
+/// flip re-renders reload the document fresh (see the light↔dark reload note
+/// above), so unlike `fitViewportJS`'s width arm this needs no idempotency
+/// guard of its own. Injected BETWEEN `leftFix` and `eatMargins` (both in the
+/// WKUserScript construction block and the `addUserScript` sequence) so
+/// `eatGutterMarginsJS` and `fitViewportJS` measure the POST-crop layout.
+/// Exposed for unit tests via `_normalizeIndentJS`.
+internal var _normalizeIndentJS: String { normalizeIndentJS }
+private var normalizeIndentJS: String {
+    let il = DebugModeManager.isLoggingEnabled()
+        ? "function il(s){try{window.webkit.messageHandlers.consoleLog.postMessage('[IndentCrop] '+s);}catch(_){}}"
+        : "function il(s){}"
+    return """
+    (function() {
+        \(il)
+        if (!document.body) return;
+        try {
+            var b = document.body.getBoundingClientRect();
+            var bodyWidth = b.width;
+            if (bodyWidth <= 0) return;
+
+            // An indent must exceed the app's 16pt gutter noticeably before it's
+            // worth normalizing — Gmail's ~0.8ex (~4px) quote indent must never
+            // trigger this; that's real quote structure the quote-collapse pass
+            // (and eatGutterMarginsJS) already own.
+            var INDENT_MIN = 24;
+            // Same main-column test as eatGutterMarginsJS: a "wide" text leaf is
+            // part of the primary reading column, not a narrow aside/badge/caption.
+            var WIDE_FRAC = 0.6;
+            // Dominance guard threshold — see the step below. An email whose main
+            // column is only PARTIALLY indented (a deliberate aside) must be left
+            // alone; only a WHOLESALE-indented column (compose-tool chrome) qualifies.
+            var DOMINANCE = 0.6;
+
+            var bodyDir = window.getComputedStyle(document.body).direction;
+            if (bodyDir === 'rtl') { il('body is rtl — LTR-only scope, skipping run'); return; }
+
+            var WIDE = bodyWidth * WIDE_FRAC;
+
+            // Direct non-whitespace text child, &nbsp;-normalized — same idiom as
+            // eatGutterMarginsJS's wide-text-leaf loop.
+            function hasDirectText(el) {
+                for (var n = el.firstChild; n; n = n.nextSibling) {
+                    if (n.nodeType === 3 && n.textContent.replace(/\\u00a0/g, ' ').trim().length) return true;
+                }
+                return false;
+            }
+
+            var all = document.body.getElementsByTagName('*');
+
+            // Step 1: find indent carriers — margin-left clears INDENT_MIN AND is
+            // asymmetric vs margin-right (excludes margin:auto centered content).
+            var carriers = [];
+            for (var i = 0; i < all.length; i++) {
+                var el = all[i];
+                var tag = el.tagName;
+                if (tag === 'UL' || tag === 'OL' || tag === 'LI' || tag === 'BLOCKQUOTE') continue;
+                var cs = window.getComputedStyle(el);
+                if (cs.direction === 'rtl') continue;
+                var ml = parseFloat(cs.marginLeft) || 0;
+                var mr = parseFloat(cs.marginRight) || 0;
+                if (ml >= INDENT_MIN && (ml - mr) >= INDENT_MIN) {
+                    el.__tmICCandidate = true;
+                    carriers.push(el);
+                }
+            }
+            if (!carriers.length) { il('no indent carriers found'); return; }
+
+            // Step 2: keep only OUTERMOST carriers — skip any carrier that has a
+            // selected ancestor (its own delta relative to the outer one is what
+            // the crop step preserves by leaving it alone).
+            var outer = [];
+            for (var j = 0; j < carriers.length; j++) {
+                var c = carriers[j];
+                var nested = false;
+                for (var p = c.parentElement; p; p = p.parentElement) {
+                    if (p.__tmICCandidate) { nested = true; break; }
+                }
+                if (!nested) { c.__tmICOuter = true; outer.push(c); }
+            }
+
+            // Step 3: a carrier only qualifies if its subtree (self included) holds
+            // at least one wide text leaf. Walking every wide leaf up to its nearest
+            // OUTER-carrier ancestor also gives the dominance-guard counts for free:
+            // totalWide = every wide leaf in the body; carrierWide = how many sit
+            // inside a selected (outer + non-empty) carrier.
+            var totalWide = 0, carrierWide = 0;
+            for (var m = 0; m < all.length; m++) {
+                var leaf = all[m];
+                var r = leaf.getBoundingClientRect();
+                if (r.width < WIDE || r.height <= 0) continue;
+                if (!hasDirectText(leaf)) continue;
+                totalWide++;
+                for (var node = leaf; node && node !== document.body; node = node.parentElement) {
+                    if (node.__tmICOuter) { node.__tmICHasWide = true; carrierWide++; break; }
+                }
+            }
+            var selected = [];
+            for (var k = 0; k < outer.length; k++) {
+                if (outer[k].__tmICHasWide) selected.push(outer[k]);
+            }
+            if (!selected.length) { il('no carrier subtree has a wide text leaf — nothing to crop'); return; }
+
+            // Step 4: DOMINANCE GUARD. Only crop when selected carriers hold most
+            // of the body's wide-column text — an email with one intentionally
+            // indented aside among normal paragraphs keeps its aside untouched.
+            var share = carrierWide / totalWide;
+            if (share < DOMINANCE) {
+                il('carrier share ' + share.toFixed(2) + ' < DOMINANCE ' + DOMINANCE + ' — leaving indentation alone');
+                return;
+            }
+
+            // Step 5: crop = SHIFT, not flatten. reduction is the tightest bounding
+            // inset (MIN margin-left) across selected carriers; subtracting it from
+            // every carrier preserves RELATIVE deltas (a 40/80 mix becomes 0/40)
+            // while a uniform indent (the OWA case) collapses to 0 — the SwiftUI
+            // 16pt gutter remains the total indent, same as any un-indented email.
+            // Only margin-left is touched, so the idiom's own margin-bottom etc.
+            // survive.
+            var reduction = Infinity;
+            for (var s = 0; s < selected.length; s++) {
+                var msL = parseFloat(window.getComputedStyle(selected[s]).marginLeft) || 0;
+                if (msL < reduction) reduction = msL;
+            }
+            for (var t = 0; t < selected.length; t++) {
+                var elT = selected[t];
+                var mlT = parseFloat(window.getComputedStyle(elT).marginLeft) || 0;
+                var newMl = mlT - reduction;
+                elT.style.setProperty('margin-left', newMl + 'px', 'important');
+                elT.setAttribute('data-tm-indentcrop', '1');
+                il('crop ' + elT.tagName + '.' + (elT.className || '').toString().slice(0, 20) + ' ' + mlT + 'px → ' + newMl + 'px');
+            }
+            il('summary: carriers=' + carriers.length + ' outer=' + outer.length + ' selected=' + selected.length
+                + ' reduction=' + reduction + ' share=' + share.toFixed(2));
+        } catch (e) { il('error: ' + (e && e.message ? e.message : e)); }
+    })();
+    """
+}
 
 /// Make the SwiftUI gutter act as a MINIMUM "indent" that ABSORBS an email's own
 /// outer horizontal inset, instead of the two STACKING (our 16pt + the email's own
