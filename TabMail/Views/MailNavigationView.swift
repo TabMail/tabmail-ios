@@ -1013,7 +1013,7 @@ private struct MessageDetailContainer: View {
 
     var body: some View {
         if let messageId = selectedMessageId {
-            MessageDetailResolvedContent(messageId: messageId)
+            MessageDetailResolvedContent(messageId: messageId, opensWithSkeletonDwell: false)
         } else {
             ContentUnavailableView("Select a Message", systemImage: "envelope", description: Text("Choose a message to read"))
         }
@@ -1033,6 +1033,7 @@ private struct MessageDetailContainer: View {
 ///   navigation push instead of riding `selectedMessageId`.
 private struct MessageDetailResolvedContent: View {
     let messageId: String
+    let opensWithSkeletonDwell: Bool
 
     var body: some View {
         // Check if this message is in a Drafts folder — if so, open ComposeView.
@@ -1046,7 +1047,7 @@ private struct MessageDetailResolvedContent: View {
             ServerDraftComposeLoader(header: check.header)
                 .id(messageId)
         } else {
-            MessageDetailView(messageId: messageId)
+            MessageDetailView(messageId: messageId, opensWithSkeletonDwell: opensWithSkeletonDwell)
                 .id(messageId)
         }
     }
@@ -1061,7 +1062,7 @@ private struct PushedMessageDestination: View {
     let messageId: String
 
     var body: some View {
-        MessageDetailResolvedContent(messageId: messageId)
+        MessageDetailResolvedContent(messageId: messageId, opensWithSkeletonDwell: true)
     }
 }
 

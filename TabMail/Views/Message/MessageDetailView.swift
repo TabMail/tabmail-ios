@@ -28,6 +28,23 @@ struct MessageDetailView: View {
     @State private var agentToastDismiss: Task<Void, Never>?
     @State private var userHasScrolledDetail = false
     @State private var openAnchorArmed = true
+    /// Pushed-pill opens only (`opensWithSkeletonDwell`): the header resolves
+    /// ~10-20ms after construction — before the push transition's first
+    /// visible frame — so the natural skeleton branch never gets a visible
+    /// frame. Draw the skeleton as an OVERLAY on top of the (immediately
+    /// mounted, fully live) content for long enough to outlast the push
+    /// transition, then dissolve. OVERLAY, never a content gate: gating
+    /// content creation on a cosmetic timer slowed normal opens and broke the
+    /// laterMessages.count anchor (68ded8e, reverted).
+    @State private var skeletonOverlayVisible = false
+    /// Must exceed the navigationDestination push transition (~0.5s spring)
+    /// so the dissolve tail lands after the view settles.
+    private static let pushedSkeletonDwell: Duration = .milliseconds(650)
+    /// Whether this instance was opened via the programmatic pushed-pill
+    /// destination (`PushedMessageDestination`) rather than an inbox row tap
+    /// or notification deep link. Only the pill path dwells the skeleton
+    /// overlay — see `skeletonOverlayVisible` doc comment above.
+    let opensWithSkeletonDwell: Bool
     var showSideButtons: Bool { !chatExpanded && sideButtonsReady }
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
@@ -37,8 +54,10 @@ struct MessageDetailView: View {
         (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
     }
 
-    init(messageId: String) {
+    init(messageId: String, opensWithSkeletonDwell: Bool = false) {
         self._viewModel = State(initialValue: MessageDetailViewModel(messageId: messageId))
+        self.opensWithSkeletonDwell = opensWithSkeletonDwell
+        self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
         if DebugModeManager.isLoggingEnabled() {
             print("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
         }
@@ -46,6 +65,19 @@ struct MessageDetailView: View {
 
     var body: some View {
         bodyContent
+            .overlay {
+                if skeletonOverlayVisible && !viewModel.messageNotFound {
+                    MessageDetailSkeleton()
+                        .transition(.opacity)
+                }
+            }
+            .task {
+                guard skeletonOverlayVisible else { return }
+                try? await Task.sleep(for: Self.pushedSkeletonDwell)
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    skeletonOverlayVisible = false
+                }
+            }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
