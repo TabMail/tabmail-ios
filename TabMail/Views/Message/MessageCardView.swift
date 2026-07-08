@@ -595,6 +595,25 @@ struct MessageCardView: View {
     @ViewBuilder
     private var bodyContent: some View {
         if isFocused {
+            let _ = {
+                if DebugModeManager.isLoggingEnabled() {
+                    let branch: String
+                    if let body = viewModel.messageBody {
+                        if let html = body.htmlContent, !html.isEmpty {
+                            branch = "webview(htmlLen=\(html.count))"
+                        } else {
+                            branch = "noContent(html=\(body.htmlContent?.count ?? -1))"
+                        }
+                    } else if viewModel.isLoading {
+                        branch = "loadingSpinner"
+                    } else if viewModel.error != nil {
+                        branch = "error"
+                    } else {
+                        branch = "safetySpinner"
+                    }
+                    print("[DetailRender] card focused bodyContent branch=\(branch) id=\(message.id.prefix(40)) hasAttachments=\(message.hasAttachments) summaryBlurb=\(message.summaryBlurb == nil ? "nil" : "set")")
+                }
+            }()
             // Focused card reads from viewModel.messageBody (loaded by loadBody)
             if let body = viewModel.messageBody {
                 if let html = body.htmlContent, !html.isEmpty {

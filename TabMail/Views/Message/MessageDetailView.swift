@@ -39,6 +39,9 @@ struct MessageDetailView: View {
 
     init(messageId: String) {
         self._viewModel = State(initialValue: MessageDetailViewModel(messageId: messageId))
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
+        }
     }
 
     var body: some View {
@@ -145,6 +148,13 @@ struct MessageDetailView: View {
     @ViewBuilder
     private var bodyContent: some View {
         Group {
+            let _ = {
+                if DebugModeManager.isLoggingEnabled() {
+                    let branch = viewModel.message != nil ? "content"
+                        : (viewModel.messageNotFound ? "notFound" : "skeleton")
+                    print("[DetailRender] bodyContent eval branch=\(branch) vm=\(ObjectIdentifier(viewModel)) vmMsgId=\(viewModel.messageId.prefix(40)) header=\(viewModel.message == nil ? "nil" : "set") body=\(viewModel.messageBody == nil ? "nil" : "set")")
+                }
+            }()
             if let message = viewModel.message {
                 messageContent(message)
             } else if viewModel.messageNotFound {

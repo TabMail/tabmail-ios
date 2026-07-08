@@ -161,6 +161,9 @@ final class MessageDetailViewModel {
         startPreviewFreezeReleasedListener()
         startNSEMergeCommitListener()
         startMessagesStagedListener()
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] VM.init vm=\(ObjectIdentifier(self)) msgId=\(messageId.prefix(40))")
+        }
     }
 
     /// Test-only init that accepts a DatabasePool override and fetch closure.
@@ -322,6 +325,9 @@ final class MessageDetailViewModel {
     }
 
     deinit {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] VM.deinit vm=\(ObjectIdentifier(self))")
+        }
         if let obs = aiUpdateObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = previewFreezeReleasedObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = nseMergeObserver { NotificationCenter.default.removeObserver(obs) }
@@ -499,6 +505,9 @@ final class MessageDetailViewModel {
         pendingTapAccountId = nil
         messageNotFound = false
         BootProfiler.mark("detail header seeded on .messagesStaged publish \(m.id.prefix(24))")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] seedFromStagedPublish vm=\(ObjectIdentifier(self)) id=\(m.id.prefix(40))")
+        }
         // Read-flip: `markReadOnOpenIfNeeded` ran on open but bailed — its resolve
         // found neither a durable row (not merged) nor a staged one (snapshot was
         // empty pre-publish). Re-arm it now that `message` is set; its fast path
@@ -731,7 +740,8 @@ final class MessageDetailViewModel {
         error = nil
         BootProfiler.mark("\(mark) \(rid.prefix(24))")
         if DebugModeManager.isLoggingEnabled() {
-            print("[MessageDetail] Body adopted (\(source)) for \(rid.prefix(40))")
+            print("[MessageDetail] Body adopted (\(source)) for \(rid.prefix(40)) vm=\(ObjectIdentifier(self))")
+            print("[DetailRender] adopt id=\(rid.prefix(40)) html=\(body.htmlContent?.count ?? -1) att=\(body.attachments.count) ics=\(body.icsText?.count ?? -1)")
         }
         return true
     }
@@ -759,6 +769,9 @@ final class MessageDetailViewModel {
         withAnimation(.easeInOut(duration: 0.35)) { message = m }
         messageNotFound = false
         BootProfiler.mark("detail header recovered via poll \(m.id.prefix(24))")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] header recovered vm=\(ObjectIdentifier(self)) id=\(m.id.prefix(40)) messageSet=\(message != nil)")
+        }
         // Body-adoption's thread load no-ops while `message` is nil — re-run
         // now that the header exists.
         if messageBody != nil {
@@ -903,6 +916,9 @@ final class MessageDetailViewModel {
         // open-lag decomposes into resolve vs body-load vs render in one file.
         let loadT0 = CFAbsoluteTimeGetCurrent()
         BootProfiler.mark("detail loadBody START \(messageId.prefix(24))")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DetailRender] loadBody vm=\(ObjectIdentifier(self)) msgId=\(messageId.prefix(40))")
+        }
         defer {
             let ms = Int((CFAbsoluteTimeGetCurrent() - loadT0) * 1000)
             if ms >= 50 {
