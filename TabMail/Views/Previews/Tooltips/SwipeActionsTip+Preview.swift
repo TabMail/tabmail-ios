@@ -24,7 +24,8 @@ import TipKit
                     title: "All Inboxes",
                     folders: [scenario.inbox],
                     selection: .unified(.inbox),
-                    selectedMessageId: .constant(nil)
+                    selectedMessageId: .constant(nil),
+                    pushedMessageId: .constant(nil)
                 )
             }
     }

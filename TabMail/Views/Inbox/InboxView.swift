@@ -36,6 +36,17 @@ struct InboxView: View {
     @State private var agentCompose: AgentToolRouter.ComposeRequest?
     @State private var sideButtonsReady = true
     @Binding var selectedMessageId: String?
+    /// Real navigation-stack push target for PROGRAMMATIC opens (chat
+    /// email-pill taps only). Decoupled from `selectedMessageId` / this
+    /// view's `List(selection:)` binding — a pill-opened message id is often
+    /// NOT any row in this list (Sent/Archive/All-Mail), and writing a
+    /// foreign value into `selectedMessageId` gets reconciled away by
+    /// SwiftUI during a concurrent List re-render (e.g. the chat-collapse
+    /// spring animation here), silently revoking the open. See the
+    /// `pushedMessageId` doc comment on `MailNavigationView` for full
+    /// rationale + on-device evidence. Bound through from `MailNavigationView`
+    /// via `MailContentColumn` → `InboxColumnResolver`.
+    @Binding var pushedMessageId: String?
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     // Read sync-status env at struct level so InboxView's body re-runs on any
@@ -62,11 +73,12 @@ struct InboxView: View {
         )
     }
 
-    init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>) {
+    init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>, pushedMessageId: Binding<String?>) {
         self.title = title
         self.folders = folders
         self.selection = selection
         self._selectedMessageId = selectedMessageId
+        self._pushedMessageId = pushedMessageId
         // StateObject(wrappedValue:) is @autoclosure @escaping — the holder
         // (and its inner InboxViewModel) is constructed EXACTLY ONCE per
         // InboxView lifetime, even if the parent re-renders many times.
@@ -159,6 +171,9 @@ struct InboxView: View {
         Binding(
             get: { selectedMessageId },
             set: { newValue in
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DetailRender] listSelectionBinding.set \(String(describing: selectedMessageId?.prefix(40))) -> \(String(describing: newValue?.prefix(40)))")
+                }
                 if let newId = newValue, isDraftsContext {
                     draftIdToOpen = newId
                 } else {
@@ -457,7 +472,10 @@ struct InboxView: View {
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false
             }
-            selectedMessageId = realId
+            // `pushedMessageId`, NOT `selectedMessageId` — see doc comment on
+            // `pushedMessageId` above (List(selection:) reconciliation revokes
+            // foreign selection values during this concurrent collapse animation).
+            pushedMessageId = realId
             print("[DynamicIslandChat] Email pill Open Email: navigating to \(realId.prefix(30))")
         }
         .modifier(TemplatePillCollapseChatModifier(chatExpanded: $chatExpanded))

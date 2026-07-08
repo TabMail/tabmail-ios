@@ -86,6 +86,24 @@ struct MailNavigationView: View {
     @State private var pendingOutlookConsentExplainerEmail: String?
     @State private var selection: MailboxSelection?
     @State private var selectedMessageId: String?
+    /// Drives a REAL navigation-stack push (`.navigationDestination(item:)`) for
+    /// PROGRAMMATIC message opens (chat email-pill taps), completely decoupled
+    /// from `selectedMessageId` / the inbox `List(selection:)` binding.
+    ///
+    /// Why this exists: `selectedMessageId` is also the inbox List's selection
+    /// binding (via `listSelectionBinding` in InboxView). A pill open can target
+    /// a Sent/Archive/All-Mail message id that is NOT any row in the currently
+    /// rendered inbox List. If that happens while the List is mid re-render
+    /// (e.g. the concurrent chat-collapse spring animation), SwiftUI reconciles
+    /// the foreign selection value away — silently revoking the push within
+    /// ~10ms-1s (on-device 2026-07-07, logmain.log lines 918-960 / 1012-1098:
+    /// VM created fine, but the row view never evaluates and the VM is
+    /// deinit'd). `navigationDestination(item:)` is a genuine stack push the
+    /// List has no way to touch, so it survives the concurrent re-render.
+    ///
+    /// Popping the pushed view (back button / swipe-back) writes `nil` into
+    /// this binding automatically — no manual reset needed.
+    @State private var pushedMessageId: String?
     /// One-shot guard for `onChange(of: selection)` to suppress the default
     /// "clear detail pane" behavior during programmatic notification-tap
     /// navigation. The handler sets selection + selectedMessageId together
@@ -411,7 +429,17 @@ struct MailNavigationView: View {
             // MailNavigationView don't cascade into the content pane.
             // Without this, GRDB ValueObservation updates destroy the
             // NavigationStack in TabMailSettingsView, wiping pushed views.
-            MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId)
+            //
+            // `.navigationDestination(item:)` is attached here — on the content
+            // column's root view, outside the `MailContentColumn` selection
+            // switch — so it's registered for every content-column selection
+            // (inbox, folder, settings, etc), not just the inbox case. See
+            // `pushedMessageId` doc comment above for why pill opens use this
+            // instead of `selectedMessageId`.
+            MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
+                .navigationDestination(item: $pushedMessageId) { id in
+                    PushedMessageDestination(messageId: id)
+                }
         } detail: {
             // Extracted into a separate struct so NavigationStore refreshes in
             // MailNavigationView don't cascade into the detail pane.
@@ -462,8 +490,10 @@ struct MailNavigationView: View {
             // Fallback handler: ensures email navigation works even when InboxView
             // isn't mounted (e.g., user is viewing Settings/Calendar/Contacts).
             // When InboxView IS mounted, both handlers fire — harmless (same state).
+            // Uses `pushedMessageId`, NOT `selectedMessageId` — see doc comment
+            // on `pushedMessageId` above.
             guard let realId = notification.userInfo?["realId"] as? String else { return }
-            selectedMessageId = realId
+            pushedMessageId = realId
         }
         .onReceive(NotificationCenter.default.publisher(for: .templatePillOpenTapped).receive(on: DispatchQueue.main)) { notification in
             // Sole sheet host for template-detail. InboxView's matching listener
@@ -767,12 +797,13 @@ private struct NavigationNotificationHandlers: ViewModifier {
 private struct MailContentColumn: View {
     let selection: MailboxSelection?
     @Binding var selectedMessageId: String?
+    @Binding var pushedMessageId: String?
 
     var body: some View {
         switch selection {
         case .unified, .folder:
             if let selection {
-                InboxColumnResolver(selection: selection, selectedMessageId: $selectedMessageId)
+                InboxColumnResolver(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
                     .id(selection)
             }
         case .outbox:
@@ -830,11 +861,12 @@ private struct SettingsContentColumn: View {
 private struct InboxColumnResolver: View {
     let selection: MailboxSelection
     @Binding var selectedMessageId: String?
+    @Binding var pushedMessageId: String?
     @Environment(NavigationStore.self) private var navigationStore
 
     var body: some View {
         let (title, matchingFolders) = resolve(selection)
-        InboxView(title: title, folders: matchingFolders, selection: selection, selectedMessageId: $selectedMessageId)
+        InboxView(title: title, folders: matchingFolders, selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
     }
 
     private func resolve(_ selection: MailboxSelection) -> (String, [Folder]) {
@@ -981,30 +1013,55 @@ private struct MessageDetailContainer: View {
 
     var body: some View {
         if let messageId = selectedMessageId {
-            // Check if this message is in a Drafts folder — if so, open ComposeView.
-            // Single read transaction for consistency (message could be deleted between reads).
-            let draftCheck: (header: MessageHeader, isDraft: Bool)? = try? AppDatabase.dbPool.read { db in
-                guard let h = try MessageHeader.fetchOne(db, key: messageId) else { return nil }
-                let f = try Folder.fetchOne(db, key: h.folderId)
-                return (h, f?.role == .drafts)
-            }
-            if let check = draftCheck, check.isDraft {
-                let header = check.header
-                draftComposeView(for: header)
-                    .id(messageId)
-            } else {
-                MessageDetailView(messageId: messageId)
-                    .id(messageId)
-            }
+            MessageDetailResolvedContent(messageId: messageId)
         } else {
             ContentUnavailableView("Select a Message", systemImage: "envelope", description: Text("Choose a message to read"))
         }
     }
+}
 
-    /// Wrapper that fetches the draft body from the server if not cached,
-    /// then opens ComposeView with the full content.
-    private func draftComposeView(for header: MessageHeader) -> some View {
-        ServerDraftComposeLoader(header: header)
+/// Resolves a concrete (non-nil) message id to its detail content: drafts
+/// check + branch between `ServerDraftComposeLoader` (server-draft message,
+/// opened as a compose view) and `MessageDetailView` (everything else).
+///
+/// Shared by two call sites so the drafts-check read logic isn't duplicated:
+/// - `MessageDetailContainer` — the detail column's selection-driven content
+///   (`selectedMessageId`, i.e. inbox row taps / notification deep links).
+/// - `PushedMessageDestination` — the content column's programmatic push
+///   (`pushedMessageId`, i.e. chat email-pill opens). See `pushedMessageId`
+///   doc comment on `MailNavigationView` for why pill opens use a real
+///   navigation push instead of riding `selectedMessageId`.
+private struct MessageDetailResolvedContent: View {
+    let messageId: String
+
+    var body: some View {
+        // Check if this message is in a Drafts folder — if so, open ComposeView.
+        // Single read transaction for consistency (message could be deleted between reads).
+        let draftCheck: (header: MessageHeader, isDraft: Bool)? = try? AppDatabase.dbPool.read { db in
+            guard let h = try MessageHeader.fetchOne(db, key: messageId) else { return nil }
+            let f = try Folder.fetchOne(db, key: h.folderId)
+            return (h, f?.role == .drafts)
+        }
+        if let check = draftCheck, check.isDraft {
+            ServerDraftComposeLoader(header: check.header)
+                .id(messageId)
+        } else {
+            MessageDetailView(messageId: messageId)
+                .id(messageId)
+        }
+    }
+}
+
+/// Destination for programmatic (chat email-pill) message opens, pushed via
+/// `.navigationDestination(item: $pushedMessageId)` on the content column's
+/// root view. A genuine navigation-stack push — the inbox `List(selection:)`
+/// has no way to revoke it. See `pushedMessageId` doc comment on
+/// `MailNavigationView` for the full rationale.
+private struct PushedMessageDestination: View {
+    let messageId: String
+
+    var body: some View {
+        MessageDetailResolvedContent(messageId: messageId)
     }
 }
 

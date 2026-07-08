@@ -38,7 +38,8 @@ private struct ThrottleBannerPreviewHost: View {
                 title: "All Inboxes",
                 folders: [scenario.inbox],
                 selection: .unified(.inbox),
-                selectedMessageId: .constant(nil)
+                selectedMessageId: .constant(nil),
+                pushedMessageId: .constant(nil)
             )
             .navigationDestination(for: ThrottlePreviewRoute.self) { route in
                 switch route {
