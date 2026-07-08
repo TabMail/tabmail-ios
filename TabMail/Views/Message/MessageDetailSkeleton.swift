@@ -12,12 +12,18 @@ import SwiftUI
 /// `MessageCardView` — same card chrome, fonts, and paddings — filled with
 /// generic fake content that is BLURRED out, pulsing with the same opacity
 /// breath as the compose editor's AI-editing state (`bodyBlink`: 1 ↔ 0.35,
-/// 0.8s easeInOut autoreverse). No shimmer. When the real message lands, the
+/// 0.8s easeInOut autoreverse). No shimmer. The pulse is driven by
+/// `.phaseAnimator`, NOT `@State` + `.onAppear { withAnimation(...repeatForever...) }`
+/// — a `repeatForever` animation started in `onAppear` leaks into this view's
+/// removal transition when the real message lands and the ViewModel swaps it
+/// out inside `withAnimation`: the outgoing skeleton's removal never
+/// completes, stranding a pulsing ghost over the rendered content forever
+/// (found on-device 2026-07-07, chat-pill open). `.phaseAnimator` scopes each
+/// phase's animation to the view's lifetime and tears down cleanly when the
+/// view is removed, so this cannot happen. When the real message lands, the
 /// ViewModel assigns it inside `withAnimation` so this dissolves into the
 /// actual card.
 struct MessageDetailSkeleton: View {
-    @State private var pulse = false
-
     var body: some View {
         VStack(spacing: 0) {
             fakeCard
@@ -26,11 +32,10 @@ struct MessageDetailSkeleton: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Palette.previewPaneBg)
-        .opacity(pulse ? 0.35 : 1)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
+        .phaseAnimator([false, true]) { content, dimmed in
+            content.opacity(dimmed ? 0.35 : 1)
+        } animation: { _ in
+            .easeInOut(duration: 0.8)
         }
         .allowsHitTesting(false)
         .accessibilityElement(children: .ignore)
