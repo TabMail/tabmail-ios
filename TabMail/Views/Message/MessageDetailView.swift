@@ -26,6 +26,8 @@ struct MessageDetailView: View {
     @State private var focusedCardHeight: CGFloat = 0
     @State private var agentToast: AgentToastPayload?
     @State private var agentToastDismiss: Task<Void, Never>?
+    @State private var userHasScrolledDetail = false
+    @State private var openAnchorArmed = true
     var showSideButtons: Bool { !chatExpanded && sideButtonsReady }
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
@@ -254,6 +256,16 @@ struct MessageDetailView: View {
             }
     }
 
+    /// Pin the focused card to the viewport top without animation (disabled
+    /// to avoid a visible snap/flash of the reply bubble).
+    private func reanchorFocusedCard(_ proxy: ScrollViewProxy, to stableId: String) {
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            proxy.scrollTo(stableId, anchor: .top)
+        }
+    }
+
     @ViewBuilder
     private func messageContent(_ message: MessageHeader) -> some View {
         ZStack(alignment: .bottom) {
@@ -301,6 +313,14 @@ struct MessageDetailView: View {
                     } else {
                         ScrollFreezeGate.shared.begin()
                     }
+                    // .interacting is the user-touch phase — programmatic
+                    // scrolls (our own scrollTo calls) don't produce it. Once
+                    // the user has taken the wheel, the opening re-anchor
+                    // must never fight them again.
+                    if newPhase == .interacting {
+                        userHasScrolledDetail = true
+                        openAnchorArmed = false
+                    }
                 }
                 .background(GeometryReader { geo in Color.clear.onAppear { listHeight = geo.size.height }.onChange(of: geo.size.height) { _, h in listHeight = h } })
                 .onPreferenceChange(CardVisibilityKey.self) { cards in
@@ -319,12 +339,32 @@ struct MessageDetailView: View {
                 }
                 .onChange(of: viewModel.laterMessages.count) { _, _ in
                     // Re-anchor when later messages load above (prevents focused card from jumping down).
-                    // Disable animation to avoid a visible snap/flash of the reply bubble.
-                    var tx = Transaction()
-                    tx.disablesAnimations = true
-                    withTransaction(tx) {
-                        proxy.scrollTo(message.stableId, anchor: .top)
+                    // TWO-PASS: the immediate pass runs in the same transaction as the
+                    // bulk insertion, when the List still has ESTIMATED heights for the
+                    // inserted rows — a long thread (chat pill opening an old mid-thread
+                    // message inserts 30+ collapsed cards above the focused one) lands
+                    // the anchor pages off (logmain.log 2026-07-07). The second pass
+                    // re-fires on the next run-loop tick, after UIKit laid the inserted
+                    // rows out with real heights; one tick is imperceptible, so it
+                    // cannot fight a user-initiated scroll.
+                    reanchorFocusedCard(proxy, to: message.stableId)
+                    Task { @MainActor in
+                        reanchorFocusedCard(proxy, to: message.stableId)
                     }
+                }
+                .onChange(of: focusedCardHeight) { _, _ in
+                    // Late-layout re-anchor: on-device the focused row
+                    // materializes AFTER the laterMessages insertion (List row
+                    // creation + webview sizing land later), so the two-pass
+                    // anchor above fires against not-yet-final layout and the
+                    // view rests on the thread cards above (logmain.log
+                    // 2026-07-07). Every focused-card height change while the
+                    // open-anchor is still armed re-pins — armed ends on the
+                    // user's first touch (never fights a user scroll) or when
+                    // the view goes away.
+                    guard openAnchorArmed, !userHasScrolledDetail else { return }
+                    guard !viewModel.laterMessages.isEmpty else { return }
+                    reanchorFocusedCard(proxy, to: message.stableId)
                 }
             }
             .background(Palette.previewPaneBg)
