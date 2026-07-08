@@ -460,6 +460,131 @@ struct EmailRenderPipelineTests {
         #expect(refitRequests(ctx) == 0)
     }
 
+    // MARK: - Width-strip pass includes <hr> (OWA quoted-content separator)
+
+    /// Minimal DOM stub for the width-strip pass only (line ~2862): a single
+    /// fixed-width `<hr>` — modeling Outlook/OWA's quoted-content separator
+    /// `<hr class="_qc_B" style="width: 1457.4px;">` — is the ONLY oversized
+    /// element; everything else in the (mocked) body already fits the device
+    /// width. Unlike widthPipelineHarness's stubs, `document.body.querySelectorAll`
+    /// here actually parses the selector's comma-separated tag list and only
+    /// returns elements whose tag is in it — so this harness is selector-
+    /// faithful and the resulting test FAILS against the pre-fix
+    /// `'div,p,section'` selector (the hr is never returned, never stripped).
+    /// `hr.getBoundingClientRect()` reports the sender's hard pixel width
+    /// until the strip sets `width:auto`, at which point it reports the
+    /// container width — mirroring real WebKit layout of an unconstrained
+    /// `<hr>`.
+    private func makeHrStripContext(deviceWidth: Int = 288) -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript("""
+        var DEVICE_W = \(deviceWidth);
+        var _vw = DEVICE_W;
+        var _msgs = [];
+        var hrStripped = false;
+        var hrWidthCalls = [];
+        function _baseEl(tag, cls) {
+            var el = {
+                tagName: tag, className: cls || '', innerText: '', outerHTML: '<' + tag.toLowerCase() + '>',
+                parentElement: null, complete: true, _attrs: {},
+                getAttribute: function (k) { return (k in el._attrs) ? el._attrs[k] : null; },
+                setAttribute: function (k, v) { el._attrs[k] = v; },
+                hasAttribute: function (k) { return (k in el._attrs); },
+                querySelectorAll: function () { return []; }
+            };
+            el.style = {
+                setProperty: function (k, v, p) {
+                    if (el.tagName === 'HR' && k === 'width') { hrWidthCalls.push(v); if (v === 'auto') hrStripped = true; }
+                },
+                getPropertyValue: function () { return ''; },
+                getPropertyPriority: function () { return ''; },
+                removeProperty: function () {}
+            };
+            return el;
+        }
+        // The OWA quoted-content separator: a hard-coded pixel width baked in
+        // from the sender's desktop window, far wider than the phone
+        // viewport (logmain.log 2026-07-07: w=1459, style="width: 1457.4px").
+        var hr = _baseEl('HR', '_qc_B');
+        hr._attrs['style'] = 'width: 1457.4px;';
+        hr.getBoundingClientRect = function () {
+            if (hrStripped) return { left: 0, right: _vw, width: _vw, height: 2 };
+            return { left: 0, right: 1457, width: 1457, height: 2 };
+        };
+        var _all = [hr];
+        var _meta = {
+            _content: 'width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes',
+            getAttribute: function (k) { return _meta._content; },
+            setAttribute: function (k, v) {
+                _meta._content = v;
+                var m = v.match(/width=(device-width|\\d+)/);
+                if (m) _vw = (m[1] === 'device-width') ? DEVICE_W : parseInt(m[1], 10);
+            }
+        };
+        var document = {
+            readyState: 'complete',
+            documentElement: { offsetHeight: 100, style: { setProperty: function () {} } },
+            querySelector: function (s) { return s.indexOf('meta') >= 0 ? _meta : null; },
+            body: {
+                scrollHeight: 300,
+                style: { setProperty: function () {} },
+                getBoundingClientRect: function () { return { left: 0, right: _vw, width: _vw, height: 300 }; },
+                getElementsByTagName: function (t) { return t === 'img' ? [] : _all.slice(); },
+                // Selector-faithful (unlike widthPipelineHarness's fixed-array
+                // stubs): splits on ',' and matches by tag, exercising the
+                // EXACT selector string fitViewportJS passes.
+                querySelectorAll: function (sel) {
+                    var tags = sel.split(',').map(function (s) { return s.trim().toUpperCase(); });
+                    return _all.filter(function (el) { return tags.indexOf(el.tagName) >= 0; });
+                }
+            }
+        };
+        var window = {
+            innerWidth: DEVICE_W, innerHeight: 800, devicePixelRatio: 3,
+            screen: { width: DEVICE_W },
+            addEventListener: function () {},
+            getComputedStyle: function () { return { width: '', height: '', maxWidth: '' }; },
+            webkit: { messageHandlers: {
+                consoleLog: { postMessage: function (s) {} },
+                heightChanged: { postMessage: function (m) { _msgs.push(m); } }
+            } }
+        };
+        function requestAnimationFrame(fn) { fn(); }
+        function setTimeout(fn, t) { fn(); }
+        """)
+        #expect(ctx.exception == nil, "harness threw: \(ctx.exception?.toString() ?? "")")
+        return ctx
+    }
+
+    @Test("fitViewportJS strips a fixed-width <hr> — the sole overflowing element — and stays at 1.0x (OWA quoted-content separator)")
+    func fitViewportStripsOversizedHrAndSkipsWiden() {
+        // Content that fits the device width except one <hr> carrying a
+        // sender-side fixed pixel width. Before the fix, the width-strip
+        // pass's selector ('div,p,section') never touched <hr>, so
+        // measureMaxRight() saw a genuine 1457px culprit and widened the
+        // layout viewport to the 1200px cap — the whole email rendered at
+        // 0.24x scale. After the fix ('div,p,section,hr'), the hr's inline
+        // width is stripped to `auto` before measurement, so no overflow
+        // remains and fitViewportJS never widens.
+        let ctx = makeHrStripContext()
+        ctx.evaluateScript("window.__tmDeviceWidth = 288;" + _fitViewportJS)
+        #expect(ctx.exception == nil, "fit threw: \(ctx.exception?.toString() ?? "")")
+
+        // The strip pass actually targeted the hr — this is exactly what the
+        // pre-fix selector misses (hr never appears in the querySelectorAll
+        // result), so this assertion alone fails without the fix.
+        #expect(ctx.evaluateScript("hrStripped")?.toBool() == true)
+        let widthCalls = ctx.evaluateScript("hrWidthCalls.join(',')")?.toString() ?? ""
+        #expect(widthCalls.contains("auto"))
+
+        // No overflow remains once the hr is content-driven — fitViewportJS
+        // must stay at 1.0x: no widened viewport stamped, meta left at
+        // device-width. (Pre-fix, this would be 1200 / "width=1200".)
+        #expect(layoutVp(ctx) == 0)
+        let metaContent = ctx.evaluateScript("_meta._content")?.toString() ?? ""
+        #expect(metaContent.contains("device-width"))
+    }
+
     @Test("eatGutterMarginsJS measures the email's inset and posts a reduced gutter (min-indent, no content fiddle)")
     func eatGutterMeasuresAndPostsReducedGutter() {
         let js = _eatGutterMarginsJS

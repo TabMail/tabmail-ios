@@ -2859,7 +2859,13 @@ private let fitViewportJS: String = {
         // the table content-driven, and after viewport widening the table
         // no longer fills the widened parent — leaving visible left/right
         // margins where the auto-centered table sits inside a wider body.
-        var toFix = document.body.querySelectorAll('div,p,section');
+        // `hr` IS included: it's purely decorative, so a fixed pixel width
+        // wider than the viewport carries no content to preserve, and
+        // `width:auto` just restores its default fill-the-container behavior.
+        // Outlook/OWA quoted-content separator `<hr class="_qc_B"
+        // style="width:1457.4px">`, logmain.log 2026-07-07: sole overflowing
+        // element → widened to the 1200 cap → whole email at 0.24x.
+        var toFix = document.body.querySelectorAll('div,p,section,hr');
         var fixCount = 0;
         var fixSamples = [];
         for (var i = 0; i < toFix.length; i++) {
