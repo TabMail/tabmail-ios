@@ -33,6 +33,17 @@ enum Theme {
     static let errorBg = Palette.delete.opacity(0.15)
     static let errorFg = Palette.delete
 
+    // MARK: - Animations
+    /// The skeleton→content dissolve played whenever a MessageDetail's header
+    /// first appears: every header-mutation site in `MessageDetailViewModel`
+    /// (`loadBody`, `seedFromStagedPublish`, `recoverHeaderIfMissing`, the
+    /// merge refresh) and the pushed-pill skeleton overlay fade-out in
+    /// `MessageDetailView`. Single source so those sites can't drift apart on a
+    /// stray edit. NOTE: deliberately NOT shared with the chat agent-toast
+    /// `.spring(response: 0.35)` (a different curve that is only coincidentally
+    /// 0.35) or the skeleton pulse's opacity floor.
+    static let detailContentDissolve: Animation = .easeInOut(duration: 0.2)
+
     // MARK: - Action Tag Colors
     /// Solid tag color for labels/badges
     static func tagColor(_ tag: ActionTag) -> Color {

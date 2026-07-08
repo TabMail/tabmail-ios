@@ -74,7 +74,7 @@ struct MessageDetailView: View {
             .task {
                 guard skeletonOverlayVisible else { return }
                 try? await Task.sleep(for: Self.pushedSkeletonDwell)
-                withAnimation(.easeInOut(duration: 0.35)) {
+                withAnimation(Theme.detailContentDissolve) {
                     skeletonOverlayVisible = false
                 }
             }

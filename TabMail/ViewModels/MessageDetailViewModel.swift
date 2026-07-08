@@ -499,7 +499,7 @@ final class MessageDetailViewModel {
         guard var m = seeded else { return }
         applyOverlay(to: &m)
         // Skeleton → content: dissolve (same rule as loadBody's assignment).
-        withAnimation(.easeInOut(duration: 0.35)) { message = m }
+        withAnimation(Theme.detailContentDissolve) { message = m }
         messageId = m.id
         pendingProviderTapId = nil
         pendingTapAccountId = nil
@@ -766,7 +766,7 @@ final class MessageDetailViewModel {
         guard message == nil else { return }
         applyOverlay(to: &m)
         // Skeleton → content dissolve, same as loadBody/seedFromStagedPublish.
-        withAnimation(.easeInOut(duration: 0.35)) { message = m }
+        withAnimation(Theme.detailContentDissolve) { message = m }
         messageNotFound = false
         BootProfiler.mark("detail header recovered via poll \(m.id.prefix(24))")
         if DebugModeManager.isLoggingEnabled() {
@@ -997,7 +997,7 @@ final class MessageDetailViewModel {
             // Skeleton → content: dissolve (withAnimation at the mutation site,
             // NEVER .animation(_:value:) on the List's ancestors — feedback-loop
             // hang, see UX rules). Later refreshes assign without animation.
-            withAnimation(.easeInOut(duration: 0.35)) { message = displayMsg }
+            withAnimation(Theme.detailContentDissolve) { message = displayMsg }
         } else {
             message = displayMsg
         }
@@ -1496,7 +1496,7 @@ final class MessageDetailViewModel {
         displayMsg.isRead = true
         if self.message == nil {
             // Skeleton → content dissolve (same rule as loadBody's assignment).
-            withAnimation(.easeInOut(duration: 0.35)) { self.message = displayMsg }
+            withAnimation(Theme.detailContentDissolve) { self.message = displayMsg }
         } else {
             self.message = displayMsg
         }
