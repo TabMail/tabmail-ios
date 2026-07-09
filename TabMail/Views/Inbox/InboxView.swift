@@ -691,9 +691,25 @@ struct InboxView: View {
             }
         }
         .onDisappear {
-            BackgroundSyncLogger.logInbox("[\(viewModel.instanceTag)] InboxView.onDisappear sideButtonsReady=\(sideButtonsReady) chatExpanded=\(chatExpanded) selection=\(String(describing: selection))")
-            sideButtonsReady = false
-            chatExpanded = false
+            let detailPushed: Bool = selectedMessageId != nil || pushedMessageId != nil
+            BackgroundSyncLogger.logInbox("[\(viewModel.instanceTag)] InboxView.onDisappear sideButtonsReady=\(sideButtonsReady) chatExpanded=\(chatExpanded) selection=\(String(describing: selection)) detailPushed=\(detailPushed)")
+            // Only hide the side buttons when a detail view is actually being
+            // pushed over this (still-alive) view — identifiable by a non-nil
+            // selectedMessageId / pushedMessageId at disappear time. The
+            // collapsed-split-view push transition fires one SPURIOUS
+            // onDisappear on the freshly-appeared page with no re-appear
+            // (ADR-IOS-054 amendment; on-device 2026-07-09: every sidebar →
+            // inbox entry logs onAppear → listDidAppear → onDisappear in the
+            // same runloop while the view stays visible and keeps evaluating
+            // body). An unconditional hide here stranded sideButtonsReady=false
+            // until the next real pop-back onAppear. Skipping the hide on the
+            // remaining non-detail disappears is harmless: a sidebar return
+            // DESTROYS this view (fresh @State on next entry), and a
+            // pushedShowsAccount cover hides the buttons by covering them.
+            if detailPushed {
+                sideButtonsReady = false
+                chatExpanded = false
+            }
             viewModel.listDidDisappear()
         }
         .onAppear {
