@@ -213,7 +213,7 @@ final class AppDatabase: Sendable {
     static func checkpointForDurability() async {
         guard !DatabaseSuspension.isSuspended else { return }
         _ = try? await rawPool.writeWithoutTransaction { db in
-            try? Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(PASSIVE)")
+            _ = try? Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(PASSIVE)")
         }
     }
 

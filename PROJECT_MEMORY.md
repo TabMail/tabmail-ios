@@ -2,7 +2,7 @@
 
 > **iOS-specific knowledge.** Claude reads this before every task and updates it when discovering something new. For cross-cutting knowledge, see `../PROJECT_MEMORY.md`.
 
-**Last updated:** 2026-04-20
+**Last updated:** 2026-07-09
 
 ---
 
@@ -13,6 +13,15 @@
 | Project definition | `project.yml` (XcodeGen) |
 | App entry | `TabMail/` |
 | Secrets | `Secrets.xcconfig` (gitignored) |
+
+---
+
+## Inbox "briefly reverts to pre-merge state" — three staged-row races + re-merge waste (2026-07-09)
+
+Full detail in the **ADR-IOS-049 amendment (2026-07-09)** in `DECISIONS.md`. Quick reference:
+- The staged in-memory render is instant; the DURABLE phase-1 write lands mean 3.9s / p90 7s later under load. Slow merges are **writer-thread starvation** during concurrent sync/paint CPU bursts — measured NOT WAL (KB-scale, checkpoints ms), NOT staging-DB contention (reads 2-10ms, zero busy), NOT writer-queue waits (`acquireWriter≈0`). Merge-before-herd ordering (385d5db) is intact; a new FG's merge deliberately doesn't wait for a PREVIOUS herd.
+- Fixes: Pass-1 guard released only by folder-move overlays (read/flag/tag keep protection); staged AI fields carry over onto AI-less phase-1/sync rows; `recentlyCompleted` per-entry expiry + `pushMergeStaleProtectionTTLSeconds` (120s) + prune-before-snapshot at all sync sites; stage-memo skip so kept gradual rows don't re-run write phases per trigger (was: one body written 36×).
+- Debugging trick: `insertStagedRows: +N` logs only on ACTUAL insert — the same staged set inserting twice means the row vanished in between. Suites: `InboxStagedRowGuardTests`, `RecentlyCompletedTTLTests`, `NSEMergeStageMemoTests`.
 
 ---
 
