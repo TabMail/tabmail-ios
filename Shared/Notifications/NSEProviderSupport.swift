@@ -60,4 +60,36 @@ public enum NSEProviderSupport {
     public static func filterReady(_ providers: [String]) -> [String] {
         providers.filter { isReady($0) }
     }
+
+    /// Pure wall-clock budget for a single NSE LLM call, given how much of the
+    /// run has already elapsed against the graceful-exit watchdog.
+    ///
+    /// Production evidence (field nse.log, 2026-07-09): `URLRequest.timeoutInterval`
+    /// is an IDLE timer that resets on every received byte. Since `/completions/chat`
+    /// streams SSE frames, a trickling response can hold the "12s" summary call open
+    /// indefinitely — one observed run measured 26.4s, with the 27s watchdog firing
+    /// 9ms before the summary finished. Budgeting each call from the REMAINING run
+    /// time (instead of always handing it the full nominal timeout) makes the
+    /// watchdog a true backstop: a healthy-but-slow run gives up on its own, with
+    /// `finishMargin` seconds left over for step 7/8 to persist + build.
+    ///
+    /// - Parameters:
+    ///   - nominal: The call's normal timeout (e.g. `NSEConfig.summaryTimeoutSeconds`).
+    ///   - elapsed: Wall-clock seconds since the run started (`now - runStart`).
+    ///   - watchdog: `NSEConfig.watchdogSeconds` — the run's hard deadline.
+    ///   - finishMargin: Seconds to reserve after the call for persist/build work.
+    ///   - minCall: Below this many seconds of budget, don't bother starting the call.
+    /// - Returns: The capped timeout to use, or `nil` if there isn't enough time
+    ///   left to justify starting the call at all.
+    public static func llmCallBudget(
+        nominal: TimeInterval,
+        elapsed: TimeInterval,
+        watchdog: TimeInterval,
+        finishMargin: TimeInterval,
+        minCall: TimeInterval
+    ) -> TimeInterval? {
+        let budget = min(nominal, watchdog - elapsed - finishMargin)
+        guard budget >= minCall else { return nil }
+        return budget
+    }
 }

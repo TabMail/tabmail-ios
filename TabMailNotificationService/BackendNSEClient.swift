@@ -48,9 +48,7 @@ enum BackendNSEClient {
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else { return nil }
+        guard let data = await performRequestWithDeadline(request, timeout: timeout) else { return nil }
 
         // Parse response — may be SSE or plain JSON
         guard let text = String(data: data, encoding: .utf8) else { return nil }
@@ -109,6 +107,61 @@ enum BackendNSEClient {
         // Take mode (most common)
         let counts = Dictionary(grouping: results, by: { $0 }).mapValues { $0.count }
         return counts.max(by: { $0.value < $1.value })?.key
+    }
+
+    // MARK: - Wall-clock-bounded request
+
+    /// Outcome of racing the network call against the wall-clock deadline.
+    /// A plain `Data?` can't distinguish "server responded non-200 / request
+    /// threw" from "deadline won the race" — this enum keeps that distinction
+    /// so the deadline branch can log without the HTTP-failure branch also
+    /// tripping it (and to satisfy Swift 6 strict concurrency: only Sendable
+    /// values may cross the `withTaskGroup` boundary).
+    private enum CallOutcome: Sendable {
+        case success(Data)
+        case httpFailure
+        case deadline
+    }
+
+    /// Enforces `timeout` as a TRUE wall-clock cap, not the idle timer
+    /// `URLRequest.timeoutInterval` provides. `timeoutInterval` resets on
+    /// every received byte, and `/completions/chat` streams SSE frames — a
+    /// trickling response can hold the connection open indefinitely.
+    /// Production evidence (field nse.log, 2026-07-09): a summary call ran
+    /// 26.4s under the nominal 12s idle timeout, missing the 27s graceful-exit
+    /// watchdog by 9ms; action calls were observed at 16.8s/17.4s/19s+.
+    ///
+    /// Races `URLSession.shared.data(for:)` against `Task.sleep` for
+    /// `timeout` seconds; first finisher wins, then `group.cancelAll()` —
+    /// `data(for:)` is cancellation-aware and aborts the in-flight HTTP
+    /// request, so the loser doesn't linger. `request.timeoutInterval` is
+    /// left set by the caller as the connection-level layer underneath this.
+    private static func performRequestWithDeadline(_ request: URLRequest, timeout: TimeInterval) async -> Data? {
+        let outcome = await withTaskGroup(of: CallOutcome.self) { group -> CallOutcome in
+            group.addTask {
+                guard let (data, response) = try? await URLSession.shared.data(for: request),
+                      let httpResponse = response as? HTTPURLResponse,
+                      httpResponse.statusCode == 200 else { return .httpFailure }
+                return .success(data)
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(timeout))
+                return .deadline
+            }
+            let first = await group.next() ?? .httpFailure
+            group.cancelAll()
+            return first
+        }
+
+        switch outcome {
+        case .success(let data):
+            return data
+        case .httpFailure:
+            return nil
+        case .deadline:
+            NSELog.step("NSE LLM call DEADLINE (\(Int(timeout))s wall-clock) — abandoning")
+            return nil
+        }
     }
 
     // MARK: - Parsing
