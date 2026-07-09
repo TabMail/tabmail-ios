@@ -224,7 +224,10 @@ extension AIService {
         }
 
         do {
-            let response = try await backend.sendCompletionsDirect(request)
+            // longTimeout: compacting a large user_action.md (20K+ chars observed)
+            // legitimately runs for minutes — the default 120s resource cap killed
+            // it with NSURLError -1001.
+            let response = try await backend.sendCompletionsDirect(request, longTimeout: true)
             if DebugModeManager.isLoggingEnabled() {
                 print("[AIService] compactActionRules: backend responded, assistant=\(response.assistant?.prefix(200) ?? "nil")")
             }
@@ -236,20 +239,32 @@ extension AIService {
                 return .failed(message: "Empty response from server")
             }
 
-            // Parse strict JSON: { "patch": "..." }
-            guard let patchText = Self.parsePatchResponse(assistantText) else {
+            // Parse strict JSON: { "patch": "...", "reason": "<code>"? }
+            guard let parsed = Self.parseCompactResponse(assistantText) else {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[AIService] compactActionRules: FAIL no patch in response. Raw: \(assistantText.prefix(300))")
                 }
                 return .failed(message: "Could not parse server response")
             }
+            let patchText = parsed.patch
 
-            // Empty patch = backend found nothing to compact
+            // Empty patch: the backend reports WHY via the reason code so a
+            // discarded merge (guard trip, non-applying ops) is distinguishable
+            // from a genuinely clean rules file.
             guard !patchText.isEmpty else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: nothing to compact (empty patch)")
+                    print("[AIService] compactActionRules: empty patch, reason=\(parsed.reason ?? "none")")
                 }
-                return .nothingToCompact
+                switch parsed.reason {
+                case "guard_char_retention", "guard_pure_delete":
+                    return .skipped(reason: "Merge discarded by safety check — try again")
+                case "no_ops_applied", "no_ops_parsed":
+                    return .skipped(reason: "Merge didn't match current rules — try again")
+                case "parse_failed", "llm_error":
+                    return .failed(message: "Model response unusable — try again")
+                default:
+                    return .nothingToCompact
+                }
             }
 
             if DebugModeManager.isLoggingEnabled() {
@@ -340,5 +355,37 @@ extension AIService {
         }
 
         return parsed.patch.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Parse a compact-only response: { "patch": "...", "reason": "<code>"? }.
+    /// The backend attaches a machine-readable reason to empty-patch exits so
+    /// discarded merges are distinguishable from a genuinely clean file
+    /// (guard trip / non-applying ops / model failure). Extra keys are ignored
+    /// by older parsers, so this stays backward/forward compatible.
+    static func parseCompactResponse(_ text: String) -> (patch: String, reason: String?)? {
+        var jsonString = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Strip markdown code fences (same handling as parsePatchResponse)
+        if jsonString.hasPrefix("```") {
+            let lines = jsonString.components(separatedBy: "\n")
+            let filtered = lines.filter { !$0.hasPrefix("```") }
+            jsonString = filtered.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard let data = jsonString.data(using: .utf8) else { return nil }
+
+        struct CompactResponse: Decodable {
+            let patch: String
+            let reason: String?
+        }
+
+        guard let parsed = try? JSONDecoder().decode(CompactResponse.self, from: data) else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AIService] Failed to parse compact JSON: \(jsonString.prefix(200))")
+            }
+            return nil
+        }
+
+        return (parsed.patch.trimmingCharacters(in: .whitespacesAndNewlines), parsed.reason)
     }
 }

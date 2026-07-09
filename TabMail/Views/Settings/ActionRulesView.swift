@@ -25,6 +25,38 @@ private struct SectionInfo {
     let color: Color
 }
 
+/// Compaction state that survives navigation. The underlying AIService task
+/// keeps running when the user leaves the page; view-local @State would reset
+/// the button and lose the result on re-entry, falsely suggesting failure.
+@MainActor
+@Observable
+final class ActionCompactionMonitor {
+    static let shared = ActionCompactionMonitor()
+
+    private(set) var isRunning = false
+    private(set) var statusMessage: String? = nil
+
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        statusMessage = nil
+        Task {
+            let result = await AIService.shared.compactActionRulesNow()
+            switch result {
+            case .applied(let opsCount):
+                statusMessage = "Merged \(opsCount) rule\(opsCount == 1 ? "" : "s")"
+            case .nothingToCompact:
+                statusMessage = "Nothing to compact"
+            case .skipped(let reason):
+                statusMessage = reason
+            case .failed(let message):
+                statusMessage = "Error: \(message)"
+            }
+            isRunning = false
+        }
+    }
+}
+
 struct ActionRulesView: View {
     @State private var store = PromptStore.shared
     @State private var syncService = DeviceSyncService.shared
@@ -34,9 +66,8 @@ struct ActionRulesView: View {
     @AppStorage(PromptStore.actionCompactThresholdKey) private var actionCompactThreshold = PromptStore.defaultActionCompactThreshold
     @AppStorage(PromptStore.actionCompactThresholdCharsKey) private var actionCompactThresholdChars = PromptStore.defaultActionCompactThresholdChars
 
-    // Compact button state
-    @State private var isCompacting = false
-    @State private var compactStatusMessage: String? = nil
+    // Compaction state lives in the monitor so it survives navigation
+    @State private var compaction = ActionCompactionMonitor.shared
 
     private let syncTip = DeviceSyncTip()
 
@@ -100,25 +131,10 @@ struct ActionRulesView: View {
                     )
 
                     Button {
-                        Task {
-                            isCompacting = true
-                            compactStatusMessage = nil
-                            let result = await AIService.shared.compactActionRulesNow()
-                            isCompacting = false
-                            switch result {
-                            case .applied(let opsCount):
-                                compactStatusMessage = "Merged \(opsCount) rule\(opsCount == 1 ? "" : "s")"
-                            case .nothingToCompact:
-                                compactStatusMessage = "Nothing to compact"
-                            case .skipped(let reason):
-                                compactStatusMessage = reason
-                            case .failed(let message):
-                                compactStatusMessage = "Error: \(message)"
-                            }
-                        }
+                        compaction.start()
                     } label: {
                         HStack {
-                            if isCompacting {
+                            if compaction.isRunning {
                                 ProgressView()
                                     .controlSize(.small)
                                 Text("Compacting…")
@@ -127,9 +143,9 @@ struct ActionRulesView: View {
                             }
                         }
                     }
-                    .disabled(isCompacting)
+                    .disabled(compaction.isRunning)
 
-                    if let msg = compactStatusMessage {
+                    if let msg = compaction.statusMessage {
                         Text(msg)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
@@ -147,28 +163,28 @@ struct ActionRulesView: View {
                 BulletListEditor(text: $store.deleteRules)
                     .background(sectionTracker("delete"))
             } header: {
-                sectionHeader(title: "Emails to Delete", subtitle: "Emails matching these rules will be suggested for deletion. Swipe to delete.", color: Theme.tagColor(.delete))
+                sectionHeader(title: "Emails to Delete", count: ruleCount(store.deleteRules), subtitle: "Emails matching these rules will be suggested for deletion. Swipe to delete.", color: Theme.tagColor(.delete))
             }
 
             Section {
                 BulletListEditor(text: $store.archiveRules)
                     .background(sectionTracker("archive"))
             } header: {
-                sectionHeader(title: "Emails to Archive", subtitle: "Emails matching these rules will be suggested for archiving.", color: Theme.tagColor(.archive))
+                sectionHeader(title: "Emails to Archive", count: ruleCount(store.archiveRules), subtitle: "Emails matching these rules will be suggested for archiving.", color: Theme.tagColor(.archive))
             }
 
             Section {
                 BulletListEditor(text: $store.replyRules)
                     .background(sectionTracker("reply"))
             } header: {
-                sectionHeader(title: "Emails to Reply", subtitle: "Emails matching these rules will be flagged as needing a reply.", color: Theme.tagColor(.reply))
+                sectionHeader(title: "Emails to Reply", count: ruleCount(store.replyRules), subtitle: "Emails matching these rules will be flagged as needing a reply.", color: Theme.tagColor(.reply))
             }
 
             Section {
                 BulletListEditor(text: $store.noneRules)
                     .background(sectionTracker("none"))
             } header: {
-                sectionHeader(title: "Emails to Mark as None", subtitle: "Emails that don't fit other categories.", color: Theme.tagColor(.none))
+                sectionHeader(title: "Emails to Mark as None", count: ruleCount(store.noneRules), subtitle: "Emails that don't fit other categories.", color: Theme.tagColor(.none))
             }
             }
             .listRowBackground(Palette.boxBg)
@@ -187,6 +203,10 @@ struct ActionRulesView: View {
             .listRowBackground(Palette.boxBg)
         }
         .coordinateSpace(name: "actionRulesList")
+        // Compaction of a large rules file can run for minutes — keep the screen
+        // awake while it runs and this page is frontmost (same pattern as speech;
+        // the modifier releases automatically when the page disappears).
+        .keepScreenAwake(while: compaction.isRunning)
         .background(GeometryReader { geo in
             Color.clear.onAppear { listHeight = geo.size.height }
                 .onChange(of: geo.size.height) { _, h in listHeight = h }
@@ -245,11 +265,21 @@ struct ActionRulesView: View {
         }
     }
 
-    private func sectionHeader(title: String, subtitle: String, color: Color) -> some View {
+    /// Count the rules in a section's markdown: one non-empty line per rule
+    /// (bulleted "- " or plain — the editor round-trips both shapes).
+    private func ruleCount(_ section: String) -> Int {
+        section.split(separator: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .count
+    }
+
+    private func sectionHeader(title: String, count: Int, subtitle: String, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Circle().fill(color).frame(width: 8, height: 8)
                 Text(title)
+                Text("(\(count))")
+                    .foregroundStyle(.secondary)
             }
             Text(subtitle)
                 .font(.caption)

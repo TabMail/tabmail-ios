@@ -30,6 +30,16 @@ actor BackendClient {
     /// the streaming/tool-loop path in unit tests. Production passes nil → the default
     /// ephemeral session with the LLM resource timeout. All other state keeps its
     /// inline defaults, so `BackendClient()` continues to work unchanged.
+    /// Maintenance-class LLM session (manual action-rules compaction): same as
+    /// llmSession but with the long-op resource cap — a single compaction of a
+    /// large user_action.md can legitimately run for minutes. Stall detection
+    /// remains the SSE heartbeat watchdog.
+    private lazy var llmLongOpSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForResource = SyncConfig.llmLongOpResourceTimeoutSeconds
+        return URLSession(configuration: config)
+    }()
+
     init(llmSession: URLSession? = nil) {
         self.llmSession = llmSession ?? {
             let config = URLSessionConfiguration.ephemeral
@@ -750,20 +760,22 @@ extension BackendClient {
 
     /// Direct variant — bypasses the LLM semaphore. Use for user-initiated calls
     /// (agent chat, inline edit, KB refinement) that should not wait behind background AI.
-    func sendCompletionsDirect(_ request: CompletionsRequest) async throws -> CompletionsResponse {
-        return try await sendCompletionsInternal(request)
+    /// `longTimeout` opts into the maintenance-class resource cap (see llmLongOpSession)
+    /// for calls that legitimately run for minutes (manual action-rules compaction).
+    func sendCompletionsDirect(_ request: CompletionsRequest, longTimeout: Bool = false) async throws -> CompletionsResponse {
+        return try await sendCompletionsInternal(request, longTimeout: longTimeout)
     }
 
     /// Shared implementation for both semaphore-gated and direct completions calls.
     /// Uses incremental SSE reader with heartbeat watchdog for stall detection.
-    private func sendCompletionsInternal(_ request: CompletionsRequest) async throws -> CompletionsResponse {
+    private func sendCompletionsInternal(_ request: CompletionsRequest, longTimeout: Bool = false) async throws -> CompletionsResponse {
         try checkForbiddenBackoff()
 
         let (urlRequest, body) = try await makeCompletionsRequest(request)
         print("[BackendClient] completions request: \(body.count) bytes")
         BackgroundSyncLogger.logAIProcessing("[HTTP] request START (completions, \(body.count) bytes)")
 
-        let jsonData = try await readSSEStreamIncremental(urlRequest, onSSEEvent: nil)
+        let jsonData = try await readSSEStreamIncremental(urlRequest, onSSEEvent: nil, session: longTimeout ? llmLongOpSession : nil)
 
         do {
             let response = try JSONDecoder().decode(CompletionsResponse.self, from: jsonData)
@@ -812,11 +824,12 @@ extension BackendClient {
     /// Calls `onSSEEvent` for intermediate events (keepalive, tool_started, etc.).
     private func readSSEStreamIncremental(
         _ urlRequest: URLRequest,
-        onSSEEvent: SSEEventHandler?
+        onSSEEvent: SSEEventHandler?,
+        session: URLSession? = nil
     ) async throws -> Data {
         let httpT0 = CFAbsoluteTimeGetCurrent()
 
-        let (bytes, response) = try await llmSession.bytes(for: urlRequest)
+        let (bytes, response) = try await (session ?? llmSession).bytes(for: urlRequest)
         guard let httpResponse = response as? HTTPURLResponse else {
             BackgroundSyncLogger.logAIProcessing("[HTTP] SSE response — not HTTPURLResponse")
             throw BackendError.requestFailed(statusCode: 0)

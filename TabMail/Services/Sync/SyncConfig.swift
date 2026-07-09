@@ -515,6 +515,13 @@ enum SyncConfig {
     /// 120s is generous while still killing the multi-minute stalls. Phase 2 (SSE heartbeat)
     /// will detect stalls in ~2s, making this a rarely-hit safety net.
     static let llmResourceTimeoutSeconds: TimeInterval = 120
+    /// Hard cap for MAINTENANCE-class LLM calls (manual action-rules compaction):
+    /// a single compaction of a large user_action.md (20K+ chars observed) can
+    /// legitimately run for minutes, which the 120s cap killed (NSURLError -1001).
+    /// Stall detection is still the SSE heartbeat watchdog (seconds); this cap is
+    /// only the absolute safety net. Not used by background AI jobs, so
+    /// llmJobDeadlineSeconds is unaffected.
+    static let llmLongOpResourceTimeoutSeconds: TimeInterval = 420
     /// Hard cap on a single AI job's total wall time (seconds). Covers semaphore wait +
     /// HTTP request + GRDB writes. Must be above llmResourceTimeoutSeconds to avoid
     /// racing the HTTP timeout. Acts as safety net for any cause of unbounded job time.
