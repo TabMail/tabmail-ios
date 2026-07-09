@@ -49,6 +49,16 @@ extension AIService {
             return
         }
 
+        // Read compaction threshold from UserDefaults; fall back to default if unset
+        // (integer(forKey:) returns 0 when unset, which would be an invalid threshold)
+        let compactThreshold = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdKey) as? Int
+            ?? PromptStore.defaultActionCompactThreshold
+        let compactThresholdChars = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
+            ?? PromptStore.defaultActionCompactThresholdChars
+        if DebugModeManager.isLoggingEnabled() {
+            print("[AIService] autoUpdatePrompt: action_compact_threshold=\(compactThreshold) action_compact_threshold_chars=\(compactThresholdChars)")
+        }
+
         // Build the system message matching TB's format for system_prompt_action_refine
         let vars: [String: JSONValue] = [
             "subject": .string(subject),
@@ -59,6 +69,8 @@ extension AIService {
             "original_user_action_prompt": .string(""),  // TB stores write-once per message; iOS not yet tracked
             "user_manual_tag": .string(userManualTag),
             "current_user_action_md": .string(currentUserActionMd),
+            "action_compact_threshold": .int(compactThreshold),
+            "action_compact_threshold_chars": .int(compactThresholdChars),
         ]
 
         let message = CompletionsMessage(
@@ -128,6 +140,180 @@ extension AIService {
 
         } catch {
             print("[AIService] autoUpdatePrompt: ERROR \(error)")
+        }
+    }
+
+    // MARK: - Manual Compact Action Rules
+
+    /// Result type for compactActionRulesNow.
+    enum CompactResult {
+        case applied(opsCount: Int)
+        case nothingToCompact
+        case skipped(reason: String)
+        case failed(message: String)
+    }
+
+    /// Manually trigger a compact-only action-rules refinement.
+    /// Sends `action_compact_only: true` so the backend runs compaction only,
+    /// bypassing thresholds, and returns patch ops or an empty patch when nothing
+    /// is mergeable. Fire-and-return — returns a CompactResult describing what happened.
+    func compactActionRulesNow() async -> CompactResult {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[AIService] compactActionRules: START disableLLM=\(disableLLMCalls)")
+        }
+
+        // Skip if LLM calls are disabled
+        guard !disableLLMCalls else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AIService] compactActionRules: SKIP LLM disabled")
+            }
+            return .skipped(reason: "AI is disabled")
+        }
+
+        // Read current snapshot (nonisolated, safe from actor)
+        let currentUserActionMd = PromptStore.actionMarkdownSnapshot()
+
+        // Skip if user_action.md is empty
+        guard !currentUserActionMd.isEmpty else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AIService] compactActionRules: SKIP user_action.md empty")
+            }
+            return .skipped(reason: "No action rules to compact")
+        }
+
+        // Read both thresholds from UserDefaults (same nil-object pattern as autoUpdateUserPromptOnTag)
+        let compactThreshold = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdKey) as? Int
+            ?? PromptStore.defaultActionCompactThreshold
+        let compactThresholdChars = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
+            ?? PromptStore.defaultActionCompactThresholdChars
+
+        if DebugModeManager.isLoggingEnabled() {
+            print("[AIService] compactActionRules: threshold=\(compactThreshold) thresholdChars=\(compactThresholdChars) mdLen=\(currentUserActionMd.count)")
+        }
+
+        // Build compact-only request: action_compact_only=true, email-metadata as empty strings
+        let vars: [String: JSONValue] = [
+            "current_user_action_md": .string(currentUserActionMd),
+            "action_compact_threshold": .int(compactThreshold),
+            "action_compact_threshold_chars": .int(compactThresholdChars),
+            "action_compact_only": .bool(true),
+            // Email-metadata fields expected by the template — empty for compact-only path
+            "subject": .string(""),
+            "from_sender": .string(""),
+            "summary_blurb": .string(""),
+            "todos": .string(""),
+            "original_agent_action": .string(""),
+            "original_user_action_prompt": .string(""),
+            "user_manual_tag": .string(""),
+        ]
+
+        let message = CompletionsMessage(
+            role: "system",
+            content: "system_prompt_action_refine",
+            vars: vars
+        )
+
+        let request = CompletionsRequest(
+            messages: [message],
+            client_timezone: nil,
+            disable_tools: true
+        )
+
+        if DebugModeManager.isLoggingEnabled() {
+            print("[AIService] compactActionRules: sending compact-only request to backend")
+        }
+
+        do {
+            let response = try await backend.sendCompletionsDirect(request)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AIService] compactActionRules: backend responded, assistant=\(response.assistant?.prefix(200) ?? "nil")")
+            }
+
+            guard let assistantText = response.assistant, !assistantText.isEmpty else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: FAIL empty response")
+                }
+                return .failed(message: "Empty response from server")
+            }
+
+            // Parse strict JSON: { "patch": "..." }
+            guard let patchText = Self.parsePatchResponse(assistantText) else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: FAIL no patch in response. Raw: \(assistantText.prefix(300))")
+                }
+                return .failed(message: "Could not parse server response")
+            }
+
+            // Empty patch = backend found nothing to compact
+            guard !patchText.isEmpty else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: nothing to compact (empty patch)")
+                }
+                return .nothingToCompact
+            }
+
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AIService] compactActionRules: parsed patch:\n\(patchText)")
+            }
+
+            // Drift guard: re-read snapshot; if changed since we started, abort.
+            let latestActionMd = PromptStore.actionMarkdownSnapshot()
+            guard latestActionMd == currentUserActionMd else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
+                }
+                return .skipped(reason: "Rules changed while compacting — try again")
+            }
+
+            // Apply the patch
+            guard let updated = ActionPatchApplier.applyActionPatch(content: currentUserActionMd, patchText: patchText) else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: FAIL patch application failed")
+                }
+                return .failed(message: "Could not apply compaction patch")
+            }
+
+            guard updated != currentUserActionMd else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: patch produced no change")
+                }
+                return .nothingToCompact
+            }
+
+            // Count applied operations (DEL lines in the patch indicate merged/removed rules)
+            let opsCount = patchText.components(separatedBy: "\n")
+                .filter { $0.trimmingCharacters(in: .whitespaces) == "DEL" || $0.trimmingCharacters(in: .whitespaces) == "ADD" }
+                .count
+
+            // Persist on MainActor; demo guard mirrors autoUpdateUserPromptOnTag.
+            // The closure returns whether the persist actually happened so the
+            // caller never reports "Merged N rules" for a demo-dropped write.
+            let beforeLen = currentUserActionMd.count
+            let afterLen = updated.count
+            let persisted = await MainActor.run { () -> Bool in
+                guard !DemoModeStore.shared.isActive else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[AIService] compactActionRules: dropped — demo mode became active mid-flight")
+                    }
+                    return false
+                }
+                PromptStore.shared.rawAction = updated
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[AIService] compactActionRules: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen) ops=\(opsCount))")
+                }
+                return true
+            }
+
+            guard persisted else {
+                return .skipped(reason: "Demo mode active")
+            }
+            return .applied(opsCount: opsCount)
+
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AIService] compactActionRules: ERROR \(error)")
+            }
+            return .failed(message: error.localizedDescription)
         }
     }
 

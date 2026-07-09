@@ -281,6 +281,13 @@ final class PromptStore {
         rawKB
     }
 
+    // MARK: - Action Compaction Config
+
+    nonisolated static let actionCompactThresholdKey = "action.compact.threshold"
+    nonisolated static let defaultActionCompactThreshold = 100
+    nonisolated static let actionCompactThresholdCharsKey = "action.compact.threshold.chars"
+    nonisolated static let defaultActionCompactThresholdChars = 8000
+
     // MARK: - Demo overlay key redirection (ADR-IOS-038)
 
     /// Demo-scoped storage key: while demo mode is active every prompt field
