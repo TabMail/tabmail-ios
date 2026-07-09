@@ -29,7 +29,10 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
     let isReplied: Bool
     let isForwarded: Bool
     var actionTag: ActionTag?
-    let tagSortOrder: Int
+    // var (not let): reloadMessages' Pass-1 carries over a staged row's
+    // tagSortOrder alongside its actionTag when a fresh (phase-1/sync) row
+    // arrives with actionTag == nil — see ADR-IOS-049 AI-field carry-over.
+    var tagSortOrder: Int
     var summaryBlurb: String?
     var isInInbox: Bool
     var hasReplyReady: Bool

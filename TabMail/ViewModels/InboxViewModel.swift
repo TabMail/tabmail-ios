@@ -871,23 +871,57 @@ final class InboxViewModel {
             var indicesToRemove: [Int] = []
             for (i, existing) in loadedMessages.enumerated() {
                 if let fresh = freshById[existing.id] {
+                    var assigned = fresh
+                    var carriedOverAI = false
+                    // ADR-IOS-049: phase-1 durable header writes and sync-created
+                    // headers carry NO AI fields (see NSEDataBridge.swift ~773 —
+                    // "NO body blob, NO AI fields. Body + AI land in phase 2"), so
+                    // the first durable/sync row to arrive for a staged id would
+                    // otherwise clobber the staged actionTag/summaryBlurb with nil,
+                    // flashing the tag chip/summary away until phase-2 + the AI
+                    // repaint restore them (phase1→phase2 gap usually ~15ms,
+                    // observed up to 13.9s under load; a sync-inserted header can
+                    // precede the merge by the merge's whole duration). Mirrors the
+                    // detail-view rule: do NOT applyRefresh AI fields from phase-1
+                    // rows. Carry the staged AI fields forward until a fresh row
+                    // arrives WITH real AI fields.
+                    if pendingStagedRows[existing.id] != nil {
+                        if assigned.actionTag == nil, let stagedTag = existing.actionTag {
+                            assigned.actionTag = stagedTag
+                            assigned.tagSortOrder = existing.tagSortOrder
+                            carriedOverAI = true
+                        }
+                        if assigned.summaryBlurb == nil, let stagedBlurb = existing.summaryBlurb {
+                            assigned.summaryBlurb = stagedBlurb
+                            carriedOverAI = true
+                        }
+                    }
                     // Only assign if the snapshot actually changed — avoids triggering
                     // @Observable for unchanged rows, preventing unnecessary re-renders
                     // and layout shifts that cause scroll position jumps.
-                    if existing != fresh {
-                        loadedMessages[i] = fresh
+                    if existing != assigned {
+                        loadedMessages[i] = assigned
                     }
                     survivingIds.insert(existing.id)
-                    // ADR-IOS-049: it's now durable in GRDB → drop the guard.
-                    pendingStagedRows.removeValue(forKey: existing.id)
+                    if !carriedOverAI {
+                        // ADR-IOS-049: it's now durable in GRDB with real AI fields
+                        // (or was never staged) → drop the guard. When a carry-over
+                        // happened above, keep the entry so a subsequent pre-phase-2
+                        // reload keeps carrying over — still bounded by the eviction
+                        // guard expiry below.
+                        pendingStagedRows.removeValue(forKey: existing.id)
+                    }
                 } else if let pending = pendingStagedRows[existing.id],
-                          overlay[existing.id] == nil,
+                          overlay[existing.id]?.folderId == nil,
                           CFAbsoluteTimeGetCurrent() - pending.insertedAt
                               < SyncConfig.stagedRowEvictionGuardSeconds {
-                    // ADR-IOS-049: a staged row whose durable write hasn't landed AND the
-                    // user hasn't acted on it — DON'T let this (competing) reload evict the
-                    // just-surfaced row, or it flickers away until the write lands. An
-                    // overlay mutation means the user acted (e.g. archived) → let it go.
+                    // ADR-IOS-049: a staged row whose durable write hasn't landed —
+                    // DON'T let this (competing) reload evict the just-surfaced row,
+                    // or it flickers away until the write lands. Only a folder-move
+                    // overlay releases the guard — non-removing mutations (read/flag/
+                    // tag) keep the row protected; `applyOverlay` already filters
+                    // moved-away rows out of `fresh`, so a folder-move overlay is what
+                    // actually explains this row's absence from `freshById` here.
                     // BOUNDED: past the guard window the row is a phantom (its headerId
                     // never appeared in a GRDB reload) — let eviction win, and drop the
                     // guard entry so it can't resurrect. Display-only; staging/GRDB
