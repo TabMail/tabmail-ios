@@ -872,6 +872,18 @@ extension Notification.Name {
     /// it IN-MEMORY without waiting for the durable header write (ADR-IOS-049).
     /// Object is `[StagedInboxRow]`.
     static let messagesStaged = Notification.Name("messagesStaged")
+    /// Posted by the NSE merge when it detects a staged row is STALE-BY-MOVE —
+    /// its durable `messageHeader` already exists in a DIFFERENT folder (or is
+    /// no longer `isInInbox`) than the staged row's push-time folder, meaning
+    /// the user (or another client) archived/deleted/moved the message before
+    /// this merge ran. The merge already excluded the row from its own write
+    /// AND scrubbed it from `latestStagedRows`/`latestStagedBodies`, but an
+    /// EARLIER `.messagesStaged` post this SAME wake may already have handed
+    /// the phantom row to the inbox in-memory — this notification tells the VM
+    /// to evict it. Object is `[String]` — the affected `MessageHeader.id`s
+    /// (`MessageIdentity.headerId(...)`), matching `insertStagedRows`'
+    /// `StagedInboxRow.headerId`.
+    static let stagedRowsInvalidated = Notification.Name("stagedRowsInvalidated")
     /// Posted by the NSE merge when staged rows have become DURABLE and queryable
     /// in GRDB — at the phase-1 header surface (headers + reference junctions
     /// newly visible) and again at end-of-merge (bodies/AI/removals landed).

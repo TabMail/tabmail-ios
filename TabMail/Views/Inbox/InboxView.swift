@@ -1734,17 +1734,33 @@ private struct CollapseChatOnNavigateModifier: ViewModifier {
 }
 
 /// ADR-IOS-049: receives `.messagesStaged` (NSE-staged mail) and inserts the rows
-/// into the inbox IN-MEMORY, before the merge's durable write. Extracted to a
-/// `ViewModifier` so `InboxView`'s large body stays under the SwiftUI type-checker
-/// complexity limit (an inline `.onReceive` tipped it over).
+/// into the inbox IN-MEMORY, before the merge's durable write. Also receives the
+/// companion `.stagedRowsInvalidated` (a later merge determined one of THIS
+/// wake's staged rows is STALE-BY-MOVE — its durable header already lives in a
+/// different folder) and evicts the phantom. Both merged into ONE `.onReceive`
+/// (like `CollapseChatOnNavigateModifier`) so this stays a SINGLE `ViewModifier`
+/// entry — `InboxView`'s large body stays under the SwiftUI type-checker
+/// complexity limit (an inline `.onReceive`, or one more chain entry, tipped it
+/// over previously).
 private struct StagedRowsReceiver: ViewModifier {
     let viewModel: InboxViewModel
     func body(content: Content) -> some View {
         content.onReceive(
-            NotificationCenter.default.publisher(for: .messagesStaged).receive(on: DispatchQueue.main)
+            NotificationCenter.default.publisher(for: .messagesStaged)
+                .merge(with: NotificationCenter.default.publisher(for: .stagedRowsInvalidated))
+                .receive(on: DispatchQueue.main)
         ) { notification in
-            if let rows = notification.object as? [StagedInboxRow] {
-                viewModel.insertStagedRows(rows)
+            switch notification.name {
+            case .messagesStaged:
+                if let rows = notification.object as? [StagedInboxRow] {
+                    viewModel.insertStagedRows(rows)
+                }
+            case .stagedRowsInvalidated:
+                if let ids = notification.object as? [String] {
+                    viewModel.invalidateStagedRows(ids)
+                }
+            default:
+                break
             }
         }
     }

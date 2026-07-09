@@ -755,6 +755,41 @@ final class InboxViewModel {
         }
     }
 
+    /// Companion to `insertStagedRows`: evicts an in-memory staged (not yet
+    /// durable) row that the merge just determined is STALE-BY-MOVE — its
+    /// durable header already exists in a DIFFERENT folder (archived/deleted/
+    /// moved by the user or another client before the NSE's later re-stage of
+    /// the same message merged). Driven by `.stagedRowsInvalidated`, which can
+    /// fire moments after a `.messagesStaged` post from the SAME merge wake
+    /// already inserted the phantom via `insertStagedRows` — this undoes
+    /// exactly that insert. Only ids still tracked in `pendingStagedRows`
+    /// (i.e. genuinely a phantom this VM inserted and never saw go durable)
+    /// are touched; a row that already went durable (removed from
+    /// `pendingStagedRows` by `reloadMessages`) is left alone — sync/reload
+    /// owns it from there, and GRDB is the source of truth for it now.
+    /// Zero DB I/O, mirrors `insertStagedRows`' render-path contract.
+    func invalidateStagedRows(_ ids: [String]) {
+        var removedCount = 0
+        for id in ids {
+            guard pendingStagedRows[id] != nil else { continue }
+            pendingStagedRows.removeValue(forKey: id)
+            loadedIds.remove(id)
+            if let idx = loadedMessages.firstIndex(where: { $0.id == id }) {
+                loadedMessages.remove(at: idx)
+                removedCount += 1
+            }
+            // Tombstone: a later re-stage of this same message (the exact
+            // mechanism that produced the stale row) must not re-insert it.
+            expiredStagedIds.insert(id)
+        }
+        if removedCount > 0 {
+            BootProfiler.mark("invalidateStagedRows: -\(removedCount) stale staged row(s) evicted (inbox=\(loadedMessages.count))")
+            withAnimation(.easeInOut(duration: 0.25)) {
+                rebuildDisplayGroups()
+            }
+        }
+    }
+
     #if DEBUG
     /// Test hook (guard-expiry tests): backdate a pending staged row's insertion
     /// timestamp so `SyncConfig.stagedRowEvictionGuardSeconds` expiry can be
@@ -937,16 +972,35 @@ final class InboxViewModel {
                     survivingIds.insert(existing.id)
                 } else {
                     indicesToRemove.append(i)
-                    if let pending = pendingStagedRows.removeValue(forKey: existing.id),
-                       overlay[existing.id] == nil,
-                       ForegroundActiveClock.now() - pending.insertedAt
-                           >= SyncConfig.stagedRowEvictionGuardSeconds {
-                        // Guard-EXPIRED eviction (phantom): tombstone the id so a
-                        // later re-post (staged-set change defeats the suppression
-                        // memo) can't re-insert it with a fresh guard window.
-                        // Overlay-released rows are NOT tombstoned — the user acted
-                        // on a real row; its lifecycle is the action's business.
-                        expiredStagedIds.insert(existing.id)
+                    if let pending = pendingStagedRows.removeValue(forKey: existing.id) {
+                        let guardExpired = overlay[existing.id] == nil
+                            && ForegroundActiveClock.now() - pending.insertedAt
+                                >= SyncConfig.stagedRowEvictionGuardSeconds
+                        let folderMoveReleased = overlay[existing.id]?.folderId != nil
+                        if guardExpired || folderMoveReleased {
+                            // Guard-EXPIRED eviction (phantom): tombstone the id so a
+                            // later re-post (staged-set change defeats the suppression
+                            // memo) can't re-insert it with a fresh guard window.
+                            //
+                            // Overlay-released (folder-move) eviction: the user
+                            // moved/archived/deleted this not-yet-durable staged row
+                            // before its durable write landed. Tombstone this one too
+                            // ("couldn't disable it" belt fix) — otherwise a stale
+                            // re-stage of the SAME message (the NSE staging it again on
+                            // a later, unrelated push) could re-insert the phantom via
+                            // `insertStagedRows` once the overlay entry drains. This
+                            // widens the prior guard-EXPIRY-only tombstone; the earlier
+                            // "the user acted on a real row, its lifecycle is the
+                            // action's business" reasoning didn't account for a staged
+                            // (not-yet-durable) row having no GRDB row for that action's
+                            // own lifecycle to own. `resetMessages` clears these
+                            // tombstones on a full reset — safe, because it re-seeds
+                            // from `NSEDataBridge.latestStagedRows`, which the merge's
+                            // stale-by-move detection (NSEDataBridge.performMerge) keeps
+                            // free of rows whose durable folder disagrees with the
+                            // staged one.
+                            expiredStagedIds.insert(existing.id)
+                        }
                     }
                 }
             }

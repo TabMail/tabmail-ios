@@ -689,6 +689,68 @@ enum NSEDataBridge {
         }) ?? []
     }
 
+    /// One staged row found STALE-BY-MOVE by `detectStaleByMoveRows`. `id` is
+    /// the STAGING row's identity (`StagedMessage.id`) — used to filter
+    /// `processed` and delete the staging row. `headerId` is the STAGED row's
+    /// headerId (`MessageIdentity.headerId` over the staged accountId/
+    /// folderPath/messageId — identical to `toInboxRow().headerId`) — used to
+    /// filter `latestStagedRows`/`latestStagedBodies` and as the payload of
+    /// `.stagedRowsInvalidated`. NOT the durable row's id: after an IMAP
+    /// UID-remap move (archive = MOVE = new UID) the durable header is found
+    /// via the rfc822 fallback under a DIFFERENT id, while the published
+    /// snapshot entries and the VM's in-memory phantom are keyed by the
+    /// staged id — a durable-id payload would miss both.
+    struct StaleByMoveRow: Equatable, Sendable {
+        let id: String
+        let headerId: String
+    }
+
+    /// Batch staleness check, extracted for unit testing (see
+    /// `NSEDataBridge.performMerge`'s STALE-BY-MOVE DETECTION section for the
+    /// full rationale). For every staged row, resolves the existing durable
+    /// header using the SAME identity lookup phase 1/phase 2 use (provider
+    /// `messageId` first, then `rfc822MessageId` fallback for IMAP UID
+    /// remaps) and compares its CURRENT `folderId`/`isInInbox` against the
+    /// staged row's folder. A row is STALE-BY-MOVE when a durable header
+    /// EXISTS and disagrees (`folderId` mismatch OR `isInInbox == false`) —
+    /// the durable message was moved/archived/deleted out of the staged
+    /// folder after the push was captured. No durable header at all is NOT
+    /// stale (an ordinary new message). ONE `rawPool.read` for the whole
+    /// batch — same shape as `verifyDurable`, cheap even for a large staged
+    /// set. `AppDatabase.rawPool` (not `.dbPool`) for the same reason
+    /// `verifyDurable` uses it: this runs from inside the privileged merge, so
+    /// `PrioritizedDatabase.read` would just re-enter (and no-op) the
+    /// read-through-merge recursion guard for no benefit.
+    static func detectStaleByMoveRows(_ processed: [StagedMessage]) async -> [StaleByMoveRow] {
+        guard !processed.isEmpty else { return [] }
+        return (try? await AppDatabase.rawPool.read { db -> [StaleByMoveRow] in
+            var stale: [StaleByMoveRow] = []
+            for msg in processed {
+                var row = try Row.fetchOne(db, sql: """
+                    SELECT id, folderId, isInInbox FROM messageHeader
+                    WHERE accountId = ? AND messageId = ?
+                    """, arguments: [msg.accountId, msg.messageId])
+                if row == nil, let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
+                    row = try Row.fetchOne(db, sql: """
+                        SELECT id, folderId, isInInbox FROM messageHeader
+                        WHERE accountId = ? AND rfc822MessageId = ?
+                        """, arguments: [msg.accountId, rfc822])
+                }
+                guard let row else { continue } // no durable header yet — an ordinary new message, not stale
+                let durableFolderId: String = row["folderId"]
+                let durableIsInInbox: Bool = row["isInInbox"]
+                let stagedFolderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
+                if durableFolderId != stagedFolderId || !durableIsInInbox {
+                    // STAGED headerId, not the durable row's id — see StaleByMoveRow doc.
+                    stale.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
+                        accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+                    )))
+                }
+            }
+            return stale
+        }) ?? []
+    }
+
     /// Test-only seam: reset the process-global stage memo between tests so
     /// state can't leak across cases. Internal (not `#if DEBUG`) — same
     /// visibility as the other hoisted test seams in this file
@@ -786,7 +848,9 @@ enum NSEDataBridge {
         // (`mergeInboxRemovals`, `consumePendingTaskResults`, orphan reap)
         // read different tables and may still succeed; failed rows in
         // `nse_processed_message` simply stay in staging and retry next wake.
-        let processed: [StagedMessage]
+        // `var` — the STALE-BY-MOVE check below reassigns it to exclude stale
+        // rows from everything that follows (stage-memo partition, phase 1/2).
+        var processed: [StagedMessage]
         do {
             processed = try await nseDB.read { db in
                 // Row→StagedMessage decode is the SINGLE SOURCE OF TRUTH in
@@ -856,6 +920,84 @@ enum NSEDataBridge {
         // Fires BEFORE phase-1's durable write, the proven-slow part on cold I/O
         // (7.6s measured), which must never gate first paint.
         onSnapshotPublished?()
+
+        // ============================================================
+        // STALE-BY-MOVE DETECTION.
+        //
+        // A staged row's `folderPath` is PUSH-TIME truth — whatever folder the
+        // message was in when the NSE captured it. If the user (or another
+        // client/instance) archived/deleted/moved the DURABLE message before
+        // this merge runs, the staging row is stale precache: merging it would
+        // resurrect a message the user already acted on. Observed on-device
+        // (boot_logs 3, 2026-07-09): a message the user archived in-app
+        // reappeared in the inbox LIST later because the NSE re-staged the SAME
+        // message on a later, unrelated push with `folderPath=INBOX` — no
+        // existing guard catches this. `loadedIds`/`insertStagedRows`' identity
+        // dedup only scan the VM's currently-loaded (visible) rows, so an
+        // archived row that isn't displayed is invisible to them; the overlay
+        // entry that recorded the original archive is long drained by the time
+        // a LATER push restages the same message. This is the one place that
+        // compares a staged row's folder against the DURABLE header's CURRENT
+        // folder.
+        //
+        // Runs strictly AFTER the snapshot publish/post above — it must never
+        // delay first paint — and BEFORE the stage-memo partition, so a stale
+        // row never enters `writeSet`/`skipSet`. Read-only against main GRDB;
+        // the only write here is the staging-row delete (mirrors the skip-set
+        // cleanup's nseDB-only write below).
+        //
+        // No durable header at all is NOT stale — that's an ordinary new
+        // message (or one sync hasn't created yet); only an EXISTING header
+        // whose current folder disagrees with the staged folder is stale.
+        // ============================================================
+        let staleByMove = await Self.detectStaleByMoveRows(processed)
+        if !staleByMove.isEmpty {
+            let staleStagingIds = Set(staleByMove.map(\.id))
+            let staleHeaderIds = staleByMove.map(\.headerId)
+
+            // (a) Exclude from all subsequent merge work this wake — must not
+            // enter `writeSet` or `skipSet`.
+            processed = processed.filter { !staleStagingIds.contains($0.id) }
+
+            // (b) Delete the stale staging rows directly (no main-GRDB write
+            // involved). Idempotent: a failure just leaves them staged for
+            // re-evaluation (and re-exclusion) next wake.
+            do {
+                try await nseDB.write { db in
+                    for id in staleStagingIds {
+                        try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                    }
+                }
+            } catch {
+                if !error.isDatabaseSuspensionAbort {
+                    print("[NSEDataBridge] Stale-by-move staging delete failed: \(error) — retried next wake (idempotent)")
+                }
+            }
+
+            // (c) Remove from the ALREADY-PUBLISHED in-memory snapshots — the
+            // `.messagesStaged` post above already fired with these rows
+            // included (deliberately not delayed for this check), so the VM
+            // may have just inserted the phantom; (e) below tells it to evict.
+            let staleHeaderIdSet = Set(staleHeaderIds)
+            latestStagedRows.withLock { rows in
+                rows.removeAll { staleHeaderIdSet.contains($0.headerId) }
+            }
+            latestStagedBodies.withLock { bodies in
+                for hid in staleHeaderIdSet { bodies.removeValue(forKey: hid) }
+            }
+
+            // (d) Drop stage-memo entries — a stale row has no "next merge" to
+            // skip against.
+            stageMemo.withLock { memo in
+                for id in staleStagingIds { memo.removeValue(forKey: id) }
+            }
+
+            // (e) Tell the VM which in-memory phantom(s) to evict.
+            BootProfiler.mark("merge: invalidated \(staleByMove.count) stale staged row(s) — durable header moved out of staged folder")
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .stagedRowsInvalidated, object: staleHeaderIds)
+            }
+        }
 
         if !processed.isEmpty {
             // ============================================================

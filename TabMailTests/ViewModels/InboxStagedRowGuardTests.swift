@@ -307,4 +307,117 @@ struct InboxStagedRowGuardTests {
         #expect(vm.loadedMessages.count == 1)
         #expect(vm.loadedMessages.contains { $0.id == id })
     }
+
+    // MARK: - Stale-by-move invalidation (companion to NSEDataBridge's
+    // STALE-BY-MOVE DETECTION — see NSEStaleStagedRowInvalidationTests for the
+    // merge-side half). `invalidateStagedRows` is the VM-side receiver for
+    // `.stagedRowsInvalidated`: it undoes an `insertStagedRows` phantom insert
+    // that raced an archive the merge later discovered.
+
+    @Test("invalidateStagedRows evicts an in-memory phantom row, tombstones it, and a later re-post of the same staged row does NOT resurrect it")
+    @MainActor func invalidateStagedRowsEvictsAndTombstones() async throws {
+        let (_, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        let row = makeStagedRow(messageId: "m-stale")
+        vm.insertStagedRows([row])
+        #expect(vm.loadedMessages.count == 1)
+        let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-stale")
+
+        // The merge determined this row's durable header (if any) disagrees
+        // with the staged folder — evict the phantom this VM inserted.
+        vm.invalidateStagedRows([id])
+        #expect(vm.loadedMessages.isEmpty)
+        #expect(!vm.loadedMessages.contains { $0.id == id })
+
+        // A later re-post of the SAME staged row (mirrors the NSE re-staging
+        // the same, already-archived message on a later push) must NOT
+        // re-insert it — the tombstone (`expiredStagedIds`) blocks it, same
+        // guard `insertStagedRows` already honors for guard-expiry evictions.
+        vm.insertStagedRows([row])
+        #expect(vm.loadedMessages.isEmpty)
+    }
+
+    @Test("invalidateStagedRows leaves an already-durable row alone (not tracked in pendingStagedRows)")
+    @MainActor func invalidateStagedRowsIgnoresDurableRows() async throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+
+        // A durable row (sync-created, not staged) — never entered pendingStagedRows.
+        var durable = MessageHeader(
+            messageId: "m-durable", subject: "Subj", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date(), snippet: "snip",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        durable.headerComplete = true
+        let durableRow = durable
+        try await pool.writeWithoutTransaction { db in try durableRow.insert(db) }
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        #expect(vm.loadedMessages.count == 1)
+        let id = durable.id
+
+        // Invalidating an id that was never a pending staged row is a no-op —
+        // sync/reload owns durable rows, not this mechanism.
+        vm.invalidateStagedRows([id])
+        #expect(vm.loadedMessages.count == 1)
+        #expect(vm.loadedMessages.contains { $0.id == id })
+    }
+
+    // MARK: - Pass-1 belt: overlay-released eviction of a GUARDED staged row also tombstones
+
+    @Test("Pass-1 belt: an overlay-released (folder-move) eviction of a GUARDED staged row also tombstones it — a stale re-post after overlay drain does not resurrect it")
+    @MainActor func overlayReleasedEvictionTombstonesAgainstStaleRepost() async throws {
+        let (_, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        let row = makeStagedRow(messageId: "m-belt")
+        vm.insertStagedRows([row])
+        #expect(vm.loadedMessages.count == 1)
+        let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-belt")
+
+        // User archives the just-pushed (not yet durable) row — a folder-move
+        // overlay, exactly `folderMoveOverlayEvicts` above. That test proves
+        // the row is evicted; this test proves the eviction ALSO tombstones it.
+        AccountManager.shared.registerMutation(id: id, mutation: .init(folderId: "acc1:Archive"))
+        await vm.reloadMessages()
+        #expect(vm.loadedMessages.isEmpty)
+
+        // Simulate the overlay draining once the archive's queued DB write
+        // commits (`AccountManager.removeOverlayEntries`, called after a
+        // PendingOperation completes) — the overlay entry that "explained" the
+        // row's absence is now gone, same as the real bug's timeline (the
+        // archive's overlay entry drains long before a LATER push re-stages
+        // the same message).
+        AccountManager.shared.removeOverlayEntries(ids: [id])
+
+        // A stale re-post of the SAME staged row (mirrors the NSE re-staging
+        // the already-archived message on a later push) must NOT resurrect
+        // it — the belt-fix tombstone blocks it even though the guard never
+        // "expired" in the guard-EXPIRY sense (the eviction happened almost
+        // immediately, well inside `stagedRowEvictionGuardSeconds`).
+        vm.insertStagedRows([row])
+        #expect(vm.loadedMessages.isEmpty)
+        #expect(!vm.loadedMessages.contains { $0.id == id })
+    }
 }
