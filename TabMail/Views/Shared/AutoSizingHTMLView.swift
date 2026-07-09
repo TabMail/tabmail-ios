@@ -1480,6 +1480,55 @@ function splitBlockBeforeTarget(targetNode, doc, logFn) {
 }
 """
 
+/// Sweeps everything positioned AFTER `quoteStart` in document order — at
+/// EVERY ancestor level up to (and including) the direct child of `body` —
+/// into `content`.
+///
+/// `walkUpToWrapStart` deliberately stops climbing as soon as it finds real
+/// prior content at some level (to avoid swallowing the user's own reply
+/// text). That often anchors `quoteStart` several levels deep — e.g. a
+/// boundary `<p>` ("----- Original Message -----") living in the SAME
+/// container as the visible reply paragraphs, because a webmail composer
+/// (Zimbra, Outlook web, etc.) emitted both as flat sibling `<p>` tags in
+/// one div. A single-level `nextSibling` sweep then only captures content
+/// within THAT one container — leaving genuinely-quoted material that sits
+/// structurally outside it (a sibling of an ANCESTOR, not of `quoteStart`
+/// itself — e.g. a nested "On X wrote:" blockquote one level up) visible,
+/// un-collapsed. Symptom: quote detection finds the right boundary line,
+/// but the collapsed region doesn't reach the true end of the message.
+///
+/// This sweeps `quoteStart`'s own remaining siblings first, then climbs to
+/// its parent and sweeps ITS remaining siblings, and so on up to (and
+/// including) the direct child of `body` — mirroring `walkUpToWrapStart`'s
+/// own climb boundary. Because it only ever follows `nextSibling` chains
+/// (never `previousSibling`), it can never pull in anything that appears
+/// BEFORE the boundary at any level — `walkUpToWrapStart`'s "don't swallow
+/// real content" guarantee holds regardless of how many levels this climbs.
+///
+/// Stops early if it hits a `.tm-ics-collapsible` marker (owned by the
+/// separate ICS collapse pass, `collapseICSJS`).
+///
+/// Defined as a top-level JS string so that `collapseQuotesJS` (production)
+/// and `EmailFilterTests` (unit tests via JSContext with synthetic tree
+/// mocks) consume the same source — zero-drift guarantee.
+let sweepQuoteContentJS = """
+function sweepQuoteContent(quoteStart, content, body, logFn) {
+    var node = quoteStart;
+    while (node && node.parentNode) {
+        var hitICS = false;
+        while (node.nextSibling) {
+            var ns = node.nextSibling;
+            try { if (ns.classList && ns.classList.contains('tm-ics-collapsible')) { hitICS = true; break; } } catch(_) {}
+            content.appendChild(ns);
+        }
+        if (hitICS) break;
+        if (node.parentNode === body) break;
+        node = node.parentNode;
+        logFn('[QuoteDetect] Sweep climbed to ancestor: ' + node.tagName + '.' + (node.className || ''));
+    }
+}
+"""
+
 /// Quote collapse: detect quote boundaries using comprehensive patterns
 /// matching the Thunderbird addon's quoteAndSignature.js — multi-language
 /// attribution lines, Outlook headers, forwarded messages, dash separators, > prefix.
@@ -1498,6 +1547,7 @@ private var collapseQuotesJS: String {
         function _log(m) { \(logBody) }
         \(walkUpToWrapStartJS)
         \(splitBlockBeforeTargetJS)
+        \(sweepQuoteContentJS)
         var body = document.body;
         if (!body) { _log('[QuoteDetect] No body, bailing'); return; }
         var existingWrapper = body.querySelector('.tm-quote-wrapper');
@@ -1867,12 +1917,11 @@ private var collapseQuotesJS: String {
         wrapper.appendChild(toggle);
         wrapper.appendChild(content);
 
-        // Move everything from quoteStart to end into content (but not ICS sections)
-        while (quoteStart.nextSibling) {
-            var ns = quoteStart.nextSibling;
-            try { if (ns.classList && ns.classList.contains('tm-ics-collapsible')) break; } catch(_) {}
-            content.appendChild(ns);
-        }
+        // Move everything from quoteStart to the true end of the message into
+        // content (but not ICS sections) — climbs through every ancestor
+        // level so trailing quoted content isn't stranded outside the
+        // wrapper when quoteStart is anchored deep (see sweepQuoteContentJS).
+        sweepQuoteContent(quoteStart, content, body, _log);
         content.insertBefore(quoteStart, content.firstChild);
 
     })();

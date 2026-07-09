@@ -843,6 +843,186 @@ struct EmailFilterTests {
         #expect(ctx.evaluateScript("result.className")?.toString() == "wrapper")
     }
 
+    // MARK: - sweepQuoteContent (multi-level sibling sweep for quote wrapping)
+    //
+    // These tests exercise the SHARED `sweepQuoteContentJS` source from
+    // AutoSizingHTMLView.swift. Production code and these tests both evaluate
+    // the same string, so there is zero drift risk.
+    //
+    // `walkUpToWrapStart` deliberately stops climbing as soon as it finds
+    // real prior content at some level, which often anchors quoteStart deep
+    // (e.g. a boundary "----- Original Message -----" <p> sharing its
+    // container with the visible reply <p>s, as webmail composers like
+    // Zimbra/Outlook web commonly emit). The OLD single-level `nextSibling`
+    // sweep then only captured content within that one container, leaving
+    // genuinely-quoted material living outside it (a sibling of an
+    // ANCESTOR, not of quoteStart) visible — the "quote detection found the
+    // right boundary but didn't collapse to the true end" bug.
+    //
+    // A dedicated synthetic node tree (real appendChild/insertBefore-style
+    // mutation + a `classList.contains` shim) stands in for a WKWebView DOM.
+
+    private static let sweepTestHarness: String = """
+    function _detach(node) {
+        if (!node.parentNode) return;
+        var p = node.parentNode;
+        if (p.children) {
+            var idx = p.children.indexOf(node);
+            if (idx >= 0) p.children.splice(idx, 1);
+        }
+        if (node.previousSibling) node.previousSibling.nextSibling = node.nextSibling;
+        if (node.nextSibling) node.nextSibling.previousSibling = node.previousSibling;
+        node.parentNode = null;
+        node.previousSibling = null;
+        node.nextSibling = null;
+    }
+    function makeClassList(cls) {
+        var set = (cls || '').split(/\\s+/).filter(function(s) { return s.length > 0; });
+        return { contains: function(c) { return set.indexOf(c) >= 0; } };
+    }
+    function el(tag, attrs, children) {
+        attrs = attrs || {};
+        children = children || [];
+        var n = {
+            nodeType: 1,
+            tagName: (tag || 'DIV').toUpperCase(),
+            className: attrs.className || '',
+            classList: makeClassList(attrs.className || ''),
+            textContent: attrs.text || '',
+            children: [],
+            parentNode: null,
+            previousSibling: null,
+            nextSibling: null,
+            appendChild: function(newNode) {
+                _detach(newNode);
+                var prev = this.children.length ? this.children[this.children.length - 1] : null;
+                this.children.push(newNode);
+                newNode.parentNode = this;
+                newNode.previousSibling = prev;
+                newNode.nextSibling = null;
+                if (prev) prev.nextSibling = newNode;
+                return newNode;
+            }
+        };
+        for (var i = 0; i < children.length; i++) {
+            n.appendChild(children[i]);
+        }
+        return n;
+    }
+    var _sweepLogs = [];
+    function _sweepLog(m) { _sweepLogs.push(m); }
+    """
+
+    /// Evaluates `sweepQuoteContentJS` + the sweep harness in a fresh JSContext.
+    private func makeSweepContext() -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(sweepQuoteContentJS)
+        ctx.evaluateScript(Self.sweepTestHarness)
+        return ctx
+    }
+
+    @Test("sweepQuoteContent: single-level sweep moves all remaining siblings into content, in order")
+    func sweepSingleLevel() {
+        let ctx = makeSweepContext()
+        ctx.evaluateScript("""
+        var quoteStart = el('p', {text: 'boundary'});
+        var sib1 = el('p', {text: 'header 1'});
+        var sib2 = el('p', {text: 'header 2'});
+        var container = el('div', {className: 'container'}, [quoteStart, sib1, sib2]);
+        var bodyMock = el('body', {}, [container]);
+        var content = el('div', {className: 'tm-quote-content'});
+        sweepQuoteContent(quoteStart, content, bodyMock, _sweepLog);
+        """)
+        #expect(ctx.evaluateScript("content.children.length")?.toInt32() == 2)
+        #expect(ctx.evaluateScript("content.children[0] === sib1")?.toBool() == true)
+        #expect(ctx.evaluateScript("content.children[1] === sib2")?.toBool() == true)
+        #expect(ctx.evaluateScript("container.children.length")?.toInt32() == 1, "only quoteStart remains in its original container")
+    }
+
+    @Test("sweepQuoteContent: climbs ancestor levels to capture a trailing sibling blockquote (production bug scenario)")
+    func sweepClimbsToAncestorSibling() {
+        let ctx = makeSweepContext()
+        // Mirrors the production shape: quoteStart (a boundary <p>) shares its
+        // immediate container with the header lines that follow it, but the
+        // real quoted content (a nested "On X wrote:" blockquote) lives OUTSIDE
+        // that container — as a sibling of the container itself. The pre-fix
+        // single-level `nextSibling` sweep stopped at the header lines and
+        // left the blockquote visible, uncollapsed.
+        ctx.evaluateScript("""
+        var quoteStart = el('p', {text: '----- Original Message -----'});
+        var header1 = el('p', {text: 'From: someone@example.com'});
+        var header2 = el('p', {text: 'Subject: Re: Something'});
+        var container = el('div', {className: 'mp-default'}, [
+            el('p', {text: 'Reply text before the boundary.'}),
+            quoteStart,
+            header1,
+            header2
+        ]);
+        var tailQuote = el('blockquote', {text: 'On X wrote: nested original message', className: 'tail'});
+        var bodyMock = el('body', {}, [container, tailQuote]);
+        var content = el('div', {className: 'tm-quote-content'});
+        sweepQuoteContent(quoteStart, content, bodyMock, _sweepLog);
+        """)
+        #expect(ctx.evaluateScript("content.children.length")?.toInt32() == 3)
+        #expect(ctx.evaluateScript("content.children[0] === header1")?.toBool() == true)
+        #expect(ctx.evaluateScript("content.children[1] === header2")?.toBool() == true)
+        #expect(ctx.evaluateScript("content.children[2] === tailQuote")?.toBool() == true, "the ancestor's trailing sibling blockquote must be swept in, not left visible")
+        // The prior reply text (before quoteStart) is untouched — never moved.
+        #expect(ctx.evaluateScript("container.children.length")?.toInt32() == 2, "only the pre-boundary reply <p> and quoteStart remain")
+    }
+
+    @Test("sweepQuoteContent: never moves content that precedes the boundary at any level")
+    func sweepNeverTouchesPriorContent() {
+        let ctx = makeSweepContext()
+        ctx.evaluateScript("""
+        var replyP = el('p', {text: 'This is the real reply.'});
+        var quoteStart = el('p', {text: 'boundary'});
+        var innerContainer = el('div', {className: 'inner'}, [quoteStart]);
+        var outerContainer = el('div', {className: 'outer'}, [replyP, innerContainer]);
+        var bodyMock = el('body', {}, [outerContainer]);
+        var content = el('div', {className: 'tm-quote-content'});
+        sweepQuoteContent(quoteStart, content, bodyMock, _sweepLog);
+        """)
+        #expect(ctx.evaluateScript("content.children.length")?.toInt32() == 0)
+        #expect(ctx.evaluateScript("replyP.parentNode === outerContainer")?.toBool() == true)
+    }
+
+    @Test("sweepQuoteContent: stops at a .tm-ics-collapsible marker without climbing further")
+    func sweepStopsAtICSBoundary() {
+        let ctx = makeSweepContext()
+        ctx.evaluateScript("""
+        var quoteStart = el('p', {text: 'boundary'});
+        var normalP = el('p', {text: 'still part of the quote'});
+        var icsMarker = el('div', {className: 'tm-ics-collapsible'});
+        var afterICS = el('p', {text: 'trailer after the ICS marker'});
+        var container = el('div', {className: 'container'}, [quoteStart, normalP, icsMarker, afterICS]);
+        var tailSibling = el('blockquote', {text: 'should never be reached'});
+        var bodyMock = el('body', {}, [container, tailSibling]);
+        var content = el('div', {className: 'tm-quote-content'});
+        sweepQuoteContent(quoteStart, content, bodyMock, _sweepLog);
+        """)
+        #expect(ctx.evaluateScript("content.children.length")?.toInt32() == 1)
+        #expect(ctx.evaluateScript("content.children[0] === normalP")?.toBool() == true)
+        #expect(ctx.evaluateScript("icsMarker.parentNode === container")?.toBool() == true, "ICS marker is left in place for the separate collapseICSJS pass")
+        #expect(ctx.evaluateScript("afterICS.parentNode === container")?.toBool() == true)
+        #expect(ctx.evaluateScript("tailSibling.parentNode === bodyMock")?.toBool() == true, "ancestor climb must not happen once the ICS boundary is hit")
+    }
+
+    @Test("sweepQuoteContent: stops after sweeping the direct child of body — never climbs past it")
+    func sweepStopsAtBodyBoundary() {
+        let ctx = makeSweepContext()
+        ctx.evaluateScript("""
+        var quoteStart = el('p', {text: 'boundary'});
+        var container = el('div', {className: 'container'}, [quoteStart]);
+        var trailingAtBody = el('p', {text: 'sibling of container, still under body'});
+        var bodyMock = el('body', {}, [container, trailingAtBody]);
+        var content = el('div', {className: 'tm-quote-content'});
+        sweepQuoteContent(quoteStart, content, bodyMock, _sweepLog);
+        """)
+        #expect(ctx.evaluateScript("content.children.length")?.toInt32() == 1)
+        #expect(ctx.evaluateScript("content.children[0] === trailingAtBody")?.toBool() == true)
+    }
+
     // MARK: - splitBlockBeforeTarget (lift attribution out when reply shares the block)
     //
     // These tests exercise the SHARED `splitBlockBeforeTargetJS` source from
