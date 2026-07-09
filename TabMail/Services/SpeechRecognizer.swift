@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import Foundation
 @preconcurrency import Speech
 @preconcurrency import AVFoundation
 import Synchronization
@@ -32,7 +33,15 @@ final class SpeechRecognizer {
     }
 
     func start(onTranscript: @escaping @MainActor @Sendable (String) -> Void) {
-        guard !isRecording, !isStarting else { return }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Speech] start() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
+        }
+        guard !isRecording, !isStarting else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Speech] start(): skip — already recording or starting")
+            }
+            return
+        }
 
         let speechStatus = SFSpeechRecognizer.authorizationStatus()
         let micStatus = AVAudioApplication.shared.recordPermission
@@ -56,10 +65,16 @@ final class SpeechRecognizer {
             state.generation &+= 1
             return state.generation
         }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Speech] start(): generation=\(gen), calling beginRecording")
+        }
         beginRecording(generation: gen, onTranscript: onTranscript)
     }
 
     func stop() {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Speech] stop() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
+        }
         // Extract resources from mutex quickly, update UI state immediately.
         // Heavy audio teardown (engine.stop, removeTap, session deactivation)
         // runs off the main thread to avoid blocking keyboard animation on the
@@ -79,6 +94,9 @@ final class SpeechRecognizer {
         isStarting = false
 
         if engine != nil || task != nil || request != nil {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Speech] stop(): teardown path — async engine/task/request cleanup, generation=\(stopGeneration)")
+            }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 task?.cancel()
                 request?.endAudio()
@@ -97,8 +115,12 @@ final class SpeechRecognizer {
                 let stillCurrent = self._audioState.withLock { $0.generation == stopGeneration }
                 if stillCurrent {
                     self.deactivateAudioSession()
+                } else if DebugModeManager.isLoggingEnabled() {
+                    print("[Speech] stop(): teardown skip deactivate — generation advanced past \(stopGeneration)")
                 }
             }
+        } else if DebugModeManager.isLoggingEnabled() {
+            print("[Speech] stop(): teardown path — nothing to tear down (no engine/task/request)")
         }
     }
 
@@ -108,11 +130,17 @@ final class SpeechRecognizer {
     /// `AVAudioSessionErrorCodeIsBusy` if audio I/O hasn't fully stopped; log and
     /// move on — the next `start()` re-activates the session regardless.
     nonisolated private func deactivateAudioSession() {
+        let start = Date()
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            if DebugModeManager.isLoggingEnabled() {
+                let ms = Int(Date().timeIntervalSince(start) * 1000)
+                print("[Speech] deactivateAudioSession(): succeeded in \(ms)ms")
+            }
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Speech] Failed to deactivate audio session: \(error)")
+                let ms = Int(Date().timeIntervalSince(start) * 1000)
+                print("[Speech] Failed to deactivate audio session (\(ms)ms): \(error)")
             }
         }
     }
@@ -139,7 +167,23 @@ final class SpeechRecognizer {
             do {
                 let audioSession = AVAudioSession.sharedInstance()
                 try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
-                try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Speech] beginRecording: setCategory done (generation=\(generation))")
+                }
+                let setActiveStart = Date()
+                do {
+                    try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                    if DebugModeManager.isLoggingEnabled() {
+                        let ms = Int(Date().timeIntervalSince(setActiveStart) * 1000)
+                        print("[Speech] beginRecording: setActive(true) done in \(ms)ms")
+                    }
+                } catch {
+                    if DebugModeManager.isLoggingEnabled() {
+                        let ms = Int(Date().timeIntervalSince(setActiveStart) * 1000)
+                        print("[Speech] beginRecording: setActive(true) threw after \(ms)ms: \(error)")
+                    }
+                    throw error
+                }
 
                 let engine = AVAudioEngine()
                 let request = SFSpeechAudioBufferRecognitionRequest()
@@ -179,6 +223,9 @@ final class SpeechRecognizer {
 
                 engine.prepare()
                 try engine.start()
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Speech] beginRecording: engine.start() succeeded (generation=\(generation))")
+                }
 
                 // Atomically check generation before committing — if stop() was called
                 // during setup, the generation will have advanced.
@@ -189,6 +236,9 @@ final class SpeechRecognizer {
                     state.recognitionRequest = request
                     state.recognitionTask = task
                     return true
+                }
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Speech] beginRecording: generation=\(generation) shouldCommit=\(shouldCommit)")
                 }
 
                 if !shouldCommit {

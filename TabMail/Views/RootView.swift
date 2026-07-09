@@ -525,7 +525,15 @@ struct RootView: View {
                 print("[RootView] Deletion status check failed: \(error)")
             }
         }
+        .onChange(of: hasTabMailSession) { old, new in
+            if DebugModeManager.isLoggingEnabled() {
+                print("[RootView] hasTabMailSession \(old) -> \(new)")
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignOut).receive(on: DispatchQueue.main)) { _ in
+            if DebugModeManager.isLoggingEnabled() {
+                print("[RootView] received .tabMailDidSignOut")
+            }
             // Save consent gate state for the current user before clearing (per-account)
             saveConsentStateForCurrentUser()
             withAnimation {
@@ -543,6 +551,9 @@ struct RootView: View {
             Text("You have been signed out of TabMail. Your email accounts and messages remain on this device. Sign in again to use AI features.")
         }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailAccountGone).receive(on: DispatchQueue.main)) { _ in
+            if DebugModeManager.isLoggingEnabled() {
+                print("[RootView] received .tabMailAccountGone")
+            }
             showAccountGoneAlert = true
         }
         .alert("Account No Longer Available", isPresented: $showAccountGoneAlert) {

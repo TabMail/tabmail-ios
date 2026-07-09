@@ -569,17 +569,46 @@ struct DynamicIslandChat: View {
             }
         }
         .onChange(of: isWorking) { wasWorking, nowWorking in
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DynamicIslandChat] dictation-auto-restart onChange(isWorking) fired: wasWorking=\(wasWorking) nowWorking=\(nowWorking)")
+            }
             // Auto-restart dictation when the agent finishes its turn — same UX
             // as auto-start on pill open. Respects the autoDictation preference,
             // and skips if the user has the keyboard up or already dictating.
-            guard wasWorking, !nowWorking else { return }
-            guard autoDictation, isExpanded, !isTextFieldFocused else { return }
-            guard !speechRecognizer.isRecording else { return }
+            guard wasWorking, !nowWorking else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DynamicIslandChat] dictation-auto-restart: skip — not a working->idle transition")
+                }
+                return
+            }
+            guard autoDictation, isExpanded, !isTextFieldFocused else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DynamicIslandChat] dictation-auto-restart: skip — autoDictation=\(autoDictation) isExpanded=\(isExpanded) isTextFieldFocused=\(isTextFieldFocused)")
+                }
+                return
+            }
+            guard !speechRecognizer.isRecording else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DynamicIslandChat] dictation-auto-restart: skip — already recording")
+                }
+                return
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DynamicIslandChat] dictation-auto-restart: scheduling delayed start (800ms)")
+            }
             autoStartTask?.cancel()
             autoStartTask = Task {
                 try? await Task.sleep(for: .milliseconds(800))
-                guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
+                guard !Task.isCancelled, isExpanded, !isTextFieldFocused else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[DynamicIslandChat] dictation-auto-restart: delayed task aborted — cancelled=\(Task.isCancelled) isExpanded=\(isExpanded) isTextFieldFocused=\(isTextFieldFocused)")
+                    }
+                    return
+                }
                 let prefix = inputText.trimmingCharacters(in: .whitespaces).isEmpty ? "" : inputText.trimmingCharacters(in: .whitespacesAndNewlines) + " "
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DynamicIslandChat] dictation-auto-restart: calling speechRecognizer.start")
+                }
                 speechRecognizer.start { transcript in
                     inputText = prefix + transcript
                 }
@@ -600,6 +629,9 @@ struct DynamicIslandChat: View {
             regenerateReminders()
         }
         .onChange(of: ActiveAgentTracker.shared.workingSessions) { _, sessions in
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DynamicIslandChat] workingSessions onChange: sessionKey=\(sessionKey) matches=\(sessions.contains(sessionKey)) isWorking=\(isWorking) activeChatTaskNil=\(activeChatTask == nil) sessionsCount=\(sessions.count)")
+            }
             // Restore working state when view is recreated and agent is still running,
             // or clear it when the agent finishes while this view is active.
             if sessions.contains(sessionKey) && !isWorking {
@@ -622,6 +654,16 @@ struct DynamicIslandChat: View {
             }
         }
         .onDisappear {
+            // Recording must never outlive its UI: if this pill vanishes while
+            // dictating (host view dismissed/torn down), stop the mic and cancel
+            // any pending auto-restart so it can't re-arm after removal
+            // (2026-07-08: mic kept recording under a dismissed compose cover).
+            autoStartTask?.cancel()
+            autoStartTask = nil
+            // Unconditional: stop() is idempotent when idle, and its generation
+            // bump also invalidates an in-flight beginRecording (a start racing
+            // this disappear) before it can commit the mic.
+            speechRecognizer.stop()
             // No eager cancellation for any session type:
             // - Inbox: pill stays mounted, N/A
             // - Message-detail: user can navigate back to see the result
@@ -1333,6 +1375,9 @@ struct DynamicIslandChat: View {
                 if let did = draftId, !skipSave {
                     let updatedSubject = result.subject ?? currentSubject
                     let updatedBody = result.body ?? currentBody
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[DynamicIslandChat] sendComposeEdit: autoSaveDraft task fired draftKey=\(did) sessionKey=\(sessionKey)")
+                    }
                     Task { await autoSaveDraft(draftKey: did, subject: updatedSubject, body: updatedBody) }
                 }
 
@@ -1366,14 +1411,29 @@ struct DynamicIslandChat: View {
             // Guard: stop button already cleaned up
             guard !Task.isCancelled else { return }
             activeChatTask = nil
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DynamicIslandChat] sendComposeEdit completion: writing isWorking=false sessionKey=\(sessionKey)")
+            }
             isWorking = false
             ActiveAgentTracker.shared.clearWorking(sessionKey)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DynamicIslandChat] sendComposeEdit completion: clearWorking called sessionKey=\(sessionKey)")
+            }
         }
     }
 
     /// Auto-save the current draft state to GRDB for resume on reopen.
     private func autoSaveDraft(draftKey: String, subject: String, body: String) async {
-        guard let ctx = composeContext else { return }
+        let entryTime = Date()
+        if DebugModeManager.isLoggingEnabled() {
+            print("[DraftStore] autoSaveDraft: enter draftKey=\(draftKey)")
+        }
+        guard let ctx = composeContext else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftStore] autoSaveDraft: exit (no composeContext) draftKey=\(draftKey)")
+            }
+            return
+        }
         let editHistJSON = Draft.encodeEditHistory(editHistory)
         let now = Date().timeIntervalSince1970
 
@@ -1382,20 +1442,38 @@ struct DynamicIslandChat: View {
 
         // Try to load existing draft — mutate in place to preserve all fields
         // (especially v24 server sync: serverDraftId, serverPushStatus, rfc822MessageId, attachmentsDirName)
-        if var existing = try? DraftStore.shared.load(id: draftKey) {
+        let loadStart = Date()
+        let existingLoaded = try? DraftStore.shared.load(id: draftKey)
+        if DebugModeManager.isLoggingEnabled() {
+            let loadMs = Int(Date().timeIntervalSince(loadStart) * 1000)
+            print("[DraftStore] autoSaveDraft: load took \(loadMs)ms found=\(existingLoaded != nil) draftKey=\(draftKey)")
+        }
+        if var existing = existingLoaded {
             existing.subject = subject
             existing.body = body
             existing.editHistoryJSON = editHistJSON
             existing.updatedAt = now
             savedAccountId = existing.accountId
-            do { try DraftStore.shared.save(existing) }
+            let saveStart = Date()
+            do {
+                try DraftStore.shared.save(existing)
+                if DebugModeManager.isLoggingEnabled() {
+                    let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
+                    print("[DraftStore] autoSaveDraft: save (existing) took \(saveMs)ms draftKey=\(draftKey)")
+                }
+            }
             catch { print("[DraftStore] Auto-save failed: \(error)"); return }
         } else {
             // First save — need accountId. Use sender email from context to find account.
             let accountId: String? = try? await AppDatabase.dbPool.read { db in
                 try Account.filter(sql: "emailAddress = ?", arguments: [ctx.senderEmail]).fetchOne(db)?.id
             }
-            guard let aid = accountId else { return }
+            guard let aid = accountId else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DraftStore] autoSaveDraft: exit (no account for first save) draftKey=\(draftKey)")
+                }
+                return
+            }
             savedAccountId = aid
             let draft = Draft(
                 id: draftKey,
@@ -1411,13 +1489,24 @@ struct DynamicIslandChat: View {
                 createdAt: now,
                 updatedAt: now
             )
-            do { try DraftStore.shared.save(draft) }
+            let saveStart = Date()
+            do {
+                try DraftStore.shared.save(draft)
+                if DebugModeManager.isLoggingEnabled() {
+                    let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
+                    print("[DraftStore] autoSaveDraft: save (first) took \(saveMs)ms draftKey=\(draftKey)")
+                }
+            }
             catch { print("[DraftStore] Auto-save failed (first save): \(error)"); return }
         }
 
         // Queue server push via PendingOperation (crash-safe, retried on failure/launch).
         if let savedAccountId {
             await AccountManager.shared.queueDraftSave(draftId: draftKey, accountId: savedAccountId)
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            let totalMs = Int(Date().timeIntervalSince(entryTime) * 1000)
+            print("[DraftStore] autoSaveDraft: exit draftKey=\(draftKey) totalMs=\(totalMs)")
         }
     }
 

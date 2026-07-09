@@ -51,6 +51,18 @@ struct ComposeView: View {
     @State private var agentToastDismiss: Task<Void, Never>?
     @State private var bodyBlink = false
     @State private var draftId: String = UUID().uuidString
+    /// Per-instance identity token for diagnosing the black-screen-on-second-edit
+    /// bug: a genuinely NEW SwiftUI identity gets a fresh token (a persisted
+    /// `@State` default only "sticks" on first attach for that identity); a
+    /// re-render of the SAME identity keeps the same token. Correlate with the
+    /// onAppear/onDisappear pairs in logmain.log to distinguish "recreated struct,
+    /// same identity" from "SwiftUI tore down and recreated the identity" (e.g.
+    /// from a drafts-folder header rekey while this ComposeView is on-screen).
+    @State private var instanceToken = String(UUID().uuidString.prefix(6))
+    /// Cancelled/replaced whenever `isApplyingEdit` flips; detects a fade-in that
+    /// never completes (the black-screen symptom: `isApplyingEdit` stuck `true`
+    /// keeps the editor at opacity 0 indefinitely). Logging only.
+    @State private var stuckFadeWatchTask: Task<Void, Never>?
     @State private var showDiscardPrompt = false
     @State private var showEmptyBodyPrompt = false
     @State private var isSavingDraft = false
@@ -100,6 +112,47 @@ struct ComposeView: View {
     /// upstream. Non-agent compose entry points leave this `nil` and the
     /// calls below become no-ops.
     var onAgentOutcome: (@MainActor (ComposeOutcome) -> Void)? = nil
+
+    /// Custom init purely to log struct construction (diagnostic for the
+    /// black-screen-on-second-edit bug — distinguishes "SwiftUI reconstructed the
+    /// value struct" from "SwiftUI recreated the identity", the latter visible via
+    /// a fresh `instanceToken` at the next `.onAppear`). Mirrors the compiler-
+    /// synthesized memberwise init exactly (same params/defaults as the stored
+    /// properties above); every `@State` property below keeps its own default.
+    init(
+        replyTo: MessageHeader? = nil,
+        suggestedBody: String? = nil,
+        account: Account? = nil,
+        isForward: Bool = false,
+        prefillTo: [String]? = nil,
+        prefillCc: [String]? = nil,
+        prefillBcc: [String]? = nil,
+        prefillSubject: String? = nil,
+        prefillBody: String? = nil,
+        prefillAttachments: [DraftAttachment]? = nil,
+        prefillTreatAsUnsavedChanges: Bool = false,
+        prefillDraftId: String? = nil,
+        serverDraftHeader: MessageHeader? = nil,
+        onAgentOutcome: (@MainActor (ComposeOutcome) -> Void)? = nil
+    ) {
+        self.replyTo = replyTo
+        self.suggestedBody = suggestedBody
+        self.account = account
+        self.isForward = isForward
+        self.prefillTo = prefillTo
+        self.prefillCc = prefillCc
+        self.prefillBcc = prefillBcc
+        self.prefillSubject = prefillSubject
+        self.prefillBody = prefillBody
+        self.prefillAttachments = prefillAttachments
+        self.prefillTreatAsUnsavedChanges = prefillTreatAsUnsavedChanges
+        self.prefillDraftId = prefillDraftId
+        self.serverDraftHeader = serverDraftHeader
+        self.onAgentOutcome = onAgentOutcome
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] init: prefillDraftId=\(prefillDraftId ?? "nil") replyTo=\(replyTo?.stableId ?? "nil") isForward=\(isForward)")
+        }
+    }
 
     /// Defense against any path that destroys the view without firing
     /// `.onDisappear` — SwiftUI doesn't formally guarantee `.onDisappear`
@@ -557,6 +610,9 @@ struct ComposeView: View {
             .toolbar(.hidden, for: .navigationBar)
             .animation(.spring(response: 0.45, dampingFraction: 0.82), value: chatExpanded)
             .onChange(of: chatExpanded) { _, expanded in
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] chatExpanded -> \(expanded) instance=\(instanceToken) draftId=\(draftId)")
+                }
                 if expanded {
                     bodyFocused = false
                     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
@@ -571,6 +627,35 @@ struct ComposeView: View {
                 } else {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         bodyBlink = false
+                    }
+                }
+            }
+            .onChange(of: isSavingDraft) { _, saving in
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] isSavingDraft -> \(saving) instance=\(instanceToken) draftId=\(draftId)")
+                }
+            }
+            // Stuck-fade detector: `isApplyingEdit` is the black-screen suspect —
+            // it drives the editor's opacity to 0 during applyInlineEdit's fade-out
+            // and should flip back to false ~0.65s later. If it doesn't, the editor
+            // stays invisible forever. Logging only — never force-resets state.
+            .onChange(of: isApplyingEdit) { _, applying in
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] isApplyingEdit -> \(applying) instance=\(instanceToken) draftId=\(draftId) chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft)")
+                }
+                stuckFadeWatchTask?.cancel()
+                stuckFadeWatchTask = nil
+                guard applying else { return }
+                stuckFadeWatchTask = Task { @MainActor in
+                    var elapsedSeconds = 0
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(3))
+                        if Task.isCancelled { return }
+                        elapsedSeconds += 3
+                        guard isApplyingEdit else { return }
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[ComposeView] ⚠ STUCK FADE: isApplyingEdit still true after \(elapsedSeconds)s — editor invisible; chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft) instance=\(instanceToken) draftId=\(draftId)")
+                        }
                     }
                 }
             }
@@ -634,6 +719,9 @@ struct ComposeView: View {
                     let stableKey = "\(reply.accountId):\(reply.stableId)"
                     draftId = Draft.draftKey(replyTo: stableKey, isForward: isForward, newId: nil)
                 }
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
+                }
                 contactSearch.requestAccess()
                 loadDraftOrPrepopulate()
                 resolveContactNames()
@@ -660,6 +748,9 @@ struct ComposeView: View {
                 }
             }
             .onDisappear {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
+                }
                 // Normal teardown path: mark the tracker so its deinit
                 // fallback is a no-op, then fire the outcome/hooks directly
                 // (synchronous — faster than the deinit path).
@@ -967,6 +1058,9 @@ struct ComposeView: View {
         withAnimation(.easeIn(duration: 0.25)) {
             isApplyingEdit = true
         }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] applyInlineEdit: fade-out begin instance=\(instanceToken) draftId=\(draftId)")
+        }
         Task { @MainActor in
             // Wait for fade-out to finish
             try? await Task.sleep(for: .milliseconds(280))
@@ -993,9 +1087,15 @@ struct ComposeView: View {
             applyRecipientDelta(field: .to, delta: toDelta)
             applyRecipientDelta(field: .cc, delta: ccDelta)
             applyRecipientDelta(field: .bcc, delta: bccDelta)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ComposeView] applyInlineEdit: mutation applied instance=\(instanceToken) draftId=\(draftId)")
+            }
             // Phase 3: dissolve back in with new text
             withAnimation(.easeOut(duration: 0.4)) {
                 isApplyingEdit = false
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ComposeView] applyInlineEdit: fade-in begin instance=\(instanceToken) draftId=\(draftId)")
             }
             print("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
         }

@@ -78,7 +78,8 @@ enum BootProfiler {
     /// block per 250ms while debug logging is unlocked; never armed otherwise.
     static func startStallWatchdog(
         pingInterval: TimeInterval = 0.25,
-        stallThreshold: TimeInterval = 0.5
+        stallThreshold: TimeInterval = 0.5,
+        ongoingStallInterval: TimeInterval = 2.0
     ) {
         guard DebugModeManager.isLoggingEnabled() else { return }
         let shouldArm = watchdogArmed.withLock { armed -> Bool in
@@ -100,9 +101,23 @@ enum BootProfiler {
                 }
                 Thread.sleep(forTimeInterval: pingInterval)
                 // If the ping is still pending after the sleep, the main thread is
-                // CURRENTLY stalled — wait for it rather than piling up pings.
+                // CURRENTLY stalled — wait for it rather than piling up pings. While
+                // waiting, emit periodic "still stalled" marks from THIS (watchdog)
+                // thread so an ongoing hang is visible in the timeline before it ever
+                // recovers — this is what lets a real log-then-black-screen report be
+                // read as "still alive, just slow" vs. "actually hung". `mark()` writes
+                // directly (print + BackgroundSyncLogger.logBoot → a background
+                // ioQueue.async) with no main-queue hop, so it's safe to call from here
+                // even while the main thread is stalled.
+                var lastOngoingMark = sent
                 while !done.withLock({ $0 }) {
                     Thread.sleep(forTimeInterval: 0.05)
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastOngoingMark >= ongoingStallInterval {
+                        let elapsedMs = Int((now - sent) * 1000)
+                        mark("⚠ MAIN THREAD STALL ONGOING ~\(elapsedMs)ms (unrecovered yet)")
+                        lastOngoingMark = now
+                    }
                 }
             }
         }

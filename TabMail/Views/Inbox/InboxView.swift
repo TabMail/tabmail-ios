@@ -66,12 +66,6 @@ struct InboxView: View {
             set: { if !$0 { contactComposeRequest = nil } }
         )
     }
-    private var replyPresented: Binding<Bool> {
-        Binding(
-            get: { replyMessageId != nil },
-            set: { if !$0 { replyMessageId = nil } }
-        )
-    }
 
     init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>, pushedMessageId: Binding<String?>) {
         self.title = title
@@ -165,7 +159,7 @@ struct InboxView: View {
     }
 
     /// Wraps `$selectedMessageId` so a tap inside the Drafts folder is
-    /// redirected to `draftIdToOpen` (which drives a fullScreenCover),
+    /// redirected to `draftHeaderToOpen` (which drives a fullScreenCover),
     /// leaving `selectedMessageId` nil so the detail pane does NOT push.
     private var listSelectionBinding: Binding<String?> {
         Binding(
@@ -175,7 +169,19 @@ struct InboxView: View {
                     print("[DetailRender] listSelectionBinding.set \(String(describing: selectedMessageId?.prefix(40))) -> \(String(describing: newValue?.prefix(40)))")
                 }
                 if let newId = newValue, isDraftsContext {
-                    draftIdToOpen = newId
+                    // Capture the header VALUE at tap time. The cover content must
+                    // NOT re-fetch by header id: pushing a draft rekeys its header
+                    // (DraftStore.pushDraftToServer migration) and the next Drafts
+                    // sync stale-deletes the old row — an id-keyed re-fetch inside
+                    // the cover then returns nil and the presented cover renders
+                    // empty (solid black, 2026-07-08 bug).
+                    if let header = try? AppDatabase.dbPool.read({ db in
+                        try MessageHeader.fetchOne(db, key: newId)
+                    }) {
+                        draftHeaderToOpen = header
+                    } else if DebugModeManager.isLoggingEnabled() {
+                        print("[DetailRender] drafts tap: header already gone, not presenting id=\(newId.prefix(40))")
+                    }
                 } else {
                     selectedMessageId = newValue
                 }
@@ -184,7 +190,11 @@ struct InboxView: View {
     }
 
     @State private var showUndoAlert = false
-    @State private var replyMessageId: String?
+    /// Reply-all compose target. Holds a VALUE copy of the header captured at
+    /// action time (same rule as `draftHeaderToOpen`): the row can be deleted
+    /// or UID-rekeyed by sync while the reply compose is open, so the cover
+    /// content must never re-fetch it.
+    @State private var replyMessage: MessageHeader?
     @State private var dismissedMessages: Set<String> = []
     @State private var swipeFadingMessages: Set<String> = []
     @State private var labelMenuMessage: MessageSnapshot?
@@ -196,8 +206,11 @@ struct InboxView: View {
     @State private var showAgentDraft = false
     /// Drafts-folder tap target. Setting this presents ComposeView as a
     /// fullScreenCover (matching every other compose entry point) instead of
-    /// pushing MessageDetailView via `selectedMessageId`.
-    @State private var draftIdToOpen: String?
+    /// pushing MessageDetailView via `selectedMessageId`. Holds a VALUE copy
+    /// of the tapped header: the header row itself may be rekeyed/deleted by
+    /// draft-push migration + Drafts sync while compose is open, so the
+    /// presentation must never depend on re-fetching it.
+    @State private var draftHeaderToOpen: MessageHeader?
     private var archiveOldEmailsTip = ArchiveOldEmailsTip()
     private var enableInboxPushTip = EnableInboxPushTip()
     private var undoService: UndoService { UndoService.shared }
@@ -577,19 +590,11 @@ struct InboxView: View {
         )) {
             moveSheetContent
         }
-        .fullScreenCover(isPresented: replyPresented) {
-            if let id = replyMessageId, let message = viewModel.lookupMessage(id) {
-                replyAllComposeView(for: message)
-            }
+        .fullScreenCover(item: $replyMessage) { message in
+            replyAllComposeView(for: message)
         }
-        .fullScreenCover(isPresented: Binding(
-            get: { draftIdToOpen != nil },
-            set: { if !$0 { draftIdToOpen = nil } }
-        )) {
-            if let id = draftIdToOpen,
-               let header = try? AppDatabase.dbPool.read({ db in try MessageHeader.fetchOne(db, key: id) }) {
-                ServerDraftComposeLoader(header: header)
-            }
+        .fullScreenCover(item: $draftHeaderToOpen) { header in
+            ServerDraftComposeLoader(header: header)
         }
         .fullScreenCover(item: $agentCompose) { req in
             composeViewForAgentRequest(req)
@@ -1255,8 +1260,11 @@ struct InboxView: View {
             } else if !snapshot.isRead {
                 viewModel.toggleRead(snapshot.id)
             }
-            // For threads, reply to the most recent message (representative)
-            replyMessageId = snapshot.id
+            // For threads, reply to the most recent message (representative).
+            // Capture the header VALUE now (lookupMessage = fresh GRDB read, or
+            // the ADR-IOS-049 staged-row synthesis) — the cover must not
+            // re-fetch it later.
+            replyMessage = viewModel.lookupMessage(snapshot.id)
         case .archive:
             if let group, group.isThread {
                 dismissAndArchiveThread(group)

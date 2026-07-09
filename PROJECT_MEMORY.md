@@ -939,6 +939,16 @@ NOT GRDB schema migrations (those are in `AppDatabase.runMigrations`, the `Datab
 
 ---
 
+## fullScreenCover content must never re-fetch by a rekeyable id → presented-but-empty cover renders SOLID BLACK (2026-07-08)
+
+- Symptom: editing a draft opened FROM the Drafts folder, agent inline-edit → whole screen goes black while the app keeps running/logging underneath (drafts list kept evaluating). Confirmed via instrumented repro (logmain.log 21:12): `DraftStaleDelete: removing …DRAFT:<tapped header id>` → `[ComposeView] onDisappear` with zero user action.
+- Root cause: `InboxView`'s drafts cover was `fullScreenCover(isPresented:)` whose CONTENT closure did `MessageHeader.fetchOne(db, key: draftIdToOpen)` on every re-evaluation. A draft push rekeys its header (`DraftStore.pushDraftToServer` migration, logged `Migrated header old → new`), the next Drafts sync stale-deletes the old row, the keyed fetch returns nil, the `if let` fails — and SwiftUI happily keeps the cover PRESENTED with `EmptyView` content = full-screen black with no dismiss affordance. "Mostly the second edit" because edit #1 creates the rekey and the next sync trips it.
+- **Rule: a presented container's content must depend only on state captured at presentation time.** Fix = capture the header VALUE at tap (`draftHeaderToOpen: MessageHeader?`) + `fullScreenCover(item:)`. If content legitimately can't resolve, auto-dismiss (`DraftComposePresenter`'s `.notFound → Color.clear.onAppear { dismiss() }` is the house idiom) — never leave a presented cover empty. Sibling of the `.task`-on-conditional self-cancellation rule (both are "SwiftUI container alive, content keyed on state that flips underneath it").
+- Audit (2026-07-08, follow-up applied): the reply-all cover had the SAME shape and was converted too — `lookupMessage` is a live GRDB `fetchOne(key:)` (NOT in-memory as first assumed), so a remote delete / thread-move UID-rekey while the reply compose was open would have blanked it. Now `replyMessage: MessageHeader?` captured at action time + `fullScreenCover(item:)`. The remaining `isPresented`+`if let` covers (`contactComposeRequest`, `agentDraftIdToOpen`, `ComposeToolbarButton.draftIdToOpen`) guard plain @State set immediately before presenting — nothing external can nil them mid-presentation, and `DraftComposePresenter` auto-dismisses on notFound — so they were deliberately left as-is.
+- Companion fix: `DynamicIslandChat` pill `.onDisappear` now cancels `autoStartTask` + calls `speechRecognizer.stop()` unconditionally (idempotent; generation bump kills an in-flight `beginRecording`) — the black-screen repro showed the mic STILL RECORDING under the dead cover (dictation auto-restart had re-armed it just before the teardown).
+
+---
+
 ## Knowledge Gaps
 
 (none currently)

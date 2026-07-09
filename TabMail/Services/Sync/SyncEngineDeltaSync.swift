@@ -121,6 +121,17 @@ extension SyncEngine {
                         if snapshot.all.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId) {
                             continue
                         }
+                        // Draft rekey visibility: pushDraftToServer mints a fresh
+                        // Gmail message.id on every push (Gmail replaces rather than
+                        // updates draft messages), so a background delta sync can
+                        // observe the OLD draft message as "deleted" here — this is
+                        // one half of the drafts-folder rekey (the matching insert
+                        // for the NEW message.id is logged below). Narrow to the
+                        // Drafts folder so this doesn't spray logs for ordinary mail.
+                        if DebugModeManager.isLoggingEnabled(),
+                           let draftsFolder = folders.first(where: { $0.id == msg.folderId && $0.role == .drafts }) {
+                            print("[DraftRekey] Gmail delta: deleting drafts-folder header id=\(msg.id) messageId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") folder=\(draftsFolder.name)")
+                        }
                         ids.append(msg.id)
                         try msg.delete(db)
                     }
@@ -183,6 +194,12 @@ extension SyncEngine {
                         } else if !existsLocally && belongsInFolder && !isPendingDestructive {
                             // New message in this folder
                             print("[MoveTrace] deltaSync — inserting \(info.messageId) into \(folder.name)(\(folder.id)) — labels=\(labelIds)")
+                            // Other half of draft rekey visibility (see the matching
+                            // delete-side log above): the NEW message.id Gmail minted
+                            // for a re-pushed draft lands here as an ordinary insert.
+                            if DebugModeManager.isLoggingEnabled(), folder.role == .drafts {
+                                print("[DraftRekey] Gmail delta: inserting drafts-folder header messageId=\(info.messageId) into \(folder.name)")
+                            }
                             var header = MessageHeader(
                                 messageId: info.messageId,
                                 subject: info.subject,
