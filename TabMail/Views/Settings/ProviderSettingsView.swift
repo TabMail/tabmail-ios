@@ -30,6 +30,11 @@ struct BYOKTierRows: View {
     @AppStorage private var providerValue: String
     @State private var modelValue: String = ""
     @State private var hasKey: Bool = false
+    /// Live model IDs the user's key can access, per provider (`POST
+    /// /byok/list-models`). Cached per provider for this view's lifetime so
+    /// switching providers back and forth doesn't refetch. nil entry = not
+    /// fetched yet for that provider; empty array = fetched, none available.
+    @State private var liveModelsByProvider: [String: [String]] = [:]
 
     init(tier: String, pickerLabel: String, caption: String, catalog: BYOKModelCatalog?) {
         self.tier = tier
@@ -71,6 +76,7 @@ struct BYOKTierRows: View {
             modelValue = UserDefaults.standard.string(forKey: AIService.byokModelKey(tier: tier, provider: providerValue)) ?? ""
             refreshHasKey()
             ensureDefaultModel()
+            Task { await refreshLiveModelsIfNeeded() }
         }
         .onChange(of: providerValue) { _, newValue in
             // Key is shared per-provider; model is per-(tier, provider). Restore
@@ -79,6 +85,7 @@ struct BYOKTierRows: View {
             modelValue = UserDefaults.standard.string(forKey: AIService.byokModelKey(tier: tier, provider: newValue)) ?? ""
             refreshHasKey()
             ensureDefaultModel()
+            Task { await refreshLiveModelsIfNeeded() }
         }
         .onChange(of: tierModels) { _, _ in
             // Catalog can arrive after the view appears (loaded async). Pick the
@@ -87,6 +94,18 @@ struct BYOKTierRows: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             refreshHasKey()
+            Task { await refreshLiveModelsIfNeeded() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .byokKeyChanged)) { note in
+            // A key was saved, rotated, or removed — any cached live list for
+            // that provider reflects the OLD key's entitlements. Invalidate it
+            // and refetch (fetch is a no-op unless the current provider has a
+            // stored key and no cached list).
+            if let provider = note.object as? String {
+                liveModelsByProvider[provider] = nil
+            }
+            refreshHasKey()
+            Task { await refreshLiveModelsIfNeeded() }
         }
 
         if providerValue != "tabmail" {
@@ -104,10 +123,21 @@ struct BYOKTierRows: View {
                 }
             }
 
-            if !tierModels.isEmpty {
+            if !mergedModels.recommended.isEmpty || !mergedModels.additional.isEmpty {
                 Picker("Model", selection: $modelValue) {
-                    ForEach(tierModels, id: \.self) { model in
-                        Text(model).tag(model)
+                    if !mergedModels.recommended.isEmpty {
+                        Section("Recommended") {
+                            ForEach(mergedModels.recommended, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                    }
+                    if !mergedModels.additional.isEmpty {
+                        Section("All models (from your API key)") {
+                            ForEach(mergedModels.additional, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
                     }
                 }
                 .pickerStyle(.menu)
@@ -128,13 +158,59 @@ struct BYOKTierRows: View {
     }
 
     /// Catalog models for the current provider + tier (empty if not loaded / none).
+    /// This is the "Recommended" list — catalog order preserved, first entry
+    /// is the auto-selected default (cheapest-first for Light).
     private var tierModels: [String] {
         catalog?[providerValue]?[tier] ?? []
+    }
+
+    /// Live model IDs the current provider's key can access, if fetched.
+    private var liveModels: [String] {
+        liveModelsByProvider[providerValue] ?? []
+    }
+
+    /// Recommended (catalog) + Additional (live-only) models for the picker's
+    /// two Sections. See `BYOKProviderInfo.mergeModels`.
+    private var mergedModels: (recommended: [String], additional: [String]) {
+        BYOKProviderInfo.mergeModels(recommended: tierModels, available: liveModels)
     }
 
     private func refreshHasKey() {
         guard providerValue != "tabmail" else { hasKey = false; return }
         hasKey = (KeychainHelper.loadBYOK(provider: providerValue) ?? "").isEmpty == false
+    }
+
+    /// Fetches the live model list for the current provider via `POST
+    /// /byok/list-models`, only when a Keychain key is stored for it and we
+    /// haven't already cached a SUCCESSFUL result for this provider this
+    /// view's lifetime. Progressive enhancement: on failure, the picker
+    /// simply falls back to showing the Recommended section only — failure
+    /// is visible in the debug log, not surfaced to the user (this mirrors
+    /// the existing catalog-fetch-failure handling in
+    /// TabMailSettingsView.loadBYOKCatalogIfNeeded). Failures are NOT cached,
+    /// so a later trigger (provider switch, UserDefaults change) retries —
+    /// same retry-on-next-trigger behavior as the catalog fetch.
+    @MainActor
+    private func refreshLiveModelsIfNeeded() async {
+        // Capture the provider ONCE at entry. `providerValue` is @AppStorage —
+        // if the user switches providers while the fetch is in flight, a
+        // re-read after the await would cache THIS fetch's models under the
+        // NEW provider's key (and the nil-guard would then permanently block
+        // the correct fetch for that provider). Keying the guard, the
+        // Keychain read, the request, AND the write-back to the captured
+        // value makes the result land in the right slot regardless of what
+        // the picker does meanwhile.
+        let provider = providerValue
+        guard provider != "tabmail" else { return }
+        guard liveModelsByProvider[provider] == nil else { return }
+        guard let apiKey = KeychainHelper.loadBYOK(provider: provider), !apiKey.isEmpty else { return }
+
+        let result = await BackendClient().listBYOKModels(provider: provider, apiKey: apiKey)
+        if result.ok {
+            liveModelsByProvider[provider] = result.models ?? []
+        } else if DebugModeManager.isLoggingEnabled() {
+            print("[BYOK] list-models failed for \(provider): \(result.error_code ?? "?") \(result.error_detail ?? "")")
+        }
     }
 
     /// When a non-TabMail provider is selected but no model is chosen for this
@@ -190,6 +266,52 @@ enum BYOKProviderInfo {
         }
     }
 
+    /// True if a live model ID (from a provider's models-list endpoint)
+    /// represents the same model as a recommended/catalog ID. Tolerant of
+    /// provider ID-format quirks: a provider's live list may return a DATED
+    /// canonical ID (e.g. Anthropic's `claude-haiku-4-5-20251001`) while our
+    /// catalog uses the dateless alias the request actually sends
+    /// (`claude-haiku-4-5`). Treats `<recommendedId>-<digits>` as a match.
+    /// The digits-only suffix check avoids false positives like `gpt-5.5`
+    /// matching `gpt-5.5-pro`.
+    static func liveIdMatches(_ liveId: String, recommendedId: String) -> Bool {
+        if liveId == recommendedId { return true }
+        let datedPrefix = recommendedId + "-"
+        guard liveId.hasPrefix(datedPrefix) else { return false }
+        let suffix = liveId.dropFirst(datedPrefix.count)
+        return !suffix.isEmpty && suffix.allSatisfy(\.isNumber)
+    }
+
+    /// Whether a recommended/catalog model ID is present in a set of live
+    /// model IDs the user's key can access — exact match or a dated variant
+    /// (see `liveIdMatches`).
+    static func isAvailable(_ recommendedModel: String, in available: Set<String>) -> Bool {
+        available.contains { liveIdMatches($0, recommendedId: recommendedModel) }
+    }
+
+    /// Merges a curated "recommended" model list (catalog order, first =
+    /// default) with the full list of models the user's API key can access,
+    /// for a two-Section model picker ("Recommended" / "All models (from
+    /// your API key)"). `additional` is `available` filtered down to IDs NOT
+    /// already covered by a recommended ID (exact or dated-variant match,
+    /// see `liveIdMatches`) — so newly released models are selectable
+    /// without an app update, without duplicating entries already surfaced
+    /// as Recommended. Order of `available` is preserved (the backend
+    /// already sorts it); `recommended` is passed through unchanged.
+    static func mergeModels(recommended: [String], available: [String]) -> (recommended: [String], additional: [String]) {
+        guard !available.isEmpty else { return (recommended, []) }
+        var seen = Set<String>()
+        var additional: [String] = []
+        for liveId in available {
+            guard !seen.contains(liveId) else { continue }
+            let coveredByRecommended = recommended.contains { liveIdMatches(liveId, recommendedId: $0) }
+            guard !coveredByRecommended else { continue }
+            seen.insert(liveId)
+            additional.append(liveId)
+        }
+        return (recommended, additional)
+    }
+
     static func zdrDisclaimer(_ raw: String) -> String {
         switch raw {
         case "openai":
@@ -202,4 +324,14 @@ enum BYOKProviderInfo {
             return ""
         }
     }
+}
+
+extension Notification.Name {
+    /// Posted by APIKeysView after a BYOK API key is saved, rotated, or
+    /// removed in the Keychain. Keychain writes do NOT fire
+    /// `UserDefaults.didChangeNotification`, so caches keyed on the key's
+    /// entitlements (the live model list in BYOKTierRows) need this explicit
+    /// signal to invalidate and refetch. `object` carries the provider
+    /// string ("openai" | "anthropic" | "google").
+    static let byokKeyChanged = Notification.Name("byokKeyChanged")
 }

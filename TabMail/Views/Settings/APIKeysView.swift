@@ -152,9 +152,20 @@ private struct APIKeyProviderSection: View {
         if trimmed.isEmpty {
             KeychainHelper.deleteBYOK(provider: provider)
             savedIndicator = false
+            // Keychain writes don't fire UserDefaults.didChangeNotification —
+            // signal listeners (BYOKTierRows' live-model cache) explicitly.
+            NotificationCenter.default.post(name: .byokKeyChanged, object: provider)
         } else {
-            try? KeychainHelper.saveBYOK(trimmed, provider: provider)
-            savedIndicator = true
+            do {
+                try KeychainHelper.saveBYOK(trimmed, provider: provider)
+                savedIndicator = true
+                NotificationCenter.default.post(name: .byokKeyChanged, object: provider)
+            } catch {
+                savedIndicator = false
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[BYOK] keychain save failed for \(provider): \(error)")
+                }
+            }
         }
         // Update the inbox usage-throttle banner immediately — adding/removing a
         // BYOK key flips whether the user is on the slow shared queue.
@@ -260,21 +271,10 @@ private struct ProviderTestRunner: View {
         return ordered
     }
 
-    /// Whether a catalog model is in the key's available set. Tolerant of
-    /// provider ID-format quirks: a provider's models-list endpoint may return
-    /// a DATED canonical ID (e.g. Anthropic's `claude-haiku-4-5-20251001`) while
-    /// our catalog uses the dateless alias the request actually uses
-    /// (`claude-haiku-4-5`). Treat `<catalogId>-<digits>` as a match. The
-    /// digits-only suffix check avoids false positives like `gpt-5.5` matching
-    /// `gpt-5.5-pro`.
+    /// Whether a catalog model is in the key's available set. Shared with the
+    /// model-picker merge logic — see `BYOKProviderInfo.isAvailable`.
     private func isAvailable(_ catalogModel: String, in available: Set<String>) -> Bool {
-        if available.contains(catalogModel) { return true }
-        let datedPrefix = catalogModel + "-"
-        return available.contains { id in
-            guard id.hasPrefix(datedPrefix) else { return false }
-            let suffix = id.dropFirst(datedPrefix.count)
-            return !suffix.isEmpty && suffix.allSatisfy(\.isNumber)
-        }
+        BYOKProviderInfo.isAvailable(catalogModel, in: available)
     }
 
     /// Shows which catalog models the key can access, after a test run. This is
