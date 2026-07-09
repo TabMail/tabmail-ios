@@ -83,6 +83,11 @@ final class InboxViewModel {
     /// staging rows are deleted only by phase-2 commit).
     private struct PendingStagedRow {
         let row: StagedInboxRow
+        /// `ForegroundActiveClock.now()` at insertion time — NOT wall clock. The
+        /// guard's window means "running time to make progress" (durable write +
+        /// reconciling reload), so it must survive device sleep and app
+        /// backgrounding rather than expire while neither can run. See
+        /// `ForegroundActiveClock` and `SyncConfig.stagedRowEvictionGuardSeconds`.
         let insertedAt: TimeInterval
     }
     /// Keyed by headerId. A reload must not evict these while the guard is fresh
@@ -739,7 +744,7 @@ final class InboxViewModel {
             }
             loadedMessages.insert(snapshot, at: insertionIndex)
             loadedIds.insert(id)
-            pendingStagedRows[id] = PendingStagedRow(row: row, insertedAt: CFAbsoluteTimeGetCurrent())
+            pendingStagedRows[id] = PendingStagedRow(row: row, insertedAt: ForegroundActiveClock.now())
             insertedCount += 1
         }
         if insertedCount > 0 {
@@ -753,7 +758,10 @@ final class InboxViewModel {
     #if DEBUG
     /// Test hook (guard-expiry tests): backdate a pending staged row's insertion
     /// timestamp so `SyncConfig.stagedRowEvictionGuardSeconds` expiry can be
-    /// exercised without waiting wall-clock time. No-op for unknown ids.
+    /// exercised without waiting for real elapsed time. Clock-agnostic — it only
+    /// subtracts `seconds` from whatever `insertedAt` holds (now
+    /// `ForegroundActiveClock.now()` units), so this keeps working unchanged.
+    /// No-op for unknown ids.
     func _testBackdateStagedGuard(id: String, by seconds: TimeInterval) {
         guard let pending = pendingStagedRows[id] else { return }
         pendingStagedRows[id] = PendingStagedRow(
@@ -913,7 +921,7 @@ final class InboxViewModel {
                     }
                 } else if let pending = pendingStagedRows[existing.id],
                           overlay[existing.id]?.folderId == nil,
-                          CFAbsoluteTimeGetCurrent() - pending.insertedAt
+                          ForegroundActiveClock.now() - pending.insertedAt
                               < SyncConfig.stagedRowEvictionGuardSeconds {
                     // ADR-IOS-049: a staged row whose durable write hasn't landed —
                     // DON'T let this (competing) reload evict the just-surfaced row,
@@ -931,7 +939,7 @@ final class InboxViewModel {
                     indicesToRemove.append(i)
                     if let pending = pendingStagedRows.removeValue(forKey: existing.id),
                        overlay[existing.id] == nil,
-                       CFAbsoluteTimeGetCurrent() - pending.insertedAt
+                       ForegroundActiveClock.now() - pending.insertedAt
                            >= SyncConfig.stagedRowEvictionGuardSeconds {
                         // Guard-EXPIRED eviction (phantom): tombstone the id so a
                         // later re-post (staged-set change defeats the suppression

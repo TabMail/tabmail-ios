@@ -24,6 +24,17 @@ import Testing
 /// fields when the fresh row lacks them, and keep the `pendingStagedRows`
 /// guard entry alive (still bounded by `stagedRowEvictionGuardSeconds`) until
 /// a fresh row arrives with real AI fields.
+///
+/// BUG 3 (clock correctness) — the guard's age was measured with
+/// `CFAbsoluteTimeGetCurrent()` (wall clock), which keeps flowing during device
+/// sleep and app backgrounding — exactly when neither the durable write nor a
+/// reconciling reload can make progress. A merge suspended mid-write for 435s
+/// (slept=127s; "boot_logs 2", 2026-07-09) left the guard long-expired on
+/// resume, so a reload racing the resumed write could evict AND tombstone a
+/// real row. Fix: `insertedAt` / the age comparisons now use
+/// `ForegroundActiveClock.now()` — a suspension-aware "active time" clock
+/// (`CLOCK_UPTIME_RAW`, additionally paused across app backgrounding) — so the
+/// window means "running time to make progress", not wall time.
 @Suite("Inbox staged-row guard races (ADR-IOS-049 fix)", .serialized)
 struct InboxStagedRowGuardTests {
 
@@ -253,5 +264,47 @@ struct InboxStagedRowGuardTests {
         await vm.reloadMessages()
         #expect(vm.loadedMessages.isEmpty)
         #expect(!vm.loadedMessages.contains { $0.id == id })
+    }
+
+    // MARK: - BUG 3: suspension (device sleep / app background) must not expire the guard
+
+    @Test("a suspension longer than the guard window in WALL terms does not expire it — active-clock age stays ~0")
+    @MainActor func suspendedSpanDoesNotExpireGuard() async throws {
+        let (_, folder, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay()
+            ForegroundActiveClock._testReset()
+        }
+        clearOverlay()
+        ForegroundActiveClock._testReset()
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        vm.insertStagedRows([makeStagedRow(messageId: "m-suspended")])
+        #expect(vm.loadedMessages.count == 1)
+        let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-suspended")
+
+        // `insertStagedRows` just stamped `insertedAt` with `ForegroundActiveClock.now()`;
+        // this read (with pausedTotal still 0) is within ms of that stamp.
+        let markUptime = ForegroundActiveClock.now()
+
+        // Simulate a suspension (device sleep and/or app background) LONGER than
+        // the guard window — the exact "435s suspended, guard expired on wall
+        // clock" scenario this fix addresses, scaled to the test's window.
+        let suspendedSpanSeconds = SyncConfig.stagedRowEvictionGuardSeconds + 30
+        ForegroundActiveClock._testSimulateBackground(at: markUptime)
+        ForegroundActiveClock._testSimulateForeground(at: markUptime + suspendedSpanSeconds)
+
+        // A competing reload whose fresh set omits the row (phantom, mirrors the
+        // pre-durable-write window) must NOT evict it: on WALL clock
+        // (CFAbsoluteTimeGetCurrent) this much elapsed time would blow straight
+        // through `stagedRowEvictionGuardSeconds`; on the active clock the row's
+        // age is still ~0s, because the whole span was excluded as suspended time
+        // during which neither the merge nor this reload could have progressed.
+        await vm.reloadMessages()
+        #expect(vm.loadedMessages.count == 1)
+        #expect(vm.loadedMessages.contains { $0.id == id })
     }
 }

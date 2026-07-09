@@ -468,6 +468,16 @@ enum SyncConfig {
     /// and would otherwise be protected forever. Generous enough to survive a
     /// suspension-delayed merge write (40s observed, boot_logs 10); small enough to
     /// bound a phantom's lifetime. Display-only — expiry never touches staging/GRDB.
+    ///
+    /// Measured on `ForegroundActiveClock.now()` — a suspension-aware "active
+    /// time" clock that excludes both device-sleep and app-backgrounded spans —
+    /// NOT wall clock (`CFAbsoluteTimeGetCurrent()`). A merge was observed
+    /// suspended mid-write for 435s (slept=127s; "boot_logs 2", 2026-07-09): on
+    /// wall clock the guard would already be long-expired by resume, letting a
+    /// reload racing the resumed write evict AND tombstone a real row via
+    /// `expiredStagedIds`, even though neither the merge nor a reconciling reload
+    /// could have made any progress during that window. The window means "running
+    /// time to make progress", so it has to be measured on running time.
     static let stagedRowEvictionGuardSeconds: TimeInterval = 60
 
     /// Notification-tap resolve: how long to poll the in-memory staged snapshot
