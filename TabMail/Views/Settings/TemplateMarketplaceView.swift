@@ -22,7 +22,12 @@ struct TemplateMarketplaceView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
+            // ZStack, NOT Group: Group is a transparent pass-through, so the
+            // `.task` below effectively hangs on the isLoading conditional —
+            // whose branches loadTemplates' own isLoading writes flip,
+            // cancelling/restarting the task (the Account-page infinite-
+            // spinner footgun; see PROJECT_MEMORY stuck-isLoading rule).
+            ZStack {
                 if isLoading && templates.isEmpty {
                     ProgressView("Loading templates...")
                 } else if let errorMessage, templates.isEmpty {

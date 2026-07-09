@@ -11,7 +11,12 @@ struct MySharedTemplatesView: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        Group {
+        // ZStack, NOT Group: Group is a transparent pass-through, so the
+        // `.task` below effectively hangs on the isLoading conditional —
+        // whose branches loadMyTemplates' own isLoading writes flip,
+        // cancelling/restarting the task (the Account-page infinite-
+        // spinner footgun; see PROJECT_MEMORY stuck-isLoading rule).
+        ZStack {
             if isLoading && templates.isEmpty {
                 ProgressView("Loading...")
             } else if let errorMessage, templates.isEmpty {

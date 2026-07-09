@@ -206,7 +206,17 @@ struct RootView: View {
     }
 
     var body: some View {
-        routedContent
+        // ZStack, NOT bare `routedContent`: the `.task`s below must hang on a
+        // stable node. `routedContent` is a @ViewBuilder conditional, and a
+        // branch flip fires disappear/appear on it — cancelling and
+        // restarting every `.task` in this chain. Two of those tasks write
+        // the very state routedContent branches on (isCheckingConsent,
+        // isStartupComplete), the same self-cancellation footgun that caused
+        // the Account-page infinite spinner (see ADR-IOS-054 amendment /
+        // PROJECT_MEMORY stuck-isLoading rule).
+        ZStack {
+            routedContent
+        }
         // Demo with AI enabled is treated as having a TabMail session so
         // chat / inline-edit surfaces don't render "Sign in to TabMail" locks.
         // Demo without AI keeps the env false, which cooperates with the

@@ -11,20 +11,64 @@ struct AccountDashboardView: View {
     @State private var usageStats: UsageStats?
     @State private var isLoading = true
     @State private var errorMessage: String?
+    /// Remount-loop diagnostic: @State survives re-renders of the SAME view
+    /// identity but is re-seeded on a remount. If the `[Dashboard]` log storm
+    /// shows a NEW id per iteration, the whole view is being torn down and
+    /// recreated by something above; if the SAME id repeats, the `.task` is
+    /// restarting on a stable identity.
+    @State private var instanceId = String(UUID().uuidString.prefix(6))
+    /// Dedup guard for the unstructured initial load (see `.task` comment).
+    @State private var loadInFlight = false
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
 
     private let backend = BackendClient()
 
     var body: some View {
-        content
+        // `.task`/`.onAppear` MUST hang on a STABLE node, never directly on
+        // `content`: `content` is a @ViewBuilder conditional, and every
+        // isLoading/errorMessage branch flip fires disappear/appear on it —
+        // cancelling and restarting the plain `.task`. loadData's own state
+        // writes flip the branch (isLoading=true on entry, errorMessage on
+        // exit), so the task cancelled ITSELF in a self-sustaining ~100Hz
+        // storm (on-device 2026-07-08, [Dashboard] id=A9755F log). The ZStack
+        // stays in the hierarchy across branch changes, so the load task
+        // survives its own spinner/error/content transitions.
+        ZStack {
+            content
+        }
             .background(Palette.previewPaneBg)
             .navigationTitle("TabMail Account")
             .navigationBarTitleDisplayMode(.inline)
-            .task { await loadData() }
+            .task {
+                // The collapsed-split-view navigation transition fires ONE
+                // spurious disappear on the freshly-appeared page (on-device
+                // 2026-07-08: onAppear → onDisappear with the view still
+                // visible, selection passing inbox → nil → account), which
+                // cancels a structured `.task` mid-fetch with no re-appear to
+                // restart it. Run the load UNSTRUCTURED so the transition
+                // can't kill it (same pattern as user-intent actions);
+                // `loadInFlight` dedups genuine re-appears.
+                guard !loadInFlight else { return }
+                loadInFlight = true
+                Task { @MainActor in
+                    defer { loadInFlight = false }
+                    await loadData()
+                }
+            }
             .onChange(of: scenePhase) { _, newPhase in
                 if newPhase == .active {
                     Task { await refreshData() }
+                }
+            }
+            .onAppear {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Dashboard] onAppear id=\(instanceId)")
+                }
+            }
+            .onDisappear {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Dashboard] onDisappear id=\(instanceId)")
                 }
             }
     }
@@ -349,12 +393,27 @@ struct AccountDashboardView: View {
     // MARK: - Helpers
 
     private func loadData() async {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Dashboard] loadData START id=\(instanceId)")
+        }
         isLoading = true
         errorMessage = nil
-        await fetchAll()
-        if !Task.isCancelled {
+        // Clear the spinner unconditionally (same defer pattern as
+        // InboxViewModel.performSync's isRefreshing): a `.task` cancelled by
+        // navigation churn used to strand isLoading=true forever with no
+        // Retry button — the cancellation catches in fetchAll() are the only
+        // silent exit paths in this file. If the cancelled load produced no
+        // data, surface Retry instead of an empty dashboard.
+        defer {
             isLoading = false
+            if Task.isCancelled && accountInfo == nil && errorMessage == nil {
+                errorMessage = "Loading was interrupted."
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Dashboard] loadData exit id=\(instanceId) cancelled=\(Task.isCancelled) hasInfo=\(accountInfo != nil) hasStats=\(usageStats != nil) error=\(errorMessage ?? "nil")")
+            }
         }
+        await fetchAll()
     }
 
     /// Pull-to-refresh: fetches fresh data without showing full-screen spinner.
@@ -377,8 +436,14 @@ struct AccountDashboardView: View {
             // the dashboard.
             UsageThrottleStore.shared.update(from: info)
         } catch is CancellationError {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Dashboard] fetchAccountInfo CANCELLED (CancellationError)")
+            }
             return
         } catch let urlError as URLError where urlError.code == .cancelled {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Dashboard] fetchAccountInfo CANCELLED (URLError.cancelled)")
+            }
             return
         } catch BackendError.accountGone {
             print("[Dashboard] Account no longer exists — showing account gone alert")
@@ -411,8 +476,14 @@ struct AccountDashboardView: View {
         do {
             usageStats = try await backend.fetchUsageStats()
         } catch is CancellationError {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Dashboard] fetchUsageStats CANCELLED (CancellationError)")
+            }
             return
         } catch let urlError as URLError where urlError.code == .cancelled {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Dashboard] fetchUsageStats CANCELLED (URLError.cancelled)")
+            }
             return
         } catch {
             print("[Dashboard] fetchUsageStats failed: \(error)")

@@ -104,6 +104,15 @@ struct MailNavigationView: View {
     /// Popping the pushed view (back button / swipe-back) writes `nil` into
     /// this binding automatically — no manual reset needed.
     @State private var pushedMessageId: String?
+    /// Same ADR-IOS-054 pattern for the PROGRAMMATIC "TabMail Account" open
+    /// (chat WarningBubble's "Active subscription required" button →
+    /// `.navigateToAccount`). The old handler wrote `selection = .account`
+    /// directly into the sidebar `List(selection:)` binding, which SwiftUI
+    /// can reconcile away during a concurrent re-render (e.g. the chat-
+    /// collapse spring) — cancelling AccountDashboardView's `.task` mid-
+    /// fetch and stranding its full-screen spinner. A real push cannot be
+    /// revoked by the List. Popping writes `false` back automatically.
+    @State private var pushedShowsAccount = false
     /// One-shot guard for `onChange(of: selection)` to suppress the default
     /// "clear detail pane" behavior during programmatic notification-tap
     /// navigation. The handler sets selection + selectedMessageId together
@@ -440,6 +449,14 @@ struct MailNavigationView: View {
                 .navigationDestination(item: $pushedMessageId) { id in
                     PushedMessageDestination(messageId: id)
                 }
+                .navigationDestination(isPresented: $pushedShowsAccount) {
+                    // Mirrors SettingsContentColumn's `.account` case.
+                    if DemoModeStore.shared.isActive {
+                        DemoAccountDashboardView()
+                    } else {
+                        AccountDashboardView()
+                    }
+                }
         } detail: {
             // Extracted into a separate struct so NavigationStore refreshes in
             // MailNavigationView don't cascade into the detail pane.
@@ -448,7 +465,7 @@ struct MailNavigationView: View {
             MessageDetailContainer(selectedMessageId: selectedMessageId)
         }
         .background(Palette.previewPaneBg)
-        .onChange(of: selection) { _, _ in
+        .onChange(of: selection) { oldValue, newValue in
             // Clear the detail pane when the user navigates between folders
             // / mailboxes. EXCEPT: when a notification-tap handler programm-
             // atically sets `selection = .unified(.inbox)` alongside a
@@ -457,13 +474,16 @@ struct MailNavigationView: View {
             // by the handler right before the selection change and lowered
             // right after — gives us a tight window of "this selection
             // change is mine, leave it alone."
+            if DebugModeManager.isLoggingEnabled() {
+                print("[NavAccount] selection changed \(String(describing: oldValue)) → \(String(describing: newValue))")
+            }
             if isHandlingNotificationDeepLink {
                 isHandlingNotificationDeepLink = false
             } else {
                 selectedMessageId = nil
             }
         }
-        .modifier(NavigationNotificationHandlers(selection: $selection))
+        .modifier(NavigationNotificationHandlers(selection: $selection, pushedShowsAccount: $pushedShowsAccount))
         .sheet(isPresented: $showSignInSheet) {
             TabMailLoginView {
                 showSignInSheet = false
@@ -767,6 +787,7 @@ struct MailNavigationView: View {
 /// the already-large body modifier chain past the Swift type-checker's limit.
 private struct NavigationNotificationHandlers: ViewModifier {
     @Binding var selection: MailboxSelection?
+    @Binding var pushedShowsAccount: Bool
 
     func body(content: Content) -> some View {
         content
@@ -774,7 +795,15 @@ private struct NavigationNotificationHandlers: ViewModifier {
                 selection = .settings
             }
             .onReceive(NotificationCenter.default.publisher(for: .navigateToAccount).receive(on: DispatchQueue.main)) { _ in
-                selection = .account
+                // ADR-IOS-054: a real push, not a `selection = .account` write —
+                // the List(selection:) binding can reconcile a programmatic
+                // selection away mid re-render, cancelling the dashboard's
+                // `.task`. Skip the push when the sidebar already shows Account.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[NavAccount] navigateToAccount → push (selection=\(String(describing: selection)) alreadyPushed=\(pushedShowsAccount))")
+                }
+                guard selection != .account else { return }
+                pushedShowsAccount = true
             }
             .onReceive(NotificationCenter.default.publisher(for: .navigateToPlanPicker).receive(on: DispatchQueue.main)) { _ in
                 selection = .planPicker

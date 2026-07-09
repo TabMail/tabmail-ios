@@ -478,7 +478,7 @@ struct InboxView: View {
             pushedMessageId = realId
             print("[DynamicIslandChat] Email pill Open Email: navigating to \(realId.prefix(30))")
         }
-        .modifier(TemplatePillCollapseChatModifier(chatExpanded: $chatExpanded))
+        .modifier(CollapseChatOnNavigateModifier(chatExpanded: $chatExpanded))
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
             // When MessageDetailView is pushed (selectedMessageId != nil), let
             // its listener handle the compose so we don't present two covers.
@@ -1685,16 +1685,21 @@ private struct MessageRowBackgroundModifier: ViewModifier {
     }
 }
 
-/// Collapses the chat pill when a template chip's "Open Template" is tapped.
-/// Extracted as a ViewModifier to keep `InboxView.body`'s modifier chain
-/// inside Swift's type-check budget — adding another `.onReceive` inline
-/// pushed it over the edge.
-private struct TemplatePillCollapseChatModifier: ViewModifier {
+/// Collapses the chat pill when navigation is about to replace/cover this view:
+/// a template chip's "Open Template" tap, or the WarningBubble's "TabMail
+/// Account" tap (`.navigateToAccount` → a REAL push in MailNavigationView,
+/// ADR-IOS-054 pattern — the push survives this concurrent collapse animation;
+/// the old `selection = .account` write did not). Extracted as a ViewModifier
+/// (and kept to a SINGLE `.modifier()` entry) to keep `InboxView.body`'s
+/// modifier chain inside Swift's type-check budget — even one more inline
+/// `.onReceive` or `.modifier` pushed it over the edge.
+private struct CollapseChatOnNavigateModifier: ViewModifier {
     @Binding var chatExpanded: Bool
 
     func body(content: Content) -> some View {
         content.onReceive(
             NotificationCenter.default.publisher(for: .templatePillOpenTapped)
+                .merge(with: NotificationCenter.default.publisher(for: .navigateToAccount))
                 .receive(on: DispatchQueue.main)
         ) { _ in
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
