@@ -3,9 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import os
-
-private let log = OSLog(subsystem: "ai.tabmail.nse", category: "outlook")
 
 /// Thin NSE-side wrapper over `Shared/API/GraphAPI`. No HTTP, no parsing,
 /// no token refresh, no body extraction — all lifted to the shared layer.
@@ -42,9 +39,7 @@ enum OutlookNSEClient {
             // Fail the fetch so the NSE delivers a passive notification and
             // the main-app sync materializes the header with the correct path.
             guard let folderPath = meta.folderPath, !folderPath.isEmpty else {
-                os_log(.error, log: log,
-                       "NSE fetchSingleMessage: Graph response missing parentFolderId for %{public}@ — refusing to stage with placeholder folderPath",
-                       messageId)
+                NSELog.step("NSE fetchSingleMessage: Graph response missing parentFolderId for \(messageId) — refusing to stage with placeholder folderPath")
                 return nil
             }
             // Graph has no raw-header concept — it returns typed recipient
@@ -82,8 +77,7 @@ enum OutlookNSEClient {
                 folderPath: folderPath
             )
         } catch {
-            os_log(.error, log: log, "NSE fetchSingleMessage failed for %{public}@: %{public}@",
-                   messageId, String(describing: error))
+            NSELog.step("NSE fetchSingleMessage failed for \(messageId): \(String(describing: error))")
             return nil
         }
     }
@@ -125,8 +119,7 @@ enum OutlookNSEClient {
             )
             return rendered
         } catch {
-            os_log(.error, log: log, "NSE fetchRenderedBody failed for %{public}@: %{public}@",
-                   messageId, String(describing: error))
+            NSELog.step("NSE fetchRenderedBody failed for \(messageId): \(String(describing: error))")
             return nil
         }
     }

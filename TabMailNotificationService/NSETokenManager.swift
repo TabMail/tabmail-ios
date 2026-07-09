@@ -3,9 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import os
-
-private let log = OSLog(subsystem: "ai.tabmail.nse", category: "token")
 
 /// Manages Supabase session tokens for the NSE.
 /// Reads the full TabMailSession JSON from shared keychain, extracts the access token,
@@ -38,7 +35,7 @@ enum NSETokenManager {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let accessToken = json["access_token"] as? String,
               let expiresAt = json["expires_at"] as? Int else {
-            os_log(.error, log: log, "NSE token: no session in keychain")
+            NSELog.step("NSE token: no session in keychain")
             return nil
         }
 
@@ -50,11 +47,11 @@ enum NSETokenManager {
 
         // Token expired — refresh it
         guard let refreshToken = json["refresh_token"] as? String else {
-            os_log(.error, log: log, "NSE token: no refresh_token in session")
+            NSELog.step("NSE token: no refresh_token in session")
             return nil
         }
 
-        os_log(.error, log: log, "NSE token: expired (expiresAt=%d now=%d), refreshing...", expiresAt, now)
+        NSELog.step("NSE token: expired (expiresAt=\(expiresAt) now=\(now)), refreshing...")
         return await performRefresh(refreshToken: refreshToken)
     }
 
@@ -72,14 +69,14 @@ enum NSETokenManager {
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
-            os_log(.error, log: log, "NSE token: refresh failed")
+            NSELog.step("NSE token: refresh failed")
             return nil
         }
 
         // Parse the new session
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let newAccessToken = json["access_token"] as? String else {
-            os_log(.error, log: log, "NSE token: failed to parse refresh response")
+            NSELog.step("NSE token: failed to parse refresh response")
             return nil
         }
 
@@ -87,7 +84,7 @@ enum NSETokenManager {
         if let sessionString = String(data: data, encoding: .utf8) {
             SharedKeychain.setSession(sessionString)
             let newExpiry = json["expires_at"] as? Int ?? 0
-            os_log(.error, log: log, "NSE token: refreshed OK, new expiresAt=%d", newExpiry)
+            NSELog.step("NSE token: refreshed OK, new expiresAt=\(newExpiry)")
         }
 
         return newAccessToken

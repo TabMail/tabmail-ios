@@ -15,6 +15,14 @@ extension Date {
         ISO8601Formatters.internetDateTime.string(from: self)
     }
 
+    /// Format as ISO 8601 with fractional seconds (ms precision), UTC:
+    /// `2024-03-15T14:03:07.123Z`. Used by `NSELog`'s file-channel timestamps,
+    /// where sub-second precision distinguishes rapid-fire steps within the
+    /// same NSE run.
+    func iso8601StringWithMilliseconds() -> String {
+        ISO8601Formatters.withFractional.string(from: self)
+    }
+
     /// Format as ISO 8601 in a specific time zone (e.g. ICS/Exchange calendar
     /// output where the event carries a TZID). Allocates per call because
     /// `timeZone` is stateful on `ISO8601DateFormatter`.

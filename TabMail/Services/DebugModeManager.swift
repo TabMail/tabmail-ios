@@ -41,6 +41,11 @@ final class DebugModeManager {
                 // Reset dev servers to production when locking debug mode
                 BackendConfig.useDevServers = false
             }
+            // Push the NSE file-log gate immediately — don't wait for the next
+            // `mirrorAllState()` pass (app launch) to reflect a mid-session
+            // toggle. `isLoggingEnabled()` re-derives from the fresh UserDefaults
+            // write above, so this reflects the new state, not the old one.
+            NSEDataBridge.mirrorDebugLogging()
         }
     }
 

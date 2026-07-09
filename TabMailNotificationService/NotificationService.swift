@@ -5,9 +5,6 @@
 import UserNotifications
 import GRDB
 import Synchronization
-import os
-
-private let log = OSLog(subsystem: "ai.tabmail.nse", category: "debug")
 
 /// Thread-safe one-shot flag for content handler race prevention.
 final class OneShotFlag: @unchecked Sendable {
@@ -61,6 +58,29 @@ final class LeaseHolder: @unchecked Sendable {
     }
 }
 
+/// Reference-typed holder carrying the BEST-KNOWN partial result from the
+/// static `process(...)` back to the instance, so the graceful-exit watchdog
+/// and `serviceExtensionTimeWillExpire` can deliver a real summary instead of
+/// the bare "New Email" fallback when they fire mid-processing.
+///
+/// Two writes happen as `process(...)` progresses: `set(...)` right after
+/// step 4 (message metadata known — sender/subject only, summary fields nil),
+/// then again after step 6a's summary parse (summary/reminder fields filled
+/// in; `actionTag` stays nil — the action vote hasn't returned yet). Either
+/// snapshot is strictly better than the payload default. `accountId` /
+/// `messageId` ride along so the exit paths can call
+/// `EmailNotificationBuilder.fill` without threading extra state through the
+/// watchdog closure.
+final class PartialSignalHolder: @unchecked Sendable {
+    private let slot = Mutex<(signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String)?>(nil)
+    func set(_ signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String) {
+        slot.withLock { $0 = (signal, accountId, messageId) }
+    }
+    func get() -> (signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String)? {
+        slot.withLock { $0 }
+    }
+}
+
 final class NotificationService: UNNotificationServiceExtension {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
@@ -79,6 +99,10 @@ final class NotificationService: UNNotificationServiceExtension {
     private let watchdogHolder = CancellableTaskHolder()
     /// Carries the claimed AI-lease identity so every exit path can release it.
     private let leaseHolder = LeaseHolder()
+    /// Carries the best-known partial result (header-only, then +summary) so
+    /// the watchdog / `serviceExtensionTimeWillExpire` can deliver a real
+    /// summary instead of the bare fallback when they fire mid-processing.
+    private let partialHolder = PartialSignalHolder()
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -88,12 +112,12 @@ final class NotificationService: UNNotificationServiceExtension {
         bestAttemptContent = request.content.mutableCopy() as? UNMutableNotificationContent
 
         guard let content = bestAttemptContent else {
-            os_log(.error, log: log, "NSE didReceive: no mutable content, passing through")
+            NSELog.step("NSE didReceive: no mutable content, passing through")
             contentHandler(request.content)
             return
         }
 
-        os_log(.error, log: log, "NSE ━━━ STARTED ━━━ id=%{public}@", request.identifier)
+        NSELog.step("NSE ━━━ STARTED ━━━ id=\(request.identifier)")
 
         // Opportunistic delivered-notification cleanup. Detached so it never
         // blocks the 30s NSE budget.
@@ -138,6 +162,7 @@ final class NotificationService: UNNotificationServiceExtension {
         let heartbeatHolder = self.heartbeatHolder
         let watchdogHolder = self.watchdogHolder
         let leaseHolder = self.leaseHolder
+        let partialHolder = self.partialHolder
         nonisolated(unsafe) let deliver = contentHandler
         nonisolated(unsafe) let c = content
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -147,16 +172,14 @@ final class NotificationService: UNNotificationServiceExtension {
         // are no-ops. Factored out so the watchdog can deliver too.
         let deliverOnce: @Sendable (UNNotificationContent) -> Void = { notification in
             guard deliverGuard.tryFire() else {
-                os_log(.error, log: log, "NSE deliver: already fired (race)")
+                NSELog.step("NSE deliver: already fired (race)")
                 return
             }
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if let n = notification as? UNMutableNotificationContent {
-                os_log(.error, log: log, "NSE ━━━ DELIVERED (%dms) ━━━ title=%{public}@ level=%d sound=%{public}@",
-                       ms, n.title, n.interruptionLevel.rawValue,
-                       n.sound == nil ? "nil" : "SET")
+                NSELog.step("NSE ━━━ DELIVERED (\(ms)ms) ━━━ title=\(n.title) level=\(n.interruptionLevel.rawValue) sound=\(n.sound == nil ? "nil" : "SET")")
             } else {
-                os_log(.error, log: log, "NSE ━━━ DELIVERED (%dms) ━━━ (immutable)", ms)
+                NSELog.step("NSE ━━━ DELIVERED (\(ms)ms) ━━━ (immutable)")
             }
             deliver(notification)
         }
@@ -167,6 +190,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 heartbeatHolder: heartbeatHolder,
                 watchdogHolder: watchdogHolder,
                 leaseHolder: leaseHolder,
+                partialHolder: partialHolder,
                 deliver: deliverOnce)
         }
 
@@ -181,18 +205,17 @@ final class NotificationService: UNNotificationServiceExtension {
         watchdogHolder.set(Task { @Sendable in
             try? await Task.sleep(nanoseconds: UInt64(NSEConfig.watchdogSeconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            os_log(.error, log: log, "NSE ⏱️ WATCHDOG (%ds) — graceful exit: release lease + deliver", watchdogSecs)
+            NSELog.step("NSE ⏱️ WATCHDOG (\(watchdogSecs)s) — graceful exit: release lease + deliver")
             heartbeatHolder.cancelAndClear()
             let released = leaseHolder.releaseIfHeld()
-            os_log(.error, log: log, "NSE watchdog: lease %{public}@", released ? "RELEASED" : "(not held)")
-            if c.title.isEmpty { c.title = "New Email"; c.body = "You have a new message" }
-            c.interruptionLevel = .passive; c.sound = nil
+            NSELog.step("NSE watchdog: lease \(released ? "RELEASED" : "(not held)")")
+            NotificationService.applyPartialOrBareFallback(c: c, partialHolder: partialHolder, source: "watchdog")
             deliverOnce(c)
         })
     }
 
     override func serviceExtensionTimeWillExpire() {
-        os_log(.error, log: log, "NSE ⏰ TIMEOUT")
+        NSELog.step("NSE ⏰ TIMEOUT")
         // iOS-fired backstop at the suspension edge. In the common case the
         // watchdog (NSEConfig.watchdogSeconds, ~3s earlier) already released the
         // lease + delivered, so the calls below are idempotent no-ops and we do
@@ -203,13 +226,41 @@ final class NotificationService: UNNotificationServiceExtension {
         watchdogHolder.cancelAndClear()
         heartbeatHolder.cancelAndClear()
         let released = leaseHolder.releaseIfHeld()
-        if released { os_log(.error, log: log, "NSE timeout: lease RELEASED (watchdog hadn't run)") }
+        if released { NSELog.step("NSE timeout: lease RELEASED (watchdog hadn't run)") }
         guard let contentHandler, let content = bestAttemptContent else { return }
         guard delivered.tryFire() else { return }
-        if content.title.isEmpty { content.title = "New Email"; content.body = "You have a new message" }
-        content.interruptionLevel = .passive; content.sound = nil
-        os_log(.error, log: log, "NSE timeout delivering: title=%{public}@ level=%d", content.title, content.interruptionLevel.rawValue)
+        NotificationService.applyPartialOrBareFallback(c: content, partialHolder: partialHolder, source: "timeout")
+        NSELog.step("NSE timeout delivering: title=\(content.title) level=\(content.interruptionLevel.rawValue)")
         contentHandler(content)
+    }
+
+    // MARK: - Partial-Result Fallback (watchdog / serviceExtensionTimeWillExpire)
+
+    /// Apply the best-known result to `c` for a graceful-exit delivery: the
+    /// `partialHolder`'s snapshot (header, or header+summary) if `process(...)`
+    /// got far enough to set one, otherwise today's bare "New Email" fallback.
+    /// Either way, forces `.passive`/no sound — the action vote never
+    /// returned at this point, so we must never ring or show an active
+    /// reply-style banner for a guess. Shared by both exit paths so the
+    /// partial-vs-bare branching lives in one place.
+    private static func applyPartialOrBareFallback(
+        c: UNMutableNotificationContent,
+        partialHolder: PartialSignalHolder,
+        source: String
+    ) {
+        if let partial = partialHolder.get() {
+            NSELog.step("NSE \(source): delivering PARTIAL (summary=\(partial.signal.summaryBlurb != nil ? "yes" : "no"))")
+            EmailNotificationBuilder.fill(c, signal: partial.signal, accountId: partial.accountId, messageId: partial.messageId)
+            // The action vote is unknown at this point — force passive/no
+            // sound regardless of what `fill` decided (it only goes active
+            // for actionTag == "reply", which is always nil in a partial
+            // signal, but this stays correct even if that rule changes).
+            c.interruptionLevel = .passive; c.sound = nil
+        } else {
+            NSELog.step("NSE \(source): delivering BARE fallback (stuck before step 4)")
+            if c.title.isEmpty { c.title = "New Email"; c.body = "You have a new message" }
+            c.interruptionLevel = .passive; c.sound = nil
+        }
     }
 
     // MARK: - Main Processing
@@ -222,11 +273,12 @@ final class NotificationService: UNNotificationServiceExtension {
         heartbeatHolder: CancellableTaskHolder,
         watchdogHolder: CancellableTaskHolder,
         leaseHolder: LeaseHolder,
+        partialHolder: PartialSignalHolder,
         deliver: @escaping (UNNotificationContent) -> Void
     ) async {
         let provider = info["provider"] ?? ""
         let accountEmail = info["accountEmail"] ?? ""
-        os_log(.error, log: log, "NSE process: provider=%{public}@ email=%{public}@ fanOut=%d", provider, accountEmail, fanOutIds.count)
+        NSELog.step("NSE process: provider=\(provider) email=\(accountEmail) fanOut=\(fanOutIds.count)")
 
         // Graceful-exit cleanup on EVERY return path. Order matters: cancel the
         // watchdog (we finished before it fired, so it must not deliver a late
@@ -246,7 +298,7 @@ final class NotificationService: UNNotificationServiceExtension {
 
         // ── Route by type ──
         if provider == "task_alarm" {
-            os_log(.error, log: log, "NSE route: task_alarm")
+            NSELog.step("NSE route: task_alarm")
             await handleTaskAlarm(c: c, info: info, db: db)
             // Task result lands in NSE staging DB — main app will merge it on
             // its next natural wake (foreground, BGAppRefresh, BGProcessingTask)
@@ -261,7 +313,7 @@ final class NotificationService: UNNotificationServiceExtension {
             // re-subscribe (previous 4 attempts failed; path to recovery
             // is a foreground subscribeAllAccounts() in the main app).
             let isFinal = (info["final"] ?? "") == "true"
-            os_log(.error, log: log, "NSE route: imap_reconnect final=%{public}@", isFinal ? "true" : "false")
+            NSELog.step("NSE route: imap_reconnect final=\(isFinal ? "true" : "false")")
             if isFinal {
                 deliverPassive(c: c, deliver: deliver); return
             }
@@ -271,7 +323,7 @@ final class NotificationService: UNNotificationServiceExtension {
 
         // ── Step 1: Account lookup + (OAuth-only) token ──
         guard let accountId = NSEState.findAccountId(for: accountEmail) else {
-            os_log(.error, log: log, "NSE FAIL: no accountId for %{public}@", accountEmail)
+            NSELog.step("NSE FAIL: no accountId for \(accountEmail)")
             deliverPassive(
                 c: c,
                 overrideTitle: "Connection to \(accountEmail) lost",
@@ -293,7 +345,7 @@ final class NotificationService: UNNotificationServiceExtension {
             refreshToken = nil
         } else {
             guard let token = SharedKeychain.getAccessToken(for: accountId) else {
-                os_log(.error, log: log, "NSE FAIL: no token for %{public}@", accountId)
+                NSELog.step("NSE FAIL: no token for \(accountId)")
                 deliverPassive(
                     c: c,
                     overrideTitle: "Connection to \(accountEmail) lost",
@@ -305,7 +357,7 @@ final class NotificationService: UNNotificationServiceExtension {
             accessToken = token
             refreshToken = SharedKeychain.getRefreshToken(for: accountId)
         }
-        os_log(.error, log: log, "NSE step1 OK: accountId=%{public}@ provider=%{public}@", String(accountId.prefix(20)), provider)
+        NSELog.step("NSE step1 OK: accountId=\(String(accountId.prefix(20))) provider=\(provider)")
 
         // ── Step 2: Resolve message IDs ──
         let payloadMessageId = info["messageId"] ?? ""
@@ -313,14 +365,14 @@ final class NotificationService: UNNotificationServiceExtension {
         if !payloadMessageId.isEmpty {
             // Worker already classified + enumerated. Trust the payload.
             messageIds = [payloadMessageId]
-            os_log(.error, log: log, "NSE step2: payload messageId=%{public}@ — skipping history.list", payloadMessageId)
+            NSELog.step("NSE step2: payload messageId=\(payloadMessageId) — skipping history.list")
         } else if !fanOutIds.isEmpty {
             messageIds = fanOutIds
-            os_log(.error, log: log, "NSE step2: fan-out %d IDs", fanOutIds.count)
+            NSELog.step("NSE step2: fan-out \(fanOutIds.count) IDs")
         } else {
             let historyId = info["historyId"]
             let lastHid = NSEState.getLastHistoryId(for: accountId)
-            os_log(.error, log: log, "NSE step2: historyId=%{public}@ lastHid=%{public}@", historyId ?? "NIL", lastHid ?? "NIL")
+            NSELog.step("NSE step2: historyId=\(historyId ?? "NIL") lastHid=\(lastHid ?? "NIL")")
 
             switch provider {
             case "gmail":
@@ -335,13 +387,13 @@ final class NotificationService: UNNotificationServiceExtension {
                 // Advance historyId to prevent re-processing same events
                 if let latestHid = historyResult.latestHistoryId {
                     NSEState.setLastHistoryId(latestHid, for: accountId)
-                    os_log(.error, log: log, "NSE step2: advanced historyId to %{public}@", latestHid)
+                    NSELog.step("NSE step2: advanced historyId to \(latestHid)")
                 }
 
                 // Persist inbox removals for main app to merge on wake
                 if !historyResult.removedMessageIds.isEmpty, let db {
                     NSEStagingDB.persistInboxRemovals(db: db, accountId: accountId, messageIds: historyResult.removedMessageIds)
-                    os_log(.error, log: log, "NSE step2: persisted %d inbox removal(s)", historyResult.removedMessageIds.count)
+                    NSELog.step("NSE step2: persisted \(historyResult.removedMessageIds.count) inbox removal(s)")
                 }
 
                 // Adjust badge for all unread changes discovered in history
@@ -350,13 +402,11 @@ final class NotificationService: UNNotificationServiceExtension {
                 if badgeDecrement > 0 { _ = NSEState.decrementBadgeCount(by: badgeDecrement) }
                 if badgeIncrement > 0 { for _ in 0..<badgeIncrement { _ = NSEState.incrementBadgeCount() } }
                 if badgeDecrement > 0 || badgeIncrement > 0 {
-                    os_log(.error, log: log, "NSE step2: badge adjust: -%d (removed=%d read=%d) +%d (unread=%d)",
-                           badgeDecrement, historyResult.unreadRemovedCount, historyResult.markedReadCount,
-                           badgeIncrement, historyResult.markedUnreadCount)
+                    NSELog.step("NSE step2: badge adjust: -\(badgeDecrement) (removed=\(historyResult.unreadRemovedCount) read=\(historyResult.markedReadCount)) +\(badgeIncrement) (unread=\(historyResult.markedUnreadCount))")
                 }
             case "imap_new_mail":
                 guard NSEState.isIMAPPushEnabled() else {
-                    os_log(.error, log: log, "NSE step2: IMAP disabled")
+                    NSELog.step("NSE step2: IMAP disabled")
                     deliverPassive(c: c, deliver: deliver); return
                 }
                 // IMAP pushes from the droplet always include the RFC 5322
@@ -365,18 +415,18 @@ final class NotificationService: UNNotificationServiceExtension {
                 // passive notification.
                 let imapMsgId = info["messageId"] ?? ""
                 guard !imapMsgId.isEmpty else {
-                    os_log(.error, log: log, "NSE step2: imap_new_mail push missing messageId")
+                    NSELog.step("NSE step2: imap_new_mail push missing messageId")
                     deliverPassive(c: c, deliver: deliver); return
                 }
                 messageIds = [imapMsgId]
             default:
                 messageIds = []
             }
-            os_log(.error, log: log, "NSE step2: got %d message(s)", messageIds.count)
+            NSELog.step("NSE step2: got \(messageIds.count) message(s)")
         }
 
         guard !messageIds.isEmpty else {
-            os_log(.error, log: log, "NSE step2: EMPTY — no new messages (removal-only or no change)")
+            NSELog.step("NSE step2: EMPTY — no new messages (removal-only or no change)")
             // Main-app sync picks up the inbox state on its next natural wake.
             deliverPassive(c: c, deliver: deliver); return
         }
@@ -390,14 +440,13 @@ final class NotificationService: UNNotificationServiceExtension {
         // /fan-out + a chained NSE; that machinery was removed.)
         let headId = messageIds[0]
         if messageIds.count > 1 {
-            os_log(.error, log: log, "NSE step3: HEAD=%{public}@ TAIL=%d (legacy payload — tail handled by main-app sync)",
-                   headId, messageIds.count - 1)
+            NSELog.step("NSE step3: HEAD=\(headId) TAIL=\(messageIds.count - 1) (legacy payload — tail handled by main-app sync)")
         } else {
-            os_log(.error, log: log, "NSE step3: HEAD=%{public}@", headId)
+            NSELog.step("NSE step3: HEAD=\(headId)")
         }
 
         // ── Step 4: Fetch message ──
-        os_log(.error, log: log, "NSE step4: fetching message %{public}@", headId)
+        NSELog.step("NSE step4: fetching message \(headId)")
         let msg: NSEMessageMetadata?
         // For IMAP, step 4 + step 5 share a single TCP round-trip: we
         // fetch metadata + full body from one logged-in connection and
@@ -418,10 +467,18 @@ final class NotificationService: UNNotificationServiceExtension {
         default: msg = nil
         }
         guard let msg else {
-            os_log(.error, log: log, "NSE step4: FAIL — message fetch failed")
+            NSELog.step("NSE step4: FAIL — message fetch failed")
             deliverPassive(c: c, deliver: deliver); return
         }
-        os_log(.error, log: log, "NSE step4 OK: from=%{public}@ subj=%{public}@", msg.senderName, String(msg.subject.prefix(40)))
+        NSELog.step("NSE step4 OK: from=\(msg.senderName) subj=\(String(msg.subject.prefix(40)))")
+
+        // Publish the header-only partial NOW — the watchdog / iOS expiration
+        // handler can deliver this (sender + subject, no summary yet) instead
+        // of the bare "New Email" fallback if they fire before step 6a.
+        partialHolder.set(
+            EmailNotificationBuilder.Signal(senderName: msg.senderName, senderEmail: msg.senderEmail, subject: msg.subject),
+            accountId: accountId, messageId: msg.messageId
+        )
 
         // ── GRADUAL STAGING stage 1: header ──
         // Write the header + populated=1 NOW so the main app's merge can SHOW the
@@ -432,11 +489,11 @@ final class NotificationService: UNNotificationServiceExtension {
             NSEStagingDB.stageHeader(
                 db: db, accountId: accountId, accountEmail: accountEmail,
                 provider: provider, message: msg, historyId: info["historyId"])
-            os_log(.error, log: log, "NSE stage1: header staged (populated)")
+            NSELog.step("NSE stage1: header staged (populated)")
         }
 
         // ── Step 5: Body (full render via shared BodyRenderer) ──
-        os_log(.error, log: log, "NSE step5: fetching body")
+        NSELog.step("NSE step5: fetching body")
         let rendered: RenderedBody?
         switch provider {
         case "gmail":
@@ -459,15 +516,14 @@ final class NotificationService: UNNotificationServiceExtension {
         default: rendered = nil
         }
         let body = rendered?.textContent
-        os_log(.error, log: log, "NSE step5: body=%d chars cidsUnresolved=%{public}@",
-               body?.count ?? 0, (rendered?.hasUnresolvedCIDs ?? false) ? "YES" : "NO")
+        NSELog.step("NSE step5: body=\(body?.count ?? 0) chars cidsUnresolved=\((rendered?.hasUnresolvedCIDs ?? false) ? "YES" : "NO")")
 
         // ── GRADUAL STAGING stage 2: body ──
         // Attach the rendered body to the already-staged header so the merge can
         // write MessageBody + FTS (and the main app's body queue won't re-fetch).
         if let db {
             NSEStagingDB.stageBody(db: db, accountId: accountId, messageId: msg.messageId, renderedBody: rendered)
-            os_log(.error, log: log, "NSE stage2: body staged")
+            NSELog.step("NSE stage2: body staged")
         }
 
         // ── Step 5.5: AI cache probe — check peers + staging DB before running AI ──
@@ -478,7 +534,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // AI cache under that.
         if let rfc = msg.rfc822MessageId,
            let peerHit = await NSEAICacheProbe.probe(accountId: accountId, folderId: msg.folderPath, rfc822MessageId: rfc) {
-            os_log(.error, log: log, "NSE step5.5: PEER cache HIT — skipping AI calls")
+            NSELog.step("NSE step5.5: PEER cache HIT — skipping AI calls")
             let active = EmailNotificationBuilder.fill(
                 c,
                 signal: EmailNotificationBuilder.Signal(
@@ -512,7 +568,7 @@ final class NotificationService: UNNotificationServiceExtension {
         }
         // Local staging DB check (handles NSE-to-NSE dedup)
         if let db, let cached = NSEStagingDB.getCachedResult(db: db, accountId: accountId, messageId: msg.messageId) {
-            os_log(.error, log: log, "NSE step5.5: STAGING cache HIT — skipping AI calls")
+            NSELog.step("NSE step5.5: STAGING cache HIT — skipping AI calls")
             // Unified layout — builder picks active (.reply + sound) when the
             // cached row carries a reply tag; otherwise passive with summary (or
             // empty body when AI was never completed for this cached entry).
@@ -561,10 +617,10 @@ final class NotificationService: UNNotificationServiceExtension {
             if let existing = AIOwnershipLease.state(db: db, accountId: accountId, messageId: msg.messageId),
                existing.owner == .mainApp,
                AIOwnershipLease.isFresh(heartbeatMs: existing.heartbeatMs) {
-                os_log(.error, log: log, "NSE step6: SKIP — main app holds fresh AI claim")
+                NSELog.step("NSE step6: SKIP — main app holds fresh AI claim")
             } else if AIOwnershipLease.tryClaim(db: db, accountId: accountId, messageId: msg.messageId, owner: .nse) {
                 didClaimAI = true
-                os_log(.error, log: log, "NSE step6: claimed AI ownership")
+                NSELog.step("NSE step6: claimed AI ownership")
                 // Register the claimed identity so EVERY exit path (natural defer,
                 // watchdog, iOS expiration) can release this lease — "lease all
                 // the time", so the main app never waits out a stale lease.
@@ -579,7 +635,7 @@ final class NotificationService: UNNotificationServiceExtension {
                     }
                 })
             } else {
-                os_log(.error, log: log, "NSE step6: SKIP — could not claim AI (contested by fresh owner)")
+                NSELog.step("NSE step6: SKIP — could not claim AI (contested by fresh owner)")
             }
         }
 
@@ -620,8 +676,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 toField: msg.to, ccField: msg.cc, fromField: msg.senderEmail,
                 claimEmails: [accountEmail], suppressEmails: NSEState.getAllAccountEmails()
             )
-            os_log(.error, log: log, "NSE step6a: calling summary (recipient_status=%{public}@)",
-                   recipientStatus.isEmpty ? "omitted" : recipientStatus)
+            NSELog.step("NSE step6a: calling summary (recipient_status=\(recipientStatus.isEmpty ? "omitted" : recipientStatus))")
             let summaryVars = PromptVariables.summaryVariables(
                 metadata: sharedMetadata, body: sharedBody, account: account,
                 recipientStatus: recipientStatus
@@ -635,7 +690,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 summaryBlurb = parsed.blurb; summaryTodos = parsed.todos
                 reminderDate = parsed.reminderDate; reminderTime = parsed.reminderTime
                 reminderContent = parsed.reminderContent
-                os_log(.error, log: log, "NSE step6a OK: blurb=%{public}@", String((summaryBlurb ?? "nil").prefix(60)))
+                NSELog.step("NSE step6a OK: blurb=\(String((summaryBlurb ?? "nil").prefix(60)))")
                 // ── GRADUAL STAGING stage 3a: summary ──
                 // Surface the summary before the action vote returns, so a merge
                 // landing mid-vote shows it. aiCompleted stays 0 until step 7.
@@ -646,11 +701,22 @@ final class NotificationService: UNNotificationServiceExtension {
                         reminderDate: reminderDate, reminderTime: reminderTime,
                         reminderContent: reminderContent)
                 }
+                // Upgrade the partial to header+summary — actionTag stays nil,
+                // the vote hasn't returned yet. A watchdog/timeout firing from
+                // here on delivers the real summary instead of a bare banner.
+                partialHolder.set(
+                    EmailNotificationBuilder.Signal(
+                        senderName: msg.senderName, senderEmail: msg.senderEmail, subject: msg.subject,
+                        summaryBlurb: summaryBlurb, reminderContent: reminderContent,
+                        dueDate: reminderDate, dueTime: reminderTime
+                    ),
+                    accountId: accountId, messageId: msg.messageId
+                )
             } else {
-                os_log(.error, log: log, "NSE step6a FAIL: summary call failed")
+                NSELog.step("NSE step6a FAIL: summary call failed")
             }
 
-            os_log(.error, log: log, "NSE step6b: calling action")
+            NSELog.step("NSE step6b: calling action")
             let summaryCtx = SummaryContext(blurb: summaryBlurb, todos: summaryTodos)
             let actionVars = PromptVariables.actionVariables(
                 metadata: sharedMetadata, body: sharedBody,
@@ -661,11 +727,11 @@ final class NotificationService: UNNotificationServiceExtension {
                 variables: BackendNSEClient.Vars(actionVars),
                 authToken: authToken, timeout: NSEConfig.actionTimeoutSeconds
             )
-            os_log(.error, log: log, "NSE step6b: action=%{public}@", actionTag ?? "nil")
+            NSELog.step("NSE step6b: action=\(actionTag ?? "nil")")
         } else if aiDisabled {
-            os_log(.error, log: log, "NSE step6: SKIP — AI disabled (privacy opt-out)")
+            NSELog.step("NSE step6: SKIP — AI disabled (privacy opt-out)")
         } else if body == nil || body?.isEmpty == true {
-            os_log(.error, log: log, "NSE step6: SKIP (no body)")
+            NSELog.step("NSE step6: SKIP (no body)")
         }
 
         // AI ownership release + heartbeat stop now happen in the top-of-function
@@ -700,7 +766,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 reminderContent: reminderContent, historyId: info["historyId"],
                 aiCompleted: aiDone, notified: active
             )
-            os_log(.error, log: log, "NSE step7: persisted ai=%d notified=%d", aiDone ? 1 : 0, active ? 1 : 0)
+            NSELog.step("NSE step7: persisted ai=\(aiDone ? 1 : 0) notified=\(active ? 1 : 0)")
         }
 
         // ── Step 8: Build notification ──
@@ -719,8 +785,7 @@ final class NotificationService: UNNotificationServiceExtension {
             c, signal: signal,
             accountId: accountId, messageId: msg.messageId
         )
-        os_log(.error, log: log, "NSE step8: %{public}@, badge=%d",
-               active ? "ACTIVE (reply)" : "PASSIVE", newBadge)
+        NSELog.step("NSE step8: \(active ? "ACTIVE (reply)" : "PASSIVE"), badge=\(newBadge)")
         c.badge = NSNumber(value: newBadge)
 
         // NSE is terminal. Heavy post-notification work (reply
@@ -795,7 +860,7 @@ final class NotificationService: UNNotificationServiceExtension {
             // Leave the payload default ("Reconnecting...") — the push-
             // worker's retry ladder will eventually give up, and the
             // final give-up push carries the "Failed..." copy.
-            os_log(.error, log: log, "NSE imap_reconnect: no accountId for %{public}@", accountEmail)
+            NSELog.step("NSE imap_reconnect: no accountId for \(accountEmail)")
             deliverPassive(c: c, deliver: deliver)
             return
         }
@@ -806,7 +871,7 @@ final class NotificationService: UNNotificationServiceExtension {
 
         if success {
             let email = accountEmail.isEmpty ? "your account" : accountEmail
-            os_log(.error, log: log, "NSE imap_reconnect: silent re-subscribe OK")
+            NSELog.step("NSE imap_reconnect: silent re-subscribe OK")
             // Stamp PushHealthStore so any sibling imap_reconnect failure
             // notifications for this account get released by the next sweep.
             // Weaker proof than receiving a real push (the IDLE socket may
@@ -835,7 +900,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // payload default untouched — push-worker retry ladder takes
         // it from here. Next ladder tick fires another reconnect push
         // after 5/10/30/60 min; we don't spam iOS in the meantime.
-        os_log(.error, log: log, "NSE imap_reconnect: silent re-subscribe FAILED — leaving payload default")
+        NSELog.step("NSE imap_reconnect: silent re-subscribe FAILED — leaving payload default")
         deliverPassive(c: c, deliver: deliver)
     }
 
@@ -846,20 +911,20 @@ final class NotificationService: UNNotificationServiceExtension {
         accountId: String, accountEmail: String
     ) async -> Bool {
         guard let imap = NSEState.getIMAPAccount(for: accountId) else {
-            os_log(.error, log: log, "NSE resubscribe: no shared IMAP config")
+            NSELog.step("NSE resubscribe: no shared IMAP config")
             return false
         }
         guard let password = SharedKeychain.getPassword(for: accountId),
               !password.isEmpty else {
-            os_log(.error, log: log, "NSE resubscribe: no password in shared Keychain")
+            NSELog.step("NSE resubscribe: no password in shared Keychain")
             return false
         }
         guard let userId = NSETokenManager.supabaseUserId() else {
-            os_log(.error, log: log, "NSE resubscribe: no supabase userId")
+            NSELog.step("NSE resubscribe: no supabase userId")
             return false
         }
         guard let token = await NSETokenManager.validAccessToken() else {
-            os_log(.error, log: log, "NSE resubscribe: no valid JWT")
+            NSELog.step("NSE resubscribe: no valid JWT")
             return false
         }
 
@@ -874,13 +939,13 @@ final class NotificationService: UNNotificationServiceExtension {
         do {
             ciphertext = try IMAPCredCrypto.encrypt(payload)
         } catch {
-            os_log(.error, log: log, "NSE resubscribe: encrypt failed: %{public}@", String(describing: error))
+            NSELog.step("NSE resubscribe: encrypt failed: \(String(describing: error))")
             return false
         }
 
         let urlString = NSEState.getPushWorkerURL() + "/subscribe-imap"
         guard let url = URL(string: urlString) else {
-            os_log(.error, log: log, "NSE resubscribe: bad push worker URL")
+            NSELog.step("NSE resubscribe: bad push worker URL")
             return false
         }
         var request = URLRequest(url: url)
@@ -904,12 +969,12 @@ final class NotificationService: UNNotificationServiceExtension {
                 // truncated to 200 bytes — it's opaque JSON from the worker,
                 // never contains credentials.
                 let bodyPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
-                os_log(.error, log: log, "NSE resubscribe: HTTP %d body=%{public}@", code, bodyPreview)
+                NSELog.step("NSE resubscribe: HTTP \(code) body=\(bodyPreview)")
                 return false
             }
             return true
         } catch {
-            os_log(.error, log: log, "NSE resubscribe: HTTP failed: %{public}@", String(describing: error))
+            NSELog.step("NSE resubscribe: HTTP failed: \(String(describing: error))")
             return false
         }
     }
@@ -927,11 +992,11 @@ final class NotificationService: UNNotificationServiceExtension {
         imapBody: inout RenderedBody?
     ) async -> NSEMessageMetadata? {
         guard let imap = NSEState.getIMAPAccount(for: accountId) else {
-            os_log(.error, log: log, "NSE IMAP: no shared IMAP config for accountId")
+            NSELog.step("NSE IMAP: no shared IMAP config for accountId")
             return nil
         }
         guard let password = SharedKeychain.getPassword(for: accountId), !password.isEmpty else {
-            os_log(.error, log: log, "NSE IMAP: no password in shared Keychain for accountId")
+            NSELog.step("NSE IMAP: no password in shared Keychain for accountId")
             return nil
         }
         let result = await NSEIMAPConnection.fetch(
@@ -964,7 +1029,7 @@ final class NotificationService: UNNotificationServiceExtension {
         deliver: @escaping (UNNotificationContent) -> Void
     ) {
         applyPassiveSettings(c, overrideTitle: overrideTitle, overrideBody: overrideBody)
-        os_log(.error, log: log, "NSE deliverPassive: title=%{public}@", c.title)
+        NSELog.step("NSE deliverPassive: title=\(c.title)")
         deliver(c)
     }
 }

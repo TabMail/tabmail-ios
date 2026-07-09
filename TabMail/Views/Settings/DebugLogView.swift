@@ -173,6 +173,7 @@ struct DebugMenuView: View {
                 LogShareButton(title: "Inbox Logs", filename: "inbox_logs.txt", readLog: { BackgroundSyncLogger.readInboxLog() }, clearLog: { BackgroundSyncLogger.clearInboxLog() })
                 LogShareButton(title: "Body Render Logs", filename: "body_render_logs.txt", readLog: { BackgroundSyncLogger.readBodyRenderLog() }, clearLog: { BackgroundSyncLogger.clearBodyRenderLog() })
                 LogShareButton(title: "Boot Profile Logs", filename: "boot_logs.txt", readLog: { BackgroundSyncLogger.readBootLog() }, clearLog: { BackgroundSyncLogger.clearBootLog() })
+                LogShareButton(title: "NSE Logs", filename: "nse_logs.txt", readLog: { NSELogStore.read() }, clearLog: { NSELogStore.clear() })
 
                 Button(role: .destructive) {
                     BackgroundSyncLogger.clearLog()
@@ -189,6 +190,7 @@ struct DebugMenuView: View {
                     BackgroundSyncLogger.clearBodyRenderLog()
                     BackgroundSyncLogger.clearStuckDiagLog()
                     BackgroundSyncLogger.clearBootLog()
+                    NSELogStore.clear()
                 } label: {
                     Label("Clear All Logs", systemImage: "trash")
                 }

@@ -4,7 +4,6 @@
 
 import Foundation
 import SwiftMail
-import os
 
 /// One-shot IMAP fetcher used by the NSE on `imap_new_mail` pushes.
 ///
@@ -22,13 +21,11 @@ import os
 ///
 /// Safety notes:
 ///   • No credentials are ever logged. We redact email/username in the
-///     os_log output and never emit the password.
+///     log output and never emit the password.
 ///   • The connection is always closed (LOGOUT) in a `defer`, even on
 ///     throw. If LOGOUT fails (server unreachable), we just drop the
 ///     socket and let TCP reset — the memory is local and dies with
 ///     the NSE process anyway.
-private let log = OSLog(subsystem: "ai.tabmail.nse", category: "imap")
-
 enum NSEIMAPConnection {
 
     /// Fetch one message by its RFC 5322 Message-ID. Returns `nil` on any
@@ -57,7 +54,7 @@ enum NSEIMAPConnection {
         do {
             try await server.connect()
         } catch {
-            os_log(.error, log: log, "NSE IMAP connect failed: %{public}@", String(describing: error))
+            NSELog.step("NSE IMAP connect failed: \(String(describing: error))")
             return nil
         }
 
@@ -94,14 +91,14 @@ enum NSEIMAPConnection {
         do {
             try await server.login(username: username, password: password)
         } catch {
-            os_log(.error, log: log, "NSE IMAP login failed — auth rejected or server error: %{public}@", String(describing: error))
+            NSELog.step("NSE IMAP login failed — auth rejected or server error: \(String(describing: error))")
             return nil
         }
 
         do {
             _ = try await server.selectMailbox(folderPath)
         } catch {
-            os_log(.error, log: log, "NSE IMAP SELECT %{public}@ failed: %{public}@", folderPath, String(describing: error))
+            NSELog.step("NSE IMAP SELECT \(folderPath) failed: \(String(describing: error))")
             return nil
         }
 
@@ -113,7 +110,7 @@ enum NSEIMAPConnection {
         guard let uidSet = await searchMessageId(server: server, normalized: normalized),
               !uidSet.isEmpty,
               let uid = uidSet.toArray().first else {
-            os_log(.error, log: log, "NSE IMAP SEARCH returned no UIDs for message id")
+            NSELog.step("NSE IMAP SEARCH returned no UIDs for message id")
             return nil
         }
 
@@ -122,11 +119,11 @@ enum NSEIMAPConnection {
         do {
             info = try await server.fetchMessageInfo(for: uid)
         } catch {
-            os_log(.error, log: log, "NSE IMAP FETCH info failed: %{public}@", String(describing: error))
+            NSELog.step("NSE IMAP FETCH info failed: \(String(describing: error))")
             return nil
         }
         guard let info else {
-            os_log(.error, log: log, "NSE IMAP FETCH info returned nil")
+            NSELog.step("NSE IMAP FETCH info returned nil")
             return nil
         }
 
@@ -134,7 +131,7 @@ enum NSEIMAPConnection {
         do {
             message = try await server.fetchMessage(from: info)
         } catch {
-            os_log(.error, log: log, "NSE IMAP FETCH message failed: %{public}@", String(describing: error))
+            NSELog.step("NSE IMAP FETCH message failed: \(String(describing: error))")
             return nil
         }
 
@@ -146,7 +143,7 @@ enum NSEIMAPConnection {
         // attachment/inline-image/ICS/embedded-.eml handling is byte-
         // identical to `IMAPProvider.buildFullMessageInfo`.
         guard let meta = mapInfoToMetadata(info: info, message: message, folderPath: folderPath) else {
-            os_log(.error, log: log, "NSE IMAP: mapInfoToMetadata returned nil (parse failure)")
+            NSELog.step("NSE IMAP: mapInfoToMetadata returned nil (parse failure)")
             return nil
         }
 
@@ -175,7 +172,7 @@ enum NSEIMAPConnection {
             let bracketed: UIDSet = ext.asSet
             if !bracketed.isEmpty { return bracketed }
         } catch {
-            os_log(.error, log: log, "NSE IMAP SEARCH (bracketed) failed: %{public}@", String(describing: error))
+            NSELog.step("NSE IMAP SEARCH (bracketed) failed: \(String(describing: error))")
             // fall through to bare
         }
         do {
@@ -184,7 +181,7 @@ enum NSEIMAPConnection {
             )
             return ext.asSet
         } catch {
-            os_log(.error, log: log, "NSE IMAP SEARCH (bare) failed: %{public}@", String(describing: error))
+            NSELog.step("NSE IMAP SEARCH (bare) failed: \(String(describing: error))")
             return nil
         }
     }

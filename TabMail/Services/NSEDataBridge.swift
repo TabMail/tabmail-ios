@@ -322,6 +322,7 @@ enum NSEDataBridge {
         mirrorBackendConfig()
         mirrorDeviceToken()
         mirrorPushSettings()
+        mirrorDebugLogging()
     }
 
     /// Mirror account email→accountId mapping.
@@ -476,6 +477,17 @@ enum NSEDataBridge {
         if let token = UserDefaults.standard.string(forKey: "lastDeviceToken") {
             suite.set(token, forKey: "nse.deviceToken")
         }
+    }
+
+    /// Mirror the debug-logging gate flag so the NSE process — which has no
+    /// Keychain access for `DebugModeManager.isLoggingEnabled()`'s session
+    /// check — can see whether `NSELogStore` should write its persistent
+    /// file. Call on launch (`mirrorAllState`) and immediately from
+    /// `DebugModeManager` on unlock/lock, so toggling debug mode takes effect
+    /// without waiting for the next mirror pass.
+    static func mirrorDebugLogging() {
+        guard let suite else { return }
+        suite.set(DebugModeManager.isLoggingEnabled(), forKey: "nse.debugLoggingEnabled")
     }
 
     // MARK: - Merge (NSE Staging DB → Main GRDB)

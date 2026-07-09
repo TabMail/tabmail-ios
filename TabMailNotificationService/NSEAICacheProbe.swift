@@ -3,9 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import os
-
-private let log = OSLog(subsystem: "ai.tabmail.nse", category: "cache")
 
 /// Probes connected DeviceSync peers (TB addon, other iOS devices) for existing AI results
 /// via the sync server's REST endpoint. Avoids redundant LLM calls when another device
@@ -28,12 +25,12 @@ enum NSEAICacheProbe {
     ) async -> CacheHit? {
         // Respect user's Device Sync setting
         guard NSEState.isDeviceSyncEnabled() else {
-            os_log(.error, log: log, "NSE probe: Device Sync disabled — skipping")
+            NSELog.step("NSE probe: Device Sync disabled — skipping")
             return nil
         }
 
         guard let authToken = await NSETokenManager.validAccessToken() else {
-            os_log(.error, log: log, "NSE probe: no auth token — skipping")
+            NSELog.step("NSE probe: no auth token — skipping")
             return nil
         }
 
@@ -52,14 +49,14 @@ enum NSEAICacheProbe {
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
-            os_log(.error, log: log, "NSE probe: request failed or non-200")
+            NSELog.step("NSE probe: request failed or non-200")
             return nil
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let results = json["results"] as? [String: Any],
               let hit = results[key] as? [String: Any] else {
-            os_log(.error, log: log, "NSE probe: no hits")
+            NSELog.step("NSE probe: no hits")
             return nil
         }
 
@@ -69,7 +66,7 @@ enum NSEAICacheProbe {
         // Only consider it a real hit if we got meaningful data
         guard summaryBlurb != nil || actionTag != nil else { return nil }
 
-        os_log(.error, log: log, "NSE probe: HIT from peer — action=%{public}@", actionTag ?? "nil")
+        NSELog.step("NSE probe: HIT from peer — action=\(actionTag ?? "nil")")
         return CacheHit(
             summaryBlurb: summaryBlurb,
             summaryTodos: hit["summaryTodos"] as? String,

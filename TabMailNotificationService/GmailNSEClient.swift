@@ -3,9 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import os
-
-private let log = OSLog(subsystem: "ai.tabmail.nse", category: "gmail")
 
 /// Thin NSE-side wrapper over `Shared/API/GmailAPI`. No HTTP, no parsing,
 /// no token refresh, no body extraction — all lifted to the shared layer.
@@ -54,11 +51,11 @@ enum GmailNSEClient {
                 labelId: "INBOX"
             )
         } catch {
-            os_log(.error, log: log, "NSE history.list failed: %{public}@", String(describing: error))
+            NSELog.step("NSE history.list failed: \(String(describing: error))")
             return .empty
         }
         guard let delta else {
-            os_log(.error, log: log, "NSE history.list: 404 — historyId expired; main app will recover via full sync")
+            NSELog.step("NSE history.list: 404 — historyId expired; main app will recover via full sync")
             return .empty
         }
 
@@ -97,8 +94,7 @@ enum GmailNSEClient {
         let removedSet = Set(removedIds)
         let filteredAdded = addedIds.filter { !removedSet.contains($0) }
 
-        os_log(.error, log: log, "NSE history: +%d added -%d removed unreadRm=%d markRd=%d markUnrd=%d",
-               filteredAdded.count, removedIds.count, unreadRemovedCount, markedReadCount, markedUnreadCount)
+        NSELog.step("NSE history: +\(filteredAdded.count) added -\(removedIds.count) removed unreadRm=\(unreadRemovedCount) markRd=\(markedReadCount) markUnrd=\(markedUnreadCount)")
 
         return HistoryResult(
             addedMessageIds: filteredAdded,
@@ -166,8 +162,7 @@ enum GmailNSEClient {
                 folderPath: meta.folderPath ?? "INBOX"
             )
         } catch {
-            os_log(.error, log: log, "NSE fetchSingleMessage failed for %{public}@: %{public}@",
-                   messageId, String(describing: error))
+            NSELog.step("NSE fetchSingleMessage failed for \(messageId): \(String(describing: error))")
             return nil
         }
     }
@@ -210,8 +205,7 @@ enum GmailNSEClient {
             )
             return rendered
         } catch {
-            os_log(.error, log: log, "NSE fetchRenderedBody failed for %{public}@: %{public}@",
-                   messageId, String(describing: error))
+            NSELog.step("NSE fetchRenderedBody failed for \(messageId): \(String(describing: error))")
             return nil
         }
     }

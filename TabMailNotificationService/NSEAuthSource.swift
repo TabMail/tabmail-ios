@@ -93,7 +93,7 @@ struct NSEAuthSource: AuthSource {
             }
 
             guard let refreshToken = SharedKeychain.getRefreshToken(for: self.accountId) else {
-                os_log(.error, log: log, "NSEAuthSource: no refresh token for %{public}@", self.accountId)
+                NSELog.step("NSEAuthSource: no refresh token for \(self.accountId)")
                 throw AuthError.noRefreshToken
             }
 

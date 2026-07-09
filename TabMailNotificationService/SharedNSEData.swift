@@ -54,4 +54,12 @@ enum SharedNSEData {
     /// and NSE never sees the toggle. Same literal key as AIService.optOutAllAIKey
     /// so the two constants match.
     static let aiOptOutAllKey = "privacy_opt_out_all_ai"
+
+    /// Persistent NSE file-log gate. Mirrored by `NSEDataBridge.mirrorDebugLogging()`
+    /// (launch + immediately on unlock/lock) from `DebugModeManager.isLoggingEnabled()`.
+    /// Same literal key as `NSELogStore.debugLoggingEnabledKey` — `NSELogStore`
+    /// (Shared/) can't reference this NSE-target-only enum, so it re-declares
+    /// the literal; this alias exists for NSE-side call sites that prefer the
+    /// named constant.
+    static let debugLoggingEnabledKey = NSELogStore.debugLoggingEnabledKey
 }
