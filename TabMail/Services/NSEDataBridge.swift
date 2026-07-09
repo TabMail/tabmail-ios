@@ -540,6 +540,171 @@ enum NSEDataBridge {
         )
     }
 
+    // MARK: - Stage-memo skip (redundant re-merge elimination)
+    //
+    // Every merge TRIGGER — a push for a different message, syncStartup,
+    // foreground, a notif-tap gate — re-reads the FULL staged set, including
+    // rows deliberately KEPT (a GRADUAL row, `aiCompleted=0`, still being
+    // computed by the NSE). Without a way to tell "unchanged since we last
+    // durably wrote it" apart from "just arrived", every one of those triggers
+    // redid BOTH write phases for every kept row — even when nothing about it
+    // had changed (observed: 982 merge runs in one session; one message's body
+    // written 36 times; 80 no-op merges still each held the GRDB writer
+    // 20ms–4s, 16.5s total, during the most write-contended windows).
+    //
+    // The fix: a per-row content signature (`StageKey`) plus an in-process memo
+    // of the signature each staging row's content last reached AND had durably
+    // written (`stageMemo`). A row whose current signature matches the memo AND
+    // whose durable rows verify present is skipped entirely by `performMerge` —
+    // no GRDB write, no FTS work, no render signal. A row that advanced (new
+    // body / summary / action / notified flip / aiCompleted) or whose durable
+    // rows went missing (a sync stale-delete raced it) still gets the full,
+    // real write.
+
+    /// Per-row content signature of a staged message. Every phase-2 write this
+    /// merge performs when a stage independently ARRIVES must be represented
+    /// here — otherwise that arrival would be silently skipped by the memo.
+    /// Deliberately PRESENCE-only (not the raw values): the NSE stages each
+    /// field exactly once (`NSEStagingDB.stageHeader`/`stageBody`/`stageSummary`/
+    /// the terminal `persistProcessedMessage` never re-stage a CHANGED value for
+    /// the same row — see `StagedMessage`'s "keep in sync" contract below), so
+    /// "did this presence flip since we last wrote?" is equivalent to "did the
+    /// content change?".
+    struct StageKey: Hashable, Sendable {
+        /// `persistRenderedBodyFromStaging` fires whenever either is non-nil.
+        let hasBody: Bool
+        /// The value-guarded summary/reminder UPDATE fires whenever any of the
+        /// five summary/reminder fields is non-nil.
+        let hasSummary: Bool
+        /// The value-guarded action UPDATE (+ `tagSortOrder`, +
+        /// `queueSetTagPendingOp`) fires whenever `actionTag` is non-nil.
+        let hasAction: Bool
+        /// The `notified`-only UPDATE (the `else if msg.notified` branch) can
+        /// flip independently of `hasAction` — must be tracked separately or
+        /// that flip is silently skipped once the other fields are memo-stable.
+        let notified: Bool
+        /// Gates the `messageAICache` UPSERT independently of `hasSummary`/
+        /// `hasAction` — the NSE stages the summary BEFORE the terminal action
+        /// vote, so `hasSummary` can be true while `aiCompleted` is still false.
+        let aiCompleted: Bool
+    }
+
+    /// Compute a row's current `StageKey` from its staged content. Internal
+    /// (not `private`) so `TabMailTests` can compute the EXPECTED key directly
+    /// instead of re-deriving the write conditions by hand.
+    static func stageKey(for msg: StagedMessage) -> StageKey {
+        StageKey(
+            hasBody: msg.htmlContent != nil || msg.textContent != nil,
+            hasSummary: msg.summaryBlurb != nil || msg.summaryTodos != nil
+                || msg.reminderDate != nil || msg.reminderTime != nil || msg.reminderContent != nil,
+            hasAction: msg.actionTag != nil,
+            notified: msg.notified,
+            aiCompleted: msg.aiCompleted
+        )
+    }
+
+    /// In-process memo of the `StageKey` each staging row's content last
+    /// reached AND had durably written to main GRDB, keyed by the staging
+    /// row's stable identity (`StagedMessage.id`, i.e. `"accountId:messageId"`
+    /// — the same id `NSEStagingDB` uses for every stage write, so it's stable
+    /// for the row's entire staging lifetime). In-process only by design (no
+    /// App Group persistence): a relaunch just costs one redundant — but fully
+    /// idempotent — re-merge of whatever's still staged, the existing fallback
+    /// behavior for every other cache in this file (`lastMergedStagingSignature`,
+    /// `lastPostedStagedRows`, the staging-probe connection cache).
+    private static let stageMemo = Mutex<[String: StageKey]>([:])
+
+    /// Splits `processed` into rows whose staged content ADVANCED since the
+    /// last durable merge (`writeSet` — phase 1 + phase 2 run for these) and
+    /// rows that are memo-identical AND durability-VERIFIED (`skipSet` — their
+    /// write phases are skipped entirely). A memo HIT that fails verification
+    /// (its durable `messageHeader` — or, if it staged a body, `MessageBody` —
+    /// row is gone, e.g. a sync stale-delete raced it) is NOT trusted: it's
+    /// treated as advanced (re-merged for real) and its stale memo entry
+    /// dropped, so a deleted durable row self-heals instead of staying
+    /// invisible until staging drains. Load-bearing — see `verifyDurable`.
+    private static func partitionByStageMemo(
+        _ processed: [StagedMessage]
+    ) async -> (writeSet: [StagedMessage], skipSet: [StagedMessage]) {
+        guard !processed.isEmpty else { return ([], []) }
+        let memoSnapshot = stageMemo.withLock { $0 }
+        var writeSet: [StagedMessage] = []
+        var candidates: [StagedMessage] = []
+        for msg in processed {
+            if memoSnapshot[msg.id] == Self.stageKey(for: msg) {
+                candidates.append(msg)
+            } else {
+                writeSet.append(msg)
+            }
+        }
+        guard !candidates.isEmpty else { return (writeSet, []) }
+        let durableIds = await verifyDurable(candidates)
+        var skipSet: [StagedMessage] = []
+        for msg in candidates {
+            if durableIds.contains(msg.id) {
+                skipSet.append(msg)
+            } else {
+                _ = stageMemo.withLock { $0.removeValue(forKey: msg.id) }
+                writeSet.append(msg)
+            }
+        }
+        return (writeSet, skipSet)
+    }
+
+    /// Durability verification for stage-memo candidates: confirms the durable
+    /// GRDB rows the memo assumes still exist, so a skip can never mask a row
+    /// that vanished out from under it (e.g. a sync stale-delete). ONE
+    /// `rawPool.read` for the WHOLE candidate batch (not N round trips) — cheap
+    /// even for a large kept set. Same account-scoped lookup phase 1/phase 2
+    /// use (messageId, then rfc822 fallback for IMAP UID remaps). Uses
+    /// `AppDatabase.rawPool` (not `.dbPool`) deliberately: this runs from
+    /// inside the merge itself (`PriorityGate.privileged`), so going through
+    /// `PrioritizedDatabase.read` would re-enter the read-through-merge check
+    /// for no benefit (its recursion guard would no-op it anyway) — the raw
+    /// pool is the direct, minimal path. Returns the subset of `candidates`
+    /// (by `.id`) that verified durable.
+    private static func verifyDurable(_ candidates: [StagedMessage]) async -> Set<String> {
+        guard !candidates.isEmpty else { return [] }
+        return (try? await AppDatabase.rawPool.read { db -> Set<String> in
+            var durable: Set<String> = []
+            for msg in candidates {
+                var headerId = try String.fetchOne(db, sql: """
+                    SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?
+                    """, arguments: [msg.accountId, msg.messageId])
+                if headerId == nil, let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
+                    headerId = try String.fetchOne(db, sql: """
+                        SELECT id FROM messageHeader WHERE accountId = ? AND rfc822MessageId = ?
+                        """, arguments: [msg.accountId, rfc822])
+                }
+                guard let headerId else { continue }
+                if msg.htmlContent != nil || msg.textContent != nil {
+                    let hasBody = try Bool.fetchOne(db, sql: """
+                        SELECT EXISTS(SELECT 1 FROM messageBody WHERE id = ?)
+                        """, arguments: [headerId]) ?? false
+                    guard hasBody else { continue }
+                }
+                durable.insert(msg.id)
+            }
+            return durable
+        }) ?? []
+    }
+
+    /// Test-only seam: reset the process-global stage memo between tests so
+    /// state can't leak across cases. Internal (not `#if DEBUG`) — same
+    /// visibility as the other hoisted test seams in this file
+    /// (`insertNewHeaderFromStaging`, etc.), reachable from `TabMailTests` via
+    /// `@testable import`.
+    static func resetStageMemoForTesting() {
+        stageMemo.withLock { $0 = [:] }
+    }
+
+    /// Test-only seam: snapshot the current memo contents, so tests can assert
+    /// the skip/record/drop behavior directly instead of only inferring it
+    /// from render signals.
+    static func stageMemoSnapshotForTesting() -> [String: StageKey] {
+        stageMemo.withLock { $0 }
+    }
+
     /// The actual merge work. NEVER call directly — go through
     /// `mergeNSEStagingData` so the coordinator's serialization holds. (Only the
     /// coordinator calls this.)
@@ -694,6 +859,33 @@ enum NSEDataBridge {
 
         if !processed.isEmpty {
             // ============================================================
+            // STAGE-MEMO SKIP.
+            //
+            // A merge TRIGGER unrelated to any particular row (a push for a
+            // DIFFERENT message, syncStartup, foreground, a notif-tap gate —
+            // every caller funnels through the same coordinator) re-reads the
+            // SAME staged content for every KEPT gradual row on every wake.
+            // Without this, both write phases below re-ran for a row whose
+            // staged content hadn't advanced at all since the last time this
+            // exact content was durably written (observed: one message's body
+            // written 36×; 80 no-op merges still each held the GRDB writer
+            // 20ms–4s — 16.5s total — during the most write-contended
+            // windows). `writeSet` gets phase 1 + phase 2 below; `skipSet` is
+            // memo-identical AND durability-verified (its durable rows are
+            // confirmed still present) — its writes are skipped entirely. It
+            // still participates in everything that ISN'T a durable write:
+            // the `stagedRows`/`.messagesStaged`/snapshot-publish above ran
+            // over the FULL `processed` set before this partition, and the
+            // stale-protection refresh below also runs over the full set.
+            // See `partitionByStageMemo` / `StageKey` / `stageMemo`.
+            // ============================================================
+            let (writeSet, skipSet) = await Self.partitionByStageMemo(processed)
+            let writeSetById = Dictionary(uniqueKeysWithValues: writeSet.map { ($0.id, $0) })
+            if !skipSet.isEmpty {
+                BootProfiler.mark("merge: skipped \(skipSet.count) unchanged staged row(s) (stage-memo, durable-verified)")
+            }
+
+            // ============================================================
             // TWO-PHASE MERGE.
             //
             // Phase 1 (this block): surface each staged message's HEADER +
@@ -726,12 +918,17 @@ enum NSEDataBridge {
             let phase1WriteT0 = CFAbsoluteTimeGetCurrent()
             let phase1LoopStart = Mutex<Double>(0)
             let phase1BodyEnd = Mutex<Double>(0)
+            // STAGE-MEMO SKIP: only rows that advanced (or failed durability
+            // re-verification) reach the writer at all — a fully-skipped merge
+            // never opens `AppDatabase.dbPool.write` for phase 1, so it can't
+            // queue behind / hold the single GRDB writer for nothing.
+            if !writeSet.isEmpty {
             do {
                 phase1HeaderIds = try await AppDatabase.dbPool.write(label: "merge.phase1") { db -> [String] in
                     // Writer acquired — everything before here was queue + writer-lock wait.
                     phase1LoopStart.withLock { $0 = CFAbsoluteTimeGetCurrent() }
                     var localIds: [String] = []
-                    for msg in processed {
+                    for msg in writeSet {
                         // Per-message savepoint: a failure leaves THIS row in
                         // staging for retry (same contract as phase 2's loop) —
                         // siblings still commit.
@@ -814,7 +1011,7 @@ enum NSEDataBridge {
                         let acquireMs = Int((loopStart - phase1WriteT0) * 1000)
                         let loopMs = Int((bodyEnd - loopStart) * 1000)
                         let commitMs = Int((CFAbsoluteTimeGetCurrent() - bodyEnd) * 1000)
-                        BootProfiler.mark("merge.phase1 SPLIT: acquireWriter=\(acquireMs)ms loop(upserts)=\(loopMs)ms commit+fsync=\(commitMs)ms (\(processed.count) msg)")
+                        BootProfiler.mark("merge.phase1 SPLIT: acquireWriter=\(acquireMs)ms loop(upserts)=\(loopMs)ms commit+fsync=\(commitMs)ms (\(writeSet.count) msg)")
                     }
                 }
             } catch {
@@ -823,6 +1020,7 @@ enum NSEDataBridge {
                 // branch; staging is untouched so nothing is lost.
                 print("[NSEDataBridge] Merge phase 1 failed (outer tx): \(error)")
             }
+            } // if !writeSet.isEmpty (phase 1)
 
             // DIAGNOSTIC (debug-gated): isolate the phase-1 header upsert tx from
             // the FTS-surface step below. The "found N staged" → "newly visible"
@@ -880,6 +1078,12 @@ enum NSEDataBridge {
             // (terminal OR kept). Drives the UI refresh + badge recount — a kept
             // gradual row still changed main GRDB and must refresh the inbox.
             var committedCount = 0
+            // `StagedMessage.id` (staging-row identity) of every `writeSet` row
+            // whose savepoint committed this wake — terminal AND kept alike.
+            // STAGE-MEMO SKIP uses this to record the current stage key for
+            // rows that committed but were KEPT (not deleted below), so the
+            // NEXT trigger-only re-merge of this exact content can skip it.
+            var committedMsgIds: [String] = []
             // Collect FTS pipeline work across ALL committed messages; flushed
             // once after the main tx commits. Per-message ftsBatch is built
             // INSIDE the savepoint and only merged into this batch after the
@@ -906,6 +1110,11 @@ enum NSEDataBridge {
             // corresponding staging rows in that case.
             var outerCommitted = false
 
+            // STAGE-MEMO SKIP: same guard as phase 1 — a fully-skipped merge
+            // (every staged row memo-identical + durability-verified) never
+            // opens `AppDatabase.dbPool.write` for phase 2 either, so it holds
+            // the GRDB writer for exactly zero time.
+            if !writeSet.isEmpty {
             do {
                 // Async overload (foreground-hang fix): SUSPENDS the caller
                 // instead of BLOCKING the thread, so a foreground-return merge no
@@ -920,8 +1129,8 @@ enum NSEDataBridge {
                 // vs. the actual write. A big gap between these two marks ⇒ the
                 // late-surfacing residual is writer contention, not the write itself.
                 let writeReqT0 = CFAbsoluteTimeGetCurrent()
-                BootProfiler.mark("merge: requesting GRDB writer for \(processed.count) staged msg(s)")
-                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
+                BootProfiler.mark("merge: requesting GRDB writer for \(writeSet.count) staged msg(s)")
+                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool, committedIds: [String]) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
                     BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
                     // Connection-level write counter snapshot. The delta over this
                     // whole transaction tells us whether phase 2 changed anything
@@ -934,9 +1143,10 @@ enum NSEDataBridge {
                     let tcStart = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
                     var localMergedIds: [String] = []
                     var localCommitted = 0
+                    var localCommittedMsgIds: [String] = []
                     var localFtsAccumulator: [(headerId: String, textContent: String)] = []
                     var localHeaderAccumulator: [String] = []
-                    for msg in processed {
+                    for msg in writeSet {
                         // Per-message savepoint: a single bad row (FK
                         // violation, ThreadUtils throw, FTS contention, etc.)
                         // rolls back JUST that row, not the entire batch. The
@@ -1211,6 +1421,7 @@ enum NSEDataBridge {
                                 localHeaderAccumulator.append(hid)
                             }
                             localCommitted += 1
+                            localCommittedMsgIds.append(msg.id)
                             // Delete the staging row only when the NSE's work is
                             // DONE: AI completed (terminal), or a gradual row whose
                             // NSE is long gone (older than the abandon window — its
@@ -1231,7 +1442,7 @@ enum NSEDataBridge {
                         }
                     }
                     let tcEnd = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
-                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart)
+                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart, committedIds: localCommittedMsgIds)
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
@@ -1240,6 +1451,7 @@ enum NSEDataBridge {
                 // proceed.
                 successfullyMergedIds = writeResult.ids
                 committedCount = writeResult.committed
+                committedMsgIds = writeResult.committedIds
                 ftsBatch = writeResult.fts
                 allMergedHeaderIds = writeResult.headers
                 mainWriteChanged = writeResult.realChanged
@@ -1249,31 +1461,7 @@ enum NSEDataBridge {
                 // wait (contention); ACQUIRED→here = the actual main write; here→DONE
                 // = post-tx FTS flush. Whichever Δ dominates is the real residual.
                 BootProfiler.mark("merge: main tx committed (\(committedCount) merged) — FTS flush next")
-                print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(processed.count) merged (\(successfullyMergedIds.count) terminal → delete)")
-
-                // STALE-DETECTION RACE FIX: a message that just became durable via this
-                // push-merge is NOT registered in pending-ops / recentlyCompleted, so a
-                // concurrent/next sync whose server fetch TRANSIENTLY misses it (STATUS/
-                // fetch propagation lag — the thing flushServerState fights) STALE-DELETES
-                // it. Symptom: insta-merge shows the new mail, a sync drops it, a later
-                // sync brings it back. Register the merged ids as recently-arrived so
-                // stale detection (fullSync + reconcile + delta all read
-                // AccountManager.shared.recentlyCompleted) SKIPS them for the 30s TTL, by
-                // which point the server reliably returns them. Protecting-from-deletion
-                // is the safe direction (never deletes; worst case a genuinely-gone
-                // message lingers one extra TTL). Keys: provider messageId (exact) +
-                // normalized rfc822 (survives UID-remap), matching both stale-check paths.
-                if !processed.isEmpty {
-                    var protectIds: [String] = []
-                    for m in processed {
-                        protectIds.append(m.messageId)
-                        if let rfc = m.rfc822MessageId, !rfc.isEmpty {
-                            protectIds.append(EmailFilter.normalizeMessageId(rfc))
-                        }
-                    }
-                    await AccountManager.shared.recordRecentlyCompleted(messageIds: protectIds)
-                    BootProfiler.mark("merge: stale-protected \(processed.count) recently-arrived msg(s) (30s) — prevents pre-verify drop")
-                }
+                print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(writeSet.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
                 // NOTE: no UI-refresh post here anymore. performMerge posts its
                 // end-of-flow `.inboxDataDidChange` (immediate) at the very end,
@@ -1293,6 +1481,38 @@ enum NSEDataBridge {
                 // on `outerCommitted` and won't run, leaving all rows in
                 // staging for retry.
                 print("[NSEDataBridge] Merge failed (outer tx): \(error)")
+            }
+            } // if !writeSet.isEmpty (phase 2)
+
+            // STALE-DETECTION RACE FIX: a message that just became durable via this
+            // push-merge is NOT registered in pending-ops / recentlyCompleted, so a
+            // concurrent/next sync whose server fetch TRANSIENTLY misses it (STATUS/
+            // fetch propagation lag — the thing flushServerState fights) STALE-DELETES
+            // it. Symptom: insta-merge shows the new mail, a sync drops it, a later
+            // sync brings it back. Register EVERY staged id (not just `writeSet`'s —
+            // 5b: a KEPT gradual row this pass SKIPPED still needs its protection
+            // refreshed, the race it guards against doesn't care whether THIS pass
+            // wrote anything) as recently-arrived so stale detection (fullSync +
+            // reconcile + delta all read AccountManager.shared.recentlyCompleted)
+            // SKIPS them for `SyncConfig.pushMergeStaleProtectionTTLSeconds`, by
+            // which point the server reliably returns them. Protecting-from-deletion
+            // is the safe direction (never deletes; worst case a genuinely-gone
+            // message lingers one extra TTL). Keys: provider messageId (exact) +
+            // normalized rfc822 (survives UID-remap), matching both stale-check
+            // paths. Uses the longer push-merge TTL (not the default
+            // action-completion TTL) — see SyncConfig.pushMergeStaleProtectionTTLSeconds.
+            do {
+                var protectIds: [String] = []
+                for m in processed {
+                    protectIds.append(m.messageId)
+                    if let rfc = m.rfc822MessageId, !rfc.isEmpty {
+                        protectIds.append(EmailFilter.normalizeMessageId(rfc))
+                    }
+                }
+                await AccountManager.shared.recordRecentlyCompleted(
+                    messageIds: protectIds, ttl: SyncConfig.pushMergeStaleProtectionTTLSeconds
+                )
+                BootProfiler.mark("merge: stale-protected \(processed.count) recently-arrived msg(s) (\(Int(SyncConfig.pushMergeStaleProtectionTTLSeconds))s) — prevents pre-verify drop")
             }
 
             // Drive the render/recount off REAL durable changes AND outer-tx
@@ -1381,6 +1601,68 @@ enum NSEDataBridge {
                         print("[NSEDataBridge] Staging delete failed: \(error) — successfullyMergedIds may be re-merged next wake (idempotent)")
                     }
                 }
+            }
+
+            // ============================================================
+            // SKIP-SET STAGING CLEANUP.
+            //
+            // `skipSet` rows are durable + unchanged — no GRDB write was
+            // needed for them at all — but a TERMINAL (aiCompleted) or
+            // ABANDONED one still carries a now-redundant staging row (most
+            // commonly: its terminal write landed on an EARLIER merge whose
+            // subsequent staging-row DELETE failed, so it re-appears here,
+            // still unchanged). Delete it directly against the staging DB —
+            // no main-GRDB write involved, so this doesn't reintroduce the
+            // writer contention the skip exists to avoid.
+            // ============================================================
+            let skipSetDeleteIds = skipSet
+                .filter { $0.aiCompleted || $0.processedAt < abandonedCutoff }
+                .map(\.id)
+            if !skipSetDeleteIds.isEmpty {
+                do {
+                    try await nseDB.write { db in
+                        for id in skipSetDeleteIds {
+                            try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                        }
+                    }
+                } catch {
+                    // Idempotent across wakes, same as the writeSet delete above —
+                    // a failure just means this (already-durable, unchanged) row
+                    // re-appears next wake and is re-evaluated as a skip candidate.
+                    if !error.isDatabaseSuspensionAbort {
+                        print("[NSEDataBridge] Skip-set staging delete failed: \(error) — retried next wake (idempotent)")
+                    }
+                }
+            }
+
+            // ============================================================
+            // STAGE-MEMO MAINTENANCE.
+            //
+            // Record the current stage key for every `writeSet` row that
+            // committed this wake AND was KEPT (not deleted below) — the next
+            // TRIGGER-ONLY re-merge of this exact content can now skip it.
+            // Drop the memo entry for every row deleted this wake (writeSet's
+            // terminal/abandoned + skip-set's terminal/abandoned) — a deleted
+            // staging row has no "next merge" to skip. Finally, bound the memo
+            // to rows still staged after this merge — defensive; the
+            // record/drop above should already keep it exact, and a self-heal
+            // over the (small) staged set costs nothing.
+            // ============================================================
+            stageMemo.withLock { memo in
+                if outerCommitted {
+                    let keptWriteSetIds = Set(committedMsgIds).subtracting(successfullyMergedIds)
+                    for id in keptWriteSetIds {
+                        if let msg = writeSetById[id] {
+                            memo[id] = Self.stageKey(for: msg)
+                        }
+                    }
+                }
+                for id in successfullyMergedIds { memo.removeValue(forKey: id) }
+                for id in skipSetDeleteIds { memo.removeValue(forKey: id) }
+                let stillStagedIds = Set(processed.map(\.id))
+                    .subtracting(successfullyMergedIds)
+                    .subtracting(skipSetDeleteIds)
+                memo = memo.filter { stillStagedIds.contains($0.key) }
             }
         }
 
