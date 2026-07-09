@@ -157,7 +157,11 @@ extension SyncEngine {
 
         // Capture actor state — single actor hop
         let mgr = AccountManager.shared
-        // Snapshot recentlyCompleted (30s TTL) — replaces per-folder recentActions
+        // Snapshot recentlyCompleted — replaces per-folder recentActions. Prune
+        // first: the reads below are presence checks (`!= nil`) that don't consult
+        // per-entry expiry, so an unpruned map would treat expired entries as
+        // still protected forever.
+        await mgr.pruneRecentlyCompleted()
         let recentlyCompletedSnapshot = await mgr.recentlyCompleted
 
         // Heavy per-folder sync — run off main thread.
@@ -357,6 +361,9 @@ extension SyncEngine {
         limit: Int
     ) async throws {
         let syncMgr = AccountManager.shared
+        // Prune before snapshotting — the reads in runSyncMessages are presence
+        // checks (`!= nil`) that don't consult per-entry expiry.
+        await syncMgr.pruneRecentlyCompleted()
         let recentlyCompletedSnapshot = await syncMgr.recentlyCompleted
         let result = try await Self.runSyncMessages(
             for: folder, provider: provider, limit: limit,

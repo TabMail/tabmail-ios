@@ -275,26 +275,37 @@ actor AccountManager {
         isDrainingLocalWrites = false
     }
 
-    // MARK: - Recently Completed Protection (30s TTL)
+    // MARK: - Recently Completed Protection (per-entry expiry)
 
-    /// Message IDs of recently completed PendingOperations.
-    /// Bridges the gap between PendingOp deletion and server-side state propagation.
-    /// Sync writes check this to avoid overwriting just-completed ops with stale server data.
+    /// Message IDs recently protected from sync stale-deletion/overwrite, keyed to
+    /// their EXPIRY date (not insertion date — each entry carries its own TTL).
+    /// Two distinct callers use different TTLs:
+    /// - PendingOperation completion (`AccountManagerQueue`) bridges the gap between
+    ///   PendingOp deletion and server-side state propagation — default TTL
+    ///   `SyncConfig.recentlyCompletedTTLSeconds` (30s).
+    /// - NSE push-merge arrival (`NSEDataBridge`) protects a message that just became
+    ///   durable via push-merge from a transient server-fetch miss — longer TTL
+    ///   `SyncConfig.pushMergeStaleProtectionTTLSeconds` (120s), because push-merged
+    ///   rows are upserted ONLY by the merge (sync deliberately skips their upsert
+    ///   while protected), so a miss needs more margin to self-correct than an
+    ///   action-completion propagation gap.
+    /// Sync writes check this to avoid overwriting/deleting just-arrived rows with
+    /// stale server data.
     private(set) var recentlyCompleted: [String: Date] = [:]
 
-    func recordRecentlyCompleted(messageIds: [String]) {
-        let now = Date()
-        for id in messageIds { recentlyCompleted[id] = now }
+    func recordRecentlyCompleted(messageIds: [String], ttl: TimeInterval = SyncConfig.recentlyCompletedTTLSeconds) {
+        let expiresAt = Date().addingTimeInterval(ttl)
+        for id in messageIds { recentlyCompleted[id] = expiresAt }
     }
 
     func pruneRecentlyCompleted() {
-        let cutoff = Date().addingTimeInterval(-SyncConfig.recentlyCompletedTTLSeconds)
-        recentlyCompleted = recentlyCompleted.filter { $0.value > cutoff }
+        let now = Date()
+        recentlyCompleted = recentlyCompleted.filter { $0.value > now }
     }
 
     func isRecentlyCompleted(_ msgId: String) -> Bool {
-        guard let completedAt = recentlyCompleted[msgId] else { return false }
-        return Date().timeIntervalSince(completedAt) < SyncConfig.recentlyCompletedTTLSeconds
+        guard let expiresAt = recentlyCompleted[msgId] else { return false }
+        return Date() < expiresAt
     }
 
     // MARK: - Optimistic Overlay

@@ -371,6 +371,17 @@ enum SyncConfig {
     /// Actual gap is 1-2s; 30s gives 15x margin for edge cases (brief app backgrounding, etc.).
     static let recentlyCompletedTTLSeconds: TimeInterval = 30
 
+    /// TTL for NSE push-merge arrival stale-protection (NSEDataBridge). A message that
+    /// becomes durable via push-merge is upserted ONLY by the merge — sync deliberately
+    /// skips its upsert while protected — so a transient server-fetch miss (STATUS/fetch
+    /// propagation lag) after the protection expires stale-deletes a real message. 120s
+    /// covers two foreground delta-sync poll cycles (60s cadence, see
+    /// `SyncEngine.backgroundDeltaSync`/two-tier sync) so a miss self-corrects before
+    /// protection lapses. The 30s `recentlyCompletedTTLSeconds` default was too short for
+    /// this purpose: it expired 5s before an observed INBOX stale-delete of a freshly
+    /// pushed message ("boot_logs 2", 2026-07-09).
+    static let pushMergeStaleProtectionTTLSeconds: TimeInterval = 120
+
     // MARK: - Large Inbox Management
     // Matches TB's SETTINGS.inboxManagement. Inboxes larger than maxRecentEmails
     // are treated as "large" — only recent messages are AI-processed.

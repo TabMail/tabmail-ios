@@ -95,9 +95,14 @@ extension SyncEngine {
 
         if !toFetch.isEmpty { publishDownloading(toFetch.count, forAccount: account.id) }
 
-        // Capture recentlyCompleted (30s TTL) — bridges the gap between PendingOp deletion
-        // and historyId cursor lag. Replaces per-folder recentActions.
+        // Capture recentlyCompleted — bridges the gap between PendingOp deletion
+        // and historyId cursor lag (default TTL), and protects freshly push-merged
+        // arrivals (longer TTL). Replaces per-folder recentActions. Prune first: the
+        // reads below are presence checks (`!= nil`), which don't consult the
+        // per-entry expiry — an unpruned map would treat expired entries as still
+        // protected forever.
         let mgr = AccountManager.shared
+        await mgr.pruneRecentlyCompleted()
         let recentlyCompletedSnapshot = await mgr.recentlyCompleted
 
         // Delete removed messages — skip messages with pending operations.
@@ -467,8 +472,11 @@ extension SyncEngine {
 
         if !toFetch.isEmpty { publishDownloading(toFetch.count, forAccount: account.id) }
 
-        // Capture recentlyCompleted — same guard as Gmail delta.
+        // Capture recentlyCompleted — same guard as Gmail delta. Prune first (see
+        // comment above the Gmail delta snapshot) since the reads below are
+        // presence checks that don't consult per-entry expiry.
         let exMgr = AccountManager.shared
+        await exMgr.pruneRecentlyCompleted()
         let exRecentlyCompleted = await exMgr.recentlyCompleted
 
         // Delete removed messages — skip messages with pending operations.

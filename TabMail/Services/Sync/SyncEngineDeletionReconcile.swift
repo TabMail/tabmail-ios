@@ -272,6 +272,9 @@ extension SyncEngine {
     @discardableResult
     func deleteServerConfirmedDeletions(folder: Folder, uids: [UInt32], reason: String) async throws -> Int {
         guard !uids.isEmpty else { return 0 }
+        // Prune before snapshotting — deleteConfirmedGhostHeaders does a presence
+        // check (`!= nil`) that doesn't consult per-entry expiry.
+        await AccountManager.shared.pruneRecentlyCompleted()
         let recentlyCompleted = await AccountManager.shared.recentlyCompleted
         let folderId = folder.id
         let folderPath = folder.path
