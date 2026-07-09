@@ -41,6 +41,12 @@ final class MessageDetailViewModel {
     // Test seams — internal so @testable import can inject them
     @ObservationIgnored var _dbPoolOverride: PrioritizedDatabase?
     @ObservationIgnored var _fetchBodyOverride: ((MessageHeader) async throws -> Void)?
+    /// Overrides for `resolveProviderTap`'s bounded poll (production defaults
+    /// to `SyncConfig.notifTapStagedResolveWaitSeconds`/`notifTapStagedResolvePollMs`,
+    /// i.e. 1.5s) so tests exercising a genuinely-exhausted ladder don't pay
+    /// the full wait.
+    @ObservationIgnored var _tapResolveWaitSecondsOverride: TimeInterval?
+    @ObservationIgnored var _tapResolvePollMsOverride: Int?
 
     /// The resolved composite ID — may differ from `messageId` if the message was found
     /// via cross-folder fallback (e.g., after IMAP MOVE changed the UID).
@@ -239,7 +245,11 @@ final class MessageDetailViewModel {
         if let existing = tapResolveTask {
             task = existing
         } else {
-            let t = Task { await Self.resolveProviderTap(providerId, accountId: accountId) }
+            let waitSeconds = _tapResolveWaitSecondsOverride ?? SyncConfig.notifTapStagedResolveWaitSeconds
+            let pollMs = _tapResolvePollMsOverride ?? SyncConfig.notifTapStagedResolvePollMs
+            let t = Task {
+                await Self.resolveProviderTap(providerId, accountId: accountId, waitSeconds: waitSeconds, pollMs: pollMs)
+            }
             tapResolveTask = t
             task = t
         }
@@ -928,9 +938,20 @@ final class MessageDetailViewModel {
 
         // Pending notification tap: resolve the PROVIDER id to a composite
         // header id first (single-flight ladder; the skeleton is on screen).
-        // On failure the message is genuinely gone — Not-Found, with Retry.
+        // On failure the NSE never staged the message AND sync hasn't landed
+        // it yet — this branch is only reachable for tap-sentinel opens
+        // (resolveTapIfNeeded returns false only when a pendingProviderTapId
+        // ladder exhausted). Contract: pop the detail view and land on the
+        // inbox instead of stranding the user on Message-Not-Found — the
+        // message will appear at the top of the inbox once sync lands
+        // seconds later. `MailNavigationView` does the actual pop/nav on
+        // `.notificationTapUnresolved`; `messageNotFound`/`isLoading` stay
+        // set here as a backstop for the case where that observer isn't
+        // mounted (cold-start edge, multi-column layouts) — Not-Found still
+        // shows rather than a blank view.
         guard await resolveTapIfNeeded() else {
             print("[MoveTrace] loadBody — notification-tap resolve exhausted for \(messageId)")
+            NotificationCenter.default.post(name: .notificationTapUnresolved, object: nil, userInfo: ["messageId": messageId])
             isLoading = false
             messageNotFound = true
             return

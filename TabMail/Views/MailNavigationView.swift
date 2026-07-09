@@ -535,6 +535,20 @@ struct MailNavigationView: View {
         .onReceive(NotificationCenter.default.publisher(for: .proactiveNotificationTapped).receive(on: DispatchQueue.main)) { notification in
             handleNotificationDeepLink(notification.userInfo)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .notificationTapUnresolved).receive(on: DispatchQueue.main)) { notification in
+            // MessageDetailViewModel's resolve ladder exhausted for a
+            // notification-tap open (NSE never staged it, sync hasn't landed
+            // it yet). Only pop when the unresolved id still matches the
+            // currently-pushed message — guards against popping an unrelated
+            // open (e.g. the user already navigated elsewhere and a stale VM
+            // fires late). Land on the inbox; the message appears at the top
+            // once sync catches up.
+            guard let messageId = notification.userInfo?["messageId"] as? String,
+                  messageId == selectedMessageId else { return }
+            BootProfiler.mark("notifTap: unresolved → falling back to inbox")
+            selectedMessageId = nil
+            selection = .unified(.inbox)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .pushConsentErrorsDetected).receive(on: DispatchQueue.main)) { notification in
             if let emails = notification.userInfo?["emails"] as? [String] {
                 pushConsentErrorEmails = emails
@@ -689,8 +703,12 @@ struct MailNavigationView: View {
         //   shows the loading skeleton while MessageDetailViewModel runs the
         //   resolve ladder (`resolveProviderTap` — durable indexed read →
         //   bounded staged/durable poll → merge fallback) and dissolves to
-        //   content. A genuinely-gone message now shows Message-Not-Found
-        //   (with Retry) instead of silently landing on the inbox.
+        //   content. If the ladder exhausts (NSE never staged it AND sync
+        //   hasn't landed it yet), the VM posts `.notificationTapUnresolved`
+        //   and the `.onReceive` below pops the detail view back to the inbox
+        //   — the message appears there once sync lands. Message-Not-Found
+        //   (with Retry) is a backstop for non-tap opens / that observer not
+        //   being mounted, not the primary outcome for a tap anymore.
         BootProfiler.mark("notifTap: deep link received \(messageId.prefix(24))")
         // `accountId` disambiguates the provider id: an IMAP UID is a per-mailbox
         // small integer that COLLIDES across accounts, so without it a tap on

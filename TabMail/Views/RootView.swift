@@ -886,4 +886,13 @@ extension Notification.Name {
     /// Posted when the server confirms the user's account no longer exists (deleted or token permanently revoked).
     /// RootView shows an explanatory alert and then signs out.
     static let tabMailAccountGone = Notification.Name("tabMailAccountGone")
+    /// Posted by `MessageDetailViewModel.loadBody()` when a notification-tap
+    /// open's resolve ladder (`resolveProviderTap`) exhausts without finding
+    /// the message — the NSE never staged it AND sync hasn't landed it yet.
+    /// `userInfo["messageId"]` is the VM's sentinel-prefixed id
+    /// (`notifTap::<accountId>::<providerId>`). `MailNavigationView` pops the
+    /// detail view and falls back to the inbox (the message appears there
+    /// once sync lands) instead of leaving the user on Message-Not-Found —
+    /// only for tap opens; this notification is never posted for other opens.
+    static let notificationTapUnresolved = Notification.Name("notificationTapUnresolved")
 }

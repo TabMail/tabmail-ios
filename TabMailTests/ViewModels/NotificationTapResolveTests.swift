@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -152,5 +153,52 @@ struct NotificationTapResolveTests {
         await vm.loadBody()
         #expect(vm.message?.subject == "Durable tap")
         #expect(vm.messageId == durable.id, "messageId must be rewritten to the composite")
+    }
+
+    // MARK: - Exhausted ladder → inbox fallback (pop-to-inbox contract)
+
+    @MainActor
+    @Test("exhausted ladder posts .notificationTapUnresolved and sets messageNotFound as a backstop")
+    func exhaustedLadderPostsUnresolvedNotification() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        // Empty staging snapshot AND empty DB — the message is genuinely
+        // nowhere yet (NSE never staged it, sync hasn't landed it).
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+
+        let sentinelId = MessageDetailViewModel.notificationTapIdPrefix + "acc1::m-prov-nowhere"
+        let vm = MessageDetailViewModel(
+            messageId: sentinelId,
+            dbPool: pool,
+            fetchBodyOverride: { _ in }
+        )
+        #expect(vm.message == nil, "no staged match → pending resolve")
+        // Keep the ladder's bounded poll short so the test doesn't pay the
+        // production 1.5s wait.
+        vm._tapResolveWaitSecondsOverride = 0.1
+        vm._tapResolvePollMsOverride = 20
+
+        let posted = Mutex<[String]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .notificationTapUnresolved, object: nil, queue: .main
+        ) { note in
+            guard let messageId = note.userInfo?["messageId"] as? String else { return }
+            posted.withLock { $0.append(messageId) }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        await vm.loadBody()
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(vm.messageNotFound == true)
+        #expect(vm.isLoading == false)
+        let captured = posted.withLock { $0 }
+        #expect(captured.count == 1)
+        guard captured.count == 1 else { return }
+        #expect(captured[0] == sentinelId, "posted messageId must be the VM's sentinel string")
     }
 }
