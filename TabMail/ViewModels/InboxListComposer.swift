@@ -20,6 +20,14 @@ struct InboxListQuery: Equatable, Sendable {
     /// reload. When non-nil, `S` and `P` rows are cut in `compose` (D
     /// arrives already cut by the shell's SQL `date < beforeDate`).
     let beforeDate: Date?
+    /// Ids to drop AFTER S-eligibility/carry-over decisions but BEFORE
+    /// sort/trim (F2 audit fix). `fetchPage` passes the VM's `loadedIds` so
+    /// an already-on-screen row can't eat a `targetCount` trim slot from a
+    /// not-yet-loaded one — restores the pre-refactor dedup-BEFORE-prefix
+    /// ordering, which matters because the triage-mode sort is not
+    /// date-monotonic. `fetchFullRange` passes `[]`: a full-range reload's
+    /// diff MUST include already-loaded rows (that's the point of the diff).
+    let excludeIds: Set<String>
 
     init(
         displayedFolderIds: Set<String>,
@@ -27,7 +35,8 @@ struct InboxListQuery: Equatable, Sendable {
         filterLabelIds: Set<String>,
         mode: InboxMode,
         targetCount: Int,
-        beforeDate: Date?
+        beforeDate: Date?,
+        excludeIds: Set<String> = []
     ) {
         self.displayedFolderIds = displayedFolderIds
         self.filterUnread = filterUnread
@@ -35,6 +44,7 @@ struct InboxListQuery: Equatable, Sendable {
         self.mode = mode
         self.targetCount = targetCount
         self.beforeDate = beforeDate
+        self.excludeIds = excludeIds
     }
 }
 
@@ -136,9 +146,23 @@ enum InboxListComposer {
         }
         // Frozen D∪P snapshot for computedThreadId adoption (§2.1 step 3's
         // "compose has D ∪ P in hand, so the adoption is pure") — captured
-        // BEFORE the S loop mutates `byId`, so adoption results don't depend
-        // on the order `staged` happens to be enumerated in.
+        // BEFORE the S loop mutates `byId`, so the D∪P PART of adoption
+        // doesn't depend on the order `staged` happens to be enumerated in.
         let frozenDP = Array(byId.values)
+        // F4 audit fix: the adoption pool starts as `frozenDP` (kept frozen,
+        // above, for that part's determinism) but GROWS as each S row is
+        // synthesized below, so a same-batch staged reply-to-a-staged-sibling
+        // can chain-adopt — old `insertStagedRows` adopted from the growing
+        // `loadedMessages` array, so a reply landing in the same batch as its
+        // parent could already adopt the parent's thread. Only a row that
+        // itself carries a non-empty adopted `computedThreadId` is appended
+        // (see the `!snapshot.computedThreadId.isEmpty` check below) — matches
+        // `adoptThreadId`'s own source-eligibility guard, so a staged row with
+        // no thread relation of its own can't be adopted from. NOTE this
+        // makes later-in-`staged` rows depend on earlier ones' input order —
+        // that input-order dependence matches OLD behavior (insertion order
+        // = batch order), not a new one introduced here.
+        var adoptionPool = frozenDP
 
         // MARK: Step 2 — S-row eligibility (§2.1a's audit-corrected table).
         var stagedIncludedIds: Set<String> = []
@@ -171,12 +195,31 @@ enum InboxListComposer {
             guard !isDuplicateIdentity(row, in: byId.values) else { continue }
 
             var header = row.toMessageHeader()
-            if let adopted = adoptThreadId(for: row, from: frozenDP) {
+            if let adopted = adoptThreadId(for: row, from: adoptionPool) {
                 header.computedThreadId = adopted
             }
             let snapshot = MessageSnapshot(from: header)
             byId[snapshot.id] = snapshot
             stagedIncludedIds.insert(snapshot.id)
+            // Grow the pool (F4) — only if THIS row itself adopted (or
+            // otherwise carries) a non-empty computedThreadId, so it's a
+            // valid source for a later same-batch S row to chain-adopt from.
+            if !snapshot.computedThreadId.isEmpty {
+                adoptionPool.append(snapshot)
+            }
+        }
+
+        // MARK: Step 2.5 — drop already-loaded ids (F2 audit fix). Runs AFTER
+        // the S-eligibility loop above, so an excluded durable row still
+        // correctly suppresses its staged duplicate via the (c) `byId`
+        // membership check (identity is on screen either way — suppression
+        // is about not double-rendering the identity, which holds regardless
+        // of whether the winning row is about to be excluded here) — but
+        // BEFORE sort/trim (step 7), so an old already-loaded row can't eat a
+        // `targetCount` trim slot that a not-yet-loaded row needs. This is
+        // the exact old dedup-BEFORE-prefix ordering `fetchPage` used to have.
+        if !query.excludeIds.isEmpty {
+            for id in query.excludeIds { byId.removeValue(forKey: id) }
         }
 
         // MARK: Step 3 — overlay, applied uniformly to D, P, and S rows.
@@ -212,14 +255,29 @@ enum InboxListComposer {
         }
 
         // MARK: Step 7 — sort (mode-aware), dedup by id, trim to window.
+        // G2 audit fix (PLAN_INBOX_UNIFIED_READ.md): every comparator ends in
+        // a total-order `id` tie-break. `byId.values` (step 1) iterates a
+        // Swift `Dictionary` — its order is NOT a function of insertion
+        // order alone and is not guaranteed stable across otherwise-identical
+        // composes. Without a final tie-break, rows that compare EQUAL on
+        // date (and tagSortOrder, in triage) can land on either side of the
+        // `targetCount` trim depending on that incidental iteration order —
+        // a tied row appears on one reload and disappears on the next, with
+        // nothing in the underlying data having changed (trim-boundary
+        // churn). `id` is unique per row and stable, so it's a safe total
+        // order to fall back to.
         switch query.mode {
         case .triage:
             rows.sort { a, b in
                 if a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
-                return a.date > b.date
+                if a.date != b.date { return a.date > b.date }
+                return a.id < b.id
             }
         case .normal:
-            rows.sort { $0.date > $1.date }
+            rows.sort { a, b in
+                if a.date != b.date { return a.date > b.date }
+                return a.id < b.id
+            }
         }
 
         var seen: Set<String> = []
@@ -252,19 +310,26 @@ enum InboxListComposer {
         return updated
     }
 
-    /// `insertStagedRows`' identity-dedup check, ported verbatim: matches the
-    /// merge's dedup identity — (accountId, messageId) then rfc822 fallback —
-    /// not just headerId equality.
+    /// `insertStagedRows`' identity-dedup check, ported: matches the merge's
+    /// dedup identity, not just headerId equality. Thin wrapper over
+    /// `DurableIdentityLookup.isSameLogicalMessage` — the G3-hardened
+    /// in-memory comparator shared with `InboxViewModel.insertStagedRows`'
+    /// inline check, so a bare (accountId, messageId) collision with an
+    /// on-screen row (e.g. a P row pinned in from another folder — IMAP UIDs
+    /// are per-folder, ADR-IOS-042) can no longer suppress a genuinely
+    /// different staged message when both sides' rfc822 identities are known
+    /// and disagree. See `DurableIdentityLookup.isSameLogicalMessage`'s doc
+    /// comment for the full truth table and DECISIONS.md ADR-IOS-055's G3
+    /// in-memory-comparator addendum.
     private static func isDuplicateIdentity(
         _ row: StagedInboxRow, in snapshots: some Sequence<MessageSnapshot>
     ) -> Bool {
         snapshots.contains { snap in
-            guard snap.accountId == row.accountId else { return false }
-            if !row.messageId.isEmpty, snap.messageId == row.messageId { return true }
-            if let rfc = row.rfc822MessageId, !rfc.isEmpty,
-               let snapRfc = snap.rfc822MessageId, !snapRfc.isEmpty,
-               rfc == snapRfc { return true }
-            return false
+            DurableIdentityLookup.isSameLogicalMessage(
+                accountId: row.accountId, messageId: row.messageId, rfc822MessageId: row.rfc822MessageId,
+                candidateAccountId: snap.accountId, candidateMessageId: snap.messageId,
+                candidateRfc822MessageId: snap.rfc822MessageId
+            )
         }
     }
 

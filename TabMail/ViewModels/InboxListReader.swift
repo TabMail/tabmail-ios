@@ -109,6 +109,15 @@ enum InboxListReader {
             }
             allHeaders.append(contentsOf: try q.limit(query.targetCount).fetchAll(db))
         }
+
+        // §4.4-2 instrumentation (PLAN_INBOX_UNIFIED_READ.md): time everything
+        // AFTER the D query — the P-step, its label batch load, and the S
+        // identity-resolution loop — NOT the D query above (that's the
+        // pre-existing, already-profiled cost). `BootProfiler.mark` is
+        // already production-gated (`DebugModeManager.isLoggingEnabled()`),
+        // so this is a guard-return no-op in production builds.
+        let unionStepStart = CFAbsoluteTimeGetCurrent()
+
         // MARK: P — overlay-pinned rows (Q1: folderId-driven selection, per
         // PLAN_INBOX_UNIFIED_READ.md §6). `isInInbox`-only mutations never
         // *restore* a row into a folder set, so they don't select for
@@ -155,10 +164,17 @@ enum InboxListReader {
         resolutions.reserveCapacity(staged.count)
         for row in staged {
             let ref = try DurableIdentityLookup.find(
-                db: db, accountId: row.accountId, messageId: row.messageId,
+                db: db, accountId: row.accountId, folderPath: row.folderPath, messageId: row.messageId,
                 rfc822MessageId: row.rfc822MessageId
             )
             resolutions[row.headerId] = StagedIdentityResolution(stagedHeaderId: row.headerId, durable: ref)
+        }
+
+        let unionStepMs = Int((CFAbsoluteTimeGetCurrent() - unionStepStart) * 1000)
+        if unionStepMs > 10 {
+            BootProfiler.mark(
+                "InboxListReader union step \(unionStepMs)ms (pinned=\(pinned.count) stagedResolutions=\(resolutions.count))"
+            )
         }
 
         return GatherResult(durable: durable, pinned: pinned, resolutions: resolutions)

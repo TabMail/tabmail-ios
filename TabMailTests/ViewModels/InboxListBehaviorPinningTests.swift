@@ -749,4 +749,308 @@ struct InboxListBehaviorPinningTests {
         #expect(vm.loadedMessages[0].userLabels.map(\.id) == ["label-x"])
         #expect(!vm.loadedMessages.contains { $0.id == unlabeled.id })
     }
+
+    // MARK: - 15. F2 audit: loadMoreMessages excludeIds ordering, 2 folders,
+    // real pageSize (PLAN_INBOX_UNIFIED_READ.md audit). Reproduces the exact
+    // `fetchPage`/`compose` trace: an already-loaded, tag-first (triage mode)
+    // row from one folder legitimately re-enters a later page's D query —
+    // its date is older than the pagination cursor, which in triage mode is
+    // NOT the globally oldest loaded date (tag priority sorts it ahead of
+    // newer, untagged rows on page 1). Before the fix, `compose` trimmed to
+    // `targetCount` BEFORE the VM's `loadedIds` dedup filtered that row back
+    // out — eating a trim slot and silently dropping a legitimately older,
+    // not-yet-loaded row, with `hasMoreMessages` flipping false even though
+    // reachable mail remained.
+
+    @Test("loadMoreMessages (triage, 2 folders, real pageSize): an already-loaded old high-priority row re-entering page 2's query does not shrink the page or drop older rows")
+    func loadMoreMessagesExcludeIdsOrderingMultiFolder() throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let priority = Folder(name: "Priority", path: "Priority", role: .inbox, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in let p = priority; try p.insert(db) }
+
+        let pageSize = SyncConfig.inboxPageSize
+        let now = Date()
+
+        // folder1 ("Priority"): ONE reply-tagged row, dated far older than
+        // everything else below — triage mode sorts it FIRST on tagSortOrder
+        // alone, regardless of its (old) date.
+        let replyOld = makeDurableHeader(
+            folder: priority, messageId: "reply-old",
+            date: now.addingTimeInterval(-60 * 200), actionTag: .reply
+        )
+
+        // folder2 (inbox): pageSize "newer" rows (page-1 candidates) +
+        // (pageSize - 1) "older" rows (page-2 candidates). NOTE pageSize-1,
+        // not pageSize, for the older tier: the per-folder D query caps each
+        // folder at `query.targetCount` rows independently — a pre-existing,
+        // unrelated-to-F2 bound ("Bounded: fetches at most folders.count ×
+        // pageSize", see fetchPage's doc comment). Page 1's trim bumps
+        // exactly ONE "newer" row out of the window (§4.3 — `replyOld`'s tag
+        // priority always wins the trim, so a "newer" row pays for it); that
+        // bumped row rejoins the "older" tier as a page-2 candidate for
+        // folder2, so sizing the older tier at pageSize-1 keeps folder2's
+        // combined page-2 candidate count exactly at its per-folder cap —
+        // isolating the F2 exclude-ordering bug from that separate, expected
+        // per-folder bound instead of conflating the two.
+        var newerHeaders: [MessageHeader] = []
+        for i in 0..<pageSize {
+            newerHeaders.append(makeDurableHeader(
+                folder: inbox, messageId: "newer-\(i)",
+                date: now.addingTimeInterval(-60 * Double(i + 1))
+            ))
+        }
+        var olderHeaders: [MessageHeader] = []
+        for i in 0..<(pageSize - 1) {
+            olderHeaders.append(makeDurableHeader(
+                folder: inbox, messageId: "older-\(i)",
+                date: now.addingTimeInterval(-60 * Double(pageSize + 1 + i))
+            ))
+        }
+        try pool.writeWithoutTransaction { db in
+            let r = replyOld; try r.insert(db)
+            for h in newerHeaders { let x = h; try x.insert(db) }
+            for h in olderHeaders { let x = h; try x.insert(db) }
+        }
+
+        let vm = InboxViewModel(folders: [priority, inbox])
+        // Set mode AFTER construction (mirrors triageOrderSortsFetchedAndStagedRows)
+        // and force a fresh page-1 fetch under it.
+        vm.mode = .triage
+        vm.resetMessages()
+
+        // Page 1: replyOld (tag-first) + the newest (pageSize - 1) of the
+        // "newer" tier — the trim bumps exactly one "newer" row (the oldest
+        // of that tier, `newer-(pageSize-1)`) out of the window. Expected,
+        // correct triage window-trim behavior (§4.3) — NOT the bug under test.
+        #expect(vm.loadedMessages.count == pageSize)
+        #expect(vm.hasMoreMessages == true)
+        let bumpedNewerId = MessageIdentity.headerId(
+            accountId: "acc1", folderPath: "INBOX", messageId: "newer-\(pageSize - 1)"
+        )
+        #expect(
+            !vm.loadedMessages.contains { $0.id == bumpedNewerId },
+            "test setup assumption violated: expected exactly one newer row bumped from page 1"
+        )
+
+        vm.loadMoreMessages()
+
+        // The fix: `excludeIds` removes `replyOld` (already loaded) AFTER
+        // eligibility decisions but BEFORE compose's targetCount trim, so the
+        // bumped newer row + the full older tier both make it into a FULL
+        // pageSize-sized next page — no drops, hasMoreMessages stays true.
+        #expect(vm.loadedMessages.count == pageSize * 2, "page 2 delivered fewer than pageSize rows — F2 regression")
+        #expect(vm.hasMoreMessages == true, "hasMoreMessages flipped false with reachable mail remaining — F2 regression")
+
+        let loadedIdsAfter = Set(vm.loadedMessages.map(\.id))
+        #expect(
+            loadedIdsAfter.contains(bumpedNewerId),
+            "the newer row bumped from page 1 was permanently dropped, not deferred to page 2"
+        )
+        for i in 0..<(pageSize - 1) {
+            let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "older-\(i)")
+            #expect(loadedIdsAfter.contains(id), "older-\(i) missing from page 2 — F2 regression")
+        }
+        // No duplicate `replyOld` — it re-entered the D query but must not
+        // double-render (it's already on screen from page 1).
+        #expect(vm.loadedMessages.filter { $0.id == replyOld.id }.count == 1)
+    }
+
+    // MARK: - 16. G1 audit: Pass-1 field-level preservation — non-empty beats empty
+
+    @Test("Pass-1 retains an existing non-empty computedThreadId when the reader's adoption misses on reload (parent evicted from the window)")
+    func pass1RetainsComputedThreadIdOnAdoptionMiss() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        // Durable, on-screen parent with a real thread id + rfc822 id.
+        var parent = MessageHeader(
+            messageId: "1000", subject: "Parent", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "p",
+            folderId: inbox.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        parent.headerComplete = true
+        parent.rfc822MessageId = "<parent@x>"
+        parent.computedThreadId = "thread-A"
+        let parentId = parent.id
+        let parentToInsert = parent
+        try await pool.writeWithoutTransaction { db in try parentToInsert.insert(db) }
+
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(vm.loadedMessages.count == 1)
+
+        // Staged reply adopts the on-screen parent's thread id instantly via
+        // the zero-I/O insertStagedRows path (InboxStagedInsertTests.
+        // adoptsThreadId pins this in isolation).
+        let reply = StagedInboxRow(
+            accountId: "acc1", folderPath: "INBOX", messageId: "m-reply",
+            rfc822MessageId: "<reply@x>", threadId: nil, inReplyTo: "<parent@x>", references: [],
+            subject: "Re: Parent", senderName: "Sender", senderAddress: "s@example.com",
+            to: "me@example.com", snippet: "reply snip", date: Date(),
+            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+            isForwarded: false, actionTag: nil, summaryBlurb: nil
+        )
+        // Seed the global BEFORE insert — mirrors the merge's publish-before-
+        // post order (see stagedRowSurvivesReloadPreDurability's comment).
+        NSEDataBridge.latestStagedRows.withLock { $0 = [reply] }
+        vm.insertStagedRows([reply])
+        #expect(vm.loadedMessages.count == 2)
+        let replyId = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-reply")
+        #expect(vm.loadedMessages.first { $0.id == replyId }?.computedThreadId == "thread-A")
+        #expect(vm.displayGroups.count == 1)
+        guard vm.displayGroups.count == 1 else { return }
+        #expect(vm.displayGroups[0].id == "thread-A")
+
+        // Simulate the parent being evicted from the window / re-keyed (e.g.
+        // a UID remap) — the composer's D∪P adoption pool no longer has it,
+        // so a fresh reload synthesizes the reply with an EMPTY
+        // computedThreadId (no adoption match this cycle). The staged row
+        // itself is unchanged — still in S, not yet durable.
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(sql: "DELETE FROM messageHeader WHERE id = ?", arguments: [parentId])
+        }
+
+        await vm.reloadMessages()
+
+        // G1: the fresh (empty) computedThreadId must not clobber the
+        // existing (adopted, non-empty) one — and the ThreadGroup key stays
+        // stable (the user-visible contract; a reverted key would silently
+        // re-collapse the group).
+        let reloaded = vm.loadedMessages.first { $0.id == replyId }
+        #expect(reloaded?.computedThreadId == "thread-A")
+        #expect(vm.displayGroups.contains { $0.id == "thread-A" })
+    }
+
+    @Test("Pass-1 retains an existing non-empty snippet when a re-synthesized staged row's fresh snippet is empty (real SnippetLoader tier-1 FTS in-place fill, ahead of the staging snapshot)")
+    func pass1RetainsSnippetOnEmptyFreshRow() async throws {
+        let (_, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let vm = InboxViewModel(folders: [inbox])
+        // A staged-only row (no durable GRDB copy) with an EMPTY staged
+        // snippet — this field NEVER changes for the rest of the test, so
+        // every `compose` re-synthesizes the row with an empty snippet via
+        // `StagedInboxRow.toMessageHeader()`, exactly like a durable-less
+        // push whose provider snippet was blank.
+        let row = StagedInboxRow(
+            accountId: "acc1", folderPath: "INBOX", messageId: "m-g1-snippet-fill",
+            rfc822MessageId: nil, threadId: nil, inReplyTo: nil, references: [],
+            subject: "Subj", senderName: "Sender", senderAddress: "s@example.com",
+            to: "me@example.com", snippet: "", date: Date(),
+            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+            isForwarded: false, actionTag: nil, summaryBlurb: nil
+        )
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        vm.insertStagedRows([row])
+        #expect(vm.loadedMessages.count == 1)
+        let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-g1-snippet-fill")
+        #expect(vm.loadedMessages.first { $0.id == id }?.snippet.isEmpty == true)
+
+        // Seed the REAL FTS index (`SearchIndex.shared` — a process-wide
+        // singleton, decoupled from the `AppDatabase.shared` swap; same
+        // pattern as `SelfHealBackfillFTSTests`) with body text for this
+        // headerId, so `loadSnippetBatch`'s tier-1 lookup can find it and
+        // perform the REAL in-place fill (`loadedMessages[idx].snippet =
+        // snippet`, InboxViewModel.swift ~1336) — the exact mechanism
+        // `flushAIBatch`'s snippet-fallback comment documents.
+        _ = try await SearchIndex.shared.indexHeaders([
+            FTSHeaderRecord(
+                headerId: id, messageId: "m-g1-snippet-fill", subject: "Subj",
+                from: "Sender", to: "me@example.com",
+                dateMs: Int64(Date().timeIntervalSince1970 * 1000)
+            )
+        ])
+        try await SearchIndex.shared.updateBody(
+            headerId: id, body: "This is the real message body used to drive the in-place snippet fill."
+        )
+
+        // Drive the real public entry point — debounces 100ms then runs
+        // loadSnippetBatch's tier-0 (DB/staged-header miss) → tier-1 (FTS hit).
+        guard let snapshot = vm.loadedMessages.first(where: { $0.id == id }) else {
+            Issue.record("staged row not inserted"); return
+        }
+        vm.requestSnippetIfNeeded(for: snapshot)
+
+        var filledSnippet: String?
+        for _ in 0..<40 {
+            if let s = vm.loadedMessages.first(where: { $0.id == id })?.snippet, !s.isEmpty {
+                filledSnippet = s
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard let filledSnippet else {
+            Issue.record("SnippetLoader tier-1 in-place fill did not land — test setup issue, not the fix under test")
+            try? await SearchIndex.shared.removeMessages(headerIds: [id])
+            return
+        }
+
+        // The staged snapshot in S is UNCHANGED (still empty) — every
+        // compose re-synthesizes the row from it via `toMessageHeader()`.
+        await vm.reloadMessages()
+
+        let reloaded = vm.loadedMessages.first { $0.id == id }
+        #expect(
+            reloaded?.snippet == filledSnippet,
+            "Pass-1 let an empty fresh snippet clobber the SnippetLoader's in-place fill"
+        )
+        try? await SearchIndex.shared.removeMessages(headerIds: [id])
+    }
+
+    @Test("Pass-1 does NOT over-preserve: a durable fresh row with a real, DIFFERENT snippet/computedThreadId always wins")
+    func pass1FreshNonEmptyValuesWinOverExisting() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        var header = MessageHeader(
+            messageId: "m1", subject: "Subj", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date(), snippet: "old snippet",
+            folderId: inbox.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        header.headerComplete = true
+        header.computedThreadId = "thread-old"
+        let headerId = header.id
+        let headerToInsert = header
+        try await pool.writeWithoutTransaction { db in try headerToInsert.insert(db) }
+
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(vm.loadedMessages.count == 1)
+        guard vm.loadedMessages.count == 1 else { return }
+        #expect(vm.loadedMessages[0].snippet == "old snippet")
+        #expect(vm.loadedMessages[0].computedThreadId == "thread-old")
+
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET snippet = ?, computedThreadId = ? WHERE id = ?",
+                arguments: ["new snippet", "thread-new", headerId]
+            )
+        }
+
+        await vm.reloadMessages()
+        #expect(vm.loadedMessages.count == 1)
+        guard vm.loadedMessages.count == 1 else { return }
+        #expect(vm.loadedMessages[0].snippet == "new snippet")
+        #expect(vm.loadedMessages[0].computedThreadId == "thread-new")
+    }
 }

@@ -197,6 +197,63 @@ struct InboxStagedInsertTests {
     }
 
     @MainActor
+    @Test("G3: identity dedup rejects a UID collision with an on-screen row when both sides' rfc822 are known and DISAGREE — both rows render")
+    func identityDedupRejectsCrossFolderUidCollisionWithDifferingRfc822() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in let f = updates; try f.insert(db) }
+        var durable = MessageHeader(
+            messageId: "1000", subject: "On screen", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        durable.headerComplete = true
+        durable.rfc822MessageId = "<y@example.com>"
+        try pool.writeWithoutTransaction { db in try durable.insert(db) }
+        let vm = InboxViewModel(folders: [folder, updates])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+        // Same account + raw UID ("1000") as the on-screen row, different
+        // folder → different headerId, and a DIFFERENT rfc822 — provably a
+        // different message (IMAP UIDs are per-folder, ADR-IOS-042). Pre-G3
+        // fix, the bare (accountId, messageId) comparator wrongly treated
+        // this as a duplicate of the on-screen row and dropped it.
+        vm.insertStagedRows([makeStagedRow(folderPath: "Updates", messageId: "1000", rfc822: "<z@example.com>")])
+        #expect(vm.loadedMessages.count == 2, "the genuinely different message must NOT be suppressed by the UID collision")
+    }
+
+    @MainActor
+    @Test("identity dedup: collision with rfc822 known on only ONE side still dedups (conservative default, unchanged by G3)")
+    func identityDedupStillMatchesWhenOnlyOneSideHasRfc822() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in let f = updates; try f.insert(db) }
+        var durable = MessageHeader(
+            messageId: "1000", subject: "Dup", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "d",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        durable.headerComplete = true
+        durable.rfc822MessageId = "<known@example.com>"
+        try pool.writeWithoutTransaction { db in try durable.insert(db) }
+        let vm = InboxViewModel(folders: [folder, updates])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+        // Same account + raw UID, different folder → different headerId. The
+        // staged row's rfc822 is unknown (nil) — can't PROVE a difference, so
+        // the conservative messageId match still applies (G3 only rejects
+        // when BOTH sides are known and disagree).
+        vm.insertStagedRows([makeStagedRow(folderPath: "Updates", messageId: "1000", rfc822: nil)])
+        #expect(vm.loadedMessages.count == 1, "nil rfc822 on one side must fall back to conservative messageId dedup")
+    }
+
+    @MainActor
     @Test("identity dedup is account-scoped: same messageId on ANOTHER account still inserts")
     func identityDedupAccountScoped() throws {
         let (pool, folder, dir, previous) = try makeTestDB()

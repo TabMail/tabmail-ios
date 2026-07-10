@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// Coverage for the STALE-BY-MOVE DETECTION added to `NSEDataBridge.performMerge`
@@ -80,9 +81,14 @@ struct NSEStaleStagedRowInvalidationTests {
     /// Header-only staged row (`populated=1, aiCompleted=0`), mirroring
     /// `NSEStagingDB.stageHeader` — a gradual row that MERGES but is KEPT in
     /// staging (not deleted) until AI lands, exactly the shape a re-stage of
-    /// an already-archived message would have.
+    /// an already-archived message would have. `date: nil` stages the
+    /// fail-open edge documented at `NSEDataBridge.stagedSetChangedSinceLastPost`
+    /// (~line 172): a nil-date row gets a FRESH `Date()` at every merge's row
+    /// build, so it never compares equal to the post memo and
+    /// `.messagesStaged` suppression never engages for it.
     private func stageHeaderRow(
-        _ q: DatabaseQueue, messageId: String = "msg-1", folderPath: String = "INBOX"
+        _ q: DatabaseQueue, messageId: String = "msg-1", folderPath: String = "INBOX",
+        date: Double? = Double(1_710_000_000)
     ) throws {
         try q.write { db in
             try db.execute(sql: """
@@ -95,7 +101,7 @@ struct NSEStaleStagedRowInvalidationTests {
                         ?, 0, 0, 1)
                 """, arguments: [
                     "acc1:\(messageId)", messageId, "rfc-\(messageId)@example.com", folderPath,
-                    Double(1_710_000_000), Date().timeIntervalSince1970
+                    date, Date().timeIntervalSince1970
                 ])
         }
     }
@@ -249,5 +255,302 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(try stagingRowExists(q, messageId: "msg-new") == true)
         let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
         #expect(stagedRows.contains { $0.headerId == headerId("msg-new") })
+    }
+
+    /// G3 audit (PLAN_INBOX_UNIFIED_READ.md): an UNRELATED durable message
+    /// already living in Archive that happens to share the staged row's raw
+    /// UID (a legitimate per-folder IMAP UID collision, not a move) must NOT
+    /// be mistaken for "the same message moved" — `detectStaleByMoveRows`
+    /// must NOT flag the staged row. Pre-G3, `DurableIdentityLookup.find`'s
+    /// folder-blind `(accountId, messageId)` lookup would land on the
+    /// Archive row regardless of folder, see `folderId != stagedFolderId`,
+    /// and wrongly scrub/suppress the staged row for a completely different
+    /// message.
+    @Test("A staged row colliding on UID with an UNRELATED Archive message (differing rfc822) is NOT flagged stale-by-move — merges normally")
+    func crossFolderUidCollisionIsNotFlaggedStaleByMove() async throws {
+        let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        resetGlobals()
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // An UNRELATED message, already durable in Archive, sharing the SAME
+        // raw UID ("msg-1") the staged row below will carry — but with a
+        // DIFFERENT rfc822MessageId, proving it is genuinely a different
+        // message (IMAP UIDs are per-folder — ADR-IOS-042).
+        let unrelatedArchiveId = "acc1:Archive:msg-1"
+        try await pool.write { db in
+            var header = MessageHeader(
+                messageId: "msg-1", subject: "Unrelated", from: "Bob", fromAddress: "bob@example.com",
+                to: "user@example.com", date: Date(), snippet: "unrelated",
+                folderId: archive.id, accountId: "acc1", folderPath: "Archive", isInInbox: false
+            )
+            header.id = unrelatedArchiveId
+            header.rfc822MessageId = "rfc-unrelated@example.com"
+            header.headerComplete = true
+            try header.insert(db)
+        }
+
+        // `stageHeaderRow`'s deterministic rfc822 is "rfc-msg-1@example.com"
+        // — DIFFERING from the Archive row's "rfc-unrelated@example.com".
+        try stageHeaderRow(q, messageId: "msg-1")
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+
+        // NOT stale-by-move: merged normally into a NEW durable header in
+        // INBOX (the unrelated Archive row is a different message).
+        let merged = try await pool.read { try MessageHeader.fetchOne($0, key: headerId("msg-1")) }
+        #expect(merged != nil, "staged row was wrongly excluded as stale-by-move")
+        #expect(merged?.folderId == inbox.id)
+        #expect(merged?.isInInbox == true)
+
+        // Still a KEPT gradual row (aiCompleted=0) — a stale-by-move
+        // exclusion would have deleted the staging row and scrubbed the
+        // published snapshot instead.
+        #expect(try stagingRowExists(q, messageId: "msg-1") == true)
+        let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
+        #expect(stagedRows.contains { $0.headerId == headerId("msg-1") })
+
+        // The unrelated Archive message is untouched.
+        let stillArchived = try await pool.read { try MessageHeader.fetchOne($0, key: unrelatedArchiveId) }
+        #expect(stillArchived?.folderId == archive.id)
+        #expect(stillArchived?.isInInbox == false)
+    }
+
+    /// F1 (PLAN_INBOX_UNIFIED_READ.md audit): a "scrub-only" merge wake — the
+    /// ONLY staged row this wake is stale-by-move, so after step (a)'s
+    /// exclusion `processed` is empty and NO durable write phase runs
+    /// (`endOfMergeChanged` never flips true). Before the fix, this meant the
+    /// pre-detection `.messagesStaged` post (which already fired WITH the
+    /// now-scrubbed row) had no eviction trigger — a VM that inserted the
+    /// phantom via `insertStagedRows` would show it forever. The fix adds an
+    /// `else if scrubbedStaleStagedRows` branch that posts ONE immediate
+    /// `.inboxDataDidChange` so the reader (which no longer finds the row in
+    /// `latestStagedRows`, and whose stale-by-move suppression rejects it
+    /// regardless — §2.1a) can evict it on the very next reload.
+    @Test("Scrub-only wake (only staged row is stale-by-move) posts exactly ONE immediate inboxDataDidChange")
+    func scrubOnlyWakePostsExactlyOneImmediateReload() async throws {
+        let (dir, pool, _, archive, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        resetGlobals()
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // ── Merge 1: ordinary push arrives, message lands in INBOX as a KEPT
+        // gradual row (header-only, aiCompleted=0). ──
+        try stageHeaderRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        #expect(try stagingRowExists(q) == true)
+
+        // ── User archives the message IN-APP. The staging row (push-time
+        // truth) is untouched — exactly the shape a later, unrelated push
+        // re-staging the SAME message would produce. ──
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderId = ?, isInInbox = 0 WHERE id = ?",
+                arguments: [archive.id, headerId()]
+            )
+        }
+
+        // ── Merge 2: the ONLY staged row is stale-by-move → scrub-only wake.
+        // Count every `.inboxDataDidChange` and whether it carried the
+        // immediate-reload flag. ──
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { note in
+            let imm = (note.userInfo?[Notification.Name.inboxReloadImmediateKey] as? Bool) == true
+            posts.withLock { $0.append(imm) }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let captured = posts.withLock { $0 }
+        #expect(captured.count == 1, "scrub-only wake must post exactly ONE reload to evict the phantom, got \(captured.count)")
+        #expect(captured.first == true, "the scrub-only reload must carry inboxReloadImmediateKey==true")
+
+        // Existing invalidation assertions still hold: staging row deleted,
+        // in-memory snapshot scrubbed.
+        #expect(try stagingRowExists(q) == false)
+        let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
+        #expect(!stagedRows.contains { $0.headerId == headerId() })
+
+        // Durable header UNCHANGED — still archived, not resurrected.
+        let stillArchived = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(stillArchived?.folderId == archive.id)
+        #expect(stillArchived?.isInInbox == false)
+    }
+
+    /// F1 edge case: at-least-once REDELIVERY of the same stale identity
+    /// AFTER a scrub-only wake already evicted it once. Two independent
+    /// wakes, each its own scrub-only wake, must EACH post exactly one
+    /// immediate reload — no accumulation across wakes, and no suppression
+    /// on the second wake. The redelivered row is staged with `date: nil`,
+    /// the fail-open edge in `stagedSetChangedSinceLastPost` (NSEDataBridge.swift
+    /// ~172-180): a nil-date row gets a FRESH `Date()` at every merge's row
+    /// build, so it never compares equal to the post memo and
+    /// `.messagesStaged`'s OWN suppression never engages for it (it would
+    /// re-post on every wake regardless of content). This proves F1's
+    /// `scrubbedStaleStagedRows` gate is independent of — and does not
+    /// double-fire alongside — `.messagesStaged`'s unrelated suppression
+    /// state: the eviction post fires once per wake because `staleByMove`
+    /// was non-empty THIS wake, not because of anything about the
+    /// `.messagesStaged` post's own dedup.
+    @Test("Redelivery (two-wake): a stale-by-move row re-staged after the scrub-only wake evicted it once is scrubbed AGAIN with its own single immediate reload — no accumulation, no suppression on wake 2")
+    func redeliveredStaleRowIsScrubbedAgainOnSecondWake() async throws {
+        let (dir, pool, _, archive, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        resetGlobals()
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // ── Merge 1: ordinary push, kept gradual row. ──
+        try stageHeaderRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        #expect(try stagingRowExists(q) == true)
+
+        // ── User archives IN-APP. ──
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderId = ?, isInInbox = 0 WHERE id = ?",
+                arguments: [archive.id, headerId()]
+            )
+        }
+
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { note in
+            let imm = (note.userInfo?[Notification.Name.inboxReloadImmediateKey] as? Bool) == true
+            posts.withLock { $0.append(imm) }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        // ── Wake 1: scrub-only wake (same shape as scrubOnlyWakePostsExactlyOneImmediateReload). ──
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(posts.withLock { $0 }.count == 1, "wake 1 must post exactly one immediate reload")
+        #expect(try stagingRowExists(q) == false)
+
+        // ── Redelivery: at-least-once duplicate of the SAME push arrives
+        // AFTER wake 1's delete — deterministic staging id ("acc1:msg-1")
+        // means this is indistinguishable from the original re-stage.
+        // Staged with a nil date (the fail-open edge) so `.messagesStaged`'s
+        // own change-detection can never suppress it — isolates that
+        // F1's eviction post is gated on `scrubbedStaleStagedRows`, not on
+        // whether `.messagesStaged` itself fired this wake. ──
+        posts.withLock { $0 = [] }
+        try stageHeaderRow(q, date: nil)
+
+        // ── Wake 2: a SECOND, independent scrub-only wake. ──
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let secondWakePosts = posts.withLock { $0 }
+        #expect(
+            secondWakePosts.count == 1,
+            "wake 2 must ALSO post exactly one immediate reload — no accumulation, no suppression, got \(secondWakePosts.count)"
+        )
+        #expect(secondWakePosts.first == true)
+
+        // No accumulation: staging row deleted again, snapshot scrubbed again.
+        #expect(try stagingRowExists(q) == false)
+        let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
+        #expect(!stagedRows.contains { $0.headerId == headerId() })
+
+        // Durable header never resurrected across either wake.
+        let stillArchived = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(stillArchived?.folderId == archive.id)
+        #expect(stillArchived?.isInInbox == false)
+    }
+
+    /// MIXED wake: a merge wake whose staging contains BOTH a stale-by-move
+    /// row AND a genuinely new row (durable work happens). `scrubbedStaleStagedRows`
+    /// is set unconditionally whenever `detectStaleByMoveRows` finds ANY stale
+    /// row this wake (NSEDataBridge.swift ~951), independent of whether other
+    /// staged rows in the SAME wake do durable work — so this wake sets BOTH
+    /// `scrubbedStaleStagedRows` (from the stale row) AND `endOfMergeChanged`
+    /// (from the new row's durable header write). The end-of-merge signal
+    /// site is an `if endOfMergeChanged { … } else if scrubbedStaleStagedRows
+    /// { … }` — structurally, the `endOfMergeChanged` branch wins and the
+    /// scrub branch's post is skipped, so a mixed wake must NOT emit a THIRD
+    /// `.inboxDataDidChange` beyond the normal phase-1 + end-of-merge pair.
+    /// Proves the `else if` doesn't silently lose the eviction signal for the
+    /// stale row on a mixed wake — the end-of-merge post covers it too (the
+    /// reader re-evaluates `latestStagedRows`/durable state on every reload
+    /// regardless of which branch posted).
+    @Test("Mixed wake (stale-by-move row + genuinely new row): standard post pattern (≤2 total, no third post from the scrub branch); stale row scrubbed, new row merged durably")
+    func mixedWakeStaleAndNewRowPostsStandardPattern() async throws {
+        let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        resetGlobals()
+        let (path, q) = try makeStagingFile(in: dir)
+
+        // ── Merge 1: ordinary push for "msg-1" arrives, kept gradual row
+        // (header-only, aiCompleted=0). ──
+        try stageHeaderRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        #expect(try stagingRowExists(q) == true)
+
+        // ── User archives "msg-1" IN-APP. The staging row (push-time truth)
+        // is untouched — exactly the shape a later, unrelated push
+        // re-staging the SAME message would produce. ──
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderId = ?, isInInbox = 0 WHERE id = ?",
+                arguments: [archive.id, headerId()]
+            )
+        }
+
+        // ── A genuinely NEW message ("msg-2") is ALSO staged for the SAME
+        // wake — no durable header exists for it anywhere. ──
+        try stageHeaderRow(q, messageId: "msg-2")
+
+        // ── Merge 2: mixed wake. Count every `.inboxDataDidChange`. ──
+        let posts = Mutex<[Bool]>([])
+        let obs = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: .main
+        ) { note in
+            let imm = (note.userInfo?[Notification.Name.inboxReloadImmediateKey] as? Bool) == true
+            posts.withLock { $0.append(imm) }
+        }
+        defer { NotificationCenter.default.removeObserver(obs) }
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let captured = posts.withLock { $0 }
+        #expect(
+            captured.count <= 2,
+            "mixed wake must post AT MOST the standard phase-1 + end-of-merge pair — got \(captured.count), a third post would mean the scrub branch fired alongside endOfMergeChanged"
+        )
+        #expect(!captured.isEmpty, "mixed wake did real durable work (msg-2) and must post at least one reload")
+        #expect(captured.allSatisfy { $0 == true }, "every post this wake must carry the immediate-reload flag")
+
+        // Stale row ("msg-1"): staging deleted, snapshot scrubbed, durable
+        // header UNCHANGED (still archived, not resurrected).
+        #expect(try stagingRowExists(q) == false, "msg-1's staging row must be deleted (stale-by-move)")
+        let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
+        #expect(!stagedRows.contains { $0.headerId == headerId() }, "msg-1 must be scrubbed from the published staged snapshot")
+        let stillArchived = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(stillArchived?.folderId == archive.id)
+        #expect(stillArchived?.isInInbox == false)
+
+        // New row ("msg-2"): merged durably into INBOX.
+        let newHeader = try await pool.read { try MessageHeader.fetchOne($0, key: headerId("msg-2")) }
+        #expect(newHeader != nil, "msg-2 must merge durably despite msg-1's stale-by-move exclusion in the SAME wake")
+        #expect(newHeader?.folderId == inbox.id)
+        #expect(newHeader?.isInInbox == true)
     }
 }

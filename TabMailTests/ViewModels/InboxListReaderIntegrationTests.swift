@@ -242,6 +242,104 @@ struct InboxListReaderIntegrationTests {
         #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the undo shape")
     }
 
+    // MARK: - (g) label filter: a genuinely-labeled durable row survives
+    // (audit round 4: compose step 6's D/P/S uniform label filter has
+    // negative-path coverage — unlabeledExcludesUnlabeledStagedRowEverywhere/
+    // labelFilterDropsStagedRows — but no positive path proving a REAL label
+    // makes it through the reader's D query + UserLabelStore batch load.)
+
+    @Test("label filter: a genuinely-labeled durable row survives an active label filter via BOTH fetch variants, with userLabels populated; an unlabeled durable sibling drops")
+    func labeledDurableRowSurvivesLabelFilter() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let labeled = makeDurableHeader(folder: inbox, messageId: "m-labeled")
+        let unlabeled = makeDurableHeader(folder: inbox, messageId: "m-unlabeled")
+        try await pool.writeWithoutTransaction { db in
+            let l = labeled; try l.insert(db)
+            let u = unlabeled; try u.insert(db)
+            try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+        }
+        let q = query(folders: [inbox], filterLabelIds: ["label-x"])
+
+        let asyncResult = await InboxListReader.fetch(folders: [inbox], query: q)
+        #expect(asyncResult.count == 1, "expected exactly the labeled row to survive the label filter (async)")
+        guard asyncResult.count == 1 else { return }
+        #expect(asyncResult.first?.id == labeled.id)
+        #expect(
+            asyncResult.first?.userLabels.map(\.id) == ["label-x"],
+            "userLabels not populated on the surviving durable snapshot (async)"
+        )
+        #expect(!asyncResult.contains { $0.id == unlabeled.id }, "unlabeled durable sibling leaked through the label filter")
+
+        let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
+        #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the durable label filter")
+        #expect(
+            syncResult.first?.userLabels.map(\.id) == ["label-x"],
+            "userLabels not populated on the surviving durable snapshot (sync)"
+        )
+    }
+
+    // MARK: - (h) label filter: a genuinely-labeled overlay-pinned (undo-shape) row survives
+
+    @Test("label filter: a genuinely-labeled overlay-pinned (undo-shape) row survives an active label filter via BOTH fetch variants, with userLabels populated; an unlabeled archived+pinned sibling drops")
+    func labeledPinnedRowSurvivesLabelFilter() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let labeled = makeDurableHeader(folder: archive, messageId: "m-undo-labeled", isInInbox: false)
+        let unlabeled = makeDurableHeader(folder: archive, messageId: "m-undo-unlabeled", isInInbox: false)
+        try await pool.writeWithoutTransaction { db in
+            let l = labeled; try l.insert(db)
+            let u = unlabeled; try u.insert(db)
+            try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+        }
+
+        // Mirror UndoService.undo()'s .move case for BOTH messages — overlay
+        // registered, deferred DB restore write NOT landed yet (the "undo
+        // shape" pinnedStepRestoresUndoneRow above exercises unlabeled).
+        AccountManager.shared.registerMutation(id: labeled.id, mutation: .init(
+            folderId: inbox.id, folderPath: inbox.path, isInInbox: true
+        ))
+        AccountManager.shared.registerMutation(id: unlabeled.id, mutation: .init(
+            folderId: inbox.id, folderPath: inbox.path, isInInbox: true
+        ))
+        let q = query(folders: [inbox], filterLabelIds: ["label-x"])
+
+        let asyncResult = await InboxListReader.fetch(folders: [inbox], query: q)
+        #expect(asyncResult.count == 1, "expected exactly the labeled pinned row to survive the label filter (async)")
+        guard asyncResult.count == 1 else { return }
+        #expect(asyncResult.first?.id == labeled.id)
+        #expect(asyncResult.first?.isInInbox == true, "overlay isInInbox not applied to the surviving pinned row")
+        #expect(
+            asyncResult.first?.userLabels.map(\.id) == ["label-x"],
+            "userLabels not populated on the surviving pinned snapshot (async)"
+        )
+        #expect(
+            !asyncResult.contains { $0.id == unlabeled.id },
+            "unlabeled archived+pinned sibling leaked through the label filter"
+        )
+
+        let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
+        #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the pinned label filter")
+        #expect(
+            syncResult.first?.userLabels.map(\.id) == ["label-x"],
+            "userLabels not populated on the surviving pinned snapshot (sync)"
+        )
+    }
+
     // MARK: - (e) §5A.3 contract parity: pure identity mirror vs DurableIdentityLookup
 
     @Test("contract parity: the scenario harness's pure identity mirror agrees with DurableIdentityLookup.find over a fixture set (primary hit / rfc822 fallback / absent / other-account)")
@@ -280,35 +378,74 @@ struct InboxListReaderIntegrationTests {
             )
         }
 
-        // Probe set: primary hit, rfc822 fallback (UID remap), fallback
-        // guards (nil/empty rfc822), absent identity, other-account scoping.
-        let probes: [(accountId: String, messageId: String, rfc822: String?)] = [
-            ("acc1", "m-primary", nil),                       // primary hit
-            ("acc1", "m-primary", "rfc-p@example.com"),       // primary hit with rfc822 present
-            ("acc1", "111", "rfc-f@example.com"),             // rfc822 fallback (UID remap)
-            ("acc1", "111", nil),                             // fallback NOT taken (nil rfc822)
-            ("acc1", "111", ""),                              // fallback NOT taken (empty rfc822)
-            ("acc1", "m-absent", "rfc-absent@example.com"),   // absent identity
-            ("acc1", "m-shared", nil),                        // other-account scoping → nil
-            ("acc2", "m-shared", nil),                        // other-account own hit
+        // Probe set: exact-folder hit, folder-blind hit, rfc822 fallback (UID
+        // remap), fallback guards (nil/empty rfc822), absent identity,
+        // other-account scoping, and the G3 cross-folder-collision cases.
+        let probes: [(accountId: String, folderPath: String, messageId: String, rfc822: String?)] = [
+            ("acc1", "INBOX", "m-primary", nil),                       // exact-folder hit
+            ("acc1", "INBOX", "m-primary", "rfc-p@example.com"),       // exact-folder hit with rfc822 present
+            ("acc1", "Archive", "m-primary", nil),                     // folder-blind hit (queried folder wrong)
+            ("acc1", "INBOX", "111", "rfc-f@example.com"),             // rfc822 fallback (UID remap)
+            ("acc1", "INBOX", "111", nil),                             // fallback NOT taken (nil rfc822)
+            ("acc1", "INBOX", "111", ""),                              // fallback NOT taken (empty rfc822)
+            ("acc1", "INBOX", "m-absent", "rfc-absent@example.com"),   // absent identity
+            ("acc1", "INBOX", "m-shared", nil),                        // other-account scoping → nil
+            ("acc2", "INBOX", "m-shared", nil),                        // other-account own hit
+            // G3: cross-folder UID collision (`remapped`, messageId "999",
+            // lives in Archive) probed FROM INBOX with a disagreeing rfc822
+            // — provable non-match, must reject the folder-blind hit.
+            ("acc1", "INBOX", "999", "rfc-different@example.com"),
         ]
 
         for probe in probes {
             let real = try pool.read { db in
                 try DurableIdentityLookup.find(
-                    db: db, accountId: probe.accountId,
+                    db: db, accountId: probe.accountId, folderPath: probe.folderPath,
                     messageId: probe.messageId, rfc822MessageId: probe.rfc822
                 )
             }
             let mirrored = SimIdentityMirror.find(
-                rows: mirrorRows, accountId: probe.accountId,
+                rows: mirrorRows, accountId: probe.accountId, folderPath: probe.folderPath,
                 messageId: probe.messageId, rfc822MessageId: probe.rfc822
             )
             #expect(
                 real == mirrored,
-                "identity contract diverged for probe (\(probe.accountId), \(probe.messageId), \(probe.rfc822 ?? "nil")): real=\(String(describing: real)) mirror=\(String(describing: mirrored))"
+                "identity contract diverged for probe (\(probe.accountId), \(probe.folderPath), \(probe.messageId), \(probe.rfc822 ?? "nil")): real=\(String(describing: real)) mirror=\(String(describing: mirrored))"
             )
         }
+    }
+
+    // MARK: - (i) G3 audit: cross-folder UID collision does not suppress a staged row
+
+    @Test("cross-folder UID collision: an unrelated Archive row sharing the UID but with a DIFFERING rfc822 does not suppress the staged INBOX row (G3 exact-folder-first + rfc822-mismatch rejection)")
+    func crossFolderUidCollisionDifferingRfc822DoesNotSuppressStagedRow() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        // Unrelated durable message in Archive sharing the SAME raw UID as
+        // the staged row below — a legitimate per-folder IMAP UID collision,
+        // not a move — but with a DIFFERENT rfc822 identity.
+        let unrelatedArchive = makeDurableHeader(
+            folder: archive, messageId: "101", rfc822MessageId: "rfc-unrelated@example.com", isInInbox: false
+        )
+        try await pool.writeWithoutTransaction { db in try unrelatedArchive.insert(db) }
+
+        let staged = makeStagedRow(messageId: "101", rfc822MessageId: "rfc-staged@example.com")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [staged] }
+        let q = query(folders: [inbox])
+
+        let asyncResult = await InboxListReader.fetch(folders: [inbox], query: q)
+        #expect(asyncResult.count == 1, "unrelated cross-folder UID collision wrongly suppressed the staged row (async)")
+        #expect(asyncResult.first?.messageId == "101")
+
+        let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
+        #expect(syncResult.count == 1, "unrelated cross-folder UID collision wrongly suppressed the staged row (sync)")
+        #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the cross-folder collision case")
     }
 
     // MARK: - (f) the §2.1a window against a real DB

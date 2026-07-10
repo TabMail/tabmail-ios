@@ -13,7 +13,15 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
     let accountId: String
     let messageId: String
     let threadId: String?
-    let computedThreadId: String
+    // var (not let): reloadMessages' Pass-1 retains an existing NON-EMPTY
+    // computedThreadId when a same-identity fresh row arrives with an EMPTY
+    // one (G1 audit fix — mirrors the `tagSortOrder` var doc comment below).
+    // A staged-only row's group key can regress to empty when the reader's
+    // in-memory thread adoption misses on a given reload (its adopted
+    // parent evicted from the D∪P window, or re-keyed by a UID remap) even
+    // though the on-screen row already carries the real, previously-adopted
+    // value — see InboxViewModel.reloadMessages.
+    var computedThreadId: String
     let rfc822MessageId: String?
     let inReplyTo: String?
     let references: [String]

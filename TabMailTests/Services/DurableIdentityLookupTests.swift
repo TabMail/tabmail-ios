@@ -64,8 +64,12 @@ struct DurableIdentityLookupTests {
         let header = makeHeader(messageId: "111")
         try pool.write { db in try header.insert(db) }
 
+        // Same folderPath as the durable row — exercises the new step-1
+        // exact-folder match, which subsumes the old "primary" behavior.
         let ref = try pool.read { db in
-            try DurableIdentityLookup.find(db: db, accountId: "acc1", messageId: "111", rfc822MessageId: nil)
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "111", rfc822MessageId: nil
+            )
         }
         #expect(ref?.id == header.id)
     }
@@ -84,7 +88,8 @@ struct DurableIdentityLookupTests {
 
         let ref = try pool.read { db in
             try DurableIdentityLookup.find(
-                db: db, accountId: "acc1", messageId: "111", rfc822MessageId: "rfc-abc@example.com"
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "111",
+                rfc822MessageId: "rfc-abc@example.com"
             )
         }
         #expect(ref?.id == header.id)
@@ -102,7 +107,9 @@ struct DurableIdentityLookupTests {
         try pool.write { db in try header.insert(db) }
 
         let ref = try pool.read { db in
-            try DurableIdentityLookup.find(db: db, accountId: "acc1", messageId: "111", rfc822MessageId: nil)
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "111", rfc822MessageId: nil
+            )
         }
         #expect(ref == nil)
     }
@@ -117,7 +124,9 @@ struct DurableIdentityLookupTests {
         try pool.write { db in try header.insert(db) }
 
         let ref = try pool.read { db in
-            try DurableIdentityLookup.find(db: db, accountId: "acc1", messageId: "111", rfc822MessageId: "")
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "111", rfc822MessageId: ""
+            )
         }
         #expect(ref == nil)
     }
@@ -131,7 +140,7 @@ struct DurableIdentityLookupTests {
 
         let ref = try pool.read { db in
             try DurableIdentityLookup.find(
-                db: db, accountId: "acc1", messageId: "does-not-exist", rfc822MessageId: nil
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "does-not-exist", rfc822MessageId: nil
             )
         }
         #expect(ref == nil)
@@ -147,7 +156,9 @@ struct DurableIdentityLookupTests {
         try pool.write { db in try header.insert(db) }
 
         let ref = try pool.read { db in
-            try DurableIdentityLookup.find(db: db, accountId: "acc1", messageId: "shared-id", rfc822MessageId: nil)
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "shared-id", rfc822MessageId: nil
+            )
         }
         #expect(ref == nil)
     }
@@ -164,13 +175,155 @@ struct DurableIdentityLookupTests {
         )
         try pool.write { db in try header.insert(db) }
 
+        // Matching folderPath — exercises the step-1 exact-folder match.
         let ref = try pool.read { db in
-            try DurableIdentityLookup.find(db: db, accountId: "acc1", messageId: "42", rfc822MessageId: nil)
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "Archive", messageId: "42", rfc822MessageId: nil
+            )
         }
         #expect(ref?.id == header.id)
         #expect(ref?.folderId == header.folderId)
         #expect(ref?.folderPath == "Archive")
         #expect(ref?.isInInbox == false)
         #expect(ref?.rfc822MessageId == "r@example.com")
+    }
+
+    // MARK: - (h/e) G3 audit: exact-folder-first precedence
+
+    @Test("exact-folder match takes precedence over a folder-blind hit — same (accountId, messageId) in two folders resolves to the QUERIED folder's row")
+    func exactFolderPrecedence() throws {
+        let (pool, dir) = try makeTestPool()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Same accountId + messageId ("42"), two different folders — a
+        // legitimate per-folder IMAP UID collision (not a move).
+        let inboxHeader = makeHeader(folderPath: "INBOX", messageId: "42")
+        let archiveHeader = makeHeader(folderPath: "Archive", messageId: "42")
+        try pool.write { db in
+            try inboxHeader.insert(db)
+            try archiveHeader.insert(db)
+        }
+
+        let refInbox = try pool.read { db in
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "42", rfc822MessageId: nil
+            )
+        }
+        #expect(refInbox?.id == inboxHeader.id)
+        #expect(refInbox?.folderPath == "INBOX")
+
+        let refArchive = try pool.read { db in
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "Archive", messageId: "42", rfc822MessageId: nil
+            )
+        }
+        #expect(refArchive?.id == archiveHeader.id)
+        #expect(refArchive?.folderPath == "Archive")
+    }
+
+    // MARK: - (h/f) G3 audit: cross-folder UID collision, differing rfc822 → rejected
+
+    @Test("cross-folder UID collision with DIFFERING non-nil rfc822MessageId on both sides is rejected — falls through to the rfc822 step, which also misses, → nil")
+    func crossFolderCollisionDifferingRfc822Rejected() throws {
+        let (pool, dir) = try makeTestPool()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // A DIFFERENT message living in Archive that happens to share the
+        // UID ("88") the caller is probing for in INBOX.
+        let archived = makeHeader(folderPath: "Archive", messageId: "88", rfc822MessageId: "rfc-real@example.com")
+        try pool.write { db in try archived.insert(db) }
+
+        let ref = try pool.read { db in
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "88",
+                rfc822MessageId: "rfc-staged@example.com"
+            )
+        }
+        #expect(ref == nil, "folder-blind false match was not rejected despite disagreeing non-nil rfc822 identities")
+    }
+
+    // MARK: - (h/g) G3 audit: cross-folder UID collision, candidate rfc822 nil → retained
+
+    @Test("cross-folder UID collision where the durable candidate's rfc822MessageId is nil → folder-blind match RETAINED (conservative: can't prove a difference)")
+    func crossFolderCollisionCandidateRfc822NilRetainsMatch() throws {
+        let (pool, dir) = try makeTestPool()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let archived = makeHeader(folderPath: "Archive", messageId: "77", rfc822MessageId: nil)
+        try pool.write { db in try archived.insert(db) }
+
+        let ref = try pool.read { db in
+            try DurableIdentityLookup.find(
+                db: db, accountId: "acc1", folderPath: "INBOX", messageId: "77",
+                rfc822MessageId: "rfc-staged@example.com"
+            )
+        }
+        #expect(ref?.id == archived.id, "folder-blind match with no evidence of a difference should be retained")
+    }
+
+    // MARK: - (i) `isSameLogicalMessage` — in-memory comparator truth table
+    //
+    // G3 in-memory-comparator hardening (DECISIONS.md ADR-IOS-055 audit round
+    // 3): `isSameLogicalMessage` is the pure IN-MEMORY counterpart of `find`'s
+    // step-2 rejection above, shared by `InboxListComposer.isDuplicateIdentity`
+    // and `InboxViewModel.insertStagedRows`' inline dedup check. No DB
+    // involved — every case below is a direct call.
+
+    @Test("isSameLogicalMessage: different accountId → false")
+    func sameLogicalMessageDifferentAccountIsFalse() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "1", rfc822MessageId: "<a@example.com>",
+            candidateAccountId: "acc2", candidateMessageId: "1", candidateRfc822MessageId: "<a@example.com>"
+        ) == false)
+    }
+
+    @Test("isSameLogicalMessage: both rfc822 known and AGREE, DIFFERING messageId → true (UID-remap duplicate)")
+    func sameLogicalMessageRfc822AgreeDifferingMessageIdIsTrue() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "111", rfc822MessageId: "<a@example.com>",
+            candidateAccountId: "acc1", candidateMessageId: "999", candidateRfc822MessageId: "<a@example.com>"
+        ) == true)
+    }
+
+    @Test("isSameLogicalMessage: both rfc822 known and AGREE, EQUAL messageId → true (same-folder redelivery / Gmail dual-label)")
+    func sameLogicalMessageRfc822AgreeSameMessageIdIsTrue() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "111", rfc822MessageId: "<a@example.com>",
+            candidateAccountId: "acc1", candidateMessageId: "111", candidateRfc822MessageId: "<a@example.com>"
+        ) == true)
+    }
+
+    @Test("isSameLogicalMessage: both rfc822 known and DISAGREE, equal messageId → false — the ONLY behavior change vs. the old bare-messageId comparator")
+    func sameLogicalMessageRfc822DisagreeSameMessageIdIsFalse() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "111", rfc822MessageId: "<a@example.com>",
+            candidateAccountId: "acc1", candidateMessageId: "111", candidateRfc822MessageId: "<b@example.com>"
+        ) == false)
+    }
+
+    @Test("isSameLogicalMessage: rfc822 unknown on one side, equal messageId → true (conservative default, unchanged)")
+    func sameLogicalMessageOneSideRfc822UnknownSameMessageIdIsTrue() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "111", rfc822MessageId: nil,
+            candidateAccountId: "acc1", candidateMessageId: "111", candidateRfc822MessageId: "<a@example.com>"
+        ) == true)
+        // Empty string is "unknown" too, same as nil.
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "111", rfc822MessageId: "<a@example.com>",
+            candidateAccountId: "acc1", candidateMessageId: "111", candidateRfc822MessageId: ""
+        ) == true)
+    }
+
+    @Test("isSameLogicalMessage: rfc822 unknown on both sides, DIFFERING messageId → false")
+    func sameLogicalMessageBothRfc822UnknownDifferingMessageIdIsFalse() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "111", rfc822MessageId: nil,
+            candidateAccountId: "acc1", candidateMessageId: "222", candidateRfc822MessageId: nil
+        ) == false)
+    }
+
+    @Test("isSameLogicalMessage: empty messageId never matches, even against an equally-empty candidate messageId (mirrors the old `!row.messageId.isEmpty` guard)")
+    func sameLogicalMessageEmptyMessageIdNeverMatches() {
+        #expect(DurableIdentityLookup.isSameLogicalMessage(
+            accountId: "acc1", messageId: "", rfc822MessageId: nil,
+            candidateAccountId: "acc1", candidateMessageId: "", candidateRfc822MessageId: nil
+        ) == false)
     }
 }

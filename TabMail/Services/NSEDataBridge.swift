@@ -672,7 +672,7 @@ enum NSEDataBridge {
             var durable: Set<String> = []
             for msg in candidates {
                 guard let ref = try DurableIdentityLookup.find(
-                    db: db, accountId: msg.accountId, messageId: msg.messageId,
+                    db: db, accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId,
                     rfc822MessageId: msg.rfc822MessageId
                 ) else { continue }
                 if msg.htmlContent != nil || msg.textContent != nil {
@@ -724,7 +724,7 @@ enum NSEDataBridge {
             var stale: [StaleByMoveRow] = []
             for msg in processed {
                 guard let ref = try DurableIdentityLookup.find(
-                    db: db, accountId: msg.accountId, messageId: msg.messageId,
+                    db: db, accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId,
                     rfc822MessageId: msg.rfc822MessageId
                 ) else { continue } // no durable header yet — an ordinary new message, not stale
                 let stagedFolderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
@@ -814,6 +814,14 @@ enum NSEDataBridge {
         // past the header doesn't fire a redundant reload. Phase 1's own render is
         // gated separately on headers becoming newly visible.
         var endOfMergeChanged = false
+        // F1 (PLAN_INBOX_UNIFIED_READ.md audit): set true when the stale-by-move
+        // scrub below removes rows the pre-detection `.messagesStaged` post
+        // already published. If the rest of this wake does no durable work
+        // (`endOfMergeChanged` stays false), there is otherwise NO eviction
+        // trigger for a phantom row the VM may have inserted from that post —
+        // drives the scrub-only-wake `else if` branch at the end-of-merge
+        // signal site below.
+        var scrubbedStaleStagedRows = false
 
         // Age window after which a still-incomplete (populated=1, aiCompleted=0)
         // GRADUAL staging row is treated as abandoned — its NSE died before
@@ -940,6 +948,7 @@ enum NSEDataBridge {
         // ============================================================
         let staleByMove = await Self.detectStaleByMoveRows(processed)
         if !staleByMove.isEmpty {
+            scrubbedStaleStagedRows = true
             let staleStagingIds = Set(staleByMove.map(\.id))
             let staleHeaderIds = staleByMove.map(\.headerId)
 
@@ -967,12 +976,13 @@ enum NSEDataBridge {
             // included (deliberately not delayed for this check), so the VM
             // may have just inserted the phantom via `insertStagedRows`.
             // PLAN_INBOX_UNIFIED_READ.md §3: no eviction notification needed —
-            // the scrub here means the NEXT reload's `InboxListReader` read no
-            // longer finds the row in `latestStagedRows`, and its stale-by-move
-            // durable header (§2.1a) also suppresses it, so the reader
-            // structurally converges without a VM-side eviction handler. Any
-            // phantom the earlier post inserted is a bounded, self-correcting
-            // transient (§2.2/§4.4-4) until that reload lands.
+            // `scrubbedStaleStagedRows` (set above) drives an explicit
+            // immediate-reload post at the end-of-merge signal site below (F1:
+            // the scrub-only-wake branch) so a reload is guaranteed even when
+            // no durable work follows this wake. Once that reload lands, the
+            // reader no longer finds the row in `latestStagedRows`, and its
+            // stale-by-move durable header (§2.1a) also suppresses it, so the
+            // reader structurally converges and the phantom is evicted.
             let staleHeaderIdSet = Set(staleHeaderIds)
             latestStagedRows.withLock { rows in
                 rows.removeAll { staleHeaderIdSet.contains($0.headerId) }
@@ -1071,8 +1081,8 @@ enum NSEDataBridge {
                                 // then rfc822 fallback for IMAP UID remaps —
                                 // mirrors phase 2's lookup.
                                 let existingRef = try DurableIdentityLookup.find(
-                                    db: db, accountId: msg.accountId, messageId: msg.messageId,
-                                    rfc822MessageId: msg.rfc822MessageId
+                                    db: db, accountId: msg.accountId, folderPath: msg.folderPath,
+                                    messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId
                                 )
                                 if let id = existingRef?.id {
                                     // Already visible (sync or a prior merge). SEED
@@ -1311,8 +1321,8 @@ enum NSEDataBridge {
                                 // keyed on the new UID, which the user sees as two
                                 // copies of the same email.
                                 let existingRef = try DurableIdentityLookup.find(
-                                    db: db, accountId: msg.accountId, messageId: msg.messageId,
-                                    rfc822MessageId: msg.rfc822MessageId
+                                    db: db, accountId: msg.accountId, folderPath: msg.folderPath,
+                                    messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId
                                 )
                                 if let ref = existingRef {
                                     let headerId: String = ref.id
@@ -1870,6 +1880,29 @@ enum NSEDataBridge {
             }
             if mergedBodyLessRow {
                 Task { await ActiveBodyQueue.shared.repopulateFromDatabase() }
+            }
+        } else if scrubbedStaleStagedRows {
+            // F1 (PLAN_INBOX_UNIFIED_READ.md audit): scrub-only wake — the
+            // stale-by-move block above scrubbed rows the pre-detection
+            // `.messagesStaged` post already published, but nothing durable
+            // happened this wake (`endOfMergeChanged` is false), so there is
+            // otherwise no eviction trigger for a phantom row the VM may have
+            // inserted from that post. Post ONLY the immediate reload — not
+            // `.nseMergeDidCommit` (its contract is durable-render points
+            // only, and nothing durable landed) and not the ActiveBodyQueue
+            // kick (no body work happened). The reader no longer finds the
+            // row in `latestStagedRows` (scrubbed above), and its
+            // stale-by-move durable header suppresses it regardless (§2.1a),
+            // so this reload evicts the phantom promptly. A MIXED wake (some
+            // durable work alongside the scrub) takes the `endOfMergeChanged`
+            // branch above instead, so this `else if` structurally preserves
+            // the ≤2-posts-per-wake contract.
+            Task { @MainActor in
+                NotificationCenter.default.post(
+                    name: .inboxDataDidChange,
+                    object: nil,
+                    userInfo: [Notification.Name.inboxReloadImmediateKey: true]
+                )
             }
         }
 

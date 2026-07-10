@@ -713,15 +713,20 @@ final class InboxViewModel {
             // fallback — any skew (IMAP UID remap, folderPath variant, durable copy
             // already on screen under a different headerId) would insert a DUPLICATE
             // phantom row that no GRDB reload ever evicts. Match the merge's
-            // identity in-memory (zero DB I/O on the render path). Account-scoped:
-            // messageId alone collides across accounts.
+            // identity in-memory (zero DB I/O on the render path) via
+            // `DurableIdentityLookup.isSameLogicalMessage` — the G3-hardened
+            // comparator shared with `InboxListComposer.isDuplicateIdentity`: a
+            // bare (accountId, messageId) collision no longer counts as a
+            // duplicate when both sides' rfc822 identities are known and
+            // disagree (IMAP UIDs are per-folder, ADR-IOS-042 — a shared UID
+            // across folders can be an unrelated message, not a move). See that
+            // helper's doc comment for the full truth table.
             let isDuplicateIdentity = loadedMessages.contains { snap in
-                guard snap.accountId == row.accountId else { return false }
-                if !row.messageId.isEmpty, snap.messageId == row.messageId { return true }
-                if let rfc = row.rfc822MessageId, !rfc.isEmpty,
-                   let snapRfc = snap.rfc822MessageId, !snapRfc.isEmpty,
-                   rfc == snapRfc { return true }
-                return false
+                DurableIdentityLookup.isSameLogicalMessage(
+                    accountId: row.accountId, messageId: row.messageId, rfc822MessageId: row.rfc822MessageId,
+                    candidateAccountId: snap.accountId, candidateMessageId: snap.messageId,
+                    candidateRfc822MessageId: snap.rfc822MessageId
+                )
             }
             guard !isDuplicateIdentity else { continue }
             var header = row.toMessageHeader()
@@ -870,11 +875,47 @@ final class InboxViewModel {
             var indicesToRemove: [Int] = []
             for (i, existing) in loadedMessages.enumerated() {
                 if let fresh = freshById[existing.id] {
+                    var assigned = fresh
+                    // G1 audit fix (PLAN_INBOX_UNIFIED_READ.md): an EMPTY
+                    // fresh field must never clobber a NON-EMPTY on-screen
+                    // enrichment — same "non-empty beats empty" principle as
+                    // flushAIBatch's documented snippet fallback above. A
+                    // staged-only row re-synthesizes both fields from the
+                    // staging snapshot on every compose
+                    // (`StagedInboxRow.toMessageHeader()` / the reader's S-row
+                    // thread adoption), so a same-identity fresh row can
+                    // legitimately arrive with an EMPTY value even though the
+                    // existing row already has a real one — an in-place
+                    // SnippetLoader fill that's ahead of the staging
+                    // snapshot, or a thread-adoption miss this cycle (its
+                    // adopted parent evicted from the D∪P window, or
+                    // re-keyed). A durable fresh row's REAL (non-empty) value
+                    // always wins regardless — this only guards the
+                    // fresh-is-empty case.
+                    if assigned.snippet.isEmpty && !existing.snippet.isEmpty {
+                        assigned.snippet = existing.snippet
+                    }
+                    // Durable rows always have a non-empty computedThreadId —
+                    // `ThreadUtils.assignComputedThreadId` seeds it from the
+                    // message's own (non-empty) id when no thread relation or
+                    // native thread id is found, so it never leaves the field
+                    // empty. Only a staged-only row's synthesized snapshot
+                    // (`StagedInboxRow.toMessageHeader()` doesn't set
+                    // `computedThreadId` at all) can land here empty.
+                    // Reverting it would silently re-collapse a
+                    // user-expanded thread: `ThreadGroupBuilder` keys a
+                    // group by `computedThreadId` (falling back to the
+                    // message's own id only when it's empty), and
+                    // `rebuildDisplayGroups` never migrates
+                    // `expandedThreads` entries to a new key.
+                    if assigned.computedThreadId.isEmpty && !existing.computedThreadId.isEmpty {
+                        assigned.computedThreadId = existing.computedThreadId
+                    }
                     // Only assign if the snapshot actually changed — avoids triggering
                     // @Observable for unchanged rows, preventing unnecessary re-renders
                     // and layout shifts that cause scroll position jumps.
-                    if existing != fresh {
-                        loadedMessages[i] = fresh
+                    if existing != assigned {
+                        loadedMessages[i] = assigned
                     }
                     survivingIds.insert(existing.id)
                 } else {
@@ -1011,7 +1052,10 @@ final class InboxViewModel {
             filterLabelIds: filterLabelIds,
             mode: mode,
             targetCount: targetWindowSize,
-            beforeDate: nil
+            beforeDate: nil,
+            // F2 audit: a full-range reload's diff MUST include already-loaded
+            // rows (that's the point of the diff) — never exclude here.
+            excludeIds: []
         )
         return await InboxListReader.fetch(folders: folders, query: query)
     }
@@ -1083,7 +1127,13 @@ final class InboxViewModel {
             filterLabelIds: filterLabelIds,
             mode: mode,
             targetCount: pageSize,
-            beforeDate: before
+            beforeDate: before,
+            // F2 audit: exclude already-loaded ids INSIDE compose, before its
+            // targetCount trim — an old already-loaded row (triage mode's
+            // sort is not date-monotonic) must not eat a trim slot from a
+            // not-yet-loaded one, which would shrink the page below pageSize
+            // and flip `hasMoreMessages` false prematurely.
+            excludeIds: loadedIds
         )
         let allResults = InboxListReader.fetchSync(folders: folders, query: query)
 
@@ -1098,10 +1148,14 @@ final class InboxViewModel {
             BootProfiler.mark("fetchPage SYNC main-actor total=\(totalMs)ms")
         }
 
-        // Deduplicate against already-loaded messages — pagination-append dedup
-        // is the VM's concern (loadMoreMessages' cursor overlap), not the
-        // reader's; the reader has no notion of what this VM instance already
-        // has on screen.
+        // Belt: `query.excludeIds` above already does this exclusion INSIDE
+        // compose (before its trim), so this should be a no-op in the common
+        // case. Kept as a second layer in case `loadedIds` grew between the
+        // query snapshot above and here (there's no `await` in between today,
+        // but this guards against a future one) — pagination-append dedup is
+        // the VM's concern either way (loadMoreMessages' cursor overlap), not
+        // the reader's; the reader has no notion of what this VM instance
+        // already has on screen.
         let unique = allResults.filter { !loadedIds.contains($0.id) }
         return Array(unique.prefix(pageSize))
     }
