@@ -1480,6 +1480,50 @@ function splitBlockBeforeTarget(targetNode, doc, logFn) {
 }
 """
 
+/// Resolves the boundary text node to the element the quote wrapper is
+/// inserted before ("quoteStart"): climbs from the text node's parent toward
+/// `body` until a block-level element is found.
+///
+/// The climb carries the same prior-content guard as `walkUpToWrapStart`:
+/// if the current (inline) element has a previous sibling with real text,
+/// climbing further would swallow the user's own reply — so the inline
+/// element itself becomes the quoteStart. This handles flat webmail HTML
+/// (MailPlug/Zimbra) where `<font>----- Original Message -----<br>From : …</font>`
+/// is a direct sibling of the reply `<p>`s: the nearest block ancestor is the
+/// whole-body container, and using it would collapse the entire message
+/// (regression: only "Show quoted text" visible, reply hidden).
+///
+/// `getDisplay` abstracts `window.getComputedStyle(el).display` so unit tests
+/// (JSContext, synthetic node trees with no CSSOM) can inject a stub.
+///
+/// Defined as a top-level JS string so that `collapseQuotesJS` (production)
+/// and `EmailFilterTests` (unit tests) consume the same source — zero-drift
+/// guarantee.
+let findQuoteStartBlockJS = """
+function findQuoteStartBlock(targetNode, body, getDisplay, logFn) {
+    var quoteStart = targetNode.parentNode;
+    while (quoteStart && quoteStart !== body) {
+        var display = getDisplay(quoteStart);
+        if (display === 'block' || display === 'flex' || display === 'table' ||
+            quoteStart.tagName === 'DIV' || quoteStart.tagName === 'P' ||
+            quoteStart.tagName === 'BLOCKQUOTE' || quoteStart.tagName === 'TABLE' ||
+            quoteStart.tagName === 'BR') {
+            break;
+        }
+        var hasPriorContent = false;
+        for (var sib = quoteStart.previousSibling; sib; sib = sib.previousSibling) {
+            if ((sib.textContent || '').trim().length >= 2) { hasPriorContent = true; break; }
+        }
+        if (hasPriorContent) {
+            logFn('[QuoteDetect] Block walk stopped at inline ' + quoteStart.tagName + '.' + (quoteStart.className || '') + ': prior content sibling, climbing would swallow reply');
+            break;
+        }
+        quoteStart = quoteStart.parentNode;
+    }
+    return quoteStart;
+}
+"""
+
 /// Sweeps everything positioned AFTER `quoteStart` in document order — at
 /// EVERY ancestor level up to (and including) the direct child of `body` —
 /// into `content`.
@@ -1547,6 +1591,7 @@ private var collapseQuotesJS: String {
         function _log(m) { \(logBody) }
         \(walkUpToWrapStartJS)
         \(splitBlockBeforeTargetJS)
+        \(findQuoteStartBlockJS)
         \(sweepQuoteContentJS)
         var body = document.body;
         if (!body) { _log('[QuoteDetect] No body, bailing'); return; }
@@ -1857,18 +1902,14 @@ private var collapseQuotesJS: String {
             quoteStart = splitBlock;
             _log('[QuoteDetect] Using split block as quoteStart (parent=' + splitBlock.parentNode.tagName + '.' + (splitBlock.parentNode.className || '') + ')');
         } else {
-            // Find the closest block-level ancestor
-            quoteStart = targetNode.parentElement;
-            while (quoteStart && quoteStart !== body) {
-                var display = window.getComputedStyle(quoteStart).display;
-                if (display === 'block' || display === 'flex' || display === 'table' ||
-                    quoteStart.tagName === 'DIV' || quoteStart.tagName === 'P' ||
-                    quoteStart.tagName === 'BLOCKQUOTE' || quoteStart.tagName === 'TABLE' ||
-                    quoteStart.tagName === 'BR') {
-                    break;
-                }
-                quoteStart = quoteStart.parentElement;
-            }
+            // Find the closest block-level ancestor — with a prior-content
+            // guard so a boundary living in an inline element (MailPlug/Zimbra
+            // flat <font> sibling of the reply <p>s) doesn't climb to the
+            // whole-body container and swallow the reply. Logic lives in
+            // `findQuoteStartBlockJS` for unit testability.
+            quoteStart = findQuoteStartBlock(targetNode, body, function(el) {
+                return window.getComputedStyle(el).display;
+            }, _log);
             _log('[QuoteDetect] quoteStart after block walk: ' + (quoteStart ? quoteStart.tagName + '.' + (quoteStart.className || '') : 'NULL/body'));
             if (!quoteStart || quoteStart === body) return;
 

@@ -843,6 +843,114 @@ struct EmailFilterTests {
         #expect(ctx.evaluateScript("result.className")?.toString() == "wrapper")
     }
 
+    // MARK: - findQuoteStartBlock (boundary text node → wrap-start element)
+    //
+    // These tests exercise the SHARED `findQuoteStartBlockJS` source from
+    // AutoSizingHTMLView.swift. Production code and these tests both evaluate
+    // the same string, so there is zero drift risk.
+    //
+    // The block walk climbs from the boundary text node's parent toward body
+    // until it hits a block-level element — but must stop early at an INLINE
+    // element whose previous siblings carry real text. Regression scenario
+    // (MailPlug/Zimbra webmail): `<font>----- Original Message -----<br>From : …</font>`
+    // is a flat direct sibling of the reply <p>s inside the one-and-only body
+    // container. Climbing to the nearest block ancestor selects that container
+    // and collapses the ENTIRE message (visible text becomes just
+    // "Show quoted text"). The prior-content guard keeps the <font> itself as
+    // the wrap start.
+    //
+    // `getDisplay` is injected (production passes getComputedStyle) — tests
+    // stub it since synthetic trees have no CSSOM.
+
+    /// Evaluates `findQuoteStartBlockJS` + the tree harness in a fresh JSContext.
+    private func makeFindBlockContext() -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(findQuoteStartBlockJS)
+        ctx.evaluateScript(Self.walkUpTestHarness)
+        ctx.evaluateScript("function inlineDisplay() { return 'inline'; }")
+        return ctx
+    }
+
+    @Test("findQuoteStartBlock: inline boundary with prior reply siblings stays at the inline element (MailPlug/Zimbra flat body)")
+    func findBlockInlineBoundaryWithPriorContent() {
+        let ctx = makeFindBlockContext()
+        // <div.email-body>
+        //   <p>reply…</p> <p>signature name</p> <br>
+        //   <font>[text "----- Original Message -----"]<br>[text "From : <a@b>"]</font>
+        //   <div>quoted content</div>
+        // Pre-fix: climb skipped inline <font> → quoteStart = .email-body →
+        // whole message (reply included) collapsed.
+        ctx.evaluateScript("""
+        var target = h('text', {text: '----- Original Message -----'});
+        var tree = attach(h('div', {className: 'email-body'}, [
+            h('p', {text: 'Reply paragraph the user must keep seeing.'}),
+            h('p', {text: 'Sender Name'}),
+            h('br', {}),
+            h('font', {className: 'marker'}, [
+                target,
+                h('br', {}),
+                h('text', {text: 'From : <someone@example.com>'})
+            ]),
+            h('div', {text: 'Quoted original message content.'})
+        ]));
+        var result = findQuoteStartBlock(target, body, inlineDisplay, _log);
+        """)
+        #expect(ctx.evaluateScript("result.tagName")?.toString() == "FONT")
+        #expect(ctx.evaluateScript("result.className")?.toString() == "marker")
+    }
+
+    @Test("findQuoteStartBlock: inline boundary with no prior content climbs to the block ancestor")
+    func findBlockClimbsWithoutPriorContent() {
+        let ctx = makeFindBlockContext()
+        // The guard must not fire when nothing precedes the inline element —
+        // the enclosing block is the correct (pre-existing) wrap start.
+        ctx.evaluateScript("""
+        var target = h('text', {text: '----- Original Message -----'});
+        var tree = attach(h('div', {className: 'email-body'}, [
+            h('div', {text: 'reply text', className: 'reply'}),
+            h('div', {className: 'quote-container'}, [
+                h('font', {}, [target]),
+                h('div', {text: 'quoted content'})
+            ])
+        ]));
+        var result = findQuoteStartBlock(target, body, inlineDisplay, _log);
+        """)
+        #expect(ctx.evaluateScript("result.className")?.toString() == "quote-container")
+    }
+
+    @Test("findQuoteStartBlock: text node directly inside a block returns that block immediately")
+    func findBlockDirectBlockParent() {
+        let ctx = makeFindBlockContext()
+        ctx.evaluateScript("""
+        var target = h('text', {text: 'On X wrote:'});
+        var tree = attach(h('div', {className: 'email-body'}, [
+            h('p', {text: 'reply'}),
+            h('p', {className: 'attrib'}, [target])
+        ]));
+        var result = findQuoteStartBlock(target, body, inlineDisplay, _log);
+        """)
+        #expect(ctx.evaluateScript("result.className")?.toString() == "attrib")
+    }
+
+    @Test("findQuoteStartBlock: computed display block halts the climb even for a non-block tag name")
+    func findBlockComputedDisplayHalts() {
+        let ctx = makeFindBlockContext()
+        // A <section> isn't in the tag list, but display:block must halt the
+        // walk — the getDisplay injection point is load-bearing.
+        ctx.evaluateScript("""
+        var target = h('text', {text: '----- Original Message -----'});
+        var tree = attach(h('div', {className: 'email-body'}, [
+            h('section', {className: 'sect'}, [
+                h('font', {}, [target])
+            ])
+        ]));
+        var result = findQuoteStartBlock(target, body, function(el) {
+            return el.tagName === 'SECTION' ? 'block' : 'inline';
+        }, _log);
+        """)
+        #expect(ctx.evaluateScript("result.className")?.toString() == "sect")
+    }
+
     // MARK: - sweepQuoteContent (multi-level sibling sweep for quote wrapping)
     //
     // These tests exercise the SHARED `sweepQuoteContentJS` source from
