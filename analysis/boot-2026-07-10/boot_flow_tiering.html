@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boot flow &amp; write tiering · TabMail iOS · 2026-07-10</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --card: #ffffff; --ink: #1a2333; --muted: #5b6b82;
+    --line: #d8e0ec; --accent: #2563eb; --warn-bg: #fef3c7; --warn-ink: #78350f;
+    --ok-bg: #dcfce7; --ok-ink: #14532d; --flag-bg: #fee2e2; --flag-ink: #7f1d1d;
+    --main: #7c3aed; --dbw: #d97706; --dbr: #0891b2; --nse: #16a34a; --net: #db2777; --sig: #475569;
+    --chip: #eef2f8;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg: #0d1320; --card: #16202f; --ink: #e6edf7; --muted: #93a4bd;
+    --line: #2a3a52; --accent: #60a5fa; --warn-bg: #3a2c08; --warn-ink: #fde68a;
+    --ok-bg: #0c2f1a; --ok-ink: #86efac; --flag-bg: #3b1212; --flag-ink: #fca5a5;
+    --main: #a78bfa; --dbw: #fbbf24; --dbr: #22d3ee; --nse: #4ade80; --net: #f472b6; --sig: #94a3b8;
+    --chip: #1e2a3d;
+  }}
+  :root[data-theme="dark"] {
+    --bg: #0d1320; --card: #16202f; --ink: #e6edf7; --muted: #93a4bd;
+    --line: #2a3a52; --accent: #60a5fa; --warn-bg: #3a2c08; --warn-ink: #fde68a;
+    --ok-bg: #0c2f1a; --ok-ink: #86efac; --flag-bg: #3b1212; --flag-ink: #fca5a5;
+    --main: #a78bfa; --dbw: #fbbf24; --dbr: #22d3ee; --nse: #4ade80; --net: #f472b6; --sig: #94a3b8;
+    --chip: #1e2a3d;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f8fb; --card: #ffffff; --ink: #1a2333; --muted: #5b6b82;
+    --line: #d8e0ec; --accent: #2563eb; --warn-bg: #fef3c7; --warn-ink: #78350f;
+    --ok-bg: #dcfce7; --ok-ink: #14532d; --flag-bg: #fee2e2; --flag-ink: #7f1d1d;
+    --main: #7c3aed; --dbw: #d97706; --dbr: #0891b2; --nse: #16a34a; --net: #db2777; --sig: #475569;
+    --chip: #eef2f8;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font: 15px/1.55 -apple-system, "SF Pro Text", Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 80px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 44px 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 10px; }
+  .datebar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom: 26px; }
+  .pill { background:var(--chip); border:1px solid var(--line); border-radius:999px; padding:3px 12px; font-size:12.5px; color:var(--muted); }
+  .pill a { color: var(--accent); text-decoration: none; }
+  code { background:var(--chip); border-radius:5px; padding:1px 5px; font: 12.5px/1.4 "SF Mono", ui-monospace, Menlo, monospace; }
+
+  /* ---- stage flow ---- */
+  .stage { background:var(--card); border:1px solid var(--line); border-radius:14px;
+           padding:16px 18px 14px; margin: 0 0 8px; position:relative; }
+  .stage h3 { margin:0 0 2px; font-size:15.5px; display:flex; gap:10px; align-items:baseline; }
+  .stage h3 .num { display:inline-flex; align-items:center; justify-content:center; min-width:24px; height:24px;
+                   border-radius:8px; background:var(--accent); color:#fff; font-size:13px; font-weight:700; }
+  .stage .when { color:var(--muted); font-size:12.5px; margin-left:auto; font-style:italic; white-space:nowrap; }
+  .stage p.desc { margin:4px 0 10px; color:var(--muted); font-size:13.5px; }
+  .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:10px; }
+  .card { border:1px solid var(--line); border-left-width:4px; border-radius:10px; padding:9px 12px; background:var(--bg); }
+  .card b { font-size:13.5px; display:block; margin-bottom:2px; }
+  .card span { font-size:12.5px; color:var(--muted); display:block; }
+  .card.main { border-left-color: var(--main); }
+  .card.dbw  { border-left-color: var(--dbw); }
+  .card.dbr  { border-left-color: var(--dbr); }
+  .card.nse  { border-left-color: var(--nse); }
+  .card.net  { border-left-color: var(--net); }
+  .card.sig  { border-left-color: var(--sig); }
+  .arrow { text-align:center; color:var(--muted); font-size:17px; line-height:1; margin: 2px 0 10px; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin: 6px 0 18px; font-size:12.5px; color:var(--muted); }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  .note { border-radius:10px; padding:8px 12px; font-size:13px; margin-top:10px; }
+  .note.warn { background:var(--warn-bg); color:var(--warn-ink); }
+  .note.ok   { background:var(--ok-bg);   color:var(--ok-ink); }
+  .note.flag { background:var(--flag-bg); color:var(--flag-ink); }
+
+  /* ---- tier table ---- */
+  .tiers { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:12px; margin-top:12px; }
+  .tier { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px 16px; }
+  .tier h4 { margin:0 0 4px; font-size:14.5px; }
+  .tier .tag { font-size:11.5px; font-weight:700; letter-spacing:.4px; border-radius:6px; padding:2px 8px; }
+  .t0 .tag { background:var(--flag-bg); color:var(--flag-ink); }
+  .t1 .tag { background:var(--warn-bg); color:var(--warn-ink); }
+  .t2 .tag { background:var(--ok-bg);   color:var(--ok-ink); }
+  .tier ul { margin:8px 0 0; padding-left:18px; font-size:13px; color:var(--muted); }
+  .tier li { margin: 3px 0; }
+  .tier li b { color: var(--ink); font-weight:600; }
+
+  /* ---- signal graph ---- */
+  .sigrow { display:grid; grid-template-columns: minmax(180px, 1.1fr) minmax(120px, .7fr) minmax(220px, 1.4fr); gap:0;
+            align-items:stretch; margin-bottom:8px; }
+  .sigcell { border:1px solid var(--line); background:var(--card); padding:8px 12px; font-size:13px; }
+  .sigcell:first-child { border-radius:10px 0 0 10px; border-right:none; }
+  .sigcell:last-child  { border-radius:0 10px 10px 0; border-left:none; }
+  .sigcell.mid { display:flex; align-items:center; justify-content:center; font-weight:600; font-size:12.5px;
+                 background:var(--chip); color:var(--muted); text-align:center; }
+  .sigcell b { font-size:13px; }
+  .sigcell span { color:var(--muted); font-size:12px; display:block; }
+  @media (max-width: 720px) { .sigrow { grid-template-columns: 1fr; }
+    .sigcell, .sigcell:first-child, .sigcell:last-child { border-radius:0; border:1px solid var(--line); border-top:none; }
+    .sigrow .sigcell:first-child { border-radius:10px 10px 0 0; border-top:1px solid var(--line); }
+    .sigrow .sigcell:last-child { border-radius:0 0 10px 10px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Boot flow &amp; write tiering — TabMail iOS</h1>
+  <p class="sub">Cold-boot ordering, the write-tier system, and the runtime signal graph — post unified-read refactor (ADR-IOS-055).</p>
+  <div class="datebar">
+    <span class="pill">📅 2026-07-10 · v5 (post ADR-IOS-056 re-tiering)</span>
+    <span class="pill">source-derived, ordering only — no measured timings</span>
+    <span class="pill">previous (measured) analysis: <a href="../boot-2026-06-26/index.html">boot-2026-06-26</a></span>
+  </div>
+
+  <div class="legend">
+    <span><i style="background:var(--main)"></i>Main / UI thread</span>
+    <span><i style="background:var(--dbw)"></i>GRDB write</span>
+    <span><i style="background:var(--dbr)"></i>GRDB read</span>
+    <span><i style="background:var(--nse)"></i>NSE merge pipeline</span>
+    <span><i style="background:var(--net)"></i>Network</span>
+    <span><i style="background:var(--sig)"></i>Signals / notifications</span>
+  </div>
+
+  <h2>Cold boot — what kicks in, in order</h2>
+  <p class="sub">Each stage begins when the previous one lets it; cards inside a stage run concurrently.</p>
+
+  <div class="stage">
+    <h3><span class="num">1</span> Process launch <span class="when">tap icon / push</span></h3>
+    <div class="cards">
+      <div class="card main"><b>dyld + Swift runtime</b><span>frameworks load, <code>TabMailApp.init</code></span></div>
+      <div class="card main"><b>StartupMigrations</b><span>schema migrations behind the splash, DB built off-main</span></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage">
+    <h3><span class="num">2</span> <code>AppStartup.runIfNeeded</code> <span class="when">before UI is allowed</span></h3>
+    <p class="desc">Everything the first frame depends on — and nothing more.</p>
+    <div class="cards">
+      <div class="card main"><b>State mirrors</b><span>account map, IMAP creds, prompts, push settings → app-group defaults for the NSE</span></div>
+      <div class="card nse"><b>Paint-gate merge</b><span><code>mergeIfStagingPendingPaintGate()</code> — boot awaits ONLY the in-memory snapshot publish (<code>latestStagedRows</code> + <code>.messagesStaged</code> decision); the durable merge write continues un-awaited</span></div>
+      <div class="card sig"><b><code>isReady = true</code></b><span>gate opens; SwiftUI proceeds</span></div>
+    </div>
+    <div class="note ok">Pushed-mail-in-first-frame comes from the snapshot, not from waiting on the merge's (possibly slow) durable write.</div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage">
+    <h3><span class="num">3</span> First paint <span class="when">VM init → frame 1</span></h3>
+    <div class="cards">
+      <div class="card main"><b><code>InboxViewModel.init</code></b><span><code>loadInitialPage → resetMessages → fetchPage</code></span></div>
+      <div class="card dbr"><b><code>InboxListReader.fetchSync</code></b><span>ONE sync read (passthrough, no merge gate): D (durable page 1) ∪ P (overlay-pinned) ∪ S (staged snapshot) → <code>compose</code> → paint. Since ADR-IOS-055 there is no separate staged re-seed — the reader IS the seed.</span></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage">
+    <h3><span class="num">4</span> <code>onAppear</code> — wiring <span class="when">frame 1 visible</span></h3>
+    <div class="cards">
+      <div class="card sig"><b><code>vm.start()</code></b><span>registers <code>.inboxDataDidChange</code> (immediate lane + 500&nbsp;ms debounce), <code>.messageDataDidChange</code> (AI batch), folder ValueObservation</span></div>
+      <div class="card sig"><b><code>.messagesStaged</code> receiver</b><span>InboxView modifier → <code>insertStagedRows</code> (zero-DB latency path)</span></div>
+      <div class="card dbr"><b>Snippet loader — live from here on</b><span>viewport-driven (fires as rows appear, forever after first paint — NOT gated on the herd); tier-0 batched <code>rawPool</code> read → FTS → network fetch</span></div>
+      <div class="card main"><b><code>startSync()</code></b><span>kicks the startup herd (stage 5)</span></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage">
+    <h3><span class="num">5</span> <code>syncStartup</code> — the herd <span class="when">post-paint</span></h3>
+    <p class="desc">A <b>sequential preamble</b> (steps 0–3), then everything runs in parallel — subordinated by TIER, not by scheduling order. The whole stage is concurrent with the UI.</p>
+
+    <p class="desc" style="margin-bottom:6px"><b style="color:var(--ink)">5a — SEQUENTIAL preamble (each step awaited):</b></p>
+    <div class="cards">
+      <div class="card nse"><b>Step-0: NSE merge (awaited)</b><span>staging drains completely BEFORE any sync pass, so sync never races the merge over the same headers</span></div>
+      <div class="card main"><b>Step-1: cancel stale in-flight</b><span>only on genuine resume (oracle-gated) — releases suspension-frozen tasks/connections</span></div>
+      <div class="card dbr"><b>Step-2: recover incomplete headers</b><span>crash-recovery FTS re-index (<code>headerComplete=0</code> rows)</span></div>
+      <div class="card main"><b>Step-3: repopulate ALL queues (detached)</b><span>active body/AI + backfill body/AI/embeddings + memory — loads work; the queues' own drain loops take it from here</span></div>
+    </div>
+    <div class="arrow" style="margin:6px 0">▼ then everything below runs IN PARALLEL, ranked by tier ▼</div>
+
+    <p class="desc" style="margin-bottom:6px"><b style="color:var(--ink)">5b — PARALLEL, tier-subordinated:</b></p>
+    <div class="cards">
+      <div class="card net"><b>Per-account sync passes</b><span>fullSync / delta, folder discovery, <code>whoami</code>, push re-subscribe · writes at <b>.normal</b></span></div>
+      <div class="card net"><b>IMAP IDLE re-connect</b><span>live connections re-established with the herd's account connects — pushes/IDLE events flow from here on</span></div>
+      <div class="card dbw"><b>Active body/AI queues — <b>.normal</b> (ADR-IOS-056)</b><span>sync wrote only HEADERS; for recent inbox mail <b>ActiveBodyQueue</b> fetches + renders + persists the body, indexes FTS (<code>bodyComplete</code>), derives the snippet; <b>ActiveAIQueue</b> gets the summary + action tag from the LLM. Self-draining from step-3's repopulate — no budget, no boot phase; they simply run at sync level</span></div>
+      <div class="card dbw"><b>Backfill body / AI / embeddings — <b>.background</b></b><span>runs WITH the herd too (foreground, whenever the app runs), just lowest tier; the network history-walk additionally gates on WiFi / Low Power Mode. BGProcessing off-hours is the guaranteed-completion window, NOT the only runtime</span></div>
+      <div class="card main"><b>Unread recounts + badge — <b>.priority</b></b><span><code>UnreadCountManager</code> (user-visible badge)</span></div>
+    </div>
+    <div class="note ok">✓ RESOLVED (ADR-IOS-056, 2026-07-10): the old "5c budgeted body/AI drain" is gone. The flush writes moved .priority → .normal (user actions and merges own the priority lane again), and the drain <i>budget</i> now exists ONLY as the background-envelope watchdog: BGAppRefresh keeps its 25&nbsp;s cap, silent pushes get a budget only on a genuine background wake — a push delivered while you're using the app passes <code>.none</code>, like the boot path always did.</div>
+  </div>
+
+  <h2>Write tiers — who writes at which priority</h2>
+  <p class="sub">One serial writer; <code>DatabaseWriteQueue</code> schedules by tier (lower wins). A tier can't preempt an in-flight write body — a 3&nbsp;s priority write still blocks everything behind it.</p>
+  <div class="tiers">
+    <div class="tier t0">
+      <h4><span class="tag">.priority (0)</span> &nbsp;jump the queue — user-visible NOW</h4>
+      <ul>
+        <li><b>User actions</b> — <code>AccountManager.enqueueWrite</code> FIFO closures (read/flag/tag/move); FIFO order is guaranteed <i>within</i> the user queue, tier order at the DB</li>
+        <li><b>NSE merge phases</b> — privileged context forces .priority even through re-tiered code paths (phase-1 header upsert, phase-2 body/AI)</li>
+        <li><b>Badge / unread recounts</b></li>
+        <li><b>On-demand user-open body fetch</b> — opening a message that needs its body (live user action; deliberately NOT re-tiered by ADR-IOS-056)</li>
+      </ul>
+    </div>
+    <div class="tier t1">
+      <h4><span class="tag">.normal (1)</span> &nbsp;sync-level steady state</h4>
+      <ul>
+        <li><b>Sync engine writes</b> — <code>normalPool/syncPool</code> (header upserts, folder updates, stale deletes)</li>
+        <li><b>Active body queue flushes</b> — body blob, snippet, <code>bodyComplete</code>/FTS flips (ADR-IOS-056: was .priority)</li>
+        <li><b>Active AI queue result writes</b> — summary/action/reply, AI cache (ADR-IOS-056: was .background — inbox AI is sync-level, not backfill)</li>
+        <li>Explicit <code>normal { }</code> blocks</li>
+      </ul>
+    </div>
+    <div class="tier t2">
+      <h4><span class="tag">.background (2)</span> &nbsp;yield to everyone</h4>
+      <ul>
+        <li><b>Backfill body / AI / embedding queues</b> (<code>backgroundPool</code>) — run in foreground too, just lowest tier</li>
+        <li>Bulk maintenance (asset eviction, prunes)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note warn" style="margin-top:12px">
+    Read paths, for contrast: <code>dbPool.read</code> <b>async</b> = merge-gated (awaits <code>mergeIfStagingPending</code> first);
+    <code>dbPool.read</code> <b>sync</b> = passthrough; <code>rawPool.read</code> = raw, no gate — the repaint-critical paths
+    (<code>InboxListReader.fetch</code>, <code>flushAIBatch</code>, snippets) all use <code>rawPool</code> so a slow merge can never block a repaint.
+  </div>
+
+  <h2>Runtime signal graph — what triggers a repaint, and how fast</h2>
+  <p class="sub">Every visible-state mutation must ride one of these lanes (E2E invariant I8).</p>
+
+  <div class="sigrow">
+    <div class="sigcell"><b>NSE merge: snapshot publish</b><span>pre-write, every wake with staged content</span></div>
+    <div class="sigcell mid">.messagesStaged<br>→ instant</div>
+    <div class="sigcell"><b><code>insertStagedRows</code></b><span>zero-DB in-memory insert; reader converges on the next reload regardless</span></div>
+  </div>
+  <div class="sigrow">
+    <div class="sigcell"><b>NSE merge: phase-1 visible / end-of-merge / scrub-only wake</b><span>≤2 posts per wake; scrub-only lane added by the 2026-07-09 audit (F1)</span></div>
+    <div class="sigcell mid">.inboxDataDidChange<br><b>immediate</b> lane</div>
+    <div class="sigcell"><b><code>runReloadCoalesced</code> → <code>reloadMessages</code></b><span>single-flight; reader (rawPool, async) → compose D∪P∪S → honest diff</span></div>
+  </div>
+  <div class="sigrow">
+    <div class="sigcell"><b>Sync / backfill / batched producers</b><span>noisy, high-frequency</span></div>
+    <div class="sigcell mid">.inboxDataDidChange<br>500&nbsp;ms debounce</div>
+    <div class="sigcell"><b>same coalesced reload</b><span>debounce applies ONLY to background producers, never to user gestures</span></div>
+  </div>
+  <div class="sigrow">
+    <div class="sigcell"><b>AI results per row</b><span>summary/action tags landing</span></div>
+    <div class="sigcell mid">.messageDataDidChange<br>300&nbsp;ms throttle</div>
+    <div class="sigcell"><b><code>flushAIBatch</code></b><span>per-row snapshot refresh (rawPool), no membership changes</span></div>
+  </div>
+  <div class="sigrow">
+    <div class="sigcell"><b>User gesture (read/flag/tag/move)</b><span>swipe, tap, toggle</span></div>
+    <div class="sigcell mid">synchronous<br>zero-DB</div>
+    <div class="sigcell"><b>optimistic snapshot flip + overlay</b><span>intent derived from the VISUALIZED state (2026-07-10 fix); header materialization + DB write deferred to the FIFO queue; overlay protects until the write drains</span></div>
+  </div>
+  <div class="sigrow">
+    <div class="sigcell"><b>Undo</b><span>restore before the deferred DB write lands</span></div>
+    <div class="sigcell mid">.messagesUndone<br>→ instant</div>
+    <div class="sigcell"><b><code>insertUndoneMessages</code></b><span>latency path; the reader's P-step keeps the row across every reload (the once-latent undo hole, closed)</span></div>
+  </div>
+
+  <div class="note ok" style="margin-top:16px">
+    Since ADR-IOS-055 all three fetch sites (<code>fetchFullRange</code>, <code>fetchPage</code>, <code>resetMessages</code>) go through ONE
+    pure composer over durable ∪ pinned ∪ staged — the event lanes above are latency optimizations only; any reload converges to the same list.
+  </div>
+</div>
+</body>
+</html>
