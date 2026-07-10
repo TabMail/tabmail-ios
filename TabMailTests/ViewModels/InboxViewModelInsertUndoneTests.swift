@@ -114,6 +114,23 @@ struct InboxViewModelInsertUndoneTests {
             isInInbox: false
         )
 
+        // VM created BEFORE the overlay mutation exists (PLAN_INBOX_UNIFIED_READ.md
+        // Phase 3: `InboxViewModel(folders:)` -> resetMessages() -> fetchPage(before: nil)
+        // now routes through InboxListReader, whose P-step fetches ANY
+        // overlay-pinned row by id on every read — see §2.1/§4.1's "improvement".
+        // Ordering the overlay registration BEFORE VM creation (as this test
+        // originally did) would have the reader's P-step surface the row during
+        // `init` itself, making line "loadedMessages is empty" below false before
+        // `insertUndoneMessages` is ever called — that's real Phase-3 behavior,
+        // not a bug, but it defeats what THIS test is isolating (insertUndoneMessages'
+        // own overlay-reroute logic). Mirroring the real call order (UndoService
+        // registers the overlay, THEN posts .messagesUndone -> insertUndoneMessages)
+        // keeps the test meaningful: no reader-backed fetch runs between VM
+        // creation and the mutation, so the pre-condition still holds.
+        let vm = InboxViewModel(folders: [inbox])
+        // Archive message never loaded into inbox VM — loadedMessages is empty.
+        #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
+
         // The undo path registers this mutation synchronously before posting
         // .messagesUndone — overlay now says "this message belongs in Inbox".
         AccountManager.shared.registerMutation(
@@ -127,9 +144,7 @@ struct InboxViewModelInsertUndoneTests {
                 actionTag: nil
             )
         )
-
-        let vm = InboxViewModel(folders: [inbox])
-        // Archive message never loaded into inbox VM — loadedMessages is empty.
+        // Registering the mutation alone doesn't trigger a VM refetch — still empty.
         #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
 
         vm.insertUndoneMessages([id])

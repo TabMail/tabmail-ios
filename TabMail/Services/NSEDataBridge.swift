@@ -98,11 +98,14 @@ enum NSEDataBridge {
     }
 
     /// The staged rows the most recent merge read (replace-all per merge; empty
-    /// when staging is drained). Consumers are the NON-render fallbacks that need
-    /// to resolve a message that is staged but not yet durable in GRDB: the
-    /// notification deep-link id resolution (`MailNavigationView`) and
-    /// `MessageDetailViewModel`'s header synthesis. GRDB always wins — these are
-    /// consulted only on a GRDB miss. ADR-IOS-049.
+    /// when staging is drained). ADR-IOS-049. Consumers: `InboxListReader` (the
+    /// unified inbox-list render path, PLAN_INBOX_UNIFIED_READ.md §2.1 — reads
+    /// this directly as the S source on every fetch) and the NON-render
+    /// fallbacks that need to resolve a message that is staged but not yet
+    /// durable in GRDB: notification deep-link id resolution
+    /// (`MailNavigationView`), `MessageDetailViewModel`'s header synthesis, and
+    /// `InboxViewModel.lookupMessage`/snippet-loader synthesis. GRDB always
+    /// wins for the fallbacks — they consult this only on a GRDB miss.
     static let latestStagedRows = Mutex<[StagedInboxRow]>([])
 
     /// Display-ready body content of the most recent merge's staged rows, keyed
@@ -668,19 +671,14 @@ enum NSEDataBridge {
         return (try? await AppDatabase.rawPool.read { db -> Set<String> in
             var durable: Set<String> = []
             for msg in candidates {
-                var headerId = try String.fetchOne(db, sql: """
-                    SELECT id FROM messageHeader WHERE accountId = ? AND messageId = ?
-                    """, arguments: [msg.accountId, msg.messageId])
-                if headerId == nil, let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
-                    headerId = try String.fetchOne(db, sql: """
-                        SELECT id FROM messageHeader WHERE accountId = ? AND rfc822MessageId = ?
-                        """, arguments: [msg.accountId, rfc822])
-                }
-                guard let headerId else { continue }
+                guard let ref = try DurableIdentityLookup.find(
+                    db: db, accountId: msg.accountId, messageId: msg.messageId,
+                    rfc822MessageId: msg.rfc822MessageId
+                ) else { continue }
                 if msg.htmlContent != nil || msg.textContent != nil {
                     let hasBody = try Bool.fetchOne(db, sql: """
                         SELECT EXISTS(SELECT 1 FROM messageBody WHERE id = ?)
-                        """, arguments: [headerId]) ?? false
+                        """, arguments: [ref.id]) ?? false
                     guard hasBody else { continue }
                 }
                 durable.insert(msg.id)
@@ -694,12 +692,11 @@ enum NSEDataBridge {
     /// `processed` and delete the staging row. `headerId` is the STAGED row's
     /// headerId (`MessageIdentity.headerId` over the staged accountId/
     /// folderPath/messageId — identical to `toInboxRow().headerId`) — used to
-    /// filter `latestStagedRows`/`latestStagedBodies` and as the payload of
-    /// `.stagedRowsInvalidated`. NOT the durable row's id: after an IMAP
-    /// UID-remap move (archive = MOVE = new UID) the durable header is found
-    /// via the rfc822 fallback under a DIFFERENT id, while the published
-    /// snapshot entries and the VM's in-memory phantom are keyed by the
-    /// staged id — a durable-id payload would miss both.
+    /// filter `latestStagedRows`/`latestStagedBodies`. NOT the durable row's
+    /// id: after an IMAP UID-remap move (archive = MOVE = new UID) the durable
+    /// header is found via the rfc822 fallback under a DIFFERENT id, while the
+    /// published snapshot entries are keyed by the staged id — a durable-id
+    /// filter would miss them.
     struct StaleByMoveRow: Equatable, Sendable {
         let id: String
         let headerId: String
@@ -726,21 +723,12 @@ enum NSEDataBridge {
         return (try? await AppDatabase.rawPool.read { db -> [StaleByMoveRow] in
             var stale: [StaleByMoveRow] = []
             for msg in processed {
-                var row = try Row.fetchOne(db, sql: """
-                    SELECT id, folderId, isInInbox FROM messageHeader
-                    WHERE accountId = ? AND messageId = ?
-                    """, arguments: [msg.accountId, msg.messageId])
-                if row == nil, let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
-                    row = try Row.fetchOne(db, sql: """
-                        SELECT id, folderId, isInInbox FROM messageHeader
-                        WHERE accountId = ? AND rfc822MessageId = ?
-                        """, arguments: [msg.accountId, rfc822])
-                }
-                guard let row else { continue } // no durable header yet — an ordinary new message, not stale
-                let durableFolderId: String = row["folderId"]
-                let durableIsInInbox: Bool = row["isInInbox"]
+                guard let ref = try DurableIdentityLookup.find(
+                    db: db, accountId: msg.accountId, messageId: msg.messageId,
+                    rfc822MessageId: msg.rfc822MessageId
+                ) else { continue } // no durable header yet — an ordinary new message, not stale
                 let stagedFolderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
-                if durableFolderId != stagedFolderId || !durableIsInInbox {
+                if ref.folderId != stagedFolderId || !ref.isInInbox {
                     // STAGED headerId, not the durable row's id — see StaleByMoveRow doc.
                     stale.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
                         accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
@@ -977,7 +965,14 @@ enum NSEDataBridge {
             // (c) Remove from the ALREADY-PUBLISHED in-memory snapshots — the
             // `.messagesStaged` post above already fired with these rows
             // included (deliberately not delayed for this check), so the VM
-            // may have just inserted the phantom; (e) below tells it to evict.
+            // may have just inserted the phantom via `insertStagedRows`.
+            // PLAN_INBOX_UNIFIED_READ.md §3: no eviction notification needed —
+            // the scrub here means the NEXT reload's `InboxListReader` read no
+            // longer finds the row in `latestStagedRows`, and its stale-by-move
+            // durable header (§2.1a) also suppresses it, so the reader
+            // structurally converges without a VM-side eviction handler. Any
+            // phantom the earlier post inserted is a bounded, self-correcting
+            // transient (§2.2/§4.4-4) until that reload lands.
             let staleHeaderIdSet = Set(staleHeaderIds)
             latestStagedRows.withLock { rows in
                 rows.removeAll { staleHeaderIdSet.contains($0.headerId) }
@@ -992,11 +987,7 @@ enum NSEDataBridge {
                 for id in staleStagingIds { memo.removeValue(forKey: id) }
             }
 
-            // (e) Tell the VM which in-memory phantom(s) to evict.
             BootProfiler.mark("merge: invalidated \(staleByMove.count) stale staged row(s) — durable header moved out of staged folder")
-            Task { @MainActor in
-                NotificationCenter.default.post(name: .stagedRowsInvalidated, object: staleHeaderIds)
-            }
         }
 
         if !processed.isEmpty {
@@ -1079,18 +1070,11 @@ enum NSEDataBridge {
                                 // Find existing header: provider messageId first,
                                 // then rfc822 fallback for IMAP UID remaps —
                                 // mirrors phase 2's lookup.
-                                var existingId = try String.fetchOne(db, sql: """
-                                    SELECT id FROM messageHeader
-                                    WHERE accountId = ? AND messageId = ?
-                                    """, arguments: [msg.accountId, msg.messageId])
-                                if existingId == nil,
-                                   let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
-                                    existingId = try String.fetchOne(db, sql: """
-                                        SELECT id FROM messageHeader
-                                        WHERE accountId = ? AND rfc822MessageId = ?
-                                        """, arguments: [msg.accountId, rfc822])
-                                }
-                                if let id = existingId {
+                                let existingRef = try DurableIdentityLookup.find(
+                                    db: db, accountId: msg.accountId, messageId: msg.messageId,
+                                    rfc822MessageId: msg.rfc822MessageId
+                                )
+                                if let id = existingRef?.id {
                                     // Already visible (sync or a prior merge). SEED
                                     // the snippet ONLY if the header has none yet —
                                     // so the fast header render has something to
@@ -1326,19 +1310,12 @@ enum NSEDataBridge {
                                 // Without this fallback we'd insert a duplicate header
                                 // keyed on the new UID, which the user sees as two
                                 // copies of the same email.
-                                var existingRow = try Row.fetchOne(db, sql: """
-                                    SELECT id, folderPath, rfc822MessageId FROM messageHeader
-                                    WHERE accountId = ? AND messageId = ?
-                                    """, arguments: [msg.accountId, msg.messageId])
-                                if existingRow == nil,
-                                   let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
-                                    existingRow = try Row.fetchOne(db, sql: """
-                                        SELECT id, folderPath, rfc822MessageId FROM messageHeader
-                                        WHERE accountId = ? AND rfc822MessageId = ?
-                                        """, arguments: [msg.accountId, rfc822])
-                                }
-                                if let row = existingRow {
-                                    let headerId: String = row["id"]
+                                let existingRef = try DurableIdentityLookup.find(
+                                    db: db, accountId: msg.accountId, messageId: msg.messageId,
+                                    rfc822MessageId: msg.rfc822MessageId
+                                )
+                                if let ref = existingRef {
+                                    let headerId: String = ref.id
                                     committedHeaderId = headerId
                                     // Use the existing header's folderPath (not the
                                     // staged msg.folderPath) as the AI cache key's
@@ -1348,8 +1325,8 @@ enum NSEDataBridge {
                                     // — we must write under the same key, not the
                                     // one NSE captured at fetch time. For the common
                                     // case (no drift) these are identical.
-                                    let existingFolderPath: String = row["folderPath"] ?? msg.folderPath
-                                    let existingRfc822: String? = row["rfc822MessageId"]
+                                    let existingFolderPath: String = ref.folderPath
+                                    let existingRfc822: String? = ref.rfc822MessageId
 
                                     // GRADUAL MERGE (header→body→summary→action):
                                     // apply each staged piece as it becomes present

@@ -9,7 +9,12 @@ import Testing
 
 /// ADR-IOS-049 — instant in-memory insert of NSE-staged mail into the inbox list,
 /// before the merge's durable write.
-@Suite("Inbox staged in-memory insert (ADR-IOS-049)")
+///
+/// `.serialized`: `lookupSynthesizes` touches `NSEDataBridge.latestStagedRows` —
+/// a process-wide global — mirrors the `.serialized` trait on every other
+/// suite that touches it (`InboxListBehaviorPinningTests`,
+/// `InboxListReaderIntegrationTests`, `NSEStaleStagedRowInvalidationTests`).
+@Suite("Inbox staged in-memory insert (ADR-IOS-049)", .serialized)
 struct InboxStagedInsertTests {
 
     private func makeTestDB() throws -> (pool: DatabasePool, folder: Folder, dir: URL, previous: AppDatabase?) {
@@ -220,40 +225,29 @@ struct InboxStagedInsertTests {
     }
 
     @MainActor
-    @Test("guard expiry: a fresh staged row survives a reload; an expired phantom is evicted")
-    func guardExpiryEvictsPhantom() async throws {
-        let (_, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
-        let vm = InboxViewModel(folders: [folder])
-        vm.loadInitialPage()
-        // Staged row with NO durable GRDB write ever landing (phantom scenario).
-        vm.insertStagedRows([makeStagedRow(messageId: "m-phantom")])
-        #expect(vm.loadedMessages.count == 1)
-        // Fresh guard: a reload must NOT evict it (anti-flicker contract).
-        await vm.reloadMessages()
-        #expect(vm.loadedMessages.count == 1)
-        // Expired guard: the reload's Pass-1 removal wins and cleans the row.
-        let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m-phantom")
-        vm._testBackdateStagedGuard(id: id, by: SyncConfig.stagedRowEvictionGuardSeconds + 1)
-        await vm.reloadMessages()
-        #expect(vm.loadedMessages.isEmpty)
-        // And the guard entry is gone — the row cannot resurrect via lookupMessage.
-        #expect(vm.lookupMessage(id) == nil)
-    }
-
-    @MainActor
-    @Test("lookupMessage synthesizes from a pending staged row when GRDB has none")
+    @Test("lookupMessage synthesizes from NSEDataBridge.latestStagedRows when GRDB has none")
     func lookupSynthesizes() throws {
         let (_, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        }
         let vm = InboxViewModel(folders: [folder])
         vm.loadInitialPage()
-        vm.insertStagedRows([makeStagedRow(messageId: "m1")])
+        let row = makeStagedRow(messageId: "m1")
+        // PLAN_INBOX_UNIFIED_READ.md §3: `lookupMessage`'s synthesis fallback
+        // now reads `NSEDataBridge.latestStagedRows` directly (the deleted
+        // `pendingStagedRows` used to synthesize from whatever
+        // `insertStagedRows` had been handed) — seed the global to mirror the
+        // merge's publish-before-post order.
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        vm.insertStagedRows([row])
         let id = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "m1")
         let looked = vm.lookupMessage(id)
         #expect(looked != nil)
         #expect(looked?.messageId == "m1")
-        // A genuinely-unknown id resolves to nil (no GRDB row, no pending row).
+        // A genuinely-unknown id resolves to nil (no GRDB row, no staged row).
         #expect(vm.lookupMessage("acc1:INBOX:nope") == nil)
     }
 }

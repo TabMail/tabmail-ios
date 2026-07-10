@@ -72,36 +72,6 @@ final class InboxViewModel {
     /// overlapping Tasks.
     @ObservationIgnored private var isSyncPending = false
     private var loadedIds: Set<String> = []
-    /// ADR-IOS-049: a staged row inserted in-memory (via `.messagesStaged`) whose
-    /// durable GRDB write hasn't landed yet, plus its insertion time. The Pass-1
-    /// guard in `reloadMessages` protects it from eviction ONLY until
-    /// `SyncConfig.stagedRowEvictionGuardSeconds` — a PHANTOM row (headerId skew vs
-    /// the merge's (accountId, messageId)/(rfc822MessageId) dedup: UID remap,
-    /// folderPath variant, durable copy outside the window) never appears in a GRDB
-    /// reload, so an unbounded guard would protect it forever. Expiry evicts the
-    /// DISPLAY row only — staging/GRDB are never touched (never-drop-intention:
-    /// staging rows are deleted only by phase-2 commit).
-    private struct PendingStagedRow {
-        let row: StagedInboxRow
-        /// `ForegroundActiveClock.now()` at insertion time — NOT wall clock. The
-        /// guard's window means "running time to make progress" (durable write +
-        /// reconciling reload), so it must survive device sleep and app
-        /// backgrounding rather than expire while neither can run. See
-        /// `ForegroundActiveClock` and `SyncConfig.stagedRowEvictionGuardSeconds`.
-        let insertedAt: TimeInterval
-    }
-    /// Keyed by headerId. A reload must not evict these while the guard is fresh
-    /// (they aren't in GRDB yet — see the Pass-1 guard in `reloadMessages`), and
-    /// `lookupMessage` synthesizes from them so actions resolve. Cleared per-row
-    /// once the row is durable (a reload sees it), the user acts on it (overlay
-    /// mutation exists), or the guard expires; wholesale on `resetMessages`.
-    private var pendingStagedRows: [String: PendingStagedRow] = [:]
-    /// Tombstones for expiry-evicted phantom staged rows: a KEPT gradual row's
-    /// later stage transition (summary/action flip) changes the staged set, which
-    /// defeats the `.messagesStaged` re-post suppression — without this, the
-    /// re-post would re-insert the evicted phantom with a fresh guard window.
-    /// Cleared on `resetMessages` (a full reset re-evaluates from scratch).
-    private var expiredStagedIds: Set<String> = []
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     // On-demand snippet loading state
@@ -312,11 +282,16 @@ final class InboxViewModel {
         if let header = try? dbPool.read({ db in try MessageHeader.fetchOne(db, key: id) }) {
             return header
         }
-        // ADR-IOS-049: staged row inserted in-memory but not yet durable in GRDB —
-        // synthesize so the action resolves instead of silently no-op'ing
-        // (`guard let message = lookupMessage(id) else { return }`). The action's
-        // `ensureDurable` gate drains the merge before the optimistic write lands.
-        return pendingStagedRows[id]?.row.toMessageHeader()
+        // ADR-IOS-049: staged row not yet durable in GRDB — synthesize from the
+        // merge's in-memory snapshot so the action resolves instead of silently
+        // no-op'ing (`guard let message = lookupMessage(id) else { return }`).
+        // The action's `ensureDurable` gate drains the merge before the
+        // optimistic write lands. Mirrors `MessageDetailViewModel`'s exact-id
+        // synthesis pattern (`stagedRowFallback`/`seedFromStagedPublish`'s
+        // composite branch) — PLAN_INBOX_UNIFIED_READ.md §3.
+        return NSEDataBridge.latestStagedRows.withLock { rows in
+            rows.first { $0.headerId == id }
+        }?.toMessageHeader()
     }
 
     /// Synchronous folder role lookup — no suspension points.
@@ -631,10 +606,38 @@ final class InboxViewModel {
         // the destination folder (e.g. Archive) and the membership guard silently drops
         // the message, so the undone row never reappears until the next full reload.
         let overlay = manager.snapshotOverlay()
+        // Batch-fetch headers + labels in ONE read txn. Unlike `insertStagedRows`
+        // (zero-I/O by contract), this path already reads the DB by design — it
+        // needs the durable header to reconstruct a snapshot — so loading real
+        // labels alongside the by-id header fetch is one more indexed read, not
+        // a new I/O class. Without this, a genuinely-labeled undone row would be
+        // dropped here under an active label filter even though
+        // `InboxListReader`'s P-step (which DOES load real labels for pinned
+        // rows — its "undo shape", see `gather()`'s `labelsByMessage` comment)
+        // would keep it on the very next reload — a fidelity gap
+        // PLAN_INBOX_UNIFIED_READ.md §2.2/§5 Phase 4 closes.
+        let idsToFetch = ids.filter { !loadedIds.contains($0) }
+        let headersById: [String: MessageHeader]
+        let labelsByMessage: [String: [UserLabel]]
+        if let batch = try? dbPool.read({ db -> ([String: MessageHeader], [String: [UserLabel]]) in
+            var headers: [String: MessageHeader] = [:]
+            for id in idsToFetch {
+                if let header = try MessageHeader.fetchOne(db, key: id) {
+                    headers[id] = header
+                }
+            }
+            let labels = try UserLabelStore.loadLabels(for: Array(headers.keys), in: db)
+            return (headers, labels)
+        }) {
+            (headersById, labelsByMessage) = batch
+        } else {
+            headersById = [:]
+            labelsByMessage = [:]
+        }
         var inserted = false
         for id in ids {
             guard !loadedIds.contains(id) else { continue }
-            guard var header = try? dbPool.read({ db in try MessageHeader.fetchOne(db, key: id) }) else { continue }
+            guard var header = headersById[id] else { continue }
             if let overlayFolderId = overlay[id]?.folderId {
                 header.folderId = overlayFolderId
             }
@@ -651,7 +654,12 @@ final class InboxViewModel {
             guard folderIds.contains(header.folderId) else { continue }
             // Respect unread filter
             if filterUnread && header.isRead { continue }
-            let snapshot = MessageSnapshot(from: header)
+            let labels = labelsByMessage[id] ?? []
+            // Respect label filter — mirrors InboxListComposer step 6 (compose
+            // applies the label filter uniformly to D/P/S); this path just
+            // loaded real labels above so it can match the reader exactly.
+            if !filterLabelIds.isEmpty && !filterLabelIds.isSubset(of: Set(labels.map(\.id))) { continue }
+            let snapshot = MessageSnapshot(from: header, userLabels: labels)
             // Insert at correct sorted position (by date, descending)
             let insertionIndex: Int
             if mode == .triage {
@@ -675,10 +683,22 @@ final class InboxViewModel {
     /// ADR-IOS-049: insert NSE-staged rows into the loaded list IN-MEMORY (no GRDB
     /// read/write) so just-pushed mail appears instantly, before the merge's durable
     /// header write. Sourced from the `.messagesStaged` payload, not GRDB. Mirrors
-    /// `insertUndoneMessages`. Each inserted id is tracked in `pendingStagedRows` so a
-    /// competing reload can't evict it before its durable write lands (see the Pass-1
-    /// guard in `reloadMessages`).
+    /// `insertUndoneMessages`. PLAN_INBOX_UNIFIED_READ.md §2.2: a pure latency
+    /// optimization, no longer correctness-bearing — any subsequent reload
+    /// converges to the same answer because `InboxListReader`/`InboxListComposer`
+    /// (the reader) includes staged (S) rows on every fetch, so this insert no
+    /// longer needs guard bookkeeping to survive a competing reload.
     func insertStagedRows(_ rows: [StagedInboxRow]) {
+        // Query-level label-filter guard, mirroring InboxListComposer step 6
+        // (PLAN_INBOX_UNIFIED_READ.md §2.1 step 3 / §2.2 / §5 Phase 4): staged
+        // rows synthesize via `toMessageHeader()` with zero `userLabels` (no
+        // labels payload in NSE-staged data), so `filterLabelIds.isSubset(of:
+        // labels)` can never be satisfied while a filter is active — EVERY row
+        // in this batch would be rejected. The check is the same for every
+        // row (query-level, not per-row), so bail before the loop rather than
+        // per-row. Zero-I/O preserved; a subsequent reload converges via the
+        // reader once the row is durable (§2.2's accepted latency window).
+        guard filterLabelIds.isEmpty else { return }
         let folderIds = Set(folders.map(\.id))
         let overlay = manager.snapshotOverlay()
         var insertedCount = 0
@@ -686,8 +706,6 @@ final class InboxViewModel {
             let id = row.headerId
             // Already shown (durable, or a prior staged insert) — skip.
             guard !loadedIds.contains(id) else { continue }
-            // Expiry-evicted phantom — don't re-arm it with a fresh guard window.
-            guard !expiredStagedIds.contains(id) else { continue }
             // Only for a currently-displayed inbox folder.
             guard folderIds.contains(row.folderId) else { continue }
             // IDENTITY dedup (phantom-row fix): `loadedIds` dedups by exact headerId,
@@ -744,7 +762,6 @@ final class InboxViewModel {
             }
             loadedMessages.insert(snapshot, at: insertionIndex)
             loadedIds.insert(id)
-            pendingStagedRows[id] = PendingStagedRow(row: row, insertedAt: ForegroundActiveClock.now())
             insertedCount += 1
         }
         if insertedCount > 0 {
@@ -755,56 +772,6 @@ final class InboxViewModel {
         }
     }
 
-    /// Companion to `insertStagedRows`: evicts an in-memory staged (not yet
-    /// durable) row that the merge just determined is STALE-BY-MOVE — its
-    /// durable header already exists in a DIFFERENT folder (archived/deleted/
-    /// moved by the user or another client before the NSE's later re-stage of
-    /// the same message merged). Driven by `.stagedRowsInvalidated`, which can
-    /// fire moments after a `.messagesStaged` post from the SAME merge wake
-    /// already inserted the phantom via `insertStagedRows` — this undoes
-    /// exactly that insert. Only ids still tracked in `pendingStagedRows`
-    /// (i.e. genuinely a phantom this VM inserted and never saw go durable)
-    /// are touched; a row that already went durable (removed from
-    /// `pendingStagedRows` by `reloadMessages`) is left alone — sync/reload
-    /// owns it from there, and GRDB is the source of truth for it now.
-    /// Zero DB I/O, mirrors `insertStagedRows`' render-path contract.
-    func invalidateStagedRows(_ ids: [String]) {
-        var removedCount = 0
-        for id in ids {
-            guard pendingStagedRows[id] != nil else { continue }
-            pendingStagedRows.removeValue(forKey: id)
-            loadedIds.remove(id)
-            if let idx = loadedMessages.firstIndex(where: { $0.id == id }) {
-                loadedMessages.remove(at: idx)
-                removedCount += 1
-            }
-            // Tombstone: a later re-stage of this same message (the exact
-            // mechanism that produced the stale row) must not re-insert it.
-            expiredStagedIds.insert(id)
-        }
-        if removedCount > 0 {
-            BootProfiler.mark("invalidateStagedRows: -\(removedCount) stale staged row(s) evicted (inbox=\(loadedMessages.count))")
-            withAnimation(.easeInOut(duration: 0.25)) {
-                rebuildDisplayGroups()
-            }
-        }
-    }
-
-    #if DEBUG
-    /// Test hook (guard-expiry tests): backdate a pending staged row's insertion
-    /// timestamp so `SyncConfig.stagedRowEvictionGuardSeconds` expiry can be
-    /// exercised without waiting for real elapsed time. Clock-agnostic — it only
-    /// subtracts `seconds` from whatever `insertedAt` holds (now
-    /// `ForegroundActiveClock.now()` units), so this keeps working unchanged.
-    /// No-op for unknown ids.
-    func _testBackdateStagedGuard(id: String, by seconds: TimeInterval) {
-        guard let pending = pendingStagedRows[id] else { return }
-        pendingStagedRows[id] = PendingStagedRow(
-            row: pending.row, insertedAt: pending.insertedAt - seconds
-        )
-    }
-    #endif
-
     /// Full reset — drops all loaded state and fetches page 1.
     /// Use for semantic changes where the data set itself changes:
     /// folder switch, filter toggle, mode switch, initial load.
@@ -812,54 +779,36 @@ final class InboxViewModel {
         selfHealFolders()
         resetSnippetState()
         loadedIds = []
-        pendingStagedRows.removeAll()
-        expiredStagedIds.removeAll()
         targetWindowSize = SyncConfig.inboxPageSize
+        // PLAN_INBOX_UNIFIED_READ.md §3: `fetchPage(before: nil)` already
+        // includes eligible staged (S) rows via InboxListReader/InboxListComposer
+        // (the reader reads `NSEDataBridge.latestStagedRows` directly), so the
+        // explicit `insertStagedRows` re-seed that used to follow this fetch is
+        // gone — the reader makes it redundant.
         loadedMessages = fetchPage(before: nil)
         loadedIds = Set(loadedMessages.map(\.id))
         hasMoreMessages = loadedMessages.count >= targetWindowSize
         // Full assign — no diff needed since the data set changed entirely
         displayGroups = ThreadGroupBuilder.buildDisplayGroups(from: loadedMessages, mode: mode)
         requeueVisibleSnippets()
-        // Re-seed staged-but-not-yet-durable rows from the merge's in-memory
-        // snapshot (zero DB I/O). `.messagesStaged` re-posts are now suppressed
-        // for an UNCHANGED staged set, so a VM that missed the one post (recreated
-        // by nav churn, cold boot before any InboxView existed, or reset by a
-        // filter/folder change) would otherwise not show a pushed row until its
-        // phase-1 durable write lands. All of insertStagedRows' guards apply
-        // (folder membership, overlay, identity dedup, unread filter), so durable
-        // rows already in page 1 are skipped and foreign-folder rows drop out.
-        insertStagedRows(NSEDataBridge.latestStagedRows.withLock { $0 })
     }
 
-    /// Diff-based reload — re-fetches the currently loaded date range and diffs in-place.
-    /// Use for background data changes (sync, backfill) where the data set is the same
-    /// but individual messages may have been added/removed/updated.
-    /// SwiftUI sees incremental changes by stable message ID, preserving scroll position.
-    /// Async: DB read runs off MainActor (prevents hang during WAL checkpoint contention).
-    /// The diff and @Observable mutations run on MainActor after the read completes.
-    /// Apply the optimistic overlay on top of DB-fetched snapshots.
-    /// Overlay is snapshotted BEFORE the DB read for correct timing.
-    /// - Overrides isRead, isFlagged, actionTag, isInInbox for messages with pending mutations
-    /// - Filters out messages whose overlay folderId moved them out of current folder set
-    private func applyOverlay(_ messages: inout [MessageSnapshot], overlay: [String: AccountManager.PendingMutation], folderIds: Set<String>) {
-        guard !overlay.isEmpty else { return }
-        // Apply field overrides and filter out moved-away messages
-        messages = messages.compactMap { snapshot in
-            guard let mutation = overlay[snapshot.id] else { return snapshot }
-            // If overlay says this message moved to a different folder, filter it out
-            if let newFolderId = mutation.folderId, !folderIds.contains(newFolderId) {
-                return nil
-            }
-            var modified = snapshot
-            if let v = mutation.isRead { modified.isRead = v }
-            if let v = mutation.isFlagged { modified.isFlagged = v }
-            if let v = mutation.actionTag { modified.actionTag = v }
-            if let v = mutation.isInInbox { modified.isInInbox = v }
-            return modified
-        }
-    }
-
+    /// Diff-based reload — re-fetches the currently loaded window and diffs it
+    /// in-place. Use for background data changes (sync, backfill, merge) where
+    /// the data set may have changed: messages added/removed/updated.
+    /// SwiftUI sees incremental changes by stable message ID, preserving scroll
+    /// position. Async: DB read runs off MainActor (prevents hang during WAL
+    /// checkpoint contention). The diff and @Observable mutations run on
+    /// MainActor after the read completes.
+    ///
+    /// PLAN_INBOX_UNIFIED_READ.md §3: the fetch below routes through
+    /// `InboxListReader`/`InboxListComposer` (the unified reader), which
+    /// applies the overlay, folds in staged (S) and overlay-pinned (P) rows,
+    /// sorts, and trims — so Pass 1's diff is an honest one: a row missing
+    /// from the fresh set is simply not on the list anymore, no guard/
+    /// tombstone bookkeeping needed. `applyOverlay` (the VM's own overlay
+    /// application, once called here) had zero callers left after Phase 3
+    /// switched this fetch to the reader — deleted in Phase 5.
     func reloadMessages(animated: Bool = false) async {
         // Heal folders OFF the main thread — the synchronous selfHealFolders()
         // here blocked the UI on a GRDB read during warm-foreground return
@@ -869,9 +818,6 @@ final class InboxViewModel {
         print("[MoveTrace] reloadMessages — folders=[\(folderNames)] prevCount=\(loadedMessages.count)")
 
         resetSnippetState()
-
-        // Snapshot overlay BEFORE DB read — ensures correct timing for all cases.
-        let overlay = manager.snapshotOverlay()
 
         // REPAINT DECOUPLING: kick the read-through NSE merge OFF the repaint critical
         // path (non-awaited). The reload's read below now uses `rawPool` (no inline
@@ -889,15 +835,17 @@ final class InboxViewModel {
         // bubble-lag cause. If this mark still fires ≥250ms post-fix, the READ itself
         // (not the merge) is slow — a distinct signal worth chasing.
         let tFetch = CFAbsoluteTimeGetCurrent()
-        var freshMessages = await fetchFullRange()
+        let freshMessages = await fetchFullRange()
         let fetchMs = Int((CFAbsoluteTimeGetCurrent() - tFetch) * 1000)
         if fetchMs >= 250 {
             BootProfiler.mark("[\(instanceTag)] reloadMessages async fetch (rawPool, merge OFF critical path) \(fetchMs)ms fresh=\(freshMessages.count)")
         }
 
-        // Apply optimistic overlay on top of DB results
-        let folderIds = Set(folders.map(\.id))
-        applyOverlay(&freshMessages, overlay: overlay, folderIds: folderIds)
+        // PLAN_INBOX_UNIFIED_READ.md §2.1 step 4: `fetchFullRange` now routes
+        // through InboxListReader/InboxListComposer, which snapshots the
+        // overlay itself (at the same "before the DB read" point) and applies
+        // it internally — so `reloadMessages` no longer needs its own overlay
+        // snapshot at all (Pass 1 below is a plain diff, §3 kill list).
 
         // Apply diff on MainActor (synchronous — fast in-memory work on @Observable state).
         let applyDiff = { [self] in
@@ -909,99 +857,28 @@ final class InboxViewModel {
                 return dict
             }()
 
-            // Pass 1: Remove messages no longer in fresh set, update changed ones
+            // Pass 1: remove messages no longer in the fresh set, update changed
+            // ones. PLAN_INBOX_UNIFIED_READ.md §3: an honest diff — the reader
+            // (InboxListReader/InboxListComposer) already supplies staged (S)
+            // and overlay-pinned (P) rows, and carries AI fields (actionTag/
+            // tagSortOrder/summaryBlurb) from a staged row onto its D-visible
+            // counterpart when the durable row's own AI fields are still nil
+            // (§2.1a) — so nothing legitimate is ever missing from
+            // `freshMessages`, and a row absent from it is simply gone. No
+            // guard, no tombstone.
             var survivingIds: Set<String> = []
             var indicesToRemove: [Int] = []
             for (i, existing) in loadedMessages.enumerated() {
                 if let fresh = freshById[existing.id] {
-                    var assigned = fresh
-                    var carriedOverAI = false
-                    // ADR-IOS-049: phase-1 durable header writes and sync-created
-                    // headers carry NO AI fields (see NSEDataBridge.swift ~773 —
-                    // "NO body blob, NO AI fields. Body + AI land in phase 2"), so
-                    // the first durable/sync row to arrive for a staged id would
-                    // otherwise clobber the staged actionTag/summaryBlurb with nil,
-                    // flashing the tag chip/summary away until phase-2 + the AI
-                    // repaint restore them (phase1→phase2 gap usually ~15ms,
-                    // observed up to 13.9s under load; a sync-inserted header can
-                    // precede the merge by the merge's whole duration). Mirrors the
-                    // detail-view rule: do NOT applyRefresh AI fields from phase-1
-                    // rows. Carry the staged AI fields forward until a fresh row
-                    // arrives WITH real AI fields.
-                    if pendingStagedRows[existing.id] != nil {
-                        if assigned.actionTag == nil, let stagedTag = existing.actionTag {
-                            assigned.actionTag = stagedTag
-                            assigned.tagSortOrder = existing.tagSortOrder
-                            carriedOverAI = true
-                        }
-                        if assigned.summaryBlurb == nil, let stagedBlurb = existing.summaryBlurb {
-                            assigned.summaryBlurb = stagedBlurb
-                            carriedOverAI = true
-                        }
-                    }
                     // Only assign if the snapshot actually changed — avoids triggering
                     // @Observable for unchanged rows, preventing unnecessary re-renders
                     // and layout shifts that cause scroll position jumps.
-                    if existing != assigned {
-                        loadedMessages[i] = assigned
+                    if existing != fresh {
+                        loadedMessages[i] = fresh
                     }
-                    survivingIds.insert(existing.id)
-                    if !carriedOverAI {
-                        // ADR-IOS-049: it's now durable in GRDB with real AI fields
-                        // (or was never staged) → drop the guard. When a carry-over
-                        // happened above, keep the entry so a subsequent pre-phase-2
-                        // reload keeps carrying over — still bounded by the eviction
-                        // guard expiry below.
-                        pendingStagedRows.removeValue(forKey: existing.id)
-                    }
-                } else if let pending = pendingStagedRows[existing.id],
-                          overlay[existing.id]?.folderId == nil,
-                          ForegroundActiveClock.now() - pending.insertedAt
-                              < SyncConfig.stagedRowEvictionGuardSeconds {
-                    // ADR-IOS-049: a staged row whose durable write hasn't landed —
-                    // DON'T let this (competing) reload evict the just-surfaced row,
-                    // or it flickers away until the write lands. Only a folder-move
-                    // overlay releases the guard — non-removing mutations (read/flag/
-                    // tag) keep the row protected; `applyOverlay` already filters
-                    // moved-away rows out of `fresh`, so a folder-move overlay is what
-                    // actually explains this row's absence from `freshById` here.
-                    // BOUNDED: past the guard window the row is a phantom (its headerId
-                    // never appeared in a GRDB reload) — let eviction win, and drop the
-                    // guard entry so it can't resurrect. Display-only; staging/GRDB
-                    // untouched.
                     survivingIds.insert(existing.id)
                 } else {
                     indicesToRemove.append(i)
-                    if let pending = pendingStagedRows.removeValue(forKey: existing.id) {
-                        let guardExpired = overlay[existing.id] == nil
-                            && ForegroundActiveClock.now() - pending.insertedAt
-                                >= SyncConfig.stagedRowEvictionGuardSeconds
-                        let folderMoveReleased = overlay[existing.id]?.folderId != nil
-                        if guardExpired || folderMoveReleased {
-                            // Guard-EXPIRED eviction (phantom): tombstone the id so a
-                            // later re-post (staged-set change defeats the suppression
-                            // memo) can't re-insert it with a fresh guard window.
-                            //
-                            // Overlay-released (folder-move) eviction: the user
-                            // moved/archived/deleted this not-yet-durable staged row
-                            // before its durable write landed. Tombstone this one too
-                            // ("couldn't disable it" belt fix) — otherwise a stale
-                            // re-stage of the SAME message (the NSE staging it again on
-                            // a later, unrelated push) could re-insert the phantom via
-                            // `insertStagedRows` once the overlay entry drains. This
-                            // widens the prior guard-EXPIRY-only tombstone; the earlier
-                            // "the user acted on a real row, its lifecycle is the
-                            // action's business" reasoning didn't account for a staged
-                            // (not-yet-durable) row having no GRDB row for that action's
-                            // own lifecycle to own. `resetMessages` clears these
-                            // tombstones on a full reset — safe, because it re-seeds
-                            // from `NSEDataBridge.latestStagedRows`, which the merge's
-                            // stale-by-move detection (NSEDataBridge.performMerge) keeps
-                            // free of rows whose durable folder disagrees with the
-                            // staged one.
-                            expiredStagedIds.insert(existing.id)
-                        }
-                    }
                 }
             }
             for i in indicesToRemove.reversed() {
@@ -1111,97 +988,32 @@ final class InboxViewModel {
 
     /// Re-fetch the currently loaded window of messages for diff-based reload.
     /// If nothing is loaded yet, fetches just the first page (synchronous).
-    /// Bounded by count: fetches the top N messages (N = current loaded count)
+    /// Bounded by count: fetches the top N messages (N = targetWindowSize)
     /// in the active sort order. Works for any sort (date, triage tagSortOrder).
-    /// Async: DB read runs off MainActor to prevent blocking during WAL checkpoint.
+    /// PLAN_INBOX_UNIFIED_READ.md Phase 3: routes through `InboxListReader.fetch`
+    /// (async, rawPool-backed — same repaint-decoupling rationale this function
+    /// used to inline, now owned by the reader/shell) which also folds in
+    /// overlay-pinned (P) and staged (S) rows, so a reload no longer needs a
+    /// separate staged-row re-seed. See InboxListReader.swift / InboxListComposer.swift.
     private func fetchFullRange() async -> [MessageSnapshot] {
         // Nothing loaded — first page (sync read, only on initial load)
         guard !loadedMessages.isEmpty else {
             return fetchPage(before: nil)
         }
 
-        // Capture MainActor-isolated query parameters before async read.
-        // These are value types — safe to send across isolation boundaries.
-        let foldersCopy = folders
-        let filterUnreadCopy = filterUnread
-        let modeCopy = mode
-        let filterLabelIdsCopy = filterLabelIds
         // Re-fetch up to the target window size. Sticky — only grows on explicit
         // user scroll (loadMoreMessages); never shrinks just because messages left
         // the inbox. Per-folder limit = target (a single folder might contain all
         // loaded messages in a unified inbox).
-        let targetCount = targetWindowSize
-
-        var allResults: [MessageSnapshot] = []
-        do {
-            // REPAINT DECOUPLING (2026-07-06): read `rawPool`, NOT `dbPool`. The async
-            // `dbPool.read` overload AWAITS the read-through NSE merge first
-            // (PriorityGate.read → mergeIfStagingPending), whose phase-1 header upsert is
-            // routinely multi-second under WAL/lock pressure (boot_logs 9: mean 3s, up to
-            // 27.8s) — that was the multi-second unread-bubble / new-arrival lag. The merge
-            // is now kicked OFF this critical path in `reloadMessages`; just-arrived mail is
-            // already shown via the in-memory `.messagesStaged` staged-rows path, and the
-            // merge's post-commit `.inboxDataDidChange` drives a reconcile reload for durable
-            // rows. Mirrors `flushAIBatch`'s deliberate rawPool read.
-            allResults = try await AppDatabase.rawPool.read { db in
-                var allHeaders: [MessageHeader] = []
-                for folder in foldersCopy {
-                    let fid = folder.id
-                    var query = MessageHeader.filter(Column("folderId") == fid)
-                        .filter(Column("headerComplete") == true)
-
-                    if filterUnreadCopy {
-                        query = query.filter(Column("isRead") == false)
-                    }
-
-                    if modeCopy == .triage {
-                        query = query.order(Column("tagSortOrder").asc, Column("date").desc)
-                    } else {
-                        query = query.order(Column("date").desc)
-                    }
-
-                    let results = try query.limit(targetCount).fetchAll(db)
-                    allHeaders.append(contentsOf: results)
-                }
-                // Batch-load user labels for all fetched messages
-                let labelsByMessage = try UserLabelStore.loadLabels(
-                    for: allHeaders.map(\.id), in: db
-                )
-                return allHeaders.map { header in
-                    MessageSnapshot(from: header, userLabels: labelsByMessage[header.id] ?? [])
-                }
-            }
-        } catch {
-            print("[InboxViewModel] fetchFullRange error: \(error)")
-        }
-
-        // Apply label filter (post-filter: keep only messages that have ALL selected labels)
-        if !filterLabelIdsCopy.isEmpty {
-            allResults = allResults.filter { snapshot in
-                let msgLabelIds = Set(snapshot.userLabels.map(\.id))
-                return filterLabelIdsCopy.isSubset(of: msgLabelIds)
-            }
-        }
-
-        // Sort consistently with fetchPage
-        if modeCopy == .triage {
-            allResults.sort { a, b in
-                if a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
-                return a.date > b.date
-            }
-        } else {
-            allResults.sort { $0.date > $1.date }
-        }
-
-        // Deduplicate by ID (multi-folder can overlap), trim to target window size
-        var seen: Set<String> = []
-        seen.reserveCapacity(allResults.count)
-        allResults.removeAll { !seen.insert($0.id).inserted }
-        if allResults.count > targetCount {
-            allResults = Array(allResults.prefix(targetCount))
-        }
-
-        return allResults
+        let query = InboxListQuery(
+            displayedFolderIds: Set(folders.map(\.id)),
+            filterUnread: filterUnread,
+            filterLabelIds: filterLabelIds,
+            mode: mode,
+            targetCount: targetWindowSize,
+            beforeDate: nil
+        )
+        return await InboxListReader.fetch(folders: folders, query: query)
     }
 
     /// Load next page for infinite scroll.
@@ -1252,89 +1064,44 @@ final class InboxViewModel {
         }
     }
 
-    /// Fetch one page of messages across all folders using GRDB.
+    /// Fetch one page of messages across all folders.
     /// Converts to value-type MessageSnapshot immediately.
     /// Bounded: fetches at most `folders.count × pageSize`, then trims to `pageSize`.
+    /// PLAN_INBOX_UNIFIED_READ.md Phase 3: routes through `InboxListReader.fetchSync`
+    /// (the sync `dbPool`-backed gather — status quo I/O, no new main-thread cost;
+    /// see InboxListReader.swift §2.1b), which folds in overlay-pinned (P) and
+    /// staged (S) rows the same way `fetchFullRange` now does. This is why
+    /// `resetMessages`' page-1 fetch (`fetchPage(before: nil)`) already returns
+    /// staged rows — its trailing `insertStagedRows` re-seed is now a no-op belt.
     private func fetchPage(before: Date?) -> [MessageSnapshot] {
         let pageSize = SyncConfig.inboxPageSize
-        var allResults: [MessageSnapshot] = []
         let tStart = CFAbsoluteTimeGetCurrent()
-        var tReadStart: CFAbsoluteTime = 0
-        var tReadEnd: CFAbsoluteTime = 0
 
-        do {
-            tReadStart = CFAbsoluteTimeGetCurrent()
-            try dbPool.read { db in
-                tReadEnd = CFAbsoluteTimeGetCurrent()  // Reader acquired — wait for semaphore ends here.
-                var allHeaders: [MessageHeader] = []
-                for folder in folders {
-                    let fid = folder.id
-                    var query = MessageHeader.filter(Column("folderId") == fid)
-                        .filter(Column("headerComplete") == true)
+        let query = InboxListQuery(
+            displayedFolderIds: Set(folders.map(\.id)),
+            filterUnread: filterUnread,
+            filterLabelIds: filterLabelIds,
+            mode: mode,
+            targetCount: pageSize,
+            beforeDate: before
+        )
+        let allResults = InboxListReader.fetchSync(folders: folders, query: query)
 
-                    if filterUnread {
-                        query = query.filter(Column("isRead") == false)
-                    }
-                    if let cutoff = before {
-                        query = query.filter(Column("date") < cutoff)
-                    }
-
-                    if mode == .triage {
-                        query = query.order(Column("tagSortOrder").asc, Column("date").desc)
-                    } else {
-                        query = query.order(Column("date").desc)
-                    }
-
-                    let results = try query.limit(pageSize).fetchAll(db)
-                    allHeaders.append(contentsOf: results)
-                }
-                // Batch-load user labels for all fetched messages
-                let labelsByMessage = try UserLabelStore.loadLabels(
-                    for: allHeaders.map(\.id), in: db
-                )
-                allResults = allHeaders.map { header in
-                    MessageSnapshot(from: header, userLabels: labelsByMessage[header.id] ?? [])
-                }
-            }
-            let tEnd = CFAbsoluteTimeGetCurrent()
-            let waitMs = Int((tReadEnd - tReadStart) * 1000)
-            let queryMs = Int((tEnd - tReadEnd) * 1000)
-            let totalMs = Int((tEnd - tStart) * 1000)
-            // Log timing split so we can tell pool-contention from query-cost.
-            // waitMs = time MainActor spent waiting for a free GRDB reader
-            // queryMs = time the actual SELECTs took once we had a reader
-            // Huge wait + tiny query = reader pool starvation (fix: async read)
-            // Tiny wait + huge query = slow query (fix: query itself)
-            if totalMs >= 50 {
-                BackgroundSyncLogger.logInbox("[\(instanceTag)] fetchPage timing wait=\(waitMs)ms query=\(queryMs)ms total=\(totalMs)ms folders=\(folders.count) page=\(pageSize) results=\(allResults.count)")
-                // Boot-log mirror: fetchPage is a SYNC main-actor read (initial
-                // paint + infinite-scroll paging) — the top remaining suspect for
-                // scroll-time stalls; wait= is reader-pool wait ON THE MAIN THREAD.
-                BootProfiler.mark("fetchPage SYNC main-actor wait=\(waitMs)ms query=\(queryMs)ms total=\(totalMs)ms")
-            }
-        } catch {
-            print("[InboxViewModel] fetchPage error: \(error)")
+        // Timing: the reader owns the read+compose split internally now, so we
+        // can only time the call as a whole (no more wait/query split) — still
+        // worth a diagnostic since fetchPage is a SYNC main-actor call (initial
+        // paint + infinite-scroll paging), the top remaining suspect for
+        // scroll-time stalls.
+        let totalMs = Int((CFAbsoluteTimeGetCurrent() - tStart) * 1000)
+        if totalMs >= 50 {
+            BackgroundSyncLogger.logInbox("[\(instanceTag)] fetchPage (via InboxListReader.fetchSync) total=\(totalMs)ms folders=\(folders.count) page=\(pageSize) results=\(allResults.count)")
+            BootProfiler.mark("fetchPage SYNC main-actor total=\(totalMs)ms")
         }
 
-        // Apply label filter
-        if !filterLabelIds.isEmpty {
-            allResults = allResults.filter { snapshot in
-                let msgLabelIds = Set(snapshot.userLabels.map(\.id))
-                return filterLabelIds.isSubset(of: msgLabelIds)
-            }
-        }
-
-        // Merge sort across folders, deduplicate, trim to pageSize
-        if mode == .triage {
-            allResults.sort { a, b in
-                if a.tagSortOrder != b.tagSortOrder { return a.tagSortOrder < b.tagSortOrder }
-                return a.date > b.date
-            }
-        } else {
-            allResults.sort { $0.date > $1.date }
-        }
-
-        // Deduplicate against already-loaded messages
+        // Deduplicate against already-loaded messages — pagination-append dedup
+        // is the VM's concern (loadMoreMessages' cursor overlap), not the
+        // reader's; the reader has no notion of what this VM instance already
+        // has on screen.
         let unique = allResults.filter { !loadedIds.contains($0.id) }
         return Array(unique.prefix(pageSize))
     }
@@ -1453,10 +1220,13 @@ final class InboxViewModel {
             BootProfiler.mark("snippet batch header read \(readMs)ms (n=\(batch.count))")
         }
         guard !Task.isCancelled else { return }
-        // ADR-IOS-049: staged rows rendered in-memory may not be durable in GRDB yet —
-        // fall back to pendingStagedRows so a just-surfaced row isn't blacklisted.
-        let headerFor: (String) -> MessageHeader? = { [self] id in
-            dbHeaders[id] ?? pendingStagedRows[id]?.row.toMessageHeader()
+        // ADR-IOS-049: staged rows rendered in-memory may not be durable in GRDB
+        // yet — fall back to the merge's in-memory snapshot so a just-surfaced
+        // row isn't blacklisted. Mirrors `lookupMessage`'s synthesis pattern.
+        let headerFor: (String) -> MessageHeader? = { id in
+            dbHeaders[id] ?? NSEDataBridge.latestStagedRows.withLock({ rows in
+                rows.first { $0.headerId == id }
+            })?.toMessageHeader()
         }
         for headerId in batch {
             if let header = headerFor(headerId), !header.snippet.isEmpty {

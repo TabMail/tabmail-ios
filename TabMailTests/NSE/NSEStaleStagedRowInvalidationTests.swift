@@ -5,7 +5,6 @@
 import Testing
 import Foundation
 import GRDB
-import Synchronization
 @testable import TabMail
 
 /// Coverage for the STALE-BY-MOVE DETECTION added to `NSEDataBridge.performMerge`
@@ -25,10 +24,14 @@ import Synchronization
 /// its CURRENT `folderId`/`isInInbox` against the staged folder. A mismatch —
 /// durable header exists but disagrees — excludes the row from this wake's
 /// write phases, deletes its staging row, scrubs it from the already-published
-/// `latestStagedRows`/`latestStagedBodies` snapshots, drops its `stageMemo`
-/// entry, and posts `.stagedRowsInvalidated` (`[String]` of affected headerIds)
-/// so a VM that already inserted the phantom (from this SAME wake's earlier
-/// `.messagesStaged` post) evicts it.
+/// `latestStagedRows`/`latestStagedBodies` snapshots, and drops its
+/// `stageMemo` entry. PLAN_INBOX_UNIFIED_READ.md §3: the companion
+/// `.stagedRowsInvalidated` notification + VM eviction handler
+/// (`InboxViewModel.invalidateStagedRows`) that used to tell a VM which
+/// already-inserted phantom to evict are GONE — the merge-side scrub above is
+/// now sufficient on its own, because `InboxListReader`'s stale-by-move
+/// suppression (§2.1a) re-evaluates identity on every reload directly against
+/// the durable header, independent of any notification.
 ///
 /// Drives the REAL `NSEDataBridge.mergeNSEStagingData` against a real
 /// pool-backed `AppDatabase` + a real staging DB, mirroring the harness in
@@ -154,17 +157,6 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(archived?.folderId == archive.id)
         #expect(archived?.isInInbox == false)
 
-        // Capture the invalidation notification the merge posts.
-        let capturedIds = Mutex<[String]>([])
-        let obs = NotificationCenter.default.addObserver(
-            forName: .stagedRowsInvalidated, object: nil, queue: .main
-        ) { note in
-            if let ids = note.object as? [String] {
-                capturedIds.withLock { $0.append(contentsOf: ids) }
-            }
-        }
-        defer { NotificationCenter.default.removeObserver(obs) }
-
         // ── Merge 2: the (unchanged, still-staged) row must be recognized as
         // STALE-BY-MOVE and invalidated, not merged. ──
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
@@ -184,10 +176,6 @@ struct NSEStaleStagedRowInvalidationTests {
         let stillArchived = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
         #expect(stillArchived?.folderId == archive.id)
         #expect(stillArchived?.isInInbox == false)
-
-        // Invalidation notification carried the affected headerId.
-        let ids = capturedIds.withLock { $0 }
-        #expect(ids.contains(headerId()))
     }
 
     @Test("IMAP UID-remap archive (durable header re-keyed, found via rfc822 fallback): invalidation is keyed by the STAGED headerId")
@@ -217,31 +205,17 @@ struct NSEStaleStagedRowInvalidationTests {
                 """, arguments: [remappedId, archive.id, headerId()])
         }
 
-        let capturedIds = Mutex<[String]>([])
-        let obs = NotificationCenter.default.addObserver(
-            forName: .stagedRowsInvalidated, object: nil, queue: .main
-        ) { note in
-            if let ids = note.object as? [String] {
-                capturedIds.withLock { $0.append(contentsOf: ids) }
-            }
-        }
-        defer { NotificationCenter.default.removeObserver(obs) }
-
         // Merge 2: the staged row's (accountId, messageId) lookup misses; the
         // rfc822 fallback finds the re-keyed Archive header → stale-by-move.
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
         try await Task.sleep(for: .milliseconds(200))
 
         #expect(try stagingRowExists(q) == false)
-        // Snapshot scrub + notification payload MUST use the STAGED headerId —
-        // the id the published snapshots and the VM phantom are keyed by. A
-        // durable-id payload (the pre-fix bug) would be `remappedId` and miss
-        // both.
+        // Snapshot scrub MUST use the STAGED headerId — the id the published
+        // snapshots are keyed by. A durable-id scrub (the pre-fix bug) would
+        // target `remappedId` and miss it.
         let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
         #expect(!stagedRows.contains { $0.headerId == headerId() })
-        let ids = capturedIds.withLock { $0 }
-        #expect(ids.contains(headerId()))
-        #expect(!ids.contains(remappedId))
         // Durable header untouched, still archived under its remapped identity.
         let durable = try await pool.read { try MessageHeader.fetchOne($0, key: remappedId) }
         #expect(durable?.isInInbox == false)
@@ -257,16 +231,6 @@ struct NSEStaleStagedRowInvalidationTests {
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
 
-        let capturedIds = Mutex<[String]>([])
-        let obs = NotificationCenter.default.addObserver(
-            forName: .stagedRowsInvalidated, object: nil, queue: .main
-        ) { note in
-            if let ids = note.object as? [String] {
-                capturedIds.withLock { $0.append(contentsOf: ids) }
-            }
-        }
-        defer { NotificationCenter.default.removeObserver(obs) }
-
         // Brand-new message, never seen before — no durable header exists.
         try stageHeaderRow(q, messageId: "msg-new")
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
@@ -278,7 +242,12 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(h?.folderId == inbox.id)
         #expect(h?.isInInbox == true)
 
-        // No false-positive invalidation for an ordinary new message.
-        #expect(capturedIds.withLock { $0 }.isEmpty)
+        // No false-positive invalidation for an ordinary new message: it's
+        // still a KEPT gradual row (aiCompleted=0), so the staging row
+        // survives merge 1 AND the published snapshot still carries it — a
+        // stale-by-move exclusion would have scrubbed it from here instead.
+        #expect(try stagingRowExists(q, messageId: "msg-new") == true)
+        let stagedRows = NSEDataBridge.latestStagedRows.withLock { $0 }
+        #expect(stagedRows.contains { $0.headerId == headerId("msg-new") })
     }
 }
