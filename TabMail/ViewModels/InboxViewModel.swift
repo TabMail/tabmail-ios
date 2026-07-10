@@ -1683,51 +1683,135 @@ final class InboxViewModel {
         )
     }
 
+    /// Current state comes from the ON-SCREEN snapshot — the visualized state
+    /// the user is acting on — never a DB read. `lookupMessage` is a
+    /// synchronous main-actor `dbPool.read` that lags the FIFO write-queue
+    /// depth by seconds under write bursts (logged 3.7s main-thread stalls);
+    /// gating the gesture on it meant a second toggle within that window read
+    /// the same stale DB row as the first and computed the SAME target — a
+    /// dead toggle (see `PROJECT_MEMORY.md` write-queue notes). `snapshot.isRead`
+    /// already reflects any prior optimistic flip + overlay, so a rapid
+    /// double-toggle before the queue drains computes the correct target from
+    /// what's actually on screen (the codebase's act-on-visualized-state
+    /// principle — see the User Interaction Freeze Rule in CLAUDE.md).
     func toggleRead(_ messageId: String) {
-
-        guard let message = lookupMessage(messageId) else { return }
-        let newIsRead = !message.isRead
+        guard let snapshot = loadedMessages.first(where: { $0.id == messageId }) else { return }
+        let newIsRead = !snapshot.isRead
 
         // Optimistic in-memory mutation (instant visual feedback)
         if let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) {
             loadedMessages[idx].isRead = newIsRead
         }
-        // Overlay protects against reloadMessages clobbering the optimistic state
+        // Overlay protects against reloadMessages clobbering the optimistic state.
+        // Retain BEFORE registering — the overlay entry must not be removable
+        // by a sibling op until this op's own release runs (see
+        // `AccountManager.retainOverlayEntry`/`releaseOverlayEntry` doc: the
+        // overlay is coalesced, so removal must be tied to the LAST in-flight
+        // op for the id, not to any single op's completion).
+        manager.retainOverlayEntry(id: messageId)
         manager.registerMutation(id: messageId, mutation: .init(isRead: newIsRead))
         rebuildDisplayGroups()
 
-        // FIFO write queue — ensures ordering with other actions
+        // FIFO write queue — the MessageHeader needed for markRead/markUnread
+        // is resolved OFF-MAIN inside the closure (zero DB reads on the
+        // gesture path). `AccountManager.resolveHeaderForAction` mirrors
+        // `lookupMessage`'s exact two-step lookup (durable row, else the
+        // ADR-IOS-049 staged-row synthesis).
         Task { await manager.enqueueWrite { [manager] in
+            guard let message = await manager.resolveHeaderForAction(id: messageId) else {
+                // Row vanished between gesture and drain (e.g. deleted by an
+                // earlier queued op) — no-op, but release THIS op's retain so
+                // the overlay doesn't strand.
+                BackgroundSyncLogger.logInbox("[InboxViewModel] toggleRead — header resolution failed for \(messageId), releasing overlay retain")
+                manager.releaseOverlayEntry(id: messageId)
+                return
+            }
             if newIsRead {
                 await manager.markRead([message])
             } else {
                 await manager.markUnread([message])
             }
-            manager.removeOverlayEntries(ids: [messageId])
+            manager.releaseOverlayEntry(id: messageId)
         }}
     }
 
     /// Batched set-read. Filters to currently-unread members, then applies the
     /// optimistic-UI + overlay + write pipeline once for the whole group.
     /// Use for thread-level actions (tag-tap archive/delete/reply).
+    ///
+    /// Current-read-state is derived from the ON-SCREEN snapshot where
+    /// available (act-on-visualized-state, mirrors `toggleRead`) — never a
+    /// gesture-path DB read. Thread-member ids passed in here can be stale
+    /// relative to the CURRENT `loadedMessages`: callers capture a `ThreadGroup`
+    /// value at render time (`InboxView.executeTaggedAction` /
+    /// `dismissAndArchiveThread` / `dismissAndDeleteThread`), and a background
+    /// reload can evict/replace rows before the user's tap actually fires. For
+    /// ids without a current on-screen snapshot, current-state + full header
+    /// resolution both happen OFF-MAIN inside the queued closure — preserving
+    /// the original filter-to-currently-unread semantics without a
+    /// synchronous DB read on the gesture path.
     func markRead(_ messageIds: [String]) {
-        let messages = messageIds.compactMap { lookupMessage($0) }.filter { !$0.isRead }
-        guard !messages.isEmpty else { return }
-        let flipIds = messages.map(\.id)
-        let flipSet = Set(flipIds)
+        guard !messageIds.isEmpty else { return }
 
-        // Optimistic in-memory mutation (instant visual feedback)
-        for idx in loadedMessages.indices where flipSet.contains(loadedMessages[idx].id) {
-            loadedMessages[idx].isRead = true
+        let onScreenIds = Set(loadedMessages.map(\.id))
+        let unreadOnScreenIds = messageIds.filter { id in
+            onScreenIds.contains(id) && (loadedMessages.first { $0.id == id }?.isRead == false)
         }
-        // Overlay protects against reloadMessages clobbering the optimistic state
-        for id in flipIds { manager.registerMutation(id: id, mutation: .init(isRead: true)) }
-        rebuildDisplayGroups()
+        let offScreenIds = messageIds.filter { !onScreenIds.contains($0) }
+        guard !unreadOnScreenIds.isEmpty || !offScreenIds.isEmpty else { return }
+
+        // Optimistic in-memory mutation for on-screen unread messages (instant visual feedback)
+        if !unreadOnScreenIds.isEmpty {
+            let flipSet = Set(unreadOnScreenIds)
+            for idx in loadedMessages.indices where flipSet.contains(loadedMessages[idx].id) {
+                loadedMessages[idx].isRead = true
+            }
+            // Overlay protects against reloadMessages clobbering the optimistic
+            // state. Retain BEFORE registering, at gesture time, one per id —
+            // matches this op's later per-id release in the queued closure.
+            for id in unreadOnScreenIds {
+                manager.retainOverlayEntry(id: id)
+                manager.registerMutation(id: id, mutation: .init(isRead: true))
+            }
+            rebuildDisplayGroups()
+        }
 
         // FIFO write queue — ensures ordering with other actions
         Task { await manager.enqueueWrite { [manager] in
-            await manager.markRead(messages)
-            manager.removeOverlayEntries(ids: flipIds)
+            // On-screen ids: intent already established by the visualized
+            // state — resolve headers and write unconditionally (writing
+            // isRead=true to a row that's already true, or still lags to
+            // false, is idempotent either way).
+            let onScreenHeaders = await manager.resolveHeadersForAction(ids: unreadOnScreenIds)
+            // Off-screen ids: current state unknown from the gesture path —
+            // resolve + filter to currently-unread OFF-MAIN here, preserving
+            // the original filter-to-unread semantics for the batch case.
+            // Their overlay registration happens HERE (not at gesture time),
+            // so retain immediately before each registerMutation call, in the
+            // SAME closure that releases it below — the entry lives exactly
+            // as long as this op.
+            let offScreenHeaders = await manager.resolveHeadersForAction(ids: offScreenIds).filter { !$0.isRead }
+            for header in offScreenHeaders {
+                manager.retainOverlayEntry(id: header.id)
+                manager.registerMutation(id: header.id, mutation: .init(isRead: true))
+            }
+
+            let vanishedOnScreenCount = unreadOnScreenIds.count - onScreenHeaders.count
+            if vanishedOnScreenCount > 0 {
+                BackgroundSyncLogger.logInbox("[InboxViewModel] markRead — header resolution failed for \(vanishedOnScreenCount) on-screen id(s), releasing overlay retain")
+            }
+
+            let messages = onScreenHeaders + offScreenHeaders
+            if !messages.isEmpty {
+                await manager.markRead(messages)
+            }
+            // Release exactly one retain per id this op holds: on-screen ids
+            // were retained at gesture time (above, before this closure ran);
+            // off-screen ids were retained just above, inside this same
+            // closure — including vanished on-screen ids, whose retain still
+            // needs releasing even though `onScreenHeaders` dropped them.
+            for id in unreadOnScreenIds { manager.releaseOverlayEntry(id: id) }
+            for header in offScreenHeaders { manager.releaseOverlayEntry(id: header.id) }
         }}
     }
 
@@ -1765,17 +1849,27 @@ final class InboxViewModel {
         }
     }
 
+    /// Same act-on-visualized-state shape as `toggleRead` — see its doc comment.
     func toggleFlag(_ messageId: String) {
-        guard let message = lookupMessage(messageId) else { return }
-        let newFlagged = !message.isFlagged
+        guard let snapshot = loadedMessages.first(where: { $0.id == messageId }) else { return }
+        let newFlagged = !snapshot.isFlagged
         if let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) {
             loadedMessages[idx].isFlagged = newFlagged
         }
+        // Retain BEFORE registering — see `toggleRead`'s doc comment for why
+        // (overlay is coalesced; removal must be tied to THIS op's own
+        // completion, not any sibling op's).
+        manager.retainOverlayEntry(id: messageId)
         manager.registerMutation(id: messageId, mutation: .init(isFlagged: newFlagged))
         rebuildDisplayGroups()
         Task { await manager.enqueueWrite { [manager] in
+            guard let message = await manager.resolveHeaderForAction(id: messageId) else {
+                BackgroundSyncLogger.logInbox("[InboxViewModel] toggleFlag — header resolution failed for \(messageId), releasing overlay retain")
+                manager.releaseOverlayEntry(id: messageId)
+                return
+            }
             await manager.markFlagged([message], flagged: newFlagged)
-            manager.removeOverlayEntries(ids: [messageId])
+            manager.releaseOverlayEntry(id: messageId)
         }}
     }
 

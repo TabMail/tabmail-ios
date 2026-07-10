@@ -350,6 +350,74 @@ actor AccountManager {
         optimisticOverlay.withLock { $0 }
     }
 
+    /// Refcounts in-flight gesture ops per message id, so overlay removal can
+    /// be tied to the LAST op still touching an id rather than to ANY single
+    /// op's completion. `optimisticOverlay` is COALESCED — one `PendingMutation`
+    /// per id holding the latest registered intent — so when N ops for the
+    /// same id are queued FIFO (e.g. alternating `toggleRead` calls queued
+    /// faster than the write lane drains), the FIRST op to complete calling
+    /// `removeOverlayEntries` strips the overlay while ops #2..N are still in
+    /// flight, exposing intermediate DB truth to `reloadMessages` until the
+    /// LAST op lands (log-confirmed 2026-07-10, logmain.log line 1743: a
+    /// 10-op drain of alternating markUnread/markRead produced visible
+    /// flip-backs mid-drain). Same bug class as
+    /// `MessageDetailViewModel.localMovePins` (ADR-IOS-049 amendment, round
+    /// 8): "overlay-presence is the wrong proxy for in-flight-ness — a
+    /// sibling op's drain ends the window early." That precedent also
+    /// motivates the refcount (round 10) over a Set: overlapping ops on the
+    /// same id (e.g. toggleRead + toggleFlag queued together) must each
+    /// retain/release independently.
+    ///
+    /// Gesture paths (`InboxViewModel.toggleRead`/`markRead`/`toggleFlag`)
+    /// call `retainOverlayEntry` at gesture time (same call site as
+    /// `registerMutation`) and `releaseOverlayEntry` at the end of their
+    /// queued closure, on every exit path, in place of a direct
+    /// `removeOverlayEntries` call. Move/undo/detail-view flows are OUT OF
+    /// SCOPE — they keep using `removeOverlayEntries` directly pending their
+    /// own audit (moves already have an independent refcounted lifecycle via
+    /// `MessageDetailViewModel.localMovePins`).
+    private let overlayOpRefCount = Mutex<[String: Int]>([:])
+
+    /// Mark one more in-flight gesture op for `id`. Call synchronously at
+    /// gesture time, alongside `registerMutation`.
+    nonisolated func retainOverlayEntry(id: String) {
+        overlayOpRefCount.withLock { counts in
+            counts[id, default: 0] += 1
+        }
+    }
+
+    /// Release one in-flight gesture op for `id`. When the refcount reaches
+    /// zero — or `id` was never retained (defensive; the count never goes
+    /// negative) — removes `id` from the refcount map AND from the overlay
+    /// itself. Call exactly once per `retainOverlayEntry` call, on every exit
+    /// path of the owning queued closure.
+    nonisolated func releaseOverlayEntry(id: String) {
+        let shouldRemoveOverlay = overlayOpRefCount.withLock { counts -> Bool in
+            guard let count = counts[id] else {
+                // Defensive: unmatched release (no retain on record). Treat as
+                // the terminal release so the overlay never strands, but this
+                // indicates a retain/release imbalance at a call site.
+                BackgroundSyncLogger.logInbox("[AccountManager] releaseOverlayEntry — unmatched release for \(id), no retain on record")
+                return true
+            }
+            if count <= 1 {
+                counts.removeValue(forKey: id)
+                return true
+            }
+            counts[id] = count - 1
+            return false
+        }
+        guard shouldRemoveOverlay else { return }
+        removeOverlayEntries(ids: [id])
+    }
+
+    /// Test seam: snapshot the retain/release refcount map (hygiene checks —
+    /// asserting it drains back to empty). Mirrors `NSEDataBridge`'s
+    /// `…ForTesting()` convention.
+    nonisolated func overlayOpRefCountForTesting() -> [String: Int] {
+        overlayOpRefCount.withLock { $0 }
+    }
+
     /// Guard for outbox drain (used by AccountManagerOutbox).
     var isDrainingOutbox = false
 

@@ -38,6 +38,41 @@ extension AccountManager {
         await NSEMergeCoordinator.shared.merge()
     }
 
+    /// Off-main `MessageHeader` resolution for use INSIDE queued write closures
+    /// (`enqueueWrite`) — never on the MainActor gesture path. Mirrors
+    /// `InboxViewModel.lookupMessage`'s exact two-step lookup (durable GRDB row,
+    /// else the ADR-IOS-049 staged-row synthesis from `NSEDataBridge.latestStagedRows`)
+    /// so a gesture on a just-pushed row not yet durable in GRDB still resolves
+    /// once its closure runs — one implementation shared by both call sites
+    /// instead of a second copy of the two-step logic.
+    ///
+    /// Ids that resolve to nothing (row genuinely vanished — e.g. deleted by an
+    /// earlier queued op) are silently dropped. Callers gate on the returned
+    /// array being smaller than `ids` and must not strand any optimistic
+    /// overlay entry registered for a dropped id.
+    func resolveHeadersForAction(ids: [String]) async -> [MessageHeader] {
+        guard !ids.isEmpty else { return [] }
+        let durable = (try? await dbPool.read { db -> [MessageHeader] in
+            try MessageHeader.filter(ids.contains(Column("id"))).fetchAll(db)
+        }) ?? []
+        var byId = Dictionary(uniqueKeysWithValues: durable.map { ($0.id, $0) })
+        let missingIds = ids.filter { byId[$0] == nil }
+        if !missingIds.isEmpty {
+            let missingSet = Set(missingIds)
+            let staged = NSEDataBridge.latestStagedRows.withLock { rows in
+                rows.filter { missingSet.contains($0.headerId) }
+            }
+            for row in staged { byId[row.headerId] = row.toMessageHeader() }
+        }
+        // Preserve caller's id order; ids that resolved to nothing are dropped.
+        return ids.compactMap { byId[$0] }
+    }
+
+    /// Singular convenience over `resolveHeadersForAction(ids:)` for single-message actions.
+    func resolveHeaderForAction(id: String) async -> MessageHeader? {
+        await resolveHeadersForAction(ids: [id]).first
+    }
+
     func markRead(_ messages: [MessageHeader]) async {
         await ensureDurable(messages)
 
