@@ -30,6 +30,12 @@ struct NSELogStoreTests {
         try? FileManager.default.removeItem(at: url)
     }
 
+    /// Stable file identity (inode number) — the assertion currency for the
+    /// "clear must not swap the inode" tests below. nil when the file is gone.
+    private func fileID(_ url: URL) -> NSNumber? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.systemFileNumber] as? NSNumber
+    }
+
     // MARK: - Append / read round-trip
 
     @Test("append then read round-trips via the path override")
@@ -166,5 +172,108 @@ struct NSELogStoreTests {
         #expect(afterSecondAppend.contains(filler))
         #expect(afterSecondAppend.contains("second append — no retrim"))
         #expect(afterFirstAppend.contains("first append trims"))
+    }
+
+    @Test("inverted override caps (keepBytes > size > maxBytes) do not trap — no trim, content intact")
+    func invertedCapsNoTrapNoTrim() throws {
+        let url = setUp()
+        defer { tearDown(url) }
+        NSELogStore.enabledOverride.withLock { $0 = true }
+        // INVERTED caps: the ~200-byte file is over maxBytes (64) but UNDER
+        // keepBytes (10_000). Before the `size > keepBytes` guard was added,
+        // trimIfNeeded computed `size - keepBytes` on UInt64 → underflow trap
+        // on the very first append.
+        NSELogStore.maxBytesOverride.withLock { $0 = 64 }
+        NSELogStore.keepBytesOverride.withLock { $0 = 10_000 }
+
+        let preExisting = (0..<25).map { String(format: "line%03d", $0) }.joined(separator: "\n") + "\n"
+        #expect(preExisting.utf8.count > 64)
+        #expect(preExisting.utf8.count < 10_000)
+        try preExisting.write(to: url, atomically: true, encoding: .utf8)
+
+        // Would trap here without the guard. With it: no crash, no trim.
+        NSELogStore.append("appended after inverted caps")
+
+        let text = NSELogStore.read()
+        // Nothing was trimmed — keeping MORE than the whole file means the
+        // whole file is already within the keep budget.
+        #expect(text.contains("line000"))
+        #expect(text.contains("line024"))
+        #expect(text.contains("appended after inverted caps"))
+    }
+
+    @Test("file size exactly at maxBytes is not trimmed (strictly-greater boundary)")
+    func exactMaxBytesBoundaryNoTrim() throws {
+        let url = setUp()
+        defer { tearDown(url) }
+        NSELogStore.enabledOverride.withLock { $0 = true }
+        NSELogStore.maxBytesOverride.withLock { $0 = 200 }
+        NSELogStore.keepBytesOverride.withLock { $0 = 100 }
+
+        // Exactly 200 bytes: 25 lines of "lineNNN\n" (8 bytes each).
+        let preExisting = (0..<25).map { String(format: "line%03d", $0) }.joined(separator: "\n") + "\n"
+        #expect(preExisting.utf8.count == 200)
+        try preExisting.write(to: url, atomically: true, encoding: .utf8)
+
+        NSELogStore.append("boundary append")
+
+        let text = NSELogStore.read()
+        // size == maxBytes must NOT trim — the guard is strictly greater-than.
+        #expect(text.contains("line000"))
+        #expect(text.contains("boundary append"))
+    }
+
+    // MARK: - Clear preserves the inode (cross-process cached-handle contract)
+
+    @Test("external in-place clear preserves the inode — a warm NSE's cached handle keeps writing to the visible file")
+    func clearPreservesInodeForCachedWriters() throws {
+        let url = setUp()
+        defer { tearDown(url) }
+        NSELogStore.enabledOverride.withLock { $0 = true }
+
+        // Warm NSE process: the first append caches the store's FileHandle.
+        NSELogStore.append("old line before clear")
+        let idBefore = try #require(fileID(url), "seeded file must exist")
+
+        // Simulate the MAIN APP's Debug-menu clear from its own process using
+        // the FIXED clear() semantics — open forWritingTo + truncate(0) +
+        // close — via an INDEPENDENT FileHandle. Deliberately NOT
+        // NSELogStore.clear(): in this same-process test that would take the
+        // cached-handle branch and prove nothing about the cross-process case.
+        let external = try FileHandle(forWritingTo: url)
+        try external.truncate(atOffset: 0)
+        try external.close()
+
+        // The warm NSE's next push logs through its CACHED handle. With the
+        // old atomic-replace clear (write-temp-then-RENAME), this line landed
+        // on the deleted-inode orphan and vanished — exactly the lines the
+        // developer cleared the file to capture.
+        NSELogStore.append("new line after external clear")
+
+        let text = NSELogStore.read()
+        #expect(!text.contains("old line before clear"), "cleared content must be gone")
+        #expect(text.contains("new line after external clear"),
+                "the cached handle must land on the VISIBLE file, not an orphaned inode")
+        let idAfter = try #require(fileID(url), "file must still exist after clear + append")
+        #expect(idAfter == idBefore, "in-place truncate must preserve the inode")
+    }
+
+    @Test("clear() without a cached handle truncates in place — same inode, empty content")
+    func clearWithoutCachedHandleTruncatesInPlace() throws {
+        let url = setUp()   // _resetForTesting() ran — no cached handle in the store
+        defer { tearDown(url) }
+
+        // Seed the file directly — NOT via NSELogStore.append, which would
+        // cache a handle and route clear() through the cached-handle branch;
+        // this test pins the no-cached-handle (production Debug-menu) branch.
+        try "seeded line one\nseeded line two\n".write(to: url, atomically: false, encoding: .utf8)
+        let idBefore = try #require(fileID(url), "seeded file must exist")
+
+        NSELogStore.clear()
+
+        #expect(NSELogStore.read() == "(no NSE log)", "cleared file reads as empty (placeholder)")
+        let idAfter = try #require(fileID(url), "the file must survive the clear (truncate, not delete/rename)")
+        #expect(idAfter == idBefore,
+                "the no-cached-handle branch must NOT atomic-replace (rename swaps the inode) — truncate in place")
     }
 }

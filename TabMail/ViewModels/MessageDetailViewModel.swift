@@ -35,6 +35,49 @@ final class MessageDetailViewModel {
     /// body load is cancelled mid-DB-read.
     @ObservationIgnored private var markReadOnOpenCalled = false
 
+    /// Guards against overlapping `retryLoad()` invocations. retryLoad
+    /// unconditionally clears the single-shot latches above, so without this
+    /// a double-tap on the Retry button (or a `.task` re-fire mid-retry)
+    /// starts a second independent resolve ladder whose exhaustion can post
+    /// `.notificationTapUnresolved` and pop the view even though the first
+    /// invocation resolved. MainActor serializes accesses; retryLoad's
+    /// `defer` releases it on every exit path.
+    @ObservationIgnored private var retryInFlight = false
+
+    /// Whether the owning MessageDetailView is currently on screen — set by
+    /// its `.onAppear`/`.onDisappear`. Defaults to TRUE: the VM is presumed
+    /// presented from init (it's constructed at push time, before the first
+    /// `.onAppear` fires), and the existing exhaustion tests drive `loadBody`
+    /// without any view mounted.
+    ///
+    /// Purpose: suppress the `.notificationTapUnresolved` pop post from a
+    /// DISAPPEARED VM. Scenario: tap → VM₁ (sentinel S) ladder in flight →
+    /// user navigates away (the `.task` is cancelled but the ladder await is
+    /// not cancellation-aware; loadBody continues) → user re-taps the SAME
+    /// notification → VM₂ for the IDENTICAL sentinel S resolves → VM₁'s
+    /// abandoned ladder exhausts late and posts S →
+    /// `shouldPopForUnresolvedTap(S, S)` passes on string equality — it
+    /// cannot distinguish VM INSTANCES — and VM₂ is popped to the inbox while
+    /// the user reads the message. Instance staleness is gated here instead.
+    ///
+    /// NOTE: this flag only covers NAVIGATION-away. Sheets/fullScreenCovers do
+    /// NOT fire the presenting view's `onDisappear` — see
+    /// `hasActivePresentation` below for that case.
+    @ObservationIgnored var isViewVisible = true
+
+    /// Whether ANY sheet/fullScreenCover of the owning MessageDetailView is
+    /// currently presented — maintained by the view's single
+    /// `.onChange(of: isAnyCoverPresented)`. Covers do NOT fire the presenting
+    /// view's `onAppear`/`onDisappear`, so this flag is the only way the VM
+    /// knows a cover is up. A `.notificationTapUnresolved` pop must NEVER tear
+    /// down a view that has a live presentation on top: SwiftUI force-dismisses
+    /// the presentation along with it — worst case yanking an OPEN COMPOSE
+    /// DRAFT out from under the user (never-drop-user-intention). Imperative
+    /// QuickLook (presented outside this view's tree by AttachmentListView) is
+    /// covered separately by the global `PreviewFreezeGate.shared.isFrozen`
+    /// check at the same gate.
+    @ObservationIgnored var hasActivePresentation = false
+
     private let manager = AccountManager.shared
     private var dbPool: PrioritizedDatabase { _dbPoolOverride ?? AppDatabase.dbPool }
 
@@ -147,6 +190,18 @@ final class MessageDetailViewModel {
                     String(payload[sep.upperBound...]))
         }
         return (nil, payload)
+    }
+
+    /// Pure pop-decision for MailNavigationView's `.notificationTapUnresolved`
+    /// handler: pop back to the inbox ONLY when the unresolved id (posted by
+    /// the VM whose resolve ladder exhausted) still matches the
+    /// currently-pushed message. A stale VM firing late (the user already
+    /// navigated elsewhere), a missing selection, or a malformed post must
+    /// never pop an unrelated open. Extracted from the `.onReceive` guard so
+    /// the decision is unit-testable (audit finding B3 — zero coverage).
+    nonisolated static func shouldPopForUnresolvedTap(postedId: String?, selectedId: String?) -> Bool {
+        guard let postedId, let selectedId else { return false }
+        return postedId == selectedId
     }
 
     init(messageId: String) {
@@ -919,6 +974,50 @@ final class MessageDetailViewModel {
         }
     }
 
+    /// Explicit user Retry from the Not-Found screen. `loadBody()` alone is a
+    /// permanent no-op after a failed first run — the latches below memoize
+    /// the failure and each must be reset for the retry to actually re-run:
+    /// - `loadBodyCalled = false`: `loadBody` is single-shot (`.task` +
+    ///   `.onAppear` dedup); without this reset the retry's `loadBody()`
+    ///   returns on its first line and the user stays on an inert skeleton.
+    /// - `tapResolveTask = nil`: the single-flight tap-resolve ladder memoizes
+    ///   its result INCLUDING a failed (nil) run — a still-pending
+    ///   `pendingProviderTapId` would `await` the same exhausted task and
+    ///   instantly re-fail. Clearing it makes the retry run a FRESH ladder
+    ///   (the message may have been staged/synced since the first attempt).
+    /// - `messageNotFound = false`: swaps the Not-Found screen back to the
+    ///   loading skeleton while the retry runs (loadBody re-sets it on a
+    ///   genuine repeat failure).
+    /// - `markReadOnOpenCalled = false` + the trailing `markReadOnOpenIfNeeded()`:
+    ///   on the ORIGINAL tap-exhausted open, the view's `.task`/`.onAppear`
+    ///   already invoked `markReadOnOpenIfNeeded()` — it latched true, then
+    ///   bailed at its `resolveTapIfNeeded` guard. Those callers sit on the
+    ///   stable outer body and never refire, so without this reset a
+    ///   successful retry renders the message but the user's implicit
+    ///   read-intention is silently dropped (never-drop-user-intention).
+    ///   Re-running it after `loadBody()` flips isRead via the fast path; on
+    ///   a still-exhausted retry it re-latches and bails at the same guard
+    ///   harmlessly. (Same re-arm pattern as `seedFromStagedPublish`.)
+    ///
+    /// Re-entrancy: guarded by `retryInFlight`. The resets above are
+    /// unconditional, so two overlapping invocations (double-tap before the
+    /// button leaves screen, or a `.task` re-fire mid-retry) would each start
+    /// an independent resolve ladder — and a LOSING duplicate that exhausts
+    /// posts `.notificationTapUnresolved` and pops the view even though the
+    /// winner resolved. MainActor serializes the flag accesses; the `defer`
+    /// releases it whether the retry resolves or exhausts.
+    func retryLoad() async {
+        guard !retryInFlight else { return }
+        retryInFlight = true
+        defer { retryInFlight = false }
+        loadBodyCalled = false
+        messageNotFound = false
+        tapResolveTask = nil
+        markReadOnOpenCalled = false
+        await loadBody()
+        await markReadOnOpenIfNeeded()
+    }
+
     func loadBody() async {
         guard !loadBodyCalled else { return }
         loadBodyCalled = true
@@ -951,7 +1050,29 @@ final class MessageDetailViewModel {
         // shows rather than a blank view.
         guard await resolveTapIfNeeded() else {
             print("[MoveTrace] loadBody — notification-tap resolve exhausted for \(messageId)")
-            NotificationCenter.default.post(name: .notificationTapUnresolved, object: nil, userInfo: ["messageId": messageId])
+            // Pop post only when NOTHING is over or replacing this view.
+            // Three independent gates, each covering a case the others can't:
+            //  - `isViewVisible` (onAppear/onDisappear) — NAVIGATION-away: a
+            //    disappeared VM's late exhaustion (user left mid-ladder, then
+            //    re-tapped the SAME notification → a NEWER VM for the
+            //    IDENTICAL sentinel resolved) must not pop the newer view —
+            //    `shouldPopForUnresolvedTap`'s string equality can't
+            //    distinguish VM instances, so instance staleness gates here.
+            //  - `hasActivePresentation` — SAME-VIEW covers: sheets and
+            //    fullScreenCovers do NOT fire the presenting view's
+            //    onDisappear, and popping the detail view force-dismisses
+            //    whatever is on top — worst case an OPEN COMPOSE DRAFT
+            //    (never-drop-user-intention).
+            //  - `PreviewFreezeGate.shared.isFrozen` — IMPERATIVE QuickLook:
+            //    presented outside this view's tree (AttachmentListView, top
+            //    view controller), invisible to both flags above; the global
+            //    freeze gate is its signal.
+            // When suppressed, the UNCONDITIONAL `messageNotFound`/`isLoading`
+            // below genuinely leave Not-Found + a working Retry underneath /
+            // on re-present.
+            if isViewVisible && !hasActivePresentation && !PreviewFreezeGate.shared.isFrozen {
+                NotificationCenter.default.post(name: .notificationTapUnresolved, object: nil, userInfo: ["messageId": messageId])
+            }
             isLoading = false
             messageNotFound = true
             return

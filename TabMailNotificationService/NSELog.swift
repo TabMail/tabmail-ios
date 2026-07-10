@@ -21,6 +21,22 @@ enum NSELog {
     /// process lifetime is safe (mirrors `BootProfiler.lastMark`).
     private static let lastStepAt = Mutex<CFAbsoluteTime>(processStart)
 
+    /// Per-run attribution tag for the file channel. iOS can run several
+    /// `NotificationService` instances CONCURRENTLY in one reused NSE process
+    /// (one per in-flight push), interleaving their step lines in nse.log with
+    /// no way to attribute a non-STARTED line to its run. `didReceive` binds
+    /// this (`NSELog.$runTag.withValue(...)`) around each run's logging task
+    /// bodies — the `process(...)` Task, the watchdog Task, and
+    /// `serviceExtensionTimeWillExpire` — so every line inside carries
+    /// `[run:<tag>]` (first 8 chars of the request identifier).
+    ///
+    /// Untagged lines are pre-Task `didReceive` lines (the STARTED marker
+    /// itself carries the full request id, so runs remain delimitable).
+    /// NOTE: `Δ` stays PROCESS-global (one `lastStepAt` for all runs) — a
+    /// cross-run delta is meaningless on its own, but the absolute wall-clock
+    /// timestamp on every line rescues per-run delta math when needed.
+    @TaskLocal static var runTag: String?
+
     static func info(_ message: String) {
         #if DEBUG
         logger.info("🔔 \(message, privacy: .public)")
@@ -53,9 +69,11 @@ enum NSELog {
         #endif
     }
 
-    /// Append a `[wall-clock] [+total Δdelta] message` line to `NSELogStore`.
-    /// No-op (skips the Mutex hop + ISO8601 formatting) when the store is
-    /// disabled — `NSELogStore.isEnabled()` is checked first.
+    /// Append a `[wall-clock] [+total Δdelta] [run:<tag>] message` line to
+    /// `NSELogStore` (the `[run:]` segment only when a `runTag` is bound —
+    /// see its doc for tagging/Δ semantics). No-op (skips the Mutex hop +
+    /// ISO8601 formatting) when the store is disabled —
+    /// `NSELogStore.isEnabled()` is checked first.
     private static func appendTimed(_ message: String) {
         guard NSELogStore.isEnabled() else { return }
         let now = CFAbsoluteTimeGetCurrent()
@@ -64,7 +82,16 @@ enum NSELog {
         }
         let total = Int((now - processStart) * 1000)
         let delta = Int((now - last) * 1000)
-        let line = "[\(Date().iso8601StringWithMilliseconds())] [+\(total)ms Δ\(delta)ms] \(message)"
+        // Formatting lives in NSEProviderSupport.logLine (Shared/) so the
+        // tagged/untagged line shapes are pinned by unit tests — this target
+        // isn't reachable from TabMailTests. logLine also caps the message at
+        // NSELogStore.lineMaxChars (single unbounded field must not blow the
+        // file byte cap) — no truncation needed here.
+        let line = NSEProviderSupport.logLine(
+            timestamp: Date().iso8601StringWithMilliseconds(),
+            totalMs: total, deltaMs: delta,
+            runTag: runTag, message: message
+        )
         NSELogStore.append(line)
     }
 }

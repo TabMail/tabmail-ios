@@ -54,6 +54,25 @@ struct MessageDetailView: View {
         (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
     }
 
+    /// True while ANY of this view's sheets/fullScreenCovers is presented.
+    /// Combines ALL EIGHT presentation states in one computed value so a
+    /// single `.onChange` (see body) keeps `viewModel.hasActivePresentation`
+    /// current — covers do NOT fire the presenting view's
+    /// `onAppear`/`onDisappear`, and the VM must not post the unresolved-tap
+    /// pop while a cover (worst case: an open compose draft) sits on top.
+    /// One computed + ONE onChange, not eight — the body's modifier chain is
+    /// type-checker-budget-sensitive.
+    private var isAnyCoverPresented: Bool {
+        showCompose
+            || contactComposeRequest != nil
+            || replyMessage != nil
+            || replyAllMessage != nil
+            || forwardMessage != nil
+            || agentCompose != nil
+            || moveMessage != nil
+            || labelMenuMessage != nil
+    }
+
     init(messageId: String, opensWithSkeletonDwell: Bool = false) {
         self._viewModel = State(initialValue: MessageDetailViewModel(messageId: messageId))
         self.opensWithSkeletonDwell = opensWithSkeletonDwell
@@ -151,6 +170,10 @@ struct MessageDetailView: View {
                 }
             }
             .onAppear {
+                // Visibility flag for the VM's unresolved-tap pop suppression:
+                // a disappeared VM's late ladder exhaustion must not pop a
+                // newer same-sentinel view (see isViewVisible's doc).
+                viewModel.isViewVisible = true
                 chatContextMessage = viewModel.message
                 // Redundant loadBody trigger — covers edge cases where SwiftUI's .task
                 // doesn't fire for programmatically pushed NavigationSplitView detail views
@@ -168,12 +191,24 @@ struct MessageDetailView: View {
                 }
             }
             .onDisappear {
+                // See .onAppear — a hidden VM must not pop a newer
+                // same-sentinel view when its abandoned ladder exhausts late.
+                viewModel.isViewVisible = false
                 chatExpanded = false
                 ICSCalendarImporter.dismiss()
                 // Never leave the gate stuck frozen if the view goes away
                 // mid-scroll — it would freeze height application for every
                 // HTMLWebView process-wide.
                 ScrollFreezeGate.shared.end()
+            }
+            .onChange(of: isAnyCoverPresented) { _, active in
+                // Sheets/covers do NOT fire onDisappear on this view — this
+                // is how the VM learns a presentation is up, so its
+                // unresolved-tap pop can't tear down a view (and force-dismiss
+                // an open compose draft) beneath a live cover. One combined
+                // onChange for all eight presentation states — see
+                // isAnyCoverPresented.
+                viewModel.hasActivePresentation = active
             }
     }
 
@@ -196,8 +231,10 @@ struct MessageDetailView: View {
                     Text("This message may have been moved or deleted.")
                 } actions: {
                     Button("Retry") {
-                        viewModel.messageNotFound = false
-                        Task { await viewModel.loadBody() }
+                        // retryLoad (NOT loadBody): resets the loadBodyCalled
+                        // latch + the memoized failed tap-resolve task — a bare
+                        // loadBody() after a failed run is a permanent no-op.
+                        Task { await viewModel.retryLoad() }
                     }
                 }
             } else {

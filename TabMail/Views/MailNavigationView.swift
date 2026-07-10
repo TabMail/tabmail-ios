@@ -541,10 +541,13 @@ struct MailNavigationView: View {
             // it yet). Only pop when the unresolved id still matches the
             // currently-pushed message — guards against popping an unrelated
             // open (e.g. the user already navigated elsewhere and a stale VM
-            // fires late). Land on the inbox; the message appears at the top
-            // once sync catches up.
-            guard let messageId = notification.userInfo?["messageId"] as? String,
-                  messageId == selectedMessageId else { return }
+            // fires late). Decision extracted to the testable
+            // `shouldPopForUnresolvedTap` helper. Land on the inbox; the
+            // message appears at the top once sync catches up.
+            guard MessageDetailViewModel.shouldPopForUnresolvedTap(
+                postedId: notification.userInfo?["messageId"] as? String,
+                selectedId: selectedMessageId
+            ) else { return }
             BootProfiler.mark("notifTap: unresolved → falling back to inbox")
             selectedMessageId = nil
             selection = .unified(.inbox)

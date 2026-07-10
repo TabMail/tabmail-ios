@@ -111,6 +111,13 @@ final class NotificationService: UNNotificationServiceExtension {
     /// the watchdog / `serviceExtensionTimeWillExpire` can deliver a real
     /// summary instead of the bare fallback when they fire mid-processing.
     private let partialHolder = PartialSignalHolder()
+    /// Per-run nse.log attribution tag (first 8 chars of the request
+    /// identifier), set in `didReceive` and re-bound (`NSELog.$runTag`) around
+    /// `serviceExtensionTimeWillExpire`'s body — iOS can run several
+    /// NotificationService instances concurrently in one reused NSE process,
+    /// and without the tag their interleaved log lines are unattributable.
+    /// nil only if `didReceive` bailed on the no-mutable-content early path.
+    private var runTag: String?
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -124,6 +131,12 @@ final class NotificationService: UNNotificationServiceExtension {
             contentHandler(request.content)
             return
         }
+
+        // Per-run log attribution (see NSELog.runTag). Derived from the request
+        // identifier; the STARTED line below stays untagged — it carries the
+        // full id, which is how a [run:<tag>] maps back to its push.
+        let runTag = String(request.identifier.prefix(8))
+        self.runTag = runTag
 
         NSELog.step("NSE ━━━ STARTED ━━━ id=\(request.identifier)")
 
@@ -193,15 +206,17 @@ final class NotificationService: UNNotificationServiceExtension {
         }
 
         Task { @Sendable in
-            await NotificationService.process(
-                c: c, info: info, fanOutIds: fanOutIds, db: db,
-                heartbeatHolder: heartbeatHolder,
-                watchdogHolder: watchdogHolder,
-                leaseHolder: leaseHolder,
-                partialHolder: partialHolder,
-                deliveredFlag: deliverGuard,
-                runStart: t0,
-                deliver: deliverOnce)
+            await NSELog.$runTag.withValue(runTag) {
+                await NotificationService.process(
+                    c: c, info: info, fanOutIds: fanOutIds, db: db,
+                    heartbeatHolder: heartbeatHolder,
+                    watchdogHolder: watchdogHolder,
+                    leaseHolder: leaseHolder,
+                    partialHolder: partialHolder,
+                    deliveredFlag: deliverGuard,
+                    runStart: t0,
+                    deliver: deliverOnce)
+            }
         }
 
         // ── Graceful-exit watchdog ──
@@ -213,35 +228,44 @@ final class NotificationService: UNNotificationServiceExtension {
         // and the iOS expiration handler both cancel this so it never fires late.
         let watchdogSecs = Int(NSEConfig.watchdogSeconds)
         watchdogHolder.set(Task { @Sendable in
-            try? await Task.sleep(nanoseconds: UInt64(NSEConfig.watchdogSeconds * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            NSELog.step("NSE ⏱️ WATCHDOG (\(watchdogSecs)s) — graceful exit: release lease + deliver")
-            heartbeatHolder.cancelAndClear()
-            let released = leaseHolder.releaseIfHeld()
-            NSELog.step("NSE watchdog: lease \(released ? "RELEASED" : "(not held)")")
-            NotificationService.applyPartialOrBareFallback(c: c, partialHolder: partialHolder, source: "watchdog")
-            deliverOnce(c)
+            await NSELog.$runTag.withValue(runTag) {
+                try? await Task.sleep(nanoseconds: UInt64(NSEConfig.watchdogSeconds * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                NSELog.step("NSE ⏱️ WATCHDOG (\(watchdogSecs)s) — graceful exit: release lease + deliver")
+                heartbeatHolder.cancelAndClear()
+                let released = leaseHolder.releaseIfHeld()
+                NSELog.step("NSE watchdog: lease \(released ? "RELEASED" : "(not held)")")
+                NotificationService.applyPartialOrBareFallback(c: c, partialHolder: partialHolder, source: "watchdog")
+                deliverOnce(c)
+            }
         })
     }
 
     override func serviceExtensionTimeWillExpire() {
-        NSELog.step("NSE ⏰ TIMEOUT")
-        // iOS-fired backstop at the suspension edge. In the common case the
-        // watchdog (NSEConfig.watchdogSeconds, ~3s earlier) already released the
-        // lease + delivered, so the calls below are idempotent no-ops and we do
-        // NO write here — keeping us clear of a 0xdead10cc at suspension. Only if
-        // iOS gave us a shorter-than-watchdog budget does this do the actual
-        // release; a single conditional UPDATE is the lesser evil vs. a held
-        // lease (which the main app would otherwise wait out for staleMs=4s).
-        watchdogHolder.cancelAndClear()
-        heartbeatHolder.cancelAndClear()
-        let released = leaseHolder.releaseIfHeld()
-        if released { NSELog.step("NSE timeout: lease RELEASED (watchdog hadn't run)") }
-        guard let contentHandler, let content = bestAttemptContent else { return }
-        guard delivered.tryFire() else { return }
-        NotificationService.applyPartialOrBareFallback(c: content, partialHolder: partialHolder, source: "timeout")
-        NSELog.step("NSE timeout delivering: title=\(content.title) level=\(content.interruptionLevel.rawValue)")
-        contentHandler(content)
+        // Synchronous per-run log attribution: bind the stored tag around the
+        // whole body so the TIMEOUT/delivery lines attribute to this run.
+        // `runTag` is nil only when `didReceive` took the no-mutable-content
+        // early path (already delivered, nothing here to attribute) — binding
+        // nil is identical to leaving the TaskLocal unbound (untagged lines).
+        NSELog.$runTag.withValue(runTag) {
+            NSELog.step("NSE ⏰ TIMEOUT")
+            // iOS-fired backstop at the suspension edge. In the common case the
+            // watchdog (NSEConfig.watchdogSeconds, ~3s earlier) already released the
+            // lease + delivered, so the calls below are idempotent no-ops and we do
+            // NO write here — keeping us clear of a 0xdead10cc at suspension. Only if
+            // iOS gave us a shorter-than-watchdog budget does this do the actual
+            // release; a single conditional UPDATE is the lesser evil vs. a held
+            // lease (which the main app would otherwise wait out for staleMs=4s).
+            watchdogHolder.cancelAndClear()
+            heartbeatHolder.cancelAndClear()
+            let released = leaseHolder.releaseIfHeld()
+            if released { NSELog.step("NSE timeout: lease RELEASED (watchdog hadn't run)") }
+            guard let contentHandler, let content = bestAttemptContent else { return }
+            guard delivered.tryFire() else { return }
+            NotificationService.applyPartialOrBareFallback(c: content, partialHolder: partialHolder, source: "timeout")
+            NSELog.step("NSE timeout delivering: title=\(content.title) level=\(content.interruptionLevel.rawValue)")
+            contentHandler(content)
+        }
     }
 
     // MARK: - Partial-Result Fallback (watchdog / serviceExtensionTimeWillExpire)
@@ -311,7 +335,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // ── Route by type ──
         if provider == "task_alarm" {
             NSELog.step("NSE route: task_alarm")
-            await handleTaskAlarm(c: c, info: info, db: db)
+            await handleTaskAlarm(c: c, info: info, db: db, deliveredFlag: deliveredFlag)
             // Task result lands in NSE staging DB — main app will merge it on
             // its next natural wake (foreground, BGAppRefresh, BGProcessingTask)
             // via mergeNSEStagingData. The previous follow-up silent push was
@@ -394,6 +418,18 @@ final class NotificationService: UNNotificationServiceExtension {
                     historyId: historyId?.isEmpty == true ? nil : historyId,
                     accountId: accountId
                 )
+                // Zombie guard — same rationale as the step-4/5/6/7 checks: a
+                // history.list fetch can outlive the watchdog (HTTPClient allows
+                // up to 300s + retries), and everything below is a write —
+                // setLastHistoryId, persistInboxRemovals, and ESPECIALLY the
+                // badge adjustment, which is raw UserDefaults arithmetic (unlike
+                // the per-message-deduped badgeForDelivery): a zombie re-running
+                // it double-counts. NSE-target-only, so (like the other six
+                // checkpoints) this is exercised in the field, not unit tests.
+                if deliveredFlag.hasFired() {
+                    NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+                    return
+                }
                 messageIds = historyResult.addedMessageIds
 
                 // Advance historyId to prevent re-processing same events
@@ -482,7 +518,17 @@ final class NotificationService: UNNotificationServiceExtension {
             NSELog.step("NSE step4: FAIL — message fetch failed")
             deliverPassive(c: c, deliver: deliver); return
         }
-        NSELog.step("NSE step4 OK: from=\(msg.senderName) subj=\(String(msg.subject.prefix(40)))")
+        NSELog.step("NSE step4 OK: from=\(String(msg.senderName.prefix(60))) subj=\(String(msg.subject.prefix(40)))")
+
+        // Zombie guard — same rationale as the step6a/6b/pre-step-7 checks: a
+        // step-4 fetch that outlived the watchdog resumes here AFTER the exit
+        // path delivered and RELEASED the AI lease; the main app may own this
+        // message now, and the stageHeader INSERT below (and the partialHolder
+        // publish feeding a next-run exit path) would be stale work.
+        if deliveredFlag.hasFired() {
+            NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+            return
+        }
 
         // Publish the header-only partial NOW — the watchdog / iOS expiration
         // handler can deliver this (sender + subject, no summary yet) instead
@@ -530,6 +576,14 @@ final class NotificationService: UNNotificationServiceExtension {
         let body = rendered?.textContent
         NSELog.step("NSE step5: body=\(body?.count ?? 0) chars cidsUnresolved=\((rendered?.hasUnresolvedCIDs ?? false) ? "YES" : "NO")")
 
+        // Zombie guard — same rationale as the step-4 check above: a body
+        // fetch that outlived the watchdog must not run the stageBody UPDATE
+        // (or anything after it) once the exit path delivered + released.
+        if deliveredFlag.hasFired() {
+            NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+            return
+        }
+
         // ── GRADUAL STAGING stage 2: body ──
         // Attach the rendered body to the already-staged header so the merge can
         // write MessageBody + FTS (and the main app's body queue won't re-fetch).
@@ -546,6 +600,20 @@ final class NotificationService: UNNotificationServiceExtension {
         // AI cache under that.
         if let rfc = msg.rfc822MessageId,
            let peerHit = await NSEAICacheProbe.probe(accountId: accountId, folderId: msg.folderPath, rfc822MessageId: rfc) {
+            // Zombie guard — the probe is a real network await (raw URLSession,
+            // idle-timer timeout, deliberately NOT deadline-wrapped: it's one
+            // small plain-JSON round-trip, not SSE, and the watchdog +
+            // partialHolder already own delivery). This checkpoint neutralizes
+            // the branch's WRITE hazard instead: a zombie-resumed reply-hit
+            // would run persistProcessedMessage(..., notified: active) with
+            // notified=1, the merge applies it PERMANENTLY (CASE WHEN ? THEN 1
+            // ELSE notified END — never resets), and the main app's
+            // postReplyNotificationIfNeeded then never fires the reply ping for
+            // that message even though the classification was correct.
+            if deliveredFlag.hasFired() {
+                NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+                return
+            }
             NSELog.step("NSE step5.5: PEER cache HIT — skipping AI calls")
             let active = EmailNotificationBuilder.fill(
                 c,
@@ -624,6 +692,16 @@ final class NotificationService: UNNotificationServiceExtension {
         // more reliable actor and will write results to staging we'll merge).
         // If no owner or the holder is stale, we try to claim; on success we
         // refresh the heartbeat every aiHeartbeatIntervalMs while AI runs.
+        //
+        // Zombie guard — same rationale as the step-4/5 checks above, placed
+        // BEFORE the lease-state read: once the exit path delivered + released,
+        // this run must not re-CLAIM the lease (tryClaim would steal it back
+        // from a main app that may have just taken over) or restart the
+        // heartbeat it would then hold until scope exit.
+        if deliveredFlag.hasFired() {
+            NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+            return
+        }
         var didClaimAI = false
         if !aiDisabled, let db, let body, !body.isEmpty {
             if let existing = AIOwnershipLease.state(db: db, accountId: accountId, messageId: msg.messageId),
@@ -894,7 +972,12 @@ final class NotificationService: UNNotificationServiceExtension {
 
     // MARK: - Task Alarm
 
-    private static func handleTaskAlarm(c: UNMutableNotificationContent, info: [String: String], db: DatabaseQueue?) async {
+    private static func handleTaskAlarm(
+        c: UNMutableNotificationContent,
+        info: [String: String],
+        db: DatabaseQueue?,
+        deliveredFlag: OneShotFlag
+    ) async {
         let taskName = info["taskName"] ?? "Scheduled Task"
         let rawInstruction = info["taskInstruction"]
         guard let instruction = (rawInstruction?.isEmpty == true ? nil : rawInstruction)
@@ -907,7 +990,7 @@ final class NotificationService: UNNotificationServiceExtension {
         let dateStr = DateFormatter.localizedString(from: now, dateStyle: .full, timeStyle: .none)
         let userMessage = "It is now \(timeStr), \(dateStr). I previously scheduled this task: \"\(instruction)\" Execute and respond."
 
-        if let resp = await BackendNSEClient.sendCompletions(
+        let resp = await BackendNSEClient.sendCompletions(
             promptAlias: "system_prompt_chat",
             variables: BackendNSEClient.Vars([
                 "user_name": NSEState.getUserName() ?? "User",
@@ -915,7 +998,19 @@ final class NotificationService: UNNotificationServiceExtension {
                 "user_message": userMessage,
             ]),
             authToken: await NSETokenManager.validAccessToken(), timeout: NSEConfig.taskTimeoutSeconds
-        ) {
+        )
+        // Zombie guard — same rationale as process()'s checkpoints: the
+        // completions call is deadline-bounded, but the process can still be
+        // suspended mid-await and zombie-resumed after the watchdog delivered.
+        // Guard BEFORE mutating `c` and before the persistTaskResult write —
+        // a stale INSERT would hand the main app a task result from a run the
+        // exit path already concluded. Returning without touching `c` is safe:
+        // the caller's deliver(c) no-ops on the fired OneShotFlag.
+        if deliveredFlag.hasFired() {
+            NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+            return
+        }
+        if let resp {
             c.title = taskName; c.body = String(resp.assistant.prefix(4096))
             c.interruptionLevel = .active; c.sound = .default
             if let db { NSEStagingDB.persistTaskResult(db: db, taskName: taskName, taskInstruction: instruction, result: resp.assistant) }

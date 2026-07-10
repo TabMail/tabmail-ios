@@ -89,3 +89,58 @@ struct NSELLMBudgetTests {
         #expect(budget == nominal)
     }
 }
+
+/// `NSEProviderSupport.logLine` — the pure nse.log line formatter behind
+/// `NSELog.appendTimed` (extracted to `Shared/` so the format is testable;
+/// the NSE target isn't reachable from TabMailTests). These pins are the
+/// grep contract for field-log tooling: `[ts] [+Nms ΔMms]` timing block,
+/// then the optional `[run:<tag>]` attribution segment added when iOS runs
+/// several NotificationService instances concurrently in one reused NSE
+/// process. The timestamp is opaque passthrough (far-future literal is fine
+/// — nothing compares it to the current date).
+@Suite("NSEProviderSupport.logLine format pins")
+struct NSELogLineFormatTests {
+
+    private let ts = "2099-01-01T00:00:00.000Z"
+
+    @Test("untagged shape: [ts] [+Nms ΔMms] message")
+    func untaggedShape() {
+        let line = NSEProviderSupport.logLine(
+            timestamp: ts, totalMs: 1234, deltaMs: 56, runTag: nil,
+            message: "NSE step4 OK: from=Sender"
+        )
+        #expect(line == "[\(ts)] [+1234ms Δ56ms] NSE step4 OK: from=Sender")
+    }
+
+    @Test("tagged shape: [ts] [+Nms ΔMms] [run:tag] message")
+    func taggedShape() {
+        let line = NSEProviderSupport.logLine(
+            timestamp: ts, totalMs: 0, deltaMs: 0, runTag: "abcd1234",
+            message: "NSE ⏰ TIMEOUT"
+        )
+        #expect(line == "[\(ts)] [+0ms Δ0ms] [run:abcd1234] NSE ⏰ TIMEOUT")
+    }
+
+    @Test("oversize message is capped at NSELogStore.lineMaxChars — one unbounded field can't blow the file cap")
+    func oversizeMessageCapped() {
+        let oversize = String(repeating: "x", count: NSELogStore.lineMaxChars + 500)
+        let line = NSEProviderSupport.logLine(
+            timestamp: ts, totalMs: 1, deltaMs: 1, runTag: nil, message: oversize
+        )
+        let expectedPrefix = "[\(ts)] [+1ms Δ1ms] "
+        #expect(line.hasPrefix(expectedPrefix))
+        let messagePortion = String(line.dropFirst(expectedPrefix.count))
+        #expect(messagePortion.count == NSELogStore.lineMaxChars,
+                "message portion must be exactly lineMaxChars characters")
+        #expect(messagePortion == String(oversize.prefix(NSELogStore.lineMaxChars)))
+    }
+
+    @Test("message at exactly lineMaxChars passes through uncapped")
+    func exactLimitMessageUntouched() {
+        let exact = String(repeating: "y", count: NSELogStore.lineMaxChars)
+        let line = NSEProviderSupport.logLine(
+            timestamp: ts, totalMs: 2, deltaMs: 2, runTag: nil, message: exact
+        )
+        #expect(line == "[\(ts)] [+2ms Δ2ms] \(exact)")
+    }
+}

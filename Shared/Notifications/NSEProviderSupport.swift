@@ -92,4 +92,33 @@ public enum NSEProviderSupport {
         guard budget >= minCall else { return nil }
         return budget
     }
+
+    /// Pure formatter for one persistent-nse.log line — extracted from
+    /// `NSELog.appendTimed` (NSE-target-only, unreachable from TabMailTests)
+    /// so the line format is pinned by unit tests. Exactly two shapes,
+    /// byte-identical to what `appendTimed` historically emitted:
+    ///   `[<timestamp>] [+<total>ms Δ<delta>ms] <message>`             (runTag nil)
+    ///   `[<timestamp>] [+<total>ms Δ<delta>ms] [run:<tag>] <message>` (tagged)
+    /// The `[run:<tag>]` segment attributes a line to its push when iOS runs
+    /// several NotificationService instances concurrently in one reused NSE
+    /// process. `timestamp` is opaque passthrough (caller formats ISO8601ms).
+    ///
+    /// The MESSAGE field is capped at `NSELogStore.lineMaxChars` (see its doc:
+    /// one unbounded interpolated field must not blow the log-file byte cap —
+    /// the once-per-process trim cannot bound an individual write). The cap
+    /// lives HERE, not in `NSELog.appendTimed`, so it is covered by the
+    /// format-pin tests (NSELog is NSE-target-only, unreachable from
+    /// TabMailTests). Display/diagnostic truncation only — the full value
+    /// still exists wherever it is actually stored.
+    public static func logLine(
+        timestamp: String,
+        totalMs: Int,
+        deltaMs: Int,
+        runTag: String?,
+        message: String
+    ) -> String {
+        let cappedMessage = String(message.prefix(NSELogStore.lineMaxChars))
+        let tag = runTag.map { " [run:\($0)]" } ?? ""
+        return "[\(timestamp)] [+\(totalMs)ms Δ\(deltaMs)ms]\(tag) \(cappedMessage)"
+    }
 }

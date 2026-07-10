@@ -33,6 +33,15 @@ enum NSELogStore {
     /// Bytes retained after a trim, advanced past the first newline so no
     /// entry is ever split.
     static let keepBytes = 1536 * 1024 // 1.5 MB
+    /// Hard per-line cap (characters) applied to the MESSAGE field by
+    /// `NSEProviderSupport.logLine`. A single unbounded interpolated field
+    /// (e.g. a crafted From display name echoed into a step line) must not
+    /// blow the `maxBytes` file cap — `trimIfNeeded` runs once per NSE
+    /// process BEFORE the first write and cannot bound the write itself;
+    /// this cap does. Character-based (`prefix`), not byte-exact: fine for a
+    /// debug channel, and matches the codebase's display-truncation
+    /// convention (`String(x.prefix(n))`).
+    static let lineMaxChars = 2000
 
     /// App Group suite key. Mirrored by `NSEDataBridge.mirrorDebugLogging()`
     /// and pushed immediately by `DebugModeManager` on unlock/lock. Also
@@ -133,7 +142,11 @@ enum NSELogStore {
     /// orphan the cached handle onto a since-deleted inode. Caller must hold
     /// `state`'s lock.
     private static func trimIfNeeded(handle: FileHandle) {
-        guard let size = try? handle.seekToEnd(), size > UInt64(effectiveMaxBytes) else { return }
+        // `size > keepBytes` too: overridden caps can invert (keepBytes > size
+        // while size > maxBytes), and the unsigned subtraction below would trap.
+        guard let size = try? handle.seekToEnd(),
+              size > UInt64(effectiveMaxBytes),
+              size > UInt64(effectiveKeepBytes) else { return }
         let offset = size - UInt64(effectiveKeepBytes)
         do { try handle.seek(toOffset: offset) } catch { return }
         guard var data = try? handle.readToEnd() else { return }
@@ -161,9 +174,21 @@ enum NSELogStore {
     /// Clear the log file. In production this is always called from the main
     /// app process (Debug menu), which never holds `state`'s cached handle —
     /// that's populated only by the NSE process's own `append` calls, in its
-    /// own address space — so it takes the atomic-replace branch below. A
+    /// own address space — so it takes the no-cached-handle branch below. A
     /// same-process caller that already has a cached handle (e.g. a test that
     /// appends then clears) truncates that handle in place instead.
+    ///
+    /// BOTH branches truncate IN PLACE — the inode is preserved. The
+    /// no-cached-handle branch previously used `"".write(atomically: true)`,
+    /// which is write-temp-then-RENAME: it swaps the inode, so a WARM NSE
+    /// process's cached `FileHandle` (in its own address space, invisible from
+    /// here) kept writing to the deleted-inode orphan — the very next push's
+    /// log lines, the ones the developer cleared the file to capture,
+    /// vanished until that NSE process died. That contradicted the trim
+    /// path's own no-atomic-replace rule (see `trimIfNeeded`). With the
+    /// in-place truncate, a warm NSE's cached handle keeps writing to the
+    /// visible file after a Debug-menu clear — clear-then-capture works.
+    /// A missing file needs no action (`append` creates it).
     static func clear() {
         guard let url = fileURL else { return }
         state.withLock { s in
@@ -171,8 +196,11 @@ enum NSELogStore {
                 try? handle.truncate(atOffset: 0)
                 try? handle.seek(toOffset: 0)
                 s.trimmedThisProcess = false
-            } else {
-                try? "".write(to: url, atomically: true, encoding: .utf8)
+            } else if FileManager.default.fileExists(atPath: url.path) {
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    try? handle.truncate(atOffset: 0)
+                    try? handle.close()
+                }
             }
         }
     }
