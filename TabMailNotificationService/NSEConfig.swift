@@ -5,7 +5,22 @@
 import Foundation
 
 enum NSEConfig {
-    static let summaryTimeoutSeconds: TimeInterval = 12
+    /// Per-ATTEMPT nominal timeout for the step-6a summary call. The summary
+    /// runs in a budget-bounded retry loop (see `NotificationService.process`):
+    /// each attempt's actual timeout is `llmCallBudget(nominal: this, ...)`, and
+    /// a failed attempt (wall-clock deadline or nil response) retries with the
+    /// freshly recomputed — smaller — remaining budget until `llmCallBudget`
+    /// returns nil. Raised 12 → 15 (2026-07-09): field runs showed 12s attempts
+    /// deadlining on slow-but-healthy backend responses; 15 + a ~7-8s second
+    /// attempt fits inside watchdog − finish margin (27 − 2.5 = 24.5s).
+    static let summaryTimeoutSeconds: TimeInterval = 15
+    /// Hard cap on step-6a summary attempts. The retry loop is normally
+    /// bounded by budget exhaustion (a DEADLINE attempt consumes its whole
+    /// budget), but a FAST-failing attempt — device offline, backend refusing
+    /// connections — returns in milliseconds and would otherwise spin the loop
+    /// (and spam nse.log + the backend) until the ~24.5s window drains. Three
+    /// attempts covers the transient-blip case a retry can actually fix.
+    static let summaryMaxAttempts = 3
     static let actionTimeoutSeconds: TimeInterval = 12
     static let taskTimeoutSeconds: TimeInterval = 24
     static let followUpTimeoutSeconds: TimeInterval = 5
@@ -32,13 +47,17 @@ enum NSEConfig {
     /// — NOT racing the suspension, which would risk a RUNNINGBOARD 0xdead10cc on
     /// a SQLite write in flight.
     ///
-    /// LLM calls are now deadline-budgeted (see `NSEProviderSupport.llmCallBudget`,
-    /// `llmFinishMarginSeconds`, `llmMinCallSeconds`): each call's timeout is
-    /// capped to what's left of this window minus the finish margin, so a
-    /// healthy-but-slow run finishes (or gives up on a call) and reaches step
-    /// 7/8 — deliver — on its own, well before this fires. This watchdog is
-    /// therefore a true backstop: it should only fire on a truly stuck
-    /// non-LLM step (network hang below the deadline-budgeted layer, DB lock,
-    /// etc.), not as the normal way a slow LLM call gets cut off.
+    /// LLM calls are deadline-budgeted (see `NSEProviderSupport.llmCallBudget`,
+    /// `llmFinishMarginSeconds`, `llmMinCallSeconds`): every attempt's timeout
+    /// is capped to what's left of this window minus the finish margin. The
+    /// summary (step 6a) RETRIES within that budget — each iteration recomputes
+    /// the remaining budget and stops when it drops below `llmMinCallSeconds` —
+    /// and the action vote (step 6b) only runs after a successful summary
+    /// (parity with `ActiveAIQueue.executeActionJob`'s no-summary skip), with
+    /// whatever budget remains. So a healthy-but-slow run finishes (or gives
+    /// up) and reaches step 7/8 — deliver — on its own, well before this
+    /// fires. This watchdog is therefore a true backstop: it should only fire
+    /// on a truly stuck non-LLM step (network hang below the deadline-budgeted
+    /// layer, DB lock, etc.), not as the normal way a slow LLM call gets cut off.
     static let watchdogSeconds: TimeInterval = 27
 }

@@ -13,16 +13,17 @@ import Foundation
 /// Budgeting each call from the run's REMAINING time (instead of the raw
 /// nominal timeout) makes the watchdog a true backstop.
 ///
-/// `NSEConfig` (the production constants — 12s summary/action nominal, 27s
-/// watchdog, 2.5s finish margin, 2s min call) lives in the
+/// `NSEConfig` (the production constants — 15s-per-attempt summary / 12s action
+/// nominal, 27s watchdog, 2.5s finish margin, 2s min call) lives in the
 /// `TabMailNotificationService` target only, not `TabMail` — this file uses
-/// the same literal values directly so it stays testable from `TabMailTests`
-/// (which depends on `TabMail`, and `NSEProviderSupport` lives in `Shared`,
-/// compiled into both targets).
+/// representative literal values directly so it stays testable from
+/// `TabMailTests` (which depends on `TabMail`, and `NSEProviderSupport` lives
+/// in `Shared`, compiled into both targets). The function is pure; the exact
+/// nominal doesn't change any semantics under test.
 @Suite("NSEProviderSupport.llmCallBudget")
 struct NSELLMBudgetTests {
 
-    // Mirrors NSEConfig's production values.
+    // Representative values (production action nominal + shared watchdog/margin/floor).
     private let nominal: TimeInterval = 12
     private let watchdog: TimeInterval = 27
     private let finishMargin: TimeInterval = 2.5

@@ -698,15 +698,38 @@ final class NotificationService: UNNotificationServiceExtension {
             // NSEProviderSupport.llmCallBudget. Makes the watchdog a true
             // backstop: a healthy-but-slow run gives up on its own with
             // llmFinishMarginSeconds left for step 7/8.
-            let summaryBudget = NSEProviderSupport.llmCallBudget(
-                nominal: NSEConfig.summaryTimeoutSeconds,
-                elapsed: CFAbsoluteTimeGetCurrent() - runStart,
-                watchdog: NSEConfig.watchdogSeconds,
-                finishMargin: NSEConfig.llmFinishMarginSeconds,
-                minCall: NSEConfig.llmMinCallSeconds
-            )
-            if let summaryBudget {
-                NSELog.step("NSE step6a: calling summary (recipient_status=\(recipientStatus.isEmpty ? "omitted" : recipientStatus), budget=\(String(format: "%.1f", summaryBudget))s)")
+            //
+            // The summary RETRIES within that budget: each iteration recomputes
+            // the remaining budget fresh; a failed attempt (wall-clock deadline
+            // or nil response) loops with the smaller recomputed budget. Two
+            // terminators: llmCallBudget returning nil (a DEADLINE attempt
+            // consumed its budget), and summaryMaxAttempts (a FAST-failing
+            // attempt — offline, connection refused — returns in ms and would
+            // otherwise spin the loop for the whole ~24.5s window). Field
+            // trigger (2026-07-09): a 12s single-shot summary deadlined, and
+            // the action then classified "reply" with NO summary context.
+            // Futile-loop guard: sendCompletions returns nil INSTANTLY when the
+            // auth token is nil (its first guard) — retrying that would
+            // tight-spin until the budget runs out. One check, once, up front;
+            // the loop condition below skips entirely. (Behavior parity with
+            // the pre-loop code: a nil token always produced a nil summary.)
+            if authToken == nil {
+                NSELog.step("NSE step6a: SKIP — no auth token")
+            }
+            var summaryAttempt = 0
+            while authToken != nil, summaryAttempt < NSEConfig.summaryMaxAttempts {
+                guard let summaryBudget = NSEProviderSupport.llmCallBudget(
+                    nominal: NSEConfig.summaryTimeoutSeconds,
+                    elapsed: CFAbsoluteTimeGetCurrent() - runStart,
+                    watchdog: NSEConfig.watchdogSeconds,
+                    finishMargin: NSEConfig.llmFinishMarginSeconds,
+                    minCall: NSEConfig.llmMinCallSeconds
+                ) else {
+                    NSELog.step("NSE step6a: SKIP — no time budget left (elapsed=\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - runStart))s)")
+                    break
+                }
+                summaryAttempt += 1
+                NSELog.step("NSE step6a: calling summary (attempt \(summaryAttempt), recipient_status=\(recipientStatus.isEmpty ? "omitted" : recipientStatus), budget=\(String(format: "%.1f", summaryBudget))s)")
                 let resp = await BackendNSEClient.sendCompletions(
                     promptAlias: "system_prompt_summary",
                     variables: BackendNSEClient.Vars(summaryVars),
@@ -717,72 +740,81 @@ final class NotificationService: UNNotificationServiceExtension {
                 // this call was in flight. If so, the main app may own this
                 // message now; a late stageSummary UPDATE would clobber its row.
                 // Never false-positives on the natural path: deliverOnce only
-                // fires after step 8, past every one of these checks.
+                // fires after step 8, past every one of these checks. Checked
+                // INSIDE the loop, before any staging write.
                 if deliveredFlag.hasFired() {
                     NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
                     return
                 }
-                if let resp {
-                    let parsed = NSEResponseParser.parseSummary(resp.assistant)
-                    summaryBlurb = parsed.blurb; summaryTodos = parsed.todos
-                    reminderDate = parsed.reminderDate; reminderTime = parsed.reminderTime
-                    reminderContent = parsed.reminderContent
-                    NSELog.step("NSE step6a OK: blurb=\(String((summaryBlurb ?? "nil").prefix(60)))")
-                    // ── GRADUAL STAGING stage 3a: summary ──
-                    // Surface the summary before the action vote returns, so a merge
-                    // landing mid-vote shows it. aiCompleted stays 0 until step 7.
-                    if let db {
-                        NSEStagingDB.stageSummary(
-                            db: db, accountId: accountId, messageId: msg.messageId,
-                            summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
-                            reminderDate: reminderDate, reminderTime: reminderTime,
-                            reminderContent: reminderContent)
-                    }
-                    // Upgrade the partial to header+summary — actionTag stays nil,
-                    // the vote hasn't returned yet. A watchdog/timeout firing from
-                    // here on delivers the real summary instead of a bare banner.
-                    partialHolder.set(
-                        EmailNotificationBuilder.Signal(
-                            senderName: msg.senderName, senderEmail: msg.senderEmail, subject: msg.subject,
-                            summaryBlurb: summaryBlurb, reminderContent: reminderContent,
-                            dueDate: reminderDate, dueTime: reminderTime
-                        ),
-                        accountId: accountId, messageId: msg.messageId
-                    )
-                } else {
-                    NSELog.step("NSE step6a FAIL: summary call failed")
+                guard let resp else {
+                    NSELog.step("NSE step6a FAIL: summary call failed (attempt \(summaryAttempt)) — retrying with remaining budget")
+                    continue
                 }
-            } else {
-                NSELog.step("NSE step6a: SKIP — no time budget left (elapsed=\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - runStart))s)")
+                let parsed = NSEResponseParser.parseSummary(resp.assistant)
+                summaryBlurb = parsed.blurb; summaryTodos = parsed.todos
+                reminderDate = parsed.reminderDate; reminderTime = parsed.reminderTime
+                reminderContent = parsed.reminderContent
+                NSELog.step("NSE step6a OK: blurb=\(String((summaryBlurb ?? "nil").prefix(60)))")
+                // ── GRADUAL STAGING stage 3a: summary ──
+                // Surface the summary before the action vote returns, so a merge
+                // landing mid-vote shows it. aiCompleted stays 0 until step 7.
+                if let db {
+                    NSEStagingDB.stageSummary(
+                        db: db, accountId: accountId, messageId: msg.messageId,
+                        summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
+                        reminderDate: reminderDate, reminderTime: reminderTime,
+                        reminderContent: reminderContent)
+                }
+                // Upgrade the partial to header+summary — actionTag stays nil,
+                // the vote hasn't returned yet. A watchdog/timeout firing from
+                // here on delivers the real summary instead of a bare banner.
+                partialHolder.set(
+                    EmailNotificationBuilder.Signal(
+                        senderName: msg.senderName, senderEmail: msg.senderEmail, subject: msg.subject,
+                        summaryBlurb: summaryBlurb, reminderContent: reminderContent,
+                        dueDate: reminderDate, dueTime: reminderTime
+                    ),
+                    accountId: accountId, messageId: msg.messageId
+                )
+                break
             }
 
-            let actionBudget = NSEProviderSupport.llmCallBudget(
-                nominal: NSEConfig.actionTimeoutSeconds,
-                elapsed: CFAbsoluteTimeGetCurrent() - runStart,
-                watchdog: NSEConfig.watchdogSeconds,
-                finishMargin: NSEConfig.llmFinishMarginSeconds,
-                minCall: NSEConfig.llmMinCallSeconds
-            )
-            if let actionBudget {
-                NSELog.step("NSE step6b: calling action (budget=\(String(format: "%.1f", actionBudget))s)")
-                let summaryCtx = SummaryContext(blurb: summaryBlurb, todos: summaryTodos)
-                let actionVars = PromptVariables.actionVariables(
-                    metadata: sharedMetadata, body: sharedBody,
-                    summary: summaryCtx, account: account
+            // Parity gate: the action vote REQUIRES summary context, matching
+            // the main app's ActiveAIQueue.executeActionJob guard ("Action
+            // skipped (no summary yet)"). Field evidence (2026-07-09): a
+            // deadline-abandoned summary followed by a summary-less action call
+            // produced a spurious "reply" classification.
+            if summaryBlurb?.isEmpty == false {
+                let actionBudget = NSEProviderSupport.llmCallBudget(
+                    nominal: NSEConfig.actionTimeoutSeconds,
+                    elapsed: CFAbsoluteTimeGetCurrent() - runStart,
+                    watchdog: NSEConfig.watchdogSeconds,
+                    finishMargin: NSEConfig.llmFinishMarginSeconds,
+                    minCall: NSEConfig.llmMinCallSeconds
                 )
-                actionTag = await BackendNSEClient.sendActionVote(
-                    promptAlias: "system_prompt_action",
-                    variables: BackendNSEClient.Vars(actionVars),
-                    authToken: authToken, timeout: actionBudget
-                )
-                // Zombie guard — same rationale as the step6a check above.
-                if deliveredFlag.hasFired() {
-                    NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
-                    return
+                if let actionBudget {
+                    NSELog.step("NSE step6b: calling action (budget=\(String(format: "%.1f", actionBudget))s)")
+                    let summaryCtx = SummaryContext(blurb: summaryBlurb, todos: summaryTodos)
+                    let actionVars = PromptVariables.actionVariables(
+                        metadata: sharedMetadata, body: sharedBody,
+                        summary: summaryCtx, account: account
+                    )
+                    actionTag = await BackendNSEClient.sendActionVote(
+                        promptAlias: "system_prompt_action",
+                        variables: BackendNSEClient.Vars(actionVars),
+                        authToken: authToken, timeout: actionBudget
+                    )
+                    // Zombie guard — same rationale as the step6a check above.
+                    if deliveredFlag.hasFired() {
+                        NSELog.step("NSE zombie: exit path already delivered — abandoning without persist")
+                        return
+                    }
+                    NSELog.step("NSE step6b: action=\(actionTag ?? "nil")")
+                } else {
+                    NSELog.step("NSE step6b: SKIP — no time budget left (elapsed=\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - runStart))s)")
                 }
-                NSELog.step("NSE step6b: action=\(actionTag ?? "nil")")
             } else {
-                NSELog.step("NSE step6b: SKIP — no time budget left (elapsed=\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - runStart))s)")
+                NSELog.step("NSE step6b: SKIP — no summary (action requires summary context; main-app AI will complete on next wake)")
             }
         } else if aiDisabled {
             NSELog.step("NSE step6: SKIP — AI disabled (privacy opt-out)")
