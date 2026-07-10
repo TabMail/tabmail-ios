@@ -202,6 +202,25 @@ final class SyncScheduler {
         case full              // BGProcessing: drain until idle + backfill
     }
 
+    /// Pure drain-mode decision for a silent push (ADR-IOS-056). No UIKit /
+    /// global state, so it is unit-testable.
+    ///
+    /// `PushConfig.silentPushDeadlineSeconds` is a BACKGROUND-ENVELOPE watchdog
+    /// — it exists because a background wake (silent push delivered while
+    /// suspended, BGAppRefresh) gets only ~30s of iOS runtime before the
+    /// process is killed, so `syncStartup` must poll-wait for the active
+    /// queues up to that budget or lose the work entirely. A silent push
+    /// delivered while the app is FOREGROUND-ACTIVE has no such envelope: the
+    /// active body/AI queues now self-drain at `.normal` (ADR-IOS-056 part A —
+    /// higher than backfill, still yields to the merge/user actions), so
+    /// nothing needs to hold the push handler open polling a budget that
+    /// exists to protect a background wake that never happened. Mirrors the
+    /// foreground boot path, which already passes `.none`
+    /// (`startForegroundPolling` → `syncStartup(drain: .none)`, see below).
+    nonisolated static func drainModeForSilentPush(isForegroundActive: Bool) -> DrainMode {
+        isForegroundActive ? .none : .budget(PushConfig.silentPushDeadlineSeconds)
+    }
+
     /// Unified startup sequence for all sync entry points.
     /// - inboxOnly: true for BGAppRefresh/push (limited budget), false for foreground/BGProcessing
     /// - drain: how long to wait for queue drain after repopulate

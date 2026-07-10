@@ -41,7 +41,21 @@ actor ActiveBodyQueue {
     private var folderActiveBatches: [String: Int] = [:]
     private let maxBatchesPerFolder = 2
 
-    private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
+    // .normal-tier (ADR-IOS-056): higher than deep backfill (.background) but
+    // below the merge/user-action/badge tier (.priority) — this queue drains
+    // NEWLY-synced inbox mail during the boot/push herd, which is sync-level
+    // work, not a privileged phase. The shared `BodyFetchProcessor` is tagged
+    // separately at its call sites below via `PriorityGate.normal` (mirrors
+    // `BackfillBodyQueue`'s `.background` wrap — it's also used by the priority
+    // on-demand fetch, so it can't be blanket-tagged). A privileged merge
+    // context still wins regardless of this tag — `PrioritizedDatabase.
+    // effectivePriority` checks `inPrivilegedContext` before any override.
+    private var dbPool: PrioritizedDatabase { AppDatabase.syncPool }
+
+    /// Test-only seam (ADR-IOS-056): expose the write tier for pinning.
+    /// Internal (not `#if DEBUG`) — same visibility as other hoisted test
+    /// seams in this file set (see `NSEDataBridge.resetStageMemoForTesting`).
+    var dbPoolPriorityForTesting: WritePriority { dbPool.priority }
 
     // MARK: - Public API
 
@@ -287,9 +301,16 @@ actor ActiveBodyQueue {
                                     )
                                     switch renderResult {
                                     case .success(let fetchResult):
-                                        let (result, processed) = await BodyFetchProcessor.process(
-                                            fetchResult: fetchResult, enableAI: true
-                                        )
+                                        // .normal-tagged (ADR-IOS-056): `BodyFetchProcessor` is
+                                        // shared with the on-demand / priority fetch (fetchBody,
+                                        // SnippetLoader tier-2) — only THIS active queue's caller
+                                        // tags it .normal so its main-pool writes beat deep
+                                        // backfill but still yield to the merge/user actions.
+                                        let (result, processed) = await PriorityGate.normal {
+                                            await BodyFetchProcessor.process(
+                                                fetchResult: fetchResult, enableAI: true
+                                            )
+                                        }
                                         return (item, processed, result == .retry)
                                     case .failure:
                                         return (item, nil, true)
@@ -316,9 +337,12 @@ actor ActiveBodyQueue {
                     }
                     let processMs = Int((CFAbsoluteTimeGetCurrent() - tProcess) * 1000)
 
-                    // 3. Write ALL to FTS + update headers in one batch
+                    // 3. Write ALL to FTS + update headers in one batch.
+                    // .normal-tagged (ADR-IOS-056) — see the process() call above.
                     if !processedItems.isEmpty {
-                        await BodyFetchProcessor.flushBatch(processedItems, enableAI: true)
+                        await PriorityGate.normal {
+                            await BodyFetchProcessor.flushBatch(processedItems, enableAI: true)
+                        }
                     }
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -337,7 +361,8 @@ actor ActiveBodyQueue {
                             // Single message too large — mark all items as empty
                             print("[ActiveBody] Single item too large for \(key.folderPath) — marking bodyEmptyConfirmed")
                             for item in items {
-                                try? await AppDatabase.dbPool.write { db in
+                                // .normal-tier (ADR-IOS-056) — same tag as this queue's dbPool.
+                                try? await AppDatabase.syncPool.write { db in
                                     try db.execute(
                                         sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 1 WHERE id = ?",
                                         arguments: [item.headerId]

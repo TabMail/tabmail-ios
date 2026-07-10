@@ -919,10 +919,17 @@ actor PushNotificationService {
             return .newData
         }
 
+        // Foreground-active oracle (ADR-IOS-056), read once and reused below for
+        // (a) the stale-connection guard (unchanged behavior) and (b) the drain-
+        // mode decision (`SyncScheduler.drainModeForSilentPush`) — the silent-push
+        // budget is a background-envelope watchdog only; a push delivered while
+        // the app is foreground-active must not poll-wait on it.
+        let isForegroundActive = await MainActor.run { UIApplication.shared.applicationState == .active }
+
         // Only mark providers dirty when waking from background — connections may be stale
         // after iOS suspension. In foreground, connections are live; marking dirty would
         // unnecessarily drain IMAP pools and kill IDLE sessions.
-        if await MainActor.run(body: { UIApplication.shared.applicationState != .active }) {
+        if !isForegroundActive {
             await AccountManager.shared.markAllProvidersDirty()
         }
 
@@ -953,9 +960,12 @@ actor PushNotificationService {
             // when this push woke us from the background (applicationState != .active) or any
             // background occurred since the last recovery — it only skips the in-flight cancel
             // when the app is provably continuous-foreground.
+            // drain: ADR-IOS-056 — `.none` when foreground-active (the active queues
+            // self-drain at `.normal`; nothing should hold this handler open), else the
+            // background-envelope `.budget` (unchanged behavior for an actual bg wake).
             await SyncScheduler.shared.syncStartup(
                 inboxOnly: true,
-                drain: .budget(PushConfig.silentPushDeadlineSeconds),
+                drain: SyncScheduler.drainModeForSilentPush(isForegroundActive: isForegroundActive),
                 foregroundFastPath: true
             )
             return .newData
@@ -978,9 +988,10 @@ actor PushNotificationService {
             // foregroundFastPath: skip the in-flight AI cancel only when the oracle confirms
             // continuous-foreground. A silent push that woke us from background still recovers
             // (applicationState != .active → mayHaveStaleConnections() == true).
+            // drain: ADR-IOS-056 — see the nse_followup branch above for the rationale.
             await SyncScheduler.shared.syncStartup(
                 inboxOnly: true,
-                drain: .budget(PushConfig.silentPushDeadlineSeconds),
+                drain: SyncScheduler.drainModeForSilentPush(isForegroundActive: isForegroundActive),
                 foregroundFastPath: true
             )
             // One-time FTS tokenizer migration (ADR-024) — small post-sync slice,

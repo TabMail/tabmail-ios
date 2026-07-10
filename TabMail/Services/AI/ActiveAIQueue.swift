@@ -103,11 +103,21 @@ actor ActiveAIQueue {
         let compositionPrompt: String
     }
 
-    // Background-tagged: this queue's async writes (summary/action/reply, lease
-    // and Device-Sync write-throughs) yield to foreground/UI work (NSE merge,
-    // badge recount, inbox reload) instead of queueing ahead of it. Reads are
+    // .normal-tier (ADR-IOS-056): this queue processes newly-synced inbox mail
+    // during the boot/push drain — sync-level work, not deep historical
+    // backfill (`BackfillAIQueue` stays `.background`) and not a privileged
+    // merge/user-action (`.priority`). Its writes (summary/action/reply, lease
+    // and Device-Sync write-throughs) still yield to the merge/badge/optimistic
+    // user actions, they just no longer sit at the SAME tier as deep backfill.
+    // Previously `.background` (2026-06-29 FIX 8, see PROJECT_MEMORY) —
+    // re-tiered because "boot/push drain" is not a privileged phase. Reads are
     // unaffected (WAL — they never contend the writer).
-    private var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
+    private var dbPool: PrioritizedDatabase { AppDatabase.syncPool }
+
+    /// Test-only seam (ADR-IOS-056): expose the write tier for pinning.
+    /// Internal (not `#if DEBUG`) — same visibility as other hoisted test
+    /// seams in this file set (see `NSEDataBridge.resetStageMemoForTesting`).
+    var dbPoolPriorityForTesting: WritePriority { dbPool.priority }
 
     /// Compact, MESSAGE-discriminating id for logs. A `headerId` is
     /// "accountId:folder:messageId"; the accountId is a 36-char UUID, so the old

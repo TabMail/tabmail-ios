@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
 
 /// Shared, `Sendable` probe for the queue tests. An actor (not a captured
@@ -114,5 +115,60 @@ struct DatabaseWriteQueueTests {
         // The queue must be usable afterward — a following write completes.
         try? await q.execute(priority: .background) { await rec.record("after") }
         #expect(await rec.log == ["after"])
+    }
+
+    // MARK: - Test observer (ADR-IOS-056 seam)
+
+    /// Coverage for the DEBUG-only test observer used by `WriteTierRoutingTests` to
+    /// assert which tier a SHARED write path (`BodyFetchProcessor`, invoked through
+    /// both `ActiveBodyQueue` at `.normal` and `BackfillBodyQueue` at `.background`)
+    /// actually executes at. Uses a fresh `DatabaseWriteQueue()` (not `.shared`), so
+    /// these tests don't need to install/clear anything on the app singleton.
+    @Test("test observer records (priority, label) for every execute call, in order")
+    func testObserverRecordsPriorityAndLabel() async {
+        let q = DatabaseWriteQueue()
+        let recorded = Mutex<[(WritePriority, String?)]>([])
+        await q.setTestObserverForTesting { priority, label in
+            recorded.withLock { $0.append((priority, label)) }
+        }
+        try? await q.execute(priority: .normal, label: "bodyFetch.flushBatch") { }
+        try? await q.execute(priority: .priority, label: nil) { }
+        try? await q.execute(priority: .background, label: "backfill") { }
+
+        let snapshot = recorded.withLock { $0 }
+        #expect(snapshot.count == 3)
+        guard snapshot.count == 3 else { return }
+        #expect(snapshot[0].0 == .normal)
+        #expect(snapshot[0].1 == "bodyFetch.flushBatch")
+        #expect(snapshot[1].0 == .priority)
+        #expect(snapshot[1].1 == nil)
+        #expect(snapshot[2].0 == .background)
+        #expect(snapshot[2].1 == "backfill")
+    }
+
+    @Test("test observer fires even when the write throws (records before the body runs)")
+    func testObserverFiresOnThrow() async {
+        struct Boom: Error {}
+        let q = DatabaseWriteQueue()
+        let recorded = Mutex<[WritePriority]>([])
+        await q.setTestObserverForTesting { priority, _ in recorded.withLock { $0.append(priority) } }
+
+        await #expect(throws: Boom.self) {
+            try await q.execute(priority: .normal) { throw Boom() }
+        }
+        #expect(recorded.withLock { $0 } == [.normal])
+    }
+
+    @Test("clearing the test observer (nil) stops recording")
+    func testObserverCanBeCleared() async {
+        let q = DatabaseWriteQueue()
+        let recorded = Mutex<[WritePriority]>([])
+        await q.setTestObserverForTesting { priority, _ in recorded.withLock { $0.append(priority) } }
+
+        try? await q.execute(priority: .background) { }
+        await q.setTestObserverForTesting(nil)
+        try? await q.execute(priority: .priority) { }
+
+        #expect(recorded.withLock { $0 } == [.background])
     }
 }

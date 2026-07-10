@@ -66,6 +66,26 @@ actor DatabaseWriteQueue {
     /// highest-priority (tier 0) first.
     private var waiters: [[CheckedContinuation<Void, Never>]] = [[], [], []]
 
+    #if DEBUG
+    /// Test-only observer: invoked with `(priority, label)` the moment a write
+    /// actually starts executing (after it holds the slot). Lets tests assert
+    /// which tier a SHARED write path really executes at end-to-end — e.g.
+    /// `BodyFetchProcessor`, invoked through `ActiveBodyQueue` at `.normal` vs
+    /// `BackfillBodyQueue` at `.background` — without threading a fake pool
+    /// through production call sites (ADR-IOS-056). DEBUG-only, zero cost and
+    /// unreachable in Release builds — same convention as
+    /// `PushNotificationService`'s DEBUG-only test overrides.
+    private var testObserver: (@Sendable (WritePriority, String?) -> Void)?
+
+    /// Install (or clear with `nil`) the test observer. It lives on whichever
+    /// `DatabaseWriteQueue` instance it's set on — tests exercising `.shared`
+    /// (the only instance production code writes through) MUST clear it (`nil`)
+    /// when done, since it's a process-wide singleton.
+    func setTestObserverForTesting(_ observer: (@Sendable (WritePriority, String?) -> Void)?) {
+        self.testObserver = observer
+    }
+    #endif
+
     /// Run `work` as the sole writer once it reaches the front of its tier. The
     /// slot is always released, including on throw.
     ///
@@ -86,6 +106,9 @@ actor DatabaseWriteQueue {
         _ work: @Sendable () async throws -> T
     ) async throws -> T {
         await acquire(priority)
+        #if DEBUG
+        testObserver?(priority, label)
+        #endif
         // DIAGNOSTIC (debug-gated): time the EXECUTION only (after the slot is held,
         // so this excludes queue-wait). A `.priority` write waits ≤ ONE in-flight
         // execution, so the longest exec here is the residual cap on merge latency.
