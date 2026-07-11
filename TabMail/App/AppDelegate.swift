@@ -558,11 +558,35 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             identifier: "MARK_READ", title: "Mark Read")
         let deleteAction = UNNotificationAction(
             identifier: "DELETE", title: "Delete", options: [.destructive])
+        // Suggested-action variants: the NSE stamps the category matching the
+        // AI action tag (EmailNotificationBuilder.categoryIdentifier(forActionTag:)),
+        // so the long-press sheet surfaces the suggestion first, labeled as
+        // such. Action IDENTIFIERS are identical across all categories —
+        // NotificationActionRouter needs no category awareness. Only
+        // archive/delete tags get variants (reply has no notification action
+        // yet; none/nil = no suggestion). A notification stamped with a
+        // not-yet-registered category shows NO buttons — registration happens
+        // here in didFinishLaunching, which also runs on background launches,
+        // so the only exposure is an NSE delivery before the FIRST process
+        // launch after the app update that introduced the new categories.
+        let suggestedArchive = UNNotificationAction(
+            identifier: "ARCHIVE", title: "Archive (Suggested)", options: [.destructive])
+        let suggestedDelete = UNNotificationAction(
+            identifier: "DELETE", title: "Delete (Suggested)", options: [.destructive])
         let emailCategory = UNNotificationCategory(
             identifier: "EMAIL",
             actions: [archiveAction, readAction, deleteAction],
             intentIdentifiers: [])
-        UNUserNotificationCenter.current().setNotificationCategories([emailCategory])
+        let tagArchiveCategory = UNNotificationCategory(
+            identifier: "EMAIL_TAG_ARCHIVE",
+            actions: [suggestedArchive, readAction, deleteAction],
+            intentIdentifiers: [])
+        let tagDeleteCategory = UNNotificationCategory(
+            identifier: "EMAIL_TAG_DELETE",
+            actions: [suggestedDelete, readAction, archiveAction],
+            intentIdentifiers: [])
+        UNUserNotificationCenter.current().setNotificationCategories(
+            [emailCategory, tagArchiveCategory, tagDeleteCategory])
     }
 
     func application(

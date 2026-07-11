@@ -116,4 +116,53 @@ struct EmailNotificationBuilderTests {
         #expect(content.body == "Today \u{2014} Renew the domain")
         #expect(content.interruptionLevel == .passive)
     }
+
+    // MARK: - Suggested-action notification categories
+
+    @Test("categoryIdentifier maps archive/delete tags to suggestion categories; reply/none/nil stay generic")
+    func categoryIdentifierMapsOnlyArchiveAndDelete() {
+        #expect(EmailNotificationBuilder.categoryIdentifier(forActionTag: "archive") == "EMAIL_TAG_ARCHIVE")
+        #expect(EmailNotificationBuilder.categoryIdentifier(forActionTag: "delete") == "EMAIL_TAG_DELETE")
+        // reply has no notification-actionable equivalent yet; none/nil mean
+        // no suggestion — all keep the generic category (user decision
+        // 2026-07-10: archive/delete only).
+        #expect(EmailNotificationBuilder.categoryIdentifier(forActionTag: "reply") == "EMAIL")
+        #expect(EmailNotificationBuilder.categoryIdentifier(forActionTag: "none") == "EMAIL")
+        #expect(EmailNotificationBuilder.categoryIdentifier(forActionTag: nil) == "EMAIL")
+    }
+
+    @Test("fill stamps the tag-matched category so long-press surfaces the suggested action")
+    func fillStampsTagMatchedCategory() {
+        let archiveContent = UNMutableNotificationContent()
+        _ = EmailNotificationBuilder.fill(
+            archiveContent,
+            signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "FYI", actionTag: "archive"),
+            accountId: "acc1", messageId: "msg5"
+        )
+        #expect(archiveContent.categoryIdentifier == "EMAIL_TAG_ARCHIVE")
+
+        let deleteContent = UNMutableNotificationContent()
+        _ = EmailNotificationBuilder.fill(
+            deleteContent,
+            signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Spam-ish", actionTag: "delete"),
+            accountId: "acc1", messageId: "msg6"
+        )
+        #expect(deleteContent.categoryIdentifier == "EMAIL_TAG_DELETE")
+
+        let replyContent = UNMutableNotificationContent()
+        _ = EmailNotificationBuilder.fill(
+            replyContent,
+            signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Question", actionTag: "reply"),
+            accountId: "acc1", messageId: "msg7"
+        )
+        #expect(replyContent.categoryIdentifier == "EMAIL")
+
+        let bareContent = UNMutableNotificationContent()
+        _ = EmailNotificationBuilder.fill(
+            bareContent,
+            signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "No AI yet"),
+            accountId: "acc1", messageId: "msg8"
+        )
+        #expect(bareContent.categoryIdentifier == "EMAIL")
+    }
 }

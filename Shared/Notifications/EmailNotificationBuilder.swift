@@ -120,6 +120,24 @@ enum EmailNotificationBuilder {
         return "Due \(formatter.string(from: dueMidnight))\(timeSuffix)"
     }
 
+    /// Notification category per AI action tag: the category picks which
+    /// long-press action buttons iOS attaches, so a tagged notification
+    /// surfaces the SUGGESTED action first (registered in
+    /// `AppDelegate.registerNotificationCategories` with identical action
+    /// ids — `NotificationActionRouter` handles all categories unchanged).
+    /// Only `archive`/`delete` get suggestion categories; `reply` has no
+    /// notification-actionable equivalent yet and `none`/nil mean no
+    /// suggestion — both keep the generic `EMAIL` category. Tag strings are
+    /// the canonical lowercase set validated by
+    /// `AIResponseParser.parseActionTag` (delete/archive/reply/none).
+    static func categoryIdentifier(forActionTag tag: String?) -> String {
+        switch tag {
+        case "archive": return "EMAIL_TAG_ARCHIVE"
+        case "delete": return "EMAIL_TAG_DELETE"
+        default: return "EMAIL"
+        }
+    }
+
     /// Fill an email notification with unified layout used by every
     /// new-email ping path (NSE, main-app silent push, BGAppRefresh merge).
     ///
@@ -144,7 +162,7 @@ enum EmailNotificationBuilder {
     ) -> Bool {
         c.title = s.senderName.isEmpty ? "New email" : "New email - \(s.senderName)"
         c.subtitle = s.subject
-        c.categoryIdentifier = "EMAIL"
+        c.categoryIdentifier = categoryIdentifier(forActionTag: s.actionTag)
         c.threadIdentifier = accountId
         var info = c.userInfo
         info["messageId"] = messageId
