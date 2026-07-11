@@ -275,6 +275,65 @@ actor AccountManager {
         isDrainingLocalWrites = false
     }
 
+    /// FIFO barrier — returns once every closure enqueued before this call
+    /// has run. Appends a continuation-resuming closure to the back of
+    /// `writeQueue`; because the queue is strictly FIFO, every write enqueued
+    /// earlier is guaranteed to have drained by the time this returns.
+    /// `AccountManager` is an actor and `enqueueWrite` is a same-actor call,
+    /// so no `Task` hop is needed here (contrast the test-only mirror of this
+    /// pattern, which hops via `Task` because it's called from `@MainActor`
+    /// test code). Used by `AppDelegate`'s background durability checkpoint
+    /// to flush queued writes (including ADR-IOS-057 intent-cycle executors)
+    /// before the WAL fsync.
+    func awaitWriteQueueDrain() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            enqueueWrite { cont.resume() }
+        }
+    }
+
+    /// Races `awaitWriteQueueDrain()` against a deadline: returns as soon as
+    /// EITHER the drain barrier resumes OR `timeoutSeconds` elapses, whichever
+    /// is first — never blocks past the deadline. On timeout the barrier's
+    /// continuation isn't lost, just abandoned by this call: it still resumes
+    /// later once the queue actually drains (per `awaitWriteQueueDrain`'s own
+    /// contract) — its result is simply discarded because nobody is waiting
+    /// on it anymore. Extracted as a standalone static func (rather than
+    /// inlined at the call site) so both production (`AppDelegate`'s
+    /// background durability checkpoint) and tests exercise the exact same
+    /// race code.
+    ///
+    /// Deliberately NOT a `withTaskGroup` race of two child tasks. Verified
+    /// empirically: `withTaskGroup` implicitly awaits every child task before
+    /// its closure scope returns — even after `cancelAll()` — and cancellation
+    /// is cooperative, so a child parked on `awaitWriteQueueDrain()`'s bare
+    /// `CheckedContinuation` (which never observes cancellation) is NOT
+    /// forcibly finished; the outer call blocks until it actually resumes,
+    /// i.e. until the queue genuinely drains. That reintroduces the exact
+    /// "pathological queue holds the background budget hostage" failure this
+    /// method exists to prevent. Instead, race two UNSTRUCTURED `Task`s (which
+    /// are allowed to outlive this function) against a single shared
+    /// continuation, guarded so it resumes exactly once: whichever finishes
+    /// first — the drain or the timer — resumes the caller; the loser keeps
+    /// running harmlessly to completion (a no-op second `finishOnce()` call)
+    /// once the queue actually drains later.
+    static func awaitWriteQueueDrainOrTimeout(timeoutSeconds: Double) async {
+        await withCheckedContinuation { (outer: CheckedContinuation<Void, Never>) in
+            let resumed = Mutex(false)
+            let finishOnce: @Sendable () -> Void = {
+                guard !resumed.withLock({ let was = $0; $0 = true; return was }) else { return }
+                outer.resume()
+            }
+            Task {
+                await AccountManager.shared.awaitWriteQueueDrain()
+                finishOnce()
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                finishOnce()
+            }
+        }
+    }
+
     // MARK: - Recently Completed Protection (per-entry expiry)
 
     /// Message IDs recently protected from sync stale-deletion/overwrite, keyed to
@@ -348,6 +407,27 @@ actor AccountManager {
     /// Snapshot the overlay for use in reloadMessages (snapshot BEFORE DB read).
     nonisolated func snapshotOverlay() -> [String: PendingMutation] {
         optimisticOverlay.withLock { $0 }
+    }
+
+    /// Undo snapshots must capture the VISUALIZED state (act-on-visualized-state
+    /// rule): a queued intent cycle's isRead/isFlagged/actionTag exist only in the
+    /// overlay until the FIFO drains, and a DB-fresh row predates them — an undo
+    /// restoring that row would silently revert the user's most recent gesture.
+    /// Folder fields are deliberately NOT taken from the overlay (a pending move's
+    /// dest must not leak into a snapshot that records the pre-move location).
+    ///
+    /// MUST be called BEFORE the call site's own `retainOverlayEntry`/
+    /// `registerMutation` — those calls write THIS action's own overlay mutation
+    /// (e.g. the F6 tag-clear on inbox exit), and `registerMutation` merges into
+    /// the SAME coalesced entry this reads. Calling it after would capture this
+    /// action's own not-yet-committed mutation as if it were pre-existing state.
+    nonisolated func overlayAdjustedSnapshot(_ header: MessageHeader) -> MessageHeader {
+        guard let m = snapshotOverlay()[header.id] else { return header }
+        var h = header
+        if let isRead = m.isRead { h.isRead = isRead }
+        if let isFlagged = m.isFlagged { h.isFlagged = isFlagged }
+        if let actionTag = m.actionTag { h.actionTag = actionTag }
+        return h
     }
 
     /// Refcounts in-flight gesture ops per message id, so overlay removal can
@@ -612,7 +692,19 @@ actor AccountManager {
             wroteAnything = true
         }
         if case let .some(target) = cycle.actionTagTarget {
-            if target != header.actionTag {
+            if !header.isInInbox {
+                // Tags are inbox-scoped (ADR-IOS-036) and F6 clears actionTag
+                // the moment a row leaves the inbox — both tag-gesture UI
+                // entry points are gated on isInInbox, so a legitimate tag
+                // intent whose RESOLVED header has already left the inbox
+                // means a move (e.g. archive/delete) ran after this gesture:
+                // closure-reorder race, since both enqueue via unstructured
+                // Tasks with no FIFO ordering guarantee between them. The
+                // move is the LATER user action, and its tag-clear wins —
+                // this matches serial-replay ordering. Skip reinstating a
+                // stale tag on a row that already left the inbox.
+                BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — skipping tag write for \(id), header left inbox (isInInbox=false)")
+            } else if target != header.actionTag {
                 // previousTag semantics: `applyManualTag` reads
                 // `message.actionTag` as the "before" value for the LLM
                 // auto-teach signal (originalAction). Feed it the
