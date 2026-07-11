@@ -61,6 +61,7 @@ struct PendingOperationTests {
         #expect(op.destinationPath == nil)
         #expect(op.tagValue == nil)
         #expect(op.retryCount == 0)
+        #expect(op.uidResolutionRetryCount == 0)
         #expect(op.status == PendingStatus.queued.rawValue)
     }
 

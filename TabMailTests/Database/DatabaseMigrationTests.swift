@@ -114,4 +114,25 @@ struct DatabaseMigrationTests {
             #expect(names.contains("messageHeader_folderId_isRead"))
         }
     }
+
+    @Test("v67: pendingOperation has uidResolutionRetryCount column, defaulting to 0")
+    func v67UidResolutionRetryCount() throws {
+        let db = try TestDatabase.make()
+        try db.read { db in
+            let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(pendingOperation)")
+            let names = columns.map { $0["name"] as String }
+            #expect(names.contains("uidResolutionRetryCount"))
+        }
+        // A row inserted via raw SQL that omits the column (mirrors the explicit-
+        // column INSERTs in AppDelegate.swift/NSEDataBridge.swift) must default to 0.
+        try TestDatabase.insertAccount(db)
+        try db.write { db in
+            try db.execute(sql: """
+                INSERT INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, createdAt, status, retryCount)
+                VALUES ('op1', 'markRead', '["msg-1"]', 'acc1', 'INBOX', datetime('now'), 'queued', 0)
+                """)
+        }
+        let fetched = try db.read { db in try PendingOperation.fetchOne(db, key: "op1") }
+        #expect(fetched?.uidResolutionRetryCount == 0)
+    }
 }

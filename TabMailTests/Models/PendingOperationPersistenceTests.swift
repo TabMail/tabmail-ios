@@ -342,6 +342,29 @@ struct PendingOperationPersistenceTests {
         #expect(fetched?.retryCount == 3)
     }
 
+    // MARK: - uidResolutionRetryCount (dedicated budget, separate from retryCount)
+
+    @Test("uidResolutionRetryCount defaults to 0 and round-trips independently of retryCount")
+    func uidResolutionRetryCountDefaultsAndPersists() throws {
+        let db = try TestDatabase.make()
+        var op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        try db.write { try op.insert($0) }
+
+        let inserted = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
+        #expect(inserted?.uidResolutionRetryCount == 0)
+
+        // Bump retryCount (simulating unrelated generic-branch blips) and
+        // uidResolutionRetryCount (simulating real SEARCH misses) independently —
+        // they must not clobber each other.
+        op.retryCount = 5
+        op.uidResolutionRetryCount = 2
+        try db.write { try op.save($0) }
+
+        let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
+        #expect(fetched?.retryCount == 5)
+        #expect(fetched?.uidResolutionRetryCount == 2)
+    }
+
     // MARK: - deleteAll by filter
 
     @Test("deleteAll by status removes matching ops only")

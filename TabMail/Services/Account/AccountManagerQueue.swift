@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 extension AccountManager {
 
@@ -31,9 +32,11 @@ extension AccountManager {
         Task { @MainActor in await AccountManager.shared.drainPendingQueue() }
     }
 
-    /// Shared mutable state for parallel drain tasks. All access on @MainActor.
-    /// Reference type so concurrent @MainActor tasks see each other's updates at await points.
-    private class DrainContext: @unchecked Sendable {
+    /// Shared mutable state for parallel drain tasks. Reference type so concurrent
+    /// lane Tasks (launched from the `AccountManager` actor) see each other's updates
+    /// at await points. `internal` (not `private`) so tests can construct it directly
+    /// to call `executeSingleOp`.
+    class DrainContext: @unchecked Sendable {
         var failedAccounts = Set<String>()
         var foldersToSync: Set<String> = []
         var executedAny = false
@@ -42,12 +45,108 @@ extension AccountManager {
         var diagnosedOpIds: Set<String> = []
     }
 
+    /// Outcome of a single claimed-op execution (`executeSingleOp`), used by the
+    /// per-lane drain loop in `drainPendingQueue` to decide whether to keep draining
+    /// the lane or halt it for this pass.
+    enum SingleOpOutcome: Sendable, Equatable {
+        /// The op reached a terminal state this pass — either it completed
+        /// successfully, or it was CONFIRMED stale/invalid and dropped (deleted, or
+        /// split into fresh individual ops). The lane may proceed to its next op.
+        case proceed
+        /// The op was reset to `.queued` for retry (its staleness/success could NOT
+        /// be confirmed this pass). The REST of this lane must halt: a later op on
+        /// the same connected component (e.g. a flag change queued after a move of
+        /// the same message) must never run ahead of its unresolved predecessor —
+        /// running it would race the predecessor's eventual retry on the wire. The
+        /// lane loop requeues the remaining claimed ops in this lane (same as the
+        /// existing failedAccounts requeue path) and stops.
+        case haltLane
+    }
+
+    /// Groups claimed pending operations into serialized "lanes" via connected-
+    /// component grouping over shared message ids (scoped per account). Two ops
+    /// that share ANY member message id land in the same lane — and transitively,
+    /// any op sharing an id with either of those joins too (union-find).
+    ///
+    /// WHY this matters: `drainPendingQueue` runs one Task per lane CONCURRENTLY,
+    /// each drawing from `ProviderWorkQueue` (bounded concurrency > 1 — separate
+    /// IMAP connections). The OLD lane key was `"accountId:messageIds.first"`, so a
+    /// batch move `[A,B,C]` landed in a lane keyed by A while a LATER single-id op
+    /// on B (e.g. a flag change) landed in a SEPARATE lane keyed by B — even though
+    /// B is a member of both. The two lanes then ran concurrently, racing on the
+    /// wire: a flag STORE on B could race the batch MOVE of B, silently losing the
+    /// flag on the MOVE's EXPUNGE, or getting wrongly confirmed-stale by the
+    /// `uidResolutionFailed` handling mid-move. Connected-component lanes guarantee
+    /// any op sharing a member id with an in-flight op serializes AFTER it.
+    ///
+    /// Pure and side-effect free (no DB/IO) — `nonisolated static` so it's directly
+    /// unit-testable without an actor hop. Callers pass ops in createdAt-asc order;
+    /// each lane preserves that relative order (FIFO within its component).
+    /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
+    /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
+    nonisolated static func buildLanes(_ ops: [PendingOperation]) -> [[PendingOperation]] {
+        // Union-Find over "accountId:msgId" keys, with path compression.
+        var parent: [String: String] = [:]
+
+        func find(_ x: String) -> String {
+            var root = x
+            while let p = parent[root], p != root {
+                root = p
+            }
+            var current = x
+            while let p = parent[current], p != root {
+                parent[current] = root
+                current = p
+            }
+            return root
+        }
+
+        func union(_ a: String, _ b: String) {
+            let rootA = find(a)
+            let rootB = find(b)
+            if rootA != rootB { parent[rootA] = rootB }
+        }
+
+        for op in ops {
+            let ids = op.messageIds
+            guard !ids.isEmpty else { continue }
+            let keys = ids.map { "\(op.accountId):\($0)" }
+            for key in keys where parent[key] == nil {
+                parent[key] = key
+            }
+            for key in keys.dropFirst() {
+                union(keys[0], key)
+            }
+        }
+
+        // Assign each op to its component's lane, in the ORIGINAL (createdAt-asc) order.
+        var laneIndexForRoot: [String: Int] = [:]
+        var lanes: [[PendingOperation]] = []
+        for op in ops {
+            guard let firstId = op.messageIds.first else {
+                // Empty messageIds — always its own singleton lane.
+                lanes.append([op])
+                continue
+            }
+            let root = find("\(op.accountId):\(firstId)")
+            if let idx = laneIndexForRoot[root] {
+                lanes[idx].append(op)
+            } else {
+                laneIndexForRoot[root] = lanes.count
+                lanes.append([op])
+            }
+        }
+        return lanes
+    }
+
     /// Drain all queued operations with per-message parallelism.
     ///
-    /// Ops are grouped into per-message "lanes" keyed by first messageId. Each lane
-    /// is a FIFO — ops for the same message execute sequentially (preserving ordering
-    /// like removeTag→move). The drain runs the head of every lane concurrently,
-    /// so ops for different messages make progress in parallel.
+    /// Ops are grouped into lanes by `buildLanes`: an op joins the lane of ANY op
+    /// sharing any member message id (connected components), not just its first id.
+    /// Each lane is a FIFO — ops in the same connected component execute
+    /// sequentially (preserving ordering like removeTag→move, or a batch move and a
+    /// later single-id flag change on one of its members). The drain runs every
+    /// lane concurrently, so ops for disjoint messages make progress in parallel.
     ///
     /// Provider-level concurrency is managed by each provider (IMAP connection pool, HTTP pooling).
     ///
@@ -91,9 +190,8 @@ extension AccountManager {
                 print("[Queue] Drain pass \(pass + 1): \(ops.count) ops remaining/new")
             }
 
-            // Claim all valid ops, building per-message lanes (nested queues).
-            // Key = "accountId:firstMessageId" — ops for the same message stay in FIFO order.
-            var lanes: [String: [PendingOperation]] = [:]
+            // Claim all valid ops (unchanged: failedAccounts / provider checks / atomic claim).
+            var claimed: [PendingOperation] = []
             for op in ops {
                 if ctx.failedAccounts.contains(op.accountId) { continue }
                 guard providers[op.accountId] != nil else {
@@ -124,20 +222,23 @@ extension AccountManager {
                     continue
                 }
                 guard let currentOp else { continue }
-                let key = "\(currentOp.accountId):\(currentOp.messageIds.first ?? currentOp.id)"
-                lanes[key, default: []].append(currentOp)
+                claimed.append(currentOp)
             }
 
+            // Connected-component lane grouping (F1) — pure, see buildLanes doc comment.
+            let lanes = Self.buildLanes(claimed)
             guard !lanes.isEmpty else { break }
 
-            // Launch one Task per lane. Each task drains its lane sequentially.
-            // Different lanes (different messages) run concurrently.
+            // Launch one Task per lane. Each task drains its lane sequentially,
+            // halting (and requeuing the rest of the lane) on `.haltLane` so a later
+            // op never runs ahead of an unresolved predecessor sharing a message id.
+            // Different lanes (disjoint connected components) run concurrently.
             var tasks: [Task<Void, Never>] = []
-            for (_, lane) in lanes {
+            for lane in lanes {
                 let capturedLane = lane
                 let capturedCtx = ctx
                 let task = Task { [self] in
-                    for op in capturedLane {
+                    for (index, op) in capturedLane.enumerated() {
                         if capturedCtx.failedAccounts.contains(op.accountId) {
                             try? await retryWrite(dbPool, label: "Queue") { db in
                                 var updated = op
@@ -155,8 +256,26 @@ extension AccountManager {
                             continue
                         }
                         let provider = queue.provider
+                        // Outcome captured via Mutex (not a plain var) — the closure
+                        // passed to queue.execute is @Sendable, so it cannot capture a
+                        // mutable local var directly under Swift 6 strict concurrency.
+                        let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
                         await queue.execute(priority: .userAction) {
-                            await self.executeSingleOp(op, provider: provider, context: capturedCtx)
+                            let result = await self.executeSingleOp(op, provider: provider, context: capturedCtx)
+                            outcomeBox.withLock { $0 = result }
+                        }
+                        if outcomeBox.withLock({ $0 }) == .haltLane {
+                            // Requeue the REMAINING claimed ops of this lane — exactly
+                            // like the failedAccounts requeue path above — then stop.
+                            let remaining = capturedLane[(index + 1)...]
+                            for remainingOp in remaining {
+                                try? await retryWrite(dbPool, label: "Queue") { db in
+                                    var updated = remainingOp
+                                    updated.status = PendingStatus.queued.rawValue
+                                    try updated.save(db)
+                                }
+                            }
+                            break
                         }
                     }
                 }
@@ -197,7 +316,10 @@ extension AccountManager {
 
     /// Execute a single claimed op against its provider. Updates shared DrainContext
     /// with results (executedAny, failedAccounts, foldersToSync, recentActions).
-    private func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext) async {
+    /// Returns the outcome (`.proceed`/`.haltLane`) so the per-lane drain loop knows
+    /// whether it's safe to run this lane's next op. `internal` (not `private`) so
+    /// tests can call it directly against a `MockEmailProvider`.
+    func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext) async -> SingleOpOutcome {
         let opType = currentOp.type.rawValue
         let opMsgCount = currentOp.messageIds.count
 
@@ -275,6 +397,7 @@ extension AccountManager {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(currentOp.folderPath)")
             }
             context.executedAny = true
+            return .proceed
         } catch {
             // UID resolution failed on tag ops — skip (best-effort).
             // Tag removal is queued before move to prevent flag copying on IMAP MOVE.
@@ -287,7 +410,7 @@ extension AccountManager {
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
                 context.executedAny = true
-                return
+                return .proceed
             }
             if isMessageNotFoundError(error) {
                 if currentOp.messageIds.count > 1 {
@@ -298,7 +421,16 @@ extension AccountManager {
                     do {
                         try await dbPool.write { db in
                             for msgId in currentOp.messageIds {
-                                try PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue).insert(db)
+                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
+                                // Split ops inherit the batch's queue position — they are
+                                // the SAME user intention, re-shaped. Without this, the
+                                // default `PendingOperation.init` createdAt (Date()) would
+                                // stamp a LATER timestamp than a same-lane sibling op queued
+                                // between the batch and the split, starving the split op
+                                // behind it on every later buildLanes pass (createdAt-order
+                                // invariant).
+                                splitOp.createdAt = currentOp.createdAt
+                                try splitOp.insert(db)
                             }
                             _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                         }
@@ -306,7 +438,17 @@ extension AccountManager {
                         print("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
                     }
                     context.executedAny = true
-                    return
+                    // Halt the lane rather than .proceed: the split singles are
+                    // freshly queued (not yet executed) and a LATER same-lane op
+                    // sharing a member id (e.g. a chained move of one of the split
+                    // messages) must never run ahead of them this pass — that would
+                    // race/misread state the split children haven't written yet and
+                    // could get itself wrongly confirmed-stale and dropped. Same
+                    // never-run-ahead invariant as the uidResolutionFailed retry
+                    // path below; the lane loop requeues the rest of the lane back
+                    // to `.queued` so it serializes behind the split ops on a later
+                    // pass/drain.
+                    return .haltLane
                 }
                 // Single-message conflict — drop (server wins)
                 print("[Queue] Conflict: \(opType) — message not found, dropping")
@@ -327,7 +469,7 @@ extension AccountManager {
                     await deleteConfirmedGoneHeader(headerId: hid, reason: "\(opType) 404")
                 }
                 context.executedAny = true
-                return
+                return .proceed
             }
             // Permanently invalid operation — drop immediately (will never succeed on retry).
             // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
@@ -337,7 +479,7 @@ extension AccountManager {
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
                 context.executedAny = true
-                return
+                return .proceed
             }
             // UID resolution failed — message not found in source folder via IMAP SEARCH.
             // Confirm staleness by checking destination (for move ops) or drop (for flag ops).
@@ -348,7 +490,12 @@ extension AccountManager {
                     do {
                         try await dbPool.write { db in
                             for msgId in currentOp.messageIds {
-                                try PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue).insert(db)
+                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
+                                // Split ops inherit the batch's queue position — they are
+                                // the SAME user intention, re-shaped. See the identical
+                                // comment in the messageNotFound split above.
+                                splitOp.createdAt = currentOp.createdAt
+                                try splitOp.insert(db)
                             }
                             _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                         }
@@ -356,7 +503,12 @@ extension AccountManager {
                         print("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
                     }
                     context.executedAny = true
-                    return
+                    // Halt the lane rather than .proceed — see the identical
+                    // never-run-ahead comment on the messageNotFound split above.
+                    // A later same-lane op (e.g. a chained move of one of the
+                    // split messages) must serialize BEHIND the freshly-queued
+                    // split singles, not run ahead of them this pass.
+                    return .haltLane
                 }
 
                 // Single-message op: confirm staleness.
@@ -376,7 +528,7 @@ extension AccountManager {
                             _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                         }
                         context.executedAny = true
-                        return
+                        return .proceed
                     } catch {
                         // If destination folder itself doesn't exist (NONEXISTENT, etc.),
                         // the message can't be in it — confirmed stale.
@@ -387,18 +539,40 @@ extension AccountManager {
                                 _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                             }
                             context.executedAny = true
-                            return
+                            return .proceed
                         }
                         print("[Queue] UID resolution failed for \(opType) \(failedId), destination check failed: \(error) — will retry")
                     }
                 } else if currentOp.type != .move {
-                    // Flag/mark op: message not in folder, flag change is moot — drop.
-                    print("[Queue] Confirmed stale: \(opType) \(failedId) — message not in folder \(currentOp.folderPath), dropping")
-                    try? await retryWrite(dbPool, label: "Queue") { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    // Flag/mark op: message not in folder via SEARCH. Per resolveUID's
+                    // documented contract (IMAPProvider.swift) a SEARCH miss can be
+                    // transient (server-side indexing lag, concurrent UID renumbering) —
+                    // so retry with a cap (matching move ops' destination-check treatment)
+                    // instead of an unconditional drop, so we don't discard user intention
+                    // on a false-negative SEARCH.
+                    //
+                    // Caps on the DEDICATED uidResolutionRetryCount, NOT the shared
+                    // retryCount (bumped below by the generic transient-error branch on
+                    // every ordinary connection blip). Reading the shared counter here
+                    // let a few unrelated blips pre-exhaust this budget before the op's
+                    // first real SEARCH miss, causing a false "confirmed stale" drop —
+                    // dropping user intention, the exact bug this cap exists to prevent.
+                    if currentOp.uidResolutionRetryCount >= SyncConfig.maxUidResolutionRetries {
+                        print("[Queue] Confirmed stale: \(opType) \(failedId) — message not in folder \(currentOp.folderPath) after \(currentOp.uidResolutionRetryCount) uidResolution retries, dropping")
+                        try? await retryWrite(dbPool, label: "Queue") { db in
+                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                        }
+                        context.executedAny = true
+                        return .proceed
                     }
-                    context.executedAny = true
-                    return
+                    print("[Queue] UID resolution failed for \(opType) \(failedId) — message not in folder \(currentOp.folderPath), uidResolution retry \(currentOp.uidResolutionRetryCount + 1)/\(SyncConfig.maxUidResolutionRetries) (not blocking account)")
+                    try? await retryWrite(dbPool, label: "Queue") { db in
+                        var updated = currentOp
+                        updated.status = PendingStatus.queued.rawValue
+                        updated.uidResolutionRetryCount += 1
+                        try updated.save(db)
+                    }
+                    return .haltLane
                 }
 
                 // Fall through: retry (destination check failed or non-IMAP move provider)
@@ -408,7 +582,7 @@ extension AccountManager {
                     updated.status = PendingStatus.queued.rawValue
                     try updated.save(db)
                 }
-                return
+                return .haltLane
             }
             // Connection/transient error — reset op to queued and mark account failed.
             // NEVER drop on age alone — transient errors don't confirm the op is stale.
@@ -443,7 +617,7 @@ extension AccountManager {
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                     context.executedAny = true
-                    return
+                    return .proceed
                 }
             }
             try? await retryWrite(dbPool, label: "Queue") { db in
@@ -457,6 +631,7 @@ extension AccountManager {
                 try updated.save(db)
             }
             context.failedAccounts.insert(currentOp.accountId)
+            return .haltLane
         }
     }
 
@@ -556,7 +731,7 @@ extension AccountManager {
         let ageHours = Date().timeIntervalSince(op.createdAt) / 3600
         print("[QueueDiag] === op=\(op.id) type=\(op.type.rawValue) ===")
         print("[QueueDiag] op: accountId=\(op.accountId) folderPath=\(op.folderPath) destinationPath=\(op.destinationPath ?? "<nil>") tagValue=\(op.tagValue ?? "<nil>") userLabelId=\(op.userLabelId ?? "<nil>")")
-        print("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
+        print("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) uidResolutionRetryCount=\(op.uidResolutionRetryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
 
         // Error structural unwrap — confirms whether classifiers should/shouldn't match
         print("[QueueDiag] error.type=\(type(of: error)) error=\(error)")

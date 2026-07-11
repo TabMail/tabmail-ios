@@ -45,6 +45,17 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     var userLabelId: String?
     var createdAt: Date
     var retryCount: Int
+    /// Dedicated retry budget for `ProviderError.uidResolutionFailed` (IMAP
+    /// SEARCH-by-Message-ID miss) on non-move, non-tag ops — separate from
+    /// `retryCount`, which the generic transient-error branch also increments
+    /// on every ordinary connection blip. Without a dedicated counter, a few
+    /// unrelated blips could pre-exhaust `SyncConfig.maxUidResolutionRetries`
+    /// before the op ever hit a real SEARCH miss, causing a false "confirmed
+    /// stale" drop on the FIRST uidResolutionFailed — dropping user intention.
+    /// Default 0 backed by the v67 migration's `DEFAULT 0` column (existing
+    /// rows are backfilled by the ALTER TABLE, so decode never sees a missing
+    /// column post-migration).
+    var uidResolutionRetryCount: Int = 0
     /// PendingStatus rawValue — stored as String for GRDB compatibility
     var status: String
 
@@ -78,6 +89,7 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.userLabelId = userLabelId
         self.createdAt = Date()
         self.retryCount = 0
+        self.uidResolutionRetryCount = 0
         self.status = PendingStatus.queued.rawValue
     }
 }
