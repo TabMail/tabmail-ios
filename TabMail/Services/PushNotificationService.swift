@@ -99,6 +99,14 @@ actor PushNotificationService {
     /// Called from AppDelegate when APNs provides a device token.
     /// Always re-registers (accounts may have changed since last registration).
     func didReceiveDeviceToken(_ tokenData: Data) async {
+        // iOS can deliver the token callback before AppDatabase.shared is
+        // published (seen as an EXC_BREAKPOINT on the rawPool force-unwrap via
+        // reregisterAllDeviceAccounts during app relaunch). Gate BOTH sub-calls
+        // on DB readiness — registerDeviceWithWorker's own gate sits after its
+        // early-return guards, and reregisterAllDeviceAccounts has none. The
+        // registration is deferred, never dropped (awaitLaunchReady resumes on
+        // both DB-build success and failure).
+        await AppStartup.shared.awaitLaunchReady(background: true)
         let tokenHex = tokenData.map { String(format: "%02x", $0) }.joined()
         print("[Push] APNs device token: \(tokenHex.prefix(16))...")
         BackgroundSyncLogger.logPush("APNs device token received: \(tokenHex.prefix(16))...")

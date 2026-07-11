@@ -59,6 +59,150 @@ enum PendingConsentErrorStore {
     }
 }
 
+/// Routes notification action-button taps (ARCHIVE, DELETE, MARK_READ) from
+/// `NotificationDelegate.didReceive` to the REAL production action paths.
+/// Extracted into a pure, testable, nonisolated helper — no raw SQL, no
+/// direct `pendingOperation` INSERTs.
+///
+/// Lookup order mirrors `InboxViewModel.lookupMessage` / `AccountManager.
+/// resolveHeaderForAction` (ADR-IOS-049): durable GRDB row first — scoped to
+/// `isInInbox = 1`, because IMAP UIDs are folder-scoped (`MessageIdentity
+/// .headerId` embeds `folderPath` for exactly this reason). An unscoped
+/// lookup could match an unrelated message that happens to share the same
+/// UID in another folder; notification actions are inbox-arrival semantics
+/// (the push this notification came from landed FOR the inbox), so the
+/// durable lookup is restricted to the inbox row. Then the staged-row
+/// synthesis for a push that landed but hasn't merged yet. If BOTH miss (the
+/// NSE staged the row to the on-disk staging table but nothing has drained it
+/// into GRDB yet — a cold-launch gap, not the "message not local yet" cold
+/// fallback below), one `NSEMergeCoordinator.shared.merge()` pass — the same
+/// call `AccountManager.ensureDurable` uses — is run and the durable lookup
+/// is retried before giving up.
+///
+/// When a header resolves, MARK_READ dispatches via `AccountManager
+/// .markRead` (the batch API deliberately lives outside the ADR-IOS-057
+/// intent register — see that ADR). ARCHIVE/DELETE dispatch via
+/// `AccountManager.performCoordinatedRoleMove` — the same overlay + FIFO +
+/// fresh-re-resolve path agent tools use (`EmailArchiveTool`/
+/// `EmailDeleteTool`) — instead of calling `archive`/`delete` directly, so a
+/// notification tap gets the same role-folder resolution, optimistic local
+/// write, and F6 tag clear as gesture actions, plus the staleness guard of
+/// re-resolving the header inside the queued write.
+///
+/// Only when NO header is resolvable anywhere — even after the merge retry —
+/// does this fall back to directly queuing a `PendingOperation` — via the
+/// RECORD TYPE (never raw SQL) — so the drain reconciles once the message
+/// syncs. MARK_READ queues `.markRead` against the account's inbox-role
+/// folder; ARCHIVE/DELETE queue `.move` with `destinationPath` set to the
+/// account's archive-/trash-role folder (`.archive`/`.delete` are legacy
+/// no-op `OperationType`s in the drain — see `AccountManagerQueue
+/// .executeOperation` — so the cold path must never queue those). That
+/// queued `.move` carries a raw numeric UID and skips rfc822 verification
+/// (`resolveUID` short-circuits on a numeric id) — an accepted residual:
+/// (a) within a UIDVALIDITY generation UIDs are never reused, so a stale UID
+/// no-ops via the confirmed-stale path rather than hitting a wrong message;
+/// (b) the wrong-target window requires a UIDVALIDITY change between push
+/// and drain — rare, and that event triggers a full resync anyway; (c) the
+/// alternative (dropping the tap) violates never-drop-user-intention.
+enum NotificationActionRouter {
+    /// Durable lookup scoped to the account's inbox — see the enum doc for why.
+    private static func resolveDurableInboxHeader(messageId: String, accountId: String) async -> MessageHeader? {
+        do {
+            return try await AppDatabase.dbPool.read { db -> MessageHeader? in
+                try MessageHeader.fetchOne(db, sql: """
+                    SELECT * FROM messageHeader
+                    WHERE messageId = ? AND accountId = ? AND folderId != '' AND isInInbox = 1
+                    LIMIT 1
+                    """, arguments: [messageId, accountId])
+            }
+        } catch {
+            print("[NotificationActionRouter] header lookup failed: \(error)")
+            return nil
+        }
+    }
+
+    static func execute(actionId: String, messageId: String, accountId: String) async {
+        let durableHeader = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
+
+        let stagedHeader: MessageHeader? = durableHeader == nil
+            ? NSEDataBridge.latestStagedRows.withLock { rows in
+                rows.first(where: { $0.messageId == messageId && $0.accountId == accountId })
+            }?.toMessageHeader()
+            : nil
+        var header = durableHeader ?? stagedHeader
+
+        if header == nil {
+            // Cold-launch gap: the NSE already staged this row to the on-disk
+            // staging table (app-group), but nothing has drained it into GRDB
+            // yet — only the in-memory staged-row cache is empty. Run the
+            // SAME merge `ensureDurable` uses, then re-check durable. This is
+            // a normal-path recovery, distinct from the "message not local at
+            // all" cold fallback below.
+            await NSEMergeCoordinator.shared.merge()
+            header = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
+        }
+
+        if let header {
+            switch actionId {
+            case "MARK_READ":
+                await AccountManager.shared.markRead([header])
+                print("[NotificationActionRouter] markRead via manager for \(messageId)")
+            case "ARCHIVE":
+                await AccountManager.shared.performCoordinatedRoleMove(ids: [header.id], role: .archive)
+                print("[NotificationActionRouter] archive via performCoordinatedRoleMove for \(messageId)")
+            case "DELETE":
+                await AccountManager.shared.performCoordinatedRoleMove(ids: [header.id], role: .trash)
+                print("[NotificationActionRouter] delete via performCoordinatedRoleMove for \(messageId)")
+            default:
+                break
+            }
+            return
+        }
+
+        // No header anywhere — even after the merge retry above (header not
+        // local yet — push arrived but sync hasn't landed). Queue a
+        // correctly-shaped PendingOperation so sync reconciles local state
+        // when the message arrives. See the enum doc for the raw-UID residual.
+        await queueColdPendingOperation(actionId: actionId, messageId: messageId, accountId: accountId)
+    }
+
+    /// Cold fallback: no durable OR staged header exists for this message.
+    /// Builds a `PendingOperation` via the record type against the account's
+    /// role folders — never raw SQL.
+    private static func queueColdPendingOperation(actionId: String, messageId: String, accountId: String) async {
+        do {
+            let folders = try await AppDatabase.dbPool.read { db in
+                try Folder.filter(Column("accountId") == accountId).fetchAll(db)
+            }
+            guard let inboxPath = folders.first(where: { $0.role == .inbox })?.path else {
+                print("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
+                return
+            }
+            switch actionId {
+            case "MARK_READ":
+                try await AppDatabase.dbPool.write { db in
+                    try PendingOperation(type: .markRead, messageIds: [messageId], accountId: accountId, folderPath: inboxPath).insert(db)
+                }
+                print("[NotificationActionRouter] header not local — queued markRead PendingOperation for \(messageId)")
+            case "ARCHIVE", "DELETE":
+                let role: FolderRole = actionId == "ARCHIVE" ? .archive : .trash
+                guard let destinationPath = folders.first(where: { $0.role == role })?.path else {
+                    print("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
+                    return
+                }
+                try await AppDatabase.dbPool.write { db in
+                    try PendingOperation(type: .move, messageIds: [messageId], accountId: accountId, folderPath: inboxPath, destinationPath: destinationPath).insert(db)
+                }
+                print("[NotificationActionRouter] header not local — queued \(actionId) (.move) PendingOperation for \(messageId)")
+            default:
+                break
+            }
+        } catch {
+            print("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(messageId): \(error)")
+        }
+    }
+}
+
 /// Separate delegate for UNUserNotificationCenter — must NOT be @MainActor
 /// because the delegate methods are called on arbitrary threads by iOS.
 /// AppDelegate is implicitly @MainActor (via UIApplicationDelegate), so
@@ -164,79 +308,27 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // A notification action can fire during the one-time migration
                 // window; wait for the DB before touching it (AppStartup).
                 await AppStartup.shared.awaitLaunchReady(background: true)
-                let header: MessageHeader?
-                do {
-                    header = try await AppDatabase.dbPool.read { db -> MessageHeader? in
-                        try MessageHeader.fetchOne(db, sql: """
-                            SELECT * FROM messageHeader
-                            WHERE messageId = ? AND accountId = ? AND folderId != ''
-                            LIMIT 1
-                            """, arguments: [messageId, accountId])
-                    }
-                } catch {
-                    print("[NotificationDelegate] markRead lookup failed: \(error)")
-                    header = nil
-                }
-                if let header {
-                    await AccountManager.shared.markRead([header])
-                    print("[NotificationDelegate] markRead via manager for \(messageId)")
-                } else {
-                    // Fallback: header not local yet (push arrived but sync hasn't landed).
-                    // Queue raw PendingOperation; sync reconciles local state when message arrives.
-                    do {
-                        try await AppDatabase.dbPool.write { db in
-                            let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: [messageId]))
-                                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-                            try db.execute(sql: """
-                                INSERT INTO pendingOperation (id, type, messageIds, accountId, status, retryCount)
-                                VALUES (?, ?, ?, ?, 'queued', 0)
-                                """, arguments: [UUID().uuidString, "markRead", messageIdsJSON, accountId])
-                        }
-                        print("[NotificationDelegate] markRead header not local — queued PendingOperation for \(messageId)")
-                    } catch {
-                        print("[NotificationDelegate] markRead fallback insert failed: \(error)")
-                    }
-                }
+                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
                 finish()
             }
             return
         }
 
         if actionId == "ARCHIVE" || actionId == "DELETE" {
-            if let messageId = userInfo["messageId"] as? String,
-               let accountId = userInfo["accountId"] as? String {
-                // Queue PendingOperation — drain loop processes on next sync (ADR-IOS-018)
-                Task { @MainActor in
-                    // Background notification action — same resume rationale as
-                    // MARK_READ above (ADR-IOS-041).
-                    DatabaseSuspension.shared.beginBackgroundWork("notification-action")
-                    defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
-                    // Can fire during the one-time migration window — wait for
-                    // the DB before touching it (AppStartup).
-                    await AppStartup.shared.awaitLaunchReady(background: true)
-                    do {
-                        // Async context (awaitLaunchReady above) → GRDB async write overload.
-                        try await AppDatabase.dbPool.write { db in
-                            let opType: String
-                            switch actionId {
-                            case "ARCHIVE": opType = "archive"
-                            case "DELETE": opType = "delete"
-                            default: return
-                            }
-                            let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: [messageId]))
-                                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-                            try db.execute(sql: """
-                                INSERT INTO pendingOperation (id, type, messageIds, accountId, status, retryCount)
-                                VALUES (?, ?, ?, ?, 'queued', 0)
-                                """, arguments: [UUID().uuidString, opType, messageIdsJSON, accountId])
-                        }
-                        print("[NotificationDelegate] Queued \(actionId) for \(messageId)")
-                    } catch {
-                        print("[NotificationDelegate] Failed to queue action: \(error)")
-                    }
-                    finish()
-                }
-            } else {
+            guard let messageId = userInfo["messageId"] as? String,
+                  let accountId = userInfo["accountId"] as? String else {
+                finish()
+                return
+            }
+            Task { @MainActor in
+                // Background notification action — same resume rationale as
+                // MARK_READ above (ADR-IOS-041).
+                DatabaseSuspension.shared.beginBackgroundWork("notification-action")
+                defer { DatabaseSuspension.shared.endBackgroundWork("notification-action") }
+                // Can fire during the one-time migration window — wait for
+                // the DB before touching it (AppStartup).
+                await AppStartup.shared.awaitLaunchReady(background: true)
+                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
                 finish()
             }
             return
@@ -384,12 +476,45 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             object: nil, queue: .main
         ) { _ in
             MainActor.assumeIsolated {
-                let bgTask = UIApplication.shared.beginBackgroundTask(withName: "wal-durability-checkpoint")
+                // Idempotent finish: the normal-completion path (end of the
+                // Task below) and the expiration handler both funnel through
+                // this one closure, so `endBackgroundWork` (a refcount) is
+                // NEVER decremented twice for one `beginBackgroundWork`, and
+                // the OS task assertion is released exactly once. Mirrors
+                // SyncScheduler.requestBackgroundGracePeriod's `ended`/
+                // `bgTaskId` Mutex idiom.
+                let ended = Mutex(false)
+                let bgTaskId = Mutex<UIBackgroundTaskIdentifier>(.invalid)
+                let finish: @MainActor @Sendable () -> Void = {
+                    guard !ended.withLock({ let was = $0; $0 = true; return was }) else { return }
+                    DatabaseSuspension.shared.endBackgroundWork("wal-durability-checkpoint")
+                    let id = bgTaskId.withLock { $0 }
+                    if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+                }
+                let bgTask = UIApplication.shared.beginBackgroundTask(
+                    withName: "wal-durability-checkpoint",
+                    expirationHandler: finish
+                )
+                bgTaskId.withLock { $0 = bgTask }
                 DatabaseSuspension.shared.beginBackgroundWork("wal-durability-checkpoint")
                 Task { @MainActor in
+                    // Drain the in-memory write queue BEFORE the durability
+                    // checkpoint. The checkpoint fsyncs the WAL as of "now";
+                    // closures still sitting in AccountManager.writeQueue —
+                    // including queued ADR-IOS-057 intent-cycle executors —
+                    // haven't committed yet, so checkpointing first could
+                    // fsync a WAL that's missing whatever the queue hasn't
+                    // flushed. Deadline-bounded (see
+                    // SyncConfig.backgroundWriteQueueFlushTimeoutSeconds) so a
+                    // pathological queue can't hold the background budget
+                    // hostage — on timeout we proceed to the checkpoint
+                    // anyway; the un-drained tail closures still run later
+                    // (never dropped), they just miss this fsync window.
+                    await AccountManager.awaitWriteQueueDrainOrTimeout(
+                        timeoutSeconds: SyncConfig.backgroundWriteQueueFlushTimeoutSeconds
+                    )
                     await AppDatabase.checkpointForDurability()
-                    DatabaseSuspension.shared.endBackgroundWork("wal-durability-checkpoint")
-                    if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+                    finish()
                 }
             }
         }
