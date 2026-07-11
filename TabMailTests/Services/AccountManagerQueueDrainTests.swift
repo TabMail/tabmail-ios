@@ -412,4 +412,228 @@ struct AccountManagerQueueDrainTests {
         let splitMessageIds = Set(splitOps.flatMap(\.messageIds))
         #expect(splitMessageIds == ["msg-a", "msg-b"])
     }
+
+    // MARK: - 8. GAP1: reconcilePendingOperations (real function) — launch-time crash recovery
+
+    @Test("reconcilePendingOperations (real function): inFlight→queued, cancelled deleted, queued untouched, count==2 — accountId has no registered provider so the triggered drain no-ops safely")
+    func reconcilePendingOperationsResetsInFlightDeletesCancelledLeavesQueued() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir) }
+
+        // No provider registered for "acc-gap1" — drainPendingQueue's claim
+        // loop (`guard providers[op.accountId] != nil else { ...skip... }`,
+        // AccountManagerQueue.swift) no-ops on both surviving ops without
+        // ever calling executeSingleOp, so this test observes ONLY
+        // reconcilePendingOperations' own crash-recovery SQL (reset
+        // inFlight→queued, delete cancelled), not drain behavior. The
+        // subsequent reconcileOutbox()/reconcileCalendarQueue() calls inside
+        // reconcilePendingOperations no-op safely too — their tables are
+        // empty in this test DB.
+        var inFlightOp = PendingOperation(type: .markRead, messageIds: ["msg-inflight"], accountId: "acc-gap1", folderPath: "INBOX")
+        inFlightOp.status = PendingStatus.inFlight.rawValue
+        var cancelledOp = PendingOperation(type: .markUnread, messageIds: ["msg-cancelled"], accountId: "acc-gap1", folderPath: "INBOX")
+        cancelledOp.status = PendingStatus.cancelled.rawValue
+        let queuedOp = PendingOperation(type: .markFlagged, messageIds: ["msg-queued"], accountId: "acc-gap1", folderPath: "INBOX")
+        try insertOp(inFlightOp, pool: pool)
+        try insertOp(cancelledOp, pool: pool)
+        try insertOp(queuedOp, pool: pool)
+
+        await AccountManager.shared.reconcilePendingOperations()
+
+        let remaining = try await pool.read { db in
+            try PendingOperation.filter(Column("accountId") == "acc-gap1").fetchAll(db)
+        }
+        #expect(remaining.count == 2)
+
+        let inFlightAfter = try fetchOp(inFlightOp.id, pool: pool)
+        #expect(inFlightAfter != nil, "inFlight op must survive (reset, not dropped)")
+        #expect(inFlightAfter?.status == PendingStatus.queued.rawValue, "inFlight op reset to queued by crash recovery")
+
+        let cancelledAfter = try fetchOp(cancelledOp.id, pool: pool)
+        #expect(cancelledAfter == nil, "cancelled op deleted by crash recovery")
+
+        let queuedAfter = try fetchOp(queuedOp.id, pool: pool)
+        #expect(queuedAfter != nil, "already-queued op must survive untouched")
+        #expect(queuedAfter?.status == PendingStatus.queued.rawValue, "already-queued op untouched")
+        #expect(queuedAfter?.retryCount == 0, "untouched op's retryCount is unaffected")
+    }
+
+    // MARK: - 9. GAP2: MockEmailProvider.setMoveThrowsOnId — partial-batch progress + requeue-then-retry
+
+    @Test("Batch move [A,B,C] fails on B via a generic connection error (ProviderError.notConnected): the WHOLE op resets to queued (not split), retryCount+1, failedAccounts marked, movedIds shows only the successful prefix [A] — a cleared retry then completes the op")
+    func batchMoveGenericFailureHaltsWholeOpThenRetrySucceeds() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir) }
+
+        // The Archive folder must exist locally — otherwise executeSingleOp's
+        // generic-error self-heal branch (`destMissing`, AccountManagerQueue.swift)
+        // would DROP the op instead of resetting it to queued, defeating the
+        // requeue-then-retry scenario under test here.
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
+            acc.id = "acc-gap2"
+            try acc.insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc-gap2").insert(db)
+        }
+
+        let provider = MockEmailProvider()
+        // Generic connection error — NOT uidResolutionFailed/messageNotFound —
+        // the same ProviderError.notConnected ConnectionResilienceTests uses
+        // for the "ordinary connection blip" scenario (falls through to
+        // executeSingleOp's bottom generic catch).
+        await provider.setMoveThrowsOnId("B", error: ProviderError.notConnected)
+
+        let op = PendingOperation(type: .move, messageIds: ["A", "B", "C"], accountId: "acc-gap2", folderPath: "INBOX", destinationPath: "Archive")
+        try insertOp(op, pool: pool)
+
+        let context = AccountManager.DrainContext()
+        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: context)
+
+        #expect(outcome == .haltLane)
+        #expect(context.failedAccounts.contains("acc-gap2"))
+
+        let after = try fetchOp(op.id, pool: pool)
+        #expect(after != nil, "the whole op must be reset to queued — a generic transient error is not confirmed staleness, so it must NOT split")
+        guard let after else { return }
+        #expect(after.status == PendingStatus.queued.rawValue)
+        #expect(after.retryCount == 1)
+        #expect(after.messageIds == ["A", "B", "C"], "batch stays intact")
+
+        let movedAfterFailure = await provider.movedIds
+        #expect(movedAfterFailure.count == 1)
+        guard movedAfterFailure.count == 1 else { return }
+        #expect(movedAfterFailure[0].ids == ["A"], "only the prefix BEFORE the failing id (B) was recorded as moved")
+        #expect(movedAfterFailure[0].from == "INBOX")
+        #expect(movedAfterFailure[0].to == "Archive")
+
+        // Idempotent-retry simulation: connection restored — clear the
+        // failure on the SAME mock instance, re-claim (mirrors how the real
+        // drain's claim step marks inFlight before calling executeSingleOp
+        // again), and re-run.
+        await provider.clearMoveThrowsOnId()
+        var mutableReclaimed = after
+        mutableReclaimed.status = PendingStatus.inFlight.rawValue
+        let reclaimed = mutableReclaimed
+        try await pool.writeWithoutTransaction { db in try reclaimed.save(db) }
+
+        let secondOutcome = await AccountManager.shared.executeSingleOp(reclaimed, provider: provider, context: AccountManager.DrainContext())
+        #expect(secondOutcome == .proceed)
+
+        let final = try fetchOp(op.id, pool: pool)
+        #expect(final == nil, "op deleted — completed on retry")
+
+        let movedAfterRetry = await provider.movedIds
+        #expect(movedAfterRetry.count == 2)
+        #expect(movedAfterRetry.last?.ids == ["A", "B", "C"], "retry succeeds for the full batch")
+    }
+
+    // MARK: - 10. GAP3: drainPendingQueue() end-to-end via registerProviderForTesting
+
+    @Test("drainPendingQueue() (real, end-to-end): 3 queued ops across two lanes all execute exactly once, and same-lane ops run in createdAt order")
+    func drainPendingQueueRealEndToEndExecutesLanesInCreatedAtOrder() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-gap3-lanes"
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+            restoreTestDB(previous: previous, dir: dir)
+        }
+
+        let provider = MockEmailProvider()
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+
+        // Dynamic (repo rule: no hardcoded dates); whole-second so the GRDB
+        // date round-trip compares exactly.
+        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+        // Lane 1: two ops sharing "msg-1" (buildLanes connected-component) — must run in createdAt order.
+        var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+        opA.createdAt = t0
+        var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+        opB.createdAt = t0.addingTimeInterval(1)
+        // Lane 2: a different message id — a separate connected component, runs concurrently.
+        var opC = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: accountId, folderPath: "INBOX")
+        opC.createdAt = t0
+        try insertOp(opA, pool: pool)
+        try insertOp(opB, pool: pool)
+        try insertOp(opC, pool: pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let remaining = try await pool.read { db in
+            try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+        }
+        #expect(remaining.isEmpty, "all ops executed (deleted)")
+
+        let callLog = await provider.callLog
+        let readIdx = callLog.firstIndex { $0.contains("markRead") && $0.contains("msg-1") }
+        let flagIdx = callLog.firstIndex { $0.contains("markFlagged") && $0.contains("msg-1") }
+        #expect(readIdx != nil && flagIdx != nil, "both lane-1 ops must have reached the provider")
+        if let readIdx, let flagIdx {
+            #expect(readIdx < flagIdx, "same-lane ops (sharing msg-1) execute in createdAt order")
+        }
+        let readCalls = await provider.markedReadIds
+        #expect(readCalls.contains { $0.ids == ["msg-2"] }, "lane 2's op also executed")
+    }
+
+    @Test("drainPendingQueue() (real): a generic connection error on the first same-lane op gates the rest of the lane — all remaining ops in that lane are requeued, none execute")
+    func drainPendingQueueRealFirstOpFailureGatesRestOfLane() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-gap3-failure"
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+            restoreTestDB(previous: previous, dir: dir)
+        }
+
+        let provider = MockEmailProvider()
+        await provider.setMarkReadThrows(ProviderError.notConnected)
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+
+        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+        var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+        opA.createdAt = t0
+        var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+        opB.createdAt = t0.addingTimeInterval(1)
+        try insertOp(opA, pool: pool)
+        try insertOp(opB, pool: pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let remaining = try await pool.read { db in
+            try PendingOperation.filter(Column("accountId") == accountId).order(Column("createdAt").asc).fetchAll(db)
+        }
+        #expect(remaining.count == 2, "both ops must still exist — requeued, not executed or dropped")
+        guard remaining.count == 2 else { return }
+        #expect(remaining.allSatisfy { $0.status == PendingStatus.queued.rawValue })
+
+        let flagged = await provider.markedFlaggedIds
+        #expect(flagged.isEmpty, "the later same-lane op must never have reached the provider — failedAccounts gates the rest of the lane")
+    }
+
+    @Test("drainPendingQueue() (real): two concurrent calls are safe — the isDraining/needsRedrain guard serializes them, the op executes exactly once (no duplication, no crash)")
+    func drainPendingQueueRealConcurrentCallsExecuteOpsExactlyOnce() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-gap3-reentrant"
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+            restoreTestDB(previous: previous, dir: dir)
+        }
+
+        let provider = MockEmailProvider()
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+
+        let op = PendingOperation(type: .markRead, messageIds: ["msg-reentrant"], accountId: accountId, folderPath: "INBOX")
+        try insertOp(op, pool: pool)
+
+        async let first: Void = AccountManager.shared.drainPendingQueue()
+        async let second: Void = AccountManager.shared.drainPendingQueue()
+        await first
+        await second
+
+        let remaining = try await pool.read { db in
+            try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+        }
+        #expect(remaining.isEmpty, "the op executed (deleted)")
+
+        let readCalls = await provider.markedReadIds
+        #expect(readCalls.count == 1, "the op must execute EXACTLY ONCE despite two concurrent drain calls")
+    }
 }

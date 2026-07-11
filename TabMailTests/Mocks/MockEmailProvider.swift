@@ -36,6 +36,15 @@ actor MockEmailProvider: EmailProvider {
     var markUnreadThrows: Error?
     var markFlaggedThrows: Error?
     var moveThrows: Error?
+    /// Configures `move(ids:from:to:)` to simulate a batch that fails PARTWAY
+    /// through (e.g. an IMAP MOVE command that drops the connection
+    /// mid-batch): every id BEFORE `failingId` is recorded into `movedIds` as
+    /// if it had already succeeded, then `error` is thrown once `failingId`
+    /// is reached — ids at/after it are never attempted/recorded. Set via
+    /// `setMoveThrowsOnId`, cleared via `clearMoveThrowsOnId`. Takes
+    /// precedence over `moveThrows` when both are configured and `ids`
+    /// contains the failing id.
+    var moveThrowsOnId: (id: String, error: Error)?
     var sendThrows: Error?
     var appendToSentResult: Bool = true
     var appendToSentThrows: Error?
@@ -112,6 +121,17 @@ actor MockEmailProvider: EmailProvider {
 
     func move(ids: [String], from: String, to: String) async throws {
         callLog.append("move(ids:\(ids),from:\(from),to:\(to))")
+        if let (failingId, error) = moveThrowsOnId, ids.contains(failingId) {
+            // Partial-batch progress: record everything BEFORE the failing id
+            // as if it had already succeeded on the wire (mirrors an IMAP
+            // batch MOVE that aborts mid-command on a connection drop), then
+            // throw. Ids at/after the failing one are never attempted.
+            let succeededPrefix = Array(ids.prefix(while: { $0 != failingId }))
+            if !succeededPrefix.isEmpty {
+                movedIds.append((ids: succeededPrefix, from: from, to: to))
+            }
+            throw error
+        }
         movedIds.append((ids: ids, from: from, to: to))
         if let error = moveThrows { throw error }
     }
@@ -172,6 +192,19 @@ actor MockEmailProvider: EmailProvider {
     /// Set moveThrows from outside the actor.
     func setMoveThrows(_ error: Error?) {
         moveThrows = error
+    }
+
+    /// See `moveThrowsOnId` doc comment.
+    func setMoveThrowsOnId(_ id: String, error: Error) {
+        moveThrowsOnId = (id, error)
+    }
+
+    /// Clears a previously configured `setMoveThrowsOnId` — simulates the
+    /// failure condition clearing (e.g. connection restored) so a retry
+    /// against the SAME mock instance succeeds and its call recordings
+    /// (`movedIds`) accumulate across both attempts.
+    func clearMoveThrowsOnId() {
+        moveThrowsOnId = nil
     }
 
     /// Reset all recorded state.

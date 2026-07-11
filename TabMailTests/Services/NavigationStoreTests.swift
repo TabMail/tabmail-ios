@@ -2,6 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): the 3 splitGate_* tests drive
+// AccountManager.registerMutation directly to seed the overlay before refreshFolders();
+// invariant = badge move-delta source/dest truth table (plan section 4 item 11, must survive).
+// Retarget the SEED call to record(intention:); the store.folders assertions are unaffected.
+
 import Testing
 import Foundation
 import GRDB

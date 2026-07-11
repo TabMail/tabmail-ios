@@ -2,6 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): simulateDrainPass/simulateExecuteOperation are a
+// hand-copy of executeOperation's dispatch switch, NOT production code — they pin the
+// OperationType -> provider-call contract only and give ZERO signal on fold-at-drain
+// correctness; only uidResolutionFailedTagOp/uidResolutionFailedNonTagOp exercise the real
+// executeSingleOp (seam-coupled; dissolves per PLAN_INTENTION_QUEUE.md section 1a).
+
 import Testing
 import Foundation
 import GRDB

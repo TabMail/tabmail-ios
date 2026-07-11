@@ -137,6 +137,18 @@ struct NotificationActionRouterTests {
         defer { restoreTestDB(previous: previous, dir: dir); resetStagedGlobal() }
         resetStagedGlobal()
 
+        // HONESTY NOTE: `NotificationActionRouter.execute` runs one
+        // `NSEMergeCoordinator.shared.merge()` pass before falling back to
+        // `queueColdPendingOperation` (see the enum doc comment in
+        // AppDelegate.swift) — in a real cold-background-launch, that merge
+        // pass can pull an already-staged (App Group) row durable and the
+        // retried lookup succeeds, dispatching through the coordinated
+        // move path instead of the cold fallback. In the TEST HOST, `merge()`
+        // no-ops (no app-group container), so this test can only ever reach
+        // the cold-fallback branch — it pins the full-cold-miss contract
+        // below; the merge-succeeds recovery branch is structurally
+        // unreachable in this harness (same convention as
+        // InboxGestureActionTests.swift's staged-row HONESTY NOTE, ~line 1467).
         await NotificationActionRouter.execute(actionId: "ARCHIVE", messageId: "m-cold-archive", accountId: "acc1")
 
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
@@ -160,6 +172,12 @@ struct NotificationActionRouterTests {
         defer { restoreTestDB(previous: previous, dir: dir); resetStagedGlobal() }
         resetStagedGlobal()
 
+        // HONESTY NOTE (see the identical note on noHeaderArchiveQueuesColdMoveOp
+        // above): the test host's `NSEMergeCoordinator.merge()` no-ops (no
+        // app-group container), so this test pins only the full-cold-miss
+        // contract — the merge-succeeds recovery branch (a staged row becomes
+        // durable and the retried lookup finds it) is structurally
+        // unreachable in this harness.
         await NotificationActionRouter.execute(actionId: "MARK_READ", messageId: "m-cold-markread", accountId: "acc1")
 
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }

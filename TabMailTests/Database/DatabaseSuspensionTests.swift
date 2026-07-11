@@ -388,4 +388,106 @@ struct DatabaseSuspensionTests {
         }
         #expect(after == 60)
     }
+
+    // MARK: - GAP4: live suspension through the REAL AccountManager.move() action path
+
+    /// Schema-correct harness — mirrors `CoordinatedToolActionTests.makeTestDB()`
+    /// (swaps `AppDatabase.shared` so `AccountManager.shared.move()` operates on
+    /// this pool, with an account + inbox/archive folder pre-seeded) but ADDITIONALLY
+    /// flags `observesSuspensionNotifications = true`. A SEPARATE harness variant
+    /// (not a change to `CoordinatedToolActionTests`/`AccountManagerQueueDrainTests`/
+    /// `NotificationActionRouterTests`'s own `makeTestDB()`) so their tests — which
+    /// never expect a process-wide suspend/resume post — are completely untouched.
+    private func makeSuspendableAccountDB() throws -> (pool: DatabasePool, inbox: Folder, archive: Folder, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        config.observesSuspensionNotifications = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
+            acc.id = "acc1"
+            try acc.insert(db)
+        }
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in
+            let i = inbox; try i.insert(db)
+            let a = archive; try a.insert(db)
+        }
+        return (pool, inbox, archive, dir, previous)
+    }
+
+    /// See `CoordinatedToolActionTests.restoreTestDB`: production paths driven
+    /// here (`AccountManager.move`'s unstructured recount/drain `Task`s) can
+    /// run AFTER this returns, so a test with no prior `AppDatabase` leaves the
+    /// test DB alive rather than let `AppDatabase.rawPool`'s force-unwrap crash
+    /// the process on a later unrelated access.
+    private func restoreAccountDB(previous: AppDatabase?, dir: URL) {
+        if previous != nil {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    @Test("Live suspension through AccountManager.move(): a suspend posted BEFORE the call aborts the whole write (row move + PendingOperation insert, one transaction) atomically — no PendingOperation, folderId unchanged; after resume the SAME move() call succeeds")
+    func moveAbortsAtomicallyDuringSuspensionThenSucceedsAfterResume() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeSuspendableAccountDB()
+        // Suspend/resume must be balanced even on test failure: the defer's
+        // postResume() runs regardless of how the test exits. Idempotent —
+        // safe even if the explicit mid-test postResume() below already ran.
+        defer {
+            Self.postResume()
+            restoreAccountDB(previous: previous, dir: dir)
+        }
+
+        var newHeader = MessageHeader(
+            messageId: "m-suspend-move", subject: "Subj", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date(), snippet: "snip",
+            folderId: inbox.id, accountId: inbox.accountId, folderPath: inbox.path,
+            isInInbox: true
+        )
+        newHeader.headerComplete = true
+        let header = newHeader
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        Self.postSuspend()
+
+        // AccountManager.move() wraps its `dbPool.write` in do/catch and never
+        // rethrows (AccountManagerActions.swift: "print(...); affectedFolderIds
+        // = []") — verified by reading the function before writing this test.
+        // A suspension abort must therefore be a silent no-op here, not a
+        // crash/hang. move()'s own reads (resolveHeadersForAction,
+        // ensureDurable) run first — WAL reads are suspension-EXEMPT (see
+        // `suspendedPoolAbortsWritesAllowsReads` above), so they succeed and
+        // the function proceeds to the write, which is where the abort hits.
+        await AccountManager.shared.move([header], to: archive.path)
+
+        let duringOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(duringOps.isEmpty, "the write (row move + PendingOperation insert, same transaction) must have rolled back atomically — nothing committed")
+        let duringHeader = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(duringHeader?.folderId == inbox.id, "folderId must be UNCHANGED — the transaction never committed")
+        #expect(duringHeader?.folderPath == inbox.path)
+
+        Self.postResume()
+
+        // The SAME move() call, retried after resume, succeeds normally.
+        await AccountManager.shared.move([header], to: archive.path)
+
+        let afterOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(afterOps.count == 1)
+        guard afterOps.count == 1 else { return }
+        #expect(afterOps[0].type == .move)
+        #expect(afterOps[0].destinationPath == archive.path)
+
+        let afterHeader = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(afterHeader?.folderId == archive.id, "after resume, the SAME move() call lands the row in Archive")
+        #expect(afterHeader?.folderPath == archive.path)
+    }
 }

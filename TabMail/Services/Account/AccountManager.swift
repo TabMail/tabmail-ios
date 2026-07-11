@@ -245,6 +245,31 @@ actor AccountManager {
         print("[AccountManager] Unregistered demo providers for accountId=\(accountId)")
     }
 
+    // MARK: - Test-only provider injection
+
+    /// Test seam: populate `providers`/`workQueues` for `accountId` exactly as
+    /// `connectAccount` does (same `ProviderWorkQueue` construction), without
+    /// the network `provider.connect()` call or `syncEngine.register` —
+    /// neither is needed to exercise `drainPendingQueue()`/`executeSingleOp`
+    /// against a `MockEmailProvider`. Overwrites any existing provider/queue
+    /// for `accountId` (mirrors `registerDemoProviders`'s replace-on-call
+    /// semantics). Mirrors the `…ForTesting()` naming convention
+    /// (`overlayOpRefCountForTesting`).
+    func registerProviderForTesting(accountId: String, provider: any EmailProvider) {
+        providers[accountId] = provider
+        workQueues[accountId] = ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling)
+    }
+
+    /// Test seam: undo `registerProviderForTesting`. Tests should call this in
+    /// their teardown so a registered mock provider/queue doesn't leak into a
+    /// later test that reuses the same accountId (the primary defenses are
+    /// `.serialized` suites + unique accountIds per test — this closes the
+    /// gap for tests that want an explicit unregister).
+    func unregisterProviderForTesting(accountId: String) {
+        providers.removeValue(forKey: accountId)
+        workQueues.removeValue(forKey: accountId)
+    }
+
     /// Guard for pending queue drain (used by AccountManagerQueue).
     var isDraining = false
     /// Set when drainPendingQueue() is called while isDraining — triggers re-drain on completion.

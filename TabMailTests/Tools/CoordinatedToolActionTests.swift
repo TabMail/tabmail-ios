@@ -298,4 +298,57 @@ struct CoordinatedToolActionTests {
             #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded for \(id)")
         }
     }
+
+    // MARK: - (5) Mixed batch: one account missing its role folder entirely (round-8 note (a))
+
+    @Test("mixed multi-account batch: acc2 has NO archive folder at all — acc1's message archives normally (ONE .move op), acc2's message is skipped entirely (zero ops, untouched), and neither the acted-on nor the skipped id strands an overlay/refcount entry")
+    func mixedBatchAccountMissingRoleFolderSkipsCleanly() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        // acc2 has ONLY an inbox — no archive folder anywhere for this account.
+        // performCoordinatedRoleMove's own "no role folder for account" skip
+        // (mirrors archive()/delete()'s moveToRoleFolderPerAccount skip) must
+        // drop h2 from `actionable` BEFORE any retainOverlayEntry call for it —
+        // otherwise h2's retain would never be released (no queued closure
+        // ever runs for an id filtered out before the retain loop).
+        try await pool.writeWithoutTransaction { db in
+            var acc2 = Account(emailAddress: "second@example.com", displayName: "Second", provider: .gmail)
+            acc2.id = "acc2"
+            try acc2.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc2").insert(db)
+        }
+        let inbox2 = try await pool.read { db in
+            try Folder.filter(Column("accountId") == "acc2" && Column("role") == FolderRole.inbox.rawValue).fetchOne(db)
+        }
+        #expect(inbox2 != nil)
+        guard let inbox2 else { return }
+
+        let h1 = makeDurableHeader(folder: inbox, messageId: "m-missing-role-1")
+        let h2 = makeDurableHeader(folder: inbox2, messageId: "m-missing-role-2")
+        try await pool.writeWithoutTransaction { db in try h1.insert(db); try h2.insert(db) }
+
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [h1.id, h2.id], role: .archive)
+
+        let f1 = try await pool.read { db in try MessageHeader.fetchOne(db, key: h1.id) }
+        #expect(f1?.folderId == archive.id, "acc1's row must still archive normally")
+        #expect(f1?.folderPath == archive.path)
+
+        let f2 = try await pool.read { db in try MessageHeader.fetchOne(db, key: h2.id) }
+        #expect(f2?.folderId == inbox2.id, "acc2's row is untouched — still in acc2's inbox")
+        #expect(f2?.folderPath == inbox2.path)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "exactly one .move op — only acc1's actionable message")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].accountId == "acc1")
+        #expect(ops[0].type == .move)
+        #expect(ops[0].destinationPath == archive.path)
+
+        for id in [h1.id, h2.id] {
+            #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded for \(id) — this must hold for BOTH the acted-on id (h1) and the skipped id (h2)")
+            #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded for \(id)")
+        }
+    }
 }

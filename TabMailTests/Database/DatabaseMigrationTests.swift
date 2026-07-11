@@ -2,6 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): uidResolutionRetryCount is schema/column-level and
+// orthogonal to the intent-register refactor — the retry-budget concept is explicitly KEPT
+// (plan section 3) regardless of the one-table-vs-two decision (section 5a).
+
 import Testing
 import Foundation
 import GRDB
