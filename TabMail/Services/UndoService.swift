@@ -126,6 +126,7 @@ final class UndoService {
             // Each captured MessageHeader carries the pre-move isInInbox value,
             // so per-message mirroring is exact even if the action spans folders.
             for msg in action.messages {
+                manager.retainOverlayEntry(id: msg.id)
                 manager.registerMutation(id: msg.id, mutation: .init(
                     folderId: action.originalFolderId,
                     folderPath: action.originalFolderPath,
@@ -141,7 +142,7 @@ final class UndoService {
                     toFolderPath: fromPath,
                     toFolderId: action.originalFolderId
                 )
-                manager.removeOverlayEntries(ids: action.messages.map(\.id))
+                for msg in action.messages { manager.releaseOverlayEntry(id: msg.id) }
             }
         }
 

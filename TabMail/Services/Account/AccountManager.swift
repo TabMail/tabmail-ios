@@ -368,14 +368,22 @@ actor AccountManager {
     /// same id (e.g. toggleRead + toggleFlag queued together) must each
     /// retain/release independently.
     ///
-    /// Gesture paths (`InboxViewModel.toggleRead`/`markRead`/`toggleFlag`)
-    /// call `retainOverlayEntry` at gesture time (same call site as
-    /// `registerMutation`) and `releaseOverlayEntry` at the end of their
-    /// queued closure, on every exit path, in place of a direct
-    /// `removeOverlayEntries` call. Move/undo/detail-view flows are OUT OF
-    /// SCOPE — they keep using `removeOverlayEntries` directly pending their
-    /// own audit (moves already have an independent refcounted lifecycle via
-    /// `MessageDetailViewModel.localMovePins`).
+    /// Gesture paths (`InboxViewModel.toggleRead`/`markRead`/`toggleFlag`,
+    /// `registerGestureIntent` below) call `retainOverlayEntry` at gesture
+    /// time (same call site as `registerMutation`) and `releaseOverlayEntry`
+    /// at the end of their queued closure, on every exit path, in place of a
+    /// direct `removeOverlayEntries` call. The audit promised above ("pending
+    /// their own audit") is DONE: every remaining production call site — the
+    /// move family (archive/delete/move, single + thread, both
+    /// `InboxViewModel` and `MessageDetailViewModel`), `UndoService.undo()`,
+    /// and the inbox/detail `applyManualTag` gesture paths (now routed
+    /// through `registerGestureIntent`'s single-retain-per-cycle protocol) —
+    /// is converted to retain/release. `removeOverlayEntries` itself is now
+    /// called from exactly one production call site: `releaseOverlayEntry`'s
+    /// zero-refcount branch below. (Moves also keep an independent
+    /// refcounted pin lifecycle via `MessageDetailViewModel.localMovePins`
+    /// for the detail view's bubble-snapback window — a separate concern
+    /// from this overlay refcount.)
     private let overlayOpRefCount = Mutex<[String: Int]>([:])
 
     /// Mark one more in-flight gesture op for `id`. Call synchronously at
@@ -416,6 +424,222 @@ actor AccountManager {
     /// `…ForTesting()` convention.
     nonisolated func overlayOpRefCountForTesting() -> [String: Int] {
         overlayOpRefCount.withLock { $0 }
+    }
+
+    // MARK: - Latest-Intent Coalescing (ADR-IOS-057)
+
+    /// One in-flight coalesced gesture cycle per message id. Folds repeated
+    /// gesture intents registered for the same id (rapid `toggleRead`/
+    /// `toggleFlag`/`applyManualTag` taps queued faster than the FIFO write
+    /// queue drains) into a SINGLE queued write that executes the NET,
+    /// per-field intent — see `registerGestureIntent`/`executeIntentCycle`.
+    /// `isReadBaseline`/`isFlaggedBaseline`/`actionTagBaseline` capture the
+    /// visualized state the FIRST touch of that field saw this cycle. The
+    /// executor's skip decision compares each net target against the
+    /// RESOLVED HEADER's current truth, not these baselines (round-3 audit —
+    /// see `executeIntentCycle`): for an undisturbed cycle the two are
+    /// identical, so a perfect cancel-out still performs zero writes, zero
+    /// `PendingOperation`s, zero unread/badge churn. The stored baselines
+    /// remain the gesture-time record: `actionTagBaseline` feeds
+    /// `applyManualTag`'s previousTag/auto-teach signal, and all three are
+    /// groundwork for phase-2 move coalescing
+    /// (`PLAN_OVERLAY_CALLSITE_AUDIT.md` §5).
+    struct IntentCycle: Sendable {
+        var isReadTarget: Bool?      // latest registered target
+        var isReadBaseline: Bool?    // visualized state when the field FIRST joined this cycle
+        var isFlaggedTarget: Bool?
+        var isFlaggedBaseline: Bool?
+        var actionTagTarget: ActionTag??    // .some(x) = touched; latest target (x may be nil = clear)
+        var actionTagBaseline: ActionTag??  // .some(x) = touched; baseline at first touch
+        /// Bumped on EVERY `registerGestureIntent` touch (create or join).
+        /// Lets the executor detect intents that joined during a nil header
+        /// resolve and grant them the fresh resolve attempt they would have
+        /// gotten as their own cycle pre-coalescing — see `executeIntentCycle`'s
+        /// retry loop (round-2 audit).
+        var generation: Int = 0
+    }
+    private let pendingIntentCycles = Mutex<[String: IntentCycle]>([:])
+
+    /// A single-field gesture intent registered against an id's open
+    /// `IntentCycle`. See `registerGestureIntent`.
+    enum GestureIntent: Sendable {
+        case isRead(target: Bool, baseline: Bool)
+        case isFlagged(target: Bool, baseline: Bool)
+        case actionTag(target: ActionTag?, baseline: ActionTag?)
+    }
+
+    /// Register a gesture intent for `id` (ADR-IOS-057). Updates the display
+    /// overlay (`registerMutation`) synchronously — on-screen state always
+    /// reflects the latest intent immediately, unchanged display semantics —
+    /// then folds the intent into `id`'s open `IntentCycle` (creating one if
+    /// none is in flight). Only when a NEW cycle is created does this take
+    /// ONE overlay retain and enqueue ONE executor closure on the FIFO write
+    /// queue; later gestures on the same id while a cycle is still queued
+    /// only update the register + overlay — no new closure, no new write, no
+    /// new `PendingOperation`. Callable synchronously from the MainActor
+    /// gesture paths that used to call `retainOverlayEntry` + `registerMutation`
+    /// + `enqueueWrite` directly.
+    nonisolated func registerGestureIntent(id: String, _ intent: GestureIntent) {
+        var mutation = PendingMutation()
+        let isNewCycle = pendingIntentCycles.withLock { cycles -> Bool in
+            let isNew = cycles[id] == nil
+            var cycle = cycles[id] ?? IntentCycle()
+            switch intent {
+            case .isRead(let target, let baseline):
+                if cycle.isReadBaseline == nil { cycle.isReadBaseline = baseline }
+                cycle.isReadTarget = target
+                mutation.isRead = target
+            case .isFlagged(let target, let baseline):
+                if cycle.isFlaggedBaseline == nil { cycle.isFlaggedBaseline = baseline }
+                cycle.isFlaggedTarget = target
+                mutation.isFlagged = target
+            case .actionTag(let target, let baseline):
+                if cycle.actionTagBaseline == nil { cycle.actionTagBaseline = .some(baseline) }
+                cycle.actionTagTarget = .some(target)
+                mutation.actionTag = .some(target)
+            }
+            cycle.generation += 1
+            cycles[id] = cycle
+            return isNew
+        }
+        // Retain BEFORE registering (new cycle only — an existing cycle
+        // already holds its retain): the overlay entry must not be removable
+        // by a sibling op's final release in the instant between
+        // `registerMutation` landing the intent and this cycle's retain
+        // taking effect. Same invariant the pre-register gesture paths
+        // documented at their retain call sites.
+        if isNewCycle { retainOverlayEntry(id: id) }
+        registerMutation(id: id, mutation: mutation)
+        guard isNewCycle else { return }
+        Task { await self.enqueueWrite { await self.executeIntentCycle(id: id) } }
+    }
+
+    /// Executes the NET per-field intent accumulated in `id`'s coalesced
+    /// gesture cycle and releases the cycle's single overlay retain.
+    ///
+    /// Resolves the header BEFORE consuming the cycle (ADR-IOS-057 round-1
+    /// audit): `resolveHeaderForAction` is a `dbPool.read` that can take
+    /// seconds under writer starvation. A gesture landing during that read
+    /// still finds the cycle open and JOINS it (folded into this executor's
+    /// net write) instead of finding no cycle and opening a second one — the
+    /// split-cycle window that would otherwise let a possible cancel-out slip
+    /// through as two writes. The cycle is consumed (`removeValue`) only
+    /// after the read, on EVERY exit path — a gesture registered after that
+    /// point starts a fresh cycle with its own retain + closure, executing
+    /// strictly later, behind this one. The residual split window is now
+    /// only the write section below: a tap landing there genuinely postdates
+    /// this in-flight write and its own write is semantically necessary (see
+    /// ADR-IOS-057 Consequences — accepted residual).
+    ///
+    /// Nil-resolve retry (round-2 audit): when the header resolves to nil,
+    /// intents that JOINED the cycle during the resolve must not be consumed
+    /// and dropped on the strength of a read that predates them — as their
+    /// own cycle (pre-coalescing) they would have gotten a fresh
+    /// `resolveHeaderForAction` call of their own, and the row can become
+    /// resolvable in the interim (e.g. an NSE merge lands). The loop grants
+    /// exactly that: re-resolve while the cycle's `generation` moved during
+    /// the failed resolve. Each retry requires a NEW gesture to have landed
+    /// mid-resolve, so the loop is bounded by the user's actual tap stream —
+    /// identical to the pre-coalescing cost of one resolve per gesture.
+    func executeIntentCycle(id: String) async {
+        var header: MessageHeader?
+        var cycle: IntentCycle?
+        while true {
+            let generationBeforeResolve = pendingIntentCycles.withLock { $0[id]?.generation }
+            header = await resolveHeaderForAction(id: id)
+            if header != nil {
+                // Successful resolve: consume unconditionally. Intents that
+                // joined at any point up to this consume are folded into this
+                // executor's net write (their baselines are first-touch, so
+                // the math stays exact).
+                cycle = pendingIntentCycles.withLock { $0.removeValue(forKey: id) }
+                break
+            }
+            // Nil resolve: the generation-stability check and the consume
+            // MUST be one atomic lock section (round-3 audit) — with two
+            // separate acquisitions, a gesture joining in the instant
+            // between "generation unchanged" and `removeValue` would be
+            // consumed by a verdict that predates it and silently dropped.
+            let (done, consumed) = pendingIntentCycles.withLock { cycles -> (Bool, IntentCycle?) in
+                guard let current = cycles[id] else { return (true, nil) }
+                guard current.generation == generationBeforeResolve else { return (false, nil) }
+                return (true, cycles.removeValue(forKey: id))
+            }
+            if done {
+                cycle = consumed
+                break
+            }
+            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — nil resolve for \(id) but the cycle changed mid-resolve, retrying resolution")
+        }
+        guard let cycle else {
+            // Defensive: executor ran with no cycle on record (should not
+            // happen — registerGestureIntent always creates a cycle before
+            // enqueueing). Release so the overlay never strands.
+            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — no cycle on record for \(id)")
+            releaseOverlayEntry(id: id)
+            return
+        }
+        guard let header else {
+            // Row vanished between gesture and drain (e.g. deleted by an
+            // earlier queued op) — no-op, but release THIS cycle's retain so
+            // the overlay doesn't strand (mirrors toggleRead's vanished-row
+            // branch).
+            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — header resolution failed for \(id), releasing overlay retain")
+            releaseOverlayEntry(id: id)
+            return
+        }
+        // Skip condition (round-3 audit): each field compares its net target
+        // against the RESOLVED HEADER's current truth, not the cycle's
+        // gesture-time baseline. For an undisturbed cycle the two are
+        // identical (a pure cancel-out stays a zero-write no-op). They
+        // diverge when an out-of-band writer touched the row mid-cycle —
+        // `markAllAsRead` (a LOCAL user action that bypasses the register,
+        // FIFO-ordered before this executor) or a remote sync flip. In both
+        // cases the cycle's net intent is the user's LATEST visualized
+        // state, so it must be asserted ("the user's next action always
+        // takes priority over stale server state" — core philosophy §4), and
+        // skipping instead would flip the row back the moment the overlay
+        // releases — the exact symptom class this register exists to kill.
+        // Bonus: a write the DB already reflects is skipped as redundant
+        // (no PendingOperation, no remote round-trip).
+        var wroteAnything = false
+        if let target = cycle.isReadTarget, target != header.isRead {
+            if target { await markRead([header]) } else { await markUnread([header]) }
+            wroteAnything = true
+        }
+        if let target = cycle.isFlaggedTarget, target != header.isFlagged {
+            await markFlagged([header], flagged: target)
+            wroteAnything = true
+        }
+        if case let .some(target) = cycle.actionTagTarget {
+            if target != header.actionTag {
+                // previousTag semantics: `applyManualTag` reads
+                // `message.actionTag` as the "before" value for the LLM
+                // auto-teach signal (originalAction). Feed it the
+                // gesture-time visualized baseline, not drain-time DB
+                // truth — a concurrent AI auto-tag landing in the
+                // gesture→drain gap must not masquerade as the tag the user
+                // overrode.
+                var tagHeader = header
+                tagHeader.actionTag = cycle.actionTagBaseline ?? nil  // outer .some guaranteed when touched
+                await applyManualTag(tagHeader, tag: target)
+                wroteAnything = true
+            }
+        }
+        // Cancel-out (every touched field's target already matches the row):
+        // nothing ran above — no local write, no unreadCount churn, no badge
+        // recount, no PendingOperation, no remote flip.
+        if !wroteAnything {
+            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — cancel-out no-op for \(id)")
+        }
+        releaseOverlayEntry(id: id)
+    }
+
+    /// Test seam: snapshot the intent-cycle register (hygiene checks —
+    /// asserting it drains back to empty once every cycle has executed).
+    /// Mirrors `overlayOpRefCountForTesting()`.
+    nonisolated func pendingIntentCyclesForTesting() -> [String: IntentCycle] {
+        pendingIntentCycles.withLock { $0 }
     }
 
     /// Guard for outbox drain (used by AccountManagerOutbox).

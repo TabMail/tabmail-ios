@@ -2,7 +2,7 @@
 
 > **iOS-specific knowledge.** Claude reads this before every task and updates it when discovering something new. For cross-cutting knowledge, see `../PROJECT_MEMORY.md`.
 
-**Last updated:** 2026-07-09
+**Last updated:** 2026-07-10
 
 ---
 
@@ -1000,6 +1000,17 @@ NOT GRDB schema migrations (those are in `AppDatabase.runMigrations`, the `Datab
 - **Rule: gesture paths are ZERO-DB.** Current state comes from the on-screen snapshot (`loadedMessages.first { $0.id == id }`) — `snapshot.isRead/isFlagged` already reflects prior optimistic flips, so rapid double-toggles compute the right target. The `MessageHeader` the `AccountManager.markRead/markUnread/markFlagged` write needs is resolved OFF-MAIN inside the queued `enqueueWrite` closure via **`AccountManager.resolveHeadersForAction(ids:)` / `resolveHeaderForAction(id:)`** (`AccountManagerActions.swift`) — the single shared implementation of `lookupMessage`'s two-step lookup (durable GRDB row, else ADR-IOS-049 staged synthesis from `NSEDataBridge.latestStagedRows`). If resolution fails in the closure (row vanished), the op no-ops and the overlay entry is removed so optimistic state can't strand (the row's snapshot is gone too, so removal is safe).
 - Batch `markRead(_:)` split: on-screen ids keep the instant optimistic flip + overlay; ids WITHOUT a snapshot (thread-member ids from a render-time-captured `ThreadGroup`) get their current-state check (filter-to-currently-unread) inside the closure, off-main — semantics preserved, no gesture-path read.
 - Tests: `TabMailTests/ViewModels/InboxGestureActionTests.swift` (5) — rapid double-toggle read/flag, staged-only-row toggle, mixed on-/off-screen batch, drain-matches-last-toggle. The double-toggle + drain tests verified FAILING against the pre-fix code. Write-queue gating pattern for determinism reused from `pinSurvivesWhileMoveQueued` (AsyncStream gate + FIFO barrier).
+
+---
+
+## Action queue coalesces gesture intents to latest-per-field (ADR-IOS-057, 2026-07-10) + overlay call-site audit closed
+
+- **Intent register**: `AccountManager.registerGestureIntent(id:_:)` / `executeIntentCycle(id:)` over `pendingIntentCycles` — first gesture on an id opens a cycle (ONE overlay retain, ONE queued executor); later gestures while queued only update the register + display overlay. Executor consumes the cycle atomically, resolves the header off-main, writes only fields whose target differs from the resolved header's current truth (round-3; identical to the gesture-time baseline for undisturbed cycles — out-of-band writers like markAllAsRead or remote flips get corrected to the user's latest visualized intent). Even-count toggles / tag-back-to-original = clean no-op: zero writes, zero `PendingOperation`s, zero unreadCount/badge churn, zero remote flips (fixes the backgrounded badge-bounce field report). Covers isRead/isFlagged/actionTag; wired from inbox `toggleRead`/`toggleFlag`/`applyManualTag` and detail `toggleRead`/`toggleReadForThread`/`markReadOnOpenIfNeeded`/`applyManualTag`.
+- **Ordering invariant**: on a NEW cycle, `retainOverlayEntry` runs BEFORE `registerMutation` — a sibling op's final release in the gap would strip the just-registered intent (same invariant the pre-register gesture paths documented).
+- **Call-site audit (PLAN_OVERLAY_CALLSITE_AUDIT.md §1-§2) CLOSED**: every production `removeOverlayEntries` caller converted to retain/release — move family (inbox+detail, single+thread), `UndoService.undo`, tags. Sole remaining production caller is `releaseOverlayEntry`'s zero-count branch. Overlay entry lifetime = union of ALL in-flight ops for the id; the mixed-path refcount bypass (direct removal stripping a refcounted sibling's entry, and the reverse) is dead. Regression tests: `mixedToggleAndArchiveOnSameId` + reverse order.
+- **Deliberately NOT coalesced yet**: moves + undo (one refcounted closure per op) — phase-2 design in `PLAN_OVERLAY_CALLSITE_AUDIT.md` §5 (UndoService reconciliation, `localMovePins`, `ensureDurable`, MOVE-vs-STORE UID-rekeying). Batch `markRead(_:)` keeps its own closure (off-screen resolution; one-direction idempotent writes).
+- **TB parity**: deliberate divergence — TB addon fire-and-forgets `browser.messages.update` to TB core (no queue/debounce); iOS owns its own IMAP write path, so the coalescing layer lives here (recorded in ADR-IOS-057).
+- Tests: `InboxGestureActionTests` now 24 (cancel-out, odd-count-one-write, cycle-consume-then-new-cycle, tag coalescing, mixed-path both orders, undo retain hygiene, strand checks on refcount + register).
 
 ---
 

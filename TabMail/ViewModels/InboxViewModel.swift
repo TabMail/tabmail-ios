@@ -1553,6 +1553,7 @@ final class InboxViewModel {
         }
         guard message.folderPath != archivePath else { return }
         let destFolderId = "\(message.accountId):\(archivePath)"
+        manager.retainOverlayEntry(id: messageId)
         manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: archivePath), messages: [message],
@@ -1562,7 +1563,7 @@ final class InboxViewModel {
         ))
         Task { await manager.enqueueWrite { [manager] in
             await manager.move([message], to: archivePath)
-            manager.removeOverlayEntries(ids: [messageId])
+            manager.releaseOverlayEntry(id: messageId)
         }}
     }
 
@@ -1579,7 +1580,10 @@ final class InboxViewModel {
         guard first.folderPath != archivePath else { return }
         let destFolderId = "\(first.accountId):\(archivePath)"
         let compositeIds = messages.map(\.id)
-        for id in compositeIds { manager.registerMutation(id: id, mutation: .init(folderId: destFolderId)) }
+        for id in compositeIds {
+            manager.retainOverlayEntry(id: id)
+            manager.registerMutation(id: id, mutation: .init(folderId: destFolderId))
+        }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: first.folderPath, toPath: archivePath), messages: messages,
             originalFolderId: first.folderId,
@@ -1588,7 +1592,7 @@ final class InboxViewModel {
         ))
         Task { await manager.enqueueWrite { [manager] in
             await manager.move(messages, to: archivePath)
-            manager.removeOverlayEntries(ids: compositeIds)
+            for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
     }
 
@@ -1611,6 +1615,7 @@ final class InboxViewModel {
         }
         guard message.folderPath != trashPath else { return }
         let destFolderId = "\(message.accountId):\(trashPath)"
+        manager.retainOverlayEntry(id: messageId)
         manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: trashPath), messages: [message],
@@ -1620,7 +1625,7 @@ final class InboxViewModel {
         ))
         Task { await manager.enqueueWrite { [manager] in
             await manager.move([message], to: trashPath)
-            manager.removeOverlayEntries(ids: [messageId])
+            manager.releaseOverlayEntry(id: messageId)
         }}
     }
 
@@ -1646,7 +1651,10 @@ final class InboxViewModel {
         guard first.folderPath != trashPath else { return }
         let destFolderId = "\(first.accountId):\(trashPath)"
         let compositeIds = messages.map(\.id)
-        for id in compositeIds { manager.registerMutation(id: id, mutation: .init(folderId: destFolderId)) }
+        for id in compositeIds {
+            manager.retainOverlayEntry(id: id)
+            manager.registerMutation(id: id, mutation: .init(folderId: destFolderId))
+        }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: first.folderPath, toPath: trashPath), messages: messages,
             originalFolderId: first.folderId,
@@ -1655,7 +1663,7 @@ final class InboxViewModel {
         ))
         Task { await manager.enqueueWrite { [manager] in
             await manager.move(messages, to: trashPath)
-            manager.removeOverlayEntries(ids: compositeIds)
+            for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
     }
 
@@ -1702,37 +1710,13 @@ final class InboxViewModel {
         if let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) {
             loadedMessages[idx].isRead = newIsRead
         }
-        // Overlay protects against reloadMessages clobbering the optimistic state.
-        // Retain BEFORE registering — the overlay entry must not be removable
-        // by a sibling op until this op's own release runs (see
-        // `AccountManager.retainOverlayEntry`/`releaseOverlayEntry` doc: the
-        // overlay is coalesced, so removal must be tied to the LAST in-flight
-        // op for the id, not to any single op's completion).
-        manager.retainOverlayEntry(id: messageId)
-        manager.registerMutation(id: messageId, mutation: .init(isRead: newIsRead))
+        // Gesture intents on the same id coalesce to the NET target
+        // (ADR-IOS-057): `registerGestureIntent` updates the display overlay
+        // synchronously and queues at most ONE write per open cycle, so N
+        // rapid alternating toggles execute as ONE write of the FINAL
+        // intent instead of N serial writes.
+        manager.registerGestureIntent(id: messageId, .isRead(target: newIsRead, baseline: snapshot.isRead))
         rebuildDisplayGroups()
-
-        // FIFO write queue — the MessageHeader needed for markRead/markUnread
-        // is resolved OFF-MAIN inside the closure (zero DB reads on the
-        // gesture path). `AccountManager.resolveHeaderForAction` mirrors
-        // `lookupMessage`'s exact two-step lookup (durable row, else the
-        // ADR-IOS-049 staged-row synthesis).
-        Task { await manager.enqueueWrite { [manager] in
-            guard let message = await manager.resolveHeaderForAction(id: messageId) else {
-                // Row vanished between gesture and drain (e.g. deleted by an
-                // earlier queued op) — no-op, but release THIS op's retain so
-                // the overlay doesn't strand.
-                BackgroundSyncLogger.logInbox("[InboxViewModel] toggleRead — header resolution failed for \(messageId), releasing overlay retain")
-                manager.releaseOverlayEntry(id: messageId)
-                return
-            }
-            if newIsRead {
-                await manager.markRead([message])
-            } else {
-                await manager.markUnread([message])
-            }
-            manager.releaseOverlayEntry(id: messageId)
-        }}
     }
 
     /// Batched set-read. Filters to currently-unread members, then applies the
@@ -1856,34 +1840,24 @@ final class InboxViewModel {
         if let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) {
             loadedMessages[idx].isFlagged = newFlagged
         }
-        // Retain BEFORE registering — see `toggleRead`'s doc comment for why
-        // (overlay is coalesced; removal must be tied to THIS op's own
-        // completion, not any sibling op's).
-        manager.retainOverlayEntry(id: messageId)
-        manager.registerMutation(id: messageId, mutation: .init(isFlagged: newFlagged))
+        // Gesture intents on the same id coalesce to the NET target
+        // (ADR-IOS-057) — see `toggleRead`'s doc comment.
+        manager.registerGestureIntent(id: messageId, .isFlagged(target: newFlagged, baseline: snapshot.isFlagged))
         rebuildDisplayGroups()
-        Task { await manager.enqueueWrite { [manager] in
-            guard let message = await manager.resolveHeaderForAction(id: messageId) else {
-                BackgroundSyncLogger.logInbox("[InboxViewModel] toggleFlag — header resolution failed for \(messageId), releasing overlay retain")
-                manager.releaseOverlayEntry(id: messageId)
-                return
-            }
-            await manager.markFlagged([message], flagged: newFlagged)
-            manager.releaseOverlayEntry(id: messageId)
-        }}
     }
 
+    /// Only reachable for on-screen rows (context menu on a visible row) —
+    /// mirrors `toggleRead`'s guard on the on-screen snapshot rather than a
+    /// gesture-path DB read (zero-DB rule).
     func applyManualTag(_ messageId: String, tag: ActionTag?) {
-        guard let message = lookupMessage(messageId) else { return }
+        guard let snapshot = loadedMessages.first(where: { $0.id == messageId }) else { return }
         if let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) {
             loadedMessages[idx].actionTag = tag
         }
-        manager.registerMutation(id: messageId, mutation: .init(actionTag: tag))
+        // Gesture intents on the same id coalesce to the NET target
+        // (ADR-IOS-057) — see `toggleRead`'s doc comment.
+        manager.registerGestureIntent(id: messageId, .actionTag(target: tag, baseline: snapshot.actionTag))
         rebuildDisplayGroups()
-        Task { await manager.enqueueWrite { [manager] in
-            await manager.applyManualTag(message, tag: tag)
-            manager.removeOverlayEntries(ids: [messageId])
-        }}
     }
 
     func removeUserLabel(_ label: UserLabel, from snapshot: MessageSnapshot) async {
@@ -1922,6 +1896,7 @@ final class InboxViewModel {
         }
         print("[MoveTrace] ViewModel.move — msgId=\(message.messageId) from=\(message.folderPath) to=\(toFolderPath) folderId=\(message.folderId) headerDbId=\(message.id)")
         let destFolderId = "\(message.accountId):\(toFolderPath)"
+        manager.retainOverlayEntry(id: messageId)
         manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: message.folderPath, toPath: toFolderPath), messages: [message],
@@ -1931,7 +1906,7 @@ final class InboxViewModel {
         ))
         Task { await manager.enqueueWrite { [manager] in
             await manager.move([message], to: toFolderPath)
-            manager.removeOverlayEntries(ids: [messageId])
+            manager.releaseOverlayEntry(id: messageId)
         }}
     }
 
@@ -1951,7 +1926,10 @@ final class InboxViewModel {
         }
         let destFolderId = "\(first.accountId):\(toFolderPath)"
         let compositeIds = messages.map(\.id)
-        for id in compositeIds { manager.registerMutation(id: id, mutation: .init(folderId: destFolderId)) }
+        for id in compositeIds {
+            manager.retainOverlayEntry(id: id)
+            manager.registerMutation(id: id, mutation: .init(folderId: destFolderId))
+        }
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: first.folderPath, toPath: toFolderPath), messages: messages,
             originalFolderId: first.folderId,
@@ -1960,7 +1938,7 @@ final class InboxViewModel {
         ))
         Task { await manager.enqueueWrite { [manager] in
             await manager.move(messages, to: toFolderPath)
-            manager.removeOverlayEntries(ids: compositeIds)
+            for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
     }
 

@@ -1390,15 +1390,9 @@ final class MessageDetailViewModel {
         let wasRead = message.isRead
         let newIsRead = !wasRead
         self.message?.isRead = newIsRead
-        manager.registerMutation(id: message.id, mutation: .init(isRead: newIsRead))
-        Task { await manager.enqueueWrite { [manager] in
-            if wasRead {
-                await manager.markUnread([message])
-            } else {
-                await manager.markRead([message])
-            }
-            manager.removeOverlayEntries(ids: [message.id])
-        }}
+        // Gesture intents on the same id coalesce to the NET target
+        // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
+        manager.registerGestureIntent(id: message.id, .isRead(target: newIsRead, baseline: wasRead))
     }
 
     /// Returns false when the archive was a no-op (no archive folder, or the
@@ -1424,6 +1418,7 @@ final class MessageDetailViewModel {
             originalFolderPath: msg.folderPath,
             accountId: msg.accountId, timestamp: Date()
         ))
+        manager.retainOverlayEntry(id: msg.id)
         manager.registerMutation(id: msg.id, mutation: .init(folderId: archiveFolder.id))
         enqueueMove(msg, to: archiveFolder.path)
         updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
@@ -1452,6 +1447,7 @@ final class MessageDetailViewModel {
             originalFolderPath: msg.folderPath,
             accountId: msg.accountId, timestamp: Date()
         ))
+        manager.retainOverlayEntry(id: msg.id)
         manager.registerMutation(id: msg.id, mutation: .init(folderId: trashFolder.id))
         enqueueMove(msg, to: trashFolder.path)
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
@@ -1484,7 +1480,7 @@ final class MessageDetailViewModel {
         let manager = manager
         Task { await manager.enqueueWrite { [weak self, manager] in
             await manager.move([msg], to: folderPath)
-            manager.removeOverlayEntries(ids: [msg.id])
+            manager.releaseOverlayEntry(id: msg.id)
             await self?.completeLocalMove(msg.id)
         }}
     }
@@ -1497,11 +1493,13 @@ final class MessageDetailViewModel {
     /// window zero-width. The pin is
     /// deliberately keyed to the OPERATION's lifetime, NOT to the shared
     /// overlay entry: `optimisticOverlay` coalesces one `PendingMutation` per
-    /// id and every op's drain calls `removeOverlayEntries(ids:)` on the whole
-    /// entry — so a sibling op draining first (e.g. a mark-read queued before
-    /// the archive) would end an overlay-keyed pin while the move hasn't run
-    /// (card snaps back), and an undo registering its own entry under the same
-    /// id would extend it (stale folder fields clobber the undo).
+    /// id, and (as of ADR-IOS-057) every op now retains/releases its OWN
+    /// share of that entry rather than removing it outright — but a pin keyed
+    /// to overlay-presence would still be wrong, because a sibling op
+    /// releasing first (e.g. a mark-read queued before the archive) would end
+    /// an overlay-keyed pin while the move hasn't run (card snaps back), and
+    /// an undo registering its own retain under the same id would extend it
+    /// (stale folder fields clobber the undo).
     /// Internal (not `private`) so tests can simulate drain completion.
     func completeLocalMove(_ id: String) {
         guard let count = localMovePins[id] else { return }
@@ -1527,6 +1525,7 @@ final class MessageDetailViewModel {
 
     func moveMessage(_ msg: MessageHeader, toFolderPath: String) {
         let destFolderId = "\(msg.accountId):\(toFolderPath)"
+        manager.retainOverlayEntry(id: msg.id)
         manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: msg.folderPath, toPath: toFolderPath), messages: [msg],
@@ -1542,6 +1541,10 @@ final class MessageDetailViewModel {
     }
 
     func applyManualTag(_ msg: MessageHeader, tag: ActionTag?) {
+        // Baseline captured from the passed header BEFORE the optimistic
+        // mutations below — `msg` is the render-time snapshot (visualized
+        // state), mirroring `toggleRead`'s act-on-visualized-state contract.
+        let baseline = msg.actionTag
         // Optimistic UI update
         if msg.id == message?.id {
             message?.actionTag = tag
@@ -1549,11 +1552,9 @@ final class MessageDetailViewModel {
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].actionTag = tag
         }
-        manager.registerMutation(id: msg.id, mutation: .init(actionTag: tag))
-        Task { await manager.enqueueWrite { [manager] in
-            await manager.applyManualTag(msg, tag: tag)
-            manager.removeOverlayEntries(ids: [msg.id])
-        }}
+        // Gesture intents on the same id coalesce to the NET target
+        // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
+        manager.registerGestureIntent(id: msg.id, .actionTag(target: tag, baseline: baseline))
     }
 
     // MARK: - Lookup Helpers
@@ -1613,11 +1614,9 @@ final class MessageDetailViewModel {
         if let msg = self.message {
             guard !msg.isRead else { return }
             self.message?.isRead = true
-            manager.registerMutation(id: msg.id, mutation: .init(isRead: true))
-            Task { await manager.enqueueWrite { [manager] in
-                await manager.markRead([msg])
-                manager.removeOverlayEntries(ids: [msg.id])
-            }}
+            // Guarded `!msg.isRead` above, so baseline `false` is exact — the
+            // visualized state (ADR-IOS-057 coalescing).
+            manager.registerGestureIntent(id: msg.id, .isRead(target: true, baseline: false))
             return
         }
 
@@ -1642,11 +1641,14 @@ final class MessageDetailViewModel {
         } else {
             self.message = displayMsg
         }
-        manager.registerMutation(id: msg.id, mutation: .init(isRead: true))
-        Task { await manager.enqueueWrite { [manager] in
-            await manager.markRead([msg])
-            manager.removeOverlayEntries(ids: [msg.id])
-        }}
+        // Guarded `!msg.isRead` above on the RAW resolved header (this path's
+        // overlay layering happens after that guard, unlike the fast path's
+        // already-adjusted `self.message`), so `baseline: false` reflects the
+        // raw row, not necessarily the overlay-adjusted view. Currently inert
+        // either way: the executor's skip compares against resolved-header
+        // truth, and the stored isRead baseline is unread groundwork
+        // (ADR-IOS-057 round-3/4 notes).
+        manager.registerGestureIntent(id: msg.id, .isRead(target: true, baseline: false))
     }
 
     /// Mark a thread message as read when expanded (fire-and-forget).
@@ -1662,15 +1664,9 @@ final class MessageDetailViewModel {
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = newIsRead
         }
-        manager.registerMutation(id: msg.id, mutation: .init(isRead: newIsRead))
-        Task { await manager.enqueueWrite { [manager] in
-            if wasRead {
-                await manager.markUnread([msg])
-            } else {
-                await manager.markRead([msg])
-            }
-            manager.removeOverlayEntries(ids: [msg.id])
-        }}
+        // Gesture intents on the same id coalesce to the NET target
+        // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
+        manager.registerGestureIntent(id: msg.id, .isRead(target: newIsRead, baseline: wasRead))
     }
 
     /// Fetch body for any message by ID (used by thread card expansion)

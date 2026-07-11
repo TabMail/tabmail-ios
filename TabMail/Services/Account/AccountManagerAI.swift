@@ -364,6 +364,12 @@ extension AccountManager {
         if DebugModeManager.isLoggingEnabled() { print("[ManualTag] START messageId=\(messageId) previousTag=\(previousTag?.rawValue ?? "nil") newTag=\(tag?.rawValue ?? "nil") subject=\(subject.prefix(60)) from=\(from.prefix(40))") }
         if DebugModeManager.isLoggingEnabled() { print("[ManualTag] summaryBlurb=\(summaryBlurb?.prefix(80) ?? "nil") summaryTodos=\(summaryTodos?.prefix(80) ?? "nil")") }
 
+        // A staged-only row (ADR-IOS-049) isn't in GRDB yet — Step 1's
+        // fetchOne-guarded write would silently no-op and the user's tag
+        // would vanish with no error and no retry (round-2 audit). Force the
+        // row durable first, mirroring markRead/markUnread/markFlagged/move.
+        await ensureDurable([message])
+
         // Step 1: Update GRDB state immediately (optimistic UI)
         try? await dbPool.write { db in
             guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return }
