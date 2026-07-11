@@ -77,8 +77,13 @@ struct EmailDeleteTool: AgentTool, Sendable {
             ] as [String: Any]))
         }
 
-        // Perform delete via AccountManager (optimistic UI + pending queue)
-        await AccountManager.shared.delete(resolved)
+        // Perform delete via the coordinated overlay + FIFO write-queue path
+        // (ADR-IOS-057 vicinity): re-resolves fresh headers INSIDE the queued
+        // closure so the write acts on row truth at execution time, not this
+        // `resolved` snapshot — which may have gone stale during the
+        // unbounded confirmation wait above. `resolved` is still used for the
+        // confirmation card display and the response payload below.
+        await AccountManager.shared.performCoordinatedRoleMove(ids: resolved.map(\.id), role: .trash)
 
         let subjects = resolved.map { $0.subject.isEmpty ? "(No subject)" : $0.subject }
         var result: [String: Any] = [

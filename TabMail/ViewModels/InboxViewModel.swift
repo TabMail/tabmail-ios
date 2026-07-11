@@ -294,6 +294,22 @@ final class InboxViewModel {
         }?.toMessageHeader()
     }
 
+    /// Undo snapshots must capture the VISUALIZED state (act-on-visualized-state
+    /// rule): a queued intent cycle's isRead/isFlagged/actionTag exist only in the
+    /// overlay until the FIFO drains, and a DB-fresh row predates them — an undo
+    /// restoring that row would silently revert the user's most recent gesture.
+    /// Folder fields are deliberately NOT taken from the overlay (a pending move's
+    /// dest must not leak into a snapshot that records the pre-move location).
+    ///
+    /// MUST be called BEFORE the call site's own `retainOverlayEntry`/
+    /// `registerMutation` — those calls write THIS action's own overlay mutation
+    /// (e.g. the F6 tag-clear on inbox exit), and `registerMutation` merges into
+    /// the SAME coalesced entry this reads. Calling it after would capture this
+    /// action's own not-yet-committed mutation as if it were pre-existing state.
+    private func overlayAdjustedForUndo(_ header: MessageHeader) -> MessageHeader {
+        manager.overlayAdjustedSnapshot(header)
+    }
+
     /// Synchronous folder role lookup — no suspension points.
     private func lookupFolderRole(_ folderId: String) -> FolderRole? {
         try? dbPool.read { db in try Folder.fetchOne(db, key: folderId)?.role }
@@ -1553,10 +1569,17 @@ final class InboxViewModel {
         }
         guard message.folderPath != archivePath else { return }
         let destFolderId = "\(message.accountId):\(archivePath)"
+        // Capture the undo snapshot BEFORE this action's own retain/
+        // registerMutation below — see overlayAdjustedForUndo's doc comment.
+        let undoSnapshot = overlayAdjustedForUndo(message)
         manager.retainOverlayEntry(id: messageId)
-        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
+        // Archive's destination is never the inbox (guarded above), so
+        // `message.isInInbox` alone determines "leaving the inbox" — clear
+        // the tag in the overlay (F6) so the mid-drain window doesn't flash
+        // the stale tag in the destination folder's row.
+        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId, actionTag: message.isInInbox ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: message.folderPath, toPath: archivePath), messages: [message],
+            type: .move(fromPath: message.folderPath, toPath: archivePath), messages: [undoSnapshot],
             originalFolderId: message.folderId,
             originalFolderPath: message.folderPath,
             accountId: message.accountId, timestamp: Date()
@@ -1580,12 +1603,19 @@ final class InboxViewModel {
         guard first.folderPath != archivePath else { return }
         let destFolderId = "\(first.accountId):\(archivePath)"
         let compositeIds = messages.map(\.id)
-        for id in compositeIds {
-            manager.retainOverlayEntry(id: id)
-            manager.registerMutation(id: id, mutation: .init(folderId: destFolderId))
+        // Capture undo snapshots BEFORE the retain/registerMutation loop
+        // below — see overlayAdjustedForUndo's doc comment.
+        let undoMessages = messages.map { overlayAdjustedForUndo($0) }
+        // Archive's destination is never the inbox (guarded above), so each
+        // member's own `isInInbox` determines "leaving the inbox" (F6) — a
+        // thread can mix members already outside the inbox with ones still
+        // in it.
+        for msg in messages {
+            manager.retainOverlayEntry(id: msg.id)
+            manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: msg.isInInbox ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: first.folderPath, toPath: archivePath), messages: messages,
+            type: .move(fromPath: first.folderPath, toPath: archivePath), messages: undoMessages,
             originalFolderId: first.folderId,
             originalFolderPath: first.folderPath,
             accountId: first.accountId, timestamp: Date()
@@ -1615,10 +1645,15 @@ final class InboxViewModel {
         }
         guard message.folderPath != trashPath else { return }
         let destFolderId = "\(message.accountId):\(trashPath)"
+        // Capture the undo snapshot BEFORE this action's own retain/
+        // registerMutation below — see overlayAdjustedForUndo's doc comment.
+        let undoSnapshot = overlayAdjustedForUndo(message)
         manager.retainOverlayEntry(id: messageId)
-        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
+        // Delete's destination is never the inbox (guarded above), so
+        // `message.isInInbox` alone determines "leaving the inbox" (F6).
+        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId, actionTag: message.isInInbox ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: message.folderPath, toPath: trashPath), messages: [message],
+            type: .move(fromPath: message.folderPath, toPath: trashPath), messages: [undoSnapshot],
             originalFolderId: message.folderId,
             originalFolderPath: message.folderPath,
             accountId: message.accountId, timestamp: Date()
@@ -1651,12 +1686,17 @@ final class InboxViewModel {
         guard first.folderPath != trashPath else { return }
         let destFolderId = "\(first.accountId):\(trashPath)"
         let compositeIds = messages.map(\.id)
-        for id in compositeIds {
-            manager.retainOverlayEntry(id: id)
-            manager.registerMutation(id: id, mutation: .init(folderId: destFolderId))
+        // Capture undo snapshots BEFORE the retain/registerMutation loop
+        // below — see overlayAdjustedForUndo's doc comment.
+        let undoMessages = messages.map { overlayAdjustedForUndo($0) }
+        // Delete's destination is never the inbox (guarded above), so each
+        // member's own `isInInbox` determines "leaving the inbox" (F6).
+        for msg in messages {
+            manager.retainOverlayEntry(id: msg.id)
+            manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: msg.isInInbox ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: first.folderPath, toPath: trashPath), messages: messages,
+            type: .move(fromPath: first.folderPath, toPath: trashPath), messages: undoMessages,
             originalFolderId: first.folderId,
             originalFolderPath: first.folderPath,
             accountId: first.accountId, timestamp: Date()
@@ -1896,10 +1936,17 @@ final class InboxViewModel {
         }
         print("[MoveTrace] ViewModel.move — msgId=\(message.messageId) from=\(message.folderPath) to=\(toFolderPath) folderId=\(message.folderId) headerDbId=\(message.id)")
         let destFolderId = "\(message.accountId):\(toFolderPath)"
+        // Capture the undo snapshot BEFORE this action's own retain/
+        // registerMutation below — see overlayAdjustedForUndo's doc comment.
+        let undoSnapshot = overlayAdjustedForUndo(message)
         manager.retainOverlayEntry(id: messageId)
-        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId))
+        // Generic move: unlike archive/delete, the destination CAN be the
+        // inbox (e.g. moving out of Spam) — check the dest folder's role,
+        // not just the source's isInInbox (F6).
+        let destRole = lookupFolderRole(destFolderId)
+        manager.registerMutation(id: messageId, mutation: .init(folderId: destFolderId, actionTag: (message.isInInbox && destRole != .inbox) ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: message.folderPath, toPath: toFolderPath), messages: [message],
+            type: .move(fromPath: message.folderPath, toPath: toFolderPath), messages: [undoSnapshot],
             originalFolderId: message.folderId,
             originalFolderPath: message.folderPath,
             accountId: message.accountId, timestamp: Date()
@@ -1926,12 +1973,19 @@ final class InboxViewModel {
         }
         let destFolderId = "\(first.accountId):\(toFolderPath)"
         let compositeIds = messages.map(\.id)
-        for id in compositeIds {
-            manager.retainOverlayEntry(id: id)
-            manager.registerMutation(id: id, mutation: .init(folderId: destFolderId))
+        // Capture undo snapshots BEFORE the retain/registerMutation loop
+        // below — see overlayAdjustedForUndo's doc comment.
+        let undoMessages = messages.map { overlayAdjustedForUndo($0) }
+        // Generic move: destination CAN be the inbox — check the dest
+        // folder's role once (same dest for every member), then combine with
+        // each member's own isInInbox (F6).
+        let destRole = lookupFolderRole(destFolderId)
+        for msg in messages {
+            manager.retainOverlayEntry(id: msg.id)
+            manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: (msg.isInInbox && destRole != .inbox) ? .some(nil) : nil))
         }
         UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: first.folderPath, toPath: toFolderPath), messages: messages,
+            type: .move(fromPath: first.folderPath, toPath: toFolderPath), messages: undoMessages,
             originalFolderId: first.folderId,
             originalFolderPath: first.folderPath,
             accountId: first.accountId, timestamp: Date()

@@ -255,14 +255,6 @@ extension AccountManager {
         let stableIds = msgs.map(\.stableId)
         let leavingInbox = msgs[0].isInInbox
 
-        // Queue tag removal BEFORE the move — FIFO ordering ensures correct execution.
-        // IMAP MOVE copies flags, so keyword must be gone before COPY.
-        if removeTagsIfLeavingInbox && leavingInbox {
-            for msg in msgs where msg.actionTag != nil {
-                try PendingOperation(type: .removeTag, messageIds: [msg.stableId], accountId: accountId, folderPath: folderPath, tagValue: msg.actionTag?.rawValue).insert(db)
-            }
-        }
-
         // Optimistic local update — move to destination folder immediately.
         // Message appears in destination right away; post-drain sync reconciles UIDs.
         let destFolderId = "\(accountId):\(destinationPath)"
@@ -270,11 +262,29 @@ extension AccountManager {
         let destIsInbox = destFolder?.role == .inbox
 
         let msgIds = msgs.map(\.id)
-        try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
-            Column("folderId").set(to: destFolderId),
-            Column("folderPath").set(to: destinationPath),
-            Column("isInInbox").set(to: destIsInbox)
-        )
+        // Tags are local-only (ADR-IOS-036) — there is no server-side keyword
+        // to remove, so leaving the inbox clears `actionTag` in THIS write
+        // (same statement as the folder move) instead of queuing a
+        // PendingOperation. `tagSortOrder = 99` mirrors the "no tag" sentinel
+        // `sweepStaleActionTags` writes (SyncEngineMaintenance.swift) and the
+        // `MessageHeader.tagSortOrder` column default — same value, same
+        // meaning, so a message that leaves the inbox and one the periodic
+        // sweep later catches converge on identical local state.
+        if removeTagsIfLeavingInbox && leavingInbox {
+            try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
+                Column("folderId").set(to: destFolderId),
+                Column("folderPath").set(to: destinationPath),
+                Column("isInInbox").set(to: destIsInbox),
+                Column("actionTag").set(to: nil as String?),
+                Column("tagSortOrder").set(to: 99)
+            )
+        } else {
+            try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
+                Column("folderId").set(to: destFolderId),
+                Column("folderPath").set(to: destinationPath),
+                Column("isInInbox").set(to: destIsInbox)
+            )
+        }
 
         // Inline unread count update — fresh DB read, not stale snapshot.
         // Re-read isRead from DB to avoid double-decrement when markRead + move race.
@@ -291,11 +301,36 @@ extension AccountManager {
     }
 
     func move(_ messages: [MessageHeader], to destinationPath: String) async {
-        // Same-folder move is a no-op. Drop those messages here — the single
-        // choke point for every surface (swipe, detail view, agent tools) —
-        // so we never queue a pointless PendingOperation whose server-side
-        // MOVE has provider-dependent effects (e.g. archive-from-Archive).
-        let movable = messages.filter { $0.folderPath != destinationPath }
+        // Re-resolve fresh headers by id — the single choke point for every
+        // surface (swipe, detail view, agent tools, settings bulk-archive).
+        // Gesture paths capture `lookupMessage` snapshots at tap time and pass
+        // them into queued closures; a second destination-changing gesture on
+        // the same message before the first closure commits would otherwise
+        // record a PendingOperation against the STALE source folderPath (on
+        // IMAP the drain then SEARCHes the wrong folder, uidResolutionFailed,
+        // and the destination-check wrongly confirms it stale and drops it).
+        // The write acts on row truth at execution time — same doctrine as
+        // `performCoordinatedRoleMove`'s in-closure re-resolve, which stays
+        // as-is (its double resolve is harmless). Ids that no longer resolve
+        // (vanished rows) are dropped from the batch — correct, per
+        // `resolveHeadersForAction`'s documented contract.
+        let fresh = await resolveHeadersForAction(ids: messages.map(\.id))
+        // Observability (audit round 5): resolveHeadersForAction swallows read
+        // errors (`try?` → []), so an empty result for a NON-empty input is
+        // either all-rows-vanished (legit) or a genuine read failure — in the
+        // latter case this drop is the only trace the gesture ever existed.
+        // Distinguishing the two needs a throwing resolve variant — recorded
+        // as a phase-2 consideration in PLAN_OVERLAY_CALLSITE_AUDIT.md §6.
+        if fresh.isEmpty, !messages.isEmpty {
+            print("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(messages.count) ids — vanished rows or read failure; nothing queued")
+        }
+        // Same-folder move is a no-op. Drop those messages here — using FRESH
+        // data so a stale caller snapshot whose row already sits at the
+        // destination (e.g. an earlier queued move already landed it there)
+        // is correctly filtered instead of queuing a pointless/incorrect
+        // PendingOperation whose server-side MOVE has provider-dependent
+        // effects (e.g. archive-from-Archive).
+        let movable = fresh.filter { $0.folderPath != destinationPath }
         guard !movable.isEmpty else { return }
         await ensureDurable(movable)
 
@@ -367,32 +402,164 @@ extension AccountManager {
 
     func archive(_ messages: [MessageHeader]) async {
         let movable = await messagesNotInRole(messages, role: .archive)
-        guard let first = movable.first else { return }
-        let archivePath: String? = try? await dbPool.read { db in
-            try Folder.filter(Column("accountId") == first.accountId && Column("role") == FolderRole.archive.rawValue)
-                .fetchOne(db)?.path
-        }
-        guard let archivePath else {
-            print("[Queue] ERROR: no archive folder found for account \(first.accountId)")
-            return
-        }
-        await move(movable, to: archivePath)
+        await moveToRoleFolderPerAccount(movable, role: .archive)
     }
 
     func delete(_ messages: [MessageHeader]) async {
         guard let first = messages.first else { return }
         AccountManager.logDeleteTrace(accountId: first.accountId, messages: messages, callSite: "AccountManager.delete")
         let movable = await messagesNotInRole(messages, role: .trash)
-        guard let firstMovable = movable.first else { return }
-        let trashPath: String? = try? await dbPool.read { db in
-            try Folder.filter(Column("accountId") == firstMovable.accountId && Column("role") == FolderRole.trash.rawValue)
-                .fetchOne(db)?.path
+        await moveToRoleFolderPerAccount(movable, role: .trash)
+    }
+
+    /// Resolve the role folder PER ACCOUNT and move each account's messages to
+    /// ITS OWN path. The previous implementation resolved the path from only
+    /// `movable.first`'s account and applied it to every account in the batch —
+    /// a cross-account batch (agent tools and the notification router accept
+    /// ids spanning accounts) mis-filed every non-first account's messages
+    /// into a folder path that doesn't exist for that account: the row got an
+    /// optimistic folderId no real folder backs (message vanishes from that
+    /// account's views until the next sync heals it) and a PendingOperation
+    /// whose destinationPath is meaningless to that provider (self-heal drop —
+    /// the archive/delete never happens server-side). Follow-up-session audit
+    /// round 6; pre-existing, reachable via EmailArchiveTool/EmailDeleteTool.
+    private func moveToRoleFolderPerAccount(_ movable: [MessageHeader], role: FolderRole) async {
+        guard !movable.isEmpty else { return }
+        let byAccount = Dictionary(grouping: movable, by: \.accountId)
+        for (accountId, accountMessages) in byAccount {
+            let path: String? = try? await dbPool.read { db in
+                try Folder.filter(Column("accountId") == accountId && Column("role") == role.rawValue)
+                    .fetchOne(db)?.path
+            }
+            guard let path else {
+                print("[Queue] ERROR: no \(role.rawValue) folder found for account \(accountId) — \(accountMessages.count) message(s) skipped")
+                continue
+            }
+            await move(accountMessages, to: path)
         }
-        guard let trashPath else {
-            print("[Queue] ERROR: no trash folder found for account \(firstMovable.accountId)")
+    }
+
+    // MARK: - Coordinated Tool Actions (agent tools, ADR-IOS-057 vicinity)
+
+    /// Archive/delete via the same overlay + FIFO write-queue lifecycle as gesture
+    /// actions, for agent tools (`EmailArchiveTool`/`EmailDeleteTool`). Tools resolve
+    /// headers BEFORE an unbounded user-confirmation wait (for the confirmation card
+    /// display) — that snapshot can go stale while the user waits, so a later
+    /// user move/delete must not be silently reversed by an action that blindly
+    /// trusts it. This helper takes ids (never a pre-resolved header) and
+    /// re-resolves fresh headers INSIDE the queued closure, so the write acts on
+    /// row truth at EXECUTION time — and participates in the same optimistic
+    /// overlay + FIFO ordering as gesture-driven archive/delete. Awaits durable
+    /// completion (the local GRDB write + `PendingOperation` insert have landed)
+    /// before returning.
+    ///
+    /// Retain/release audit: one `retainOverlayEntry` per actionable id below,
+    /// BEFORE its `registerMutation` call (ADR-IOS-057 ordering — the overlay
+    /// entry must not be removable by a sibling op's release before this id's
+    /// own retain lands). The queued closure releases every retained id on
+    /// every exit: ids dropped by the closure's own fresh re-resolve (vanished
+    /// row, or already moved into the role folder by an earlier queued op) are
+    /// released as soon as the drop is detected; the remaining (fresh) ids are
+    /// released once, after the `archive()`/`delete()` write completes (or is
+    /// skipped on the defensive unsupported-role branch, unreachable in
+    /// practice — the guard at the top of this function only lets `.archive`/
+    /// `.trash` reach the retain loop at all). There is exactly one path
+    /// through the closure body — no early returns — so the two release loops
+    /// together cover every id this call ever retained.
+    func performCoordinatedRoleMove(ids: [String], role: FolderRole) async {
+        guard !ids.isEmpty else { return }
+        guard role == .archive || role == .trash else {
+            BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unsupported role \(role.rawValue), no-op")
             return
         }
-        await move(movable, to: trashPath)
+
+        // Pre-resolve fresh headers to drop ids that no longer exist or are
+        // already in the target role folder, and to look up each account's
+        // destination folder for the overlay's display-only folderId. This
+        // snapshot is intentionally re-taken again INSIDE the queued closure
+        // below — the actual write never trusts this one.
+        let preResolved = await resolveHeadersForAction(ids: ids)
+        let movable = await messagesNotInRole(preResolved, role: role)
+        guard !movable.isEmpty else {
+            // Observability (audit round 5): callers (agent tools, notification
+            // router) report success unconditionally after this await — a silent
+            // return here on a read failure (resolveHeadersForAction swallows
+            // errors to []) would leave no trace anywhere. Vanished/already-in-
+            // role ids are legit no-ops; the log is the only failure correlate.
+            print("[Queue] performCoordinatedRoleMove(\(role.rawValue)): 0 of \(ids.count) ids actionable after resolve/role filter — nothing to do")
+            return
+        }
+
+        let accountIds = Set(movable.map(\.accountId))
+        let destFolderIdByAccount: [String: String] = (try? await dbPool.read { db -> [String: String] in
+            var result: [String: String] = [:]
+            for accountId in accountIds {
+                if let folder = try Folder
+                    .filter(Column("accountId") == accountId && Column("role") == role.rawValue)
+                    .fetchOne(db) {
+                    result[accountId] = folder.id
+                }
+            }
+            return result
+        }) ?? [:]
+
+        // Skip ids whose account has no folder for this role — mirrors
+        // archive()/delete()'s own "no archive/trash folder for account" skip
+        // (including its ERROR log convention — audit round 5).
+        let actionable = movable.filter { destFolderIdByAccount[$0.accountId] != nil }
+        guard !actionable.isEmpty else {
+            print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) — no \(role.rawValue) folder resolved for account(s) \(accountIds.sorted().joined(separator: ",")); \(movable.count) message(s) skipped")
+            return
+        }
+        let actionableIds = Set(actionable.map(\.id))
+
+        for msg in actionable {
+            guard let destFolderId = destFolderIdByAccount[msg.accountId] else { continue }
+            retainOverlayEntry(id: msg.id)
+            registerMutation(id: msg.id, mutation: PendingMutation(
+                folderId: destFolderId,
+                // Tag clears locally the moment the message LEAVES the inbox —
+                // mirrors the DB-side clear semantics (F6): archive/trash
+                // destinations are never the inbox, so for this helper's two
+                // supported roles "isInInbox on the pre-resolved snapshot"
+                // IS "leaving the inbox".
+                actionTag: msg.isInInbox ? .some(nil) : nil
+            ))
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            enqueueWrite {
+                // Re-resolve INSIDE the queued closure: acts on row truth at
+                // EXECUTION time, not the confirmation-time snapshot above —
+                // the staleness bug this helper exists to close.
+                let fresh = await self.resolveHeadersForAction(ids: Array(actionableIds))
+                let freshMovable = await self.messagesNotInRole(fresh, role: role)
+                let freshIds = Set(freshMovable.map(\.id))
+
+                // Ids dropped by the fresh resolve (vanished row, or already
+                // in the role folder — e.g. an earlier queued op moved it
+                // there first) get no write; release their retain now.
+                for id in actionableIds.subtracting(freshIds) {
+                    self.releaseOverlayEntry(id: id)
+                }
+
+                switch role {
+                case .archive:
+                    await self.archive(freshMovable)
+                case .trash:
+                    await self.delete(freshMovable)
+                default:
+                    // Unreachable — the guard at the top of this function
+                    // only lets .archive/.trash reach the retain loop.
+                    BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unexpected role \(role.rawValue) reached queued closure")
+                }
+
+                for id in freshIds {
+                    self.releaseOverlayEntry(id: id)
+                }
+                cont.resume()
+            }
+        }
     }
 
     /// Diagnostic-only: log the trash-folder lookup result and the message(s) being deleted

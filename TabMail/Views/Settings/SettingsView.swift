@@ -602,8 +602,16 @@ struct SettingsView: View {
                 continue
             }
             if let first = messages.first {
+                // Overlay-adjusted for the UndoableAction ONLY — a raw fetchAll
+                // snapshot predates any still-queued gesture cycle's isRead/
+                // isFlagged/actionTag, and undo would silently revert it (the
+                // exact bug `overlayAdjustedSnapshot` fixes at the inbox gesture
+                // sites; see AccountManager.overlayAdjustedSnapshot). The
+                // manager.move call below keeps the raw structs — it re-resolves
+                // fresh headers by id internally regardless.
+                let undoMessages = messages.map { AccountManager.shared.overlayAdjustedSnapshot($0) }
                 UndoService.shared.push(UndoableAction(
-                    type: .move(fromPath: first.folderPath, toPath: archivePath), messages: messages,
+                    type: .move(fromPath: first.folderPath, toPath: archivePath), messages: undoMessages,
                     originalFolderId: first.folderId,
                     originalFolderPath: first.folderPath,
                     accountId: accountId, timestamp: Date()

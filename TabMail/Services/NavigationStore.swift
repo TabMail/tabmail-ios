@@ -165,16 +165,26 @@ final class NavigationStore {
                         }
                     }
 
-                    // Adjust for folderId change (message moved)
+                    // Adjust for folderId change (message moved). The source
+                    // decrement and dest increment are gated on DIFFERENT
+                    // questions — under a coalesced overlay entry (isRead +
+                    // folderId merged into one PendingMutation, ADR-IOS-057),
+                    // "was this counted in source's unread total" and "will it
+                    // be counted in dest's" can diverge (e.g. a read message
+                    // moved AND marked unread in the same mutation: it was
+                    // never in source's unread count, but WILL be in dest's).
                     if let newFolderId = mutation.folderId, newFolderId != dbFolderId {
-                        let isUnread = mutation.isRead.map { !$0 } ?? !dbIsRead
-                        if isUnread {
-                            if let srcIdx = folderIndex[dbFolderId] {
-                                adjusted[srcIdx].unreadCount = max(0, adjusted[srcIdx].unreadCount - 1)
-                            }
-                            if let dstIdx = folderIndex[newFolderId] {
-                                adjusted[dstIdx].unreadCount += 1
-                            }
+                        // Source: raw DB truth — was it unread in the folder it's
+                        // leaving? (isRead-in-mutation is a post-move target, not
+                        // a description of the source folder's pre-move count.)
+                        let wasUnreadInSource = !dbIsRead
+                        // Dest: overlay-projected — will it be unread once it lands?
+                        let willBeUnreadInDest = mutation.isRead.map { !$0 } ?? !dbIsRead
+                        if wasUnreadInSource, let srcIdx = folderIndex[dbFolderId] {
+                            adjusted[srcIdx].unreadCount = max(0, adjusted[srcIdx].unreadCount - 1)
+                        }
+                        if willBeUnreadInDest, let dstIdx = folderIndex[newFolderId] {
+                            adjusted[dstIdx].unreadCount += 1
                         }
                     }
                 }

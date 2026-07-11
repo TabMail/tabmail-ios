@@ -1030,6 +1030,119 @@ struct InboxGestureActionTests {
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount entry stranded after full drain")
     }
 
+    @Test("UndoService.undo(): the restore intent overwrites the archive gesture's overlay tag-clear — the restored chip is visible DURING the drain window, not only after every retain releases (follow-up audit round-1 finding)")
+    func undoRestoresActionTagIntoOverlayWhileArchiveClearStillHeld() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+            UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal()
+        UndoService.shared.dismissAll()
+
+        var header = makeDurableHeader(folder: inbox, messageId: "m-undo-tag", isRead: true)
+        header.actionTag = ActionTag.reply
+        try await pool.writeWithoutTransaction { [header] db in try header.insert(db) }
+        let id = header.id
+
+        let vm = InboxViewModel(folders: [inbox])
+
+        // Gate the write queue BEFORE the archive so both the archive's move
+        // closure and the undo's restore closure stay queued while we inspect
+        // the overlay mid-window.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+
+        vm.archive(id)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(AccountManager.shared.snapshotOverlay()[id]?.actionTag == ActionTag??.some(nil),
+                "the inbox-leaving archive registers the overlay tag-clear")
+
+        await UndoService.shared.undo()
+        // The restore mutation must overwrite the coalesced entry's tag-clear
+        // with the pre-move snapshot's tag — registerMutation only overwrites
+        // fields the new mutation SETS, so undo has to set actionTag explicitly.
+        #expect(AccountManager.shared.snapshotOverlay()[id]?.actionTag == ActionTag??.some(.reply),
+                "undo restores the tag INTO the overlay for the drain window")
+
+        gate.finish()
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == inbox.id)
+        #expect(final?.actionTag == ActionTag.reply, "DB truth: full-row restore brings the tag back")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil)
+    }
+
+    @Test("FIX 4: archive() queued right behind a STILL-QUEUED tag gesture (never drained) — undo must restore the gesture's tag, not the pre-gesture DB value. Before the fix, archive()'s undo snapshot came from a fresh lookupMessage DB read (predates the queued gesture), so undo silently reverted the user's most recent tap")
+    func undoAfterArchiveRestoresStillQueuedTagGesture() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+            UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal()
+        UndoService.shared.dismissAll()
+
+        // Durable row starts with NO tag. The tag is applied via the REAL
+        // gesture path below and is STILL QUEUED (never drained to DB) when
+        // the archive fires — distinct from a pre-existing durable tag.
+        let header = makeDurableHeader(folder: inbox, messageId: "m-undo-queued-tag", isRead: true)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(vm.loadedMessages.first?.actionTag == nil)
+
+        // Gate the write queue BEFORE the tag gesture so both the tag
+        // intent-cycle's executor and the archive's move closure stay queued
+        // for the whole test.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+
+        // Gesture #1: tag Reply — registers a NEW intent cycle (retain #1),
+        // still queued behind the gate.
+        vm.applyManualTag(id, tag: .reply)
+        #expect(vm.loadedMessages.first?.actionTag == .reply)
+        #expect(AccountManager.shared.snapshotOverlay()[id]?.actionTag == ActionTag??.some(.reply))
+
+        // Let the tag cycle's executor Task actually enqueue behind the gate
+        // before the archive fires, so ordering is deterministic.
+        try await Task.sleep(for: .milliseconds(50))
+
+        // Gesture #2: archive — while the tag gesture is STILL queued
+        // (retain #2). Pre-fix, `archive(_:)`'s UndoableAction snapshot came
+        // from `lookupMessage(messageId)` — a fresh DB read whose actionTag
+        // is still nil (the tag gesture hasn't drained) — so undo would
+        // restore nil, silently dropping the just-applied tag.
+        vm.archive(id)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == 2, "tag intent-cycle + archive each hold their own retain")
+
+        await UndoService.shared.undo()
+        #expect(AccountManager.shared.snapshotOverlay()[id]?.actionTag == ActionTag??.some(.reply),
+                "undo's restore mutation must carry the STILL-QUEUED gesture's tag, not the pre-gesture DB value")
+
+        gate.finish()
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == inbox.id, "undo must restore the message to its original (inbox) folder")
+        #expect(final?.actionTag == .reply, "DB truth: the still-queued tag gesture must survive the archive+undo cycle, not revert to the pre-gesture nil")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay stranded after full drain")
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded after full drain")
+        #expect(AccountManager.shared.pendingIntentCyclesForTesting()[id] == nil, "intent-cycle register stranded after full drain")
+    }
+
     // MARK: - (n) Round-1 audit coverage gaps
 
     @Test("MessageDetailViewModel.toggleRead(): two gated calls round-trip back to baseline — a perfect cancel-out with zero PendingOperations, DB unchanged, and all registers empty")
@@ -1390,5 +1503,86 @@ struct InboxGestureActionTests {
         #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded after staged-row tag cycle")
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount entry stranded after staged-row tag cycle")
         #expect(AccountManager.shared.pendingIntentCyclesForTesting()[id] == nil, "intent cycle stranded after staged-row tag cycle")
+    }
+
+    // MARK: - (q) Tag-vs-move closure-reorder race (FIX B)
+    //
+    // Audit round 2: a tag gesture opens an intent cycle; an archive
+    // gesture's move closure can end up AHEAD of the cycle executor in the
+    // FIFO (both enqueue via unstructured Tasks — no ordering guarantee
+    // between them). The move clears actionTag and moves the row out of the
+    // inbox; the tag executor then resolves the header, sees
+    // `target != header.actionTag`, and (pre-fix) re-applied the tag to the
+    // now-archived row — a stale chip in Archive/Trash lists. Fix:
+    // `executeIntentCycle`'s actionTag branch now guards on the RESOLVED
+    // header's `isInInbox` and skips the write when the row has already left
+    // the inbox by execution time.
+
+    @Test("executeIntentCycle: a tag intent whose RESOLVED header has already left the inbox (simulating a move closure that ran ahead of the tag executor in the FIFO) does NOT reinstate the tag — no .setTag PendingOperation, actionTag stays nil, and the overlay/refcount/intent registers all drain to empty")
+    func tagIntentSkipsReinstateWhenRowLeftInboxBeforeExecution() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-tag-move-race", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        // Gate the FIFO write queue BEFORE registering the tag intent so its
+        // executor closure cannot run until we've simulated the reordered
+        // move below.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+
+        // Tag gesture: opens an intent cycle for id (retain #1), queues its
+        // executor closure onto the FIFO write queue behind the gate.
+        AccountManager.shared.registerGestureIntent(id: id, .actionTag(target: .reply, baseline: nil))
+        // Settle: let the cycle's Task actually append its closure to the
+        // queue before the simulated-move write below (mirrors the settle
+        // pattern used across this suite).
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == 1, "the tag intent cycle holds its own retain")
+
+        // Simulate the archive gesture's move closure having ALREADY RUN
+        // ahead of the tag executor in the FIFO: directly update the row in
+        // DB to the post-move state (folderId/folderPath -> Archive,
+        // isInInbox -> false, actionTag cleared by F6, tagSortOrder reset to
+        // the sweepStaleActionTags sentinel) — bypassing the overlay/queue
+        // machinery entirely, since only the RESOLVED DB row is what
+        // `executeIntentCycle` consults for the isInInbox guard.
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET folderId = ?, folderPath = ?, isInInbox = ?, actionTag = NULL, tagSortOrder = 99
+                WHERE id = ?
+                """, arguments: [archive.id, archive.path, false, id])
+        }
+
+        // Release the gate: the tag executor now resolves the header (which
+        // shows isInInbox == false, actionTag == nil) and must skip the
+        // reinstate rather than writing target (.reply) over the cleared tag.
+        gate.finish()
+        await drainWriteQueue()
+        // Settle: the executor's release/log side effects are synchronous
+        // within its closure, but give any trailing unstructured Task a beat
+        // before asserting (mirrors this suite's drain+settle convention).
+        try await Task.sleep(for: .milliseconds(50))
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.actionTag == nil, "the tag must NOT be reinstated on a row that left the inbox")
+        #expect(final?.folderId == archive.id, "the simulated move's folder must be untouched by the tag executor")
+
+        let pendingOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(!pendingOps.contains { $0.type == .setTag }, "no .setTag PendingOperation may be queued for a row that already left the inbox")
+
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded after the skipped-tag cycle")
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount entry stranded after the skipped-tag cycle")
+        #expect(AccountManager.shared.pendingIntentCyclesForTesting()[id] == nil, "intent cycle stranded after the skipped-tag cycle")
     }
 }

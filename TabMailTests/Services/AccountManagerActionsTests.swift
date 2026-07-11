@@ -574,160 +574,13 @@ struct AccountManagerActionsTests {
     }
 
     // MARK: - Tag removal on inbox exit
-
-    @Test("Tag removal: removeTag ops queued BEFORE move op (FIFO ordering)")
-    func moveWithTagRemoval() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:INBOX", folderPath: "INBOX",
-            isInInbox: true, actionTag: .reply
-        )
-
-        try db.write { dbConn in
-            let leavingInbox = msg.isInInbox
-            let removeTagsIfLeavingInbox = true
-
-            // Tag removal BEFORE move (FIFO ordering) — mirrors optimisticMoveToFolder
-            if removeTagsIfLeavingInbox && leavingInbox {
-                if let tag = msg.actionTag {
-                    try PendingOperation(type: .removeTag, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", tagValue: tag.rawValue).insert(dbConn)
-                }
-            }
-
-            // Then the move
-            try MessageHeader.filter(Column("id") == msg.id).updateAll(dbConn,
-                Column("folderId").set(to: "acc1:Archive"),
-                Column("folderPath").set(to: "Archive"),
-                Column("isInInbox").set(to: false)
-            )
-            try PendingOperation(type: .move, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive").insert(dbConn)
-        }
-
-        let ops = try db.read { dbConn in
-            try PendingOperation.order(Column("createdAt").asc).fetchAll(dbConn)
-        }
-        #expect(ops.count == 2)
-        #expect(ops[0].type == .removeTag, "removeTag must appear BEFORE move in FIFO order")
-        #expect(ops[0].tagValue == "reply")
-        #expect(ops[1].type == .move)
-    }
-
-    @Test("Tag removal: multiple tagged messages each get separate removeTag ops")
-    func multipleTaggedMessagesRemoval() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash)
-        let msg1 = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:INBOX", folderPath: "INBOX",
-            isInInbox: true, actionTag: .reply
-        )
-        let msg2 = try TestDatabase.insertMessageHeader(
-            db, messageId: "2", folderId: "acc1:INBOX", folderPath: "INBOX",
-            isInInbox: true, actionTag: .archive
-        )
-
-        let msgs = [msg1, msg2]
-
-        try db.write { dbConn in
-            // Replicate optimisticMoveToFolder: tag removal per message
-            let leavingInbox = msgs[0].isInInbox
-            if leavingInbox {
-                for msg in msgs where msg.actionTag != nil {
-                    try PendingOperation(type: .removeTag, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", tagValue: msg.actionTag?.rawValue).insert(dbConn)
-                }
-            }
-
-            let msgIds = msgs.map(\.id)
-            try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(dbConn,
-                Column("folderId").set(to: "acc1:Trash"),
-                Column("folderPath").set(to: "Trash"),
-                Column("isInInbox").set(to: false)
-            )
-            try PendingOperation(type: .delete, messageIds: msgs.map(\.stableId), accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash").insert(dbConn)
-        }
-
-        let ops = try db.read { db in
-            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
-        }
-        #expect(ops.count == 3, "2 removeTag ops + 1 delete op")
-        #expect(ops[0].type == OperationType.removeTag)
-        #expect(ops[1].type == OperationType.removeTag)
-        #expect(ops[2].type == OperationType.delete)
-    }
-
-    // MARK: - Tag removal skipped for non-inbox
-
-    @Test("Tag removal skipped: moving from non-inbox folder does NOT create removeTag ops")
-    func tagRemovalSkippedForNonInbox() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:Sent", folderPath: "Sent",
-            isInInbox: false, actionTag: .reply
-        )
-
-        try db.write { dbConn in
-            let leavingInbox = msg.isInInbox
-            let removeTagsIfLeavingInbox = true
-
-            // This condition should NOT fire because isInInbox is false
-            if removeTagsIfLeavingInbox && leavingInbox {
-                if let tag = msg.actionTag {
-                    try PendingOperation(type: .removeTag, messageIds: [msg.stableId], accountId: "acc1", folderPath: "Sent", tagValue: tag.rawValue).insert(dbConn)
-                }
-            }
-
-            try MessageHeader.filter(Column("id") == msg.id).updateAll(dbConn,
-                Column("folderId").set(to: "acc1:Trash"),
-                Column("folderPath").set(to: "Trash"),
-                Column("isInInbox").set(to: false)
-            )
-            try PendingOperation(type: .delete, messageIds: [msg.stableId], accountId: "acc1", folderPath: "Sent", destinationPath: "Trash").insert(dbConn)
-        }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1, "Only the delete op — no removeTag for non-inbox source")
-        #expect(ops[0].type == .delete)
-    }
-
-    @Test("Tag removal skipped: message with nil actionTag does NOT create removeTag op")
-    func tagRemovalSkippedForNilTag() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:INBOX", folderPath: "INBOX",
-            isInInbox: true, actionTag: nil
-        )
-
-        try db.write { dbConn in
-            let leavingInbox = msg.isInInbox
-            if leavingInbox {
-                // msg.actionTag is nil, so this block is skipped
-                if msg.actionTag != nil {
-                    try PendingOperation(type: .removeTag, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", tagValue: msg.actionTag?.rawValue).insert(dbConn)
-                }
-            }
-
-            try MessageHeader.filter(Column("id") == msg.id).updateAll(dbConn,
-                Column("folderId").set(to: "acc1:Archive"),
-                Column("folderPath").set(to: "Archive"),
-                Column("isInInbox").set(to: false)
-            )
-            try PendingOperation(type: .archive, messageIds: [msg.stableId], accountId: "acc1", folderPath: "INBOX", destinationPath: "Archive").insert(dbConn)
-        }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1, "Only archive op — no removeTag for nil actionTag")
-        #expect(ops[0].type == .archive)
-    }
+    //
+    // F6 (PLAN_OVERLAY_CALLSITE_AUDIT.md §6): `optimisticMoveToFolder` no
+    // longer queues a `.removeTag` PendingOperation — tags are local-only
+    // (ADR-IOS-036), so leaving the inbox clears `actionTag`/`tagSortOrder`
+    // directly in the move's own write. See `AccountManagerActionsTagClearTests`
+    // below for the real-production-path coverage (manager.move/archive on a
+    // seeded DB, not hand-mirrored logic).
 
     // MARK: - Multi-message grouping
 
@@ -1536,5 +1389,233 @@ struct AccountManagerActionsTests {
         let trash = try db.read { try Folder.fetchOne($0, key: "acc1:Trash") }
         #expect(inbox?.unreadCount == 1, "No change — restored message was read")
         #expect(trash?.unreadCount == 0, "No change — restored message was read")
+    }
+}
+
+/// F6 (PLAN_OVERLAY_CALLSITE_AUDIT.md §6): actionTag clears locally the moment
+/// a message leaves the inbox (archive/delete/move-out), in the SAME write as
+/// the folder move — no `.removeTag` PendingOperation is queued (tags are
+/// local-only, ADR-IOS-036). Unlike `AccountManagerActionsTests` above (which
+/// hand-mirrors GRDB statements against a local `TestDatabase`), these tests
+/// drive the REAL `AccountManager.archive`/`move` production methods against
+/// a swapped `AppDatabase.shared` — mirrors `CoordinatedToolActionTests`.
+///
+/// `.serialized`: tests swap the process-wide `AppDatabase.shared` singleton
+/// and touch `AccountManager.shared`'s optimistic overlay — mirrors
+/// `InboxGestureActionTests` / `CoordinatedToolActionTests`.
+@Suite("AccountManagerActions — actionTag clears on inbox exit (F6)", .serialized)
+struct AccountManagerActionsTagClearTests {
+
+    // MARK: - Harness (mirrors CoordinatedToolActionTests.swift)
+
+    private func makeTestDB() throws -> (pool: DatabasePool, inbox: Folder, archive: Folder, trash: Folder, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
+            acc.id = "acc1"
+            try acc.insert(db)
+        }
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+        let trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
+        try pool.writeWithoutTransaction { db in
+            let i = inbox; try i.insert(db)
+            let a = archive; try a.insert(db)
+            let t = trash; try t.insert(db)
+        }
+        return (pool, inbox, archive, trash, dir, previous)
+    }
+
+    /// A durable, query-visible header (`headerComplete = true`) carrying an
+    /// optional actionTag (with its matching tagSortOrder — mirrors how a real
+    /// tagged row looks, since `applyManualTag` keeps both in sync).
+    private func makeDurableHeader(
+        folder: Folder,
+        messageId: String,
+        actionTag: ActionTag? = nil
+    ) -> MessageHeader {
+        var h = MessageHeader(
+            messageId: messageId, subject: "Subj \(messageId)", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date(), snippet: "snip",
+            folderId: folder.id, accountId: folder.accountId, folderPath: folder.path,
+            isInInbox: folder.role == .inbox
+        )
+        h.headerComplete = true
+        h.actionTag = actionTag
+        if let actionTag { h.tagSortOrder = actionTag.sortOrder }
+        return h
+    }
+
+    /// Mirrors `CoordinatedToolActionTests.restoreTestDB` — leave the test DB
+    /// alive (rather than force-unwrap crash the process) when there's no
+    /// previous `AppDatabase` to restore.
+    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
+        if previous != nil {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    private func clearOverlay() {
+        let snapshot = AccountManager.shared.snapshotOverlay()
+        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+    }
+
+    // MARK: - (1) Archive clears the tag, no .removeTag op
+
+    @Test("archive() (real production path): actionTag clears to nil, tagSortOrder resets to the sweepStaleActionTags sentinel (99), and NO .removeTag PendingOperation is queued — only .move")
+    func archiveClearsActionTagNoRemoveTagOp() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-archive-tag", actionTag: .reply)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await AccountManager.shared.archive([header])
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == archive.id, "message moved to Archive")
+        #expect(final?.actionTag == nil, "F6: actionTag clears in the SAME write as the move")
+        #expect(final?.tagSortOrder == 99, "F6: tagSortOrder resets to the sweep's sentinel")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "only the .move op — the legacy .removeTag enqueue was removed")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+    }
+
+    // MARK: - (2) Move between two non-inbox folders does NOT clear the tag
+
+    @Test("move() between two non-inbox folders (Archive -> Trash, real production path): actionTag is NOT cleared — leavingInbox is false")
+    func moveBetweenNonInboxFoldersDoesNotClearTag() async throws {
+        let (pool, _, archive, trash, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: archive, messageId: "m-nonInbox-move", actionTag: .reply)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await AccountManager.shared.move([header], to: trash.path)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == trash.id, "message moved to the new destination")
+        #expect(final?.actionTag == .reply, "tag survives a move that never touches the inbox")
+        #expect(final?.tagSortOrder == ActionTag.reply.sortOrder, "tagSortOrder untouched when the tag isn't cleared")
+    }
+
+    // MARK: - (3) Undo restores the tag
+
+    @Test("undo restores actionTag: archive() clears the tag locally; undoDestructiveAction's full-row save (the pre-archive snapshot) restores it")
+    func undoRestoresActionTagAfterArchive() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-undo-tag", actionTag: .reply)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+        // Captured BEFORE archive mutates the DB row — mirrors UndoService.push
+        // capturing the gesture-time `message` snapshot pre-move (still carries
+        // the original actionTag; `archive()`'s optimistic write below only
+        // touches the DB row, never this local value-type copy).
+        let preArchiveSnapshot = header
+
+        await AccountManager.shared.archive([header])
+
+        let afterArchive = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(afterArchive?.actionTag == nil, "setup: archive clears the tag locally (F6)")
+        #expect(afterArchive?.folderId == archive.id)
+
+        // Mirrors UndoService.undo()'s .move case: originalOpType is always
+        // .move (archive/delete/move all funnel through AccountManager.move),
+        // fromFolderPath is the CURRENT (post-archive) location, toFolderPath/
+        // toFolderId are the ORIGINAL (pre-archive) location.
+        await AccountManager.shared.undoDestructiveAction(
+            [preArchiveSnapshot],
+            accountId: "acc1",
+            originalOpType: .move,
+            fromFolderPath: archive.path,
+            toFolderPath: inbox.path,
+            toFolderId: inbox.id
+        )
+
+        let afterUndo = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(afterUndo?.folderId == inbox.id, "undo restores the original folder")
+        #expect(afterUndo?.actionTag == .reply, "undo's full-row save (from the pre-archive snapshot) restores the tag")
+    }
+
+    // MARK: - (4) move() re-resolves fresh headers by id (FIX B)
+
+    @Test("move() re-resolves fresh headers by id: a stale caller snapshot (still pointing at INBOX) is superseded by the row's CURRENT folder (Archive, landed by an earlier committed move) — the queued PendingOperation's source folderPath is the FRESH location, not the stale one")
+    func moveReResolvesFreshHeaderOverStaleCallerSnapshot() async throws {
+        let (pool, inbox, archive, trash, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-stale-move")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+        // Caller's snapshot — captured BEFORE the "earlier committed move" below,
+        // still says INBOX. Mirrors a gesture path's `lookupMessage` snapshot
+        // captured at tap time and passed into a queued closure that runs late.
+        let staleSnapshot = header
+
+        // Simulate an earlier committed move: a prior queued closure already
+        // ran and moved the row to Archive before this move() call executes.
+        try await pool.writeWithoutTransaction { db in
+            _ = try MessageHeader.filter(Column("id") == id).updateAll(db,
+                Column("folderId").set(to: archive.id),
+                Column("folderPath").set(to: archive.path),
+                Column("isInInbox").set(to: false)
+            )
+        }
+
+        await AccountManager.shared.move([staleSnapshot], to: trash.path)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == trash.id, "row lands in Trash — the FRESH (Archive) source resolved correctly")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].folderPath == archive.path, "queued op's source folderPath is the FRESH (Archive) location, not the stale caller snapshot's INBOX")
+        #expect(ops[0].destinationPath == trash.path)
+    }
+
+    // MARK: - (5) overlayAdjustedSnapshot (FIX C — promoted from InboxViewModel.overlayAdjustedForUndo)
+
+    @Test("AccountManager.overlayAdjustedSnapshot: a still-queued gesture intent's overlay actionTag wins over the DB-fresh nil — undo snapshots must read visualized state, not stale DB truth")
+    func overlayAdjustedSnapshotPicksUpQueuedTagIntent() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-overlay-snapshot")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+
+        // Register the gesture's overlay mutation directly (mirrors
+        // `registerGestureIntent`'s synchronous `registerMutation` call)
+        // WITHOUT draining the FIFO write queue — the queue stays GATED so the
+        // DB row is untouched, simulating a still-in-flight gesture cycle whose
+        // executor hasn't run yet.
+        AccountManager.shared.registerMutation(id: header.id, mutation: .init(actionTag: .some(ActionTag.reply)))
+
+        let dbTruth = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(dbTruth?.actionTag == nil, "setup: DB row is untouched — the write is gated/queued, not yet drained")
+
+        let snapshot = AccountManager.shared.overlayAdjustedSnapshot(header)
+        #expect(snapshot.actionTag == .reply, "the undo snapshot must carry the overlay's queued intent, not the stale DB nil")
     }
 }

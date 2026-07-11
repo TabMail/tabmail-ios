@@ -1419,7 +1419,10 @@ final class MessageDetailViewModel {
             accountId: msg.accountId, timestamp: Date()
         ))
         manager.retainOverlayEntry(id: msg.id)
-        manager.registerMutation(id: msg.id, mutation: .init(folderId: archiveFolder.id))
+        // Archive's destination is never the inbox (guarded above), so
+        // `msg.isInInbox` alone determines "leaving the inbox" (F6) — clears
+        // the tag in the overlay so the mid-drain window doesn't flash it.
+        manager.registerMutation(id: msg.id, mutation: .init(folderId: archiveFolder.id, actionTag: msg.isInInbox ? .some(nil) : nil))
         enqueueMove(msg, to: archiveFolder.path)
         updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
         return true
@@ -1448,7 +1451,9 @@ final class MessageDetailViewModel {
             accountId: msg.accountId, timestamp: Date()
         ))
         manager.retainOverlayEntry(id: msg.id)
-        manager.registerMutation(id: msg.id, mutation: .init(folderId: trashFolder.id))
+        // Delete's destination is never the inbox (guarded above), so
+        // `msg.isInInbox` alone determines "leaving the inbox" (F6).
+        manager.registerMutation(id: msg.id, mutation: .init(folderId: trashFolder.id, actionTag: msg.isInInbox ? .some(nil) : nil))
         enqueueMove(msg, to: trashFolder.path)
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
         return true
@@ -1525,8 +1530,12 @@ final class MessageDetailViewModel {
 
     func moveMessage(_ msg: MessageHeader, toFolderPath: String) {
         let destFolderId = "\(msg.accountId):\(toFolderPath)"
+        // Generic move: destination CAN be the inbox — reuse the same
+        // dest-is-inbox lookup `updateThreadMessageFolder` below already
+        // needs, combined with the source's isInInbox (F6).
+        let destIsInbox = isInboxFolder(accountId: msg.accountId, path: toFolderPath)
         manager.retainOverlayEntry(id: msg.id)
-        manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId))
+        manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: (msg.isInInbox && !destIsInbox) ? .some(nil) : nil))
         UndoService.shared.push(UndoableAction(
             type: .move(fromPath: msg.folderPath, toPath: toFolderPath), messages: [msg],
             originalFolderId: msg.folderId,
@@ -1536,7 +1545,7 @@ final class MessageDetailViewModel {
         enqueueMove(msg, to: toFolderPath)
         updateThreadMessageFolder(
             msg, newFolderPath: toFolderPath, newFolderId: destFolderId,
-            isInInbox: isInboxFolder(accountId: msg.accountId, path: toFolderPath)
+            isInInbox: destIsInbox
         )
     }
 

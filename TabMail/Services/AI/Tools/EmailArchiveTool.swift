@@ -77,8 +77,13 @@ struct EmailArchiveTool: AgentTool, Sendable {
             ] as [String: Any]))
         }
 
-        // Perform archive via AccountManager (optimistic UI + pending queue)
-        await AccountManager.shared.archive(resolved)
+        // Perform archive via the coordinated overlay + FIFO write-queue path
+        // (ADR-IOS-057 vicinity): re-resolves fresh headers INSIDE the queued
+        // closure so the write acts on row truth at execution time, not this
+        // `resolved` snapshot — which may have gone stale during the
+        // unbounded confirmation wait above. `resolved` is still used for the
+        // confirmation card display and the response payload below.
+        await AccountManager.shared.performCoordinatedRoleMove(ids: resolved.map(\.id), role: .archive)
 
         let subjects = resolved.map { $0.subject.isEmpty ? "(No subject)" : $0.subject }
         var result: [String: Any] = [

@@ -208,4 +208,131 @@ struct NavigationStoreRefreshTests {
             #expect(store.folders.map(\.name) == ["Archive", "INBOX", "Trash"])
         }
     }
+
+    // MARK: - F5: badge-delta split (source truth vs dest-projected truth)
+    //
+    // `optimisticOverlay` entries are process-wide (`AccountManager.shared`),
+    // not scoped to the swapped `AppDatabase.shared` — clear them before AND
+    // after every test in this section so no cross-test/cross-suite leakage
+    // (other suites assert an empty overlay).
+
+    private func makeInboxArchiveHeader(
+        folderId: String, accountId: String, folderPath: String, messageId: String, isRead: Bool
+    ) -> MessageHeader {
+        var h = MessageHeader(
+            messageId: messageId, subject: "Subj \(messageId)", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date(), snippet: "snip",
+            folderId: folderId, accountId: accountId, folderPath: folderPath, isInInbox: folderPath == "INBOX"
+        )
+        h.headerComplete = true
+        h.isRead = isRead
+        return h
+    }
+
+    private func clearOverlay() {
+        let snapshot = AccountManager.shared.snapshotOverlay()
+        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+    }
+
+    /// Characterizes the pre-fix bug AND pins the fix: a message that is
+    /// ALREADY READ in the source folder (never contributed to its
+    /// unreadCount) is moved AND marked unread on arrival. The OLD code
+    /// gated BOTH the source decrement and the dest increment on the same
+    /// `isUnread` boolean (derived from the mutation's overlay-projected
+    /// state), so it wrongly decremented the source too — a read row that
+    /// was never part of the count. The fix splits the two questions:
+    /// source uses raw DB truth (`!dbIsRead`), dest uses the
+    /// overlay-projected truth.
+    @Test("refreshFolders(): read row moved + marked-unread-on-arrival — source unread count UNCHANGED (F5 split fix; pre-fix code wrongly decremented it), dest +1")
+    @MainActor func splitGate_readRowMovedMarkedUnread_sourceUnchangedDestIncrements() async throws {
+        try await withTestDB { pool in
+            clearOverlay()
+            defer { clearOverlay() }
+            try await pool.write { db in
+                var a = Account(emailAddress: "a@b.com", displayName: "A", provider: .gmail); a.id = "acc1"; try a.insert(db)
+                try Self.insertFolders(db, [("INBOX", "INBOX", .inbox), ("Archive", "Archive", .archive)], accountId: "acc1")
+            }
+            // Baseline: 3 UNRELATED unread messages already counted in Inbox.
+            // The row under test is READ, so it never contributed to this 3.
+            try await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET unreadCount = 3 WHERE id = ?", arguments: ["acc1:INBOX"])
+            }
+            let header = makeInboxArchiveHeader(folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", messageId: "m1", isRead: true)
+            try await pool.write { db in try header.insert(db) }
+
+            AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: false, folderId: "acc1:Archive"))
+
+            let store = NavigationStore()
+            await store.refreshFolders()
+
+            guard let inbox = store.folders.first(where: { $0.id == "acc1:INBOX" }),
+                  let archive = store.folders.first(where: { $0.id == "acc1:Archive" }) else {
+                Issue.record("expected folders not found in store.folders")
+                return
+            }
+            #expect(inbox.unreadCount == 3, "source must stay at baseline — this row was READ (never counted as unread in Inbox); the pre-fix code wrongly decremented it to 2")
+            #expect(archive.unreadCount == 1, "dest increments — the overlay-projected state (marked unread on arrival) counts it in the destination")
+        }
+    }
+
+    @Test("refreshFolders(): unread row moved + marked-read-on-arrival — source -1, dest count UNCHANGED (F5 split fix)")
+    @MainActor func splitGate_unreadRowMovedMarkedRead_sourceDecrementsDestUnchanged() async throws {
+        try await withTestDB { pool in
+            clearOverlay()
+            defer { clearOverlay() }
+            try await pool.write { db in
+                var a = Account(emailAddress: "a@b.com", displayName: "A", provider: .gmail); a.id = "acc1"; try a.insert(db)
+                try Self.insertFolders(db, [("INBOX", "INBOX", .inbox), ("Archive", "Archive", .archive)], accountId: "acc1")
+            }
+            try await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET unreadCount = 2 WHERE id = ?", arguments: ["acc1:INBOX"])
+                try db.execute(sql: "UPDATE folder SET unreadCount = 5 WHERE id = ?", arguments: ["acc1:Archive"])
+            }
+            let header = makeInboxArchiveHeader(folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", messageId: "m2", isRead: false)
+            try await pool.write { db in try header.insert(db) }
+
+            AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: true, folderId: "acc1:Archive"))
+
+            let store = NavigationStore()
+            await store.refreshFolders()
+
+            guard let inbox = store.folders.first(where: { $0.id == "acc1:INBOX" }),
+                  let archive = store.folders.first(where: { $0.id == "acc1:Archive" }) else {
+                Issue.record("expected folders not found in store.folders")
+                return
+            }
+            #expect(inbox.unreadCount == 1, "source decrements — this row WAS counted unread in Inbox before the move")
+            #expect(archive.unreadCount == 5, "dest must NOT increment — the overlay-projected state (marked read on arrival) is not unread in the destination")
+        }
+    }
+
+    @Test("refreshFolders(): plain move of an unread row (no isRead in the mutation) — source -1, dest +1 (pre-existing behavior preserved by the F5 split)")
+    @MainActor func splitGate_plainMoveOfUnreadRow_sourceDecrementsDestIncrements() async throws {
+        try await withTestDB { pool in
+            clearOverlay()
+            defer { clearOverlay() }
+            try await pool.write { db in
+                var a = Account(emailAddress: "a@b.com", displayName: "A", provider: .gmail); a.id = "acc1"; try a.insert(db)
+                try Self.insertFolders(db, [("INBOX", "INBOX", .inbox), ("Archive", "Archive", .archive)], accountId: "acc1")
+            }
+            try await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET unreadCount = 4 WHERE id = ?", arguments: ["acc1:INBOX"])
+            }
+            let header = makeInboxArchiveHeader(folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", messageId: "m3", isRead: false)
+            try await pool.write { db in try header.insert(db) }
+
+            AccountManager.shared.registerMutation(id: header.id, mutation: .init(folderId: "acc1:Archive"))
+
+            let store = NavigationStore()
+            await store.refreshFolders()
+
+            guard let inbox = store.folders.first(where: { $0.id == "acc1:INBOX" }),
+                  let archive = store.folders.first(where: { $0.id == "acc1:Archive" }) else {
+                Issue.record("expected folders not found in store.folders")
+                return
+            }
+            #expect(inbox.unreadCount == 3, "source decrements by 1")
+            #expect(archive.unreadCount == 1, "dest increments by 1 — no isRead override, falls through to raw DB truth (unread) on both sides")
+        }
+    }
 }

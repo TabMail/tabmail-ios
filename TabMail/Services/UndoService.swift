@@ -125,12 +125,19 @@ final class UndoService {
         case .move(let fromPath, let toPath):
             // Each captured MessageHeader carries the pre-move isInInbox value,
             // so per-message mirroring is exact even if the action spans folders.
+            // actionTag must be restored too: the archive/delete gesture registered
+            // an overlay tag-clear (.some(nil)) for inbox-leaving moves, and the
+            // registerMutation merge only overwrites fields the new mutation SETS —
+            // leaving actionTag untouched here would keep hiding the restored chip
+            // until every retain releases, even though undoDestructiveAction's
+            // full-row save already restored the tag in the DB.
             for msg in action.messages {
                 manager.retainOverlayEntry(id: msg.id)
                 manager.registerMutation(id: msg.id, mutation: .init(
                     folderId: action.originalFolderId,
                     folderPath: action.originalFolderPath,
-                    isInInbox: msg.isInInbox
+                    isInInbox: msg.isInInbox,
+                    actionTag: .some(msg.actionTag)
                 ))
             }
             await manager.enqueueWrite { [manager] in
