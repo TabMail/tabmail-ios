@@ -451,19 +451,23 @@ struct GmailProviderMockTests {
 
     // MARK: - Durable RFC action resolution
 
-    @Test("legacy provider id resolves to RFC identity inside recorded source scope")
-    func legacyProviderIdResolvesInsideRecordedScope() async throws {
+    @Test("token member resolves by exact resource id inside the recorded source scope")
+    func tokenMemberResolvesInsideRecordedSourceScope() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-source"
-        let rfc822 = "legacy-source@example.com"
+        let token = "gmail-token-source"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/\(token)?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: rfc822,
-                labelIds: ["INBOX"]
+                id: token,
+                rfc822MessageId: "token-source@example.com",
+                labelIds: ["INBOX", "UNREAD"]
             ))
+        )
+        http.register(
+            path: "/messages/\(token)/modify",
+            method: "POST",
+            response: .json(raw: "{}")
         )
         let provider = GmailProvider(
             userEmail: "test@example.com",
@@ -471,27 +475,25 @@ struct GmailProviderMockTests {
             session: http.session
         )
 
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "INBOX",
-            destinationFolder: "TRASH"
-        )
+        try await provider.markRead(ids: [token], folder: "INBOX")
 
-        #expect(result == .resolved(rfc822MessageId: rfc822))
-        #expect(http.recordedCalls().count == 1)
+        let calls = http.recordedCalls()
+        let modifyCalls = calls.filter { $0.url.contains("/messages/\(token)/modify") }
+        #expect(modifyCalls.count == 1)
+        // The token path never issues an rfc822msgid search — exact GET only.
+        #expect(!calls.contains { $0.url.contains("rfc822msgid") })
     }
 
-    @Test("legacy provider id resolves inside recorded optimistic destination")
-    func legacyProviderIdResolvesInsideRecordedDestination() async throws {
+    @Test("token member found only in the optimistic destination is stale — actions use source scope only")
+    func tokenMemberInDestinationOnlyIsStale() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-destination"
-        let rfc822 = "legacy-destination@example.com"
+        let token = "gmail-token-destination"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/\(token)?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: rfc822,
+                id: token,
+                rfc822MessageId: "token-destination@example.com",
                 labelIds: ["TRASH"]
             ))
         )
@@ -501,83 +503,86 @@ struct GmailProviderMockTests {
             session: http.session
         )
 
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "INBOX",
-            destinationFolder: "TRASH"
-        )
+        // Recorded source scope is INBOX; the resource now carries only TRASH.
+        // B3's destination corroboration existed for conversion, not
+        // execution — the action path must treat this as authoritative stale.
+        try await provider.markRead(ids: [token], folder: "INBOX")
 
-        #expect(result == .resolved(rfc822MessageId: rfc822))
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(!calls.contains { $0.url.contains("/modify") })
     }
 
-    @Test("legacy provider id resolves inside synthetic All Mail scope")
-    func legacyProviderIdResolvesInsideSyntheticAllMail() async throws {
+    @Test("token member resolves inside synthetic All Mail scope")
+    func tokenMemberResolvesInsideSyntheticAllMail() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-archive"
-        let rfc822 = "legacy-archive@example.com"
+        let token = "gmail-token-archive"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/\(token)?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: rfc822,
+                id: token,
+                rfc822MessageId: "token-archive@example.com",
                 labelIds: ["CATEGORY_UPDATES", "STARRED"]
             ))
         )
+        http.register(
+            path: "/messages/\(token)/modify",
+            method: "POST",
+            response: .json(raw: "{}")
+        )
         let provider = GmailProvider(
             userEmail: "test@example.com",
             accessToken: { _ in "fake-access-token" },
             session: http.session
         )
 
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: GmailProvider.archivePath,
-            destinationFolder: nil
-        )
+        try await provider.markRead(ids: [token], folder: GmailProvider.archivePath)
 
-        #expect(result == .resolved(rfc822MessageId: rfc822))
+        let modifyCalls = http.recordedCalls().filter { $0.url.contains("/modify") }
+        #expect(modifyCalls.count == 1)
     }
 
-    @Test("legacy provider id with omitted labels resolves inside synthetic All Mail")
-    func legacyProviderIdWithoutLabelsResolvesInsideSyntheticAllMail() async throws {
+    @Test("token member with omitted labels resolves inside synthetic All Mail")
+    func tokenMemberWithoutLabelsResolvesInsideSyntheticAllMail() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-unlabelled"
-        let rfc822 = "legacy-unlabelled@example.com"
+        let token = "gmail-token-unlabelled"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/\(token)?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: rfc822,
+                id: token,
+                rfc822MessageId: "token-unlabelled@example.com",
                 labelIds: nil
             ))
         )
+        http.register(
+            path: "/messages/\(token)/modify",
+            method: "POST",
+            response: .json(raw: "{}")
+        )
         let provider = GmailProvider(
             userEmail: "test@example.com",
             accessToken: { _ in "fake-access-token" },
             session: http.session
         )
 
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: GmailProvider.archivePath,
-            destinationFolder: nil
-        )
+        try await provider.markRead(ids: [token], folder: GmailProvider.archivePath)
 
-        #expect(result == .resolved(rfc822MessageId: rfc822))
+        let modifyCalls = http.recordedCalls().filter { $0.url.contains("/modify") }
+        #expect(modifyCalls.count == 1)
     }
 
-    @Test("legacy provider id is outside synthetic All Mail when an excluded label remains")
-    func legacyProviderIdOutsideSyntheticAllMailIsStale() async throws {
+    @Test("token member outside synthetic All Mail when an excluded label remains is stale")
+    func tokenMemberOutsideSyntheticAllMailIsStale() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-inbox"
+        let token = "gmail-token-inbox"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/\(token)?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: "legacy-inbox@example.com",
+                id: token,
+                rfc822MessageId: "token-inbox@example.com",
                 labelIds: ["INBOX", "STARRED"]
             ))
         )
@@ -587,101 +592,77 @@ struct GmailProviderMockTests {
             session: http.session
         )
 
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: GmailProvider.archivePath,
-            destinationFolder: nil
-        )
+        try await provider.markRead(ids: [token], folder: GmailProvider.archivePath)
 
-        #expect(result == .staleOrAmbiguous)
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(!calls.contains { $0.url.contains("/modify") })
     }
 
-    @Test("legacy provider id outside recorded scope is authoritative stale")
-    func legacyProviderIdOutsideRecordedScopeIsStale() async throws {
+    @Test("token member 404 is authoritative stale")
+    func tokenMemberGoneIsStale() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-elsewhere"
+        let token = "gmail-token-gone"
+        http.register(path: "/messages/\(token)?", response: .status(404))
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        try await provider.markRead(ids: [token], folder: "INBOX")
+
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(!calls.contains { $0.url.contains("/modify") })
+    }
+
+    @Test("token member lookup preserves reserved path characters")
+    func tokenMemberIsPercentEncoded() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "gmail/token+target"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/gmail%2Ftoken%2Btarget?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: "legacy-elsewhere@example.com",
-                labelIds: ["SENT"]
+                id: token,
+                rfc822MessageId: "token-encoded@example.com",
+                labelIds: ["INBOX"]
             ))
         )
-        let provider = GmailProvider(
-            userEmail: "test@example.com",
-            accessToken: { _ in "fake-access-token" },
-            session: http.session
-        )
-
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "INBOX",
-            destinationFolder: "TRASH"
-        )
-
-        #expect(result == .staleOrAmbiguous)
-    }
-
-    @Test("legacy provider id 404 is authoritative stale")
-    func legacyProviderIdGoneIsStale() async throws {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        let providerId = "gmail-legacy-gone"
-        http.register(path: "/messages/\(providerId)?", response: .status(404))
-        let provider = GmailProvider(
-            userEmail: "test@example.com",
-            accessToken: { _ in "fake-access-token" },
-            session: http.session
-        )
-
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "INBOX",
-            destinationFolder: nil
-        )
-
-        #expect(result == .staleOrAmbiguous)
-    }
-
-    @Test("legacy provider id lookup preserves reserved path characters")
-    func legacyProviderIdIsPercentEncoded() async throws {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        let providerId = "gmail/legacy+target"
-        let rfc822 = "legacy-encoded@example.com"
+        // The resolution GET strictly path-encodes the token; the modify then
+        // uses the RESOLVED id exactly like the RFC path does (raw — real
+        // Gmail ids contain no reserved characters).
         http.register(
-            path: "/messages/gmail%2Flegacy%2Btarget?",
+            path: "/messages/gmail/token+target/modify",
+            method: "POST",
+            response: .json(raw: "{}")
+        )
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        try await provider.markRead(ids: [token], folder: "INBOX")
+
+        #expect(http.recordedCalls().first?.url.contains("gmail%2Ftoken%2Btarget") == true)
+        #expect(http.recordedCalls().contains { $0.url.contains("/modify") })
+    }
+
+    @Test("token metadata whose id contradicts the token is retryable uncertainty")
+    func tokenMemberMismatchedMetadataThrows() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "gmail-token-mismatch"
+        http.register(
+            path: "/messages/\(token)?",
             response: .json(raw: Self.actionMetadata(
-                id: providerId,
-                rfc822MessageId: rfc822
+                id: "some-other-id",
+                rfc822MessageId: "token-mismatch@example.com",
+                labelIds: ["INBOX"]
             ))
-        )
-        let provider = GmailProvider(
-            userEmail: "test@example.com",
-            accessToken: { _ in "fake-access-token" },
-            session: http.session
-        )
-
-        let result = try await provider.resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "INBOX",
-            destinationFolder: nil
-        )
-
-        #expect(result == .resolved(rfc822MessageId: rfc822))
-        #expect(http.recordedCalls().first?.url.contains("gmail%2Flegacy%2Btarget") == true)
-    }
-
-    @Test("malformed legacy provider metadata is retryable uncertainty")
-    func malformedLegacyProviderMetadataThrows() async {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        let providerId = "gmail-legacy-malformed"
-        http.register(
-            path: "/messages/\(providerId)?",
-            response: .json(raw: #"{"id":"gmail-legacy-malformed","labelIds":["INBOX"]}"#)
         )
         let provider = GmailProvider(
             userEmail: "test@example.com",
@@ -690,21 +671,17 @@ struct GmailProviderMockTests {
         )
 
         do {
-            _ = try await provider.resolveLegacyMessageActionIdentity(
-                providerMessageId: providerId,
-                sourceFolder: "INBOX",
-                destinationFolder: nil
-            )
-            Issue.record("malformed legacy metadata must throw")
+            try await provider.markRead(ids: [token], folder: "INBOX")
+            Issue.record("contradictory token metadata must throw for retry")
         } catch {}
     }
 
-    @Test("non-gone legacy provider lookup failure is retryable uncertainty")
-    func legacyProviderLookupFailureThrows() async {
+    @Test("non-gone token lookup failure is retryable uncertainty")
+    func tokenMemberLookupFailureThrows() async {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "gmail-legacy-uncertain"
-        http.register(path: "/messages/\(providerId)?", response: .status(400))
+        let token = "gmail-token-uncertain"
+        http.register(path: "/messages/\(token)?", response: .status(500))
         let provider = GmailProvider(
             userEmail: "test@example.com",
             accessToken: { _ in "fake-access-token" },
@@ -712,12 +689,8 @@ struct GmailProviderMockTests {
         )
 
         do {
-            _ = try await provider.resolveLegacyMessageActionIdentity(
-                providerMessageId: providerId,
-                sourceFolder: "INBOX",
-                destinationFolder: nil
-            )
-            Issue.record("non-gone legacy lookup failure must throw")
+            try await provider.markRead(ids: [token], folder: "INBOX")
+            Issue.record("non-gone token lookup failure must throw")
         } catch {}
     }
 

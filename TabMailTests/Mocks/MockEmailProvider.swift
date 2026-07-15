@@ -68,13 +68,6 @@ actor MockEmailProvider: EmailProvider {
     var fetchHistoryThrows: Error?
     var fetchMessageHeadersResult: [MessageHeaderInfo] = []
     var fetchMessageHeadersThrows: Error?
-    var legacyIdentityResolutions: [String: LegacyMessageActionIdentityResolution] = [:]
-    var legacyIdentityResolutionErrors: [String: any Error] = [:]
-    var legacyIdentityResolutionHandler: (@Sendable (
-        _ providerMessageId: String,
-        _ sourceFolder: String,
-        _ destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution)?
     var markReadHook: (@Sendable () async -> Void)?
     var saveDraftHook: (@Sendable () async -> Void)?
     /// Awaited BEFORE `move()` records or mutates anything — lets a test
@@ -95,11 +88,6 @@ actor MockEmailProvider: EmailProvider {
     var movedIds: [(ids: [String], from: String, to: String)] = []
     var sentDrafts: [DraftMessage] = []
     var appendedToSent: [(draft: DraftMessage, sentFolderPath: String, messageId: String)] = []
-    var legacyIdentityResolutionCalls: [(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    )] = []
 
     // MARK: - EmailProvider Protocol
 
@@ -258,33 +246,6 @@ actor MockEmailProvider: EmailProvider {
         return fetchMessageHeadersResult
     }
 
-    func resolveLegacyMessageActionIdentity(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution {
-        callLog.append("resolveLegacyMessageActionIdentity(id:\(providerMessageId))")
-        legacyIdentityResolutionCalls.append((
-            providerMessageId: providerMessageId,
-            sourceFolder: sourceFolder,
-            destinationFolder: destinationFolder
-        ))
-        if let legacyIdentityResolutionHandler {
-            return try await legacyIdentityResolutionHandler(
-                providerMessageId,
-                sourceFolder,
-                destinationFolder
-            )
-        }
-        if let error = legacyIdentityResolutionErrors[providerMessageId] {
-            throw error
-        }
-        guard let resolution = legacyIdentityResolutions[providerMessageId] else {
-            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
-        }
-        return resolution
-    }
-
     func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] {
         callLog.append("fetchTextBodies(ids:\(ids.count),folder:\(folder))")
         return []
@@ -352,32 +313,6 @@ actor MockEmailProvider: EmailProvider {
         moveThrowsOnId = nil
     }
 
-    func setLegacyIdentityResolution(
-        providerMessageId: String,
-        result: LegacyMessageActionIdentityResolution
-    ) {
-        legacyIdentityResolutions[providerMessageId] = result
-        legacyIdentityResolutionErrors.removeValue(forKey: providerMessageId)
-    }
-
-    func setLegacyIdentityResolutionError(
-        providerMessageId: String,
-        error: any Error
-    ) {
-        legacyIdentityResolutionErrors[providerMessageId] = error
-        legacyIdentityResolutions.removeValue(forKey: providerMessageId)
-    }
-
-    func setLegacyIdentityResolutionHandler(
-        _ handler: @escaping @Sendable (
-            _ providerMessageId: String,
-            _ sourceFolder: String,
-            _ destinationFolder: String?
-        ) async throws -> LegacyMessageActionIdentityResolution
-    ) {
-        legacyIdentityResolutionHandler = handler
-    }
-
     func setMarkReadHook(_ hook: (@Sendable () async -> Void)?) {
         markReadHook = hook
     }
@@ -402,13 +337,9 @@ actor MockEmailProvider: EmailProvider {
         movedIds.removeAll()
         sentDrafts.removeAll()
         appendedToSent.removeAll()
-        legacyIdentityResolutions.removeAll()
-        legacyIdentityResolutionErrors.removeAll()
-        legacyIdentityResolutionHandler = nil
         markReadHook = nil
         saveDraftHook = nil
         moveHook = nil
-        legacyIdentityResolutionCalls.removeAll()
         statefulMessagesByRFCMessageId = nil
     }
 }

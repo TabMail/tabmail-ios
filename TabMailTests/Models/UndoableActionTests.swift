@@ -15,7 +15,7 @@ struct UndoableActionLabelTests {
 
     private func member(_ n: Int) -> UndoMember {
         UndoMember(
-            rfc822MessageId: "m\(n)@example.com",
+            memberIdentity: "m\(n)@example.com",
             sourceFolderPath: "INBOX",
             originalHeaderId: "acc1:INBOX:msg\(n)"
         )
@@ -102,17 +102,23 @@ struct UndoableActionCommandsAdmissionTests {
         #expect(byAccount["acc2"]?.members.map(\.originalHeaderId) == [h2.id])
     }
 
-    @Test("member without a resolvable RFC identity is omitted")
-    func invalidRfcMemberOmitted() {
+    @Test("member without a resolvable RFC identity falls back to its provider ID as a token member")
+    func tailMemberFallsBackToProviderToken() {
         let valid = makeHeader(messageId: "m1")
-        var invalid = makeHeader(messageId: "m2")
-        invalid.rfc822MessageId = nil
+        var tail = makeHeader(messageId: "m2")
+        tail.rfc822MessageId = nil
+        var malformed = makeHeader(messageId: "m3")
+        malformed.rfc822MessageId = "<broken@example.com"
         let commands = UndoableAction.commands(
-            for: [valid, invalid],
+            for: [valid, tail, malformed],
             forwardDestinationByAccount: ["acc1": "Archive"]
         )
         #expect(commands.count == 1)
-        #expect(commands.first?.members.map(\.originalHeaderId) == [valid.id])
+        #expect(commands.first?.members.map(\.originalHeaderId) == [valid.id, tail.id, malformed.id])
+        // Hybrid identities: normalized RFC for the valid member, the raw
+        // provider ID token for the identity-less/malformed ones
+        // (PLAN_IDENTITY_HYBRID §2).
+        #expect(commands.first?.members.map(\.memberIdentity) == ["m1@example.com", "m2", "m3"])
     }
 
     @Test("account with no recorded destination is omitted entirely")

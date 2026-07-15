@@ -67,10 +67,12 @@ enum PendingConsentErrorStore {
 /// The delivered payload carries two deliberately separate identities:
 /// `messageId` is the provider transport/deep-link ID, while
 /// `rfc822MessageId` is the provider-neutral action ID. New notifications
-/// always act by normalized RFC identity. A legacy notification without that
-/// field may use its provider ID only to recover exactly one inbox-scoped
-/// durable/staged header and extract that header's RFC identity; the provider
-/// ID itself is never appended to durable work.
+/// with RFC identity act by it. A notification without that field (legacy
+/// build, or a tail message with no valid Message-ID) uses its provider ID
+/// to recover exactly one inbox-scoped durable/staged header; when no header
+/// exists anywhere, the transport ID is admitted as an opaque TOKEN member
+/// (PLAN_IDENTITY_HYBRID §2) — the provider resolves it by exact ID in the
+/// inbox scope at drain, so tail messages stay actionable.
 ///
 /// When a header resolves, MARK_READ dispatches via `AccountManager
 /// .markRead` (the batch API deliberately lives outside the ADR-IOS-058
@@ -82,10 +84,12 @@ enum PendingConsentErrorStore {
 /// gesture actions, plus the staleness guard of the fold executor
 /// re-resolving the header at execution time.
 ///
-/// If no local/staged header exists but the payload supplied a valid RFC
-/// identity, the cold path may queue that RFC identity against the inbox role
-/// so the provider resolves it later. A legacy payload that cannot recover an
-/// RFC identity is a safe no-op; there is no provider-ID fallback.
+/// If no local/staged header exists, the cold path queues the supplied RFC
+/// identity — or, for a payload with no RFC field, the provider transport ID
+/// as a token member — against the inbox role so the provider resolves it
+/// later. A payload that CARRIES an RFC field whose value is invalid still
+/// fails closed: that is corrupt input, not a tail message (the builder
+/// omits the field entirely when the Message-ID does not normalize).
 enum NotificationActionRouter {
     #if DEBUG
     /// Stateful merge double used only by the test host, where the App Group
@@ -243,8 +247,9 @@ enum NotificationActionRouter {
             // A staged hit is local state, not a cold miss. Route through the
             // exact same production action as a durable row: markRead and the
             // role-move fold both reach `ensureDurable`, which merges the NSE
-            // row before committing optimistic state plus RFC-addressed work.
-            guard EmailNotificationBuilder.normalizedActionMessageId(header.rfc822MessageId) != nil else { return }
+            // row before committing optimistic state plus identity-addressed
+            // work. No RFC gate here: a tail header admits its provider ID as
+            // a token member downstream (PLAN_IDENTITY_HYBRID §2).
             #if DEBUG
             if let prepare = prepareStagedHeaderForActionForTesting.withLock({ $0 }) {
                 do {
@@ -261,12 +266,27 @@ enum NotificationActionRouter {
                 header: header
             )
         case .missing:
-            // Only an explicit RFC payload can survive a full local miss. A
-            // legacy provider ID is never converted into durable work.
-            guard let suppliedActionId else { return }
+            // Full local miss. An explicit RFC payload queues its RFC
+            // identity; a payload with no RFC field queues the provider
+            // transport ID as an opaque token member (PLAN_IDENTITY_HYBRID
+            // §2) — the adapter resolves it by exact provider ID in the
+            // inbox scope, restoring actionable notifications for tail
+            // messages.
+            let memberIdentity: String
+            if let suppliedActionId {
+                memberIdentity = suppliedActionId
+            } else if rfc822MessageId == nil,
+                      let fallback = MessageIdentity.durableActionMemberIdentity(
+                          rfc822MessageId: nil,
+                          providerMessageId: transportMessageId
+                      ) {
+                memberIdentity = fallback
+            } else {
+                return
+            }
             await queueColdPendingOperation(
                 actionId: actionId,
-                rfc822MessageId: suppliedActionId,
+                memberIdentity: memberIdentity,
                 accountId: accountId
             )
         case .ambiguous:
@@ -279,7 +299,9 @@ enum NotificationActionRouter {
         transportMessageId: String,
         header: MessageHeader
     ) async {
-        guard EmailNotificationBuilder.normalizedActionMessageId(header.rfc822MessageId) != nil else { return }
+        // No RFC gate (PLAN_IDENTITY_HYBRID §2): the production action paths
+        // below admit a tail header's provider ID as a token member, so a
+        // resolved header is always actionable.
         switch actionId {
         case "MARK_READ":
             await AccountManager.shared.markRead([header])
@@ -305,8 +327,10 @@ enum NotificationActionRouter {
 
     /// Cold fallback: no durable OR staged header exists for this message.
     /// Builds a `PendingOperation` via the record type against the account's
-    /// role folders — never raw SQL.
-    private static func queueColdPendingOperation(actionId: String, rfc822MessageId: String, accountId: String) async {
+    /// role folders — never raw SQL. `memberIdentity` is hybrid: a normalized
+    /// RFC Message-ID or an opaque provider-token (classified by shape at
+    /// admission and again inside the adapters).
+    private static func queueColdPendingOperation(actionId: String, memberIdentity: String, accountId: String) async {
         do {
             let folders = try await AppDatabase.dbPool.read { db in
                 try Folder.filter(Column("accountId") == accountId).fetchAll(db)
@@ -314,7 +338,7 @@ enum NotificationActionRouter {
             guard let inboxPath = folders.first(where: { $0.role == .inbox })?.path,
                   !accountId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !inboxPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                log("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(rfc822MessageId)")
+                log("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(memberIdentity)")
                 return
             }
             // Notification actions are deliberately undo-less
@@ -329,19 +353,19 @@ enum NotificationActionRouter {
                 ) { db in
                     guard let operation = PendingOperation.durableMessageAction(
                         type: .markRead,
-                        messageIds: [rfc822MessageId],
+                        messageIds: [memberIdentity],
                         accountId: accountId,
                         folderPath: inboxPath
                     ) else { return false }
                     try operation.insert(db)
                     return true
                 }
-                log("[NotificationActionRouter] header not local — queued markRead PendingOperation for \(rfc822MessageId)")
+                log("[NotificationActionRouter] header not local — queued markRead PendingOperation for \(memberIdentity)")
             case "ARCHIVE", "DELETE":
                 let role: FolderRole = actionId == "ARCHIVE" ? .archive : .trash
                 guard let destinationPath = folders.first(where: { $0.role == role })?.path,
                       !destinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    log("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(rfc822MessageId)")
+                    log("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(memberIdentity)")
                     return
                 }
                 inserted = try await AccountManager.shared.retryGatedQueueWrite(
@@ -349,7 +373,7 @@ enum NotificationActionRouter {
                 ) { db in
                     guard let operation = PendingOperation.durableMessageAction(
                         type: .move,
-                        messageIds: [rfc822MessageId],
+                        messageIds: [memberIdentity],
                         accountId: accountId,
                         folderPath: inboxPath,
                         destinationPath: destinationPath
@@ -357,14 +381,14 @@ enum NotificationActionRouter {
                     try operation.insert(db)
                     return true
                 }
-                log("[NotificationActionRouter] header not local — queued \(actionId) (.move) PendingOperation for \(rfc822MessageId)")
+                log("[NotificationActionRouter] header not local — queued \(actionId) (.move) PendingOperation for \(memberIdentity)")
             default:
                 return
             }
             guard inserted else { return }
             await AccountManager.shared.drainPendingQueue()
         } catch {
-            log("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(rfc822MessageId): \(error)")
+            log("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(memberIdentity): \(error)")
         }
     }
 }

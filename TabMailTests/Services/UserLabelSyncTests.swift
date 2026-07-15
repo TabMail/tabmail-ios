@@ -389,8 +389,8 @@ struct UserLabelMenuAdmissionTests {
         #expect(allOperations.allSatisfy { $0.messageIds == ["label-action@example.com"] })
     }
 
-    @Test("real menu transaction rechecks fresh header identity before local or durable mutation")
-    func freshInvalidHeaderRefusesApply() async throws {
+    @Test("real menu transaction rechecks fresh header identity — a row that lost its RFC identity applies via its provider-ID token")
+    func freshTailHeaderAppliesViaToken() async throws {
         let (pool, header, label, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir) }
 
@@ -402,16 +402,22 @@ struct UserLabelMenuAdmissionTests {
             )
         }
 
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): the fresh recheck falls
+        // back to the provider ID as a token member instead of refusing.
         let appliedResult = await menu.applyLabel(label)
-        #expect(!appliedResult)
+        #expect(appliedResult)
         let result = try await pool.read { db in
             (
                 try MessageUserLabel.fetchCount(db),
-                try PendingOperation.fetchCount(db)
+                try PendingOperation.fetchAll(db)
             )
         }
-        #expect(result.0 == 0)
-        #expect(result.1 == 0)
+        #expect(result.0 == 1)
+        #expect(result.1.count == 1)
+        if result.1.count == 1 {
+            #expect(result.1[0].type == .addUserLabel)
+            #expect(result.1[0].messageIds == ["provider-message-id"])
+        }
     }
 
     @Test("real menu transaction refuses a label owned by another account")

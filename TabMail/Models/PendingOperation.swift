@@ -127,8 +127,16 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
             return nil
         }
 
-        let normalizedIds = messageIds.compactMap {
-            MessageIdentity.durableActionRFC822MessageId($0)
+        // Hybrid member identity (PLAN_IDENTITY_HYBRID §2): an RFC-shaped
+        // member is stored normalized; anything else non-empty is admitted
+        // byte-exact as an opaque provider token. Classification is per
+        // member — mixed batches are fine. Only an empty member refuses.
+        let normalizedIds = messageIds.compactMap { member -> String? in
+            switch MessageIdentity.durableMemberKind(member) {
+            case .rfc(let normalized): normalized
+            case .providerToken(let token): token
+            case nil: nil
+            }
         }
         guard normalizedIds.count == messageIds.count else { return nil }
 
@@ -206,10 +214,12 @@ extension PendingOperation {
 
 // MARK: - Sync Filter Snapshot
 //
-// New durable message-action rows carry normalized RFC Message-ID for every
-// provider. During the finite legacy conversion window, snapshots still match
-// both provider `messageId` and `rfc822MessageId` so released rows remain
-// protected until startup conversion has classified them.
+// Durable message-action rows carry hybrid member identity: normalized RFC
+// Message-ID when the message has one, otherwise the raw provider ID as an
+// opaque token (PLAN_IDENTITY_HYBRID). Snapshots therefore match BOTH the
+// provider `messageId` and the normalized `rfc822MessageId` permanently —
+// a token member keys protection by its raw token string, which equals the
+// header's `messageId` in the recorded scope.
 
 /// Snapshot of pending operation IDs for the sync filter. Mutation decisions
 /// always include a load INSIDE the write transaction; a preflight observation
@@ -349,10 +359,12 @@ struct PendingOperationSnapshot: Sendable {
 }
 
 extension Set where Element == String {
-    /// Temporary two-key compatibility check used while released provider-ID
-    /// rows are converted at startup. New message-action admissions always
-    /// match through the RFC leg; the provider-ID leg exists only until that
-    /// finite migration and its call sites are removed.
+    /// PERMANENT two-key hybrid membership check (PLAN_IDENTITY_HYBRID §4).
+    /// RFC members match through the normalized-RFC leg; token members match
+    /// through the raw provider-ID leg (`header.messageId`). Sync-side
+    /// membership checks against queued/pending/recently-completed sets MUST
+    /// consult both legs — this is a designed feature of the hybrid identity
+    /// model, not legacy compatibility.
     func containsAnyKey(messageId: String, rfc822MessageId: String?) -> Bool {
         if contains(messageId) { return true }
         if let rfc = MessageIdentity.durableActionRFC822MessageId(rfc822MessageId),

@@ -89,8 +89,8 @@ struct AccountManagerActionsTagClearTests {
 
     // MARK: - Admission and forward execution
 
-    @Test("move refuses a missing RFC identity before folder, tag, count, or queue mutation")
-    func moveMissingRfcIsCompleteNoOp() async throws {
+    @Test("move admits a missing-RFC row as a provider-ID token member (hybrid identity) — optimistic move, count, and queue all land")
+    func moveMissingRfcAdmitsProviderToken() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
@@ -121,11 +121,19 @@ struct AccountManagerActionsTagClearTests {
                 try PendingOperation.fetchAll(db)
             )
         }
-        #expect(result.0?.folderId == inbox.id)
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): the identity-less row is
+        // no longer refused — its provider ID admits as an opaque token, the
+        // optimistic move lands (tag retained per Round D-0), the unread
+        // count transfers, and one durable row carries the raw token.
+        #expect(result.0?.folderId == archive.id)
         #expect(result.0?.actionTag == .reply)
-        #expect(result.1 == 1)
-        #expect(result.2 == 0)
-        #expect(result.3.isEmpty)
+        #expect(result.1 == 0)
+        #expect(result.2 == 1)
+        #expect(result.3.count == 1)
+        if result.3.count == 1 {
+            #expect(result.3[0].type == .move)
+            #expect(result.3[0].messageIds == ["provider-only-move"])
+        }
     }
 
     @Test("archive() (real production path): actionTag is RETAINED (Round D-0) with a consistent tagSortOrder, isInInbox flips to false, and NO .removeTag PendingOperation is queued — only .move")

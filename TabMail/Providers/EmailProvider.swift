@@ -164,17 +164,6 @@ enum MessageFieldScope: Sendable {
     case account
 }
 
-/// Finite upgrade result for a released message-action row that still carries
-/// a provider resource id. This is not a runtime execution receipt: startup
-/// consumes it once to replace the legacy id with RFC Message-ID before drain.
-/// A provider may classify a legacy value that cannot represent an actionable
-/// target as terminal stale; failed I/O or contradictory lookup correlation
-/// remains retryable uncertainty and must throw.
-enum LegacyMessageActionIdentityResolution: Sendable, Equatable {
-    case resolved(rfc822MessageId: String)
-    case staleOrAmbiguous
-}
-
 protocol EmailProvider: Sendable {
     func connect() async throws
     func disconnect() async throws
@@ -202,16 +191,6 @@ protocol EmailProvider: Sendable {
     func markForwarded(ids: [String], folder: String) async throws
     func setUserLabel(ids: [String], labelId: String, present: Bool, folder: String) async throws
     func move(ids: [String], from: String, to: String) async throws
-
-    /// Resolve one released provider resource id within the recorded
-    /// source/optimistic-destination scope. A normal stale/ambiguous result may
-    /// be omitted by the finite startup conversion; uncertainty must throw so
-    /// the complete conversion remains unchanged and retries later.
-    func resolveLegacyMessageActionIdentity(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution
 
     func send(draft: DraftMessage) async throws
 
@@ -269,17 +248,6 @@ extension EmailProvider {
 
     /// Providers without remote user-label support treat membership writes as no-op.
     func setUserLabel(ids: [String], labelId: String, present: Bool, folder: String) async throws {}
-
-    /// Providers must opt into the finite released-row cutover explicitly.
-    /// An unsupported implementation is uncertainty, never evidence that a
-    /// user's queued target is stale.
-    func resolveLegacyMessageActionIdentity(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution {
-        throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
-    }
 
     /// HTTP providers (Gmail, Exchange) return most-recent-by-date → date window.
     /// IMAP overrides to `.uid`.

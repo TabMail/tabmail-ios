@@ -875,8 +875,8 @@ struct OutboxRFCAdmissionTests {
         #expect(state.2[0].messageIds == ["Reply.Case@Example.COM"])
     }
 
-    @Test("normal forward with malformed RFC still finalizes locally but queues no auxiliary action")
-    func normalForwardInvalidRFCQueuesNothing() async throws {
+    @Test("normal forward with malformed RFC finalizes locally and queues the provider-ID token member")
+    func normalForwardInvalidRFCQueuesToken() async throws {
         let fixture = try makeFixture()
         defer { restore(fixture) }
         let header = makeHeader(
@@ -900,7 +900,13 @@ struct OutboxRFCAdmissionTests {
         }
         #expect(state.0?.isForwarded == true)
         #expect(state.1 == nil)
-        #expect(state.2.isEmpty)
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): the malformed RFC falls
+        // back to the provider ID as an opaque token member.
+        #expect(state.2.count == 1)
+        if state.2.count == 1 {
+            #expect(state.2[0].type == .markForwarded)
+            #expect(state.2[0].messageIds == ["provider-resource-id"])
+        }
     }
 
     @Test("normal reply with a blank source finalizes locally but queues no auxiliary action")

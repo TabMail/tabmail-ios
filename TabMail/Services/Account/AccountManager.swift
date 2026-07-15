@@ -462,6 +462,12 @@ actor AccountManager {
     weak var pendingQueuePreparedDatabase: AppDatabase?
     var pendingQueuePreparationFlight: PendingQueuePreparationFlight?
     var pendingQueueAuthorizationHookForTesting: (@Sendable () async -> Void)?
+    /// Test-only seam awaited at the START of a new preparation flight
+    /// (before crash recovery). Captured once at flight creation. Exists so
+    /// database-lifecycle tests can hold a specific database's preparation
+    /// open deterministically — the deleted legacy identity converter used to
+    /// provide that suspension point via its provider lookups.
+    var pendingQueuePreparationHookForTesting: (@Sendable () async -> Void)?
 
     // MARK: - FIFO Local Write Queue
 

@@ -768,10 +768,11 @@ extension AccountManager {
                             if let address = MessageIdentity.durableActionAddress(
                                 accountId: original.accountId,
                                 folderPath: original.folderPath,
-                                rfc822MessageId: original.rfc822MessageId
+                                rfc822MessageId: original.rfc822MessageId,
+                                providerMessageId: original.messageId
                             ), let operation = PendingOperation.durableMessageAction(
                                     type: .markForwarded,
-                                    messageIds: [address.rfc822MessageId],
+                                    messageIds: [address.memberIdentity],
                                     accountId: address.accountId,
                                     folderPath: address.folderPath
                             ) {
@@ -786,10 +787,11 @@ extension AccountManager {
                             if let address = MessageIdentity.durableActionAddress(
                                 accountId: original.accountId,
                                 folderPath: original.folderPath,
-                                rfc822MessageId: original.rfc822MessageId
+                                rfc822MessageId: original.rfc822MessageId,
+                                providerMessageId: original.messageId
                             ), let operation = PendingOperation.durableMessageAction(
                                     type: .markReplied,
-                                    messageIds: [address.rfc822MessageId],
+                                    messageIds: [address.memberIdentity],
                                     accountId: address.accountId,
                                     folderPath: address.folderPath
                             ) {
@@ -945,10 +947,11 @@ extension AccountManager {
                                         if let address = MessageIdentity.durableActionAddress(
                                             accountId: original.accountId,
                                             folderPath: original.folderPath,
-                                            rfc822MessageId: original.rfc822MessageId
+                                            rfc822MessageId: original.rfc822MessageId,
+                                            providerMessageId: original.messageId
                                         ), let operation = PendingOperation.durableMessageAction(
                                             type: .markForwarded,
-                                            messageIds: [address.rfc822MessageId],
+                                            messageIds: [address.memberIdentity],
                                             accountId: address.accountId,
                                             folderPath: address.folderPath
                                         ) {
@@ -960,10 +963,11 @@ extension AccountManager {
                                     if let address = MessageIdentity.durableActionAddress(
                                         accountId: original.accountId,
                                         folderPath: original.folderPath,
-                                        rfc822MessageId: original.rfc822MessageId
+                                        rfc822MessageId: original.rfc822MessageId,
+                                        providerMessageId: original.messageId
                                     ), let operation = PendingOperation.durableMessageAction(
                                         type: .markReplied,
-                                        messageIds: [address.rfc822MessageId],
+                                        messageIds: [address.memberIdentity],
                                         accountId: address.accountId,
                                         folderPath: address.folderPath
                                     ) {

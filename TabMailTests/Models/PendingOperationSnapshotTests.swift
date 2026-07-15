@@ -289,4 +289,95 @@ struct PendingOperationSnapshotTests {
         // The legacy one-key check (the bug) would return false here.
         #expect(!snap.destructive.contains("8421"))
     }
+
+    // MARK: - Hybrid identity: token members (PLAN_IDENTITY_HYBRID §7.9/§7.10)
+
+    /// §7.9 — Undo's flip/reconciliation matching is identity-agnostic string
+    /// set comparison: a token member set behaves exactly like an RFC set.
+    @Test("flip equality is identity-agnostic: token member sets match exactly, partial overlap never matches")
+    func flipEqualityForTokenMemberSets() {
+        let forward = PendingOperation(
+            type: .move,
+            messageIds: ["4711", "gmail-token-abc"],
+            accountId: "acc1",
+            folderPath: "INBOX",
+            destinationPath: "Archive"
+        )
+        let inverse = PendingOperation(
+            type: .move,
+            messageIds: ["gmail-token-abc", "4711"],
+            accountId: "acc1",
+            folderPath: "Archive",
+            destinationPath: "INBOX"
+        )
+        #expect(inverse.matchesFlip(of: forward), "the structural flip matches regardless of member shape")
+        #expect(Set(inverse.messageIds) == Set(forward.messageIds), "member-set equality is a plain string-set comparison")
+
+        let partial = PendingOperation(
+            type: .move,
+            messageIds: ["4711"],
+            accountId: "acc1",
+            folderPath: "Archive",
+            destinationPath: "INBOX"
+        )
+        // Member-set equality is checked by the caller — a partial-overlap
+        // batch must never be treated as the same member set.
+        #expect(Set(partial.messageIds) != Set(forward.messageIds))
+
+        let setterForward = PendingOperation(
+            type: .markRead, messageIds: ["4711"], accountId: "acc1", folderPath: "INBOX"
+        )
+        let setterInverse = PendingOperation(
+            type: .markUnread, messageIds: ["4711"], accountId: "acc1", folderPath: "INBOX"
+        )
+        #expect(setterInverse.matchesFlip(of: setterForward))
+    }
+
+    /// §7.10 — token members flow through admission into every snapshot
+    /// protection set keyed by their raw token string, and `containsAnyKey`'s
+    /// provider-ID leg matches them (that leg is a permanent hybrid feature,
+    /// not legacy compatibility).
+    @Test("token members key snapshot protection sets by their raw token string")
+    func snapshotProtectionKeysForTokenMembers() throws {
+        // Admission: a mixed batch admits the token member as-is and
+        // normalizes the RFC member (RED until hybrid admission lands).
+        let admitted = try #require(PendingOperation.durableMessageAction(
+            type: .move,
+            messageIds: ["4711", "<mixed@example.com>"],
+            accountId: "acc1",
+            folderPath: "INBOX",
+            destinationPath: "Archive"
+        ), "hybrid admission must accept a token member instead of refusing the batch")
+        #expect(admitted.messageIds == ["4711", "mixed@example.com"], "token byte-exact, RFC normalized")
+
+        let setter = try #require(PendingOperation.durableMessageAction(
+            type: .markRead,
+            messageIds: ["graph/AAMkAGI2+token="],
+            accountId: "acc1",
+            folderPath: "INBOX"
+        ))
+
+        let snapshot = PendingOperationSnapshot(ops: [admitted, setter])
+        #expect(snapshot.destructive.contains("4711"))
+        #expect(snapshot.messageActions.contains("4711"))
+        #expect(snapshot.read.contains("graph/AAMkAGI2+token="))
+
+        // Sync-side membership checks consult header.messageId as well as
+        // normalized RFC — a tail header (nil RFC) matches via its provider ID.
+        #expect(snapshot.destructive.containsAnyKey(messageId: "4711", rfc822MessageId: nil))
+        #expect(snapshot.read.containsAnyKey(messageId: "graph/AAMkAGI2+token=", rfc822MessageId: nil))
+
+        // Directional membership keys are built from the raw member string,
+        // so the sync consumer's identityIds(messageId, rfc) probe finds them.
+        let sourceKey = MessageIdentity.membershipKey(
+            accountId: "acc1", folderPath: "INBOX", messageId: "4711",
+            membership: .removedSource
+        )
+        let destinationKey = MessageIdentity.membershipKey(
+            accountId: "acc1", folderPath: "Archive", messageId: "4711",
+            membership: .addedDestination
+        )
+        #expect(snapshot.destructiveSourceMemberships.contains(sourceKey))
+        #expect(snapshot.destructiveDestinationMemberships.contains(destinationKey))
+    }
 }

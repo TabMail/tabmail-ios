@@ -9,7 +9,10 @@ extension AccountManager {
 
     private struct DurableMessageActionMember: Sendable {
         let header: MessageHeader
-        let rfc822MessageId: String
+        /// Hybrid durable identity: normalized RFC Message-ID, or the raw
+        /// provider ID token when the header has no valid RFC identity
+        /// (PLAN_IDENTITY_HYBRID §2).
+        let memberIdentity: String
     }
 
     private struct MarkReadWriteResult: Sendable {
@@ -17,9 +20,12 @@ extension AccountManager {
         var notificationKeys: [(accountId: String, messageId: String)] = []
     }
 
-    /// Pairs the exact row eligible for optimistic mutation with the canonical
-    /// RFC identity written to the durable queue. Invalid identities disappear
-    /// here, before either side of that contract can occur.
+    /// Pairs the exact row eligible for optimistic mutation with the hybrid
+    /// member identity written to the durable queue: normalized RFC identity
+    /// when the header has one, else the provider ID (`header.messageId`) as
+    /// an opaque token (PLAN_IDENTITY_HYBRID §2 — the per-producer fallback
+    /// lives HERE). Only blank scope or a completely identity-less row
+    /// disappears, before either side of that contract can occur.
     private nonisolated static func durableMessageActionMembers(
         _ messages: [MessageHeader]
     ) -> [DurableMessageActionMember] {
@@ -27,12 +33,13 @@ extension AccountManager {
             guard let address = MessageIdentity.durableActionAddress(
                 accountId: header.accountId,
                 folderPath: header.folderPath,
-                rfc822MessageId: header.rfc822MessageId
+                rfc822MessageId: header.rfc822MessageId,
+                providerMessageId: header.messageId
             )
             else { return nil }
             return DurableMessageActionMember(
                 header: header,
-                rfc822MessageId: address.rfc822MessageId
+                memberIdentity: address.memberIdentity
             )
         }
     }
@@ -151,7 +158,7 @@ extension AccountManager {
                 for (_, members) in grouped {
                     let accountId = members[0].header.accountId
                     let folderPath = members[0].header.folderPath
-                    let durableIds = members.map(\.rfc822MessageId)
+                    let durableIds = members.map(\.memberIdentity)
                     let msgIds = members.map(\.header.id)
                     guard let operation = PendingOperation.durableMessageAction(
                         type: .markRead,
@@ -215,7 +222,7 @@ extension AccountManager {
                 for (_, members) in grouped {
                     let accountId = members[0].header.accountId
                     let folderPath = members[0].header.folderPath
-                    let durableIds = members.map(\.rfc822MessageId)
+                    let durableIds = members.map(\.memberIdentity)
                     let msgIds = members.map(\.header.id)
                     guard let operation = PendingOperation.durableMessageAction(
                         type: .markUnread,
@@ -280,6 +287,11 @@ extension AccountManager {
     ///
     /// Sync acts as the safety net — if a sibling is missed (e.g., null or stale
     /// `rfc822MessageId`), the next delta sync reconciles it.
+    ///
+    /// Hybrid-identity pin (PLAN_IDENTITY_HYBRID §2): sibling expansion applies
+    /// ONLY to members that carry an rfc822 identity — a token (tail) member has
+    /// no cross-folder identity by definition, so the `guard let rfc` below
+    /// correctly skips it and the action stays scoped to its own row.
     nonisolated static func expandWithSiblingsByRfc822(
         messages: [MessageHeader],
         db: Database
@@ -406,7 +418,7 @@ extension AccountManager {
             return OptimisticMoveResult()
         }
         let msgs = members.map(\.header)
-        let durableIds = members.map(\.rfc822MessageId)
+        let durableIds = members.map(\.memberIdentity)
         guard let pendingOperation = PendingOperation.durableMessageAction(
             type: opType,
             messageIds: durableIds,
@@ -559,7 +571,7 @@ extension AccountManager {
                 for (_, members) in grouped {
                     let accountId = members[0].header.accountId
                     let folderPath = members[0].header.folderPath
-                    let durableIds = members.map(\.rfc822MessageId)
+                    let durableIds = members.map(\.memberIdentity)
                     guard let operation = PendingOperation.durableMessageAction(
                         type: flagged ? .markFlagged : .markUnflagged,
                         messageIds: durableIds,
@@ -803,8 +815,8 @@ extension AccountManager {
             let destFolderId = "\(accountId):\(archivePath)"
             // Undo commands are built from the pre-move headers directly
             // (ADR-IOS-060): no full-row snapshot, no overlay adjustment
-            // needed — `UndoMember` carries only rfc822 identity and the
-            // pre-move source path, neither of which the overlay affects.
+            // needed — `UndoMember` carries only the hybrid member
+            // identity and the pre-move source path, neither of which the overlay affects.
             await UndoService.shared.push(UndoableAction(
                 commands: UndoableAction.commands(
                     for: messages,
@@ -859,10 +871,15 @@ extension AccountManager {
     ///    the only case tier 2 exists for. This tier is what makes an Undo dispatched
     ///    while the forward move is STILL only in memory (never durably written) resolve
     ///    to the right row: the id is unaffected by the move not having happened yet.
-    /// 2. By normalized RFC Message-ID scoped to `forwardDestinationPath` — the one place
-    ///    the forward move is known to have put this message. Used only when tier 1's id
-    ///    has vanished (an independent re-key). Zero or multiple matches there mean the
-    ///    Undo is stale for this member.
+    ///    This tier covers RFC and token members alike: the identity check routes by
+    ///    the member's shape (`durableMemberKind`) — a token member matches the row's
+    ///    provider `messageId` byte-exact.
+    /// 2. By identity scoped to `forwardDestinationPath` — the one place the forward
+    ///    move is known to have put this message. Used only when tier 1's id has
+    ///    vanished (an independent re-key). RFC members match through the normalized
+    ///    RFC column; token members fall back to `messageId == token` in the same
+    ///    scope with the same location guards. Zero or multiple matches there mean
+    ///    the Undo is stale for this member.
     ///
     /// Never fabricates a row. A member neither tier resolves is dropped — the same
     /// stale-drop rule as any other locally vanished intention.
@@ -872,9 +889,20 @@ extension AccountManager {
         member: UndoMember,
         db: Database
     ) throws -> MessageHeader? {
+        guard let memberKind = MessageIdentity.durableMemberKind(member.memberIdentity) else {
+            return nil
+        }
+        let rowMatchesIdentity: (MessageHeader) -> Bool = { row in
+            switch memberKind {
+            case .rfc(let normalized):
+                MessageIdentity.durableActionRFC822MessageId(row.rfc822MessageId) == normalized
+            case .providerToken(let token):
+                row.messageId == token
+            }
+        }
         if let row = try MessageHeader.fetchOne(db, key: member.originalHeaderId),
            row.accountId == accountId,
-           MessageIdentity.durableActionRFC822MessageId(row.rfc822MessageId) == member.rfc822MessageId,
+           rowMatchesIdentity(row),
            // Serial-intent location guard (ADR-IOS-060 §8.2, plan §19): the row
            // is undoable only where serial replay could have left it — at the
            // forward destination (fold already executed) or still at this
@@ -886,17 +914,32 @@ extension AccountManager {
            row.folderPath == forwardDestinationPath || row.folderPath == member.sourceFolderPath {
             return row
         }
-        let storedSpellings = [member.rfc822MessageId, "<\(member.rfc822MessageId)>"]
-        let candidates = try MessageHeader
-            .filter(
-                Column("accountId") == accountId
-                    && Column("folderPath") == forwardDestinationPath
-                    && storedSpellings.contains(Column("rfc822MessageId"))
-            )
-            .fetchAll(db)
-            .filter {
-                MessageIdentity.durableActionRFC822MessageId($0.rfc822MessageId) == member.rfc822MessageId
-            }
+        let candidates: [MessageHeader]
+        switch memberKind {
+        case .rfc(let normalized):
+            let storedSpellings = [normalized, "<\(normalized)>"]
+            candidates = try MessageHeader
+                .filter(
+                    Column("accountId") == accountId
+                        && Column("folderPath") == forwardDestinationPath
+                        && storedSpellings.contains(Column("rfc822MessageId"))
+                )
+                .fetchAll(db)
+                .filter {
+                    MessageIdentity.durableActionRFC822MessageId($0.rfc822MessageId) == normalized
+                }
+        case .providerToken(let token):
+            // Token tier-2: exact provider-ID match in the forward-destination
+            // scope only. A churned/renumbered ID simply fails to match — the
+            // member is stale (degraded-tail semantics, = released level).
+            candidates = try MessageHeader
+                .filter(
+                    Column("accountId") == accountId
+                        && Column("folderPath") == forwardDestinationPath
+                        && Column("messageId") == token
+                )
+                .fetchAll(db)
+        }
         guard candidates.count == 1 else { return nil }
         return candidates.first
     }

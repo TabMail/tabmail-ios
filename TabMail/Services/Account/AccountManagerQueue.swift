@@ -397,8 +397,10 @@ extension AccountManager {
     /// is needed. Skips drain when offline to prevent retry storms.
     func drainPendingQueue() async {
         guard NetworkMonitor.checkConnected() else { return }
-        // No drain owner, claim, or action-provider call may exist before the
-        // finite released-row conversion and crash recovery both succeed.
+        // No drain owner, claim, or action-provider call may exist before
+        // crash recovery succeeds. Released bare provider-ID rows need no
+        // conversion: they are token members by shape and execute through the
+        // adapters' token path directly (PLAN_IDENTITY_HYBRID §5).
         guard var queueDatabase = await preparePendingQueueForExecution() else { return }
         let authorizationHook = pendingQueueAuthorizationHookForTesting
         pendingQueueAuthorizationHookForTesting = nil
@@ -876,10 +878,12 @@ extension AccountManager {
         }
     }
 
-    /// Shared finite cutover for every message-queue execution entry point.
-    /// Conversion may perform provider lookups, but no row has been claimed and
-    /// `isDraining` is still false. A failed flight publishes no readiness; the
-    /// next external drain trigger retries the complete preparation.
+    /// Shared preparation flight for every message-queue execution entry
+    /// point: crash recovery (`inFlight -> queued` reset + legacy row cleanup)
+    /// bound to the exact active `AppDatabase` instance. No row has been
+    /// claimed and `isDraining` is still false while it runs. A failed flight
+    /// publishes no readiness; the next external drain trigger retries the
+    /// complete preparation.
     private func preparePendingQueueForExecution() async -> PrioritizedDatabase? {
         guard !Task.isCancelled else { return nil }
         guard let appDatabase = AppDatabase.shared.withLock({ $0 }) else {
@@ -901,10 +905,13 @@ extension AccountManager {
             flight = existing
         } else {
             let database = PrioritizedDatabase(pool: appDatabase.dbPool)
+            let preparationHook = pendingQueuePreparationHookForTesting
             let task = Task { [self] in
                 try Task.checkCancellation()
-                try await convertReleasedMessageActionIdentities(using: database)
-                try Task.checkCancellation()
+                if let preparationHook {
+                    await preparationHook()
+                    try Task.checkCancellation()
+                }
                 try await recoverPendingMessageQueueAfterCrash(using: database)
             }
             flight = PendingQueuePreparationFlight(
@@ -959,10 +966,6 @@ extension AccountManager {
         return db.changesCount
     }
 
-    /// The conversion transaction intentionally precedes this transaction. If
-    /// the process dies between them, the next flight sees conversion as a no-op
-    /// and retries this recovery before any drain owner can exist.
-    ///
     /// Runs before any drain owner exists, but gated anyway (§9.4) so a
     /// concurrent enqueue cannot interleave with this reset/cleanup write.
     private func recoverPendingMessageQueueAfterCrash(
@@ -1003,6 +1006,7 @@ extension AccountManager {
         pendingQueuePreparationFlight = nil
         pendingQueuePreparedDatabase = nil
         pendingQueueAuthorizationHookForTesting = nil
+        pendingQueuePreparationHookForTesting = nil
         oldTask?.cancel()
         if let oldTask {
             _ = await oldTask.result
@@ -1030,9 +1034,18 @@ extension AccountManager {
         pendingQueueAuthorizationHookForTesting = hook
     }
 
+    /// Companion seam to the authorization hook above: suspends a NEW
+    /// preparation flight at its start (captured at flight creation, so
+    /// clearing it never affects an already-started flight).
+    func setPendingQueuePreparationHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        pendingQueuePreparationHookForTesting = hook
+    }
+
     /// On app launch, recover from a previous crash, then drain the queue.
     /// Outbox and calendar recovery are independent and continue even when
-    /// message identity conversion is waiting on a provider or transient lookup.
+    /// message-queue preparation fails transiently.
     func reconcilePendingOperations() async {
         if await preparePendingQueueForExecution() != nil {
             await drainPendingQueue()

@@ -25,7 +25,7 @@ private func makeMoveAction(
             forwardDestinationPath: forwardDestinationPath,
             members: [
                 UndoMember(
-                    rfc822MessageId: rfc822MessageId,
+                    memberIdentity: rfc822MessageId,
                     sourceFolderPath: sourceFolderPath,
                     originalHeaderId: originalHeaderId
                 ),
@@ -121,15 +121,15 @@ struct UndoServiceStateTests {
         }
         #expect(service.undoStack.count == SyncConfig.undoStackMaxSize,
                 "stack is bounded at max size after \(total) pushes")
-        #expect(service.currentAction?.commands.first?.members.first?.rfc822MessageId == rfcIds.last,
+        #expect(service.currentAction?.commands.first?.members.first?.memberIdentity == rfcIds.last,
                 "the just-pushed action survives eviction as currentAction")
         let expectedOldestSurvivor = rfcIds.dropFirst(2).first
         #expect(
-            service.undoStack.first?.commands.first?.members.first?.rfc822MessageId == expectedOldestSurvivor,
+            service.undoStack.first?.commands.first?.members.first?.memberIdentity == expectedOldestSurvivor,
             "the oldest two entries (and only those) were evicted"
         )
         #expect(
-            service.undoStack.compactMap { $0.commands.first?.members.first?.rfc822MessageId }
+            service.undoStack.compactMap { $0.commands.first?.members.first?.memberIdentity }
                 == Array(rfcIds.dropFirst(2)),
             "walk order is preserved oldest-to-newest after eviction"
         )

@@ -141,7 +141,8 @@ struct UserLabelMenuView: View {
               MessageIdentity.durableActionAddress(
             accountId: messageSnapshot.accountId,
             folderPath: messageSnapshot.folderPath,
-            rfc822MessageId: messageSnapshot.rfc822MessageId
+            rfc822MessageId: messageSnapshot.rfc822MessageId,
+            providerMessageId: messageSnapshot.messageId
         ) != nil
         else { return }
         let wasApplied = appliedIds.contains(label.id)
@@ -181,12 +182,13 @@ struct UserLabelMenuView: View {
                       let address = MessageIdentity.durableActionAddress(
                           accountId: header.accountId,
                           folderPath: header.folderPath,
-                          rfc822MessageId: header.rfc822MessageId
+                          rfc822MessageId: header.rfc822MessageId,
+                          providerMessageId: header.messageId
                       ),
                       label.accountId == address.accountId,
                       let op = PendingOperation.durableMessageAction(
                           type: .addUserLabel,
-                          messageIds: [address.rfc822MessageId],
+                          messageIds: [address.memberIdentity],
                           accountId: address.accountId,
                           folderPath: address.folderPath,
                           userLabelId: label.id
@@ -224,12 +226,13 @@ struct UserLabelMenuView: View {
                       let address = MessageIdentity.durableActionAddress(
                           accountId: header.accountId,
                           folderPath: header.folderPath,
-                          rfc822MessageId: header.rfc822MessageId
+                          rfc822MessageId: header.rfc822MessageId,
+                          providerMessageId: header.messageId
                       ),
                       label.accountId == address.accountId,
                       let op = PendingOperation.durableMessageAction(
                           type: .removeUserLabel,
-                          messageIds: [address.rfc822MessageId],
+                          messageIds: [address.memberIdentity],
                           accountId: address.accountId,
                           folderPath: address.folderPath,
                           userLabelId: label.id
@@ -258,7 +261,8 @@ struct UserLabelMenuView: View {
               MessageIdentity.durableActionAddress(
                   accountId: messageSnapshot.accountId,
                   folderPath: messageSnapshot.folderPath,
-                  rfc822MessageId: messageSnapshot.rfc822MessageId
+                  rfc822MessageId: messageSnapshot.rfc822MessageId,
+                  providerMessageId: messageSnapshot.messageId
               ) != nil
         else { return }
 

@@ -1324,10 +1324,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
                 var plans: [(ResolvedActionMessage, ActionUIDResolution)] = []
                 for message in messages {
-                    let destinationResolution = try await self.resolveActionMessage(
-                        message.rfc822MessageId,
-                        server: server
-                    )
+                    let destinationResolution: ActionUIDResolution
+                    if let rfc822MessageId = message.verificationRFC822MessageId {
+                        destinationResolution = try await self.resolveActionMessage(
+                            rfc822MessageId,
+                            server: server
+                        )
+                    } else {
+                        // Token member (PLAN_IDENTITY_HYBRID §3): UIDs are
+                        // mailbox-local, so no destination probe exists —
+                        // proceed with the plain move, exactly released-level
+                        // idempotency for tail members.
+                        destinationResolution = .missing
+                    }
                     plans.append((message, destinationResolution))
                 }
                 for (message, destinationResolution) in plans {
@@ -1369,7 +1378,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         to destination: String,
         server: IMAPServer
     ) async throws {
-        let id = message.rfc822MessageId
+        let id = message.memberIdentity
         let srcUIDs = UIDSet(message.uid)
 
         switch destinationResolution {
@@ -1414,8 +1423,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // fails (e.g. atomic MOVE silently dropped, or fallback partial failure we didn't
         // catch), throw so the op stays queued for retry — the next pass's probe will
         // handle the partial state idempotently.
+        //
+        // Token members skip verification (PLAN_IDENTITY_HYBRID §3): the UID
+        // changed on move and there is no cross-mailbox identity to verify
+        // by, so a non-throwing MOVE is trusted as complete — released-level
+        // semantics; verifying by the stale source UID would ALWAYS miss and
+        // wedge the FIFO on an already-successful move.
+        guard let verificationRFC822MessageId = message.verificationRFC822MessageId else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] IMAPProvider.move — \(id): token member completed (no post-verify)")
+            }
+            return
+        }
         _ = try await server.selectMailbox(destination)
-        let destinationAfterMove = try await resolveActionMessage(id, server: server)
+        let destinationAfterMove = try await resolveActionMessage(verificationRFC822MessageId, server: server)
         if case .missing = destinationAfterMove {
             if DebugModeManager.isLoggingEnabled() {
                 print("[MoveTrace] IMAPProvider.move — \(id): VERIFY FAILED (not in dst after move) — will retry")
@@ -2111,52 +2132,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - UID Resolution
 
-    /// Upgrade one released durable row that still carries a mailbox-local UID.
-    /// The UID is meaningful only in the recorded source mailbox: a numerically
-    /// identical UID in the optimistic destination can name another message and
-    /// must never participate in identity conversion.
-    func resolveLegacyMessageActionIdentity(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution {
-        _ = destinationFolder
-        let trimmedSourceFolder = sourceFolder.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard !trimmedSourceFolder.isEmpty,
-              sourceFolder.rangeOfCharacter(from: .controlCharacters) == nil
-        else {
-            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
-        }
-        guard let uidValue = UInt32(providerMessageId),
-              uidValue > 0,
-              providerMessageId == String(uidValue)
-        else {
-            return .staleOrAmbiguous
-        }
-
-        return try await withActionConnection(folder: sourceFolder) { server in
-            let infos = try await server.fetchMessageInfosBulk(
-                using: UIDSet(UID(uidValue)),
-                options: [.envelope]
-            )
-            guard !infos.isEmpty else { return .staleOrAmbiguous }
-            guard infos.count == 1,
-                  let info = infos.first,
-                  info.uid?.value == uidValue
-            else {
-                throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
-            }
-            guard let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
-                IMAPFetchMapping.rfc822MessageId(from: info)
-            ) else {
-                return .staleOrAmbiguous
-            }
-            return .resolved(rfc822MessageId: rfc822MessageId)
-        }
-    }
-
     private enum ActionUIDResolution {
         case missing
         case ambiguous
@@ -2164,8 +2139,44 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     private struct ResolvedActionMessage {
-        let rfc822MessageId: String
+        /// The durable member string this resolution came from — a normalized
+        /// RFC Message-ID, or the raw UID token (PLAN_IDENTITY_HYBRID §3).
+        let memberIdentity: String
+        /// Non-nil only for RFC members: the identity used for the move
+        /// path's destination probe and post-move verification. A token
+        /// member has NO cross-mailbox identity (UIDs are mailbox-local), so
+        /// those steps are skipped for it — released-level semantics.
+        let verificationRFC822MessageId: String?
         let uid: UID
+    }
+
+    /// Resolve one opaque UID-token member in the CURRENTLY SELECTED source
+    /// mailbox (PLAN_IDENTITY_HYBRID §3). The token is meaningful only there —
+    /// a numerically identical UID in another mailbox can name a different
+    /// message. Canonical `UInt32` text → exact `UID FETCH`; a noncanonical
+    /// token or an empty fetch is authoritative stale; a contradictory fetch
+    /// result throws as retryable uncertainty.
+    private func resolveTokenMember(
+        _ token: String,
+        server: IMAPServer
+    ) async throws -> UID? {
+        guard let uidValue = UInt32(token),
+              uidValue > 0,
+              token == String(uidValue)
+        else { return nil }
+        let infos = try await server.fetchMessageInfosBulk(
+            using: UIDSet(UID(uidValue)),
+            options: [.envelope]
+        )
+        guard !infos.isEmpty else { return nil }
+        guard infos.count == 1,
+              let info = infos.first,
+              let uid = info.uid,
+              uid.value == uidValue
+        else {
+            throw ProviderError.actionIdentityResolutionFailed(token)
+        }
+        return uid
     }
 
     private enum ActionFlagOperation: Sendable {
@@ -2217,8 +2228,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Resolve the whole batch before its first mutation. Missing or ambiguous
-    /// messages are stale no-ops; transport/verification failures abort the batch.
+    /// Resolve the whole batch before its first mutation, routing each member
+    /// by SHAPE (`MessageIdentity.durableMemberKind`, PLAN_IDENTITY_HYBRID §3):
+    /// RFC members search by Message-ID; token members exact-`UID FETCH` in
+    /// the selected source mailbox. Missing/ambiguous/noncanonical members are
+    /// stale no-ops; transport/verification failures abort the batch.
     private func resolveActionMessages(
         _ ids: [String],
         server: IMAPServer
@@ -2226,13 +2240,28 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         var resolved: [ResolvedActionMessage] = []
         var seenUIDs = Set<UInt32>()
         for id in ids {
-            guard let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(id),
-                  case .exact(let uid) = try await resolveActionMessage(id, server: server),
-                  seenUIDs.insert(uid.value).inserted
-            else { continue }
-            resolved.append(
-                ResolvedActionMessage(rfc822MessageId: rfc822MessageId, uid: uid)
-            )
+            switch MessageIdentity.durableMemberKind(id) {
+            case .rfc(let rfc822MessageId):
+                guard case .exact(let uid) = try await resolveActionMessage(id, server: server),
+                      seenUIDs.insert(uid.value).inserted
+                else { continue }
+                resolved.append(ResolvedActionMessage(
+                    memberIdentity: rfc822MessageId,
+                    verificationRFC822MessageId: rfc822MessageId,
+                    uid: uid
+                ))
+            case .providerToken(let token):
+                guard let uid = try await resolveTokenMember(token, server: server),
+                      seenUIDs.insert(uid.value).inserted
+                else { continue }
+                resolved.append(ResolvedActionMessage(
+                    memberIdentity: token,
+                    verificationRFC822MessageId: nil,
+                    uid: uid
+                ))
+            case nil:
+                continue
+            }
         }
         return resolved
     }

@@ -901,13 +901,9 @@ struct AccountManagerQueueDrainTests {
         }
 
         let provider = MockEmailProvider()
-        // RFC822-shaped ids (not bare "A"/"B") — `drainPendingQueue()`'s
-        // finite legacy-identity conversion pass (unlike `executeSingleOp`
-        // called directly, as the sibling negative test above does) treats
-        // any non-RFC822-shaped id as a legacy provider id needing
-        // resolution and blocks forever waiting on
-        // `resolveLegacyMessageActionIdentity`, which `MockEmailProvider`
-        // does not implement.
+        // RFC822-shaped ids kept for realism (hybrid identity would admit a
+        // bare token just the same — the deleted legacy conversion pass no
+        // longer exists to care about member shape).
         let staleMessageId = "self-heal-\(UUID().uuidString.lowercased())@example.com"
         let laterMessageId = "self-heal-later-\(UUID().uuidString.lowercased())@example.com"
         // The provider would happily attempt the move if asked — the
@@ -988,7 +984,6 @@ struct AccountManagerQueueDrainTests {
         #expect(readCalls.contains { $0.ids == [secondMessageId] })
         let flaggedCalls = await provider.markedFlaggedIds
         #expect(flaggedCalls.contains { $0.ids == [firstMessageId] })
-        #expect(await provider.legacyIdentityResolutionCalls.isEmpty)
     }
 
     @Test("drainPendingQueue() (real): two concurrent calls are safe — the isDraining/needsRedrain guard serializes them, the op executes exactly once (no duplication, no crash)")
@@ -1130,79 +1125,29 @@ struct AccountManagerQueueDrainTests {
         "the DB-to-recent handoff must exist even without a local header")
     }
 
-    // MARK: - Released identity preparation gate
+    // MARK: - Preparation flight (crash recovery before any drain owner)
 
-    @Test("legacy move converts before its first claim and reaches the provider by RFC identity")
-    func legacyMoveConvertsBeforeClaimAndExecutesByRFCIdentity() async throws {
-        let (pool, dir, previous) = try await makeTestDB()
-        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
-
-        let suffix = UUID().uuidString.lowercased()
-        let accountId = "acc-preparation-convert-\(suffix)"
-        let providerMessageId = "provider-resource-\(suffix)"
-        let rfcMessageId = "converted-\(suffix)@example.com"
-        let source = "Source-\(suffix)"
-        let destination = "Destination-\(suffix)"
-        try await insertAccount(id: accountId, provider: .outlook, pool: pool)
-
-        let provider = MockEmailProvider(messageFieldScope: .account)
-        await provider.setLegacyIdentityResolution(
-            providerMessageId: providerMessageId,
-            result: .resolved(rfc822MessageId: "<\(rfcMessageId)>")
-        )
-        await provider.seedStatefulMessage(
-            id: rfcMessageId,
-            folder: source,
-            providerMessageId: providerMessageId
-        )
-        let operation = PendingOperation(
-            type: .move,
-            messageIds: [providerMessageId],
-            accountId: accountId,
-            folderPath: source,
-            destinationPath: destination
-        )
-        try insertOp(operation, pool: pool)
-
-        try await withRegisteredProvider(accountId: accountId, provider: provider) {
-            await AccountManager.shared.drainPendingQueue()
-        }
-
-        #expect(try fetchOp(operation.id, pool: pool) == nil)
-        #expect(await provider.statefulFolder(messageId: rfcMessageId) == destination)
-        let resolutions = await provider.legacyIdentityResolutionCalls
-        #expect(resolutions.count == 1)
-        guard resolutions.count == 1 else { return }
-        #expect(resolutions[0].providerMessageId == providerMessageId)
-        let moves = await provider.movedIds
-        #expect(moves.count == 1)
-        guard moves.count == 1 else { return }
-        #expect(moves[0].ids == [rfcMessageId])
-        #expect(moves[0].from == source)
-        #expect(moves[0].to == destination)
-    }
-
-    @Test("conversion uncertainty leaves every row unclaimed until a later trigger succeeds")
-    func conversionUncertaintyBlocksDrainThenLaterTriggerSucceeds() async throws {
+    /// Hybrid replacement for the deleted conversion-uncertainty test: a
+    /// released bare provider-ID row stranded `inFlight` by a crash is reset
+    /// to `queued` by the preparation flight and drains directly through the
+    /// token path — no conversion step exists. Independent Outbox/calendar
+    /// recovery behaves exactly as before.
+    @Test("crash-stranded legacy provider-ID row recovers and drains via the token path; outbox/calendar recovery stay independent")
+    func crashStrandedLegacyRowRecoversAndDrainsViaTokenPath() async throws {
         let (pool, dir, previous) = try await makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let suffix = UUID().uuidString.lowercased()
         let accountId = "acc-preparation-retry-\(suffix)"
         let providerMessageId = "provider-retry-\(suffix)"
-        let rfcMessageId = "retry-\(suffix)@example.com"
         let followerMessageId = "follower-\(suffix)@example.com"
         let source = "Source-\(suffix)"
         let destination = "Destination-\(suffix)"
         try await insertAccount(id: accountId, provider: .gmail, pool: pool)
 
         let provider = MockEmailProvider(messageFieldScope: .account)
-        await provider.setLegacyIdentityResolutionError(
-            providerMessageId: providerMessageId,
-            error: ProviderError.notConnected
-        )
         await provider.seedStatefulMessage(
-            id: rfcMessageId,
+            id: providerMessageId,
             folder: source,
             providerMessageId: providerMessageId
         )
@@ -1253,77 +1198,54 @@ struct AccountManagerQueueDrainTests {
 
         try await withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.reconcilePendingOperations()
-
-            let blocked = try fetchOp(operation.id, pool: pool)
-            #expect(blocked?.messageIds == [providerMessageId])
-            #expect(blocked?.status == PendingStatus.inFlight.rawValue)
-            let blockedFollower = try fetchOp(canonicalFollower.id, pool: pool)
-            #expect(blockedFollower?.messageIds == [followerMessageId])
-            #expect(blockedFollower?.status == PendingStatus.queued.rawValue)
-            #expect(await provider.movedIds.isEmpty)
-            #expect(await provider.markedFlaggedIds.isEmpty)
-            #expect(await AccountManager.shared.isDraining == false)
-            let independentRecovery = try await pool.read { db in
-                (
-                    try OutboxMessage.fetchOne(db, key: persistedOutbox.id),
-                    try PendingCalendarOperation.fetchOne(db, key: persistedCalendarOperation.id)
-                )
-            }
-            #expect(independentRecovery.0 == nil)
-            #expect(independentRecovery.1?.status == PendingStatus.queued.rawValue)
-
-            await provider.setLegacyIdentityResolution(
-                providerMessageId: providerMessageId,
-                result: .resolved(rfc822MessageId: rfcMessageId)
-            )
-            await AccountManager.shared.reconcilePendingOperations()
         }
 
+        // No conversion, no startup blocking: the bare provider-ID member
+        // reached the provider byte-exact as a token and both rows drained.
         #expect(try fetchOp(operation.id, pool: pool) == nil)
         #expect(try fetchOp(canonicalFollower.id, pool: pool) == nil)
-        #expect(await provider.statefulFolder(messageId: rfcMessageId) == destination)
-        let resolutions = await provider.legacyIdentityResolutionCalls
-        #expect(resolutions.count == 2)
+        #expect(await provider.statefulFolder(messageId: providerMessageId) == destination)
         let moves = await provider.movedIds
         #expect(moves.count == 1)
         guard moves.count == 1 else { return }
-        #expect(moves[0].ids == [rfcMessageId])
+        #expect(moves[0].ids == [providerMessageId])
         let flagCalls = await provider.markedFlaggedIds
         #expect(flagCalls.count == 1)
         guard flagCalls.count == 1 else { return }
         #expect(flagCalls[0].ids == [followerMessageId])
+        // Independent recovery unchanged: the sent outbox row is finalized
+        // (deleted) and the calendar op is reset to queued.
+        let independentRecovery = try await pool.read { db in
+            (
+                try OutboxMessage.fetchOne(db, key: persistedOutbox.id),
+                try PendingCalendarOperation.fetchOne(db, key: persistedCalendarOperation.id)
+            )
+        }
+        #expect(independentRecovery.0 == nil)
+        #expect(independentRecovery.1?.status == PendingStatus.queued.rawValue)
     }
 
-    @Test("concurrent drains share one blocked conversion flight and execute once")
-    func concurrentDrainsShareOneConversionFlightAndExecuteOnce() async throws {
+    /// Preparation single-flight, hybrid edition: with the converter gone,
+    /// preparation is crash recovery's gated write — block it by holding the
+    /// shared mutation gate. Both drains join ONE flight; release lets exactly
+    /// one owner execute the row once.
+    @Test("concurrent drains share one blocked preparation flight and execute once")
+    func concurrentDrainsShareOnePreparationFlightAndExecuteOnce() async throws {
         let (pool, dir, previous) = try await makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let suffix = UUID().uuidString.lowercased()
         let accountId = "acc-preparation-single-flight-\(suffix)"
-        let providerMessageId = "provider-single-flight-\(suffix)"
         let rfcMessageId = "single-flight-\(suffix)@example.com"
         let source = "Source-\(suffix)"
-        let destination = "Destination-\(suffix)"
         try await insertAccount(id: accountId, provider: .outlook, pool: pool)
 
-        let gate = QueuePreparationTestGate()
         let provider = MockEmailProvider(messageFieldScope: .account)
-        await provider.setLegacyIdentityResolutionHandler { _, _, _ in
-            await gate.arriveAndWaitForRelease()
-            return .resolved(rfc822MessageId: rfcMessageId)
-        }
-        await provider.seedStatefulMessage(
-            id: rfcMessageId,
-            folder: source,
-            providerMessageId: providerMessageId
-        )
         let operation = PendingOperation(
-            type: .move,
-            messageIds: [providerMessageId],
+            type: .markRead,
+            messageIds: [rfcMessageId],
             accountId: accountId,
-            folderPath: source,
-            destinationPath: destination
+            folderPath: source
         )
         try insertOp(operation, pool: pool)
 
@@ -1332,36 +1254,41 @@ struct AccountManagerQueueDrainTests {
             provider: provider
         )
 
+        let gate = AccountManager.shared.pendingOperationMutationGate
+        let lease = try await gate.acquire()
         let first = Task { await AccountManager.shared.drainPendingQueue() }
         var second: Task<Void, Never>?
+        var leaseReleased = false
         do {
+            // Preparation's crash-recovery gated write is now blocked on the
+            // lease we hold.
             try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
-                await gate.waitUntilArrival()
+                while gate.waiterCountForTesting < 1 {
+                    try Task.checkCancellation()
+                    await Task.yield()
+                }
             }
             let joined = Task { await AccountManager.shared.drainPendingQueue() }
             second = joined
             try await waitForPreparationParticipants(2)
 
-            #expect(await provider.legacyIdentityResolutionCalls.count == 1)
-            #expect(await provider.movedIds.isEmpty)
+            #expect(await provider.markedReadIds.isEmpty)
             #expect(try fetchOp(operation.id, pool: pool)?.status == PendingStatus.queued.rawValue)
             #expect(await AccountManager.shared.isDraining == false)
 
-            joined.cancel()
-            await gate.releaseAll()
+            gate.release(lease)
+            leaseReleased = true
             try await joinDrainTask(first)
             try await joinDrainTask(joined)
 
             #expect(await AccountManager.shared.needsRedrain == false)
             #expect(try fetchOp(operation.id, pool: pool) == nil)
-            #expect(await provider.legacyIdentityResolutionCalls.count == 1)
-            #expect(await provider.movedIds.count == 1)
-            #expect(await provider.statefulFolder(messageId: rfcMessageId) == destination)
+            #expect(await provider.markedReadIds.count == 1, "one shared flight, one owner, one execution")
             await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
         } catch {
             second?.cancel()
             first.cancel()
-            await gate.releaseAll()
+            if !leaseReleased { gate.release(lease) }
             try? await joinDrainTask(first)
             if let second {
                 try? await joinDrainTask(second)
@@ -1369,6 +1296,114 @@ struct AccountManagerQueueDrainTests {
             await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
             throw error
         }
+    }
+
+    /// PLAN_IDENTITY_HYBRID §7.6 — a released (≤1.6.38) bare provider-ID row
+    /// is, by shape, a tail member: it executes directly through the token
+    /// path with NO pre-drain conversion, no startup blocking, and its member
+    /// string reaches the provider byte-exact. A younger RFC row behind it
+    /// preserves FIFO order.
+    @Test("a released bare provider-ID row executes directly through the token path with no conversion")
+    func legacyProviderIdRowExecutesViaTokenPathWithoutConversion() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-token-legacy-\(suffix)"
+        let providerMessageId = "provider-resource-\(suffix)"
+        let followerRFCId = "follower-\(suffix)@example.com"
+        let source = "Source-\(suffix)"
+        let destination = "Destination-\(suffix)"
+        try await insertAccount(id: accountId, provider: .outlook, pool: pool)
+
+        let provider = MockEmailProvider(messageFieldScope: .account)
+        await provider.seedStatefulMessage(
+            id: providerMessageId,
+            folder: source,
+            providerMessageId: providerMessageId
+        )
+        let legacyRow = PendingOperation(
+            type: .move,
+            messageIds: [providerMessageId],
+            accountId: accountId,
+            folderPath: source,
+            destinationPath: destination
+        )
+        let followerRow = PendingOperation(
+            type: .markRead,
+            messageIds: [followerRFCId],
+            accountId: accountId,
+            folderPath: source
+        )
+        try insertOp(legacyRow, pool: pool)
+        try insertOp(followerRow, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        #expect(try fetchOp(legacyRow.id, pool: pool) == nil, "the bare provider-ID row must drain without any conversion step")
+        #expect(try fetchOp(followerRow.id, pool: pool) == nil)
+        let moves = await provider.movedIds
+        #expect(moves.count == 1)
+        guard moves.count == 1 else { return }
+        #expect(moves[0].ids == [providerMessageId], "the token member reaches the provider byte-exact")
+        #expect(moves[0].from == source)
+        #expect(moves[0].to == destination)
+        #expect(await provider.statefulFolder(messageId: providerMessageId) == destination)
+        // FIFO order preserved: the legacy row (older) executed before the follower.
+        let callLog = await provider.callLog
+        let moveIndex = callLog.firstIndex { $0.hasPrefix("move(") }
+        let readIndex = callLog.firstIndex { $0.hasPrefix("markRead(") }
+        #expect(moveIndex != nil && readIndex != nil)
+        if let moveIndex, let readIndex {
+            #expect(moveIndex < readIndex, "insertion-order FIFO: the released row drains first")
+        }
+    }
+
+    /// PLAN_IDENTITY_HYBRID §7.8 — a member containing `@` that fails RFC
+    /// validation (double brackets) classifies as a TOKEN, is looked up as an
+    /// exact opaque string, and no-ops authoritatively — it must never be
+    /// re-normalized into the decoy message whose real RFC identity is the
+    /// inner string.
+    @Test("a malformed with-@ member classifies as a token: zero-match no-op, decoy untouched")
+    func malformedAtMemberClassifiesAsTokenZeroMatchNoOp() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-token-malformed-\(suffix)"
+        let decoyRFC = "decoy-\(suffix)@example.com"
+        let decoyProviderId = "gmail-decoy-\(suffix)"
+        // Contains exactly the decoy's RFC identity inside double brackets —
+        // fails `durableActionRFC822MessageId`, so it is a token. A buggy
+        // "normalize harder" path would strip to the decoy's identity and
+        // mutate the wrong message.
+        let malformedMember = "<<\(decoyRFC)>>"
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: decoyRFC, providerMessageId: decoyProviderId, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+
+        let operation = PendingOperation(
+            type: .markRead,
+            messageIds: [malformedMember],
+            accountId: accountId,
+            folderPath: "INBOX"
+        )
+        try insertOp(operation, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        #expect(try fetchOp(operation.id, pool: pool) == nil, "an exact zero-match token is authoritative stale — the row leaves the queue")
+        let decoy = server.snapshots(rfc822MessageId: decoyRFC)
+        #expect(decoy.count == 1)
+        guard decoy.count == 1 else { return }
+        #expect(decoy[0].labels.contains("UNREAD"), "the decoy sharing the inner identity must NOT be mutated")
     }
 
     @Test("a cancelled caller cannot own a drain after prepared fast-path authorization")
@@ -1545,18 +1580,16 @@ struct AccountManagerQueueDrainTests {
         let secondSuffix = UUID().uuidString.lowercased()
         let secondAccountId = "acc-preparation-db-two-\(secondSuffix)"
         let providerMessageId = "provider-db-two-\(secondSuffix)"
-        let rfcMessageId = "db-two-\(secondSuffix)@example.com"
         let source = "Source-\(secondSuffix)"
         let destination = "Destination-\(secondSuffix)"
         try await insertAccount(id: secondAccountId, provider: .gmail, pool: secondPool)
 
         let secondProvider = MockEmailProvider(messageFieldScope: .account)
-        await secondProvider.setLegacyIdentityResolution(
-            providerMessageId: providerMessageId,
-            result: .resolved(rfc822MessageId: rfcMessageId)
-        )
+        // Hybrid: the bare provider-ID row is a token member — no conversion
+        // exists; the fresh database still requires its own preparation
+        // (crash recovery) before this row may drain.
         await secondProvider.seedStatefulMessage(
-            id: rfcMessageId,
+            id: providerMessageId,
             folder: source,
             providerMessageId: providerMessageId
         )
@@ -1577,8 +1610,7 @@ struct AccountManagerQueueDrainTests {
         }
 
         #expect(try fetchOp(secondOperation.id, pool: secondPool) == nil)
-        #expect(await secondProvider.legacyIdentityResolutionCalls.count == 1)
-        #expect(await secondProvider.statefulFolder(messageId: rfcMessageId) == destination)
+        #expect(await secondProvider.statefulFolder(messageId: providerMessageId) == destination)
     }
 
     @Test("an older blocked database flight cannot clear or publish over its replacement")
@@ -1591,22 +1623,22 @@ struct AccountManagerQueueDrainTests {
         let firstSuffix = UUID().uuidString.lowercased()
         let firstAccountId = "acc-preparation-overlap-one-\(firstSuffix)"
         let firstProviderMessageId = "provider-overlap-one-\(firstSuffix)"
-        let firstRfcMessageId = "overlap-one-\(firstSuffix)@example.com"
         let firstSource = "Source-one-\(firstSuffix)"
         let firstDestination = "Destination-one-\(firstSuffix)"
         try await insertAccount(id: firstAccountId, provider: .gmail, pool: firstPool)
 
         let firstGate = QueuePreparationTestGate()
         let firstProvider = MockEmailProvider(messageFieldScope: .account)
-        await firstProvider.setLegacyIdentityResolutionHandler { _, _, _ in
-            await firstGate.arriveAndWaitForRelease()
-            return .resolved(rfc822MessageId: firstRfcMessageId)
-        }
         await firstProvider.seedStatefulMessage(
-            id: firstRfcMessageId,
+            id: firstProviderMessageId,
             folder: firstSource,
             providerMessageId: firstProviderMessageId
         )
+        // Hold the FIRST database's preparation flight open (the deleted
+        // legacy converter used to provide this suspension point).
+        await AccountManager.shared.setPendingQueuePreparationHookForTesting {
+            await firstGate.arriveAndWaitForRelease()
+        }
         let firstOperation = PendingOperation(
             type: .move,
             messageIds: [firstProviderMessageId],
@@ -1637,21 +1669,21 @@ struct AccountManagerQueueDrainTests {
             let accountId = "acc-preparation-overlap-two-\(secondSuffix)"
             secondAccountId = accountId
             let providerMessageId = "provider-overlap-two-\(secondSuffix)"
-            let rfcMessageId = "overlap-two-\(secondSuffix)@example.com"
             let source = "Source-two-\(secondSuffix)"
             let destination = "Destination-two-\(secondSuffix)"
             try await insertAccount(id: accountId, provider: .outlook, pool: fixture.pool)
 
             let secondProvider = MockEmailProvider(messageFieldScope: .account)
-            await secondProvider.setLegacyIdentityResolutionHandler { _, _, _ in
-                await secondGate.arriveAndWaitForRelease()
-                return .resolved(rfc822MessageId: rfcMessageId)
-            }
             await secondProvider.seedStatefulMessage(
-                id: rfcMessageId,
+                id: providerMessageId,
                 folder: source,
                 providerMessageId: providerMessageId
             )
+            // Swap the flight hook: the REPLACEMENT database's preparation
+            // now blocks on the second gate (captured at flight creation).
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting {
+                await secondGate.arriveAndWaitForRelease()
+            }
             let secondOperation = PendingOperation(
                 type: .move,
                 messageIds: [providerMessageId],
@@ -1688,13 +1720,13 @@ struct AccountManagerQueueDrainTests {
             )
             #expect(await AccountManager.shared.isDraining == false)
 
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting(nil)
             await secondGate.releaseAll()
             try await joinDrainTask(replacementDrain)
 
             #expect(try fetchOp(secondOperation.id, pool: fixture.pool) == nil)
-            #expect(await secondProvider.legacyIdentityResolutionCalls.count == 1)
             #expect(await secondProvider.movedIds.count == 1)
-            #expect(await secondProvider.statefulFolder(messageId: rfcMessageId) == destination)
+            #expect(await secondProvider.statefulFolder(messageId: providerMessageId) == destination)
 
             await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
             await AccountManager.shared.unregisterProviderForTesting(accountId: firstAccountId)
@@ -1703,6 +1735,7 @@ struct AccountManagerQueueDrainTests {
         } catch {
             firstDrain.cancel()
             secondDrain?.cancel()
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting(nil)
             await firstGate.releaseAll()
             await secondGate.releaseAll()
             try? await joinDrainTask(firstDrain)
@@ -1845,7 +1878,6 @@ struct AccountManagerQueueDrainTests {
         let thirdAccountId = "acc-redrain-third-\(suffix)"
         let firstMessageId = "redrain-first-\(suffix)@example.com"
         let secondProviderMessageId = "provider-redrain-second-\(suffix)"
-        let secondRfcMessageId = "redrain-second-\(suffix)@example.com"
         let thirdMessageId = "redrain-third-\(suffix)@example.com"
 
         try await insertAccount(id: secondAccountId, provider: .outlook, pool: secondPool)
@@ -1856,10 +1888,6 @@ struct AccountManagerQueueDrainTests {
             await firstProviderGate.arriveAndWaitForRelease()
         }
         let secondProvider = MockEmailProvider()
-        await secondProvider.setLegacyIdentityResolutionHandler { _, _, _ in
-            await secondPreparationGate.arriveAndWaitForRelease()
-            return .resolved(rfc822MessageId: secondRfcMessageId)
-        }
         let thirdProvider = MockEmailProvider()
 
         let firstOperation = PendingOperation(
@@ -1914,6 +1942,11 @@ struct AccountManagerQueueDrainTests {
             #expect(await AccountManager.shared.needsRedrain)
 
             AppDatabase.shared.withLock { $0 = secondDatabase }
+            // Hold database B's preparation flight open (the deleted legacy
+            // converter used to provide this suspension point).
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting {
+                await secondPreparationGate.arriveAndWaitForRelease()
+            }
             let secondDrain = Task { await AccountManager.shared.drainPendingQueue() }
             secondCaller = secondDrain
             try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
@@ -1924,6 +1957,9 @@ struct AccountManagerQueueDrainTests {
             try await waitForPreparationParticipants(2)
 
             AppDatabase.shared.withLock { $0 = thirdDatabase }
+            // Database C's flight must NOT block — clear the hook before it
+            // is created (each flight captures the hook at creation).
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting(nil)
             let thirdDrain = Task { await AccountManager.shared.drainPendingQueue() }
             thirdCaller = thirdDrain
             try await joinDrainTask(thirdDrain)
@@ -1943,6 +1979,7 @@ struct AccountManagerQueueDrainTests {
             owner.cancel()
             secondCaller?.cancel()
             thirdCaller?.cancel()
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting(nil)
             await firstProviderGate.releaseAll()
             await secondPreparationGate.releaseAll()
             try? await joinDrainTask(owner)

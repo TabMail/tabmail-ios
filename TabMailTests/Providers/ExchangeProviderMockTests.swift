@@ -419,166 +419,134 @@ struct ExchangeProviderActionResolutionTests {
         return #"{"value":[\#(rows.joined(separator: ","))]\#(next)}"#
     }
 
-    @Test("legacy Graph id resolves to RFC identity in recorded source")
-    func legacyGraphIdResolvesInsideSource() async throws {
+    @Test("token member resolves by exact resource id in the recorded source")
+    func tokenMemberResolvesInsideSource() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "graph/legacy+token="
-        let rfc822 = "Legacy-Graph@Example.COM"
+        let token = "graph/hybrid+token="
         http.register(
-            path: "/messages/graph%2Flegacy%2Btoken%3D?",
+            path: "/messages/graph%2Fhybrid%2Btoken%3D?",
             response: .json(raw: row(
-                id: providerId,
-                rfc822MessageId: rfc822,
+                id: token,
+                rfc822MessageId: "hybrid-graph@example.com",
                 folder: "source-folder"
             ))
         )
-
-        let result = try await provider(http).resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "source-folder",
-            destinationFolder: "destination-folder"
+        http.register(
+            path: "/messages/graph%2Fhybrid%2Btoken%3D",
+            method: "PATCH",
+            response: .json(raw: "{}")
         )
 
-        #expect(result == .resolved(rfc822MessageId: rfc822))
-        let call = try #require(http.recordedCalls().first)
-        let components = try #require(URLComponents(string: call.url))
+        try await provider(http).markRead(ids: [token], folder: "source-folder")
+
+        let calls = http.recordedCalls()
+        let lookup = try #require(calls.first)
+        let components = try #require(URLComponents(string: lookup.url))
         let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map {
             ($0.name, $0.value ?? "")
         })
-        #expect(call.url.contains("graph%2Flegacy%2Btoken%3D"))
-        #expect(query["$select"] == "id,parentFolderId,internetMessageId")
+        #expect(lookup.url.contains("graph%2Fhybrid%2Btoken%3D"))
+        #expect(query["$select"] == "id,parentFolderId")
+        let patchCalls = calls.filter { $0.method == "PATCH" }
+        #expect(patchCalls.count == 1)
+        // The token path never issues an internetMessageId filter lookup.
+        #expect(!calls.contains { $0.url.contains("internetMessageId") || $0.url.contains("%24filter") || $0.url.contains("$filter") })
     }
 
-    @Test("legacy Graph id resolves in recorded optimistic destination")
-    func legacyGraphIdResolvesInsideDestination() async throws {
+    @Test("token member found only in the optimistic destination is stale — actions use source scope only")
+    func tokenMemberInDestinationOnlyIsStale() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "graph-legacy-destination"
-        let rfc822 = "legacy-destination@example.com"
+        let token = "graph-token-destination"
         http.register(
-            path: "/messages/\(providerId)?",
+            path: "/messages/\(token)?",
             response: .json(raw: row(
-                id: providerId,
-                rfc822MessageId: rfc822,
+                id: token,
+                rfc822MessageId: "token-destination@example.com",
                 folder: "destination-folder"
             ))
         )
 
-        let result = try await provider(http).resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "source-folder",
-            destinationFolder: "destination-folder"
-        )
+        try await provider(http).markRead(ids: [token], folder: "source-folder")
 
-        #expect(result == .resolved(rfc822MessageId: rfc822))
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(!calls.contains { $0.method == "PATCH" })
     }
 
-    @Test("legacy Graph id outside both recorded folders is stale")
-    func legacyGraphIdOutsideScopeIsStale() async throws {
+    @Test("token member 404 is authoritative stale")
+    func tokenMemberGoneIsStale() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "graph-legacy-elsewhere"
+        let token = "graph-token-gone"
+        http.register(path: "/messages/\(token)?", response: .status(404))
+
+        try await provider(http).markRead(ids: [token], folder: "source-folder")
+
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(!calls.contains { $0.method == "PATCH" })
+    }
+
+    @Test("token member ErrorInvalidIdMalformed is authoritative stale")
+    func tokenMemberInvalidIdMalformedIsStale() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "graph-token-malformed-id"
         http.register(
-            path: "/messages/\(providerId)?",
-            response: .json(raw: row(
-                id: providerId,
-                rfc822MessageId: "legacy-elsewhere@example.com",
-                folder: "other-folder"
-            ))
+            path: "/messages/\(token)?",
+            response: .bytes(
+                Data(#"{"error":{"code":"ErrorInvalidIdMalformed","message":"Id is malformed."}}"#.utf8),
+                contentType: "application/json",
+                statusCode: 400
+            )
         )
 
-        let result = try await provider(http).resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "source-folder",
-            destinationFolder: "destination-folder"
-        )
+        // A structurally-never-valid resource id can never be executed —
+        // authoritative stale no-op, exactly the churned-mid-queue case.
+        try await provider(http).markRead(ids: [token], folder: "source-folder")
 
-        #expect(result == .staleOrAmbiguous)
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(!calls.contains { $0.method == "PATCH" })
     }
 
-    @Test("legacy Graph id 404 is authoritative stale")
-    func legacyGraphIdGoneIsStale() async throws {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        let providerId = "graph-legacy-gone"
-        http.register(path: "/messages/\(providerId)?", response: .status(404))
-
-        let result = try await provider(http).resolveLegacyMessageActionIdentity(
-            providerMessageId: providerId,
-            sourceFolder: "source-folder",
-            destinationFolder: nil
-        )
-
-        #expect(result == .staleOrAmbiguous)
-    }
-
-    @Test("malformed legacy Graph metadata is retryable uncertainty")
-    func malformedLegacyGraphMetadataThrows() async {
+    @Test("contradictory token metadata is retryable uncertainty")
+    func contradictoryTokenMetadataThrows() async {
         let responses = [
-            #"{"id":"graph-legacy-malformed","parentFolderId":"source-folder"}"#,
-            #"{"id":"different","internetMessageId":"<legacy@example.com>","parentFolderId":"source-folder"}"#,
-            #"{"id":"graph-legacy-malformed","internetMessageId":"opaque","parentFolderId":"source-folder"}"#,
-            #"{"id":"graph-legacy-malformed","internetMessageId":"<legacy@example.com>","parentFolderId":" "}"#,
-            #"{"id":"graph-legacy-malformed","internetMessageId":"<legacy@example.com>","parentFolderId":"source\u0001folder"}"#,
+            #"{"id":"different","internetMessageId":"<hybrid@example.com>","parentFolderId":"source-folder"}"#,
+            #"{"id":"graph-token-contradictory","internetMessageId":"<hybrid@example.com>","parentFolderId":" "}"#,
+            #"{"id":"graph-token-contradictory","internetMessageId":"<hybrid@example.com>","parentFolderId":"source\u0001folder"}"#,
         ]
         for response in responses {
             let http = FakeHTTP.Scenario()
             defer { http.close() }
             http.register(
-                path: "/messages/graph-legacy-malformed?",
+                path: "/messages/graph-token-contradictory?",
                 response: .json(raw: response)
             )
 
             do {
-                _ = try await provider(http).resolveLegacyMessageActionIdentity(
-                    providerMessageId: "graph-legacy-malformed",
-                    sourceFolder: "source-folder",
-                    destinationFolder: nil
+                try await provider(http).markRead(
+                    ids: ["graph-token-contradictory"],
+                    folder: "source-folder"
                 )
-                Issue.record("malformed legacy Graph metadata must throw")
+                Issue.record("contradictory token metadata must throw")
             } catch {}
         }
     }
 
-    @Test("invalid legacy Graph folder scope throws before networking")
-    func invalidLegacyGraphFolderScopeThrowsBeforeNetworking() async {
-        let inputs = [
-            (source: " ", destination: Optional("destination-folder")),
-            (source: "source\u{0001}folder", destination: Optional("destination-folder")),
-            (source: "source-folder", destination: Optional(" destination-folder")),
-            (source: "source-folder", destination: Optional("destination\u{0001}folder")),
-        ]
-        for input in inputs {
-            let http = FakeHTTP.Scenario()
-            defer { http.close() }
-
-            do {
-                _ = try await provider(http).resolveLegacyMessageActionIdentity(
-                    providerMessageId: "graph-legacy-invalid-scope",
-                    sourceFolder: input.source,
-                    destinationFolder: input.destination
-                )
-                Issue.record("invalid legacy Graph folder scope must throw")
-            } catch {}
-            #expect(http.recordedCalls().isEmpty)
-        }
-    }
-
-    @Test("non-gone legacy Graph lookup failure is retryable uncertainty")
-    func legacyGraphLookupFailureThrows() async {
+    @Test("non-gone token lookup failure is retryable uncertainty")
+    func tokenLookupFailureThrows() async {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let providerId = "graph-legacy-uncertain"
-        http.register(path: "/messages/\(providerId)?", response: .status(400))
+        let token = "graph-token-uncertain"
+        http.register(path: "/messages/\(token)?", response: .status(500))
 
         do {
-            _ = try await provider(http).resolveLegacyMessageActionIdentity(
-                providerMessageId: providerId,
-                sourceFolder: "source-folder",
-                destinationFolder: nil
-            )
-            Issue.record("non-gone legacy Graph failure must throw")
+            try await provider(http).markRead(ids: [token], folder: "source-folder")
+            Issue.record("non-gone token lookup failure must throw")
         } catch {}
     }
 

@@ -201,9 +201,9 @@ struct ReadUnreadPersistenceTests {
         #expect(ops[1].type == .markUnread)
     }
 
-    @Test("markRead refuses a missing RFC identity before optimistic mutation")
+    @Test("markRead admits a missing-RFC row as a provider-ID token member (hybrid identity)")
     @MainActor
-    func markReadMissingRfcDoesNotMutateOrQueue() async throws {
+    func markReadMissingRfcAdmitsProviderToken() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
         let cleared = Mutex<[(String, String)]>([])
         NSEDataBridge.clearNotificationRecorderForTesting.withLock { recorder in
@@ -229,14 +229,21 @@ struct ReadUnreadPersistenceTests {
             let row = try MessageHeader.fetchOne(db, key: header.id)
             return (row?.isRead, try PendingOperation.fetchAll(db))
         }
-        #expect(result.0 == false)
-        #expect(result.1.isEmpty)
-        #expect(cleared.withLock { $0 }.isEmpty)
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): the provider ID admits
+        // as an opaque token — the optimistic flip lands, one durable row
+        // carries the raw token, and the delivered notification clears.
+        #expect(result.0 == true)
+        #expect(result.1.count == 1)
+        if result.1.count == 1 {
+            #expect(result.1[0].type == .markRead)
+            #expect(result.1[0].messageIds == ["provider-only-id"])
+        }
+        #expect(cleared.withLock { $0 }.count == 1)
     }
 
-    @Test("markRead refuses malformed RFC identity before optimistic mutation")
+    @Test("markRead admits a malformed-RFC row as a provider-ID token member (hybrid identity)")
     @MainActor
-    func markReadMalformedRfcDoesNotMutateOrQueue() async throws {
+    func markReadMalformedRfcAdmitsProviderToken() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir) }
 
@@ -253,11 +260,14 @@ struct ReadUnreadPersistenceTests {
             let row = try MessageHeader.fetchOne(db, key: header.id)
             return (row?.isRead, try PendingOperation.fetchAll(db))
         }
-        #expect(result.0 == false)
-        #expect(result.1.isEmpty)
+        #expect(result.0 == true)
+        #expect(result.1.count == 1)
+        if result.1.count == 1 {
+            #expect(result.1[0].messageIds == ["transport-malformed"], "byte-exact provider-ID token, never the malformed RFC string")
+        }
     }
 
-    @Test("markUnread refuses an invalid RFC identity before optimistic mutation")
+    @Test("markUnread admits an invalid-RFC row as a provider-ID token member (hybrid identity)")
     @MainActor
     func markUnreadInvalidRfcDoesNotMutateOrQueue() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
@@ -276,11 +286,15 @@ struct ReadUnreadPersistenceTests {
             let row = try MessageHeader.fetchOne(db, key: header.id)
             return (row?.isRead, try PendingOperation.fetchAll(db))
         }
-        #expect(result.0 == true)
-        #expect(result.1.isEmpty)
+        #expect(result.0 == false)
+        #expect(result.1.count == 1)
+        if result.1.count == 1 {
+            #expect(result.1[0].type == .markUnread)
+            #expect(result.1[0].messageIds == ["transport-unread-invalid"])
+        }
     }
 
-    @Test("markFlagged refuses a missing RFC identity before optimistic mutation")
+    @Test("markFlagged admits a missing-RFC row as a provider-ID token member (hybrid identity)")
     @MainActor
     func markFlaggedMissingRfcDoesNotMutateOrQueue() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
@@ -299,8 +313,12 @@ struct ReadUnreadPersistenceTests {
             let row = try MessageHeader.fetchOne(db, key: header.id)
             return (row?.isFlagged, try PendingOperation.fetchAll(db))
         }
-        #expect(result.0 == false)
-        #expect(result.1.isEmpty)
+        #expect(result.0 == true)
+        #expect(result.1.count == 1)
+        if result.1.count == 1 {
+            #expect(result.1[0].type == .markFlagged)
+            #expect(result.1[0].messageIds == ["transport-flag-invalid"])
+        }
     }
 
     @Test("markRead refuses a whitespace-only source before optimistic mutation")
@@ -327,9 +345,9 @@ struct ReadUnreadPersistenceTests {
         #expect(result.1.isEmpty)
     }
 
-    @Test("markRead mixed batch mutates and queues only members with valid RFC identity")
+    @Test("markRead mixed batch mutates and queues BOTH shapes: normalized RFC + provider-ID token")
     @MainActor
-    func markReadMixedBatchFiltersBeforeMutation() async throws {
+    func markReadMixedBatchQueuesBothShapes() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir) }
 
@@ -356,10 +374,11 @@ struct ReadUnreadPersistenceTests {
             )
         }
         #expect(result.0[valid.messageId] == true)
-        #expect(result.0[refused.messageId] == false)
+        #expect(result.0[refused.messageId] == true, "the token member's optimistic flip lands too (hybrid identity)")
         #expect(result.1.count == 1)
         guard result.1.count == 1 else { return }
-        #expect(result.1[0].messageIds == ["Durable.Valid@Example.COM"])
+        #expect(Set(result.1[0].messageIds) == ["Durable.Valid@Example.COM", "transport-refused"],
+                "one batch row carries the normalized RFC member and the byte-exact token")
     }
 
     // MARK: - rfc822 sibling expansion (real path)

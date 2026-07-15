@@ -330,8 +330,8 @@ struct InboxGestureActionTests {
         MessageIdentity.durableActionRFC822MessageId(message.rfc822MessageId)!
     }
 
-    @Test("RFC admission refuses missing/malformed single-message gestures before snapshot, journal, or Undo mutation")
-    func invalidRFCSingleGesturesAreSideEffectFree() async throws {
+    @Test("admission still refuses blank scope and blank destination before snapshot, journal, or Undo mutation — the hybrid rule relaxes only the identity leg")
+    func blankScopeGesturesAreSideEffectFree() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             restoreTestDB(previous: previous, dir: dir)
@@ -339,14 +339,6 @@ struct InboxGestureActionTests {
         }
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
 
-        let missing = makeDurableHeader(
-            folder: inbox, messageId: "m-rfc-missing", isRead: false,
-            isFlagged: false, includeRFCIdentity: false
-        )
-        let malformed = makeDurableHeader(
-            folder: inbox, messageId: "m-rfc-malformed", isRead: false,
-            rfc822MessageId: "<broken@example.com"
-        )
         let blankSource: MessageHeader = {
             var header = makeDurableHeader(
                 folder: inbox, messageId: "m-source-blank", isRead: false
@@ -358,29 +350,23 @@ struct InboxGestureActionTests {
             folder: inbox, messageId: "m-blank-destination", isRead: false
         )
         try await pool.writeWithoutTransaction { db in
-            try missing.insert(db)
-            try malformed.insert(db)
             try blankSource.insert(db)
             try valid.insert(db)
         }
 
         let vm = InboxViewModel(folders: [inbox])
-        #expect(!vm.durableMessageActionIsAdmissible(missing.id))
-        #expect(!vm.durableMessageActionIsAdmissible(malformed.id))
         #expect(!vm.durableMessageActionIsAdmissible(blankSource.id))
-        #expect(vm.admissibleDurableMessageActionIds([missing.id, malformed.id, blankSource.id]).isEmpty)
+        #expect(vm.admissibleDurableMessageActionIds([blankSource.id]).isEmpty)
 
-        vm.toggleRead(missing.id)
-        vm.toggleFlag(missing.id)
-        #expect(!vm.archive(missing.id))
-        #expect(!vm.move(malformed.id, toFolderPath: "Archive"))
+        vm.toggleRead(blankSource.id)
+        vm.toggleFlag(blankSource.id)
         #expect(!vm.archive(blankSource.id))
         #expect(!vm.move(valid.id, toFolderPath: " \n"))
         #expect(vm.moveThread([valid.id], toFolderPath: "\t") == [valid.id])
 
-        let missingSnapshot = vm.loadedMessages.first { $0.id == missing.id }
-        #expect(missingSnapshot?.isRead == false)
-        #expect(missingSnapshot?.isFlagged == false)
+        let blankSnapshot = vm.loadedMessages.first { $0.id == blankSource.id }
+        #expect(blankSnapshot?.isRead == false)
+        #expect(blankSnapshot?.isFlagged == false)
         #expect(AccountManager.shared.intentionJournal.recordsForTesting().isEmpty)
         #expect(AccountManager.shared.snapshotOverlay().isEmpty)
         #expect(UndoService.shared.undoStack.isEmpty)
@@ -389,8 +375,8 @@ struct InboxGestureActionTests {
         #expect(providerOps.isEmpty)
     }
 
-    @Test("RFC admission filters a mixed archive thread and acts only on the valid member")
-    func mixedRFCArchiveThreadActsOnlyOnValidMember() async throws {
+    @Test("hybrid admission acts on a mixed archive thread: the RFC member queues normalized, the malformed member queues its provider ID token")
+    func mixedRFCArchiveThreadActsOnBothMembers() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             restoreTestDB(previous: previous, dir: dir)
@@ -399,41 +385,41 @@ struct InboxGestureActionTests {
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
 
         let valid = makeDurableHeader(folder: inbox, messageId: "m-rfc-valid")
-        let invalid = makeDurableHeader(
+        let tail = makeDurableHeader(
             folder: inbox, messageId: "m-rfc-invalid",
             rfc822MessageId: "bad@example.com>"
         )
         try await pool.writeWithoutTransaction { db in
             try valid.insert(db)
-            try invalid.insert(db)
+            try tail.insert(db)
         }
 
         let vm = InboxViewModel(folders: [inbox])
-        #expect(vm.admissibleDurableMessageActionIds([valid.id, invalid.id]) == [valid.id],
-                "the View must hide only the admitted member")
+        #expect(vm.admissibleDurableMessageActionIds([valid.id, tail.id]) == [valid.id, tail.id],
+                "both members admit under the hybrid rule")
 
-        let skipped = vm.archiveThread([valid.id, invalid.id])
-        #expect(skipped == [invalid.id])
+        let skipped = vm.archiveThread([valid.id, tail.id])
+        #expect(skipped.isEmpty)
         #expect(
-            UndoService.shared.currentAction?.commands.flatMap { $0.members.map(\.originalHeaderId) } == [valid.id]
+            UndoService.shared.currentAction?.commands.flatMap { $0.members.map(\.originalHeaderId) } == [valid.id, tail.id]
         )
-        #expect(AccountManager.shared.snapshotOverlay()[invalid.id] == nil)
 
         await drainWriteQueue()
         let final = try await pool.read { db in
             (
                 try MessageHeader.fetchOne(db, key: valid.id),
-                try MessageHeader.fetchOne(db, key: invalid.id),
+                try MessageHeader.fetchOne(db, key: tail.id),
                 try PendingOperation.fetchAll(db)
             )
         }
         #expect(final.0?.folderId == archive.id)
-        #expect(final.1?.folderId == inbox.id)
-        #expect(final.2.flatMap { $0.messageIds } == ["acc1-m-rfc-valid@example.com"])
+        #expect(final.1?.folderId == archive.id, "the tail member's optimistic move must land too")
+        #expect(Set(final.2.flatMap { $0.messageIds }) == ["acc1-m-rfc-valid@example.com", "m-rfc-invalid"],
+                "normalized RFC member + byte-exact provider token")
     }
 
-    @Test("removeUserLabel refuses invalid RFC before visible/durable mutation and queues normalized RFC for a valid row")
-    func removeUserLabelUsesRFCAdmissionAtPublicBoundary() async throws {
+    @Test("removeUserLabel queues normalized RFC for a valid row and the provider-ID token for a tail row; foreign-account labels still refuse")
+    func removeUserLabelUsesHybridAdmissionAtPublicBoundary() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             restoreTestDB(previous: previous, dir: dir)
@@ -486,8 +472,10 @@ struct InboxGestureActionTests {
         #expect(afterAccountRefusal.1.isEmpty)
         #expect(vm.loadedMessages.first { $0.id == valid.id }?.userLabels.map(\.id) == [label.id])
 
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): the identity-less row is
+        // no longer refused — the removal proceeds with its provider-ID token.
         await vm.removeUserLabel(label, from: invalidSnapshot)
-        let afterRefusal = try await pool.read { db in
+        let afterTailRemoval = try await pool.read { db in
             (
                 try MessageUserLabel
                     .filter(Column("messageId") == invalid.id && Column("userLabelId") == label.id)
@@ -495,9 +483,13 @@ struct InboxGestureActionTests {
                 try PendingOperation.fetchAll(db)
             )
         }
-        #expect(afterRefusal.0 == 1)
-        #expect(afterRefusal.1.isEmpty)
-        #expect(vm.loadedMessages.first { $0.id == invalid.id }?.userLabels.map(\.id) == [label.id])
+        #expect(afterTailRemoval.0 == 0)
+        #expect(afterTailRemoval.1.count == 1)
+        if afterTailRemoval.1.count == 1 {
+            #expect(afterTailRemoval.1[0].type == .removeUserLabel)
+            #expect(afterTailRemoval.1[0].messageIds == ["m-label-rfc-missing"], "byte-exact provider-ID token")
+        }
+        #expect(vm.loadedMessages.first { $0.id == invalid.id }?.userLabels.isEmpty == true)
 
         await vm.removeUserLabel(label, from: validSnapshot)
         let afterSuccess = try await pool.read { db in
@@ -509,10 +501,9 @@ struct InboxGestureActionTests {
             )
         }
         #expect(afterSuccess.0 == 0)
-        let removeOps = afterSuccess.1.filter { $0.type == .removeUserLabel }
+        let removeOps = afterSuccess.1.filter { $0.type == .removeUserLabel && $0.messageIds == ["valid-label@example.com"] }
         #expect(removeOps.count == 1)
         guard removeOps.count == 1 else { return }
-        #expect(removeOps[0].messageIds == ["valid-label@example.com"])
         #expect(removeOps[0].accountId == "acc1")
         #expect(removeOps[0].folderPath == inbox.path)
         #expect(removeOps[0].userLabelId == label.id)
@@ -5045,5 +5036,356 @@ struct InboxGestureActionTests {
         #expect(finalC?.folderId == inbox2.id, "acc2 member restores to acc2's own inbox, not acc1's")
 
         #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+    }
+
+    // MARK: - Hybrid durable identity — provider-token tail members (PLAN_IDENTITY_HYBRID)
+
+    /// §7.1 — Tail admission: a header whose `rfc822MessageId` is missing or
+    /// malformed is no longer refused. The archive/toggle gestures admit the
+    /// provider ID (`header.messageId`) as an opaque token member, the
+    /// optimistic local flip happens, and the durable row carries the raw
+    /// token string.
+    @Test("tail admission: missing/malformed RFC identity admits the provider ID as a token member with an optimistic flip")
+    func tailAdmissionQueuesProviderTokenMember() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+
+        let missing = makeDurableHeader(
+            folder: inbox, messageId: "m-tail-missing", isRead: false,
+            includeRFCIdentity: false
+        )
+        let malformed = makeDurableHeader(
+            folder: inbox, messageId: "m-tail-malformed", isRead: false,
+            rfc822MessageId: "<broken@example.com"
+        )
+        // Blank source scope stays refused — the hybrid only relaxes the
+        // identity leg, never the account/folder scope legs.
+        let blankSource: MessageHeader = {
+            var header = makeDurableHeader(
+                folder: inbox, messageId: "m-tail-source-blank", isRead: false,
+                includeRFCIdentity: false
+            )
+            header.folderPath = "   "
+            return header
+        }()
+        try await pool.writeWithoutTransaction { db in
+            try missing.insert(db)
+            try malformed.insert(db)
+            try blankSource.insert(db)
+        }
+
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(vm.durableMessageActionIsAdmissible(missing.id))
+        #expect(vm.durableMessageActionIsAdmissible(malformed.id))
+        #expect(!vm.durableMessageActionIsAdmissible(blankSource.id))
+
+        // Archive gesture on the identity-less row: admits, hides, pushes Undo.
+        #expect(vm.archive(missing.id))
+        #expect(UndoService.shared.currentAction?.totalMemberCount == 1)
+        // Setter gesture on the malformed-RFC row: optimistic flip happens.
+        vm.toggleRead(malformed.id)
+        #expect(vm.loadedMessages.first { $0.id == malformed.id }?.isRead == true)
+
+        await drainWriteQueue()
+
+        let finalMissing = try await pool.read { db in try MessageHeader.fetchOne(db, key: missing.id) }
+        #expect(finalMissing?.folderId == archive.id, "the optimistic move must land for a token member")
+        let finalMalformed = try await pool.read { db in try MessageHeader.fetchOne(db, key: malformed.id) }
+        #expect(finalMalformed?.isRead == true)
+
+        // Durable rows carry the raw provider IDs, byte-exact (no provider
+        // registered, so the ops remain queued and inspectable).
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let moveOps = ops.filter { $0.type == .move }
+        let readOps = ops.filter { $0.type == .markRead }
+        #expect(moveOps.count == 1)
+        #expect(moveOps.first?.messageIds == ["m-tail-missing"])
+        #expect(readOps.count == 1)
+        #expect(readOps.first?.messageIds == ["m-tail-malformed"])
+    }
+
+    /// §7.2 — Gmail tail E2E: archive → drain → undo → drain → sync converges.
+    /// Gmail IDs are stable across label changes, so a tail member has ~full
+    /// fidelity: the undo resolves the exact same resource.
+    @Test("Gmail tail member archives, undoes, and syncs by its stable provider ID")
+    func gmailTailArchiveUndoFinalOutcome() async throws {
+        let tailIdentity = "tail unparseable \(UUID().uuidString.lowercased())"
+        let fixture = makeStatefulRESTFixture(kind: .gmail, rfc822MessageId: tailIdentity)
+        defer { fixture.close() }
+        let (pool, inbox, _, dir, previous) = try makeTestDB(
+            provider: fixture.accountProvider,
+            inboxPath: fixture.inboxPath,
+            archivePath: fixture.archivePath
+        )
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: fixture.provider)
+
+        do {
+            let header = makeDurableHeader(
+                folder: inbox,
+                messageId: fixture.initialProviderMessageId,
+                includeRFCIdentity: false
+            )
+            try await pool.writeWithoutTransaction { db in try header.insert(db) }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            #expect(viewModel.archive(header.id))
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            let archivedRemote = fixture.snapshots(tailIdentity)
+            #expect(archivedRemote.count == 1)
+            guard archivedRemote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(archivedRemote[0].folderPath == fixture.archivePath)
+
+            await UndoService.shared.undo()
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+            try await reconcileWithoutRecentProtection(pool: pool, folder: inbox, provider: fixture.provider)
+
+            let remote = fixture.snapshots(tailIdentity)
+            #expect(remote.count == 1)
+            guard remote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(remote[0].folderPath == fixture.inboxPath, "the token member's undo must restore INBOX remotely")
+            #expect(remote[0].providerMessageId == fixture.initialProviderMessageId, "Gmail IDs are stable — the token still names the same resource")
+
+            let local = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+            #expect(local?.folderId == inbox.id)
+            #expect(local?.isInInbox == true)
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+    }
+
+    /// §7.3 — Exchange tail E2E: the forward archive executes by exact Graph
+    /// resource ID; the move churns the ID, so the later undo's token lookup
+    /// is an authoritative 404 → stale no-op (accepted degraded-tail
+    /// semantics, exactly released behavior). Ordinary sync then reconciles
+    /// the optimistic local undo back to provider truth.
+    @Test("Exchange tail member: archive drains, ID churns, undo is a stale no-op, sync restores provider truth")
+    func exchangeTailArchiveUndoStaleNoOpAfterIdChurn() async throws {
+        let tailIdentity = "tail unparseable \(UUID().uuidString.lowercased())"
+        let fixture = makeStatefulRESTFixture(kind: .exchange, rfc822MessageId: tailIdentity)
+        defer { fixture.close() }
+        let (pool, inbox, archive, dir, previous) = try makeTestDB(
+            provider: fixture.accountProvider,
+            inboxPath: fixture.inboxPath,
+            archivePath: fixture.archivePath
+        )
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: fixture.provider)
+
+        do {
+            let header = makeDurableHeader(
+                folder: inbox,
+                messageId: fixture.initialProviderMessageId,
+                includeRFCIdentity: false
+            )
+            try await pool.writeWithoutTransaction { db in try header.insert(db) }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            #expect(viewModel.archive(header.id))
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            let archivedRemote = fixture.snapshots(tailIdentity)
+            #expect(archivedRemote.count == 1)
+            guard archivedRemote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(archivedRemote[0].folderPath == fixture.archivePath)
+            #expect(archivedRemote[0].providerMessageId != fixture.initialProviderMessageId, "Graph churns the resource ID on move")
+
+            // Undo: the token names the PRE-move resource — exact lookup 404s,
+            // the inverse move is an authoritative stale no-op, and the queue
+            // still drains to empty (never a wedge).
+            await UndoService.shared.undo()
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            let remote = fixture.snapshots(tailIdentity)
+            #expect(remote.count == 1)
+            guard remote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(remote[0].folderPath == fixture.archivePath, "the stale token undo must NOT move anything remotely")
+
+            // Ordinary sync reconciles the optimistic local undo to provider truth.
+            try await reconcileWithoutRecentProtection(pool: pool, folder: inbox, provider: fixture.provider)
+            try await reconcileWithoutRecentProtection(pool: pool, folder: archive, provider: fixture.provider)
+            let localRows = try await pool.read { db in
+                try MessageHeader.filter(Column("accountId") == "acc1").fetchAll(db)
+            }
+            let archiveRows = localRows.filter { $0.folderId == archive.id }
+            #expect(archiveRows.count == 1, "provider truth (archived, churned ID) must win locally after sync")
+            #expect(archiveRows.first?.messageId == remote[0].providerMessageId)
+            #expect(localRows.filter { $0.folderId == inbox.id }.isEmpty, "the optimistic undo row must be reconciled away")
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+    }
+
+    /// §7.5 — Mixed batch: one durable row carrying an RFC member AND a token
+    /// member resolves every member before the first mutation. A transient
+    /// failure on the RFC member's lookup (resolved AFTER the token member)
+    /// leaves the whole batch unmutated and queued; the retry converges both.
+    @Test("mixed RFC + token batch resolves wholly before the first mutation")
+    func mixedBatchResolvesWhollyBeforeFirstMutation() async throws {
+        let suffix = UUID().uuidString.lowercased()
+        let tailIdentity = "tail unparseable \(suffix)"
+        let rfcIdentity = "mixed-batch-\(suffix)@example.com"
+        let tokenProviderId = "gmail-token-\(suffix)"
+        let rfcProviderId = "gmail-rfc-\(suffix)"
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: tailIdentity, providerMessageId: tokenProviderId, labels: ["INBOX", "UNREAD"]),
+            .init(rfc822MessageId: rfcIdentity, providerMessageId: rfcProviderId, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+        let provider = server.provider()
+        let (pool, inbox, _, dir, previous) = try makeTestDB(
+            provider: .gmail,
+            inboxPath: "INBOX",
+            archivePath: GmailProvider.archivePath
+        )
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+
+        do {
+            let tokenHeader = makeDurableHeader(
+                folder: inbox, messageId: tokenProviderId, includeRFCIdentity: false
+            )
+            let rfcHeader = makeDurableHeader(
+                folder: inbox, messageId: rfcProviderId, rfc822MessageId: "<\(rfcIdentity)>"
+            )
+            try await pool.writeWithoutTransaction { db in
+                try tokenHeader.insert(db)
+                try rfcHeader.insert(db)
+            }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            // Phase 1 — NO provider registered: the gesture records, folds,
+            // and queues one durable batch; nothing can execute yet, so the
+            // admitted batch shape is observable deterministically. Token
+            // member FIRST so phase 2 proves its (successful) resolution did
+            // not mutate before the RFC member's transient failure.
+            let skipped = viewModel.archiveThread([tokenHeader.id, rfcHeader.id])
+            #expect(skipped.isEmpty, "both members admit under the hybrid rule")
+            await drainWriteQueue()
+            try await waitForProviderQueueQuiescence()
+            let queuedOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            #expect(queuedOps.count == 1)
+            #expect(Set(queuedOps.first?.messageIds ?? []) == [tokenProviderId, rfcIdentity],
+                    "one batch row carries the byte-exact token and the normalized RFC member")
+
+            // Phase 2 — provider registered, RFC lookup fails transiently:
+            // the whole batch must stay unmutated and queued (whole-batch
+            // preflight before the first mutation).
+            server.failNextLookup()
+            await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: provider)
+            await AccountManager.shared.drainPendingQueue()
+            try await waitForProviderQueueQuiescence()
+
+            #expect(server.consumedLookupFailureCount() == 1)
+            let blockedToken = server.snapshots(rfc822MessageId: tailIdentity)
+            let blockedRFC = server.snapshots(rfc822MessageId: rfcIdentity)
+            #expect(blockedToken.first?.labels.contains("INBOX") == true, "the token member must NOT mutate before the whole batch resolves")
+            #expect(blockedRFC.first?.labels.contains("INBOX") == true)
+            let blockedOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            #expect(blockedOps.count == 1, "the whole batch stays queued, unchanged, for retry")
+
+            // Phase 3 — failure consumed: the retry converges the whole batch.
+            try await drainProviderQueue(pool: pool)
+            #expect(server.snapshots(rfc822MessageId: tailIdentity).first?.labels.contains("INBOX") == false)
+            #expect(server.snapshots(rfc822MessageId: rfcIdentity).first?.labels.contains("INBOX") == false)
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+    }
+
+    /// §7.7 — Cold notification with no recoverable RFC identity: the provider
+    /// transport ID is admitted as a token member instead of refused, and the
+    /// queued action drains to final provider + local state.
+    @Test("cold notification with no RFC identity admits the transport ID as a token member and drains")
+    func coldNotificationTokenAdmissionDrains() async throws {
+        let tailIdentity = "tail unparseable \(UUID().uuidString.lowercased())"
+        let fixture = makeStatefulRESTFixture(kind: .gmail, rfc822MessageId: tailIdentity)
+        defer { fixture.close() }
+        let (pool, _, archive, dir, previous) = try makeTestDB(
+            provider: fixture.accountProvider,
+            inboxPath: fixture.inboxPath,
+            archivePath: fixture.archivePath
+        )
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: fixture.provider)
+
+        do {
+            // NO local header anywhere — a true cold miss, and the payload has
+            // no RFC identity (legacy/tail message). The transport ID is the
+            // provider ID and becomes the token member.
+            await NotificationActionRouter.execute(
+                actionId: "ARCHIVE",
+                transportMessageId: fixture.initialProviderMessageId,
+                rfc822MessageId: nil,
+                accountId: "acc1"
+            )
+
+            let remote = fixture.snapshots(tailIdentity)
+            #expect(remote.count == 1)
+            guard remote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(remote[0].folderPath == fixture.archivePath, "the token cold action must archive remotely")
+
+            try await reconcileWithoutRecentProtection(pool: pool, folder: archive, provider: fixture.provider)
+            let local = try await pool.read { db in
+                try MessageHeader
+                    .filter(Column("accountId") == "acc1" && Column("messageId") == fixture.initialProviderMessageId)
+                    .fetchAll(db)
+            }
+            #expect(local.count == 1)
+            #expect(local.first?.folderId == archive.id)
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
     }
 }

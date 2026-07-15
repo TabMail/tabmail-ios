@@ -1400,7 +1400,8 @@ final class MessageDetailViewModel {
         MessageIdentity.durableActionAddress(
             accountId: message.accountId,
             folderPath: message.folderPath,
-            rfc822MessageId: message.rfc822MessageId
+            rfc822MessageId: message.rfc822MessageId,
+            providerMessageId: message.messageId
         ) != nil
     }
 

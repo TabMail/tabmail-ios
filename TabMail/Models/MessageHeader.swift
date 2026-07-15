@@ -275,7 +275,8 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
 
     /// Legacy mixed identity helper retained for non-queue local keys.
     /// Durable message actions must use `MessageIdentity.durableActionAddress` instead,
-    /// which requires one canonical RFC Message-ID across every mail provider.
+    /// which yields the hybrid member identity: canonical RFC Message-ID when
+    /// present, else the provider ID as an opaque token (PLAN_IDENTITY_HYBRID).
     var stableId: String {
         if UInt32(messageId) != nil, let rfc822 = rfc822MessageId, !rfc822.isEmpty {
             return rfc822

@@ -39,25 +39,66 @@ struct MessageIdentityTests {
         #expect(MessageIdentity.durableActionRFC822MessageId("line@example.com\r\nInjected: value") == nil)
     }
 
-    @Test("durable action address admits RFC identity and scope together")
+    @Test("durable action address admits hybrid member identity and scope together")
     func durableActionAddressRequiresCompleteScope() {
         let address = MessageIdentity.durableActionAddress(
             accountId: "account",
             folderPath: "INBOX",
-            rfc822MessageId: " <member@example.com> "
+            rfc822MessageId: " <member@example.com> ",
+            providerMessageId: "provider-123"
         )
         #expect(address?.accountId == "account")
         #expect(address?.folderPath == "INBOX")
-        #expect(address?.rfc822MessageId == "member@example.com")
+        #expect(address?.memberIdentity == "member@example.com")
+        // Tail fallback: no/invalid RFC identity admits the provider ID as an
+        // opaque token member (PLAN_IDENTITY_HYBRID §2).
         #expect(MessageIdentity.durableActionAddress(
-            accountId: " ", folderPath: "INBOX", rfc822MessageId: "member@example.com"
+            accountId: "account", folderPath: "INBOX",
+            rfc822MessageId: nil, providerMessageId: "provider-123"
+        )?.memberIdentity == "provider-123")
+        #expect(MessageIdentity.durableActionAddress(
+            accountId: "account", folderPath: "INBOX",
+            rfc822MessageId: "<broken@example.com", providerMessageId: "4711"
+        )?.memberIdentity == "4711")
+        // Scope legs stay strict, and a row with NO identity at all refuses.
+        #expect(MessageIdentity.durableActionAddress(
+            accountId: " ", folderPath: "INBOX",
+            rfc822MessageId: "member@example.com", providerMessageId: "provider-123"
         ) == nil)
         #expect(MessageIdentity.durableActionAddress(
-            accountId: "account", folderPath: "\n", rfc822MessageId: "member@example.com"
+            accountId: "account", folderPath: "\n",
+            rfc822MessageId: "member@example.com", providerMessageId: "provider-123"
+        ) == nil)
+        #expect(MessageIdentity.durableActionAddress(
+            accountId: "account", folderPath: "INBOX",
+            rfc822MessageId: nil, providerMessageId: ""
         ) == nil)
     }
 
-    @Test("durable message-action factory normalizes all members and rejects other identity domains")
+    @Test("durableMemberKind classifies by shape: RFC normalizes, everything else is an exact opaque token")
+    func durableMemberKindClassifiesByShape() {
+        #expect(MessageIdentity.durableMemberKind(" <Case@Example.COM> ")
+            == .rfc("Case@Example.COM"))
+        #expect(MessageIdentity.durableMemberKind("bare@example.com")
+            == .rfc("bare@example.com"))
+        // Provider shapes never contain exactly one @ in RFC form.
+        #expect(MessageIdentity.durableMemberKind("4711")
+            == .providerToken("4711"))
+        #expect(MessageIdentity.durableMemberKind("18c2f0a9bd3e")
+            == .providerToken("18c2f0a9bd3e"))
+        #expect(MessageIdentity.durableMemberKind("graph/AAMkAGI2+x=_-")
+            == .providerToken("graph/AAMkAGI2+x=_-"))
+        // Malformed with-@ strings are TOKENS, byte-exact — never
+        // re-normalized into a different message's identity.
+        #expect(MessageIdentity.durableMemberKind("<<nested@example.com>>")
+            == .providerToken("<<nested@example.com>>"))
+        #expect(MessageIdentity.durableMemberKind("local@@example.com")
+            == .providerToken("local@@example.com"))
+        #expect(MessageIdentity.durableMemberKind(nil) == nil)
+        #expect(MessageIdentity.durableMemberKind("") == nil)
+    }
+
+    @Test("durable message-action factory normalizes RFC members, admits tokens byte-exact, and rejects other identity domains")
     func durableMessageActionFactoryEnforcesBoundary() {
         let operation = PendingOperation.durableMessageAction(
             type: .move,
@@ -67,12 +108,15 @@ struct MessageIdentityTests {
             destinationPath: "Archive"
         )
         #expect(operation?.messageIds == ["first@example.com", "second@example.com"])
+        // A member that fails RFC validation admits as an exact opaque token
+        // (PLAN_IDENTITY_HYBRID §2) — adapters resolve it by exact provider
+        // ID, so the worst case is an authoritative zero-match no-op.
         #expect(PendingOperation.durableMessageAction(
             type: .markRead,
             messageIds: ["line@example.com\r\nInjected: value"],
             accountId: "account",
             folderPath: "INBOX"
-        ) == nil)
+        )?.messageIds == ["line@example.com\r\nInjected: value"])
         #expect(PendingOperation.durableMessageAction(
             type: .saveDraft,
             messageIds: ["provider-draft-resource"],

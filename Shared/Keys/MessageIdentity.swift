@@ -19,12 +19,63 @@ public enum MessageIdentity {
 
     /// Complete provider-neutral address required before a message action may
     /// mutate local state or enter the durable queue. Scope is validated here
-    /// with the RFC identity so producers cannot independently forget one of
-    /// the three admission fields.
+    /// with the member identity so producers cannot independently forget one
+    /// of the three admission fields. `memberIdentity` is RFC-first hybrid:
+    /// a normalized RFC Message-ID when the header has one, otherwise the raw
+    /// provider ID admitted as an opaque token (see `DurableMemberKind`).
     public struct DurableActionAddress: Sendable, Equatable {
         public let accountId: String
         public let folderPath: String
-        public let rfc822MessageId: String
+        public let memberIdentity: String
+    }
+
+    /// The ONE shape classifier for hybrid durable member identity
+    /// (PLAN_IDENTITY_HYBRID §1, amending ADR-IOS-060 decision 9). Every
+    /// consumer — admission, provider adapters, undo-entry construction, the
+    /// notification router — classifies a member string by SHAPE through this
+    /// predicate; the rule is never re-derived elsewhere.
+    ///
+    /// - `.rfc(normalized)` — passes `durableActionRFC822MessageId` (exactly
+    ///   one `@`, non-empty sides, no whitespace/controls, balanced
+    ///   brackets). Resolved by source-scoped provider search.
+    /// - `.providerToken(raw)` — anything else non-empty, preserved
+    ///   byte-exact. Resolved by exact provider-ID fetch + source-membership
+    ///   verification. Collision safety: a valid RFC ID always contains
+    ///   exactly one `@`; Gmail IDs (hex), Graph IDs (base64url), and IMAP
+    ///   UIDs (decimal) never do. A malformed Message-ID that contains `@`
+    ///   but fails validation classifies as a token — adapters treat a token
+    ///   as an exact opaque string, so the worst case is an authoritative
+    ///   zero-match no-op, never a wrong-message mutation.
+    public enum DurableMemberKind: Sendable, Equatable {
+        case rfc(String)
+        case providerToken(String)
+    }
+
+    public static func durableMemberKind(_ rawValue: String?) -> DurableMemberKind? {
+        if let normalized = durableActionRFC822MessageId(rawValue) {
+            return .rfc(normalized)
+        }
+        guard let rawValue, !rawValue.isEmpty else { return nil }
+        return .providerToken(rawValue)
+    }
+
+    /// Hybrid member identity for one message: the normalized RFC Message-ID
+    /// when `rfc822MessageId` normalizes, otherwise the provider ID as an
+    /// opaque token. Producers pass `header.messageId` as the fallback —
+    /// every provider row has one, so a message is never refused for lacking
+    /// RFC identity (tail members get released-level semantics instead).
+    public static func durableActionMemberIdentity(
+        rfc822MessageId: String?,
+        providerMessageId: String?
+    ) -> String? {
+        if let normalized = durableActionRFC822MessageId(rfc822MessageId) {
+            return normalized
+        }
+        switch durableMemberKind(providerMessageId) {
+        case .rfc(let normalized): return normalized
+        case .providerToken(let token): return token
+        case nil: return nil
+        }
     }
 
     /// Canonical durable identity for provider-agnostic message actions.
@@ -70,16 +121,20 @@ public enum MessageIdentity {
     public static func durableActionAddress(
         accountId: String,
         folderPath: String,
-        rfc822MessageId: String?
+        rfc822MessageId: String?,
+        providerMessageId: String?
     ) -> DurableActionAddress? {
         guard !accountId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !folderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let rfc822MessageId = durableActionRFC822MessageId(rfc822MessageId)
+              let memberIdentity = durableActionMemberIdentity(
+                  rfc822MessageId: rfc822MessageId,
+                  providerMessageId: providerMessageId
+              )
         else { return nil }
         return DurableActionAddress(
             accountId: accountId,
             folderPath: folderPath,
-            rfc822MessageId: rfc822MessageId
+            memberIdentity: memberIdentity
         )
     }
 

@@ -1544,7 +1544,8 @@ final class InboxViewModel {
         MessageIdentity.durableActionAddress(
             accountId: message.accountId,
             folderPath: message.folderPath,
-            rfc822MessageId: message.rfc822MessageId
+            rfc822MessageId: message.rfc822MessageId,
+            providerMessageId: message.messageId
         ) != nil
     }
 
@@ -1552,14 +1553,17 @@ final class InboxViewModel {
         MessageIdentity.durableActionAddress(
             accountId: snapshot.accountId,
             folderPath: snapshot.folderPath,
-            rfc822MessageId: snapshot.rfc822MessageId
+            rfc822MessageId: snapshot.rfc822MessageId,
+            providerMessageId: snapshot.messageId
         ) != nil
     }
 
     /// Provider-neutral admission gate for durable message actions. Members
     /// resolve through the same durable/staged lookup as every other gesture
-    /// path so account, source folder, and RFC identity are validated before
-    /// any optimistic mutation. Provider transport ids are never accepted.
+    /// path so account, source folder, and member identity are validated
+    /// before any optimistic mutation. Identity is hybrid
+    /// (PLAN_IDENTITY_HYBRID): normalized RFC Message-ID when present, else
+    /// the provider ID admitted as an opaque token member.
     func durableMessageActionIsAdmissible(_ messageId: String) -> Bool {
         if let snapshot = loadedMessages.first(where: { $0.id == messageId }) {
             return isAdmissibleDurableMessageAction(snapshot)
@@ -1653,7 +1657,7 @@ final class InboxViewModel {
         let destFolderId = "\(message.accountId):\(archivePath)"
         // Undo command built directly from the pre-move header (ADR-IOS-060):
         // no full-row snapshot, no overlay adjustment needed — `UndoMember`
-        // carries only rfc822 identity and the pre-move source path.
+        // carries only the hybrid member identity and the pre-move source path.
         UndoService.shared.push(UndoableAction(
             commands: UndoableAction.commands(
                 for: [message],
@@ -2080,12 +2084,13 @@ final class InboxViewModel {
                       let address = MessageIdentity.durableActionAddress(
                           accountId: current.accountId,
                           folderPath: current.folderPath,
-                          rfc822MessageId: current.rfc822MessageId
+                          rfc822MessageId: current.rfc822MessageId,
+                          providerMessageId: current.messageId
                       ),
                       label.accountId == address.accountId,
                       let op = PendingOperation.durableMessageAction(
                           type: .removeUserLabel,
-                          messageIds: [address.rfc822MessageId],
+                          messageIds: [address.memberIdentity],
                           accountId: address.accountId,
                           folderPath: address.folderPath,
                           userLabelId: label.id

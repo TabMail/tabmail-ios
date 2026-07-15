@@ -229,8 +229,8 @@ struct ArchiveOldMessagesTests {
         #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded by the skip")
     }
 
-    @Test("mixed RFC admission archives, counts, overlays, records Undo, and enqueues only the valid member")
-    func mixedRFCAdmissionIncludesOnlyValidMember() async throws {
+    @Test("mixed hybrid admission archives BOTH members: normalized RFC + provider-ID token")
+    func mixedHybridAdmissionIncludesBothMembers() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             restoreTestDB(previous: previous, dir: dir)
@@ -271,28 +271,30 @@ struct ArchiveOldMessagesTests {
         #expect(settled)
         let overlay = AccountManager.shared.snapshotOverlay()
         #expect(overlay[valid.id]?.folderId == archive.id)
-        #expect(overlay[invalidId] == nil,
-                "refused member never enters the optimistic overlay")
+        #expect(overlay[invalidId]?.folderId == archive.id,
+                "the token member enters the optimistic overlay like any other (PLAN_IDENTITY_HYBRID)")
         #expect(
-            UndoService.shared.currentAction?.commands.flatMap { $0.members.map(\.originalHeaderId) } == [valid.id]
+            Set(UndoService.shared.currentAction?.commands.flatMap { $0.members.map(\.originalHeaderId) } ?? [])
+                == [valid.id, invalidId]
         )
 
         gate.finish()
-        #expect(await archiveTask.value == 1)
+        #expect(await archiveTask.value == 2)
         await drainWriteQueue()
 
         let finalValid = try await pool.read { db in try MessageHeader.fetchOne(db, key: valid.id) }
-        let finalInvalid = try await pool.read { db in try MessageHeader.fetchOne(db, key: invalidId) }
+        let finalTail = try await pool.read { db in try MessageHeader.fetchOne(db, key: invalidId) }
         #expect(finalValid?.folderId == archive.id)
-        #expect(finalInvalid?.folderId == inbox.id)
+        #expect(finalTail?.folderId == archive.id, "the token member's optimistic move must land too")
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(ops.count == 1)
         guard ops.count == 1 else { return }
-        #expect(ops[0].messageIds == ["mixed-valid@archive-old.example.com"])
+        #expect(Set(ops[0].messageIds) == ["mixed-valid@archive-old.example.com", "mixed-invalid"],
+                "normalized RFC member + byte-exact provider token")
     }
 
-    @Test("all-refused RFC admission returns zero without Undo, overlay, local mutation, or durable work")
-    func allRefusedRFCAdmissionIsCompleteNoOp() async throws {
+    @Test("identity-less members archive as provider-ID tokens — the bulk archive never refuses a message that has a provider ID")
+    func tailOnlyBulkArchiveAdmitsTokens() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             restoreTestDB(previous: previous, dir: dir)
@@ -320,18 +322,18 @@ struct ArchiveOldMessagesTests {
         )
         await drainWriteQueue()
 
-        #expect(archived == 0)
-        #expect(UndoService.shared.undoStack.isEmpty)
-        #expect(AccountManager.shared.snapshotOverlay()[missingHeader.id] == nil)
-        #expect(AccountManager.shared.snapshotOverlay()[malformedHeader.id] == nil)
+        #expect(archived == 2, "hybrid admission: identity-less rows archive by provider-ID token")
+        #expect(UndoService.shared.undoStack.count == 1)
         let rows = try await pool.read { db in
             try MessageHeader.filter(refusedIds.contains(Column("id"))).fetchAll(db)
         }
         #expect(rows.count == 2)
         guard rows.count == 2 else { return }
-        #expect(rows.allSatisfy { $0.folderId == inbox.id })
+        #expect(rows.allSatisfy { $0.folderPath != inbox.path }, "both tail rows left the inbox optimistically")
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(ops.isEmpty)
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(Set(ops[0].messageIds) == ["all-missing", "all-malformed"], "byte-exact provider-ID tokens")
     }
 
 }

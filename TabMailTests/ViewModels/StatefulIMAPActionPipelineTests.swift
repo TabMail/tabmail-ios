@@ -1363,4 +1363,164 @@ struct StatefulIMAPActionPipelineTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
         try await provider.disconnect()
     }
+
+    // MARK: - Hybrid durable identity — provider-token (UID) tail members (PLAN_IDENTITY_HYBRID §7.4)
+
+    /// RFC 2822 text WITHOUT a Message-ID header — a genuine tail message.
+    private func rfc822WithoutMessageId() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        return [
+            "From: Test Sender <sender@example.com>",
+            "To: Recipient <recipient@example.com>",
+            "Subject: Stateful IMAP tail message",
+            "Date: \(formatter.string(from: Date()))",
+            "Content-Type: text/plain; charset=utf-8",
+            "",
+            "Stateful IMAP tail body.",
+            "",
+        ].joined(separator: "\r\n")
+    }
+
+    /// A local header with NO RFC identity — the durable member is the
+    /// mailbox-scoped UID token.
+    private func makeTailHeader(folder: Folder, uid: Int, isRead: Bool = false, isFlagged: Bool = false) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: String(uid),
+            subject: "Stateful IMAP tail message",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "body",
+            folderId: folder.id,
+            accountId: folder.accountId,
+            folderPath: folder.path,
+            isInInbox: folder.role == .inbox
+        )
+        header.headerComplete = true
+        header.rfc822MessageId = nil
+        header.isRead = isRead
+        header.isFlagged = isFlagged
+        return header
+    }
+
+    /// §7.4 — an identity-less message flags and archives by exact UID token
+    /// in the recorded source mailbox; a post-drain undo is an authoritative
+    /// stale no-op (the UID changed on move — released-level semantics) and
+    /// ordinary sync reconciles the optimistic local undo to provider truth.
+    @Test("tail (UID token) member: setter and move execute by mailbox-scoped exact UID; post-drain undo is a stale no-op")
+    func tailSetterAndMoveFinalOutcome() async throws {
+        let uid = 61
+        let message = FakeIMAPServer.makeMessage(uid: uid, rfc822Text: rfc822WithoutMessageId())
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message], "Archive": []])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        let (pool, inbox, archive, previous) = try makeTestDB()
+        defer { restore(previous: previous) }
+        resetProcessState()
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: provider)
+
+        do {
+            let header = makeTailHeader(folder: inbox, uid: uid)
+            try await pool.writeWithoutTransaction { db in try header.insert(db) }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            // Setter: flag by UID token.
+            viewModel.toggleFlag(header.id)
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+            #expect(server.flags(in: "INBOX", uid: uid).contains("\\Flagged"), "the UID-token setter must STORE against the exact source UID")
+
+            // Move: archive by UID token.
+            #expect(viewModel.archive(header.id))
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+            let archivedRemote = try await provider.fetchMessages(folder: "Archive", limit: 10, offset: 0)
+            #expect(archivedRemote.count == 1)
+            #expect(server.messageIDs(in: "INBOX").isEmpty)
+
+            // Post-drain undo: the UID changed on move, so the token is
+            // authoritatively stale — remote unchanged, queue drains clean.
+            await UndoService.shared.undo()
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+            let remoteAfterUndo = try await provider.fetchMessages(folder: "Archive", limit: 10, offset: 0)
+            #expect(remoteAfterUndo.count == 1, "the stale UID-token undo must NOT move anything remotely")
+            #expect(server.messageIDs(in: "INBOX").isEmpty)
+
+            // Ordinary sync reconciles the optimistic local undo to provider truth.
+            try await reconcileWithoutRecentProtection(pool: pool, folder: inbox, provider: provider)
+            try await reconcileWithoutRecentProtection(pool: pool, folder: archive, provider: provider)
+            let localRows = try await pool.read { db in
+                try MessageHeader.filter(Column("accountId") == "acc1").fetchAll(db)
+            }
+            #expect(localRows.filter { $0.folderId == archive.id }.count == 1, "provider truth (archived) must win locally after sync")
+            #expect(localRows.filter { $0.folderId == inbox.id }.isEmpty)
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            try? await provider.disconnect()
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+        try await provider.disconnect()
+    }
+
+    /// §7.4 (second half) — undo-before-drain of a token-member archive still
+    /// annihilates: the forward fold and the undo join the same in-memory
+    /// batch, so the provider sees ZERO commands and the message never moves.
+    @Test("tail (UID token) member: undo before drain annihilates in memory — zero provider calls")
+    func tailUndoBeforeDrainAnnihilates() async throws {
+        let uid = 62
+        let message = FakeIMAPServer.makeMessage(uid: uid, rfc822Text: rfc822WithoutMessageId())
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message], "Archive": []])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        let (pool, inbox, _, previous) = try makeTestDB()
+        defer { restore(previous: previous) }
+        resetProcessState()
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: provider)
+
+        do {
+            let header = makeTailHeader(folder: inbox, uid: uid)
+            try await pool.writeWithoutTransaction { db in try header.insert(db) }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            // Gate the FIFO write queue BEFORE the gesture so the archive's
+            // fold cannot run until Undo's record joins the same batch —
+            // mirrors `undoBeforeDrainProducesZeroProviderCalls`.
+            let (gateStream, gate) = AsyncStream<Void>.makeStream()
+            await AccountManager.shared.enqueueWrite {
+                var iterator = gateStream.makeAsyncIterator()
+                _ = await iterator.next()
+            }
+
+            #expect(viewModel.archive(header.id), "the token-member archive must record")
+            await UndoService.shared.undo()
+            gate.finish()
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            let local = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+            #expect(local?.folderId == inbox.id, "the message never left INBOX locally")
+            #expect(server.messageIDs(in: "INBOX").count == 1, "the message never left INBOX remotely")
+            #expect(server.messageIDs(in: "Archive").isEmpty)
+            let moveCommands = server.recordedCommands().filter { $0.uppercased().contains(" MOVE ") || $0.uppercased().contains(" COPY ") }
+            #expect(moveCommands.isEmpty, "the annihilated pair must produce ZERO provider move/copy commands")
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            try? await provider.disconnect()
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+        try await provider.disconnect()
+    }
 }

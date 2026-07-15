@@ -167,6 +167,18 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let body = (try? JSONSerialization.data(withJSONObject: ["value": rows])) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
+        // Exact resource lookup (`GET /messages/{id}?$select=…`) — the same
+        // resource Graph exposes for provider-ID (token) action resolution.
+        // A gone/churned ID is a plain 404, Graph's authoritative-stale shape.
+        http.register(path: "/messages/", method: "GET") { [state] request in
+            guard let providerId = Self.messageId(from: request.url, move: false) else {
+                return .status(404)
+            }
+            let message = state.value.withLock { $0.messagesByProviderId[providerId] }
+            guard let message else { return .status(404) }
+            let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(message))) ?? Data()
+            return .bytes(body, contentType: "application/json")
+        }
         http.register(path: "/messages/", method: "PATCH") { [state] request in
             guard !Self.consumeMutationFailure(state) else { return .status(503) }
             guard let providerId = Self.messageId(from: request.url, move: false) else {

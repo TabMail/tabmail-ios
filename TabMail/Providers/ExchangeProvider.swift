@@ -547,104 +547,101 @@ actor ExchangeProvider: EmailProvider {
         }
     }
 
-    /// Resolve the entire durable RFC batch before the first provider mutation.
+    /// Resolve the entire durable hybrid batch before the first provider
+    /// mutation. Each member routes by SHAPE (`MessageIdentity.durableMemberKind`,
+    /// PLAN_IDENTITY_HYBRID §3): RFC members resolve by source-scoped
+    /// `internetMessageId` filter, token members by exact resource fetch.
     /// Transient Graph IDs are ordered-deduplicated and never escape this adapter.
     private func resolveActionMessageIds(_ ids: [String], folder: String) async throws -> [String] {
         var resolved: [String] = []
         var seen = Set<String>()
         for id in ids {
-            guard let providerId = try await resolveActionMessageId(id, folder: folder),
-                  seen.insert(providerId).inserted
-            else { continue }
+            let providerId: String?
+            switch MessageIdentity.durableMemberKind(id) {
+            case .rfc:
+                providerId = try await resolveActionMessageId(id, folder: folder)
+            case .providerToken(let token):
+                providerId = try await resolveTokenMember(token, folder: folder)
+            case nil:
+                providerId = nil
+            }
+            guard let providerId, seen.insert(providerId).inserted else { continue }
             resolved.append(providerId)
         }
         return resolved
     }
 
-    /// Upgrade one released durable row that still carries a transient Graph
-    /// resource id. The exact resource lookup is finite: a gone resource or one
-    /// outside both recorded folders is authoritative stale state, while malformed
-    /// metadata and every non-gone request failure remain retryable uncertainty.
-    func resolveLegacyMessageActionIdentity(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution {
-        let trimmedProviderId = providerMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedSourceFolder = sourceFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Resolve one opaque token member — a Graph resource ID admitted when
+    /// the message had no valid RFC identity (PLAN_IDENTITY_HYBRID §3).
+    /// Exact `GET /messages/{id}?$select=id,parentFolderId`, then verify
+    /// `parentFolderId` equals the recorded SOURCE folder only. 404/410 and
+    /// Graph's structured `ErrorInvalidIdMalformed` are authoritative stale —
+    /// a Graph ID that churned mid-queue (Graph reallocates the default
+    /// resource ID on move) no-ops here and ordinary sync reconciles, exactly
+    /// released-level tail semantics. A token whose shape can never name a
+    /// Graph resource (whitespace/control characters) is likewise stale.
+    /// Every other request failure remains retryable uncertainty.
+    private func resolveTokenMember(_ token: String, folder: String) async throws -> String? {
         let invalidFolderCharacters = CharacterSet.controlCharacters
-        let destinationIsValid = destinationFolder.map {
-            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty
-                && trimmed == $0
-                && $0.rangeOfCharacter(from: invalidFolderCharacters) == nil
-        } ?? true
-        guard !trimmedProviderId.isEmpty,
-              trimmedProviderId == providerMessageId,
-              providerMessageId.rangeOfCharacter(
+        guard !token.isEmpty,
+              token.rangeOfCharacter(
                   from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
-              ) == nil,
-              !trimmedSourceFolder.isEmpty,
-              trimmedSourceFolder == sourceFolder,
-              sourceFolder.rangeOfCharacter(from: invalidFolderCharacters) == nil,
-              destinationIsValid
-        else {
-            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
-        }
-        var scopedFolders = Set([sourceFolder])
-        if let destinationFolder {
-            scopedFolders.insert(destinationFolder)
-        }
+              ) == nil
+        else { return nil }
+        guard !folder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              folder.rangeOfCharacter(from: invalidFolderCharacters) == nil
+        else { return nil }
 
         let unreserved = Self.graphPathSegmentAllowed
-        let encodedProviderId = try Self.encodedGraphPathSegment(
-            providerMessageId,
-            context: "Graph legacy action identity"
+        let encodedToken = try Self.encodedGraphPathSegment(
+            token,
+            context: "Graph token action identity"
         )
-        let queryItems = [(name: "$select", value: "id,parentFolderId,internetMessageId")]
+        let queryItems = [(name: "$select", value: "id,parentFolderId")]
         var encodedQueryItems: [URLQueryItem] = []
         for item in queryItems {
             guard let name = item.name.addingPercentEncoding(withAllowedCharacters: unreserved),
                   let value = item.value.addingPercentEncoding(withAllowedCharacters: unreserved)
             else {
-                throw ProviderError.invalidURL("Graph legacy action identity")
+                throw ProviderError.invalidURL("Graph token action identity")
             }
             encodedQueryItems.append(URLQueryItem(name: name, value: value))
         }
         var components = URLComponents()
-        components.percentEncodedPath = "/messages/\(encodedProviderId)"
+        components.percentEncodedPath = "/messages/\(encodedToken)"
         components.percentEncodedQueryItems = encodedQueryItems
         guard let path = components.string else {
-            throw ProviderError.invalidURL("Graph legacy action identity")
+            throw ProviderError.invalidURL("Graph token action identity")
         }
 
         let metadata: Data
         do {
-            metadata = try await request(path: path)
-        } catch let error where isGraphNotFound(error) {
-            return .staleOrAmbiguous
+            // Body-preserving variant: `ErrorInvalidIdMalformed` arrives as a
+            // structured 400 body, which the plain `request` throw discards.
+            metadata = try await requestPreservingBadRequestBody(
+                path: path,
+                method: "GET",
+                body: nil
+            )
+        } catch let error where isGraphNotFound(error) || isGraphInvalidIdMalformed(error) {
+            return nil
         }
 
         let message = try JSONDecoder().decode(GraphMessage.self, from: metadata)
         let trimmedParentFolderId = message.parentFolderId?.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard message.id == providerMessageId,
+        guard message.id == token,
               let parentFolderId = message.parentFolderId,
               let trimmedParentFolderId,
               !trimmedParentFolderId.isEmpty,
               trimmedParentFolderId == parentFolderId,
-              parentFolderId.rangeOfCharacter(from: invalidFolderCharacters) == nil,
-              let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
-                  message.internetMessageId
-              )
+              parentFolderId.rangeOfCharacter(from: invalidFolderCharacters) == nil
         else {
-            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+            throw ProviderError.actionIdentityResolutionFailed(token)
         }
-        guard scopedFolders.contains(parentFolderId) else {
-            return .staleOrAmbiguous
-        }
-        return .resolved(rfc822MessageId: rfc822MessageId)
+        guard parentFolderId == folder else { return nil }
+        return token
     }
 
     /// Graph's default message resource ID changes on move. Durable actions use

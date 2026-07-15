@@ -141,9 +141,9 @@ struct CoordinatedToolActionTests {
 
     // MARK: - (1) Basic archive
 
-    @Test("EmailArchiveTool mixed batch reports only RFC-admitted members and maps refusals back to numeric IDs")
+    @Test("EmailArchiveTool mixed batch admits RFC and token members, refusing only blank scope — refusals map back to numeric IDs")
     @MainActor
-    func archiveToolReportsOnlyAdmittedMembers() async throws {
+    func archiveToolAdmitsHybridMembers() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
@@ -173,11 +173,13 @@ struct CoordinatedToolActionTests {
         )
         let result = try decodeToolResult(output)
 
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): the missing-RFC member
+        // admits as a provider-ID token; only the blank-scope member refuses.
         #expect(result["success"] as? Bool == true)
-        #expect(result["archived_count"] as? Int == 1)
-        #expect(result["archived_subjects"] as? [String] == [admitted.subject])
+        #expect(result["archived_count"] as? Int == 2)
+        #expect(Set(result["archived_subjects"] as? [String] ?? []) == [admitted.subject, missingRFCHeader.subject])
         let failedIds = (result["failed_ids"] as? [NSNumber])?.map(\.intValue)
-        #expect(failedIds == [102, 103])
+        #expect(failedIds == [103])
 
         let headerIds = [admitted.id, missingRFCHeader.id, blankSourceHeader.id]
         let final = try await pool.read { db in
@@ -185,19 +187,20 @@ struct CoordinatedToolActionTests {
         }
         let finalById = Dictionary(uniqueKeysWithValues: final.map { ($0.id, $0) })
         #expect(finalById[admitted.id]?.folderId == archive.id)
-        #expect(finalById[missingRFCHeader.id]?.folderId == inbox.id)
+        #expect(finalById[missingRFCHeader.id]?.folderId == archive.id, "the token member's optimistic move lands too")
         #expect(finalById[blankSourceHeader.id]?.folderId == inbox.id)
 
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(ops.count == 1)
         guard ops.count == 1 else { return }
-        #expect(ops[0].messageIds == ["tool-archive-admitted@example.com"])
+        #expect(Set(ops[0].messageIds) == ["tool-archive-admitted@example.com", "tool-archive-missing-rfc"],
+                "normalized RFC member + byte-exact provider token")
     }
 
-    @Test("EmailDeleteTool all-refused batch reports failure, zero deletes, and every refused numeric ID")
+    @Test("EmailDeleteTool: tail members delete via provider-ID tokens; only the blank-scope member refuses")
     @MainActor
-    func deleteToolAllRefusedDoesNotClaimSuccess() async throws {
-        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+    func deleteToolAdmitsTailMembersRefusesBlankScope() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
@@ -238,20 +241,26 @@ struct CoordinatedToolActionTests {
         )
         let result = try decodeToolResult(output)
 
-        #expect(result["success"] as? Bool == false)
-        #expect(result["deleted_count"] as? Int == 0)
-        #expect(result["deleted_subjects"] as? [String] == [])
+        // Hybrid identity (PLAN_IDENTITY_HYBRID §2): missing/malformed RFC
+        // members admit as provider-ID tokens; only the blank-account member
+        // refuses.
+        #expect(result["success"] as? Bool == true)
+        #expect(result["deleted_count"] as? Int == 2)
         let failedIds = (result["failed_ids"] as? [NSNumber])?.map(\.intValue)
-        #expect(failedIds == [201, 202, 203])
+        #expect(failedIds == [203])
 
-        let headerIds = [missingRFCHeader.id, malformedRFCHeader.id, blankAccountHeader.id]
         let final = try await pool.read { db in
-            try MessageHeader.filter(keys: headerIds).fetchAll(db)
+            try MessageHeader.filter(keys: [missingRFCHeader.id, malformedRFCHeader.id, blankAccountHeader.id]).fetchAll(db)
         }
-        #expect(final.count == 3)
-        #expect(final.allSatisfy { $0.folderId == inbox.id })
+        let finalById = Dictionary(uniqueKeysWithValues: final.map { ($0.id, $0) })
+        #expect(finalById[missingRFCHeader.id]?.folderId == trash.id)
+        #expect(finalById[malformedRFCHeader.id]?.folderId == trash.id)
+        #expect(finalById[blankAccountHeader.id]?.folderId == inbox.id)
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(ops.isEmpty)
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(Set(ops[0].messageIds) == ["tool-delete-missing-rfc", "tool-delete-malformed-rfc"],
+                "byte-exact provider-ID tokens — never the malformed RFC string")
     }
 
     @Test("recordRoleMove archives a message: row moves to Archive, the tag is RETAINED (Round D-0), ONE .move PendingOperation is queued, and the overlay refcount/entry fully drain")

@@ -320,9 +320,9 @@ struct NotificationActionRouterTests {
         #expect(ops[0].messageIds == ["legacy-provider-id@example.com"])
     }
 
-    @Test("legacy notification with no exact local RFC recovery never queues the provider transport ID")
-    func legacyPayloadFullMissDoesNotQueueProviderId() async throws {
-        let (pool, _, _, _, dir, previous) = try makeTestDB()
+    @Test("no-RFC notification with a full local miss queues the provider transport ID as a token member")
+    func legacyPayloadFullMissQueuesTokenMember() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir); resetStagedGlobal() }
         resetStagedGlobal()
 
@@ -331,8 +331,16 @@ struct NotificationActionRouterTests {
             rfc822MessageId: nil, accountId: "acc1"
         )
 
+        // PLAN_IDENTITY_HYBRID §2: instead of refusing, the cold path admits
+        // the transport ID as an opaque token member against the inbox scope;
+        // the adapter resolves it by exact provider ID at drain.
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(ops.isEmpty)
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].messageIds == ["provider-only-id"])
+        #expect(ops[0].folderPath == inbox.path)
+        #expect(ops[0].destinationPath == archive.path)
     }
 
     @Test("present malformed RFC never falls back to transport-ID recovery")

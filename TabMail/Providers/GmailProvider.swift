@@ -546,87 +546,75 @@ actor GmailProvider: EmailProvider {
         }
     }
 
-    /// Resolve durable provider-neutral RFC identities to transient Gmail message
-    /// IDs inside the recorded source label. The entire batch resolves before any
-    /// mutation, so a later lookup failure cannot leave an uncommitted prefix.
+    /// Resolve durable hybrid member identities to transient Gmail message
+    /// IDs inside the recorded source label. Each member routes by SHAPE
+    /// (`MessageIdentity.durableMemberKind`, PLAN_IDENTITY_HYBRID §3): RFC
+    /// members resolve by source-scoped search, token members by exact
+    /// provider-ID fetch. The entire batch resolves before any mutation, so a
+    /// later lookup failure cannot leave an uncommitted prefix; resolved IDs
+    /// are ordered-deduplicated.
     private func resolveActionMessageIds(_ ids: [String], folder: String) async throws -> [String] {
         var resolved: [String] = []
         var seen = Set<String>()
         for id in ids {
-            guard let providerId = try await resolveActionMessageId(id, folder: folder),
-                  seen.insert(providerId).inserted
-            else { continue }
+            let providerId: String?
+            switch MessageIdentity.durableMemberKind(id) {
+            case .rfc:
+                providerId = try await resolveActionMessageId(id, folder: folder)
+            case .providerToken(let token):
+                providerId = try await resolveTokenMember(token, folder: folder)
+            case nil:
+                providerId = nil
+            }
+            guard let providerId, seen.insert(providerId).inserted else { continue }
             resolved.append(providerId)
         }
         return resolved
     }
 
-    /// Upgrade one released durable row that still carries Gmail's provider id.
-    /// The exact resource lookup is finite: a gone resource or one outside both
-    /// recorded folders is authoritative stale state, while malformed metadata
-    /// and every non-gone request failure remain retryable uncertainty.
-    func resolveLegacyMessageActionIdentity(
-        providerMessageId: String,
-        sourceFolder: String,
-        destinationFolder: String?
-    ) async throws -> LegacyMessageActionIdentityResolution {
-        let trimmedProviderId = providerMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedSourceFolder = sourceFolder.trimmingCharacters(in: .whitespacesAndNewlines)
-        let destinationIsValid = destinationFolder.map {
-            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty && trimmed == $0
-        } ?? true
-        guard !trimmedProviderId.isEmpty,
-              trimmedProviderId == providerMessageId,
-              providerMessageId.rangeOfCharacter(
+    /// Resolve one opaque token member — a Gmail message ID admitted when the
+    /// message had no valid RFC identity (PLAN_IDENTITY_HYBRID §3). Exact
+    /// `GET /messages/{id}` with strict path-encoding, then verify the
+    /// current labels include the recorded SOURCE scope only (archive scope
+    /// per the Batch-A SENT fix). 404/410 is authoritative stale, as is a
+    /// token whose shape can never name a Gmail resource (whitespace/control
+    /// characters — the exact opaque string can only zero-match). Every other
+    /// request failure remains retryable uncertainty. Gmail IDs are stable
+    /// across label changes, so tail members have near-full fidelity.
+    private func resolveTokenMember(_ token: String, folder: String) async throws -> String? {
+        guard !token.isEmpty,
+              token.rangeOfCharacter(
                   from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
               ) == nil,
-              !trimmedSourceFolder.isEmpty,
-              trimmedSourceFolder == sourceFolder,
-              destinationIsValid
-        else {
-            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
-        }
-        var scopedFolders = Set([sourceFolder])
-        if let destinationFolder {
-            scopedFolders.insert(destinationFolder)
-        }
+              !folder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
 
         let unreserved = CharacterSet(
             charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
         )
-        guard let encodedProviderId = providerMessageId.addingPercentEncoding(
+        guard let encodedToken = token.addingPercentEncoding(
             withAllowedCharacters: unreserved
         ) else {
-            throw ProviderError.invalidURL("Gmail legacy action identity")
+            throw ProviderError.invalidURL("Gmail token action identity")
         }
 
         let metadata: Data
         do {
             metadata = try await request(
-                path: "/messages/\(encodedProviderId)\(GmailAPI.metadataQuery)"
+                path: "/messages/\(encodedToken)\(GmailAPI.metadataQuery)"
             )
         } catch {
-            guard !isHttpGoneStatus(error) else { return .staleOrAmbiguous }
+            guard !isHttpGoneStatus(error) else { return nil }
             throw error
         }
 
         let message = try JSONDecoder().decode(GmailMessage.self, from: metadata)
-        guard message.id == providerMessageId,
-              let header = parseGmailMessage(message),
-              let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
-                  header.rfc822MessageId
-              )
-        else {
-            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+        guard message.id == token else {
+            throw ProviderError.actionIdentityResolutionFailed(token)
         }
         let labelIds = message.labelIds ?? []
-        guard scopedFolders.contains(where: {
-            labels(labelIds, belongToActionFolder: $0)
-        }) else {
-            return .staleOrAmbiguous
-        }
-        return .resolved(rfc822MessageId: rfc822MessageId)
+        guard labels(labelIds, belongToActionFolder: folder) else { return nil }
+        return token
     }
 
     /// Exactly one source-scoped Gmail search result is actionable. Missing,
@@ -719,7 +707,7 @@ actor GmailProvider: EmailProvider {
         return ref.id
     }
 
-    /// ACTION-path membership only (resolution + legacy identity conversion).
+    /// ACTION-path membership only (RFC resolution + token-member resolution).
     /// Archive scope mirrors `allMailActionExclusionQuery`: SENT is NOT
     /// excluded (a self-sent message archived to `{SENT}` is in archive scope
     /// for actions — excluding it silently no-opped Undo-of-archive); DRAFT

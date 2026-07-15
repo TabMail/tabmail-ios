@@ -128,9 +128,14 @@ struct MessageDetailViewModelMoveTests {
 
     // MARK: - Tests
 
-    @Test("Missing/malformed RFC identity refuses detail gestures before detail/thread mutation, journal, Undo, or success")
+    /// Hybrid identity (PLAN_IDENTITY_HYBRID): missing/malformed RFC identity
+    /// no longer refuses detail gestures — those admit the provider ID as a
+    /// token member (covered by the tail-admission tests). Only the SCOPE
+    /// legs still refuse: blank source folder, blank account, blank
+    /// destination.
+    @Test("Blank scope refuses detail gestures before detail/thread mutation, journal, Undo, or success")
     @MainActor
-    func invalidRFCDetailGesturesAreSideEffectFree() async throws {
+    func blankScopeDetailGesturesAreSideEffectFree() async throws {
         let (pool, dir, previous) = try makeEnv()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -141,15 +146,6 @@ struct MessageDetailViewModelMoveTests {
         clearOverlay()
         UndoService.shared.dismissAll()
 
-        let focused = try insertHeader(
-            pool, messageId: "detail-rfc-missing", folderPath: Self.inboxPath,
-            isInInbox: true, isRead: false, includeRFCIdentity: false
-        )
-        let thread = try insertHeader(
-            pool, messageId: "detail-rfc-malformed", folderPath: Self.inboxPath,
-            isInInbox: true, isRead: false, actionTag: .reply,
-            rfc822MessageId: "<broken@example.com"
-        )
         var blankSource = try insertHeader(
             pool, messageId: "detail-source-blank", folderPath: Self.inboxPath,
             isInInbox: true, isRead: false
@@ -165,18 +161,15 @@ struct MessageDetailViewModelMoveTests {
             isInInbox: true, isRead: false
         )
 
-        let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
-        vm._testSeedMessage(focused)
-        vm.threadMessages = [thread, blankSource, blankAccount, valid]
+        let vm = MessageDetailViewModel(messageId: blankSource.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(blankSource)
+        vm.threadMessages = [blankSource, blankAccount, valid]
 
         vm.toggleRead()
-        await vm.markReadOnOpenIfNeeded()
         #expect(!vm.archive())
         #expect(!vm.delete())
         #expect(!vm.move(toFolderPath: Self.archivePath))
 
-        vm.toggleReadForThread(thread)
-        #expect(!vm.moveMessage(thread, toFolderPath: Self.archivePath))
         vm.toggleReadForThread(blankSource)
         #expect(!vm.moveMessage(blankSource, toFolderPath: Self.archivePath))
         vm.toggleReadForThread(blankAccount)
@@ -184,12 +177,9 @@ struct MessageDetailViewModelMoveTests {
         #expect(!vm.moveMessage(valid, toFolderPath: " \n"))
 
         #expect(vm.message?.isRead == false)
-        #expect(vm.message?.actionTag == nil)
-        #expect(vm.threadMessages.count == 4)
-        guard vm.threadMessages.count == 4 else { return }
+        #expect(vm.threadMessages.count == 3)
+        guard vm.threadMessages.count == 3 else { return }
         #expect(vm.threadMessages.allSatisfy { !$0.isRead })
-        #expect(vm.threadMessages.first { $0.id == thread.id }?.folderPath == Self.inboxPath)
-        #expect(vm.threadMessages.first { $0.id == thread.id }?.actionTag == .reply)
         #expect(AccountManager.shared.intentionJournal.recordsForTesting().isEmpty)
         #expect(AccountManager.shared.snapshotOverlay().isEmpty)
         #expect(UndoService.shared.undoStack.isEmpty)

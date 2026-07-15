@@ -16,8 +16,11 @@ import SwiftUI
 
 /// One message the forward gesture moved, from this account's perspective.
 struct UndoMember: Sendable, Equatable {
-    /// Normalized RFC Message-ID — the only durable identity (§9.3).
-    let rfc822MessageId: String
+    /// Hybrid durable member identity (PLAN_IDENTITY_HYBRID): a normalized
+    /// RFC Message-ID when the message has one, otherwise the raw provider
+    /// ID as an opaque token. Classified by shape via
+    /// `MessageIdentity.durableMemberKind` at every consumer.
+    let memberIdentity: String
     /// Where this member came FROM — the inverse move's destination.
     let sourceFolderPath: String
     /// UI-LOCAL ONLY: the composite `MessageHeader.id` this row had at
@@ -25,7 +28,7 @@ struct UndoMember: Sendable, Equatable {
     /// `.messagesUndone` so `InboxView` can un-dismiss the exact row it hid
     /// (`dismissedMessages` is keyed by this same pre-move id) — never used
     /// to resolve/mutate the row. Resolution always happens by
-    /// `rfc822MessageId`, because an independent sync re-key between the
+    /// `memberIdentity`, because an independent sync re-key between the
     /// forward gesture and this Undo can make this id stale
     /// (`AccountManager.undoMove` falls back to identity-scoped resolution
     /// when it is).
@@ -64,10 +67,13 @@ struct UndoableAction: Sendable, Equatable {
 
     /// Builds one command per account from a set of pre-move headers headed
     /// to their account's own destination (a cross-account batch sends each
-    /// account's members to ITS OWN folder — e.g. `archiveThread`). Members
-    /// without a resolvable durable RFC identity, or whose account has no
-    /// recorded destination, are omitted: there is nothing to undo for a
-    /// member the durable queue itself could never have admitted.
+    /// account's members to ITS OWN folder — e.g. `archiveThread`). A member
+    /// whose RFC identity does not normalize falls back to its provider ID
+    /// (`header.messageId`) as a token member — the same hybrid rule as
+    /// durable admission (PLAN_IDENTITY_HYBRID §2). Only a member with no
+    /// identity at all, or whose account has no recorded destination, is
+    /// omitted: there is nothing to undo for a member the durable queue
+    /// itself could never have admitted.
     static func commands(
         for messages: [MessageHeader],
         forwardDestinationByAccount: [String: String]
@@ -77,11 +83,14 @@ struct UndoableAction: Sendable, Equatable {
         for accountId in byAccount.keys.sorted() {
             guard let forwardDestinationPath = forwardDestinationByAccount[accountId] else { continue }
             let members: [UndoMember] = (byAccount[accountId] ?? []).compactMap { header in
-                guard let rfc = MessageIdentity.durableActionRFC822MessageId(header.rfc822MessageId) else {
+                guard let memberIdentity = MessageIdentity.durableActionMemberIdentity(
+                    rfc822MessageId: header.rfc822MessageId,
+                    providerMessageId: header.messageId
+                ) else {
                     return nil
                 }
                 return UndoMember(
-                    rfc822MessageId: rfc,
+                    memberIdentity: memberIdentity,
                     sourceFolderPath: header.folderPath,
                     originalHeaderId: header.id
                 )
