@@ -34,6 +34,15 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var isFlagged: Bool { labels.contains("STARRED") }
     }
 
+    /// One attempted `/messages/{id}/modify` call, in chronological order —
+    /// including attempts the fixture rejected (injected 400s). Lets tests
+    /// assert cross-op provider ordering and per-message attempt counts.
+    struct ModifyCall: Sendable, Equatable {
+        let providerMessageId: String
+        let addLabelIds: [String]
+        let removeLabelIds: [String]
+    }
+
     private struct Message: Sendable {
         let rfc822MessageId: String
         let providerMessageId: String
@@ -51,6 +60,14 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// enqueue and drain. Gmail's real shape for this is a structural
         /// `400` (not `404`): https://developers.google.com/workspace/gmail/api/guides/handle-errors
         var deletedLabelIds: Set<String> = []
+        /// Provider message ids whose `/messages/{id}/modify` returns a
+        /// structural `400` whose body does NOT match the known
+        /// invalid-label shape — an UNCLASSIFIED permanent-shaped failure
+        /// (persistent-failure chain-demotion tests). Cleared via
+        /// `clearUnclassified400s()` to simulate the condition resolving.
+        var unclassified400ProviderIds: Set<String> = []
+        var unclassified400Served = 0
+        var modifyLog: [ModifyCall] = []
     }
 
     private final class StateBox: Sendable {
@@ -111,6 +128,52 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// 400 invalid-label error body instead of succeeding.
     func markLabelDeleted(_ labelId: String) {
         _ = state.value.withLock { $0.deletedLabelIds.insert(labelId) }
+    }
+
+    /// Inject an UNCLASSIFIED structural 400 for every `/messages/{id}/modify`
+    /// naming `providerMessageId`: the body is Gmail's structured error shape
+    /// but matches neither the invalid-label wording nor any other terminal
+    /// shape the adapter knows — permanent-SHAPED, not authoritative-terminal.
+    /// Drives the persistent-failure chain-demotion path.
+    func injectUnclassified400(providerMessageId: String) {
+        _ = state.value.withLock { $0.unclassified400ProviderIds.insert(providerMessageId) }
+    }
+
+    /// Clear every injected unclassified 400 — simulates the provider-side
+    /// condition resolving so a later drain completes the demoted chain.
+    func clearUnclassified400s() {
+        state.value.withLock { $0.unclassified400ProviderIds.removeAll() }
+    }
+
+    /// How many modify attempts were rejected with the injected unclassified
+    /// 400 — one per provider attempt on the failing op.
+    func unclassified400ServedCount() -> Int {
+        state.value.withLock { $0.unclassified400Served }
+    }
+
+    /// Chronological log of every attempted modify call (including rejected
+    /// ones) for ordering/attempt-count assertions.
+    func modifyLog() -> [ModifyCall] {
+        state.value.withLock { $0.modifyLog }
+    }
+
+    /// Gmail's structured error-body shape with a reason/message that matches
+    /// NO terminal classification the adapter knows (not invalid-label, not
+    /// 404/410) — the "unrecognized REST 400" that used to wedge the queue.
+    private static func unclassifiedBadRequestBody() -> Data {
+        let message = "Precondition check failed."
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "failedPrecondition",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
     /// Gmail's real `400` error body for an invalid/gone label — the shape
@@ -242,6 +305,19 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             } ?? [:]
             let additions = body["addLabelIds"] as? [String] ?? []
             let removals = body["removeLabelIds"] as? [String] ?? []
+            let injectedUnclassified400 = state.value.withLock { model -> Bool in
+                model.modifyLog.append(ModifyCall(
+                    providerMessageId: providerId,
+                    addLabelIds: additions,
+                    removeLabelIds: removals
+                ))
+                guard model.unclassified400ProviderIds.contains(providerId) else { return false }
+                model.unclassified400Served += 1
+                return true
+            }
+            if injectedUnclassified400 {
+                return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            }
             if let deletedLabel = state.value.withLock({ model in
                 (additions + removals).first(where: { model.deletedLabelIds.contains($0) })
             }) {

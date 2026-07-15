@@ -387,6 +387,19 @@ enum ProviderError: LocalizedError {
     /// the request boundary so the bug surfaces at its source, not as an opaque
     /// network error.
     case syntheticFolderPath(String)
+    /// An action-path provider failure that is permanent-SHAPED but NOT
+    /// authoritative-terminal — e.g. an unrecognized structural REST `400`
+    /// whose body matches none of the adapter's known terminal shapes
+    /// (Gmail invalid-label, Graph `ErrorInvalidIdMalformed`). The same
+    /// request will keep failing on retry, but the adapter cannot prove the
+    /// target is stale/gone, so dropping the intention is forbidden (Law 4
+    /// forbids guessing terminality; "never drop user intention" forbids
+    /// discarding). Adapters classify (Law 5); the generic queue reacts by
+    /// demoting the failing op's related chain to the queue tail so
+    /// unrelated work proceeds (ADR-IOS-060 decision 1 amendment,
+    /// 2026-07-15). 401/403/429/5xx/transport failures are NEVER classified
+    /// as this — they stay plain transient and keep blocking the frontier.
+    case persistentActionFailure(underlying: Error)
 
     var errorDescription: String? {
         switch self {
@@ -399,6 +412,7 @@ enum ProviderError: LocalizedError {
         case .uidResolutionFailed(let id): return "Could not resolve Message-ID '\(id)' to UID."
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
+        case .persistentActionFailure(let error): return "Persistent provider action failure: \(error.localizedDescription)"
         }
     }
 }

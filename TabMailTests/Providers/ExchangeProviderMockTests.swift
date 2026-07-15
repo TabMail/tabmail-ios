@@ -512,6 +512,139 @@ struct ExchangeProviderActionResolutionTests {
         #expect(!calls.contains { $0.method == "PATCH" })
     }
 
+    // MARK: - Persistent-failure classification (Law 5; ADR-IOS-060 decision 1 amendment)
+
+    /// A structured Graph 400 whose code matches NO terminal classification
+    /// the adapter knows — the "unrecognized REST 400".
+    private static let unrecognizedGraph400Body = Data(
+        #"{"error":{"code":"ErrorIrresolvableConflict","message":"The send or update operation could not be performed."}}"#.utf8
+    )
+
+    @Test("action-path PATCH 400 with an unrecognized body classifies as persistentActionFailure — permanent-shaped, not terminal")
+    func patchUnrecognized400ClassifiesAsPersistentActionFailure() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "graph-token-persistent-400"
+        http.register(
+            path: "/messages/\(token)?",
+            response: .json(raw: row(
+                id: token,
+                rfc822MessageId: "persistent-400@example.com",
+                folder: "source-folder"
+            ))
+        )
+        http.register(
+            path: "/messages/\(token)",
+            method: "PATCH",
+            response: .bytes(Self.unrecognizedGraph400Body, contentType: "application/json", statusCode: 400)
+        )
+
+        do {
+            try await provider(http).markRead(ids: [token], folder: "source-folder")
+            Issue.record("an unrecognized action-path 400 must throw")
+        } catch {
+            guard case ProviderError.persistentActionFailure(let underlying) = error else {
+                Issue.record("expected persistentActionFailure, got \(error)")
+                return
+            }
+            guard case ProviderError.networkError(let httpError) = underlying,
+                  case HTTPError.networkErrorWithBody(let statusCode, _) = httpError else {
+                Issue.record("expected the wrapped body-preserving 400, got \(underlying)")
+                return
+            }
+            #expect(statusCode == 400)
+        }
+    }
+
+    @Test("action-path PATCH ErrorInvalidIdMalformed stays authoritative — normal no-op return, not persistent")
+    func patchInvalidIdMalformedStaysAuthoritativeNoOp() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "graph-token-patch-malformed"
+        http.register(
+            path: "/messages/\(token)?",
+            response: .json(raw: row(
+                id: token,
+                rfc822MessageId: "patch-malformed@example.com",
+                folder: "source-folder"
+            ))
+        )
+        http.register(
+            path: "/messages/\(token)",
+            method: "PATCH",
+            response: .bytes(
+                Data(#"{"error":{"code":"ErrorInvalidIdMalformed","message":"Id is malformed."}}"#.utf8),
+                contentType: "application/json",
+                statusCode: 400
+            )
+        )
+
+        // Authoritative stale (Law 4): a never-valid id cannot succeed on
+        // retry — normal return, the queue treats it as a completed no-op.
+        try await provider(http).markRead(ids: [token], folder: "source-folder")
+
+        #expect(http.recordedCalls().contains { $0.method == "PATCH" })
+    }
+
+    @Test("action-path PATCH 500 stays a plain transient failure — never persistentActionFailure")
+    func patch500StaysPlainTransient() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "graph-token-patch-500"
+        http.register(
+            path: "/messages/\(token)?",
+            response: .json(raw: row(
+                id: token,
+                rfc822MessageId: "patch-500@example.com",
+                folder: "source-folder"
+            ))
+        )
+        http.register(path: "/messages/\(token)", method: "PATCH", response: .status(500))
+
+        do {
+            try await provider(http).markRead(ids: [token], folder: "source-folder")
+            Issue.record("a 500 must throw")
+        } catch {
+            if case ProviderError.persistentActionFailure = error {
+                Issue.record("a 500 must stay plain transient (frontier blocks), got persistentActionFailure")
+            }
+            guard case ProviderError.networkError = error else {
+                Issue.record("expected the ordinary transient networkError, got \(error)")
+                return
+            }
+        }
+    }
+
+    @Test("move 400 with an unrecognized body classifies as persistentActionFailure while ErrorInvalidIdMalformed stays a no-op")
+    func moveUnrecognized400ClassifiesAsPersistentActionFailure() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let token = "graph-token-move-400"
+        http.register(
+            path: "/messages/\(token)?",
+            response: .json(raw: row(
+                id: token,
+                rfc822MessageId: "move-400@example.com",
+                folder: "source-folder"
+            ))
+        )
+        http.register(
+            path: "/messages/\(token)/move",
+            method: "POST",
+            response: .bytes(Self.unrecognizedGraph400Body, contentType: "application/json", statusCode: 400)
+        )
+
+        do {
+            try await provider(http).move(ids: [token], from: "source-folder", to: "destination-folder")
+            Issue.record("an unrecognized move 400 must throw")
+        } catch {
+            guard case ProviderError.persistentActionFailure = error else {
+                Issue.record("expected persistentActionFailure, got \(error)")
+                return
+            }
+        }
+    }
+
     @Test("contradictory token metadata is retryable uncertainty")
     func contradictoryTokenMetadataThrows() async {
         let responses = [

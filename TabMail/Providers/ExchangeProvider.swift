@@ -623,8 +623,11 @@ actor ExchangeProvider: EmailProvider {
                 method: "GET",
                 body: nil
             )
-        } catch let error where isGraphNotFound(error) || isGraphInvalidIdMalformed(error) {
-            return nil
+        } catch {
+            if isGraphNotFound(error) || isGraphInvalidIdMalformed(error) { return nil }
+            // Any OTHER structural 400 is permanent-shaped but unproven:
+            // persistent, so the queue demotes rather than wedges (or drops).
+            throw classifyUnrecognizedActionBadRequest(error)
         }
 
         let message = try JSONDecoder().decode(GraphMessage.self, from: metadata)
@@ -1140,6 +1143,24 @@ actor ExchangeProvider: EmailProvider {
         let error: ErrorObject
     }
 
+    /// Law 5 classification for a structurally-preserved action-path `400`
+    /// whose body matched NO known terminal shape (`ErrorInvalidIdMalformed`
+    /// handled by the caller first): permanent-SHAPED — the same request
+    /// keeps failing — but not authoritative-terminal, so dropping the
+    /// intention is forbidden. Wrapped as `.persistentActionFailure` so the
+    /// generic queue demotes the failure's related chain to the queue tail
+    /// instead of blocking the global FIFO forever (ADR-IOS-060 decision 1
+    /// amendment, 2026-07-15). Only the body-preserving `400` is classified:
+    /// 401/403/429/5xx/transport arrive as the bodyless `.networkError` and
+    /// pass through unchanged as plain transient.
+    private func classifyUnrecognizedActionBadRequest(_ error: Error) -> Error {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, _) = underlying,
+              statusCode == 400
+        else { return error }
+        return ProviderError.persistentActionFailure(underlying: error)
+    }
+
     /// True only when Graph's structured `400` error body proves the id could
     /// never be valid — `code == "ErrorInvalidIdMalformed"`. This is distinct
     /// from "not found" (already 404/410 via `isGraphNotFound`): a malformed
@@ -1180,9 +1201,22 @@ actor ExchangeProvider: EmailProvider {
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
         do {
-            _ = try await request(path: "/messages/\(encodedId)", method: "PATCH", body: jsonData)
-        } catch let error where isGraphNotFound(error) {
-            return
+            // Body-preserving variant so an action-path 400 can be
+            // structurally classified instead of guessed from the status code
+            // alone — same treatment as `moveMessage`.
+            _ = try await requestPreservingBadRequestBody(
+                path: "/messages/\(encodedId)",
+                method: "PATCH",
+                body: jsonData
+            )
+        } catch {
+            // Authoritative stale (Law 4): resource confirmed gone (404/410)
+            // or a never-valid id (`ErrorInvalidIdMalformed` 400) — a
+            // completed no-op, consistent with `moveMessage`/token resolution.
+            if isGraphNotFound(error) || isGraphInvalidIdMalformed(error) { return }
+            // Any OTHER structural 400 is permanent-shaped but unproven:
+            // persistent, so the queue demotes rather than wedges (or drops).
+            throw classifyUnrecognizedActionBadRequest(error)
         }
     }
 
@@ -1196,13 +1230,16 @@ actor ExchangeProvider: EmailProvider {
                 method: "POST",
                 body: jsonData
             )
-        } catch let error where isGraphNotFound(error) || isGraphInvalidIdMalformed(error) {
+        } catch {
             // Authoritative stale (Law 4): either the resource is confirmed
             // gone (404/410) or the destination id could never be valid
             // (`ErrorInvalidIdMalformed` 400 — a never-valid folder id, not
             // merely "not found"). Normal return; the queue treats this as a
             // completed no-op.
-            return
+            if isGraphNotFound(error) || isGraphInvalidIdMalformed(error) { return }
+            // Any OTHER structural 400 is permanent-shaped but unproven:
+            // persistent, so the queue demotes rather than wedges (or drops).
+            throw classifyUnrecognizedActionBadRequest(error)
         }
     }
 

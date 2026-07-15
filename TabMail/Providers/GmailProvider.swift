@@ -675,7 +675,9 @@ actor GmailProvider: EmailProvider {
                 }
                 return nil
             }
-            throw error
+            // Any OTHER structural 400 is permanent-shaped but unproven:
+            // persistent, so the queue demotes rather than wedges (or drops).
+            throw classifyUnrecognizedActionBadRequest(error)
         }
         let response = try JSONDecoder().decode(GmailMessageListResponse.self, from: listData)
         guard let refs = response.messages,
@@ -1321,6 +1323,25 @@ actor GmailProvider: EmailProvider {
         let error: ErrorObject
     }
 
+    /// Law 5 classification for a structurally-preserved action-path `400`
+    /// whose body matched NO known terminal shape (invalid-label handled by
+    /// the caller first): permanent-SHAPED — the same request keeps failing —
+    /// but not authoritative-terminal, so dropping the intention is
+    /// forbidden. Wrapped as `.persistentActionFailure` so the generic queue
+    /// demotes the failure's related chain to the queue tail instead of
+    /// blocking the global FIFO forever (ADR-IOS-060 decision 1 amendment,
+    /// 2026-07-15). Only the body-preserving `400` is classified: 401/403/
+    /// 429/5xx/transport arrive as the bodyless `.networkError` and pass
+    /// through unchanged as plain transient (frontier blocks; auth/throttle
+    /// heal on their own).
+    private func classifyUnrecognizedActionBadRequest(_ error: Error) -> Error {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, _) = underlying,
+              statusCode == 400
+        else { return error }
+        return ProviderError.persistentActionFailure(underlying: error)
+    }
+
     /// True only when Gmail's structured `400` error body PROVES the target
     /// label no longer exists — `reason == "invalidArgument"` AND Gmail's own
     /// literal wording `"Invalid label: <id>"` (e.g. a destination/source
@@ -1360,7 +1381,9 @@ actor GmailProvider: EmailProvider {
                 }
                 return
             }
-            throw error
+            // Any OTHER structural 400 is permanent-shaped but unproven:
+            // persistent, so the queue demotes rather than wedges (or drops).
+            throw classifyUnrecognizedActionBadRequest(error)
         }
     }
 

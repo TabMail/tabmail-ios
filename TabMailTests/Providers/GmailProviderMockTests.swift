@@ -1019,6 +1019,157 @@ struct GmailProviderMockTests {
         #expect(http.recordedCalls().contains { $0.url.contains("/modify") })
     }
 
+    // MARK: - Persistent-failure classification (Law 5; ADR-IOS-060 decision 1 amendment)
+
+    /// Gmail's structured error-body shape with a reason/message the adapter
+    /// recognizes as NO terminal classification — the "unrecognized REST 400".
+    private static let unrecognizedGmail400Body = Data(
+        #"{"error":{"errors":[{"domain":"global","reason":"failedPrecondition","message":"Precondition check failed."}],"code":400,"message":"Precondition check failed."}}"#.utf8
+    )
+
+    @Test("modify 400 with an unrecognized body classifies as persistentActionFailure — permanent-shaped, not terminal, never a silent drop")
+    func modifyUnrecognized400ClassifiesAsPersistentActionFailure() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let rfc822 = "persistent-400@example.com"
+        let providerId = "gmail-persistent-400"
+        http.register(
+            path: "/messages?q=",
+            response: .json(raw: #"{"messages":[{"id":"gmail-persistent-400","threadId":"thread"}]}"#)
+        )
+        http.register(
+            path: "/messages/\(providerId)?",
+            response: .json(raw: Self.actionMetadata(id: providerId, rfc822MessageId: rfc822))
+        )
+        http.register(
+            path: "/messages/\(providerId)/modify",
+            method: "POST",
+            response: .bytes(Self.unrecognizedGmail400Body, contentType: "application/json", statusCode: 400)
+        )
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        do {
+            try await provider.markRead(ids: [rfc822], folder: "INBOX")
+            Issue.record("an unrecognized action-path 400 must throw")
+        } catch {
+            guard case ProviderError.persistentActionFailure(let underlying) = error else {
+                Issue.record("expected persistentActionFailure, got \(error)")
+                return
+            }
+            // The original structural failure is preserved for diagnostics.
+            guard case ProviderError.networkError(let httpError) = underlying,
+                  case HTTPError.networkErrorWithBody(let statusCode, _) = httpError else {
+                Issue.record("expected the wrapped body-preserving 400, got \(underlying)")
+                return
+            }
+            #expect(statusCode == 400)
+        }
+    }
+
+    @Test("action-path list 400 with an unrecognized body classifies as persistentActionFailure")
+    func actionLookupUnrecognized400ClassifiesAsPersistentActionFailure() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(
+            path: "/messages?q=",
+            response: .bytes(Self.unrecognizedGmail400Body, contentType: "application/json", statusCode: 400)
+        )
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        do {
+            try await provider.markRead(ids: ["persistent-list-400@example.com"], folder: "INBOX")
+            Issue.record("an unrecognized action-lookup 400 must throw")
+        } catch {
+            guard case ProviderError.persistentActionFailure = error else {
+                Issue.record("expected persistentActionFailure, got \(error)")
+                return
+            }
+        }
+        #expect(!http.recordedCalls().contains { $0.url.contains("/modify") }, "no mutation after a failed lookup")
+    }
+
+    @Test("modify 400 with the KNOWN invalid-label body stays an authoritative no-op — not persistent")
+    func modifyKnownInvalidLabel400StaysAuthoritativeNoOp() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let rfc822 = "invalid-label-400@example.com"
+        let providerId = "gmail-invalid-label-400"
+        http.register(
+            path: "/messages?q=",
+            response: .json(raw: #"{"messages":[{"id":"gmail-invalid-label-400","threadId":"thread"}]}"#)
+        )
+        http.register(
+            path: "/messages/\(providerId)?",
+            response: .json(raw: Self.actionMetadata(id: providerId, rfc822MessageId: rfc822))
+        )
+        http.register(
+            path: "/messages/\(providerId)/modify",
+            method: "POST",
+            response: .bytes(
+                Data(#"{"error":{"errors":[{"domain":"global","reason":"invalidArgument","message":"Invalid label: Label_9"}],"code":400,"message":"Invalid label: Label_9"}}"#.utf8),
+                contentType: "application/json",
+                statusCode: 400
+            )
+        )
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        // Authoritative stale (Law 4): normal return, no throw of any kind.
+        try await provider.setUserLabel(ids: [rfc822], labelId: "Label_9", present: true, folder: "INBOX")
+
+        #expect(http.recordedCalls().contains { $0.url.contains("/modify") })
+    }
+
+    @Test("modify 500 stays a plain transient failure — never persistentActionFailure")
+    func modify500StaysPlainTransient() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let rfc822 = "transient-500@example.com"
+        let providerId = "gmail-transient-500"
+        http.register(
+            path: "/messages?q=",
+            response: .json(raw: #"{"messages":[{"id":"gmail-transient-500","threadId":"thread"}]}"#)
+        )
+        http.register(
+            path: "/messages/\(providerId)?",
+            response: .json(raw: Self.actionMetadata(id: providerId, rfc822MessageId: rfc822))
+        )
+        http.register(
+            path: "/messages/\(providerId)/modify",
+            method: "POST",
+            response: .status(500)
+        )
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        do {
+            try await provider.markRead(ids: [rfc822], folder: "INBOX")
+            Issue.record("a 500 must throw")
+        } catch {
+            if case ProviderError.persistentActionFailure = error {
+                Issue.record("a 500 must stay plain transient (frontier blocks), got persistentActionFailure")
+            }
+            guard case ProviderError.networkError = error else {
+                Issue.record("expected the ordinary transient networkError, got \(error)")
+                return
+            }
+        }
+    }
+
     @Test("user-label membership resolves RFC identity before mutation")
     func userLabelResolvesRFCIdentity() async throws {
         let http = FakeHTTP.Scenario()

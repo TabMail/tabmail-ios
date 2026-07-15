@@ -173,12 +173,27 @@ extension AccountManager {
             // op.id values that have already produced a [QueueDiag] deep-dump this drain.
             // Prevents log-spam on the same stuck op that retries every drain cycle.
             var diagnosedOpIds = Set<String>()
+            // op.id values demoted to the queue tail THIS drain pass
+            // (persistent-failure chain demotion, ADR-IOS-060 decision 1
+            // amendment). The spin guard: a re-claimed frontier whose id is
+            // in this set is requeued untouched and stops the drain — a
+            // failing chain gets exactly ONE provider attempt per drain,
+            // never a tight demote/re-claim loop within one.
+            var demotedOpIds = Set<String>()
         }
 
         private let state = Mutex(State())
 
         func markDiagnosedIfNew(operationId: String) -> Bool {
             state.withLock { $0.diagnosedOpIds.insert(operationId).inserted }
+        }
+
+        func markDemotedThisDrain(operationIds: [String]) {
+            state.withLock { $0.demotedOpIds.formUnion(operationIds) }
+        }
+
+        func wasDemotedThisDrain(operationId: String) -> Bool {
+            state.withLock { $0.demotedOpIds.contains(operationId) }
         }
     }
 
@@ -432,6 +447,15 @@ extension AccountManager {
 
             while !Task.isCancelled {
                 guard let claimed = await claimFrontierOperation(database: passDatabase) else { break }
+                // Spin guard (persistent-failure chain demotion): a frontier
+                // whose id was already demoted THIS drain has had its one
+                // provider attempt — requeue it untouched and stop, exactly
+                // like a transient frontier. The next external drain trigger
+                // retries the chain naturally (one attempt per drain).
+                if ctx.wasDemotedThisDrain(operationId: claimed.id) {
+                    await requeueClaimedOperation(id: claimed.id, database: passDatabase)
+                    break
+                }
                 guard let queue = workQueues[claimed.accountId] else {
                     // Cannot execute the frontier without its provider. Return it
                     // and stop: a later job must never overtake an unexecuted
@@ -504,6 +528,81 @@ extension AccountManager {
                 print("[Queue] CRITICAL: Failed to requeue claimed op \(id): \(error)")
             }
             return false
+        }
+    }
+
+    /// Persistent-failure chain demotion (ADR-IOS-060 decision 1 amendment,
+    /// 2026-07-15). In ONE gated transaction:
+    ///   1. load the active (non-cancelled) rows in durable rowid order;
+    ///   2. compute the failing op's RELATED CHAIN — the transitive closure
+    ///      over same-account rows whose member sets intersect, seeded by
+    ///      (and including) the failing op. Per-message serial order is what
+    ///      the chain protects: every op touching any chained message moves
+    ///      together, so no member's ops can ever execute out of their
+    ///      original relative order;
+    ///   3. re-insert the chain at the queue TAIL — physical delete + insert
+    ///      preserving `id` and every payload byte (the exact fetched record
+    ///      values; only the rowid position changes), keeping the chain's
+    ///      intra-chain relative order, all rows `status = queued` (the
+    ///      failing frontier itself was `inFlight`).
+    ///
+    /// The dumb-pipe law (§9.3/decision 3) is upheld: no payload is
+    /// rewritten, split, or merged — position is not payload. Undo's
+    /// newest-related rowid scan is unaffected: a demoted chain's newest
+    /// member is still its newest.
+    ///
+    /// Returns the demoted chain size, marking every chain id in `context`'s
+    /// per-drain demoted set (the spin guard). Returns 0 when the failing row
+    /// vanished concurrently or the gated write failed after retries — the
+    /// caller then falls back to the ordinary transient requeue so the
+    /// claimed row is never stranded `inFlight`.
+    private func demoteRelatedChainToTail(
+        failing: PendingOperation,
+        context: DrainContext,
+        database: PrioritizedDatabase
+    ) async -> Int {
+        do {
+            let chainIds: [String] = try await retryGatedQueueWrite(database, label: "Queue demotion") { db in
+                let active = try PendingOperation.fetchAll(
+                    db,
+                    sql: "SELECT * FROM pendingOperation WHERE status != ? ORDER BY rowid ASC",
+                    arguments: [PendingStatus.cancelled.rawValue]
+                )
+                // The claimed frontier should still be present (single owner,
+                // gate held) — if it vanished (e.g. a concurrent account
+                // purge), there is nothing safe to demote.
+                guard let seed = active.first(where: { $0.id == failing.id }) else { return [] }
+                var chainMemberSet = Set(seed.messageIds)
+                var chainIdSet: Set<String> = [seed.id]
+                var grew = true
+                while grew {
+                    grew = false
+                    for row in active
+                    where row.accountId == seed.accountId && !chainIdSet.contains(row.id) {
+                        guard !chainMemberSet.isDisjoint(with: row.messageIds) else { continue }
+                        chainIdSet.insert(row.id)
+                        chainMemberSet.formUnion(row.messageIds)
+                        grew = true
+                    }
+                }
+                // Delete + re-insert the exact fetched records in original
+                // relative order: same primary key, byte-identical payload;
+                // fresh rowids place them at the tail.
+                let chain = active.filter { chainIdSet.contains($0.id) }
+                for row in chain {
+                    _ = try PendingOperation.deleteOne(db, key: row.id)
+                }
+                for var row in chain {
+                    row.status = PendingStatus.queued.rawValue
+                    try row.insert(db)
+                }
+                return chain.map(\.id)
+            }
+            context.markDemotedThisDrain(operationIds: chainIds)
+            return chainIds.count
+        } catch {
+            print("[Queue] ERROR: chain demotion failed for op \(failing.id) — falling back to transient requeue: \(error)")
+            return 0
         }
     }
 
@@ -613,13 +712,41 @@ extension AccountManager {
             return .proceed
         } catch {
             // Law 4/5: the provider adapter — not the queue — normalizes an
-            // authoritative stale/no-op outcome to a normal return. Once a
-            // provider action method throws at all, the queue treats it
-            // uniformly as transient/uncertain: NEVER drop on age or on a
-            // guessed error shape. Staleness is confirmed only by the
-            // provider's normal return; a throw here always means retry. The
-            // frontier is protected (§9.1): stopping the drain here prevents
-            // any later row from overtaking this unresolved one.
+            // authoritative stale/no-op outcome to a normal return, and
+            // CLASSIFIES a permanent-shaped-but-unproven failure as
+            // `.persistentActionFailure`. The queue reacts generically:
+            //   - persistent → demote the failing op's exact related chain to
+            //     the queue tail so unrelated work proceeds (ADR-IOS-060
+            //     decision 1 amendment, 2026-07-15) — nothing is dropped;
+            //   - everything else → transient/uncertain: NEVER drop on age or
+            //     on a guessed error shape; requeue in place and stop the
+            //     drain (protected frontier, §9.1).
+            if case ProviderError.persistentActionFailure = error {
+                // Same once-per-(drain, opId) deep diagnostic as the
+                // transient path — report loudly, even while demoting.
+                if context.markDiagnosedIfNew(operationId: currentOp.id) {
+                    await logStuckOpDiagnostic(
+                        currentOp,
+                        error: error,
+                        database: queueDatabase
+                    )
+                }
+                let demotedCount = await demoteRelatedChainToTail(
+                    failing: currentOp,
+                    context: context,
+                    database: queueDatabase
+                )
+                if demotedCount > 0 {
+                    // Loud, UNGATED error report (owner-directed): a
+                    // persistently failing user intention parked at the tail
+                    // is production-observability-worthy.
+                    print("[Queue] ERROR: persistent provider failure — demoted \(demotedCount)-op chain for \(currentOp.accountId) to queue tail: \(error)")
+                    return .proceed
+                }
+                // The demotion write itself failed (or the row vanished
+                // concurrently) — fall through to the ordinary transient
+                // requeue below so the claimed row is never stranded inFlight.
+            }
             let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
             print("[Queue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
             // Deep diagnostic on the failing op — fires once per (drain, opId) so a
@@ -731,8 +858,15 @@ extension AccountManager {
         print("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
 
         // Error structural unwrap — diagnostic only (Round E/Law 5: the queue
-        // no longer interprets provider error types to make decisions).
+        // no longer interprets provider error types to make decisions; the
+        // one classified verdict, `.persistentActionFailure`, is unwrapped
+        // here purely so the dump shows the original structural failure).
         print("[QueueDiag] error.type=\(type(of: error)) error=\(error)")
+        var error = error
+        if case ProviderError.persistentActionFailure(let wrapped) = error {
+            print("[QueueDiag] persistentActionFailure wraps: \(type(of: wrapped)) \(wrapped)")
+            error = wrapped
+        }
         if case ProviderError.networkError(let underlying) = error {
             print("[QueueDiag] underlying.type=\(type(of: underlying)) underlying=\(underlying)")
             if case HTTPError.networkError(let statusCode) = underlying {
