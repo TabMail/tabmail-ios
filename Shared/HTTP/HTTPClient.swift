@@ -38,6 +38,19 @@ let sharedEphemeralSession: URLSession = {
 struct HTTPRequestResult: Sendable {
     let data: Data?
     let statusCode: Int
+    /// Raw response body captured on a non-2xx response, even though `data`
+    /// stays nil for failures. Populated so a caller that opts into
+    /// `AuthedHTTP.requestPreservingBadRequestBody` can structurally parse a
+    /// provider's error payload (e.g. Gmail's invalid-label 400, Graph's
+    /// `ErrorInvalidIdMalformed` 400) instead of guessing from status code
+    /// alone. `nil` on success (use `data` there) or when the body is empty.
+    /// Defaulted so every pre-existing `HTTPRequestResult(...)` call site
+    /// (production and test) keeps compiling unchanged. `var` (not `let`) is
+    /// required for a defaulted stored property to appear as an overridable
+    /// parameter in the synthesized memberwise initializer at all — a
+    /// defaulted `let` is baked in as a fixed constant and cannot be
+    /// customized per instance.
+    var errorBody: Data? = nil
 }
 
 /// Execute an HTTP request with Bearer token authentication.
@@ -76,11 +89,11 @@ func performHTTPRequest(
         return HTTPRequestResult(data: data, statusCode: statusCode)
     }
 
-    if let logLabel, let errorBody = String(data: data, encoding: .utf8) {
-        print("[\(logLabel)] HTTP \(statusCode) \(method) \(url): \(errorBody.prefix(500))")
+    if let logLabel, let errorBodyText = String(data: data, encoding: .utf8) {
+        print("[\(logLabel)] HTTP \(statusCode) \(method) \(url): \(errorBodyText.prefix(500))")
     }
 
-    return HTTPRequestResult(data: nil, statusCode: statusCode)
+    return HTTPRequestResult(data: nil, statusCode: statusCode, errorBody: data.isEmpty ? nil : data)
 }
 
 /// Execute an HTTP request with automatic retry on rate-limiting status codes.
@@ -127,4 +140,14 @@ func performHTTPRequestWithRetry(
 enum HTTPError: Error, Sendable {
     case invalidURL(String)
     case networkError(statusCode: Int)
+    /// Same failure shape as `.networkError`, but additionally carries the raw
+    /// response body. Only `AuthedHTTP.requestPreservingBadRequestBody` (an
+    /// explicit opt-in used by a handful of action-path call sites) produces
+    /// this case, and only for a `400` response — every other failure status,
+    /// and every ordinary `request()` call site, still throws the bodyless
+    /// `.networkError` unchanged. Exists so a caller can structurally parse a
+    /// provider-specific error payload (e.g. Gmail's invalid-label 400,
+    /// Graph's `ErrorInvalidIdMalformed` 400) instead of guessing from the
+    /// status code alone.
+    case networkErrorWithBody(statusCode: Int, body: Data)
 }

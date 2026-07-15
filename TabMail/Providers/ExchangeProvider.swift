@@ -8,6 +8,7 @@ import Foundation
 /// Mirrors `GmailProvider` actor pattern — same `accessToken` closure, same retry logic.
 /// Uses Microsoft Graph Mail REST API for all operations.
 actor ExchangeProvider: EmailProvider {
+    nonisolated let messageFieldScope: MessageFieldScope = .account
 
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let userEmail: String
@@ -502,27 +503,33 @@ actor ExchangeProvider: EmailProvider {
     // MARK: - Actions
 
     func markRead(ids: [String], folder: String) async throws {
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
             try await patchMessage(id: id, body: ["isRead": true])
         }
     }
 
     func markUnread(ids: [String], folder: String) async throws {
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
             try await patchMessage(id: id, body: ["isRead": false])
         }
     }
 
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {
         let flagBody: [String: Any] = ["flag": ["flagStatus": flagged ? "flagged" : "notFlagged"]]
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
             try await patchMessage(id: id, body: flagBody)
         }
     }
 
     func move(ids: [String], from source: String, to destination: String) async throws {
-        print("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: source)
+        for id in resolvedIds {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] ExchangeProvider.move — rfcIds=\(ids) resolvedId=\(id) to=\(destination)")
+            }
             // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
             // tm_* Graph categories so pre-ADR pollution fades naturally as
             // the user triages. Best-effort — a strip failure must NOT
@@ -531,19 +538,215 @@ actor ExchangeProvider: EmailProvider {
                 do {
                     try await stripLegacyCategories(id: id)
                 } catch {
-                    print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)")
+                    }
                 }
             }
             try await moveMessage(id: id, destinationId: destination)
-            print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
         }
+    }
+
+    /// Resolve the entire durable RFC batch before the first provider mutation.
+    /// Transient Graph IDs are ordered-deduplicated and never escape this adapter.
+    private func resolveActionMessageIds(_ ids: [String], folder: String) async throws -> [String] {
+        var resolved: [String] = []
+        var seen = Set<String>()
+        for id in ids {
+            guard let providerId = try await resolveActionMessageId(id, folder: folder),
+                  seen.insert(providerId).inserted
+            else { continue }
+            resolved.append(providerId)
+        }
+        return resolved
+    }
+
+    /// Upgrade one released durable row that still carries a transient Graph
+    /// resource id. The exact resource lookup is finite: a gone resource or one
+    /// outside both recorded folders is authoritative stale state, while malformed
+    /// metadata and every non-gone request failure remain retryable uncertainty.
+    func resolveLegacyMessageActionIdentity(
+        providerMessageId: String,
+        sourceFolder: String,
+        destinationFolder: String?
+    ) async throws -> LegacyMessageActionIdentityResolution {
+        let trimmedProviderId = providerMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSourceFolder = sourceFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let invalidFolderCharacters = CharacterSet.controlCharacters
+        let destinationIsValid = destinationFolder.map {
+            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty
+                && trimmed == $0
+                && $0.rangeOfCharacter(from: invalidFolderCharacters) == nil
+        } ?? true
+        guard !trimmedProviderId.isEmpty,
+              trimmedProviderId == providerMessageId,
+              providerMessageId.rangeOfCharacter(
+                  from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+              ) == nil,
+              !trimmedSourceFolder.isEmpty,
+              trimmedSourceFolder == sourceFolder,
+              sourceFolder.rangeOfCharacter(from: invalidFolderCharacters) == nil,
+              destinationIsValid
+        else {
+            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+        }
+        var scopedFolders = Set([sourceFolder])
+        if let destinationFolder {
+            scopedFolders.insert(destinationFolder)
+        }
+
+        let unreserved = Self.graphPathSegmentAllowed
+        let encodedProviderId = try Self.encodedGraphPathSegment(
+            providerMessageId,
+            context: "Graph legacy action identity"
+        )
+        let queryItems = [(name: "$select", value: "id,parentFolderId,internetMessageId")]
+        var encodedQueryItems: [URLQueryItem] = []
+        for item in queryItems {
+            guard let name = item.name.addingPercentEncoding(withAllowedCharacters: unreserved),
+                  let value = item.value.addingPercentEncoding(withAllowedCharacters: unreserved)
+            else {
+                throw ProviderError.invalidURL("Graph legacy action identity")
+            }
+            encodedQueryItems.append(URLQueryItem(name: name, value: value))
+        }
+        var components = URLComponents()
+        components.percentEncodedPath = "/messages/\(encodedProviderId)"
+        components.percentEncodedQueryItems = encodedQueryItems
+        guard let path = components.string else {
+            throw ProviderError.invalidURL("Graph legacy action identity")
+        }
+
+        let metadata: Data
+        do {
+            metadata = try await request(path: path)
+        } catch let error where isGraphNotFound(error) {
+            return .staleOrAmbiguous
+        }
+
+        let message = try JSONDecoder().decode(GraphMessage.self, from: metadata)
+        let trimmedParentFolderId = message.parentFolderId?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard message.id == providerMessageId,
+              let parentFolderId = message.parentFolderId,
+              let trimmedParentFolderId,
+              !trimmedParentFolderId.isEmpty,
+              trimmedParentFolderId == parentFolderId,
+              parentFolderId.rangeOfCharacter(from: invalidFolderCharacters) == nil,
+              let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
+                  message.internetMessageId
+              )
+        else {
+            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+        }
+        guard scopedFolders.contains(parentFolderId) else {
+            return .staleOrAmbiguous
+        }
+        return .resolved(rfc822MessageId: rfc822MessageId)
+    }
+
+    /// Graph's default message resource ID changes on move. Durable actions use
+    /// RFC Message-ID and resolve exactly one current resource inside the recorded
+    /// source folder; zero/multiple are terminal no-ops and incomplete lookups throw.
+    private func resolveActionMessageId(_ rawRFC822MessageId: String, folder: String) async throws -> String? {
+        guard let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
+            rawRFC822MessageId
+        ) else { return nil }
+        guard !folder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let wireId = "<\(rfc822MessageId)>"
+        let escapedWireId = wireId.replacingOccurrences(of: "'", with: "''")
+        let allowed = Self.graphPathSegmentAllowed
+        let encodedFolder = try Self.encodedGraphPathSegment(
+            folder,
+            context: "Graph action source folder"
+        )
+        let queryItems = [
+            (name: "$select", value: "id,parentFolderId,internetMessageId"),
+            (name: "$filter", value: "internetMessageId eq '\(escapedWireId)'"),
+            (name: "$top", value: "2"),
+        ]
+        var encodedQueryItems: [URLQueryItem] = []
+        for item in queryItems {
+            guard let name = item.name.addingPercentEncoding(withAllowedCharacters: allowed),
+                  let value = item.value.addingPercentEncoding(withAllowedCharacters: allowed)
+            else {
+                throw ProviderError.invalidURL("Graph action lookup")
+            }
+            encodedQueryItems.append(URLQueryItem(name: name, value: value))
+        }
+        var components = URLComponents()
+        components.percentEncodedPath = "/mailFolders/\(encodedFolder)/messages"
+        components.percentEncodedQueryItems = encodedQueryItems
+        guard let firstPath = components.string else {
+            throw ProviderError.invalidURL("Graph action lookup")
+        }
+
+        var nextLink: String?
+        var firstPage = true
+        var seenLinks = Set<String>()
+        var matches: [String] = []
+        repeat {
+            let data: Data
+            if firstPage {
+                do {
+                    data = try await request(path: firstPath)
+                } catch let error where isGraphNotFound(error) {
+                    // A folder-scoped collection 404/410 proves the recorded source
+                    // folder is gone; that is authoritative stale state.
+                    return nil
+                }
+                firstPage = false
+            } else {
+                guard let link = nextLink,
+                      seenLinks.insert(link).inserted,
+                      let linkComponents = URLComponents(string: link),
+                      linkComponents.scheme == "https",
+                      linkComponents.host?.lowercased() == "graph.microsoft.com",
+                      linkComponents.user == nil,
+                      linkComponents.password == nil,
+                      linkComponents.port == nil || linkComponents.port == 443
+                else {
+                    throw ProviderError.invalidURL("Graph action pagination")
+                }
+                data = try await requestAbsolute(url: link)
+            }
+
+            let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
+            for message in response.value {
+                let trimmedId = message.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedId.isEmpty,
+                      trimmedId == message.id,
+                      let returnedRFC822MessageId = MessageIdentity.durableActionRFC822MessageId(
+                          message.internetMessageId
+                      ),
+                      returnedRFC822MessageId == rfc822MessageId,
+                      message.parentFolderId == folder
+                else {
+                    throw ProviderError.actionIdentityResolutionFailed(rfc822MessageId)
+                }
+                matches.append(message.id)
+            }
+            if matches.count > 1 { return nil }
+            nextLink = response.odataNextLink
+            if let nextLink, nextLink.isEmpty {
+                throw ProviderError.invalidURL("Graph action pagination")
+            }
+        } while nextLink != nil
+
+        return matches.first
     }
 
     /// Remove any residual `tm_*` categories from a message. PATCH replaces
     /// the categories array in Graph, so we read-filter-write to preserve
     /// user-created categories. Skips the PATCH if no tm_* entries exist.
     private func stripLegacyCategories(id: String) async throws {
-        let data = try await request(path: "/messages/\(id)?$select=categories")
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        let data = try await request(path: "/messages/\(encodedId)?$select=categories")
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
         let existing = msg.categories ?? []
         let filtered = existing.filter { !$0.lowercased().hasPrefix("tm_") }
@@ -572,22 +775,32 @@ actor ExchangeProvider: EmailProvider {
         if let existingId = existingDraftId {
             // Update existing draft via PATCH
             let jsonData = try JSONSerialization.data(withJSONObject: message)
-            let response = try await request(path: "/messages/\(existingId)", method: "PATCH", body: jsonData)
-            if let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-               let msgId = dict["id"] as? String {
-                return DraftSaveResult(serverId: msgId)
+            do {
+                let response = try await request(path: "/messages/\(existingId)", method: "PATCH", body: jsonData)
+                if let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+                   let msgId = dict["id"] as? String {
+                    return DraftSaveResult(serverId: msgId)
+                }
+                return DraftSaveResult(serverId: existingId)
+            } catch let error where isGraphNotFound(error) {
+                // The server-side draft is authoritatively gone (404/410) —
+                // deleted directly, or auto-deleted after the underlying
+                // message was sent. The user's intention is "save this
+                // draft"; never drop it and never wedge the queue retrying an
+                // update that can never succeed. Fall through to CREATE.
+                print("[Exchange] saveDraft UPDATE: draft \(existingId) confirmed gone (404/410) — creating a new draft instead")
             }
-            return DraftSaveResult(serverId: existingId)
-        } else {
-            // Create new draft in Drafts folder
-            let jsonData = try JSONSerialization.data(withJSONObject: message)
-            let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
-            guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-                  let msgId = dict["id"] as? String else {
-                throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
-            }
-            return DraftSaveResult(serverId: msgId)
         }
+        // Create new draft in Drafts folder — reached both when there is no
+        // existing draft and when the recorded existing draft was confirmed
+        // gone above.
+        let jsonData = try JSONSerialization.data(withJSONObject: message)
+        let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
+        guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+              let msgId = dict["id"] as? String else {
+            throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
+        }
+        return DraftSaveResult(serverId: msgId)
     }
 
     func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
@@ -905,17 +1118,104 @@ actor ExchangeProvider: EmailProvider {
         }
     }
 
+    /// Same as `request(...)` but preserves the raw body of a `400` failure
+    /// instead of throwing the bodyless `.networkError`, so it can be parsed
+    /// for Graph's structured error shape (see `isGraphInvalidIdMalformed`)
+    /// rather than guessed from the status code alone. Every other failure
+    /// status still throws the ordinary `.networkError` — same as `request(...)`.
+    private func requestPreservingBadRequestBody(path: String, method: String, body: Data?) async throws -> Data {
+        let url = baseURL + path
+        do {
+            return try await authedHTTP.requestPreservingBadRequestBody(url: url, method: method, body: body ?? Data())
+        } catch let e as HTTPError {
+            throw ProviderError.networkError(underlying: e)
+        }
+    }
+
+    /// Graph's structured JSON error body shape:
+    /// `{"error":{"code":"ErrorInvalidIdMalformed","message":"Id is malformed."}}`.
+    /// https://learn.microsoft.com/en-us/graph/errors
+    private struct GraphAPIErrorBody: Decodable {
+        struct ErrorObject: Decodable {
+            let code: String?
+            let message: String?
+        }
+        let error: ErrorObject
+    }
+
+    /// True only when Graph's structured `400` error body proves the id could
+    /// never be valid — `code == "ErrorInvalidIdMalformed"`. This is distinct
+    /// from "not found" (already 404/410 via `isGraphNotFound`): a malformed
+    /// id can never succeed on retry, so Law 4 treats it as an authoritative
+    /// stale no-op. Any other `400` shape is uncertainty and must keep
+    /// throwing.
+    private func isGraphInvalidIdMalformed(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, let body) = underlying,
+              statusCode == 400,
+              let decoded = try? JSONDecoder().decode(GraphAPIErrorBody.self, from: body)
+        else { return false }
+        return decoded.error.code == "ErrorInvalidIdMalformed"
+    }
+
     // MARK: - Helpers
+
+    /// Graph resource IDs are opaque. Encode them as one strict RFC 3986 path
+    /// segment before composing any resource URL so `/`, `?`, `#`, `+`, and `=`
+    /// cannot alter the route selected by the server.
+    private static let graphPathSegmentAllowed = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+
+    private static func encodedGraphPathSegment(
+        _ value: String,
+        context: String
+    ) throws -> String {
+        guard let encoded = value.addingPercentEncoding(
+            withAllowedCharacters: graphPathSegmentAllowed
+        ) else {
+            throw ProviderError.invalidURL(context)
+        }
+        return encoded
+    }
 
     private func patchMessage(id: String, body: [String: Any]) async throws {
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/\(id)", method: "PATCH", body: jsonData)
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        do {
+            _ = try await request(path: "/messages/\(encodedId)", method: "PATCH", body: jsonData)
+        } catch let error where isGraphNotFound(error) {
+            return
+        }
     }
 
     private func moveMessage(id: String, destinationId: String) async throws {
         let body = ["destinationId": destinationId]
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/\(id)/move", method: "POST", body: jsonData)
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        do {
+            _ = try await requestPreservingBadRequestBody(
+                path: "/messages/\(encodedId)/move",
+                method: "POST",
+                body: jsonData
+            )
+        } catch let error where isGraphNotFound(error) || isGraphInvalidIdMalformed(error) {
+            // Authoritative stale (Law 4): either the resource is confirmed
+            // gone (404/410) or the destination id could never be valid
+            // (`ErrorInvalidIdMalformed` 400 — a never-valid folder id, not
+            // merely "not found"). Normal return; the queue treats this as a
+            // completed no-op.
+            return
+        }
+    }
+
+    private func isGraphNotFound(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error else { return false }
+        if case HTTPError.networkError(let statusCode) = underlying {
+            return statusCode == 404 || statusCode == 410
+        }
+        let statusCode = (underlying as NSError).code
+        return statusCode == 404 || statusCode == 410
     }
 
 
@@ -1084,8 +1384,11 @@ private struct GraphFolder: Decodable {
 
 private struct GraphMessageListResponse: Decodable {
     let value: [GraphMessage]
+    let odataNextLink: String?
+
     enum CodingKeys: String, CodingKey {
         case value
+        case odataNextLink = "@odata.nextLink"
     }
 }
 

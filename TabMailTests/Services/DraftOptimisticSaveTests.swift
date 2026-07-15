@@ -505,7 +505,7 @@ struct DraftOptimisticSaveTests {
         // but the defensive check preserves local state if it does).
         let matchDate = Date(timeIntervalSince1970: 0)
         try db.write { db in
-            guard var staleMsg = try MessageHeader.fetchOne(db, key: oldHeaderId) else { return }
+            guard let staleMsg = try MessageHeader.fetchOne(db, key: oldHeaderId) else { return }
             try staleMsg.delete(db)
             var migrated = staleMsg
             migrated.id = newHeaderId
@@ -558,7 +558,7 @@ struct DraftOptimisticSaveTests {
         }
 
         try db.write { db in
-            guard var staleMsg = try MessageHeader.fetchOne(db, key: oldHeaderId) else { return }
+            guard let staleMsg = try MessageHeader.fetchOne(db, key: oldHeaderId) else { return }
             try staleMsg.delete(db)
             var migrated = staleMsg
             migrated.id = newHeaderId

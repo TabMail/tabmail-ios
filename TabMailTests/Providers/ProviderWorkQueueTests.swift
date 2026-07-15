@@ -21,7 +21,7 @@ struct ProviderWorkQueueConcurrencyTests {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<5 {
                 group.addTask {
-                    try? await queue.execute(priority: .bodyFetch) {
+                    await queue.execute(priority: .bodyFetch) {
                         await tracker.enter()
                         try? await Task.sleep(for: .milliseconds(100))
                         await tracker.exit()
@@ -45,7 +45,7 @@ struct ProviderWorkQueueConcurrencyTests {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<3 {
                 group.addTask {
-                    try? await queue.execute(priority: .bodyFetch) {
+                    await queue.execute(priority: .bodyFetch) {
                         await tracker.enter()
                         try? await Task.sleep(for: .milliseconds(50))
                         await tracker.exit()
@@ -125,9 +125,9 @@ struct ProviderWorkQueuePriorityTests {
         try await Task.sleep(for: .milliseconds(50))
 
         // Queue work at different priorities — all will wait for the blocker
-        let body = Task { try? await queue.execute(priority: .bodyFetch) { await order.record("body") } }
-        let header = Task { try? await queue.execute(priority: .headerFetch) { await order.record("header") } }
-        let user = Task { try? await queue.execute(priority: .userAction) { await order.record("user") } }
+        let body = Task { await queue.execute(priority: .bodyFetch) { await order.record("body") } }
+        let header = Task { await queue.execute(priority: .headerFetch) { await order.record("header") } }
+        let user = Task { await queue.execute(priority: .userAction) { await order.record("user") } }
 
         // Give tasks time to enqueue
         try await Task.sleep(for: .milliseconds(50))
@@ -158,11 +158,11 @@ struct ProviderWorkQueuePriorityTests {
         try await Task.sleep(for: .milliseconds(50))
 
         // Queue 3 body-fetch items
-        let t1 = Task { try? await queue.execute(priority: .bodyFetch) { await order.record("first") } }
+        let t1 = Task { await queue.execute(priority: .bodyFetch) { await order.record("first") } }
         try await Task.sleep(for: .milliseconds(10))
-        let t2 = Task { try? await queue.execute(priority: .bodyFetch) { await order.record("second") } }
+        let t2 = Task { await queue.execute(priority: .bodyFetch) { await order.record("second") } }
         try await Task.sleep(for: .milliseconds(10))
-        let t3 = Task { try? await queue.execute(priority: .bodyFetch) { await order.record("third") } }
+        let t3 = Task { await queue.execute(priority: .bodyFetch) { await order.record("third") } }
 
         await blocker.value
         await t1.value
@@ -240,7 +240,7 @@ struct ProviderWorkQueueDynamicTests {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<6 {
                 group.addTask {
-                    try? await queue.execute(priority: .bodyFetch) {
+                    await queue.execute(priority: .bodyFetch) {
                         await tracker.enter()
                         try? await Task.sleep(for: .milliseconds(100))
                         await tracker.exit()
@@ -267,7 +267,7 @@ struct ProviderWorkQueueDynamicTests {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<6 {
                 group.addTask {
-                    try? await queue.execute(priority: .bodyFetch) {
+                    await queue.execute(priority: .bodyFetch) {
                         await tracker.enter()
                         try? await Task.sleep(for: .milliseconds(100))
                         await tracker.exit()
@@ -290,7 +290,7 @@ struct ProviderWorkQueueDynamicTests {
 
         // Fill the single slot with a long-running task
         let blocker = Task {
-            try? await queue.execute(priority: .bodyFetch) {
+            await queue.execute(priority: .bodyFetch) {
                 try? await Task.sleep(for: .milliseconds(300))
                 await order.record("blocker")
             }
@@ -300,8 +300,8 @@ struct ProviderWorkQueueDynamicTests {
         try await Task.sleep(for: .milliseconds(50))
 
         // Queue two more — they'll wait since maxConcurrency=1
-        let t1 = Task { try? await queue.execute(priority: .bodyFetch) { await order.record("t1") } }
-        let t2 = Task { try? await queue.execute(priority: .bodyFetch) { await order.record("t2") } }
+        let t1 = Task { await queue.execute(priority: .bodyFetch) { await order.record("t1") } }
+        let t2 = Task { await queue.execute(priority: .bodyFetch) { await order.record("t2") } }
 
         try await Task.sleep(for: .milliseconds(50))
 
@@ -329,7 +329,7 @@ struct ProviderWorkQueueCancellationTests {
 
         // Fill the single slot
         let blocker = Task {
-            try? await queue.execute(priority: .bodyFetch) {
+            await queue.execute(priority: .bodyFetch) {
                 try? await Task.sleep(for: .milliseconds(300))
                 await order.record("blocker")
             }

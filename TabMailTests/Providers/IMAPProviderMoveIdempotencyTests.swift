@@ -6,23 +6,44 @@ import Testing
 import Foundation
 @testable import TabMail
 
-/// Regression coverage for commit bbdc4f3 — "Make IMAP move idempotent on
-/// partial-failure retry". The full idempotent-move pipeline (COPY → STORE
-/// \Deleted → UID EXPUNGE with a destination-probe short-circuit) is an
-/// internal implementation detail of `IMAPProvider.idempotentMove`. The
-/// `FakeIMAPServer` infrastructure only supports SEARCH/FETCH today, so we
-/// can't end-to-end-exercise the MOVE path against it.
-///
-/// What we CAN test end-to-end is the destination probe itself — the SEARCH
-/// HEADER "Message-ID" that the idempotent path runs before deciding whether
-/// to re-issue COPY or short-circuit to source-side cleanup. If the probe
-/// returns the wrong answer, every downstream branch is wrong. Covering the
-/// probe locks in the commit's correctness floor.
+/// Provider-boundary coverage for IMAP action identity and move idempotency.
+/// The `FakeIMAPServer` is mailbox-aware and stateful: provider actions exercise
+/// SELECT/SEARCH/FETCH/STORE/UID MOVE over the same wire path as production.
+/// The fake advertises atomic MOVE; SwiftMail's COPY/delete fallback remains an
+/// adapter implementation detail and is not claimed by this suite.
 ///
 /// `.serialized` — the fake binds a listening socket; parallel tests would
 /// contend on ephemeral port allocation.
-@Suite("IMAPProvider move idempotency — destination probe", .serialized)
+@Suite("IMAPProvider RFC action identity", .serialized)
 struct IMAPProviderMoveIdempotencyTests {
+
+    enum ActionMutation: CaseIterable, Sendable {
+        case read
+        case unread
+        case flag
+        case unflag
+        case replied
+        case forwarded
+        case addLabel
+        case removeLabel
+
+        var flag: String {
+            switch self {
+            case .read, .unread: "\\Seen"
+            case .flag, .unflag: "\\Flagged"
+            case .replied: "\\Answered"
+            case .forwarded: "$Forwarded"
+            case .addLabel, .removeLabel: "project_test"
+            }
+        }
+
+        var removesFlag: Bool {
+            switch self {
+            case .unread, .unflag, .removeLabel: true
+            default: false
+            }
+        }
+    }
 
     private func rfc822(messageId: String, subject: String = "probe-test") -> String {
         """
@@ -36,6 +57,67 @@ struct IMAPProviderMoveIdempotencyTests {
         probe body.\r
 
         """
+    }
+
+    private func rfc822(rawMessageIdHeader: String?) -> String {
+        let messageIdLine = rawMessageIdHeader.map { "Message-ID: \($0)\r\n" } ?? ""
+        return """
+        From: Test Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: legacy-identity-test\r
+        Date: Thu, 01 Jan 2026 00:00:00 +0000\r
+        \(messageIdLine)Content-Type: text/plain; charset=utf-8\r
+        \r
+        legacy identity body.\r
+
+        """
+    }
+
+    private func provider(for server: FakeIMAPServer) -> IMAPProvider {
+        IMAPProvider(
+            host: "127.0.0.1",
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            smtpHost: "127.0.0.1",
+            smtpPort: 587,
+            useTLS: false
+        )
+    }
+
+    private func apply(
+        _ action: ActionMutation,
+        messageIds: [String],
+        provider: IMAPProvider
+    ) async throws {
+        switch action {
+        case .read:
+            try await provider.markRead(ids: messageIds, folder: "INBOX")
+        case .unread:
+            try await provider.markUnread(ids: messageIds, folder: "INBOX")
+        case .flag:
+            try await provider.markFlagged(ids: messageIds, flagged: true, folder: "INBOX")
+        case .unflag:
+            try await provider.markFlagged(ids: messageIds, flagged: false, folder: "INBOX")
+        case .replied:
+            try await provider.markReplied(ids: messageIds, folder: "INBOX")
+        case .forwarded:
+            try await provider.markForwarded(ids: messageIds, folder: "INBOX")
+        case .addLabel:
+            try await provider.setUserLabel(
+                ids: messageIds,
+                labelId: action.flag,
+                present: true,
+                folder: "INBOX"
+            )
+        case .removeLabel:
+            try await provider.setUserLabel(
+                ids: messageIds,
+                labelId: action.flag,
+                present: false,
+                folder: "INBOX"
+            )
+        }
     }
 
     @Test("messageExistsInFolder returns true when destination has the Message-ID")
@@ -66,9 +148,6 @@ struct IMAPProviderMoveIdempotencyTests {
 
     @Test("messageExistsInFolder returns false when destination does NOT have the Message-ID")
     func probeMiss() async throws {
-        // Same server but searching for a Message-ID that doesn't exist.
-        // This is the "dstHitsBefore is empty → take normal MOVE branch" case
-        // from idempotentMove.
         let msg = FakeIMAPServer.makeMessage(uid: 1, rfc822Text: rfc822(messageId: "someone-else@example.com"))
         let server = FakeIMAPServer(messages: [msg])
         try server.start()
@@ -134,9 +213,7 @@ struct IMAPProviderMoveIdempotencyTests {
 
     @Test("IMAPProvider conforms to MessageExistenceProbe (compile-time guard)")
     func conformanceGuard() {
-        // The idempotentMove recovery path depends on IMAPProvider being a
-        // MessageExistenceProbe. If a refactor drops the conformance, this
-        // test's type assertion stops compiling.
+        // Backfill UID re-resolution consumes this provider capability.
         let provider = IMAPProvider(
             host: "127.0.0.1",
             port: 1,
@@ -148,5 +225,600 @@ struct IMAPProviderMoveIdempotencyTests {
         )
         let probe: any MessageExistenceProbe = provider
         _ = probe
+    }
+
+    @Test("stateful fake scopes SEARCH to the selected mailbox")
+    func statefulMailboxScope() async throws {
+        let messageId = "mailbox-scope@example.com"
+        let archived = FakeIMAPServer.makeMessage(
+            uid: 7,
+            rfc822Text: rfc822(messageId: messageId)
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Archive": [archived]])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            smtpHost: "127.0.0.1",
+            smtpPort: 587,
+            useTLS: false
+        )
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        #expect(try await provider.messageExistsInFolder(
+            rfc822MessageId: messageId,
+            folderPath: "INBOX"
+        ) == false)
+        #expect(try await provider.messageExistsInFolder(
+            rfc822MessageId: messageId,
+            folderPath: "Archive"
+        ) == true)
+    }
+
+    @Test("stateful fake applies STORE flags through the public provider")
+    func statefulStore() async throws {
+        let messageId = "store-state@example.com"
+        let message = FakeIMAPServer.makeMessage(
+            uid: 11,
+            rfc822Text: rfc822(messageId: messageId)
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message]])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            smtpHost: "127.0.0.1",
+            smtpPort: 587,
+            useTLS: false
+        )
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(ids: [messageId], folder: "INBOX")
+        #expect(server.flags(in: "INBOX", uid: 11).contains("\\Seen"))
+        #expect(server.recordedCommands().contains { $0.contains("UID STORE") })
+    }
+
+    @Test("stateful fake moves RFC identity between mailboxes through the public provider")
+    func statefulMove() async throws {
+        let messageId = "move-state@example.com"
+        let message = FakeIMAPServer.makeMessage(
+            uid: 13,
+            rfc822Text: rfc822(messageId: messageId)
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message], "Archive": []])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            smtpHost: "127.0.0.1",
+            smtpPort: 587,
+            useTLS: false
+        )
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.move(ids: [messageId], from: "INBOX", to: "Archive")
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(messageId)>"])
+        #expect(server.recordedCommands().contains { $0.contains("UID MOVE") })
+    }
+
+    @Test("stateful fake injects one bounded command failure")
+    func boundedFailureInjection() async throws {
+        let messageId = "failure-state@example.com"
+        let message = FakeIMAPServer.makeMessage(
+            uid: 17,
+            rfc822Text: rfc822(messageId: messageId)
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message]])
+        try server.start()
+        defer { server.stop() }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            smtpHost: "127.0.0.1",
+            smtpPort: 587,
+            useTLS: false
+        )
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        server.failNextCommand(containing: "UID SEARCH")
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.messageExistsInFolder(
+                rfc822MessageId: messageId,
+                folderPath: "INBOX"
+            )
+        }
+        #expect(try await provider.messageExistsInFolder(
+            rfc822MessageId: messageId,
+            folderPath: "INBOX"
+        ))
+    }
+
+    @Test("released IMAP UID resolves only from its recorded source mailbox")
+    func legacyIdentityResolvesSourceUID() async throws {
+        let source = FakeIMAPServer.makeMessage(
+            uid: 41,
+            rfc822Text: rfc822(messageId: "Case+Legacy@Example.COM")
+        )
+        let unrelatedDestination = FakeIMAPServer.makeMessage(
+            uid: 41,
+            rfc822Text: rfc822(messageId: "different-message@example.com")
+        )
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [source],
+            "Archive": [unrelatedDestination],
+        ])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let result = try await provider.resolveLegacyMessageActionIdentity(
+            providerMessageId: "41",
+            sourceFolder: "INBOX",
+            destinationFolder: "Archive"
+        )
+
+        #expect(result == .resolved(rfc822MessageId: "Case+Legacy@Example.COM"))
+        #expect(!server.recordedCommands().contains { $0.contains("SELECT Archive") })
+    }
+
+    @Test("destination UID collision cannot revive a missing released source UID")
+    func legacyIdentityMissingSourceIsStale() async throws {
+        let destination = FakeIMAPServer.makeMessage(
+            uid: 43,
+            rfc822Text: rfc822(messageId: "destination-only@example.com")
+        )
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [],
+            "Archive": [destination],
+        ])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let result = try await provider.resolveLegacyMessageActionIdentity(
+            providerMessageId: "43",
+            sourceFolder: "INBOX",
+            destinationFolder: "Archive"
+        )
+
+        #expect(result == .staleOrAmbiguous)
+        #expect(!server.recordedCommands().contains { $0.contains("SELECT Archive") })
+    }
+
+    @Test(
+        "invalid released IMAP UID is authoritative stale without provider access",
+        arguments: ["", " ", "opaque", "0", "041", "4294967296"]
+    )
+    func legacyIdentityInvalidUIDIsStale(providerMessageId: String) async throws {
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: 1,
+            username: "u",
+            password: "p",
+            smtpHost: "127.0.0.1",
+            smtpPort: 1,
+            useTLS: false
+        )
+
+        let result = try await provider.resolveLegacyMessageActionIdentity(
+            providerMessageId: providerMessageId,
+            sourceFolder: "INBOX",
+            destinationFolder: nil
+        )
+
+        #expect(result == .staleOrAmbiguous)
+    }
+
+    @Test(
+        "released source UID without a durable RFC identity is authoritative stale",
+        arguments: [String?.none, String?.some("not-an-rfc-message-id")]
+    )
+    func legacyIdentityInvalidRFCIsStale(rawMessageIdHeader: String?) async throws {
+        let message = FakeIMAPServer.makeMessage(
+            uid: 47,
+            rfc822Text: rfc822(rawMessageIdHeader: rawMessageIdHeader)
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let result = try await provider.resolveLegacyMessageActionIdentity(
+            providerMessageId: "47",
+            sourceFolder: "INBOX",
+            destinationFolder: nil
+        )
+
+        #expect(result == .staleOrAmbiguous)
+    }
+
+    @Test("contradictory exact UID FETCH responses remain uncertainty")
+    func legacyIdentityContradictoryFetchThrows() async throws {
+        let first = FakeIMAPServer.makeMessage(
+            uid: 49,
+            rfc822Text: rfc822(messageId: "first-legacy@example.com")
+        )
+        let second = FakeIMAPServer.makeMessage(
+            uid: 49,
+            rfc822Text: rfc822(messageId: "second-legacy@example.com")
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [first, second]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.resolveLegacyMessageActionIdentity(
+                providerMessageId: "49",
+                sourceFolder: "INBOX",
+                destinationFolder: nil
+            )
+        }
+    }
+
+    @Test("released UID FETCH failure remains retryable uncertainty")
+    func legacyIdentityFetchFailureRetries() async throws {
+        let message = FakeIMAPServer.makeMessage(
+            uid: 53,
+            rfc822Text: rfc822(messageId: "retry-legacy@example.com")
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        server.failNextCommand(containing: "UID FETCH 53")
+
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.resolveLegacyMessageActionIdentity(
+                providerMessageId: "53",
+                sourceFolder: "INBOX",
+                destinationFolder: nil
+            )
+        }
+        let retry = try await provider.resolveLegacyMessageActionIdentity(
+            providerMessageId: "53",
+            sourceFolder: "INBOX",
+            destinationFolder: nil
+        )
+        #expect(retry == .resolved(rfc822MessageId: "retry-legacy@example.com"))
+    }
+
+    @Test(
+        "invalid released source scope remains uncertainty without provider access",
+        arguments: ["", " ", "INBOX\u{0}"]
+    )
+    func legacyIdentityInvalidSourceThrows(sourceFolder: String) async {
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: 1,
+            username: "u",
+            password: "p",
+            smtpHost: "127.0.0.1",
+            smtpPort: 1,
+            useTLS: false
+        )
+
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.resolveLegacyMessageActionIdentity(
+                providerMessageId: "59",
+                sourceFolder: sourceFolder,
+                destinationFolder: nil
+            )
+        }
+    }
+
+    @Test(
+        "every flag/keyword action resolves one source-scoped RFC identity",
+        arguments: ActionMutation.allCases
+    )
+    func actionFamilyExactResolution(action: ActionMutation) async throws {
+        let messageId = "action-family@example.com"
+        let message = FakeIMAPServer.makeMessage(
+            uid: 21,
+            rfc822Text: rfc822(messageId: messageId)
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message]])
+        if action.removesFlag {
+            server.setFlags([action.flag], in: "INBOX", uid: 21)
+        }
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await apply(action, messageIds: [messageId], provider: provider)
+
+        let finalFlags = server.flags(in: "INBOX", uid: 21)
+        #expect(finalFlags.contains(action.flag) != action.removesFlag)
+    }
+
+    @Test("missing RFC identity is an authoritative action no-op")
+    func actionMissingNoOp() async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(ids: ["missing-action@example.com"], folder: "INBOX")
+
+        #expect(!server.recordedCommands().contains { $0.contains("UID STORE") })
+    }
+
+    @Test("duplicate exact RFC identities are ambiguous action no-ops")
+    func actionAmbiguousNoOp() async throws {
+        let messageId = "ambiguous-action@example.com"
+        let first = FakeIMAPServer.makeMessage(uid: 31, rfc822Text: rfc822(messageId: messageId))
+        let second = FakeIMAPServer.makeMessage(uid: 32, rfc822Text: rfc822(messageId: messageId))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [first, second]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(ids: [messageId], folder: "INBOX")
+
+        #expect(server.flags(in: "INBOX", uid: 31).isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 32).isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID STORE") })
+    }
+
+    @Test("substring-only IMAP SEARCH hit is not an exact RFC action match")
+    func actionSubstringNoOp() async throws {
+        let stored = FakeIMAPServer.makeMessage(
+            uid: 41,
+            rfc822Text: rfc822(messageId: "prefix-target-action@example.com")
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [stored]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(ids: ["target-action@example.com"], folder: "INBOX")
+
+        #expect(server.flags(in: "INBOX", uid: 41).isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID STORE") })
+    }
+
+    @Test("numeric provider ID is not accepted as a durable IMAP action identity")
+    func actionNumericIdNoOp() async throws {
+        let stored = FakeIMAPServer.makeMessage(
+            uid: 51,
+            rfc822Text: rfc822(messageId: "numeric-action@example.com")
+        )
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [stored]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(ids: ["51"], folder: "INBOX")
+
+        #expect(server.flags(in: "INBOX", uid: 51).isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID STORE") })
+    }
+
+    @Test("later lookup failure prevents every flag mutation in the batch")
+    func actionBatchPreflight() async throws {
+        let firstId = "batch-first@example.com"
+        let secondId = "batch-second@example.com"
+        let first = FakeIMAPServer.makeMessage(uid: 61, rfc822Text: rfc822(messageId: firstId))
+        let second = FakeIMAPServer.makeMessage(uid: 62, rfc822Text: rfc822(messageId: secondId))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [first, second]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        server.failNextCommand(containing: secondId)
+
+        await #expect(throws: (any Error).self) {
+            try await provider.markRead(ids: [firstId, secondId], folder: "INBOX")
+        }
+
+        #expect(server.flags(in: "INBOX", uid: 61).isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 62).isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID STORE") })
+    }
+
+    @Test("exact members execute after missing and ambiguous members finish preflight")
+    func actionMixedBatch() async throws {
+        let firstId = "mixed-first@example.com"
+        let ambiguousId = "mixed-ambiguous@example.com"
+        let lastId = "mixed-last@example.com"
+        let messages = [
+            FakeIMAPServer.makeMessage(uid: 71, rfc822Text: rfc822(messageId: firstId)),
+            FakeIMAPServer.makeMessage(uid: 72, rfc822Text: rfc822(messageId: ambiguousId)),
+            FakeIMAPServer.makeMessage(uid: 73, rfc822Text: rfc822(messageId: ambiguousId)),
+            FakeIMAPServer.makeMessage(uid: 74, rfc822Text: rfc822(messageId: lastId)),
+        ]
+        let server = FakeIMAPServer(mailboxes: ["INBOX": messages])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(
+            ids: [firstId, "mixed-missing@example.com", ambiguousId, lastId],
+            folder: "INBOX"
+        )
+
+        #expect(server.flags(in: "INBOX", uid: 71).contains("\\Seen"))
+        #expect(server.flags(in: "INBOX", uid: 72).isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 73).isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 74).contains("\\Seen"))
+    }
+
+    @Test("duplicate RFC batch member mutates its current UID once")
+    func actionBatchDeduplicates() async throws {
+        let messageId = "dedupe-action@example.com"
+        let message = FakeIMAPServer.makeMessage(uid: 81, rfc822Text: rfc822(messageId: messageId))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message]])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.markRead(ids: [messageId, messageId], folder: "INBOX")
+
+        let stores = server.recordedCommands().filter { $0.contains("UID STORE") }
+        #expect(stores.count == 1)
+    }
+
+    @Test("later source lookup failure prevents every move in the batch")
+    func moveBatchPreflight() async throws {
+        let firstId = "move-batch-first@example.com"
+        let secondId = "move-batch-second@example.com"
+        let first = FakeIMAPServer.makeMessage(uid: 91, rfc822Text: rfc822(messageId: firstId))
+        let second = FakeIMAPServer.makeMessage(uid: 92, rfc822Text: rfc822(messageId: secondId))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [first, second], "Archive": []])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        server.failNextCommand(containing: secondId)
+
+        await #expect(throws: (any Error).self) {
+            try await provider.move(ids: [firstId, secondId], from: "INBOX", to: "Archive")
+        }
+
+        #expect(Set(server.messageIDs(in: "INBOX")) == ["<\(firstId)>", "<\(secondId)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID MOVE") })
+    }
+
+    @Test("later destination lookup failure prevents every move in the batch")
+    func moveDestinationBatchPreflight() async throws {
+        let firstId = "move-destination-batch-first@example.com"
+        let secondId = "move-destination-batch-second@example.com"
+        let first = FakeIMAPServer.makeMessage(
+            uid: 93,
+            rfc822Text: rfc822(messageId: firstId)
+        )
+        let second = FakeIMAPServer.makeMessage(
+            uid: 94,
+            rfc822Text: rfc822(messageId: secondId)
+        )
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [first, second],
+            "Archive": [],
+        ])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        server.failCommand(containing: "UID SEARCH", onMatch: 4)
+
+        await #expect(throws: (any Error).self) {
+            try await provider.move(ids: [firstId, secondId], from: "INBOX", to: "Archive")
+        }
+
+        #expect(Set(server.messageIDs(in: "INBOX")) == ["<\(firstId)>", "<\(secondId)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID MOVE") })
+    }
+
+    @Test("ambiguous destination does not trigger source cleanup")
+    func moveAmbiguousDestinationNoOp() async throws {
+        let messageId = "move-destination-ambiguous@example.com"
+        let source = FakeIMAPServer.makeMessage(uid: 101, rfc822Text: rfc822(messageId: messageId))
+        let destinationA = FakeIMAPServer.makeMessage(uid: 201, rfc822Text: rfc822(messageId: messageId))
+        let destinationB = FakeIMAPServer.makeMessage(uid: 202, rfc822Text: rfc822(messageId: messageId))
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [source],
+            "Archive": [destinationA, destinationB],
+        ])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.move(ids: [messageId], from: "INBOX", to: "Archive")
+
+        #expect(server.messageIDs(in: "INBOX") == ["<\(messageId)>"])
+        #expect(server.messageIDs(in: "Archive").count == 2)
+    }
+
+    @Test("existing exact destination copy converges by removing the source copy")
+    func moveExistingDestinationCleansSource() async throws {
+        let messageId = "move-destination-exact@example.com"
+        let source = FakeIMAPServer.makeMessage(uid: 105, rfc822Text: rfc822(messageId: messageId))
+        let destination = FakeIMAPServer.makeMessage(uid: 205, rfc822Text: rfc822(messageId: messageId))
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [source],
+            "Archive": [destination],
+        ])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.move(ids: [messageId], from: "INBOX", to: "Archive")
+
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+        #expect(server.messageIDs(in: "Archive") == ["<\(messageId)>"])
+    }
+
+    @Test("destination lookup failure propagates before move mutation")
+    func moveDestinationFailurePropagates() async throws {
+        let messageId = "move-destination-failure@example.com"
+        let source = FakeIMAPServer.makeMessage(uid: 111, rfc822Text: rfc822(messageId: messageId))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [source], "Archive": []])
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        server.failCommand(containing: "UID SEARCH", onMatch: 2)
+
+        await #expect(throws: (any Error).self) {
+            try await provider.move(ids: [messageId], from: "INBOX", to: "Archive")
+        }
+
+        #expect(server.messageIDs(in: "INBOX") == ["<\(messageId)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(!server.recordedCommands().contains { $0.contains("UID MOVE") })
     }
 }

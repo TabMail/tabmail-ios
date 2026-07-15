@@ -57,10 +57,21 @@ struct MessageHeaderInfo: Sendable {
     let isReplied: Bool
     let isForwarded: Bool
     let actionTag: ActionTag?
+    /// When `actionTag` is non-nil, the local timestamp it was originally set at
+    /// (SyncConfig.actionTagTTLSeconds). Real mail providers never populate this
+    /// (they don't carry a local tag at all — ADR-IOS-036), so it defaults to nil
+    /// and consumers stamp `Date()` instead. `DemoProvider` is the one caller that
+    /// round-trips a genuinely local `MessageHeader.actionTagSetAt` through this
+    /// DTO, so its synthetic re-sync doesn't reset the TTL clock on every poll.
+    var actionTagSetAt: Date? = nil
     /// User label IDs extracted during message parse (Gmail: label IDs, IMAP: custom keywords).
     /// Excludes tm_* labels (handled by ActionTag) and system labels.
     /// Empty for providers that don't support labels.
     var userLabelIds: [String] = []
+    /// Whether `userLabelIds` is a complete provider-authoritative set. Gmail
+    /// cannot classify opaque `Label_N` IDs until its label catalog has loaded;
+    /// fail closed so an early delta cannot erase valid local membership.
+    var userLabelIdsAreAuthoritative = false
 }
 
 struct AttachmentInfo: Sendable, Codable {
@@ -145,6 +156,25 @@ protocol MessageExistenceProbe: Sendable {
 /// - `.date`: Gmail/Exchange return the most recent by date → date-based window.
 enum StaleWindowMode: Sendable { case uid, date }
 
+/// Identity scope of independently mutable server fields such as read/star.
+/// Gmail and Graph expose message-wide state across every label/folder row.
+/// IMAP exposes mailbox-local UIDs and therefore remains folder-scoped.
+enum MessageFieldScope: Sendable {
+    case folder
+    case account
+}
+
+/// Finite upgrade result for a released message-action row that still carries
+/// a provider resource id. This is not a runtime execution receipt: startup
+/// consumes it once to replace the legacy id with RFC Message-ID before drain.
+/// A provider may classify a legacy value that cannot represent an actionable
+/// target as terminal stale; failed I/O or contradictory lookup correlation
+/// remains retryable uncertainty and must throw.
+enum LegacyMessageActionIdentityResolution: Sendable, Equatable {
+    case resolved(rfc822MessageId: String)
+    case staleOrAmbiguous
+}
+
 protocol EmailProvider: Sendable {
     func connect() async throws
     func disconnect() async throws
@@ -152,6 +182,8 @@ protocol EmailProvider: Sendable {
     /// Fetch-ordering dimension for stale-detection windowing. Defaults to `.date`
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
     var staleWindowMode: StaleWindowMode { get }
+
+    var messageFieldScope: MessageFieldScope { get }
 
     /// Mark the provider's connections as potentially stale. Called on session start
     /// (foreground return, BGAppRefresh, push wakeup). IMAP providers drain and reseed
@@ -166,7 +198,20 @@ protocol EmailProvider: Sendable {
     func markRead(ids: [String], folder: String) async throws
     func markUnread(ids: [String], folder: String) async throws
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws
+    func markReplied(ids: [String], folder: String) async throws
+    func markForwarded(ids: [String], folder: String) async throws
+    func setUserLabel(ids: [String], labelId: String, present: Bool, folder: String) async throws
     func move(ids: [String], from: String, to: String) async throws
+
+    /// Resolve one released provider resource id within the recorded
+    /// source/optimistic-destination scope. A normal stale/ambiguous result may
+    /// be omitted by the finite startup conversion; uncertainty must throw so
+    /// the complete conversion remains unchanged and retries later.
+    func resolveLegacyMessageActionIdentity(
+        providerMessageId: String,
+        sourceFolder: String,
+        destinationFolder: String?
+    ) async throws -> LegacyMessageActionIdentityResolution
 
     func send(draft: DraftMessage) async throws
 
@@ -218,9 +263,31 @@ extension EmailProvider {
     /// Default no-op for HTTP-based providers (Gmail, Exchange) — ephemeral sessions have no stale connections.
     func markDirty() async {}
 
+    /// Providers without remote replied/forwarded state keep these actions local.
+    func markReplied(ids: [String], folder: String) async throws {}
+    func markForwarded(ids: [String], folder: String) async throws {}
+
+    /// Providers without remote user-label support treat membership writes as no-op.
+    func setUserLabel(ids: [String], labelId: String, present: Bool, folder: String) async throws {}
+
+    /// Providers must opt into the finite released-row cutover explicitly.
+    /// An unsupported implementation is uncertainty, never evidence that a
+    /// user's queued target is stale.
+    func resolveLegacyMessageActionIdentity(
+        providerMessageId: String,
+        sourceFolder: String,
+        destinationFolder: String?
+    ) async throws -> LegacyMessageActionIdentityResolution {
+        throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+    }
+
     /// HTTP providers (Gmail, Exchange) return most-recent-by-date → date window.
     /// IMAP overrides to `.uid`.
     var staleWindowMode: StaleWindowMode { .date }
+
+    /// Safest default for custom/demo providers and test doubles. Providers with
+    /// globally stable message ids explicitly opt into account-wide field state.
+    var messageFieldScope: MessageFieldScope { .folder }
 
     /// Default sequential implementation. IMAP overrides with batched single-connection fetch.
     ///
@@ -239,9 +306,10 @@ extension EmailProvider {
     /// after 5 unparseable responses, which is a data-loss bug. Parse failures
     /// re-throw and retry, letting a transient server glitch resolve itself.
     ///
-    /// `isConfirmedGoneError` (which DOES match `.messageNotFound`) remains
-    /// correct for the PendingOperation drain path because action methods
-    /// (move, markRead, setTag) never exercise the parse-failure code paths.
+    /// Action methods (move, markRead, setTag) never exercise this
+    /// parse-failure code path — they classify their own action-scoped
+    /// results internally (Law 4/5) and never route through
+    /// `fetchMessagesBatch`.
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo] {
         // Defensive guard: synthetic placeholder ids ("sent-<UUID>" / "draft-<UUID>")
         // must never be forwarded to a remote provider. If we see any, throw — do
@@ -273,11 +341,10 @@ extension EmailProvider {
     }
 }
 
-/// Structural HTTP 404/410 check. Intentionally stricter than
-/// `AccountManager.isConfirmedGoneError` — does NOT match
+/// Structural HTTP 404/410 check. Deliberately does NOT match
 /// `ProviderError.messageNotFound` because Gmail/Exchange overload it for
 /// parse failures (see `fetchMessagesBatch` doc above).
-private func isHttpGoneStatus(_ error: Error) -> Bool {
+func isHttpGoneStatus(_ error: Error) -> Bool {
     guard case ProviderError.networkError(let underlying) = error else { return false }
     if case HTTPError.networkError(let statusCode) = underlying {
         return statusCode == 404 || statusCode == 410
@@ -330,6 +397,10 @@ enum ProviderError: LocalizedError {
     case authenticationFailed
     case networkError(underlying: Error)
     case invalidURL(String)
+    /// A provider lookup returned malformed or internally inconsistent data
+    /// before it could prove an exact RFC Message-ID match. This is retryable;
+    /// unlike a zero/multiple result, it is not authoritative stale evidence.
+    case actionIdentityResolutionFailed(String)
     /// IMAP SEARCH by Message-ID header returned no results. The message likely exists
     /// but the server couldn't match it (substring vs exact match, timing, etc.).
     /// Distinct from `messageNotFound` — drain queue should retry, not drop.
@@ -356,6 +427,7 @@ enum ProviderError: LocalizedError {
         case .authenticationFailed: return "Authentication failed. Please check your credentials."
         case .networkError(let error): return "Network error: \(error.localizedDescription)"
         case .invalidURL(let url): return "Invalid URL: \(url)"
+        case .actionIdentityResolutionFailed(let id): return "Could not verify action identity '\(id)'."
         case .uidResolutionFailed(let id): return "Could not resolve Message-ID '\(id)' to UID."
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"

@@ -297,6 +297,7 @@ actor DemoProvider: EmailProvider {
             isReplied: h.isReplied,
             isForwarded: h.isForwarded,
             actionTag: h.actionTag,
+            actionTagSetAt: h.actionTagSetAt,
             userLabelIds: []
         )
     }

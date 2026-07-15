@@ -56,8 +56,8 @@ struct ProviderErrorExtendedTests {
 
     @Test("isSyntheticPlaceholderId rejects real provider ids")
     func realIdsDoNotMatch() {
-        // Gmail uses hex thread ids, IMAP uses numeric UIDs, Exchange uses base64-ish
-        // immutable ids. None should match the synthetic prefix shape.
+        // Gmail uses hex thread ids, IMAP uses numeric UIDs, Exchange uses
+        // base64-ish resource ids. None should match the synthetic prefix shape.
         #expect(!isSyntheticPlaceholderId("19dea75bb00e913d"))
         #expect(!isSyntheticPlaceholderId("18055"))
         #expect(!isSyntheticPlaceholderId("AAMkADAw…ABKQ=="))

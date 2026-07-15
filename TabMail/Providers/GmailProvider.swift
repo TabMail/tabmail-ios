@@ -4,9 +4,63 @@
 
 import Foundation
 
+/// Actor-owned ordering state for Gmail's `/labels` catalog. Kept as a small
+/// value type so out-of-order response handling can be tested deterministically
+/// without reproducing URLSession scheduling.
+struct GmailUserLabelCatalogState: Sendable {
+    struct Request: Sendable, Equatable {
+        fileprivate let generation: Int
+        fileprivate let mutationRevision: Int
+    }
+
+    private(set) var knownUserLabelIds: Set<String> = []
+    private(set) var legacyTmLabelIds: Set<String> = []
+    private(set) var isAuthoritative = false
+    private var mutationRevision = 0
+    private var nextRequestGeneration = 0
+    private var latestAppliedRequestGeneration = 0
+
+    mutating func beginRequest() -> Request {
+        nextRequestGeneration &+= 1
+        return Request(
+            generation: nextRequestGeneration,
+            mutationRevision: mutationRevision
+        )
+    }
+
+    mutating func apply(
+        userLabelIds: Set<String>,
+        legacyTmLabelIds: Set<String>,
+        request: Request
+    ) {
+        guard request.generation > latestAppliedRequestGeneration else { return }
+        if mutationRevision == request.mutationRevision {
+            knownUserLabelIds = userLabelIds
+        } else {
+            knownUserLabelIds.formUnion(userLabelIds)
+        }
+        self.legacyTmLabelIds = legacyTmLabelIds
+        isAuthoritative = true
+        latestAppliedRequestGeneration = request.generation
+    }
+
+    mutating func recordKnownUserLabel(_ labelId: String) {
+        knownUserLabelIds.insert(labelId)
+        mutationRevision &+= 1
+    }
+
+    func extractUserLabelIds(from labelIds: [String]?) -> [String] {
+        (labelIds ?? []).filter { labelId in
+            !legacyTmLabelIds.contains(labelId) && knownUserLabelIds.contains(labelId)
+        }
+    }
+}
+
 /// Gmail API-based provider for Google accounts.
 /// Uses Gmail REST API for all operations — strictly better than IMAP for Gmail.
 actor GmailProvider: EmailProvider {
+    nonisolated let messageFieldScope: MessageFieldScope = .account
+
     /// Synthetic folder path for Gmail's "All Mail" (archive). Gmail has no real archive label.
     static let archivePath = "__GMAIL_ALL_MAIL__"
 
@@ -26,7 +80,11 @@ actor GmailProvider: EmailProvider {
     /// Used in `move()` to strip the label from the message being moved out
     /// of the inbox, so the legacy pollution decays naturally as the user
     /// triages. Never read for ActionTag resolution (see ADR-IOS-036).
-    private var legacyTmLabelIds: Set<String> = []
+    /// Gmail user labels use opaque IDs such as `Label_42`, which are
+    /// indistinguishable from Gmail's reserved ID namespace without the
+    /// display names returned by `/labels`. Message parsing therefore trusts
+    /// only IDs learned from a complete successful catalog response.
+    private var userLabelCatalog = GmailUserLabelCatalogState()
 
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Gmail API calls.
@@ -63,6 +121,7 @@ actor GmailProvider: EmailProvider {
     }
 
     func fetchFolders() async throws -> [FolderInfo] {
+        let catalogRequest = userLabelCatalog.beginRequest()
         let data = try await request(path: "/labels")
         let response = try JSONDecoder().decode(GmailLabelsResponse.self, from: data)
 
@@ -74,6 +133,8 @@ actor GmailProvider: EmailProvider {
         ]
 
         var folders: [FolderInfo] = []
+        var discoveredLegacyTmLabelIds: Set<String> = []
+        var discoveredUserLabelIds: Set<String> = []
 
         for label in response.labels {
             if label.type == "system" {
@@ -93,11 +154,12 @@ actor GmailProvider: EmailProvider {
                 // folder list, record the ID so `move()` can strip it from
                 // messages exiting the inbox (natural decay, ADR-IOS-036).
                 if label.name.lowercased().hasPrefix("tm_") {
-                    legacyTmLabelIds.insert(label.id)
+                    discoveredLegacyTmLabelIds.insert(label.id)
                 }
                 if UserLabelStore.shouldExcludeLabel(id: label.id, name: label.name) {
                     continue
                 }
+                discoveredUserLabelIds.insert(label.id)
                 // User-created labels → custom folders
                 folders.append(FolderInfo(
                     name: label.name,
@@ -108,6 +170,12 @@ actor GmailProvider: EmailProvider {
                 ))
             }
         }
+
+        userLabelCatalog.apply(
+            userLabelIds: discoveredUserLabelIds,
+            legacyTmLabelIds: discoveredLegacyTmLabelIds,
+            request: catalogRequest
+        )
 
         // Gmail has no explicit archive label — add synthetic "All Mail" folder with .archive role.
         // Gmail's archive = removing INBOX label; "All Mail" is the closest equivalent folder.
@@ -399,23 +467,37 @@ actor GmailProvider: EmailProvider {
     }
 
     func markRead(ids: [String], folder: String) async throws {
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
             try await modifyMessage(id: id, removeLabelIds: ["UNREAD"])
         }
     }
 
     func markUnread(ids: [String], folder: String) async throws {
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
             try await modifyMessage(id: id, addLabelIds: ["UNREAD"])
         }
     }
 
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
             if flagged {
                 try await modifyMessage(id: id, addLabelIds: ["STARRED"])
             } else {
                 try await modifyMessage(id: id, removeLabelIds: ["STARRED"])
+            }
+        }
+    }
+
+    func setUserLabel(ids: [String], labelId: String, present: Bool, folder: String) async throws {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: folder)
+        for id in resolvedIds {
+            if present {
+                try await modifyMessage(id: id, addLabelIds: [labelId])
+            } else {
+                try await modifyMessage(id: id, removeLabelIds: [labelId])
             }
         }
     }
@@ -432,8 +514,8 @@ actor GmailProvider: EmailProvider {
         // TabMail versions. Batched into the same messages.modify call — zero
         // extra round-trip. Only runs on inbox-exit so we don't disturb labels
         // on messages that stay in other folders.
-        if source == "INBOX" && !legacyTmLabelIds.isEmpty {
-            remove.append(contentsOf: legacyTmLabelIds)
+        if source == "INBOX" && !userLabelCatalog.legacyTmLabelIds.isEmpty {
+            remove.append(contentsOf: userLabelCatalog.legacyTmLabelIds)
         }
         // No-op: both source and destination resolve to no label changes (e.g., move from
         // All Mail to All Mail). Skip the API call — Gmail rejects empty modify bodies.
@@ -441,11 +523,191 @@ actor GmailProvider: EmailProvider {
             print("[MoveTrace] GmailProvider.move — no-op (no label changes): ids=\(ids) source=\(source) dest=\(destination)")
             return
         }
-        print("[MoveTrace] GmailProvider.move — ids=\(ids) addLabels=\(add) removeLabels=\(remove)")
-        for id in ids {
+        let resolvedIds = try await resolveActionMessageIds(ids, folder: source)
+        print("[MoveTrace] GmailProvider.move — rfcIds=\(ids) resolvedIds=\(resolvedIds) addLabels=\(add) removeLabels=\(remove)")
+        for id in resolvedIds {
             try await modifyMessage(id: id, addLabelIds: add, removeLabelIds: remove)
             print("[MoveTrace] GmailProvider.move — modifyMessage completed for \(id)")
         }
+    }
+
+    /// Resolve durable provider-neutral RFC identities to transient Gmail message
+    /// IDs inside the recorded source label. The entire batch resolves before any
+    /// mutation, so a later lookup failure cannot leave an uncommitted prefix.
+    private func resolveActionMessageIds(_ ids: [String], folder: String) async throws -> [String] {
+        var resolved: [String] = []
+        var seen = Set<String>()
+        for id in ids {
+            guard let providerId = try await resolveActionMessageId(id, folder: folder),
+                  seen.insert(providerId).inserted
+            else { continue }
+            resolved.append(providerId)
+        }
+        return resolved
+    }
+
+    /// Upgrade one released durable row that still carries Gmail's provider id.
+    /// The exact resource lookup is finite: a gone resource or one outside both
+    /// recorded folders is authoritative stale state, while malformed metadata
+    /// and every non-gone request failure remain retryable uncertainty.
+    func resolveLegacyMessageActionIdentity(
+        providerMessageId: String,
+        sourceFolder: String,
+        destinationFolder: String?
+    ) async throws -> LegacyMessageActionIdentityResolution {
+        let trimmedProviderId = providerMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSourceFolder = sourceFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let destinationIsValid = destinationFolder.map {
+            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && trimmed == $0
+        } ?? true
+        guard !trimmedProviderId.isEmpty,
+              trimmedProviderId == providerMessageId,
+              providerMessageId.rangeOfCharacter(
+                  from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+              ) == nil,
+              !trimmedSourceFolder.isEmpty,
+              trimmedSourceFolder == sourceFolder,
+              destinationIsValid
+        else {
+            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+        }
+        var scopedFolders = Set([sourceFolder])
+        if let destinationFolder {
+            scopedFolders.insert(destinationFolder)
+        }
+
+        let unreserved = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+        )
+        guard let encodedProviderId = providerMessageId.addingPercentEncoding(
+            withAllowedCharacters: unreserved
+        ) else {
+            throw ProviderError.invalidURL("Gmail legacy action identity")
+        }
+
+        let metadata: Data
+        do {
+            metadata = try await request(
+                path: "/messages/\(encodedProviderId)\(GmailAPI.metadataQuery)"
+            )
+        } catch {
+            guard !isHttpGoneStatus(error) else { return .staleOrAmbiguous }
+            throw error
+        }
+
+        let message = try JSONDecoder().decode(GmailMessage.self, from: metadata)
+        guard message.id == providerMessageId,
+              let header = parseGmailMessage(message),
+              let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
+                  header.rfc822MessageId
+              )
+        else {
+            throw ProviderError.actionIdentityResolutionFailed(providerMessageId)
+        }
+        let labelIds = message.labelIds ?? []
+        guard scopedFolders.contains(where: {
+            labels(labelIds, belongToActionFolder: $0)
+        }) else {
+            return .staleOrAmbiguous
+        }
+        return .resolved(rfc822MessageId: rfc822MessageId)
+    }
+
+    /// Exactly one source-scoped Gmail search result is actionable. Missing,
+    /// duplicate, or paginated results are authoritative stale/ambiguous no-ops;
+    /// request, decode, and metadata-verification failures throw for retry.
+    private func resolveActionMessageId(_ rawRFC822MessageId: String, folder: String) async throws -> String? {
+        guard let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
+            rawRFC822MessageId
+        ) else { return nil }
+        guard !folder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        var query = "rfc822msgid:\(rfc822MessageId)"
+        if folder == Self.archivePath {
+            query += " " + Self.allMailExclusionQuery
+        }
+        var queryItems = [
+            (name: "q", value: query),
+            (name: "maxResults", value: "2"),
+            (name: "includeSpamTrash", value: "true"),
+        ]
+        if folder != Self.archivePath {
+            queryItems.append((name: "labelIds", value: folder))
+        }
+        let unreserved = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+        )
+        var encodedItems: [URLQueryItem] = []
+        for item in queryItems {
+            guard let name = item.name.addingPercentEncoding(withAllowedCharacters: unreserved),
+                  let value = item.value.addingPercentEncoding(withAllowedCharacters: unreserved)
+            else {
+                throw ProviderError.invalidURL("Gmail action lookup")
+            }
+            encodedItems.append(URLQueryItem(name: name, value: value))
+        }
+        var components = URLComponents()
+        components.path = "/messages"
+        components.percentEncodedQueryItems = encodedItems
+        guard let path = components.string else {
+            throw ProviderError.invalidURL("Gmail action lookup")
+        }
+
+        let listData: Data
+        do {
+            listData = try await requestPreservingBadRequestBody(path: path)
+        } catch {
+            guard !isGmailInvalidLabelError(error) else {
+                // The recorded SOURCE label id no longer exists — the source
+                // scope this op was recorded against is gone, so the op
+                // itself is authoritatively stale (Law 4). No candidate can
+                // ever resolve inside a deleted label; normal no-op return.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] resolveActionMessageId: invalid-label 400 for source '\(folder)' confirmed stale — no-op")
+                }
+                return nil
+            }
+            throw error
+        }
+        let response = try JSONDecoder().decode(GmailMessageListResponse.self, from: listData)
+        guard let refs = response.messages,
+              refs.count == 1,
+              response.nextPageToken == nil
+        else { return nil }
+
+        let ref = refs[0]
+        let metadata: Data
+        do {
+            metadata = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
+        } catch {
+            guard !isHttpGoneStatus(error) else { return nil }
+            throw error
+        }
+        let message = try JSONDecoder().decode(GmailMessage.self, from: metadata)
+        guard message.id == ref.id,
+              let header = parseGmailMessage(message)
+        else {
+            throw ProviderError.actionIdentityResolutionFailed(rfc822MessageId)
+        }
+        guard MessageIdentity.durableActionRFC822MessageId(
+            header.rfc822MessageId
+        ) == rfc822MessageId else {
+            throw ProviderError.actionIdentityResolutionFailed(rfc822MessageId)
+        }
+        let labelIds = message.labelIds ?? []
+        guard labels(labelIds, belongToActionFolder: folder) else { return nil }
+        return ref.id
+    }
+
+    private func labels(_ labelIds: [String], belongToActionFolder folder: String) -> Bool {
+        if folder == Self.archivePath {
+            let excludedLabelIds: Set<String> = ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"]
+            return excludedLabelIds.isDisjoint(with: labelIds)
+        }
+        return labelIds.contains(folder)
     }
 
     func send(draft: DraftMessage) async throws {
@@ -511,29 +773,39 @@ actor GmailProvider: EmailProvider {
             // Update existing draft
             let body: [String: Any] = ["message": messagePayload]
             let jsonData = try JSONSerialization.data(withJSONObject: body)
-            let response = try await request(path: "/drafts/\(existingId)", method: "PUT", body: jsonData)
-            if let json = try? JSONSerialization.jsonObject(with: response) as? [String: Any] {
-                let draftId = json["id"] as? String ?? existingId
-                let msgId = (json["message"] as? [String: Any])?["id"] as? String
-                let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
-                if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
-                return DraftSaveResult(serverId: draftId, messageId: msgId)
+            do {
+                let response = try await request(path: "/drafts/\(existingId)", method: "PUT", body: jsonData)
+                if let json = try? JSONSerialization.jsonObject(with: response) as? [String: Any] {
+                    let draftId = json["id"] as? String ?? existingId
+                    let msgId = (json["message"] as? [String: Any])?["id"] as? String
+                    let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
+                    if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
+                    return DraftSaveResult(serverId: draftId, messageId: msgId)
+                }
+                print("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)")
+                return DraftSaveResult(serverId: existingId)
+            } catch {
+                guard isHttpGoneStatus(error) else { throw error }
+                // The server-side draft is authoritatively gone (404/410) —
+                // deleted directly, or auto-deleted after the underlying
+                // message was sent. The user's intention is "save this
+                // draft"; never drop it and never wedge the queue retrying an
+                // update that can never succeed. Fall through to CREATE.
+                print("[Gmail] saveDraft UPDATE: draft \(existingId) confirmed gone (404/410) — creating a new draft instead")
             }
-            print("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)")
-            return DraftSaveResult(serverId: existingId)
-        } else {
-            // Create new draft
-            let body: [String: Any] = ["message": messagePayload]
-            let jsonData = try JSONSerialization.data(withJSONObject: body)
-            let response = try await request(path: "/drafts", method: "POST", body: jsonData)
-            guard let json = try? JSONSerialization.jsonObject(with: response) as? [String: Any], let draftId = json["id"] as? String else {
-                throw NSError(domain: "GmailProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No draft ID in response"])
-            }
-            let msgId = (json["message"] as? [String: Any])?["id"] as? String
-            let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft CREATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
-            return DraftSaveResult(serverId: draftId, messageId: msgId)
         }
+        // Create new draft — reached both when there is no existing draft and
+        // when the recorded existing draft was confirmed gone above.
+        let body: [String: Any] = ["message": messagePayload]
+        let jsonData = try JSONSerialization.data(withJSONObject: body)
+        let response = try await request(path: "/drafts", method: "POST", body: jsonData)
+        guard let json = try? JSONSerialization.jsonObject(with: response) as? [String: Any], let draftId = json["id"] as? String else {
+            throw NSError(domain: "GmailProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No draft ID in response"])
+        }
+        let msgId = (json["message"] as? [String: Any])?["id"] as? String
+        let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
+        if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft CREATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
+        return DraftSaveResult(serverId: draftId, messageId: msgId)
     }
 
     func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
@@ -813,7 +1085,7 @@ actor GmailProvider: EmailProvider {
         // to full sync, matching legacy behavior.
         let http = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
-            retry: .gmail, logLabel: "Gmail"
+            retry: .gmail, logLabel: "Gmail", session: testSession
         )
 
         let delta: HistoryDelta?
@@ -949,6 +1221,37 @@ actor GmailProvider: EmailProvider {
         }
     }
 
+    /// Same as `request(...)` but for the two action-path call sites that must
+    /// structurally classify a `400` response (`modifyMessage`,
+    /// `resolveActionMessageId`'s list call): preserves the raw response body
+    /// of a `400` failure instead of throwing the bodyless `.networkError`, so
+    /// it can be parsed for Gmail's invalid-label error shape (see
+    /// `isGmailInvalidLabelError`) rather than guessed from the status code
+    /// alone. Every other failure status still throws the ordinary
+    /// `.networkError` — same as `request(...)`.
+    private func requestPreservingBadRequestBody(
+        path: String,
+        method: String = "GET",
+        body: Data? = nil
+    ) async throws -> Data {
+        if path.contains(GmailProvider.archivePath) {
+            print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)")
+            throw ProviderError.syntheticFolderPath(path)
+        }
+        let url = baseURL + path
+        await acquireRequestSlot()
+        defer { releaseRequestSlot() }
+        do {
+            switch method {
+            case "GET": return try await authedHTTP.requestPreservingBadRequestBody(url: url, method: "GET", body: nil)
+            case "POST": return try await authedHTTP.requestPreservingBadRequestBody(url: url, method: "POST", body: body ?? Data())
+            default: fatalError("GmailProvider.requestPreservingBadRequestBody: unsupported HTTP method \(method)")
+            }
+        } catch let e as HTTPError {
+            throw ProviderError.networkError(underlying: e)
+        }
+    }
+
     /// Acquire one of `GmailAPI.maxConcurrentRequests` HTTP slots, suspending FIFO
     /// when the cap is reached. Actor-isolated, so the counter/waiter mutations are
     /// race-free without a lock.
@@ -981,6 +1284,7 @@ actor GmailProvider: EmailProvider {
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let data = try await request(path: "/labels", method: "POST", body: jsonData)
         let label = try JSONDecoder().decode(GmailLabel.self, from: data)
+        userLabelCatalog.recordKnownUserLabel(label.id)
         return label.id
     }
 
@@ -990,12 +1294,64 @@ actor GmailProvider: EmailProvider {
         _ = tag
     }
 
-    func modifyMessage(id: String, addLabelIds: [String] = [], removeLabelIds: [String] = []) async throws {
+    /// Gmail's structured JSON error body shape (used across the v1 REST API):
+    /// `{"error":{"code":400,"message":"...","errors":[{"domain":"global","reason":"invalidArgument","message":"..."}]}}`.
+    /// https://developers.google.com/workspace/gmail/api/guides/handle-errors
+    private struct GmailAPIErrorBody: Decodable {
+        struct Detail: Decodable {
+            let domain: String?
+            let reason: String?
+            let message: String?
+        }
+        struct ErrorObject: Decodable {
+            let code: Int?
+            let message: String?
+            let errors: [Detail]?
+        }
+        let error: ErrorObject
+    }
+
+    /// True only when Gmail's structured `400` error body PROVES the target
+    /// label no longer exists — `reason == "invalidArgument"` AND Gmail's own
+    /// literal wording `"Invalid label: <id>"` (e.g. a destination/source
+    /// label deleted between enqueue and drain). Any other `400` shape
+    /// (malformed query, an unrelated bad-request cause) is NOT authoritative
+    /// staleness and must keep throwing — Law 4 forbids guessing from a bare
+    /// status code.
+    private func isGmailInvalidLabelError(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, let body) = underlying,
+              statusCode == 400,
+              let decoded = try? JSONDecoder().decode(GmailAPIErrorBody.self, from: body)
+        else { return false }
+        let detail = decoded.error.errors?.first
+        let reason = detail?.reason ?? ""
+        let message = detail?.message ?? decoded.error.message ?? ""
+        return reason == "invalidArgument" && message.hasPrefix("Invalid label")
+    }
+
+    private func modifyMessage(id: String, addLabelIds: [String] = [], removeLabelIds: [String] = []) async throws {
         var body: [String: Any] = [:]
         if !addLabelIds.isEmpty { body["addLabelIds"] = addLabelIds }
         if !removeLabelIds.isEmpty { body["removeLabelIds"] = removeLabelIds }
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/\(id)/modify", method: "POST", body: jsonData)
+        do {
+            _ = try await requestPreservingBadRequestBody(path: "/messages/\(id)/modify", method: "POST", body: jsonData)
+        } catch {
+            guard !isHttpGoneStatus(error) else { return }
+            guard !isGmailInvalidLabelError(error) else {
+                // Authoritative stale (Law 4): the add/remove label named in
+                // this batch no longer exists — deleted remotely between
+                // enqueue and drain (source membership or destination
+                // folder). Normal return; the queue treats this as a
+                // completed no-op.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] modifyMessage \(id): invalid-label 400 confirmed stale — treating as no-op")
+                }
+                return
+            }
+            throw error
+        }
     }
 
     // MARK: - Parsing
@@ -1049,7 +1405,8 @@ actor GmailProvider: EmailProvider {
             isReplied: false,
             isForwarded: false,
             actionTag: nil,
-            userLabelIds: extractUserLabelIds(from: metadata.providerLabels)
+            userLabelIds: userLabelCatalog.extractUserLabelIds(from: metadata.providerLabels),
+            userLabelIdsAreAuthoritative: userLabelCatalog.isAuthoritative
         )
     }
 
@@ -1058,21 +1415,39 @@ actor GmailProvider: EmailProvider {
     ///   Without this filter, messages still tagged server-side from pre-ADR-IOS-036
     ///   installs would round-trip the ID into `MessageUserLabel` junction rows until
     ///   `move()`'s inbox-exit cleanup strips them.
-    /// - Gmail system labels (INBOX, SENT, STARRED, CATEGORY_*, Label_N, etc.)
+    /// - Gmail system labels (INBOX, SENT, STARRED, CATEGORY_*, etc.)
     /// Returns only user-created label IDs suitable for UserLabel/MessageUserLabel storage.
-    private func extractUserLabelIds(from labelIds: [String]?) -> [String] {
-        let ids = labelIds ?? []
-        return ids.filter { labelId in
-            !legacyTmLabelIds.contains(labelId) && !UserLabelStore.isGmailSystemLabel(id: labelId)
-        }
-    }
-
     /// Look up a Gmail label ID by display name. Returns nil if not found.
     /// Used when createLabel returns 409 Conflict (label already exists on server).
     func findLabelIdByName(_ name: String) async throws -> String? {
+        let catalogRequest = userLabelCatalog.beginRequest()
         let data = try await request(path: "/labels")
         let response = try JSONDecoder().decode(GmailLabelsResponse.self, from: data)
-        return response.labels.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.id
+        let userLabels = response.labels.filter {
+            $0.type == "user" && !UserLabelStore.shouldExcludeLabel(id: $0.id, name: $0.name)
+        }
+        let discoveredUserLabelIds = Set(userLabels.map(\.id))
+        let discoveredLegacyTmLabelIds: Set<String> = Set(response.labels.compactMap { label in
+            guard label.type == "user", label.name.lowercased().hasPrefix("tm_") else {
+                return nil
+            }
+            return label.id
+        })
+        userLabelCatalog.apply(
+            userLabelIds: discoveredUserLabelIds,
+            legacyTmLabelIds: discoveredLegacyTmLabelIds,
+            request: catalogRequest
+        )
+        guard let match = userLabels.first(where: {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame
+        }) else {
+            return nil
+        }
+        // Even when this response lost an out-of-order catalog race, the exact
+        // match is provider-confirmed and must survive any older request still
+        // in flight until a later uncontended catalog replaces the cache.
+        userLabelCatalog.recordKnownUserLabel(match.id)
+        return match.id
     }
 
     /// Recursively check all MIME parts for attachments.

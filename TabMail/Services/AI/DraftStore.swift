@@ -118,8 +118,15 @@ actor DraftStore {
     /// Push a local draft to the server's Drafts folder.
     /// Builds a DraftMessage from the local Draft, calls provider.saveDraft(),
     /// and stores the returned server draft ID.
-    func pushDraftToServer(draftId: String, provider: any EmailProvider, draftsFolderPath: String) async throws {
-        guard var draft = try load(id: draftId) else {
+    func pushDraftToServer(
+        draftId: String,
+        provider: any EmailProvider,
+        draftsFolderPath: String,
+        database: PrioritizedDatabase
+    ) async throws {
+        guard var draft = try await database.read({ db in
+            try Draft.fetchOne(db, key: draftId)
+        }) else {
             print("[DraftStore] pushDraftToServer: draft \(draftId) not found — skipping")
             return
         }
@@ -193,7 +200,7 @@ actor DraftStore {
         // based; migrating it to the server id re-keys the GRDB row, so FTS must
         // follow or the entry orphans. (No-ops harmlessly if the draft was never indexed.)
         let draftFtsOps: (removals: [String], rekeys: [(oldId: String, newId: String, newMessageId: String?)])
-        draftFtsOps = try await AppDatabase.dbPool.write { db in
+        draftFtsOps = try await database.write { db in
             var draftFtsRemovals: [String] = []
             var draftFtsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
             try db.execute(

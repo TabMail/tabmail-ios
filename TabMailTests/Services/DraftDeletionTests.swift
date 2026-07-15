@@ -7,9 +7,12 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// Tests for draft save/delete lifecycle: isPermanentlyInvalidError classification,
-/// DraftSaveResult struct, pendingAllIds protection for .saveDraft ops, and
-/// flushAIBatch folder filtering.
+/// Tests for draft save/delete lifecycle: DraftSaveResult struct,
+/// pendingAllIds protection for .saveDraft ops, and flushAIBatch folder
+/// filtering. Provider-adapter-level `400`/gone classification (Gmail
+/// invalid-label, Graph malformed-id, draft-resurrection fallback) is
+/// covered directly on `GmailProvider`/`ExchangeProvider` — the queue no
+/// longer classifies provider error types (Round E/Law 4-5).
 @Suite("Draft Deletion Tests")
 struct DraftDeletionTests {
 
@@ -21,98 +24,6 @@ struct DraftDeletionTests {
         try TestDatabase.insertFolder(db, name: "Drafts", path: "DRAFT", role: .drafts, accountId: "acc1")
         try TestDatabase.insertFolder(db, name: "Inbox", path: "INBOX", role: .inbox, accountId: "acc1")
         try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
-    }
-
-    // MARK: - isPermanentlyInvalidError
-
-    @Test("isPermanentlyInvalidError: Gmail 400 returns true")
-    func permanentlyInvalidGmail400() {
-        let error = ProviderError.networkError(underlying: NSError(domain: "Gmail", code: 400))
-        let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: Exchange 400 returns true")
-    func permanentlyInvalidExchange400() {
-        let error = ProviderError.networkError(underlying: NSError(domain: "Exchange", code: 400))
-        let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: non-REST domain 400 returns false")
-    func permanentlyInvalidOtherDomain400() {
-        let error = ProviderError.networkError(underlying: NSError(domain: "IMAP", code: 400))
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: Gmail 404 returns false (not permanently invalid)")
-    func permanentlyInvalidGmail404() {
-        let error = ProviderError.networkError(underlying: NSError(domain: "Gmail", code: 404))
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: Gmail 500 returns false")
-    func permanentlyInvalidGmail500() {
-        let error = ProviderError.networkError(underlying: NSError(domain: "Gmail", code: 500))
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: non-ProviderError returns false")
-    func permanentlyInvalidNonProviderError() {
-        let error = NSError(domain: "Gmail", code: 400)
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: messageNotFound returns false")
-    func permanentlyInvalidMessageNotFound() {
-        let error = ProviderError.messageNotFound
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    // MARK: - isPermanentlyInvalidError — HTTPError enum shape (commit 06f4b3c)
-    //
-    // GmailProvider / ExchangeProvider's `request()` helpers throw
-    // `ProviderError.networkError(underlying: HTTPError.networkError(statusCode: N))`.
-    // The classifier must enum-pattern-match the underlying directly — bridging
-    // HTTPError to NSError gives `domain="TabMail.HTTPError" code=<case ordinal>`,
-    // NOT the HTTP status code. The previous NSError-only check silently missed
-    // every Gmail/Exchange 400 thrown this way, which is why a stuck `.move` op
-    // (Gmail "Invalid label: Deleted Messages") retried for 9 days.
-
-    @Test("isPermanentlyInvalidError: HTTPError.networkError(400) returns true")
-    func permanentlyInvalidHTTPError400() {
-        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 400))
-        let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: HTTPError.networkError(404) returns false")
-    func permanentlyInvalidHTTPError404() {
-        // 404 is messageNotFound's job, not the permanent-invalid classifier.
-        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 404))
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: HTTPError.networkError(500) returns false")
-    func permanentlyInvalidHTTPError500() {
-        // 5xx is transient; must retry.
-        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 500))
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isPermanentlyInvalidError: HTTPError.networkError(429) returns false")
-    func permanentlyInvalidHTTPError429() {
-        // Throttle is transient; must retry.
-        let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 429))
-        let manager = AccountManager.shared
-        #expect(!manager.isPermanentlyInvalidError(error))
     }
 
     // MARK: - DraftSaveResult
@@ -391,20 +302,4 @@ struct DraftDeletionTests {
         #expect(log.contains { $0.contains("deleteDraft") })
     }
 
-    // MARK: - isMessageNotFoundError (boundary with isPermanentlyInvalidError)
-
-    @Test("isMessageNotFoundError: 404 is message-not-found, not permanently invalid")
-    func messageNotFound404() {
-        let error = ProviderError.networkError(underlying: NSError(domain: "Gmail", code: 404))
-        let manager = AccountManager.shared
-        #expect(manager.isMessageNotFoundError(error))
-        #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    @Test("isMessageNotFoundError: messageNotFound enum case")
-    func messageNotFoundEnumCase() {
-        let error = ProviderError.messageNotFound
-        let manager = AccountManager.shared
-        #expect(manager.isMessageNotFoundError(error))
-    }
 }
