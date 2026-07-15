@@ -17,7 +17,7 @@ import Testing
 /// `.serialized`: tests swap `AppDatabase.shared` and touch the
 /// `AccountManager.shared` overlay + `NSEDataBridge.latestStagedRows`
 /// process-wide globals (mirrors `InboxListBehaviorPinningTests`).
-@Suite("InboxListReader integration (PLAN_INBOX_UNIFIED_READ §5A.3)", .serialized)
+@Suite("InboxListReader integration (PLAN_INBOX_UNIFIED_READ §5A.3)", .serialized, .processGlobalState)
 @MainActor
 struct InboxListReaderIntegrationTests {
 
@@ -96,8 +96,7 @@ struct InboxListReaderIntegrationTests {
     }
 
     private func clearOverlay() {
-        let snapshot = AccountManager.shared.snapshotOverlay()
-        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+        AccountManager.shared.intentionJournal.resetForTesting()
     }
 
     private func resetStagedGlobal() {
@@ -114,7 +113,8 @@ struct InboxListReaderIntegrationTests {
     ) -> InboxListQuery {
         InboxListQuery(
             displayedFolderIds: Set(folders.map(\.id)), filterUnread: filterUnread,
-            filterLabelIds: filterLabelIds, mode: mode, targetCount: targetCount, beforeDate: beforeDate
+            filterLabelIds: filterLabelIds, filterLabelAccountId: folders.first?.accountId,
+            mode: mode, targetCount: targetCount, beforeDate: beforeDate
         )
     }
 
@@ -211,10 +211,10 @@ struct InboxListReaderIntegrationTests {
         #expect(syncResult.isEmpty, "stale staged row resurrected despite the rfc822-linked archived durable copy (sync)")
     }
 
-    // MARK: - (d) P-step: archived durable + overlay folderId→inbox (the undo shape)
+    // MARK: - (d) Overlay-pinned durable row composition
 
-    @Test("P-step: an archived durable row with an overlay folderId back into the inbox appears in the result — the undo shape Phase 3 turns on")
-    func pinnedStepRestoresUndoneRow() async throws {
+    @Test("an archived durable row pinned into the inbox by an overlay appears in both fetch variants")
+    func overlayPinnedRowAppears() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -223,23 +223,23 @@ struct InboxListReaderIntegrationTests {
         }
         clearOverlay(); resetStagedGlobal()
 
-        let archived = makeDurableHeader(folder: archive, messageId: "m-undo", isInInbox: false)
+        let archived = makeDurableHeader(folder: archive, messageId: "m-overlay-pinned", isInInbox: false)
         try await pool.writeWithoutTransaction { db in try archived.insert(db) }
 
-        // Mirror UndoService.undo()'s .move case: overlay registered, DB
-        // restore write still deferred (header physically in Archive).
-        AccountManager.shared.registerMutation(id: archived.id, mutation: .init(
+        // The durable row remains in Archive while the provider-neutral
+        // display overlay pins its composed snapshot into Inbox.
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: archived.id, mutation: .init(
             folderId: inbox.id, folderPath: inbox.path, isInInbox: true
         ))
         let q = query(folders: [inbox])
 
         let asyncResult = await InboxListReader.fetch(folders: [inbox], query: q)
-        #expect(asyncResult.count == 1, "undone row missing from fetch — P-step did not pin it")
+        #expect(asyncResult.count == 1, "overlay-pinned row missing from fetch")
         #expect(asyncResult.first?.id == archived.id)
         #expect(asyncResult.first?.isInInbox == true, "overlay isInInbox not applied to the pinned row")
 
         let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
-        #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the undo shape")
+        #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the overlay-pinned shape")
     }
 
     // MARK: - (g) label filter: a genuinely-labeled durable row survives
@@ -264,7 +264,11 @@ struct InboxListReaderIntegrationTests {
             let l = labeled; try l.insert(db)
             let u = unlabeled; try u.insert(db)
             try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+            try MessageUserLabel(
+                messageId: labeled.id,
+                accountId: "acc1",
+                userLabelId: "label-x"
+            ).insert(db)
         }
         let q = query(folders: [inbox], filterLabelIds: ["label-x"])
 
@@ -286,9 +290,9 @@ struct InboxListReaderIntegrationTests {
         )
     }
 
-    // MARK: - (h) label filter: a genuinely-labeled overlay-pinned (undo-shape) row survives
+    // MARK: - (h) Label filter for an overlay-pinned row
 
-    @Test("label filter: a genuinely-labeled overlay-pinned (undo-shape) row survives an active label filter via BOTH fetch variants, with userLabels populated; an unlabeled archived+pinned sibling drops")
+    @Test("label filter: a labeled overlay-pinned row survives both fetch variants while an unlabeled pinned sibling drops")
     func labeledPinnedRowSurvivesLabelFilter() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
@@ -298,22 +302,25 @@ struct InboxListReaderIntegrationTests {
         }
         clearOverlay(); resetStagedGlobal()
 
-        let labeled = makeDurableHeader(folder: archive, messageId: "m-undo-labeled", isInInbox: false)
-        let unlabeled = makeDurableHeader(folder: archive, messageId: "m-undo-unlabeled", isInInbox: false)
+        let labeled = makeDurableHeader(folder: archive, messageId: "m-pinned-labeled", isInInbox: false)
+        let unlabeled = makeDurableHeader(folder: archive, messageId: "m-pinned-unlabeled", isInInbox: false)
         try await pool.writeWithoutTransaction { db in
             let l = labeled; try l.insert(db)
             let u = unlabeled; try u.insert(db)
             try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+            try MessageUserLabel(
+                messageId: labeled.id,
+                accountId: "acc1",
+                userLabelId: "label-x"
+            ).insert(db)
         }
 
-        // Mirror UndoService.undo()'s .move case for BOTH messages — overlay
-        // registered, deferred DB restore write NOT landed yet (the "undo
-        // shape" pinnedStepRestoresUndoneRow above exercises unlabeled).
-        AccountManager.shared.registerMutation(id: labeled.id, mutation: .init(
+        // Provider-neutral overlays pin both archived durable rows into the
+        // displayed folder; the normal label filter still applies uniformly.
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: labeled.id, mutation: .init(
             folderId: inbox.id, folderPath: inbox.path, isInInbox: true
         ))
-        AccountManager.shared.registerMutation(id: unlabeled.id, mutation: .init(
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: unlabeled.id, mutation: .init(
             folderId: inbox.id, folderPath: inbox.path, isInInbox: true
         ))
         let q = query(folders: [inbox], filterLabelIds: ["label-x"])

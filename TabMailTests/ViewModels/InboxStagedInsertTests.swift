@@ -14,7 +14,7 @@ import Testing
 /// a process-wide global — mirrors the `.serialized` trait on every other
 /// suite that touches it (`InboxListBehaviorPinningTests`,
 /// `InboxListReaderIntegrationTests`, `NSEStaleStagedRowInvalidationTests`).
-@Suite("Inbox staged in-memory insert (ADR-IOS-049)", .serialized)
+@Suite("Inbox staged in-memory insert (ADR-IOS-049)", .serialized, .processGlobalState)
 struct InboxStagedInsertTests {
 
     private func makeTestDB() throws -> (pool: DatabasePool, folder: Folder, dir: URL, previous: AppDatabase?) {

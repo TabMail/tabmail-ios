@@ -47,6 +47,7 @@ private func insertFixtures(_ pool: DatabasePool, messageId: String, isRead: Boo
         )
         header.isRead = isRead
         header.headerComplete = true
+        header.rfc822MessageId = "<\(messageId)@example.com>"
         try header.insert(db)
         return header
     }
@@ -290,8 +291,40 @@ struct OnDemandBodyFetchErrorTests {
 
 // MARK: - Suite 4: Mark-read-on-open (independent of loadBody)
 
-@Suite("Mark-Read on Open — Independent of loadBody")
+@Suite("Mark-Read on Open — Independent of loadBody", .processGlobalState)
 struct MarkReadOnOpenTests {
+
+    /// Escaped-write hygiene barrier (ADR-IOS-058, PROJECT_MEMORY "drain-before-
+    /// return" rule): `markReadOnOpenIfNeeded` registers a gesture intention on
+    /// `AccountManager.shared`, whose fold executor runs on the process-wide
+    /// FIFO write queue. Enqueue a no-op and await it — FIFO ordering
+    /// guarantees every closure enqueued BEFORE this call has executed by the
+    /// time this returns. MUST run before a test returns so no fold closure
+    /// escapes to execute later, against whatever DB happens to be installed
+    /// at that point. Mirrors `InboxGestureActionTests.drainWriteQueue`. Note:
+    /// this suite does not swap `AppDatabase.shared` for its own `dbPool` (out
+    /// of scope for this sweep — see round-1 audit item 1), so the fold still
+    /// resolves against whatever `AppDatabase.shared` currently points to.
+    /// Round-2 audit: a single FIFO enqueue+await only guarantees closures
+    /// already enqueued BEFORE this call have run — it does NOT guarantee the
+    /// journal is empty. Two independently-created Tasks (a gesture site's
+    /// `record()`, which spawns its own fold-executor Task, and this drain
+    /// call) can reach the shared FIFO in EITHER order, so a fold closure the
+    /// gesture just triggered may land AFTER this barrier's no-op closure and
+    /// still be pending when the barrier returns — closing this window is the
+    /// likely fix for the plan's known settle-flake. Loop the barrier until
+    /// the journal reports fully drained (no pending records, no in-flight
+    /// display holds/seqs); bounded so a genuine stuck-drain bug fails the
+    /// test instead of hanging it forever.
+    private func drainWriteQueue() async {
+        var iterations = 0
+        repeat {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+            }
+            iterations += 1
+        } while !AccountManager.shared.intentionJournal.isFullyDrainedForTesting() && iterations < 200
+    }
 
     @Test("markReadOnOpenIfNeeded flips unread message's optimistic isRead flag")
     @MainActor
@@ -311,6 +344,9 @@ struct MarkReadOnOpenTests {
         await vm.markReadOnOpenIfNeeded()
 
         #expect(vm.message?.isRead == true, "Optimistic in-memory flip should apply after call")
+
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     @Test("markReadOnOpenIfNeeded is a no-op for already-read messages")
@@ -350,6 +386,9 @@ struct MarkReadOnOpenTests {
 
         // No crash, no re-flip (state is idempotent).
         #expect(vm.message?.isRead == true)
+
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     @Test("loadBody alone no longer marks as read — decoupled from body-load path")
@@ -394,14 +433,16 @@ struct MarkReadOnOpenTests {
 // optimistic move's overlay points at the destination before the
 // message has physically been moved there.
 
-@Suite("MessageDetailViewModel — Overlay survives DB re-reads")
+// .serialized (test-review round 3): these tests share the process-wide
+// intention journal (seedDisplayForTesting + resetForTesting in every
+// setup/defer) — concurrent siblings would wipe each other's seeded entries.
+@Suite("MessageDetailViewModel — Overlay survives DB re-reads", .serialized, .processGlobalState)
 struct MessageDetailOverlayTests {
 
     /// AccountManager.shared is a singleton — clear any stragglers between tests.
-    /// snapshotOverlay/removeOverlayEntries are nonisolated; no actor hop needed.
+    /// intentionJournal is nonisolated; no actor hop needed.
     private func clearOverlay() {
-        let snapshot = AccountManager.shared.snapshotOverlay()
-        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+        AccountManager.shared.intentionJournal.resetForTesting()
     }
 
     @Test("init layers overlay isRead=true on top of a staged seed that has isRead=false")
@@ -427,7 +468,7 @@ struct MessageDetailOverlayTests {
             isForwarded: false, actionTag: nil, summaryBlurb: nil
         )
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
-        AccountManager.shared.registerMutation(id: row.headerId, mutation: .init(isRead: true))
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: row.headerId, mutation: .init(isRead: true))
 
         let vm = MessageDetailViewModel(
             messageId: row.headerId,
@@ -437,6 +478,43 @@ struct MessageDetailOverlayTests {
 
         #expect(vm.message?.isRead == true,
                 "init's staged-snapshot seed must be layered with overlay before assignment")
+    }
+
+    @Test("detail staged seed: an overlay actionTag re-derives tagSortOrder")
+    @MainActor
+    func initOverlayTagDerivesSortOrder() async throws {
+        let (pool, dir) = try makeTestPool()
+        defer {
+            clearOverlay()
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+            try? pool.close()
+            try? FileManager.default.removeItem(at: dir)
+        }
+        clearOverlay()
+
+        let row = StagedInboxRow(
+            accountId: "acc1", folderPath: "INBOX", messageId: "mdo-init-tag",
+            rfc822MessageId: "<mdo-init-tag@example.com>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "Staged", senderName: "Sender", senderAddress: "sender@example.com",
+            to: "recipient@example.com", snippet: "", date: Date(),
+            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+            isForwarded: false, actionTag: ActionTag.archive.rawValue, summaryBlurb: nil
+        )
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
+            id: row.headerId,
+            mutation: .init(actionTag: .some(.reply))
+        )
+
+        let vm = MessageDetailViewModel(
+            messageId: row.headerId,
+            dbPool: pool,
+            fetchBodyOverride: { _ in }
+        )
+
+        #expect(vm.message?.actionTag == .reply)
+        #expect(vm.message?.tagSortOrder == ActionTag.reply.sortOrder,
+                "detail overlay changed archive to reply, so the staged archive sort order must not survive")
     }
 
     @Test("loadBody cached-body path: `message = msg` does not revert overlay isRead")
@@ -465,7 +543,7 @@ struct MessageDetailOverlayTests {
         )
         // Register overlay AFTER init so the test isolates loadBody's behavior
         // (init was already covered by initAppliesOverlay above).
-        AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: true))
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: header.id, mutation: .init(isRead: true))
 
         await vm.loadBody()
 
@@ -486,7 +564,7 @@ struct MessageDetailOverlayTests {
             messageId: "mdo_loadfetch_\(Int(Date().timeIntervalSince1970))",
             isRead: false
         )
-        AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: true))
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: header.id, mutation: .init(isRead: true))
 
         let vm = MessageDetailViewModel(
             messageId: header.id,
@@ -558,7 +636,7 @@ struct MessageDetailOverlayTests {
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )
-        AccountManager.shared.registerMutation(id: header.id, mutation: .init(isFlagged: true))
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: header.id, mutation: .init(isFlagged: true))
 
         await vm.loadBody()
 

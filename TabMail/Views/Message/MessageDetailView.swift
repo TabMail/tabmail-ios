@@ -635,11 +635,13 @@ struct MessageDetailView: View {
 
     private func handleMove(_ msg: MessageHeader, toFolderPath: String) {
         if msg.id == viewModel.message?.id {
-            viewModel.move(toFolderPath: toFolderPath)
-            dismissMessage()
+            if viewModel.move(toFolderPath: toFolderPath) {
+                dismissMessage()
+            }
         } else {
-            viewModel.moveMessage(msg, toFolderPath: toFolderPath)
-            flashedCardId = msg.id
+            if viewModel.moveMessage(msg, toFolderPath: toFolderPath) {
+                flashedCardId = msg.id
+            }
         }
     }
 

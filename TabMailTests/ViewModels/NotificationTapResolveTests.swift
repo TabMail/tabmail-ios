@@ -13,7 +13,7 @@ import Testing
 /// detail view at once, with the sentinel-prefixed PROVIDER id when the staged
 /// snapshot misses, and `MessageDetailViewModel` resolves it asynchronously
 /// under the loading skeleton (`resolveProviderTap`).
-@Suite("Notification-tap provider-id resolve (immediate push)")
+@Suite("Notification-tap provider-id resolve (immediate push)", .processGlobalState)
 struct NotificationTapResolveTests {
 
     private func makePool() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
@@ -52,6 +52,36 @@ struct NotificationTapResolveTests {
         durable.isInInbox = true
         try pool.writeWithoutTransaction { db in try durable.insert(db) }
         return durable
+    }
+
+    /// Escaped-write hygiene barrier (ADR-IOS-058, PROJECT_MEMORY "drain-before-
+    /// return" rule): `markReadOnOpenIfNeeded` registers a gesture intention on
+    /// `AccountManager.shared`, whose fold executor runs on the process-wide
+    /// FIFO write queue. Enqueue a no-op and await it — FIFO ordering
+    /// guarantees every closure enqueued BEFORE this call has executed by the
+    /// time this returns. MUST run before a test returns (i.e. before its
+    /// `defer`'s `AppDatabase.shared` restore fires), or an escaped fold
+    /// closure executes against whatever DB is installed later. Mirrors
+    /// `InboxGestureActionTests.drainWriteQueue`.
+    /// Round-2 audit: a single FIFO enqueue+await only guarantees closures
+    /// already enqueued BEFORE this call have run — it does NOT guarantee the
+    /// journal is empty. Two independently-created Tasks (a gesture site's
+    /// `record()`, which spawns its own fold-executor Task, and this drain
+    /// call) can reach the shared FIFO in EITHER order, so a fold closure the
+    /// gesture just triggered may land AFTER this barrier's no-op closure and
+    /// still be pending when the barrier returns — closing this window is the
+    /// likely fix for the plan's known settle-flake. Loop the barrier until
+    /// the journal reports fully drained (no pending records, no in-flight
+    /// display holds/seqs); bounded so a genuine stuck-drain bug fails the
+    /// test instead of hanging it forever.
+    private func drainWriteQueue() async {
+        var iterations = 0
+        repeat {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+            }
+            iterations += 1
+        } while !AccountManager.shared.intentionJournal.isFullyDrainedForTesting() && iterations < 200
     }
 
     // MARK: - Ladder tiers
@@ -449,6 +479,9 @@ struct NotificationTapResolveTests {
         // MarkReadOnOpenTests — the durable write is a fire-and-forget
         // enqueue behind it).
         #expect(vm.message?.isRead == true, "the open's read-intent must survive the retry (never-drop-user-intention)")
+
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     @MainActor

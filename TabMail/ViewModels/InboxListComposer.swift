@@ -12,6 +12,11 @@ struct InboxListQuery: Equatable, Sendable {
     let displayedFolderIds: Set<String>
     let filterUnread: Bool
     let filterLabelIds: Set<String>
+    /// Account that owns `filterLabelIds`. Provider label ids are only
+    /// unique inside an account, so a unified-inbox row from another account
+    /// must never satisfy the active picker selection merely because it uses
+    /// the same raw provider label id.
+    let filterLabelAccountId: String?
     let mode: InboxMode
     /// Window size: `targetWindowSize` (full-range reload) or `pageSize` (a
     /// single page). Rows are trimmed to this count after sort.
@@ -33,6 +38,7 @@ struct InboxListQuery: Equatable, Sendable {
         displayedFolderIds: Set<String>,
         filterUnread: Bool,
         filterLabelIds: Set<String>,
+        filterLabelAccountId: String?,
         mode: InboxMode,
         targetCount: Int,
         beforeDate: Date?,
@@ -41,6 +47,7 @@ struct InboxListQuery: Equatable, Sendable {
         self.displayedFolderIds = displayedFolderIds
         self.filterUnread = filterUnread
         self.filterLabelIds = filterLabelIds
+        self.filterLabelAccountId = filterLabelAccountId
         self.mode = mode
         self.targetCount = targetCount
         self.beforeDate = beforeDate
@@ -250,6 +257,7 @@ enum InboxListComposer {
         // skips this filter entirely; the reader unifies it).
         if !query.filterLabelIds.isEmpty {
             rows = rows.filter { snapshot in
+                snapshot.accountId == query.filterLabelAccountId &&
                 query.filterLabelIds.isSubset(of: Set(snapshot.userLabels.map(\.id)))
             }
         }
@@ -367,7 +375,20 @@ enum InboxListComposer {
             var modified = snapshot
             if let v = mutation.isRead { modified.isRead = v }
             if let v = mutation.isFlagged { modified.isFlagged = v }
-            if let v = mutation.actionTag { modified.actionTag = v }
+            if let v = mutation.actionTag {
+                modified.actionTag = v
+                // `tagSortOrder` is a DERIVED mirror of `actionTag`, not an
+                // independent field — triage sorts on it (step 7) instead of
+                // re-deriving per comparison. Every other writer of one writes
+                // the other (`optimisticMoveToFolder`'s inbox-exit clear,
+                // `AccountManagerActions`' undo restore, `sweepStaleActionTags`);
+                // overlaying the tag without the mirror rendered the new badge
+                // while sorting at the OLD priority, so an optimistically-tagged
+                // or freshly-undone row sat in the wrong triage group until an
+                // unrelated reload re-read the durable row. Same derivation as
+                // theirs — `?.sortOrder ?? 99`, the no-tag sentinel.
+                modified.tagSortOrder = v?.sortOrder ?? 99
+            }
             if let v = mutation.isInInbox { modified.isInInbox = v }
             return modified
         }

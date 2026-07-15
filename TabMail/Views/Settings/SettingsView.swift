@@ -583,45 +583,7 @@ struct SettingsView: View {
         let inboxFolderIds = Set(navigationStore.folders.filter { $0.role == .inbox }.map(\.id))
         guard !inboxFolderIds.isEmpty else { return }
 
-        guard let oldMessages = try? await AppDatabase.dbPool.read({ db in
-            try MessageHeader
-                .filter(inboxFolderIds.contains(Column("folderId")))
-                .filter(Column("date") < archiveCutoff)
-                .order(Column("date").asc)
-                .fetchAll(db)
-        }), !oldMessages.isEmpty else { return }
-
-        let byAccount = Dictionary(grouping: oldMessages, by: \.accountId)
-        var totalArchived = 0
-
-        for (accountId, messages) in byAccount {
-            guard let archivePath = try? await AppDatabase.dbPool.read({ db in
-                try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.archive.rawValue).fetchOne(db)?.path
-            }) else {
-                print("[ArchiveOld] No archive folder for account \(accountId)")
-                continue
-            }
-            if let first = messages.first {
-                // Overlay-adjusted for the UndoableAction ONLY — a raw fetchAll
-                // snapshot predates any still-queued gesture cycle's isRead/
-                // isFlagged/actionTag, and undo would silently revert it (the
-                // exact bug `overlayAdjustedSnapshot` fixes at the inbox gesture
-                // sites; see AccountManager.overlayAdjustedSnapshot). The
-                // manager.move call below keeps the raw structs — it re-resolves
-                // fresh headers by id internally regardless.
-                let undoMessages = messages.map { AccountManager.shared.overlayAdjustedSnapshot($0) }
-                UndoService.shared.push(UndoableAction(
-                    type: .move(fromPath: first.folderPath, toPath: archivePath), messages: undoMessages,
-                    originalFolderId: first.folderId,
-                    originalFolderPath: first.folderPath,
-                    accountId: accountId, timestamp: Date()
-                ))
-            }
-            await AccountManager.shared.move(messages, to: archivePath)
-            totalArchived += messages.count
-        }
-
-        print("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
+        await AccountManager.shared.archiveOldInboxMessages(inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff)
 
         // Refresh state
         isLargeInbox = false

@@ -19,7 +19,7 @@ import Testing
 /// Ids use a distinctive `tapseed-` prefix: suites run concurrently and other
 /// suites post `.messagesStaged` from real merges — matching is id-scoped so
 /// cross-suite posts can't seed these VMs (and vice versa).
-@Suite("MessageDetail staged-publish seed")
+@Suite("MessageDetail staged-publish seed", .processGlobalState)
 struct MessageDetailStagedPublishTests {
 
     private func makePool() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {

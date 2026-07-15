@@ -10,7 +10,7 @@ import GRDB
 /// Tests for InboxViewModel.evictAndRebuild() — when archiving/deleting the thread
 /// head while expanded, children must be promoted to their own group(s) immediately.
 /// Also tests that expanded-thread swipe/tag actions scope to the individual message.
-@Suite("InboxViewModel Thread Evict & Rebuild", .serialized)
+@Suite("InboxViewModel Thread Evict & Rebuild", .serialized, .processGlobalState)
 struct InboxViewModelThreadEvictTests {
 
     // MARK: - Helpers
@@ -40,11 +40,40 @@ struct InboxViewModelThreadEvictTests {
 
         let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         try pool.writeWithoutTransaction { db in
-            var f = folder
+            let f = folder
             try f.insert(db)
         }
 
         return (pool, folder, dir, previous)
+    }
+
+    /// Escaped-write hygiene barrier (ADR-IOS-058, PROJECT_MEMORY "drain-before-
+    /// return" rule): enqueue a no-op onto `AccountManager.shared`'s FIFO write
+    /// queue and await it — since the queue is strictly FIFO, every fold
+    /// closure enqueued BEFORE this call is guaranteed to have executed by the
+    /// time this returns. MUST run before a test returns, or an escaped fold
+    /// closure executes against the NEXT test's freshly-installed DB (composite
+    /// ids reuse the same values across tests). Mirrors
+    /// `InboxGestureActionTests.drainWriteQueue`.
+    /// Round-2 audit: a single FIFO enqueue+await only guarantees closures
+    /// already enqueued BEFORE this call have run — it does NOT guarantee the
+    /// journal is empty. Two independently-created Tasks (a gesture site's
+    /// `record()`, which spawns its own fold-executor Task, and this drain
+    /// call) can reach the shared FIFO in EITHER order, so a fold closure the
+    /// gesture just triggered may land AFTER this barrier's no-op closure and
+    /// still be pending when the barrier returns — closing this window is the
+    /// likely fix for the plan's known settle-flake. Loop the barrier until
+    /// the journal reports fully drained (no pending records, no in-flight
+    /// display holds/seqs); bounded so a genuine stuck-drain bug fails the
+    /// test instead of hanging it forever.
+    private func drainWriteQueue() async {
+        var iterations = 0
+        repeat {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+            }
+            iterations += 1
+        } while !AccountManager.shared.intentionJournal.isFullyDrainedForTesting() && iterations < 200
     }
 
     /// Insert messages with optional computedThreadId. Returns IDs ordered by insertion.
@@ -71,6 +100,7 @@ struct InboxViewModelThreadEvictTests {
             )
             header.computedThreadId = spec.computedThreadId
             header.headerComplete = true  // Required for inbox display (v38 migration gate)
+            header.rfc822MessageId = "<\(spec.messageId)@example.com>"
             try pool.writeWithoutTransaction { db in
                 try header.insert(db)
             }
@@ -467,6 +497,15 @@ struct InboxViewModelThreadEvictTests {
 
         vm.moveThread(group.members.map(\.id), toFolderPath: "Archive")
 
+        // Round-2 audit guard-gap fix: drain BEFORE the guard below, not only
+        // at function end — an early return from the guard would otherwise
+        // let moveThread's fold closure escape past this test's return. Safe
+        // to drain here: the assertions below read UndoService.shared's
+        // in-memory undo stack, set synchronously by push() (inside
+        // moveThread(), before record() is even called) — untouched by
+        // draining.
+        await drainWriteQueue()
+
         // A whole-thread move must be a SINGLE grouped undo entry carrying every
         // member — not three separate entries. This is the bug #1 invariant.
         #expect(UndoService.shared.undoStack.count == 1)
@@ -474,13 +513,9 @@ struct InboxViewModelThreadEvictTests {
             Issue.record("moveThread did not push an undo action")
             return
         }
-        #expect(action.messages.count == 3)
-        #expect(Set(action.messages.map(\.id)) == Set(ids))
-        if case let .move(_, toPath) = action.type {
-            #expect(toPath == "Archive")
-        } else {
-            Issue.record("expected a .move undo action")
-        }
+        #expect(action.totalMemberCount == 3)
+        #expect(Set(action.commands.flatMap { $0.members.map(\.originalHeaderId) }) == Set(ids))
+        #expect(action.commands.allSatisfy { $0.forwardDestinationPath == "Archive" })
     }
 }
 

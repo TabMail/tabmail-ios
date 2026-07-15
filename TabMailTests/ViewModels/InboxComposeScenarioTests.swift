@@ -188,8 +188,8 @@ struct SimWorld {
         case userRead               // non-removing overlay mutation
         case optimisticWrite        // the action's durable GRDB write lands
         case overlayDrain           // pending op completes → overlay entry removed
-        case undo                   // overlay folderId back-to-displayed (restore write deferred)
-        case undoRestoreWrite       // the deferred DB restore commits
+        case overlayPinIntoInbox    // overlay points an out-of-folder row into the displayed set
+        case durableReturnWrite     // the corresponding durable folder write commits
         case staleDelete            // sync transiently deletes the durable row
         case uidRemap               // IMAP MOVE re-keys durable identity (rfc822 link only)
         case reStage                // NSE re-stages an old message (boot_logs 3 driver)
@@ -199,7 +199,7 @@ struct SimWorld {
         var everStaged = false
         var phase2Done = false
         var movedAwayByUser = false
-        var undoActive = false
+        var returnMoveActive = false
         /// Whether the CURRENT overlay entry's durable write has landed
         /// (gates `overlayDrain` — the real overlay only drains after its
         /// PendingOperation's DB write commits).
@@ -261,7 +261,7 @@ struct SimWorld {
     static var defaultQuery: InboxListQuery {
         InboxListQuery(
             displayedFolderIds: [MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")],
-            filterUnread: false, filterLabelIds: [], mode: .normal,
+            filterUnread: false, filterLabelIds: [], filterLabelAccountId: "acc1", mode: .normal,
             targetCount: 50, beforeDate: nil
         )
     }
@@ -339,19 +339,17 @@ struct SimWorld {
             return overlayEntry != nil && durable != nil && !state.writeApplied
         case .overlayDrain:
             return overlayEntry != nil && state.writeApplied
-        case .undo:
+        case .overlayPinIntoInbox:
             return state.movedAwayByUser
-        case .undoRestoreWrite:
-            return state.undoActive && durable != nil && !state.writeApplied
+        case .durableReturnWrite:
+            return state.returnMoveActive && durable != nil && !state.writeApplied
         case .staleDelete:
             // The DB-layer 120s stale-delete protection + recentlyCompleted
             // TTL shield rows with in-flight user actions — model that by
             // only allowing stale deletes on action-free rows.
-            return durable != nil && !anyOverlay && !state.movedAwayByUser && !state.undoActive
+            return durable != nil && !anyOverlay && !state.movedAwayByUser && !state.returnMoveActive
         case .uidRemap:
-            // The plan notes post-remap undo-id staleness is out of scope
-            // (§6, "Undo-id staleness"), so a remap never races an overlay.
-            return durable != nil && !anyOverlay && !state.undoActive
+            return durable != nil && !anyOverlay && !state.returnMoveActive
         }
     }
 
@@ -391,7 +389,7 @@ struct SimWorld {
                 folderId: archiveFolderId, folderPath: archivePath, isInInbox: false
             ))
             state.movedAwayByUser = true
-            state.undoActive = false
+            state.returnMoveActive = false
             state.writeApplied = false
         case .userRead:
             registerMutation(id: currentId(forKey: key), AccountManager.PendingMutation(isRead: true))
@@ -407,21 +405,21 @@ struct SimWorld {
         case .overlayDrain:
             overlay.removeValue(forKey: currentId(forKey: key))
             state.writeApplied = false
-        case .undo:
-            // Mirrors UndoService.undo()'s .move case: fresh overlay entry
-            // pointing back into the displayed set, DB restore deferred.
+        case .overlayPinIntoInbox:
+            // Pin the archived durable row into the displayed set while the
+            // corresponding durable return write is still pending.
             registerMutation(id: currentId(forKey: key), AccountManager.PendingMutation(
                 folderId: inboxFolderId, folderPath: inboxPath, isInInbox: true
             ))
             state.movedAwayByUser = false
-            state.undoActive = true
+            state.returnMoveActive = true
             state.writeApplied = false
-        case .undoRestoreWrite:
-            let restoreFolderId = inboxFolderId
-            let restoreFolderPath = inboxPath
+        case .durableReturnWrite:
+            let returnDestinationFolderId = inboxFolderId
+            let returnDestinationPath = inboxPath
             mutateDurable(forKey: key) { row in
-                row.folderId = restoreFolderId
-                row.folderPath = restoreFolderPath
+                row.folderId = returnDestinationFolderId
+                row.folderPath = returnDestinationPath
                 row.isInInbox = true
             }
             state.writeApplied = true
@@ -509,7 +507,7 @@ struct SimWorld {
 
         // P — overlay entries whose folderId points INTO the displayed set,
         // id not already in D, durable row fetched by id with overlay folder
-        // fields applied (insertUndoneMessages' logic; the shell's P step).
+        // fields applied (the shell's provider-neutral P step).
         let dIds = Set(durableSnaps.map(\.id))
         var pinned: [MessageSnapshot] = []
         for (id, mutation) in overlay {
@@ -607,7 +605,7 @@ struct InboxComposeScenarioTests {
 
             // I1 no-resurrection: identity durably present with folder ∉
             // displayed (or isInInbox=false) ⟹ NOT composed — unless an
-            // overlay entry moves it back INTO the displayed set (undo).
+            // overlay entry moves it back INTO the displayed set.
             if let d = durable,
                !query.displayedFolderIds.contains(d.folderId) || !d.isInInbox,
                !overlayIntoDisplayed {
@@ -617,8 +615,8 @@ struct InboxComposeScenarioTests {
                 )
             }
 
-            // I6 move-hides: from userMove(out) onward, identity in NO list
-            // (undo clears movedAwayByUser, so it stops applying there).
+            // I6 move-hides: while userMove(out) remains active, identity is
+            // in NO list.
             if state.movedAwayByUser {
                 #expect(
                     !composedIdentities.contains(identity),
@@ -652,12 +650,12 @@ struct InboxComposeScenarioTests {
                         "I2 durable-visible VIOLATED for \(key): headerComplete durable row in displayed folder missing from composed list — \(detail)"
                     )
                 }
-                // I4 undo-visible: from undo(msg) onward — before AND after
-                // undoRestoreWrite, across overlayDrain — always composed.
-                if state.undoActive {
+                // I4 return-move-visible: before and after the durable return
+                // write, across overlayDrain, the pinned row stays composed.
+                if state.returnMoveActive {
                     #expect(
                         composedIdentities.contains(identity),
-                        "I4 undo-visible VIOLATED for \(key): undone message missing from composed list — \(detail)"
+                        "I4 return-move-visible VIOLATED for \(key): overlay-pinned message missing from composed list — \(detail)"
                     )
                 }
             }
@@ -676,29 +674,27 @@ struct InboxComposeScenarioTests {
         // I3 AI-monotonic: once a composed row shows non-nil AI fields, no
         // later compose shows nil for that identity (no clear steps in sim).
         //
-        // Undo carve-out (designed parity behavior, NOT a bug): an undone row
-        // whose durable copy never got its phase-2 AI write renders via the
-        // P-step from the AI-less durable header — exactly what
-        // `insertUndoneMessages` does today, and the §2.1a carry-over only
-        // applies to same-folder D∪P rows (an undo target is stale-by-move
-        // until the restore write lands, so its S copy is suppressed without
-        // carry-over). The AI repaint/phase-2 restores the fields later.
+        // An overlay-pinned row whose durable copy never got its phase-2 AI
+        // write can render from the AI-less durable header. The §2.1a
+        // carry-over only applies to same-folder D∪P rows; while the durable
+        // return write is pending, its S copy is stale-by-move and suppressed.
+        // The later AI repaint/phase-2 restores the fields.
         let identityToKey: [String: String] = Dictionary(
             uniqueKeysWithValues: world.messageKeys.map { (world.identity(of: $0), $0) }
         )
         for row in composed {
             let identity = identityKey(accountId: row.accountId, messageId: row.messageId, rfc822: row.rfc822MessageId)
             let key = identityToKey[identity]
-            let undoActive = key.flatMap { world.states[$0]?.undoActive } ?? false
+            let returnMoveActive = key.flatMap { world.states[$0]?.returnMoveActive } ?? false
             let durableRow = key.flatMap { world.durableRow(forKey: $0) }
-            if ai.tagSeen.contains(identity), !(undoActive && durableRow?.actionTag == nil) {
+            if ai.tagSeen.contains(identity), !(returnMoveActive && durableRow?.actionTag == nil) {
                 #expect(
                     row.actionTag != nil,
                     "I3 AI-monotonic VIOLATED: actionTag flashed to nil for \(identity) — \(detail)"
                 )
             }
             if row.actionTag != nil { ai.tagSeen.insert(identity) }
-            if ai.blurbSeen.contains(identity), !(undoActive && durableRow?.summaryBlurb == nil) {
+            if ai.blurbSeen.contains(identity), !(returnMoveActive && durableRow?.summaryBlurb == nil) {
                 #expect(
                     row.summaryBlurb != nil,
                     "I3 AI-monotonic VIOLATED: summaryBlurb flashed to nil for \(identity) — \(detail)"
@@ -913,8 +909,8 @@ struct InboxComposeScenarioTests {
         #expect(contains(stormed, world, "m1"))
     }
 
-    @Test("undoSurvivesEveryReload — from undo onward the row is in EVERY composed list, before AND after the restore write, across overlay drain (I4)")
-    func undoSurvivesEveryReload() {
+    @Test("overlayPinIntoInboxSurvivesEveryCompose — the row stays composed before and after the durable return write, across overlay drain (I4)")
+    func overlayPinIntoInboxSurvivesEveryCompose() {
         var world = SimWorld.standard(messages: [SimWorld.spec("m1", uid: "101", minutesAgo: 5)])
         var ai = AITracker()
         // Make it durable + visible, then archive it (write lands, overlay drains).
@@ -927,24 +923,29 @@ struct InboxComposeScenarioTests {
             (.userMove, "m1"),
             (.optimisticWrite, "m1"),
             (.overlayDrain, "m1"),
-        ], world: &world, ai: &ai, scenario: "undoSurvivesEveryReload")
+        ], world: &world, ai: &ai, scenario: "overlayPinIntoInboxSurvivesEveryCompose")
 
-        // Undo: overlay back-to-inbox, DB restore write still deferred.
-        var composed = runSteps([(.undo, "m1")], world: &world, ai: &ai, scenario: "undoSurvivesEveryReload")
-        #expect(contains(composed, world, "m1"), "undone row missing immediately after undo (P-step hole)")
-
-        // The latent hole today: reloads between undo and the restore write
-        // evicted the row. The P-step must survive any number of them.
-        composed = composeRepeatedly(
-            15, world: world, ai: &ai, scenario: "undoSurvivesEveryReload", note: "pre-restore-write storm"
+        // Pin the archived row into the displayed set while the durable return
+        // write is deferred.
+        var composed = runSteps(
+            [(.overlayPinIntoInbox, "m1")], world: &world, ai: &ai,
+            scenario: "overlayPinIntoInboxSurvivesEveryCompose"
         )
-        #expect(contains(composed, world, "m1"), "undone row vanished during pre-restore-write reload storm")
+        #expect(contains(composed, world, "m1"), "overlay-pinned row missing immediately (P-step hole)")
+
+        // Recomposition between the overlay pin and durable write must not
+        // evict the row.
+        composed = composeRepeatedly(
+            15, world: world, ai: &ai,
+            scenario: "overlayPinIntoInboxSurvivesEveryCompose", note: "pre-durable-return-write storm"
+        )
+        #expect(contains(composed, world, "m1"), "overlay-pinned row vanished before the durable return write")
 
         composed = runSteps([
-            (.undoRestoreWrite, "m1"),
+            (.durableReturnWrite, "m1"),
             (.overlayDrain, "m1"),
-        ], world: &world, ai: &ai, scenario: "undoSurvivesEveryReload")
-        #expect(contains(composed, world, "m1"), "undone row vanished after restore write / overlay drain")
+        ], world: &world, ai: &ai, scenario: "overlayPinIntoInboxSurvivesEveryCompose")
+        #expect(contains(composed, world, "m1"), "returned row vanished after durable write / overlay drain")
     }
 
     @Test("staleDeleteSelfHeals — sync stale-deletes a still-staged row: the S row becomes eligible again and the display never blanks (§2.3 emergent property)")
@@ -1017,7 +1018,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: true,
-            filterLabelIds: [], mode: .normal, targetCount: 50, beforeDate: nil
+            filterLabelIds: [], filterLabelAccountId: "acc1", mode: .normal, targetCount: 50, beforeDate: nil
         )
         let composed = runSteps([
             (.stagePush, "mReadStaged"),
@@ -1047,7 +1048,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: ["label-x"], mode: .normal, targetCount: 50, beforeDate: nil
+            filterLabelIds: ["label-x"], filterLabelAccountId: "acc1", mode: .normal, targetCount: 50, beforeDate: nil
         )
         let composed = runSteps([
             (.stagePush, "m1"),
@@ -1064,7 +1065,7 @@ struct InboxComposeScenarioTests {
     // compose call as an always-dropped S row and unlabeled D/P siblings —
     // pinning compose step 6's "uniform over D, P, and S" contract from both
     // directions at once.
-    @Test("labeledRowsSurviveLabelFilterInCompose — a labeled D row and a labeled P (overlay-pinned, undo-shape) row survive an active label filter in the SAME compose call; unlabeled D/P siblings and the (always-unlabeled) S row all drop")
+    @Test("labeledRowsSurviveLabelFilterInCompose — a labeled D row and a labeled overlay-pinned P row survive an active label filter in the SAME compose call; unlabeled D/P siblings and the (always-unlabeled) S row all drop")
     func labeledRowsSurviveLabelFilterInCompose() {
         let accountId = "acc1"
         let folderPath = "INBOX"
@@ -1087,7 +1088,7 @@ struct InboxComposeScenarioTests {
             headerComplete: true, actionTag: nil, summaryBlurb: nil, date: now
         ).toSnapshot()
 
-        // P — overlay-pinned "undo shape": durable identity lives in
+        // P — overlay-pinned return-move shape: durable identity lives in
         // Archive, but the shell has ALREADY applied the overlay's folderId
         // onto the snapshot (ComposeInputs.pinned's documented shape) before
         // compose ever sees it — mirrors InboxListReader's P-step.
@@ -1123,6 +1124,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: ["label-x"],
+            filterLabelAccountId: accountId,
             mode: .normal, targetCount: 50, beforeDate: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
@@ -1148,6 +1150,49 @@ struct InboxComposeScenarioTests {
         )
     }
 
+    @Test("label filter account scope — identical provider label ids in a unified inbox match only the picker account")
+    func labelFilterMatchesOnlyPickerAccount() {
+        let accountA = "acc1"
+        let accountB = "acc2"
+        let folderPath = "INBOX"
+        let rawLabelId = "Label_42"
+        let now = Date()
+
+        func snapshot(accountId: String) -> MessageSnapshot {
+            SimHeader(
+                id: MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: "message"),
+                accountId: accountId, messageId: "message", rfc822MessageId: nil,
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath),
+                folderPath: folderPath, isInInbox: true, isRead: false,
+                headerComplete: true, actionTag: nil, summaryBlurb: nil, date: now,
+                userLabels: [UserLabel(
+                    id: rawLabelId, accountId: accountId, name: "Shared raw id", isSystem: false
+                )]
+            ).toSnapshot()
+        }
+
+        let fromA = snapshot(accountId: accountA)
+        let fromB = snapshot(accountId: accountB)
+        let query = InboxListQuery(
+            displayedFolderIds: [
+                MessageIdentity.folderId(accountId: accountA, folderPath: folderPath),
+                MessageIdentity.folderId(accountId: accountB, folderPath: folderPath),
+            ],
+            filterUnread: false,
+            filterLabelIds: [rawLabelId],
+            filterLabelAccountId: accountA,
+            mode: .normal,
+            targetCount: 50,
+            beforeDate: nil
+        )
+
+        let composed = InboxListComposer.compose(ComposeInputs(
+            durable: [fromA, fromB], pinned: [], staged: [], stagedResolutions: [:], overlay: [:], query: query
+        ))
+
+        #expect(composed.map(\.id) == [fromA.id])
+    }
+
     @Test("triageOrder — tagSortOrder asc then date desc, across durable AND staged sources")
     func triageOrderScenario() {
         var world = SimWorld.standard(messages: [
@@ -1158,7 +1203,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: [], mode: .triage, targetCount: 50, beforeDate: nil
+            filterLabelIds: [], filterLabelAccountId: "acc1", mode: .triage, targetCount: 50, beforeDate: nil
         )
         let composed = runSteps([
             (.stagePush, "mReplyOld"),
@@ -1192,7 +1237,7 @@ struct InboxComposeScenarioTests {
         var ai = AITracker()
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: [], mode: .normal, targetCount: 3, beforeDate: nil
+            filterLabelIds: [], filterLabelAccountId: "acc1", mode: .normal, targetCount: 3, beforeDate: nil
         )
         let composed = runSteps([
             (.stagePush, "d1"), (.phase1Commit, "d1"), (.ftsFlushCommit, "d1"),
@@ -1222,7 +1267,7 @@ struct InboxComposeScenarioTests {
         let cutoff = SimWorld.baseDate.addingTimeInterval(-60 * 60)  // 60 minutes ago
         let query = InboxListQuery(
             displayedFolderIds: world.displayedFolderIds, filterUnread: false,
-            filterLabelIds: [], mode: .normal, targetCount: 50, beforeDate: cutoff
+            filterLabelIds: [], filterLabelAccountId: "acc1", mode: .normal, targetCount: 50, beforeDate: cutoff
         )
         let composed = runSteps([
             (.stagePush, "sNewer"),
@@ -1286,6 +1331,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
+            filterLabelAccountId: "acc1",
             mode: .triage, targetCount: 3, beforeDate: nil, excludeIds: [rExcluded.id]
         )
         let composed = InboxListComposer.compose(ComposeInputs(
@@ -1368,6 +1414,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
+            filterLabelAccountId: "acc1",
             mode: .normal, targetCount: 50, beforeDate: nil, excludeIds: [d1.id]
         )
         let composed = InboxListComposer.compose(ComposeInputs(
@@ -1433,6 +1480,7 @@ struct InboxComposeScenarioTests {
             durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:],
             query: InboxListQuery(
                 displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
+                filterLabelAccountId: "acc1",
                 mode: .normal, targetCount: 4, beforeDate: now.addingTimeInterval(-60 * 60)
             )
         )
@@ -1440,6 +1488,7 @@ struct InboxComposeScenarioTests {
             durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:],
             query: InboxListQuery(
                 displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
+                filterLabelAccountId: "acc1",
                 mode: .normal, targetCount: 4, beforeDate: now.addingTimeInterval(-60 * 60),
                 excludeIds: loadedIds
             )
@@ -1514,6 +1563,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
+            filterLabelAccountId: "acc1",
             mode: .normal, targetCount: 50, beforeDate: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
@@ -1677,7 +1727,8 @@ struct InboxComposeScenarioTests {
             let durable = shuffledIds.map { tiedSnapshot(id: $0, date: now) }
             let query = InboxListQuery(
                 displayedFolderIds: [MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")],
-                filterUnread: false, filterLabelIds: [], mode: .normal, targetCount: 3, beforeDate: nil
+                filterUnread: false, filterLabelIds: [], filterLabelAccountId: "acc1",
+                mode: .normal, targetCount: 3, beforeDate: nil
             )
             let composed = InboxListComposer.compose(ComposeInputs(
                 durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:], query: query
@@ -1709,7 +1760,8 @@ struct InboxComposeScenarioTests {
             let durable = shuffledIds.map { tiedSnapshot(id: $0, date: now, tagSortOrder: 5) }
             let query = InboxListQuery(
                 displayedFolderIds: [MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")],
-                filterUnread: false, filterLabelIds: [], mode: .triage, targetCount: 3, beforeDate: nil
+                filterUnread: false, filterLabelIds: [], filterLabelAccountId: "acc1",
+                mode: .triage, targetCount: 3, beforeDate: nil
             )
             let composed = InboxListComposer.compose(ComposeInputs(
                 durable: durable, pinned: [], staged: [], stagedResolutions: [:], overlay: [:], query: query
@@ -1727,10 +1779,93 @@ struct InboxComposeScenarioTests {
         }
     }
 
+    /// Round-51 audit. `applyOverlay` set `actionTag` from the overlay but left
+    /// `tagSortOrder` at whatever the durable row carried. The two are not
+    /// independent: `tagSortOrder` is a DERIVED mirror of `actionTag`
+    /// (`?.sortOrder ?? 99`) that exists solely so triage can sort by tag without
+    /// re-deriving it per comparison — every writer of one writes the other
+    /// (`optimisticMoveToFolder`'s inbox-exit clear, durable return writes,
+    /// `SyncEngineMaintenance.sweepStaleActionTags`). Only the
+    /// overlay set one without the other.
+    ///
+    /// Consequence: in TRIAGE (sorted by `tagSortOrder` ascending, then date
+    /// descending) an overlaid tag rendered its new badge but sorted at its OLD
+    /// priority — so an optimistically-tagged or overlay-pinned row displayed
+    /// `.reply` while sitting in the untagged group at the bottom, until an
+    /// unrelated reload re-read the durable row and re-derived the mirror.
+    ///
+    /// The fixture makes the two orderings disagree: A is OLDER than B, so a
+    /// stale `tagSortOrder` (both 99) ties the first key and date puts B first.
+    /// Only a re-derived mirror (.reply = 0) can lift A above B.
+    @Test("compose: an overlay that changes actionTag must RE-DERIVE tagSortOrder — in triage the row sorts into its overlaid tag's group, not the durable row's stale one")
+    func overlayActionTagReDerivesTagSortOrder() {
+        let inboxId = MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")
+        let older = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        let newer = older.addingTimeInterval(3600)
+        // Both durable rows are UNTAGGED — the post-archive/no-tag sentinel.
+        let a = tiedSnapshot(id: "acc1:INBOX:a", date: older, tagSortOrder: 99)
+        let b = tiedSnapshot(id: "acc1:INBOX:b", date: newer, tagSortOrder: 99)
+
+        let query = InboxListQuery(
+            displayedFolderIds: [inboxId],
+            filterUnread: false, filterLabelIds: [], filterLabelAccountId: "acc1",
+            mode: .triage, targetCount: 10, beforeDate: nil
+        )
+        let composed = InboxListComposer.compose(ComposeInputs(
+            durable: [a, b], pinned: [], staged: [], stagedResolutions: [:],
+            overlay: ["acc1:INBOX:a": .init(
+                isRead: nil, folderId: nil, folderPath: nil, isInInbox: nil,
+                isFlagged: nil, actionTag: .some(.reply)
+            )],
+            query: query
+        ))
+
+        #expect(composed.count == 2)
+        guard composed.count == 2 else { return }
+        let rowA = composed.first { $0.id == "acc1:INBOX:a" }
+        #expect(rowA?.actionTag == .reply, "setup: the overlay's tag reaches the snapshot")
+        #expect(rowA?.tagSortOrder == 0,
+                "tagSortOrder must mirror the OVERLAID tag (.reply = 0), not the durable row's cleared sentinel (99)")
+        #expect(composed[0].id == "acc1:INBOX:a",
+                "triage sorts by tagSortOrder first — the overlaid .reply row must lead, even though it is the OLDER of the two; a stale mirror ties the key and lets the newer untagged row win")
+    }
+
+    /// The clear direction of the same mirror: an overlay carrying `.some(nil)`
+    /// (the inbox-exit tag clear that every leaving-the-inbox gesture registers)
+    /// must push the row to the untagged sentinel, not leave it sorting at its
+    /// old tag's priority.
+    @Test("compose: an overlay that CLEARS actionTag (.some(nil)) re-derives tagSortOrder to the 99 sentinel")
+    func overlayActionTagClearReDerivesSentinel() {
+        let inboxId = MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")
+        let now = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        var tagged = tiedSnapshot(id: "acc1:INBOX:t", date: now, tagSortOrder: 0)
+        tagged.actionTag = .reply
+
+        let query = InboxListQuery(
+            displayedFolderIds: [inboxId],
+            filterUnread: false, filterLabelIds: [], filterLabelAccountId: "acc1",
+            mode: .triage, targetCount: 10, beforeDate: nil
+        )
+        let composed = InboxListComposer.compose(ComposeInputs(
+            durable: [tagged], pinned: [], staged: [], stagedResolutions: [:],
+            overlay: ["acc1:INBOX:t": .init(
+                isRead: nil, folderId: nil, folderPath: nil, isInInbox: nil,
+                isFlagged: nil, actionTag: .some(nil)
+            )],
+            query: query
+        ))
+
+        #expect(composed.count == 1)
+        guard composed.count == 1 else { return }
+        #expect(composed[0].actionTag == nil, "setup: the overlay's clear reaches the snapshot")
+        #expect(composed[0].tagSortOrder == 99,
+                "a cleared tag must re-derive the no-tag sentinel — otherwise the row keeps sorting in the .reply group it no longer belongs to")
+    }
+
     // MARK: - G3 in-memory-comparator hardening (DECISIONS.md ADR-IOS-055
     // audit round 3, `DurableIdentityLookup.isSameLogicalMessage`)
 
-    /// A P row (overlay-pinned Archive message, shown via the "undo shape" —
+    /// A P row (overlay-pinned Archive message, shown via a return-move shape —
     /// the shell has ALREADY applied the overlay's folderId onto it) that
     /// shares a raw IMAP UID with a genuinely NEW staged INBOX row, but whose
     /// rfc822 identities are both KNOWN and DISAGREE — proof the two are
@@ -1747,11 +1882,11 @@ struct InboxComposeScenarioTests {
 
         // P row: true durable identity lives in Archive (folderPath "Archive"
         // — its `id` is the Archive-based header id), but the shell has
-        // already applied an undo-restore overlay entry mapping its folderId
+        // already applied a return-move overlay entry mapping its folderId
         // into the displayed inbox set (`ComposeInputs.pinned`'s documented
         // shape).
         var pinnedHeader = MessageHeader(
-            messageId: "101", subject: "Archived, undo-pinned", from: "Sender", fromAddress: "s@example.com",
+            messageId: "101", subject: "Archived, overlay-pinned", from: "Sender", fromAddress: "s@example.com",
             to: "me@example.com", date: SimWorld.baseDate, snippet: "p",
             folderId: inboxFolderId, accountId: "acc1", folderPath: "Archive", isInInbox: true
         )
@@ -1779,7 +1914,7 @@ struct InboxComposeScenarioTests {
 
         let query = InboxListQuery(
             displayedFolderIds: [inboxFolderId], filterUnread: false, filterLabelIds: [],
-            mode: .normal, targetCount: 50, beforeDate: nil
+            filterLabelAccountId: "acc1", mode: .normal, targetCount: 50, beforeDate: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
             durable: [], pinned: [pinnedSnapshot], staged: [stagedRow],

@@ -142,11 +142,11 @@ enum PreviewMocks {
         ]
         // Row 0 → Work; row 1 → Work + Urgent; row 3 → Personal; row 4 → Work.
         let messageLabels: [MessageUserLabel] = [
-            MessageUserLabel(messageId: headers[0].id, userLabelId: "lbl_work"),
-            MessageUserLabel(messageId: headers[1].id, userLabelId: "lbl_work"),
-            MessageUserLabel(messageId: headers[1].id, userLabelId: "lbl_urgent"),
-            MessageUserLabel(messageId: headers[3].id, userLabelId: "lbl_personal"),
-            MessageUserLabel(messageId: headers[4].id, userLabelId: "lbl_work"),
+            MessageUserLabel(messageId: headers[0].id, accountId: account.id, userLabelId: "lbl_work"),
+            MessageUserLabel(messageId: headers[1].id, accountId: account.id, userLabelId: "lbl_work"),
+            MessageUserLabel(messageId: headers[1].id, accountId: account.id, userLabelId: "lbl_urgent"),
+            MessageUserLabel(messageId: headers[3].id, accountId: account.id, userLabelId: "lbl_personal"),
+            MessageUserLabel(messageId: headers[4].id, accountId: account.id, userLabelId: "lbl_work"),
         ]
 
         // Message bodies so MessageDetailView can render full content.

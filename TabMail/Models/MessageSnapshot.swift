@@ -11,6 +11,7 @@ import Foundation
 struct MessageSnapshot: Identifiable, Hashable, Sendable {
     let id: String
     let accountId: String
+    let folderPath: String
     let messageId: String
     let threadId: String?
     // var (not let): reloadMessages' Pass-1 retains an existing NON-EMPTY
@@ -50,6 +51,7 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
     init(from header: MessageHeader, userLabels: [UserLabel] = []) {
         self.id = header.id
         self.accountId = header.accountId
+        self.folderPath = header.folderPath
         self.messageId = header.messageId
         self.threadId = header.threadId
         self.computedThreadId = header.computedThreadId

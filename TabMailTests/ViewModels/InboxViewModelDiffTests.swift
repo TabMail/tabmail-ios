@@ -10,7 +10,7 @@ import GRDB
 /// Tests for diff-based reloadMessages() and rebuildDisplayGroups().
 /// Verifies that background reloads preserve existing message/group identity
 /// (scroll position stability) while correctly reflecting data changes.
-@Suite("InboxViewModel Diff-Based Updates", .serialized)
+@Suite("InboxViewModel Diff-Based Updates", .serialized, .processGlobalState)
 struct InboxViewModelDiffTests {
 
     // MARK: - Helpers
@@ -70,6 +70,7 @@ struct InboxViewModelDiffTests {
             )
             header.computedThreadId = spec.computedThreadId
             header.headerComplete = true  // Required for inbox display (v38 migration gate)
+            header.rfc822MessageId = "<\(spec.messageId)@example.com>"
             try pool.writeWithoutTransaction { db in
                 try header.insert(db)
             }
@@ -814,10 +815,41 @@ struct InboxViewModelDiffTests {
         #expect(vm.loadedMessages[0].id == ids[0])
     }
 
+
+    /// Escaped-write hygiene (ADR-IOS-058 fold-executor timing): the gesture
+    /// paths above enqueue their durable work on `AccountManager.shared`'s
+    /// process-wide FIFO write queue. A synchronous test that returns without
+    /// draining lets that closure execute LATER — against the NEXT test's
+    /// freshly-installed DB, whose rows reuse the same composite ids
+    /// ("acc1:INBOX:m1") — marking them read before that test's own
+    /// assertions run (reproduced 4/4 with paired suite runs, 2026-07-10).
+    /// Every test that calls a VM gesture method MUST await this barrier
+    /// before returning. Mirrors `InboxGestureActionTests.drainWriteQueue`.
+    /// Round-2 audit: a single FIFO enqueue+await only guarantees closures
+    /// already enqueued BEFORE this call have run — it does NOT guarantee the
+    /// journal is empty. Two independently-created Tasks (a gesture site's
+    /// `record()`, which spawns its own fold-executor Task, and this drain
+    /// call) can reach the shared FIFO in EITHER order, so a fold closure the
+    /// gesture just triggered may land AFTER this barrier's no-op closure and
+    /// still be pending when the barrier returns — closing this window is the
+    /// likely fix for the plan's known settle-flake. Loop the barrier until
+    /// the journal reports fully drained (no pending records, no in-flight
+    /// display holds/seqs); bounded so a genuine stuck-drain bug fails the
+    /// test instead of hanging it forever.
+    private func drainWriteQueue() async {
+        var iterations = 0
+        repeat {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+            }
+            iterations += 1
+        } while !AccountManager.shared.intentionJournal.isFullyDrainedForTesting() && iterations < 200
+    }
+
     // MARK: - toggleRead immediate update
 
     @Test("toggleRead updates snapshot isRead immediately")
-    @MainActor func toggleReadImmediate() throws {
+    @MainActor func toggleReadImmediate() async throws {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -842,12 +874,15 @@ struct InboxViewModelDiffTests {
         #expect(vm.displayGroups.count == 1)
         guard vm.displayGroups.count == 1 else { return }
         #expect(vm.displayGroups[0].hasUnread == false)
+    
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     // MARK: - markRead([String]) batch (commit 4d23eef)
 
     @Test("markRead batch flips multiple unread messages in one pass")
-    @MainActor func markReadBatchFlipsMultiple() throws {
+    @MainActor func markReadBatchFlipsMultiple() async throws {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -878,10 +913,13 @@ struct InboxViewModelDiffTests {
         #expect(vm.displayGroups.count == 1)
         guard vm.displayGroups.count == 1 else { return }
         #expect(vm.displayGroups[0].hasUnread == false)
+    
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     @Test("markRead batch skips already-read members (filters to unread)")
-    @MainActor func markReadBatchSkipsAlreadyRead() throws {
+    @MainActor func markReadBatchSkipsAlreadyRead() async throws {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -894,7 +932,7 @@ struct InboxViewModelDiffTests {
         ], folderId: folder.id)
 
         // Pre-mark m1 read so the batch sees a mixed set.
-        try pool.writeWithoutTransaction { db in
+        try await pool.writeWithoutTransaction { db in
             try db.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [ids[0]])
         }
 
@@ -915,10 +953,13 @@ struct InboxViewModelDiffTests {
         let m2After = vm.loadedMessages.first { $0.id == ids[1] }
         #expect(m1After?.isRead == true)  // unchanged
         #expect(m2After?.isRead == true)  // flipped
+    
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     @Test("markRead batch is a no-op when all messages already read")
-    @MainActor func markReadBatchNoOpAllRead() throws {
+    @MainActor func markReadBatchNoOpAllRead() async throws {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -929,7 +970,7 @@ struct InboxViewModelDiffTests {
             ("m1", "Re: thread", baseDate, "thread-1", "alice@test.com"),
             ("m2", "Re: thread", baseDate.addingTimeInterval(60), "thread-1", "bob@test.com"),
         ], folderId: folder.id)
-        try pool.writeWithoutTransaction { db in
+        try await pool.writeWithoutTransaction { db in
             try db.execute(sql: "UPDATE messageHeader SET isRead = 1", arguments: [])
         }
 
@@ -945,10 +986,13 @@ struct InboxViewModelDiffTests {
 
         #expect(vm.loadedMessages.map(\.id) == snapshotIds)
         for m in vm.loadedMessages { #expect(m.isRead == true) }
+    
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     @Test("markRead batch ignores unknown ids without crashing")
-    @MainActor func markReadBatchIgnoresUnknownIds() throws {
+    @MainActor func markReadBatchIgnoresUnknownIds() async throws {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -970,6 +1014,9 @@ struct InboxViewModelDiffTests {
         #expect(vm.loadedMessages.count == 1)
         guard vm.loadedMessages.count == 1 else { return }
         #expect(vm.loadedMessages[0].isRead == true)
+    
+        // Drain the FIFO before returning — see drainWriteQueue doc.
+        await drainWriteQueue()
     }
 
     // MARK: - Pagination + reload interaction

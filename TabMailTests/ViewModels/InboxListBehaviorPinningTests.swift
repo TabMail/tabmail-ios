@@ -11,13 +11,11 @@ import Testing
 /// phases item 1): a table-driven pinning suite over TODAY'S observable
 /// inbox-list behavior, exercised entirely through `InboxViewModel`'s public
 /// surface (`insertStagedRows` / `reloadMessages` / `resetMessages` /
-/// `insertUndoneMessages` / `loadMoreMessages` / `lookupMessage` +
+/// `loadMoreMessages` / `lookupMessage` +
 /// `loadedMessages`/`displayGroups`) — never internals. This is the safety
 /// net for the `InboxListComposer` refactor (§2.1). Phase 3 switched the
-/// three fetch sites to the reader (undo-survives-reload, test 8, is live).
-/// Phase 4 closes the last transitional gap: `insertStagedRows` /
-/// `insertUndoneMessages` now carry the same label-filter treatment as the
-/// reader (§2.2), so test 10's transitional divergence is gone — event
+/// three fetch sites to the reader. Phase 4 closes the last transitional gap:
+/// event inserts carry the same label-filter treatment as the reader (§2.2), so
 /// inserts stay pure latency optimizations that never insert a row the
 /// reader would reject. Phase 5 (§3 kill list) deleted the Pass-1 guard/
 /// tombstone/AI-carry-over machinery `reloadMessages` used to own — tests
@@ -31,7 +29,7 @@ import Testing
 /// overlay and `NSEDataBridge.latestStagedRows` — both process-wide globals —
 /// so tests must not interleave (mirrors `InboxStagedRowGuardTests` /
 /// `NSEStaleStagedRowInvalidationTests`).
-@Suite("Inbox list behavior pinning (PLAN_INBOX_UNIFIED_READ Phase 1)", .serialized)
+@Suite("Inbox list behavior pinning (PLAN_INBOX_UNIFIED_READ Phase 1)", .serialized, .processGlobalState)
 @MainActor
 struct InboxListBehaviorPinningTests {
 
@@ -108,8 +106,7 @@ struct InboxListBehaviorPinningTests {
     /// clear any overlay entries a test leaves behind (mirrors
     /// InboxStagedRowGuardTests.swift's `clearOverlay`).
     private func clearOverlay() {
-        let snapshot = AccountManager.shared.snapshotOverlay()
-        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+        AccountManager.shared.intentionJournal.resetForTesting()
     }
 
     /// `NSEDataBridge.latestStagedRows` is a process-wide Mutex snapshot —
@@ -205,11 +202,38 @@ struct InboxListBehaviorPinningTests {
 
         // Mirrors MessageDetailViewModel.markReadOnOpenIfNeeded: an isRead-only
         // overlay mutation, no folder change.
-        AccountManager.shared.registerMutation(id: id, mutation: .init(isRead: true))
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: id, mutation: .init(isRead: true))
 
         await vm.reloadMessages()
         #expect(vm.loadedMessages.count == 1)
         #expect(vm.loadedMessages.contains { $0.id == id })
+    }
+
+    @Test("insertStagedRows: an overlay actionTag re-derives tagSortOrder instead of keeping the staged tag's stale sort group")
+    func stagedInsertOverlayTagDerivesSortOrder() async throws {
+        let (_, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let vm = InboxViewModel(folders: [inbox])
+        let row = makeStagedRow(messageId: "m-overlay-tag", actionTag: ActionTag.archive.rawValue)
+        NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
+            id: row.headerId,
+            mutation: .init(actionTag: .some(.reply))
+        )
+
+        vm.insertStagedRows([row])
+
+        #expect(vm.loadedMessages.count == 1)
+        guard vm.loadedMessages.count == 1 else { return }
+        #expect(vm.loadedMessages[0].actionTag == .reply)
+        #expect(vm.loadedMessages[0].tagSortOrder == ActionTag.reply.sortOrder,
+                "the overlay changed archive to reply, so the staged archive sort order must not survive")
     }
 
     // MARK: - 4. Folder-move overlay releases the row; once the durable write
@@ -236,7 +260,7 @@ struct InboxListBehaviorPinningTests {
 
         // User archives the just-pushed (not yet durable) row: overlay
         // registered optimistically (mirrors InboxViewModel.archive()).
-        AccountManager.shared.registerMutation(id: id, mutation: .init(folderId: archive.id))
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(id: id, mutation: .init(folderId: archive.id))
         await vm.reloadMessages()
         #expect(vm.loadedMessages.isEmpty)
 
@@ -247,18 +271,22 @@ struct InboxListBehaviorPinningTests {
 
         // The archive's durable write lands (mirrors `manager.move` completing
         // — the real timeline's `optimisticWrite` step), THEN the overlay
-        // drains (`AccountManager.removeOverlayEntries`, called after the
-        // queued PendingOperation completes) — the real bug's timeline: the
-        // archive's overlay entry drains long before a LATER push re-stages
-        // the message. NOTE: the durable copy's id embeds the Archive
-        // folderPath (`acc1:Archive:m-moved`), NOT the staged row's INBOX id —
-        // the reader links the two via the merge's (accountId, messageId)
-        // identity lookup (`DurableIdentityLookup`), never id equality; this
-        // id skew is exactly the stale-by-move shape.
+        // drains (the journal's derived-overlay entry clears once the fold
+        // executor completes, called after the queued PendingOperation
+        // completes) — the real bug's timeline: the archive's overlay entry
+        // drains long before a LATER push re-stages the message. NOTE: the
+        // durable copy's id embeds the Archive folderPath
+        // (`acc1:Archive:m-moved`), NOT the staged row's INBOX id — the reader
+        // links the two via the merge's (accountId, messageId) identity lookup
+        // (`DurableIdentityLookup`), never id equality; this id skew is
+        // exactly the stale-by-move shape.
         let archived = makeDurableHeader(folder: archive, messageId: "m-moved", isInInbox: false)
         #expect(archived.id != id)
         try await pool.writeWithoutTransaction { db in try archived.insert(db) }
-        AccountManager.shared.removeOverlayEntries(ids: [id])
+        // Simulate the overlay drain: this test's only seeded entry is `id`'s
+        // folderId mutation above, so a full journal reset is equivalent to
+        // clearing that one entry (mirrors the old targeted removeOverlayEntries).
+        AccountManager.shared.intentionJournal.resetForTesting()
 
         // Post-drain re-insert attempt: `insertStagedRows` is a ZERO-I/O path
         // by contract (§2.2) — it never consults durable state, so nothing
@@ -383,82 +411,6 @@ struct InboxListBehaviorPinningTests {
         #expect(vm.loadedMessages[0].actionTag == .archive)
         #expect(vm.loadedMessages[0].tagSortOrder == ActionTag.archive.sortOrder)
         #expect(vm.loadedMessages[0].summaryBlurb == "real blurb")
-    }
-
-    // MARK: - 7. Undo reappears
-
-    @Test("undo: overlay + insertUndoneMessages makes an archived durable row reappear in the inbox list")
-    func undoReappearsViaOverlayAndInsertUndoneMessages() async throws {
-        let (pool, inbox, archive, dir, previous) = try makeTestDB()
-        defer {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-            clearOverlay(); resetStagedGlobal()
-        }
-        clearOverlay(); resetStagedGlobal()
-
-        // Durable header currently in Archive (the "already moved" state).
-        let archived = makeDurableHeader(folder: archive, messageId: "m-undo", isInInbox: false)
-        try await pool.writeWithoutTransaction { db in try archived.insert(db) }
-        let id = archived.id
-
-        // VM only displays the inbox folder.
-        let vm = InboxViewModel(folders: [inbox])
-        #expect(vm.loadedMessages.isEmpty)
-
-        // Mirror UndoService.undo()'s .move case EXACTLY (UndoService.swift
-        // ~129-133): register the overlay BEFORE the deferred DB write, with
-        // the pre-move isInInbox value (true — the message was in inbox
-        // before being archived).
-        AccountManager.shared.registerMutation(id: id, mutation: .init(
-            folderId: inbox.id, folderPath: inbox.path, isInInbox: true
-        ))
-
-        vm.insertUndoneMessages([id])
-        #expect(vm.loadedMessages.count == 1)
-        #expect(vm.loadedMessages.first?.id == id)
-    }
-
-    // MARK: - 8. Undo survives an immediate reload — CLOSED by the Phase 3 P-step
-
-    // Verified-failing pre-Phase-3 (2026-07-09): both expectations failed,
-    // loadedMessages.count → 0 after reloadMessages() (the latent undo hole —
-    // insertUndoneMessages had no reload-survival guarantee). PLAN_INBOX_UNIFIED_READ.md
-    // §2.1 step 2's P-step (InboxListReader's overlay-pinned-row fetch) closes
-    // it: every reload now re-fetches an undone-but-not-yet-durable row by id
-    // as long as its overlay folderId mutation points into the displayed set.
-    @Test("undo survives an immediate reloadMessages()")
-    func undoSurvivesImmediateReload() async throws {
-        let (pool, inbox, archive, dir, previous) = try makeTestDB()
-        defer {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-            clearOverlay(); resetStagedGlobal()
-        }
-        clearOverlay(); resetStagedGlobal()
-
-        let archived = makeDurableHeader(folder: archive, messageId: "m-undo-reload", isInInbox: false)
-        try await pool.writeWithoutTransaction { db in try archived.insert(db) }
-        let id = archived.id
-
-        let vm = InboxViewModel(folders: [inbox])
-        AccountManager.shared.registerMutation(id: id, mutation: .init(
-            folderId: inbox.id, folderPath: inbox.path, isInInbox: true
-        ))
-        vm.insertUndoneMessages([id])
-        #expect(vm.loadedMessages.count == 1)
-
-        // The deferred DB restore write has NOT landed (mirrors the real
-        // timeline: UndoService registers the overlay synchronously, then
-        // enqueues the write asynchronously) — the durable header is still
-        // physically in Archive. A plain folder-scoped D query would miss
-        // this row entirely; the reader's P-step (§2.1 step 2) is what closes
-        // the hole — it fetches overlay-pinned rows (an overlay `folderId`
-        // pointing INTO the displayed set, durable row elsewhere) by id on
-        // EVERY read, independent of any staged-row bookkeeping.
-        await vm.reloadMessages()
-        #expect(vm.loadedMessages.count == 1)
-        #expect(vm.loadedMessages.contains { $0.id == id })
     }
 
     // MARK: - 9. Unread filter
@@ -697,57 +649,6 @@ struct InboxListBehaviorPinningTests {
         vm.resetMessages()
         #expect(vm.loadedMessages.count == 1)
         #expect(vm.loadedMessages.first?.messageId == "m-reseed")
-    }
-
-    // MARK: - 14. Undo + label filter — insertUndoneMessages honors the active label filter
-
-    // `insertUndoneMessages` is NOT the zero-I/O staged path — it already
-    // reads the durable header by id, by design (PLAN_INBOX_UNIFIED_READ.md
-    // §5 Phase 4). Loading real labels alongside that fetch (via
-    // `UserLabelStore.loadLabels`, the same helper `InboxListReader`'s P-step
-    // uses for its "undo shape") lets it honor an active label filter with
-    // full fidelity instead of unconditionally dropping every undone row —
-    // matching what the reader would show on the very next reload.
-    @Test("undo + label filter: insertUndoneMessages includes a genuinely-labeled undone row and excludes an unlabeled one")
-    func insertUndoneMessagesHonorsLabelFilter() async throws {
-        let (pool, inbox, archive, dir, previous) = try makeTestDB()
-        defer {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-            clearOverlay(); resetStagedGlobal()
-        }
-        clearOverlay(); resetStagedGlobal()
-
-        // Two durable headers in Archive (the "already moved" state) — one
-        // carries the filtered label, the other carries none.
-        let labeled = makeDurableHeader(folder: archive, messageId: "m-undo-labeled", isInInbox: false)
-        let unlabeled = makeDurableHeader(folder: archive, messageId: "m-undo-unlabeled", isInInbox: false)
-        try await pool.writeWithoutTransaction { db in
-            let l = labeled; try l.insert(db)
-            let u = unlabeled; try u.insert(db)
-            try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
-        }
-
-        let vm = InboxViewModel(folders: [inbox])
-        vm.filterLabelIds = ["label-x"]
-
-        // Mirror UndoService.undo()'s .move case for BOTH messages: overlay
-        // registered before the deferred DB restore write.
-        AccountManager.shared.registerMutation(id: labeled.id, mutation: .init(
-            folderId: inbox.id, folderPath: inbox.path, isInInbox: true
-        ))
-        AccountManager.shared.registerMutation(id: unlabeled.id, mutation: .init(
-            folderId: inbox.id, folderPath: inbox.path, isInInbox: true
-        ))
-
-        vm.insertUndoneMessages([labeled.id, unlabeled.id])
-
-        #expect(vm.loadedMessages.count == 1)
-        guard vm.loadedMessages.count == 1 else { return }
-        #expect(vm.loadedMessages[0].id == labeled.id)
-        #expect(vm.loadedMessages[0].userLabels.map(\.id) == ["label-x"])
-        #expect(!vm.loadedMessages.contains { $0.id == unlabeled.id })
     }
 
     // MARK: - 15. F2 audit: loadMoreMessages excludeIds ordering, 2 folders,

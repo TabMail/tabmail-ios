@@ -14,7 +14,7 @@ import Testing
 /// `.serialized`: `mergeCommitBuffersDuringPreviewFreeze` flips the process-
 /// GLOBAL `PreviewFreezeGate.shared` — a sibling test's `.nseMergeDidCommit`
 /// handler observing the frozen gate would buffer its refresh and flake.
-@Suite("MessageDetail staged-row fallback (ADR-IOS-049)", .serialized)
+@Suite("MessageDetail staged-row fallback (ADR-IOS-049)", .serialized, .processGlobalState)
 struct MessageDetailStagedFallbackTests {
 
     /// Sentinel `object` for test posts of `.nseMergeDidCommit`. Production
@@ -479,7 +479,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
             try? FileManager.default.removeItem(at: dir)
         }
         let focused = stagedRow(messageId: "m-reply-pending", references: [parent.rfc822MessageId!])
@@ -498,8 +498,9 @@ struct MessageDetailStagedFallbackTests {
         // User archives the bubble: overlay entry + in-place optimistic move
         // (the exact archiveMessage sequence); the IMAP drain is still
         // pending, so the DB row keeps the OLD folder.
-        AccountManager.shared.registerMutation(
-            id: parent.headerId, mutation: .init(folderId: "acc1:Archive")
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
+            id: parent.headerId,
+            mutation: .init(folderId: "acc1:Archive", actionTag: .some(.reply))
         )
         vm.updateThreadMessageFolder(
             vm.threadMessages[0], newFolderPath: "Archive", newFolderId: "acc1:Archive"
@@ -509,11 +510,17 @@ struct MessageDetailStagedFallbackTests {
         // optimistically-mutated bubble, NOT snap it back to the stale DB row
         // (folder fields are deliberately absent from applyOverlay).
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
-        try await Task.sleep(for: .milliseconds(400))
+        try await waitUntil {
+            vm.threadMessages.first?.actionTag == .reply
+                && vm.threadMessages.first?.tagSortOrder == ActionTag.reply.sortOrder
+        }
         #expect(vm.threadMessages.count == 1)
         guard vm.threadMessages.count == 1 else { return }
         #expect(vm.threadMessages[0].folderPath == "Archive")
         #expect(vm.threadMessages[0].isInInbox == false)
+        #expect(vm.threadMessages[0].actionTag == .reply)
+        #expect(vm.threadMessages[0].tagSortOrder == ActionTag.reply.sortOrder,
+                "the thread-array overlay re-read must derive tagSortOrder from its optimistic tag")
     }
 
     @MainActor
@@ -524,7 +531,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
             try? FileManager.default.removeItem(at: dir)
         }
         let focused = stagedRow(messageId: "m-reply-airev", references: [parent.rfc822MessageId!])
@@ -543,7 +550,7 @@ struct MessageDetailStagedFallbackTests {
         // User deletes the bubble in place (overlay + in-place move, the
         // deleteMessage sequence); the drain is pending, so the DB row still
         // shows the OLD folder.
-        AccountManager.shared.registerMutation(
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
             id: parent.headerId, mutation: .init(folderId: "acc1:Trash")
         )
         vm.updateThreadMessageFolder(
@@ -569,17 +576,17 @@ struct MessageDetailStagedFallbackTests {
     }
 
     @MainActor
-    @Test("undo heals a locally-moved bubble: overlay drained → fresh DB row wins, pin cleared")
-    func undoHealsLocallyMovedBubble() async throws {
+    @Test("a completed local-move pin yields to fresh DB truth after the overlay drains")
+    func completedLocalMovePinYieldsToDatabase() async throws {
         let (pool, dir, previous) = try makePool()
-        let parent = stagedRow(messageId: "m-parent-undo")
+        let parent = stagedRow(messageId: "m-parent-pin-release")
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
             try? FileManager.default.removeItem(at: dir)
         }
-        let focused = stagedRow(messageId: "m-reply-undo", references: [parent.rfc822MessageId!])
+        let focused = stagedRow(messageId: "m-reply-pin-release", references: [parent.rfc822MessageId!])
         NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
         try insertDurableHeader(parent.toMessageHeader(), into: pool)
 
@@ -592,10 +599,9 @@ struct MessageDetailStagedFallbackTests {
         #expect(vm.threadMessages.count == 1)
         guard vm.threadMessages.count == 1 else { return }
 
-        // Archive the bubble in place; the move op completes (continuation
-        // un-pins), then the user UNDOES it: the overlay entry is removed and
-        // the DB row (never moved in this test) is the INBOX truth again.
-        AccountManager.shared.registerMutation(
+        // Move the bubble in place, then complete its local-move pin and drain
+        // the display overlay. The durable INBOX row is authoritative again.
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
             id: parent.headerId, mutation: .init(folderId: "acc1:Archive")
         )
         vm.updateThreadMessageFolder(
@@ -603,10 +609,10 @@ struct MessageDetailStagedFallbackTests {
         )
         #expect(vm.threadMessages[0].folderPath == "Archive")
         vm.completeLocalMove(parent.headerId)
-        AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+        AccountManager.shared.intentionJournal.resetForTesting()
 
-        // The next merge reload must heal the card back to the DB truth —
-        // an insert-only pin would show "Archive" forever after an undo.
+        // The next merge reload must heal the card back to DB truth; a stale
+        // insert-only pin would otherwise show "Archive" forever.
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
         try await waitUntil { vm.threadMessages.first?.folderPath == "INBOX" }
         #expect(vm.threadMessages.count == 1)
@@ -623,7 +629,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
             try? FileManager.default.removeItem(at: dir)
         }
         let focused = stagedRow(messageId: "m-reply-overlap", references: [parent.rfc822MessageId!])
@@ -641,13 +647,13 @@ struct MessageDetailStagedFallbackTests {
 
         // Archive the card, then immediately delete the (still visible,
         // still actionable) same card: two pins on one id.
-        AccountManager.shared.registerMutation(
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
             id: parent.headerId, mutation: .init(folderId: "acc1:Archive")
         )
         vm.updateThreadMessageFolder(
             vm.threadMessages[0], newFolderPath: "Archive", newFolderId: "acc1:Archive"
         )
-        AccountManager.shared.registerMutation(
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
             id: parent.headerId, mutation: .init(folderId: "acc1:Trash")
         )
         vm.updateThreadMessageFolder(
@@ -686,7 +692,7 @@ struct MessageDetailStagedFallbackTests {
                 try? FileManager.default.removeItem(at: dir)
             }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
         }
         try await pool.write { db in
             try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
@@ -743,6 +749,51 @@ struct MessageDetailStagedFallbackTests {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
         }
+
+        // ── Pin RELEASE through the real chain (ADR-IOS-058) ──
+        // `recordMove`'s unstructured Task awaits its own record's seq
+        // (`intentionJournal.awaitCompletion`) and only THEN calls
+        // `completeLocalMove` — prove that chain actually released the pin
+        // (no manual `completeLocalMove` here). First, a journal-aware drain:
+        // the single barrier above only covers closures already enqueued, and
+        // the archive's fold-enqueue Task has no arrival-order guarantee
+        // (round-2 audit — same loop as InboxGestureActionTests.drainWriteQueue).
+        var drainIterations = 0
+        repeat {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+            }
+            drainIterations += 1
+        } while !AccountManager.shared.intentionJournal.isFullyDrainedForTesting() && drainIterations < 200
+
+        // Out-of-band row truth change (another client moved it back to the
+        // inbox), then merge-commit reloads. With the pin RELEASED, the
+        // reload follows DB truth and the card heals to INBOX (the
+        // completedLocalMovePinYieldsToDatabase contract); a pin the real
+        // seq→awaitCompletion→completeLocalMove chain failed to release
+        // keeps the stale optimistic "Archive" card forever.
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderId = ?, folderPath = ?, isInInbox = 1 WHERE id = ?",
+                arguments: ["acc1:INBOX", "INBOX", parent.headerId]
+            )
+        }
+        // Bounded poll (5s deadline): completeLocalMove lands on its own
+        // MainActor Task after the fold completes, so re-post the merge
+        // signal each outer tick until a reload runs UNPINNED.
+        var followedTruth = false
+        for _ in 0..<50 where !followedTruth { // 50 × (10 × 10ms) = 5s
+            NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+            for _ in 0..<10 where !followedTruth {
+                try await Task.sleep(for: .milliseconds(10))
+                followedTruth = vm.threadMessages.first?.folderPath == "INBOX"
+            }
+        }
+        #expect(followedTruth, "the detail card must follow DB truth once the move's fold completed — the pin was released by the real record-seq → awaitCompletion → completeLocalMove chain, not left held")
+        #expect(vm.threadMessages.count == 1)
+        if vm.threadMessages.count == 1 {
+            #expect(vm.threadMessages[0].isInInbox == true)
+        }
     }
 
     @MainActor
@@ -753,7 +804,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
             try? FileManager.default.removeItem(at: dir)
         }
         let focused = stagedRow(messageId: "m-reply-sibling", references: [parent.rfc822MessageId!])
@@ -773,13 +824,13 @@ struct MessageDetailStagedFallbackTests {
         // earlier (e.g. a mark-read) drains first: its removeOverlayEntries
         // wipes the whole coalesced entry while the move op has NOT executed —
         // the DB row still shows INBOX.
-        AccountManager.shared.registerMutation(
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
             id: parent.headerId, mutation: .init(folderId: "acc1:Archive")
         )
         vm.updateThreadMessageFolder(
             vm.threadMessages[0], newFolderPath: "Archive", newFolderId: "acc1:Archive"
         )
-        AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+        AccountManager.shared.intentionJournal.resetForTesting()
 
         // A merge reload in that gap must keep the moved card — an overlay-
         // keyed pin window ended here and snapped the card back to INBOX.
@@ -799,7 +850,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+            AccountManager.shared.intentionJournal.resetForTesting()
             try? FileManager.default.removeItem(at: dir)
         }
         // ThreadDetection excludes by folder ROLE — the Trash folder row must
@@ -822,7 +873,7 @@ struct MessageDetailStagedFallbackTests {
 
         // Delete the bubble in place, then the drain lands: the optimistic
         // local write moves the DB row to Trash and the overlay entry drains.
-        AccountManager.shared.registerMutation(
+        AccountManager.shared.intentionJournal.seedDisplayForTesting(
             id: parent.headerId, mutation: .init(folderId: "acc1:Trash")
         )
         vm.updateThreadMessageFolder(
@@ -834,7 +885,7 @@ struct MessageDetailStagedFallbackTests {
                 arguments: ["acc1:Trash", "Trash", parent.headerId]
             )
         }
-        AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
+        AccountManager.shared.intentionJournal.resetForTesting()
         vm.completeLocalMove(parent.headerId)
 
         // Post-completion the pin is gone: ThreadDetection's Trash exclusion

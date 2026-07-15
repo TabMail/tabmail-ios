@@ -829,6 +829,13 @@ extension Notification.Name {
     static let unreadCountsDidChange = Notification.Name("unreadCountsDidChange")
     /// Posted when inbox message list data changes (new headers from sync/backfill).
     /// InboxViewModel reloads message list. NavigationStore refreshes folders.
+    /// `object` is `nil` for the routine posts scattered across the codebase.
+    /// The ONE exception: `AccountManager.undoMove`'s (ADR-IOS-060) corrective
+    /// re-post (fired when a member could not be resolved — stale Undo)
+    /// carries `object: [String]` — the refused members' pre-move composite
+    /// ids — so a caller (or a test) can distinguish that specific corrective
+    /// post from the many unconditional ones. No current observer reads
+    /// `object` on this notification, so the non-nil payload is additive.
     static let inboxDataDidChange = Notification.Name("inboxDataDidChange")
     /// `userInfo` key on `.inboxDataDidChange`. When `true`, the inbox reload
     /// runs IMMEDIATELY, bypassing the 500ms coalescing debounce that the noisy

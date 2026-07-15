@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
-import GRDB
 
 /// Horizontally scrollable row of active filter chips, shown above the bottom toolbar.
 ///
@@ -100,10 +99,7 @@ struct FilterChipBar: View {
         }
         let ids = filterLabelIds
         resolvedLabels = (try? AppDatabase.dbPool.read { db in
-            try UserLabel
-                .filter(ids.contains(Column("id")))
-                .order(Column("name").collating(.localizedCaseInsensitiveCompare))
-                .fetchAll(db)
+            try UserLabelStore.labels(ids: ids, accountId: accountId, in: db)
                 .map { (id: $0.id, name: $0.name) }
         }) ?? []
     }

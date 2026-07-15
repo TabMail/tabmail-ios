@@ -14,6 +14,7 @@ struct UserLabelMenuView: View {
     @State private var sortedLabels: [UserLabel] = []
     /// Applied label IDs — mutated optimistically on toggle, drives checkmark display.
     @State private var appliedIds: Set<String> = []
+    @State private var supportsRemoteUserLabels = false
     @State private var isCreating = false
     @Environment(\.dismiss) private var dismiss
 
@@ -21,7 +22,7 @@ struct UserLabelMenuView: View {
         NavigationStack {
             List {
                 // Search / create field
-                if !searchText.isEmpty && !matchesExisting {
+                if supportsRemoteUserLabels && !searchText.isEmpty && !matchesExisting {
                     createRow
                 }
 
@@ -42,6 +43,7 @@ struct UserLabelMenuView: View {
                 }
             }
             .searchable(text: $searchText, prompt: "Search or create label...")
+            .disabled(!supportsRemoteUserLabels)
             .navigationTitle("Labels")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -103,23 +105,29 @@ struct UserLabelMenuView: View {
         do {
             let accountId = messageSnapshot.accountId
             let messageId = messageSnapshot.id
-            let inboxFolderIds = try AppDatabase.dbPool.read { db in
-                try String.fetchAll(db,
+            let state = try AppDatabase.dbPool.read { db -> (
+                supportsRemoteUserLabels: Bool,
+                entries: [(label: UserLabel, isApplied: Bool)]
+            ) in
+                guard let account = try Account.fetchOne(db, key: accountId),
+                      account.provider.supportsRemoteUserLabels
+                else { return (false, []) }
+                let inboxFolderIds = try String.fetchAll(db,
                     Folder.select(Column("id"))
                         .filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue)
                 )
-            }
-            let entries = try AppDatabase.dbPool.read { db in
-                try UserLabelStore.labelsSortedForMenu(
+                let entries = try UserLabelStore.labelsSortedForMenu(
                     accountId: accountId,
                     messageId: messageId,
                     inboxFolderIds: inboxFolderIds,
                     in: db
                 )
+                return (true, entries)
             }
+            supportsRemoteUserLabels = state.supportsRemoteUserLabels
             // Sort order set once — stable during session
-            sortedLabels = entries.map(\.label)
-            appliedIds = Set(entries.filter(\.isApplied).map(\.label.id))
+            sortedLabels = state.entries.map(\.label)
+            appliedIds = Set(state.entries.filter(\.isApplied).map(\.label.id))
         } catch {
             print("[UserLabelMenu] Failed to load labels: \(error)")
         }
@@ -128,6 +136,14 @@ struct UserLabelMenuView: View {
     // MARK: - Actions
 
     private func toggleLabel(_ label: UserLabel) {
+        guard supportsRemoteUserLabels,
+              !label.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              MessageIdentity.durableActionAddress(
+            accountId: messageSnapshot.accountId,
+            folderPath: messageSnapshot.folderPath,
+            rfc822MessageId: messageSnapshot.rfc822MessageId
+        ) != nil
+        else { return }
         let wasApplied = appliedIds.contains(label.id)
         // Optimistic UI: flip checkmark immediately, no re-sort
         if wasApplied {
@@ -137,69 +153,114 @@ struct UserLabelMenuView: View {
         }
         // DB write + queue drain in background
         Task {
+            let persisted: Bool
             if wasApplied {
-                await removeLabel(label)
+                persisted = await removeLabel(label)
             } else {
-                await applyLabel(label)
+                persisted = await applyLabel(label)
+            }
+            guard !persisted else { return }
+            if wasApplied {
+                appliedIds.insert(label.id)
+            } else {
+                appliedIds.remove(label.id)
             }
         }
     }
 
-    /// Look up the real folder path from DB (MessageSnapshot doesn't carry folderPath).
-    private func resolvedFolderPath() -> String {
-        (try? AppDatabase.dbPool.read { db in
-            try MessageHeader.fetchOne(db, key: messageSnapshot.id)?.folderPath
-        }) ?? "INBOX"
-    }
-
-    private func applyLabel(_ label: UserLabel) async {
-        let folderPath = resolvedFolderPath()
+    /// Internal so tests can exercise the real transaction/admission path.
+    /// UI callers still enter through `toggleLabel`.
+    func applyLabel(_ label: UserLabel) async -> Bool {
         do {
-            try await AppDatabase.dbPool.write { db in
-                try MessageUserLabel(messageId: messageSnapshot.id, userLabelId: label.id)
-                    .insert(db, onConflict: .ignore)
-                let op = PendingOperation(
-                    type: .addUserLabel,
-                    messageIds: [messageSnapshot.stableId],
-                    accountId: messageSnapshot.accountId,
-                    folderPath: folderPath,
+            let persisted = try await AccountManager.shared.retryGatedQueueWrite(
+                AppDatabase.dbPool, label: "applyLabel", maxAttempts: 1
+            ) { db -> Bool in
+                guard let header = try MessageHeader.fetchOne(db, key: messageSnapshot.id),
+                      let account = try Account.fetchOne(db, key: header.accountId),
+                      account.provider.supportsRemoteUserLabels,
+                      let address = MessageIdentity.durableActionAddress(
+                          accountId: header.accountId,
+                          folderPath: header.folderPath,
+                          rfc822MessageId: header.rfc822MessageId
+                      ),
+                      label.accountId == address.accountId,
+                      let op = PendingOperation.durableMessageAction(
+                          type: .addUserLabel,
+                          messageIds: [address.rfc822MessageId],
+                          accountId: address.accountId,
+                          folderPath: address.folderPath,
+                          userLabelId: label.id
+                      )
+                else { return false }
+                try MessageUserLabel(
+                    messageId: messageSnapshot.id,
+                    accountId: address.accountId,
                     userLabelId: label.id
                 )
+                    .insert(db, onConflict: .ignore)
                 try op.insert(db)
+                return true
             }
+            guard persisted else { return false }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             await AccountManager.shared.drainPendingQueue()
+            return true
         } catch {
             print("[UserLabelMenu] Apply label failed: \(error)")
+            return false
         }
     }
 
-    private func removeLabel(_ label: UserLabel) async {
-        let folderPath = resolvedFolderPath()
+    /// Internal so tests can exercise the real transaction/admission path.
+    /// UI callers still enter through `toggleLabel`.
+    func removeLabel(_ label: UserLabel) async -> Bool {
         do {
-            try await AppDatabase.dbPool.write { db in
+            let persisted = try await AccountManager.shared.retryGatedQueueWrite(
+                AppDatabase.dbPool, label: "removeLabel", maxAttempts: 1
+            ) { db -> Bool in
+                guard let header = try MessageHeader.fetchOne(db, key: messageSnapshot.id),
+                      let account = try Account.fetchOne(db, key: header.accountId),
+                      account.provider.supportsRemoteUserLabels,
+                      let address = MessageIdentity.durableActionAddress(
+                          accountId: header.accountId,
+                          folderPath: header.folderPath,
+                          rfc822MessageId: header.rfc822MessageId
+                      ),
+                      label.accountId == address.accountId,
+                      let op = PendingOperation.durableMessageAction(
+                          type: .removeUserLabel,
+                          messageIds: [address.rfc822MessageId],
+                          accountId: address.accountId,
+                          folderPath: address.folderPath,
+                          userLabelId: label.id
+                      )
+                else { return false }
                 try MessageUserLabel
                     .filter(Column("messageId") == messageSnapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
-                let op = PendingOperation(
-                    type: .removeUserLabel,
-                    messageIds: [messageSnapshot.stableId],
-                    accountId: messageSnapshot.accountId,
-                    folderPath: folderPath,
-                    userLabelId: label.id
-                )
                 try op.insert(db)
+                return true
             }
+            guard persisted else { return false }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             await AccountManager.shared.drainPendingQueue()
+            return true
         } catch {
             print("[UserLabelMenu] Remove label failed: \(error)")
+            return false
         }
     }
 
     private func createAndApply() async {
         let name = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !UserLabelStore.isReservedName(name) else { return }
+        guard !name.isEmpty,
+              !UserLabelStore.isReservedName(name),
+              MessageIdentity.durableActionAddress(
+                  accountId: messageSnapshot.accountId,
+                  folderPath: messageSnapshot.folderPath,
+                  rfc822MessageId: messageSnapshot.rfc822MessageId
+              ) != nil
+        else { return }
 
         isCreating = true
         defer { isCreating = false }
@@ -209,11 +270,12 @@ struct UserLabelMenuView: View {
             let labelId: String
 
             // Check provider type from account
-            let account = try await AppDatabase.dbPool.read { db in
+            guard let account = try await AppDatabase.dbPool.read({ db in
                 try Account.fetchOne(db, key: accountId)
-            }
+            }), account.provider.supportsRemoteUserLabels else { return }
 
-            if account?.provider == .gmail {
+            switch account.provider {
+            case .gmail:
                 // Gmail: create label on server synchronously (with timeout)
                 let provider = await AccountManager.shared.providers[accountId]
                 guard let gmail = provider as? GmailProvider else { return }
@@ -234,9 +296,11 @@ struct UserLabelMenuView: View {
                     group.cancelAll()
                     return result
                 }
-            } else {
+            case .imap, .icloud:
                 // IMAP: keyword name (lowercased) IS the ID — no server call needed
                 labelId = name.lowercased()
+            case .outlook, .caldav:
+                return
             }
 
             // Insert locally
@@ -247,7 +311,7 @@ struct UserLabelMenuView: View {
 
             // Apply to message
             let newLabel = UserLabel(id: labelId, accountId: accountId, name: name, isSystem: false)
-            await applyLabel(newLabel)
+            guard await applyLabel(newLabel) else { return }
             // Add to list + mark applied (no full re-sort)
             sortedLabels.insert(newLabel, at: 0)
             appliedIds.insert(labelId)

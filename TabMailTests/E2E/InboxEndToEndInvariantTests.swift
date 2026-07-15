@@ -48,7 +48,7 @@ import Testing
 // xcodebuild's static test enumeration did not), matching every other test
 // file's convention in this repo. Non-`@Test` helpers live in `private`
 // members below.
-@Suite("Inbox end-to-end invariant layer (PLAN_INBOX_UNIFIED_READ §5B Phase 7)", .serialized)
+@Suite("Inbox end-to-end invariant layer (PLAN_INBOX_UNIFIED_READ §5B Phase 7)", .serialized, .processGlobalState)
 @MainActor
 struct InboxEndToEndInvariantTests {
 
@@ -128,8 +128,7 @@ struct InboxEndToEndInvariantTests {
     /// `NSEStaleStagedRowInvalidationTests.resetGlobals` — process-wide
     /// globals every suite in this repo resets around itself.
     private func resetGlobals() {
-        let snapshot = AccountManager.shared.snapshotOverlay()
-        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+        AccountManager.shared.intentionJournal.resetForTesting()
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
         NSEDataBridge.resetStageMemoForTesting()
@@ -281,19 +280,17 @@ struct InboxEndToEndInvariantTests {
             let staged = world.stagedRow(forKey: key)
 
             // I1 no-resurrection: identity durably present outside the
-            // displayed set (or isInInbox=false) ⟹ NOT on screen — unless an
-            // undo overlay is actively pinning it back in (P-step).
+            // displayed set (or isInInbox=false) ⟹ NOT on screen.
             if let d = durable,
-               !displayedFolderIds.contains(d.folderId) || !d.isInInbox,
-               !state.undoActive {
+               !displayedFolderIds.contains(d.folderId) || !d.isInInbox {
                 #expect(
                     !composedIdentities.contains(identity),
                     "I1 no-resurrection VIOLATED for \(key): durable copy is in \(d.folderPath) (isInInbox=\(d.isInInbox)) yet the identity is on screen — \(detail)"
                 )
             }
 
-            // I6 move-hides: from userArchive onward (until undo), the
-            // identity must be in NO composed list.
+            // I6 move-hides: from userArchive onward, the identity must be in
+            // NO composed list.
             if state.movedAwayByUser {
                 #expect(
                     !composedIdentities.contains(identity),
@@ -320,13 +317,6 @@ struct InboxEndToEndInvariantTests {
                         )
                     }
                 }
-                // I4 undo-visible.
-                if state.undoActive {
-                    #expect(
-                        composedIdentities.contains(identity),
-                        "I4 undo-visible VIOLATED for \(key): undone message missing from screen — \(detail)"
-                    )
-                }
             }
         }
 
@@ -341,23 +331,14 @@ struct InboxEndToEndInvariantTests {
         )
 
         // I3 AI-monotonic: once a row shows non-nil AI fields, no later
-        // settle shows nil for that identity (undo carve-out — mirrors the
-        // pure layer: an undone row renders via the P-step from an AI-less
-        // durable header until the AI repaint lands).
-        let identityToKey: [String: String] = Dictionary(
-            uniqueKeysWithValues: world.messageKeys.map { (world.identity(of: $0), $0) }
-        )
+        // settle shows nil for that identity.
         for row in composed {
             let identity = identityKey(accountId: row.accountId, messageId: row.messageId, rfc822: row.rfc822MessageId)
-            let key = identityToKey[identity]
-            let undoActive = key.flatMap { world.states[$0]?.undoActive } ?? false
-            var durableRowForKey: MessageHeader?
-            if let key { durableRowForKey = try await world.durableRow(forKey: key) }
-            if ai.tagSeen.contains(identity), !(undoActive && durableRowForKey?.actionTag == nil) {
+            if ai.tagSeen.contains(identity) {
                 #expect(row.actionTag != nil, "I3 AI-monotonic VIOLATED: actionTag flashed to nil for \(identity) — \(detail)")
             }
             if row.actionTag != nil { ai.tagSeen.insert(identity) }
-            if ai.blurbSeen.contains(identity), !(undoActive && durableRowForKey?.summaryBlurb == nil) {
+            if ai.blurbSeen.contains(identity) {
                 #expect(row.summaryBlurb != nil, "I3 AI-monotonic VIOLATED: summaryBlurb flashed to nil for \(identity) — \(detail)")
             }
             if row.summaryBlurb != nil { ai.blurbSeen.insert(identity) }
@@ -408,7 +389,8 @@ struct InboxEndToEndInvariantTests {
         // check with the grown window size instead of calling this helper).
         let query = InboxListQuery(
             displayedFolderIds: displayedFolderIds, filterUnread: vm.filterUnread,
-            filterLabelIds: vm.filterLabelIds, mode: vm.mode,
+            filterLabelIds: vm.filterLabelIds, filterLabelAccountId: vm.folders.first?.accountId,
+            mode: vm.mode,
             targetCount: SyncConfig.inboxPageSize, beforeDate: nil
         )
         let readerTruth = InboxListReader.fetchSync(folders: vm.folders, query: query)
@@ -427,7 +409,7 @@ struct InboxEndToEndInvariantTests {
         ai: inout E2EAITracker, scenario: String
     ) async throws {
         world.clearSignals()
-        try await world.apply(step, key, vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(step, key, stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
         try await assertE2EInvariants(
             world: world, vm: vm, ai: &ai, context: "scenario=\(scenario) step=\(step.rawValue)(\(key))"
@@ -542,11 +524,11 @@ struct InboxEndToEndInvariantTests {
         var ai = E2EAITracker()
 
         // Land it durably in inbox, then archive it (setup — not under test).
-        try await world.apply(.pushArrives, "m1", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.pushArrives, "m1", stageTerminal: stageTerminalRow)
         await waitUntil { vm.loadedMessages.contains { $0.messageId == "101" } }
-        try await world.apply(.userArchive, "m1", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.userArchive, "m1", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
-        try await world.apply(.overlayDrain, "m1", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.overlayDrain, "m1", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
         #expect(!vm.loadedMessages.contains { $0.messageId == "101" }, "setup assumption violated: archived row must be off-screen before the scrub-only wake")
         try await assertE2EInvariants(world: world, vm: vm, ai: &ai, context: "scrubOnlyWakeStillConverges pre-scrub settle")
@@ -560,7 +542,7 @@ struct InboxEndToEndInvariantTests {
         // render signal to follow that evicts it — WITHOUT any manual
         // reloadMessages() call from this test.
         world.clearSignals()
-        try await world.apply(.silentStateChangePush, "m1", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.silentStateChangePush, "m1", stageTerminal: stageTerminalRow)
 
         await waitUntil(5) { !vm.loadedMessages.contains { $0.messageId == "101" } }
 
@@ -647,42 +629,7 @@ struct InboxEndToEndInvariantTests {
         #expect(vm.loadedMessages.first { $0.messageId == "101" }?.actionTag == .reply)
     }
 
-    // MARK: - Named scenarios, batch 2 (undo / stale-delete self-heal / UID remap / redelivery / filters)
-
-    @Test("undoSurvivesEveryReload — from undo onward the row is in EVERY REAL reload, before AND after the restore write, across overlay drain (I4)")
-    func undoSurvivesEveryReload() async throws {
-        let fixture = try makeFixture()
-        defer { cleanup(fixture) }
-        let world = E2EWorld(
-            pool: fixture.pool, stagingPath: fixture.stagingPath, stagingQueue: fixture.stagingQueue,
-            accountId: fixture.accountId, inbox: fixture.inbox, archive: fixture.archive
-        )
-        defer { world.teardown() }
-        world.addMessage("m1", uid: "101", minutesAgo: 5, base: Date())
-
-        let vm = InboxViewModel(folders: [fixture.inbox])
-        var ai = E2EAITracker()
-
-        // Land it, then archive it (write lands, overlay drains) — setup.
-        try await applyAndSettle(.pushArrives, "m1", world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload")
-        try await applyAndSettle(.userArchive, "m1", world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload")
-        try await applyAndSettle(.overlayDrain, "m1", world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload")
-        #expect(!containsIdentity(vm, world, "m1"))
-
-        // Undo: overlay back-to-inbox + insertUndoneMessages, DB restore
-        // write still DEFERRED (mirrors UndoService.undo()'s real timeline).
-        try await applyAndSettle(.undo, "m1", world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload")
-        #expect(containsIdentity(vm, world, "m1"), "undone row missing immediately after undo (P-step hole)")
-
-        // The latent hole the P-step closes: reloads between undo and the
-        // restore write must never evict the row.
-        try await reloadRepeatedly(15, world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload", note: "pre-restore-write storm")
-        #expect(containsIdentity(vm, world, "m1"), "undone row vanished during pre-restore-write reload storm")
-
-        try await applyAndSettle(.undoRestoreWrite, "m1", world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload")
-        try await applyAndSettle(.overlayDrain, "m1", world: world, vm: vm, ai: &ai, scenario: "undoSurvivesEveryReload")
-        #expect(containsIdentity(vm, world, "m1"), "undone row vanished after restore write / overlay drain")
-    }
+    // MARK: - Named scenarios, batch 2 (stale-delete self-heal / UID remap / redelivery / filters)
 
     @Test("staleDeleteSelfHeals — a real sync stale-delete of the durable row leaves a still-published staged row eligible again; the REAL VM never blanks (§2.3 emergent property)")
     func staleDeleteSelfHeals() async throws {
@@ -704,14 +651,14 @@ struct InboxEndToEndInvariantTests {
         // gradual staging row co-exists with an already-durable header —
         // NSEGradualMergeTests' shape — via the same real publish seam
         // `publishStagedOnly` documents).
-        try await world.apply(.syncCreatesHeader, "m1", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.syncCreatesHeader, "m1", stageTerminal: stageTerminalRow)
         world.publishStagedOnly("m1")
         await vm.reloadMessages()
         try await assertE2EInvariants(world: world, vm: vm, ai: &ai, context: "staleDeleteSelfHeals pre-delete settle")
         #expect(containsIdentity(vm, world, "m1"))
 
         // Sync transiently stale-deletes the durable row (a real GRDB DELETE).
-        try await world.apply(.staleDelete, "m1", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.staleDelete, "m1", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
         try await assertE2EInvariants(world: world, vm: vm, ai: &ai, context: "staleDeleteSelfHeals post-delete settle")
         #expect(
@@ -793,7 +740,7 @@ struct InboxEndToEndInvariantTests {
         // DIRECTLY into the in-memory snapshot and would otherwise be wiped
         // out by the next real merge's replace-all (the merge has no idea
         // about identities it never staged to the file).
-        try await world.apply(.pushArrives, "mUnreadDurable", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.pushArrives, "mUnreadDurable", stageTerminal: stageTerminalRow)
         world.publishStagedOnly("mReadStaged")
         world.publishStagedOnly("mUnreadStaged")
 
@@ -807,7 +754,7 @@ struct InboxEndToEndInvariantTests {
 
         // A userRead overlay on the staged row must also drop it (S is
         // filtered POST-overlay — insertStagedRows parity, §2.1 step 4).
-        try await world.apply(.userRead, "mUnreadStaged", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.userRead, "mUnreadStaged", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
         #expect(!containsIdentity(vm, world, "mUnreadStaged"), "post-overlay read staged row leaked through filterUnread")
     }
@@ -828,11 +775,15 @@ struct InboxEndToEndInvariantTests {
         world.addMessage("mUnlabeledStaged", uid: "102", minutesAgo: 2, base: base)
 
         let vm = InboxViewModel(folders: [fixture.inbox])
-        try await world.apply(.pushArrives, "mLabeledDurable", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.pushArrives, "mLabeledDurable", stageTerminal: stageTerminalRow)
         let labeledId = try await world.currentId(forKey: "mLabeledDurable")
         try await fixture.pool.writeWithoutTransaction { db in
             try UserLabel(id: "label-x", accountId: fixture.accountId, name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeledId, userLabelId: "label-x").insert(db)
+            try MessageUserLabel(
+                messageId: labeledId,
+                accountId: fixture.accountId,
+                userLabelId: "label-x"
+            ).insert(db)
         }
         world.publishStagedOnly("mUnlabeledStaged")
 
@@ -860,8 +811,8 @@ struct InboxEndToEndInvariantTests {
 
         let vm = InboxViewModel(folders: [fixture.inbox])
         vm.mode = .triage
-        try await world.apply(.pushArrives, "mReplyOld", vm: vm, stageTerminal: stageTerminalRow)
-        try await world.apply(.pushArrives, "mArchiveNew", vm: vm, stageTerminal: stageTerminalRow)
+        try await world.apply(.pushArrives, "mReplyOld", stageTerminal: stageTerminalRow)
+        try await world.apply(.pushArrives, "mArchiveNew", stageTerminal: stageTerminalRow)
         world.addMessage("mReplyStaged", uid: "103", minutesAgo: 120, base: base, tag: "reply")
         world.publishStagedOnly("mReplyStaged")
         vm.resetMessages()
@@ -889,15 +840,14 @@ struct InboxEndToEndInvariantTests {
         world.addMessage("d3", uid: "103", minutesAgo: 30, base: base)
         world.addMessage("sNew", uid: "104", minutesAgo: 1, base: base)
 
-        let vm = InboxViewModel(folders: [fixture.inbox])
         for key in ["d1", "d2", "d3"] {
-            try await world.apply(.pushArrives, key, vm: vm, stageTerminal: stageTerminalRow)
+            try await world.apply(.pushArrives, key, stageTerminal: stageTerminalRow)
         }
         world.publishStagedOnly("sNew")
 
         let query = InboxListQuery(
             displayedFolderIds: [fixture.inbox.id], filterUnread: false, filterLabelIds: [],
-            mode: .normal, targetCount: 3, beforeDate: nil
+            filterLabelAccountId: fixture.inbox.accountId, mode: .normal, targetCount: 3, beforeDate: nil
         )
         let composed = InboxListReader.fetchSync(folders: [fixture.inbox], query: query)
         #expect(composed.count == 3)
@@ -929,8 +879,8 @@ struct InboxEndToEndInvariantTests {
         world2.addMessage("acc2msg", uid: "101", minutesAgo: 5, base: base)
 
         let vm = InboxViewModel(folders: [fixture.inbox, inbox2])
-        try await world1.apply(.pushArrives, "acc1msg", vm: vm, stageTerminal: stageTerminalRow)
-        try await world2.apply(.pushArrives, "acc2msg", vm: vm, stageTerminal: stageTerminalRow)
+        try await world1.apply(.pushArrives, "acc1msg", stageTerminal: stageTerminalRow)
+        try await world2.apply(.pushArrives, "acc2msg", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
 
         #expect(vm.loadedMessages.count == 2, "same-UID cross-account messages must not collide/dedupe")
@@ -942,9 +892,9 @@ struct InboxEndToEndInvariantTests {
         // Archive account 1's message — account 2's message must be
         // completely unaffected (folderId/overlay scoping is per-identity,
         // not per-raw-uid).
-        try await world1.apply(.userArchive, "acc1msg", vm: vm, stageTerminal: stageTerminalRow)
+        try await world1.apply(.userArchive, "acc1msg", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
-        try await world1.apply(.overlayDrain, "acc1msg", vm: vm, stageTerminal: stageTerminalRow)
+        try await world1.apply(.overlayDrain, "acc1msg", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
 
         #expect(!containsIdentity(vm, world1, "acc1msg"), "account 1's archived message still on screen")
@@ -952,7 +902,7 @@ struct InboxEndToEndInvariantTests {
 
         // A stale re-stage of account 1's (now archived) identity must not
         // resurrect it OR touch account 2's identical-UID message.
-        try await world1.apply(.silentStateChangePush, "acc1msg", vm: vm, stageTerminal: stageTerminalRow)
+        try await world1.apply(.silentStateChangePush, "acc1msg", stageTerminal: stageTerminalRow)
         await vm.reloadMessages()
         #expect(!containsIdentity(vm, world1, "acc1msg"), "account 1's archived message resurrected via re-stage")
         #expect(containsIdentity(vm, world2, "acc2msg"), "account 2's message evicted by account 1's stale-by-move scrub — cross-account leak")
@@ -1131,7 +1081,7 @@ struct InboxEndToEndInvariantTests {
                 }
                 guard !legal.isEmpty else { break }
                 let (step, key) = legal[rng.pick(legal.count)]
-                try await world.apply(step, key, vm: vm, stageTerminal: stageTerminalRow)
+                try await world.apply(step, key, stageTerminal: stageTerminalRow)
                 await vm.reloadMessages()
                 try await assertE2EInvariants(
                     world: world, vm: vm, ai: &ai,
@@ -1147,7 +1097,7 @@ struct InboxEndToEndInvariantTests {
 /// Drives REAL mechanisms (staging DB + `mergeNSEStagingData` + GRDB writes +
 /// `AccountManager` overlay + `InboxViewModel`) instead of synthesizing value
 /// states. Tracks the SAME lifecycle bookkeeping shape as the pure layer's
-/// `SimWorld.MessageState` (`everStaged`/`movedAwayByUser`/`undoActive`/etc.)
+/// `SimWorld.MessageState` (`everStaged`/`movedAwayByUser`/etc.)
 /// so the fuzz mode's legality function can enumerate legal (step, key) pairs
 /// WITHOUT a database round-trip per check — the bookkeeping is kept in sync
 /// with reality because this World is the sole writer for the identities it
@@ -1182,7 +1132,6 @@ final class E2EWorld {
         var everStaged = false
         var durableExists = false
         var movedAwayByUser = false
-        var undoActive = false
         /// An overlay entry currently registered for this identity's current id.
         var hasOverlay = false
     }
@@ -1326,8 +1275,6 @@ final class E2EWorld {
         case syncCreatesHeader
         case userArchive
         case overlayDrain
-        case undo
-        case undoRestoreWrite
         case userRead
         case staleDelete
         case uidRemap
@@ -1344,24 +1291,17 @@ final class E2EWorld {
             return state.durableExists && !state.movedAwayByUser && !state.hasOverlay
         case .overlayDrain:
             return state.hasOverlay
-        case .undo:
-            return state.movedAwayByUser && !state.hasOverlay
-        case .undoRestoreWrite:
-            return state.undoActive
         case .userRead:
             return !state.movedAwayByUser && (state.everStaged || state.durableExists)
         case .staleDelete:
-            return state.durableExists && !state.hasOverlay && !state.movedAwayByUser && !state.undoActive
+            return state.durableExists && !state.hasOverlay && !state.movedAwayByUser
         case .uidRemap:
-            return state.durableExists && !state.hasOverlay && !state.undoActive
+            return state.durableExists && !state.hasOverlay
         }
     }
 
-    /// Applies one step via REAL mechanisms. `vm` is only consulted by
-    /// `.undo` (mirrors `InboxView`'s `.onReceive(.messagesUndone)` glue,
-    /// which — like `.messagesStaged` — lives at the VIEW layer, not inside
-    /// `InboxViewModel` itself; the harness supplies that glue explicitly).
-    func apply(_ step: Step, _ key: String, vm: InboxViewModel, stageTerminal: (E2EWorld, String, String) throws -> Void) async throws {
+    /// Applies one step via REAL mechanisms.
+    func apply(_ step: Step, _ key: String, stageTerminal: (E2EWorld, String, String) throws -> Void) async throws {
         let spec = specs[key]!
         switch step {
         case .pushArrives:
@@ -1399,7 +1339,7 @@ final class E2EWorld {
             // can't be referenced from inside it directly.
             let destFolderId = archiveFolderId
             let destFolderPath = archivePath
-            AccountManager.shared.registerMutation(id: id, mutation: .init(
+            AccountManager.shared.intentionJournal.seedDisplayForTesting(id: id, mutation: .init(
                 folderId: destFolderId, folderPath: destFolderPath, isInInbox: false
             ))
             try await pool.writeWithoutTransaction { db in
@@ -1411,32 +1351,22 @@ final class E2EWorld {
             states[key]?.movedAwayByUser = true
             states[key]?.hasOverlay = true
         case .overlayDrain:
-            let id = try await currentId(forKey: key)
-            AccountManager.shared.removeOverlayEntries(ids: [id])
+            // NOTE: no per-id removal seam exists under the derived overlay
+            // (ADR-IOS-058) — `resetForTesting()` clears the WHOLE journal,
+            // not just this key's id. Safe here because this fuzz harness's
+            // `.overlayDrain` is only ever legal for a key whose OWN overlay
+            // is the one under test in this synthetic-seed step; if a
+            // cross-key interleaving ever DOES leave another key's overlay
+            // live at this point, that key's `states[key].hasOverlay`
+            // bookkeeping would diverge from reality — watch for spurious
+            // invariant failures on OTHER keys if this step's legality window
+            // is ever widened.
+            _ = try await currentId(forKey: key)
+            AccountManager.shared.intentionJournal.resetForTesting()
             states[key]?.hasOverlay = false
-        case .undo:
-            let id = try await currentId(forKey: key)
-            AccountManager.shared.registerMutation(id: id, mutation: .init(
-                folderId: inboxFolderId, folderPath: inboxPath, isInInbox: true
-            ))
-            vm.insertUndoneMessages([id])
-            states[key]?.movedAwayByUser = false
-            states[key]?.undoActive = true
-            states[key]?.hasOverlay = true
-        case .undoRestoreWrite:
-            let id = try await currentId(forKey: key)
-            let restoreFolderId = inboxFolderId
-            let restoreFolderPath = inboxPath
-            try await pool.writeWithoutTransaction { db in
-                try db.execute(
-                    sql: "UPDATE messageHeader SET folderId = ?, folderPath = ?, isInInbox = 1 WHERE id = ?",
-                    arguments: [restoreFolderId, restoreFolderPath, id]
-                )
-            }
-            states[key]?.undoActive = false
         case .userRead:
             let id = try await currentId(forKey: key)
-            AccountManager.shared.registerMutation(id: id, mutation: .init(isRead: true))
+            AccountManager.shared.intentionJournal.seedDisplayForTesting(id: id, mutation: .init(isRead: true))
         case .staleDelete:
             try await pool.writeWithoutTransaction { db in
                 try db.execute(
