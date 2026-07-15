@@ -260,9 +260,9 @@ struct ExecuteOperationTests {
         #expect(log.isEmpty)
     }
 
-    // MARK: - markReplied / markForwarded (non-IMAP = no-op)
+    // MARK: - Provider-neutral message actions
 
-    @Test("markReplied with non-IMAP provider is a no-op")
+    @Test("markReplied dispatches through EmailProvider")
     @MainActor
     func markRepliedNonImap() async throws {
         let mock = MockEmailProvider()
@@ -275,11 +275,14 @@ struct ExecuteOperationTests {
 
         try await AccountManager.shared.executeOperation(op, provider: mock)
 
-        let log = await mock.callLog
-        #expect(log.isEmpty, "markReplied with non-IMAP provider should be a no-op")
+        let calls = await mock.markedRepliedIds
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].ids == ["msg-1"])
+        #expect(calls[0].folder == "INBOX")
     }
 
-    @Test("markForwarded with non-IMAP provider is a no-op")
+    @Test("markForwarded dispatches through EmailProvider")
     @MainActor
     func markForwardedNonImap() async throws {
         let mock = MockEmailProvider()
@@ -292,7 +295,45 @@ struct ExecuteOperationTests {
 
         try await AccountManager.shared.executeOperation(op, provider: mock)
 
-        let log = await mock.callLog
-        #expect(log.isEmpty, "markForwarded with non-IMAP provider should be a no-op")
+        let calls = await mock.markedForwardedIds
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].ids == ["msg-1"])
+        #expect(calls[0].folder == "INBOX")
+    }
+
+    @Test("user-label add and remove dispatch complete batches through EmailProvider")
+    @MainActor
+    func userLabelDispatchesCompleteBatch() async throws {
+        let mock = MockEmailProvider()
+        let add = PendingOperation(
+            type: .addUserLabel,
+            messageIds: ["first@example.com", "second@example.com"],
+            accountId: "acct1",
+            folderPath: "INBOX",
+            userLabelId: "Label_1"
+        )
+        let remove = PendingOperation(
+            type: .removeUserLabel,
+            messageIds: ["third@example.com", "fourth@example.com"],
+            accountId: "acct1",
+            folderPath: "Archive",
+            userLabelId: "Label_2"
+        )
+
+        try await AccountManager.shared.executeOperation(add, provider: mock)
+        try await AccountManager.shared.executeOperation(remove, provider: mock)
+
+        let calls = await mock.userLabelChanges
+        #expect(calls.count == 2)
+        guard calls.count == 2 else { return }
+        #expect(calls[0].ids == ["first@example.com", "second@example.com"])
+        #expect(calls[0].labelId == "Label_1")
+        #expect(calls[0].present)
+        #expect(calls[0].folder == "INBOX")
+        #expect(calls[1].ids == ["third@example.com", "fourth@example.com"])
+        #expect(calls[1].labelId == "Label_2")
+        #expect(!calls[1].present)
+        #expect(calls[1].folder == "Archive")
     }
 }

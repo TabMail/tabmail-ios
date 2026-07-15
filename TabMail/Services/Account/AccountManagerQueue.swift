@@ -6,598 +6,630 @@ import Foundation
 import GRDB
 import Synchronization
 
+private enum QueueRecoveryError: LocalizedError {
+    case invalidActionTag(String?)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidActionTag(let value):
+            return "Pending action-tag value is invalid: \(value ?? "<missing>")."
+        }
+    }
+}
+
 extension AccountManager {
+    nonisolated private static func recentlyCompletedIdentityKey(
+        accountId: String,
+        folderPath: String,
+        messageId: String,
+        scope: MessageFieldScope
+    ) -> String {
+        switch scope {
+        case .account:
+            MessageIdentity.recentlyCompletedAccountKey(
+                accountId: accountId,
+                messageId: messageId
+            )
+        case .folder:
+            MessageIdentity.recentlyCompletedFolderKey(
+                accountId: accountId,
+                folderPath: folderPath,
+                messageId: messageId
+            )
+        }
+    }
+
+    private func recordRecentlyCompletedIdentities(
+        messageIds: [String],
+        accountId: String,
+        folderPath: String,
+        scope: MessageFieldScope
+    ) {
+        recordRecentlyCompleted(messageIds: Self.orderedUniqueMessageIds(messageIds.map {
+            Self.recentlyCompletedIdentityKey(
+                accountId: accountId,
+                folderPath: folderPath,
+                messageId: $0,
+                scope: scope
+            )
+        }))
+    }
+
+    /// Publish exact directional membership provenance plus the provider-scoped
+    /// generic identity. Destination entries carry their own folder so Gmail does
+    /// not freeze label X just because a move completed between labels A and B.
+    private func recordRecentlyCompletedDestructiveMemberships(
+        sourceMessageIds: [String],
+        destinationIdentities: [(messageId: String, folderPath: String)],
+        accountId: String,
+        sourceFolderPath: String,
+        scope: MessageFieldScope
+    ) {
+        var keys: [String] = []
+        for messageId in Self.orderedUniqueMessageIds(sourceMessageIds) {
+            keys.append(Self.recentlyCompletedIdentityKey(
+                accountId: accountId,
+                folderPath: sourceFolderPath,
+                messageId: messageId,
+                scope: scope
+            ))
+            keys.append(MessageIdentity.membershipKey(
+                accountId: accountId,
+                folderPath: sourceFolderPath,
+                messageId: messageId,
+                membership: .removedSource
+            ))
+        }
+        var seenDestinations = Set<String>()
+        for destination in destinationIdentities {
+            let membershipKey = MessageIdentity.membershipKey(
+                accountId: accountId,
+                folderPath: destination.folderPath,
+                messageId: destination.messageId,
+                membership: .addedDestination
+            )
+            guard seenDestinations.insert(membershipKey).inserted else { continue }
+            keys.append(Self.recentlyCompletedIdentityKey(
+                accountId: accountId,
+                folderPath: destination.folderPath,
+                messageId: destination.messageId,
+                scope: scope
+            ))
+            keys.append(membershipKey)
+        }
+        recordRecentlyCompleted(messageIds: Self.orderedUniqueMessageIds(keys))
+    }
+
+    /// Publish field-specific lag protection in addition to the generic identity
+    /// keys used by stale-row protection. Sync consumes these keys per field so a
+    /// completed read toggle cannot suppress an unrelated remote flag change.
+    private func recordRecentlyCompletedFieldState(
+        messageIds: [String],
+        accountId: String,
+        folderPath: String,
+        scope: MessageFieldScope,
+        value: MessageIdentity.RecentlyCompletedFieldValue
+    ) {
+        let fieldIds = messageIds.map {
+            switch scope {
+            case .account:
+                MessageIdentity.recentlyCompletedFieldKey(
+                    accountId: accountId,
+                    messageId: $0,
+                    field: value.field
+                )
+            case .folder:
+                MessageIdentity.recentlyCompletedFieldKey(
+                    accountId: accountId,
+                    folderPath: folderPath,
+                    messageId: $0,
+                    field: value.field
+                )
+            }
+        }
+        let valueIds = messageIds.map {
+            switch scope {
+            case .account:
+                MessageIdentity.recentlyCompletedFieldValueKey(
+                    accountId: accountId,
+                    messageId: $0,
+                    value: value
+                )
+            case .folder:
+                MessageIdentity.recentlyCompletedFieldValueKey(
+                    accountId: accountId,
+                    folderPath: folderPath,
+                    messageId: $0,
+                    value: value
+                )
+            }
+        }
+        let genericIds = messageIds.map {
+            Self.recentlyCompletedIdentityKey(
+                accountId: accountId,
+                folderPath: folderPath,
+                messageId: $0,
+                scope: scope
+            )
+        }
+        recordRecentlyCompleted(
+            messageIds: Self.orderedUniqueMessageIds(genericIds + fieldIds + valueIds)
+        )
+    }
+
+    nonisolated private static func orderedUniqueMessageIds(_ messageIds: [String]) -> [String] {
+        var seen = Set<String>()
+        return messageIds.filter { seen.insert($0).inserted }
+    }
 
     // MARK: - Persistent Action Queue
 
-    /// Queue an action tag write for async execution.
-    /// Called from AI processing and manual tag application.
-    /// Static + nonisolated: the GRDB write is thread-safe and doesn't need MainActor.
-    /// Callers can call directly without `await MainActor.run { ... }`.
-    nonisolated static func queueTagWrite(accountId: String, messageId: String, rfc822MessageId: String? = nil, tag: ActionTag?, folder: String) {
-        // Prefer rfc822MessageId for IMAP messages (numeric UIDs) — survives UIDVALIDITY changes
-        let stableId: String
-        if UInt32(messageId) != nil, let rfc822 = rfc822MessageId, !rfc822.isEmpty {
-            stableId = rfc822
-        } else {
-            stableId = messageId
+    /// Shared mutable state for a single drain owner's pass. Reference type
+    /// so it can be threaded through sequential `executeSingleOp` calls
+    /// without re-allocating. `internal` (not `private`) so tests can
+    /// construct it directly to call `executeSingleOp`.
+    final class DrainContext: Sendable {
+        private struct State: Sendable {
+            // op.id values that have already produced a [QueueDiag] deep-dump this drain.
+            // Prevents log-spam on the same stuck op that retries every drain cycle.
+            var diagnosedOpIds = Set<String>()
         }
-        let opType: OperationType = tag != nil ? .setTag : .removeTag
-        let op = PendingOperation(type: opType, messageIds: [stableId], accountId: accountId, folderPath: folder, tagValue: tag?.rawValue)
-        do {
-            try AppDatabase.dbPool.write { db in try op.insert(db) }
-        } catch {
-            print("[Queue] ERROR: queueTagWrite failed: \(error)")
+
+        private let state = Mutex(State())
+
+        func markDiagnosedIfNew(operationId: String) -> Bool {
+            state.withLock { $0.diagnosedOpIds.insert(operationId).inserted }
         }
-        Task { @MainActor in await AccountManager.shared.drainPendingQueue() }
     }
 
-    /// Shared mutable state for parallel drain tasks. Reference type so concurrent
-    /// lane Tasks (launched from the `AccountManager` actor) see each other's updates
-    /// at await points. `internal` (not `private`) so tests can construct it directly
-    /// to call `executeSingleOp`.
-    class DrainContext: @unchecked Sendable {
-        var failedAccounts = Set<String>()
-        var foldersToSync: Set<String> = []
-        var executedAny = false
-        // op.id values that have already produced a [QueueDiag] deep-dump this drain.
-        // Prevents log-spam on the same stuck op that retries every drain cycle.
-        var diagnosedOpIds: Set<String> = []
-    }
-
-    /// Outcome of a single claimed-op execution (`executeSingleOp`), used by the
-    /// per-lane drain loop in `drainPendingQueue` to decide whether to keep draining
-    /// the lane or halt it for this pass.
+    /// Outcome of a single claimed-op execution (`executeSingleOp`), used by
+    /// the global FIFO drain loop in `drainPendingQueue` to decide whether it
+    /// is safe to claim and execute the next frontier op.
     enum SingleOpOutcome: Sendable, Equatable {
         /// The op reached a terminal state this pass — either it completed
-        /// successfully, or it was CONFIRMED stale/invalid and dropped (deleted, or
-        /// split into fresh individual ops). The lane may proceed to its next op.
+        /// successfully, or it was CONFIRMED stale/invalid and dropped
+        /// (deleted). The drain may claim and execute the next frontier op.
         case proceed
-        /// The op was reset to `.queued` for retry (its staleness/success could NOT
-        /// be confirmed this pass). The REST of this lane must halt: a later op on
-        /// the same connected component (e.g. a flag change queued after a move of
-        /// the same message) must never run ahead of its unresolved predecessor —
-        /// running it would race the predecessor's eventual retry on the wire. The
-        /// lane loop requeues the remaining claimed ops in this lane (same as the
-        /// existing failedAccounts requeue path) and stops.
-        case haltLane
+        /// The op was restored to `.queued`, payload unchanged, for retry
+        /// (its staleness/success could NOT be confirmed this pass). The
+        /// drain MUST stop: this row is the protected frontier (§9.1), and a
+        /// later row must never overtake an unresolved predecessor — running
+        /// it would race the predecessor's eventual retry on the wire.
+        case stopDrain
     }
 
-    /// Groups claimed pending operations into serialized "lanes" via connected-
-    /// component grouping over shared message ids (scoped per account). Two ops
-    /// that share ANY member message id land in the same lane — and transitively,
-    /// any op sharing an id with either of those joins too (union-find).
+    /// Atomically claim the protected frontier row — the first active
+    /// (non-cancelled) row in durable SQLite insertion order (`rowid`; §9.1).
+    /// Wall-clock `createdAt` is diagnostic metadata only and never
+    /// participates in this ordering.
     ///
-    /// WHY this matters: `drainPendingQueue` runs one Task per lane CONCURRENTLY,
-    /// each drawing from `ProviderWorkQueue` (bounded concurrency > 1 — separate
-    /// IMAP connections). The OLD lane key was `"accountId:messageIds.first"`, so a
-    /// batch move `[A,B,C]` landed in a lane keyed by A while a LATER single-id op
-    /// on B (e.g. a flag change) landed in a SEPARATE lane keyed by B — even though
-    /// B is a member of both. The two lanes then ran concurrently, racing on the
-    /// wire: a flag STORE on B could race the batch MOVE of B, silently losing the
-    /// flag on the MOVE's EXPUNGE, or getting wrongly confirmed-stale by the
-    /// `uidResolutionFailed` handling mid-move. Connected-component lanes guarantee
-    /// any op sharing a member id with an in-flight op serializes AFTER it.
-    ///
-    /// Pure and side-effect free (no DB/IO) — `nonisolated static` so it's directly
-    /// unit-testable without an actor hop. Callers pass ops in createdAt-asc order;
-    /// each lane preserves that relative order (FIFO within its component).
-    /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
-    /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
-    nonisolated static func buildLanes(_ ops: [PendingOperation]) -> [[PendingOperation]] {
-        // Union-Find over "accountId:msgId" keys, with path compression.
-        var parent: [String: String] = [:]
-
-        func find(_ x: String) -> String {
-            var root = x
-            while let p = parent[root], p != root {
-                root = p
-            }
-            var current = x
-            while let p = parent[current], p != root {
-                parent[current] = root
-                current = p
-            }
-            return root
+    /// Acquires the shared mutation gate exactly once and performs exactly
+    /// one bounded GRDB write transaction — no provider I/O, no sleep, no
+    /// retry. Walking from the front:
+    ///   - a legacy `.cancelled` row (Undo's pre-Round-D status-cancellation
+    ///     path) is physically deleted and the walk continues;
+    ///   - an `.inFlight` row means another owner already holds the
+    ///     frontier — return nil rather than steal or skip past it (single-
+    ///     owner drain + startup `inFlight -> queued` reset should make this
+    ///     unreachable, but the protected-frontier law is absolute);
+    ///   - the first `.queued` row is claimed (`status = .inFlight`) and
+    ///     returned.
+    /// Returns nil when nothing is claimable, or when the gated transaction
+    /// itself throws (logged, debug-gated) — either way the caller's drain
+    /// loop stops advancing.
+    private func claimFrontierOperation(database: PrioritizedDatabase) async -> PendingOperation? {
+        let lease: PendingOperationMutationGate.Lease
+        do {
+            lease = try await pendingOperationMutationGate.acquire()
+        } catch {
+            return nil
         }
-
-        func union(_ a: String, _ b: String) {
-            let rootA = find(a)
-            let rootB = find(b)
-            if rootA != rootB { parent[rootA] = rootB }
+        defer { pendingOperationMutationGate.release(lease) }
+        do {
+            return try await database.write { db -> PendingOperation? in
+                let ops = try PendingOperation.fetchAll(
+                    db,
+                    sql: "SELECT * FROM pendingOperation ORDER BY rowid ASC"
+                )
+                for var candidate in ops {
+                    if candidate.status == PendingStatus.cancelled.rawValue {
+                        _ = try PendingOperation.deleteOne(db, key: candidate.id)
+                        print("[Queue] Op \(candidate.id.prefix(8)) cancelled by undo, deleted")
+                        continue
+                    }
+                    if candidate.status == PendingStatus.inFlight.rawValue {
+                        return nil
+                    }
+                    candidate.status = PendingStatus.inFlight.rawValue
+                    try candidate.save(db)
+                    return candidate
+                }
+                return nil
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] ERROR: Failed to claim frontier operation: \(error)")
+            }
+            return nil
         }
-
-        for op in ops {
-            let ids = op.messageIds
-            guard !ids.isEmpty else { continue }
-            let keys = ids.map { "\(op.accountId):\($0)" }
-            for key in keys where parent[key] == nil {
-                parent[key] = key
-            }
-            for key in keys.dropFirst() {
-                union(keys[0], key)
-            }
-        }
-
-        // Assign each op to its component's lane, in the ORIGINAL (createdAt-asc) order.
-        var laneIndexForRoot: [String: Int] = [:]
-        var lanes: [[PendingOperation]] = []
-        for op in ops {
-            guard let firstId = op.messageIds.first else {
-                // Empty messageIds — always its own singleton lane.
-                lanes.append([op])
-                continue
-            }
-            let root = find("\(op.accountId):\(firstId)")
-            if let idx = laneIndexForRoot[root] {
-                lanes[idx].append(op)
-            } else {
-                laneIndexForRoot[root] = lanes.count
-                lanes.append([op])
-            }
-        }
-        return lanes
     }
 
-    /// Drain all queued operations with per-message parallelism.
+    /// Retried gated GRDB write for durable queue-row lifecycle mutations
+    /// (completion delete, stale/invalid drop, transient requeue, crash
+    /// recovery). The backoff sleep between attempts runs OUTSIDE the gate —
+    /// `attemptOnce()` acquires, writes, and releases (via `defer`) entirely
+    /// within one iteration before the `catch` branch that sleeps is reached.
+    /// Never call this with a body that performs provider I/O, and never call
+    /// it while already holding the gate — it is not reentrant.
     ///
-    /// Ops are grouped into lanes by `buildLanes`: an op joins the lane of ANY op
-    /// sharing any member message id (connected components), not just its first id.
-    /// Each lane is a FIFO — ops in the same connected component execute
-    /// sequentially (preserving ordering like removeTag→move, or a batch move and a
-    /// later single-id flag change on one of its members). The drain runs every
-    /// lane concurrently, so ops for disjoint messages make progress in parallel.
+    /// This is also the durable-admission transaction wrapper (§9.3): every
+    /// site that appends a `PendingOperation` — not just drain's own
+    /// lifecycle writes — routes its local optimistic mutation plus the
+    /// insert through this same gated helper, so local state, queue state,
+    /// and the drain frontier stay one linearizable sequence. It is
+    /// `nonisolated` (not `private`) so callers outside this file (actions,
+    /// outbox, view models, notification routing) can call it directly —
+    /// `AccountManager` being an actor does not by itself provide the
+    /// mutual-exclusion this gate provides (§9.2). It is NOT reentrant:
+    /// never call it from inside another gated region (another
+    /// `retryGatedQueueWrite` body, or any other holder of
+    /// `pendingOperationMutationGate`) — a second acquire from the same
+    /// logical caller would deadlock against itself.
     ///
-    /// Provider-level concurrency is managed by each provider (IMAP connection pool, HTTP pooling).
+    /// The attempts run on a detached task so they do NOT inherit the
+    /// caller's cancellation. This is load-bearing, not defensive: the gate's
+    /// `acquire()` throws immediately once the calling task is cancelled, so
+    /// a drain cancelled while completing its claimed frontier would leave
+    /// that row `inFlight` forever. Under the protected-frontier rule (§9.1)
+    /// `claimFrontierOperation` refuses to steal or skip an `inFlight` row,
+    /// so one stranded row would wedge the ENTIRE global FIFO until the next
+    /// process start re-ran crash recovery (§9.4 — a live process never
+    /// re-runs that reset). Every body passed here is a bounded, idempotent
+    /// terminal write that must land regardless of why the drain is ending.
+    nonisolated func retryGatedQueueWrite<T: Sendable>(
+        _ database: PrioritizedDatabase,
+        label: String,
+        maxAttempts: Int = 3,
+        retryDelay: Duration = .milliseconds(100),
+        _ body: @Sendable @escaping (Database) throws -> T
+    ) async throws -> T {
+        let gate = pendingOperationMutationGate
+        // `Task.detached` does not inherit task-locals, and `PriorityGate`'s
+        // write-tier selection IS a task-local. Re-bind both so detaching for
+        // cancellation immunity cannot silently re-tier a queue write if a
+        // caller is ever wrapped in `PriorityGate.background { }`/`normal { }`.
+        let writePriorityOverride = PriorityGate.writePriorityOverride
+        let inPrivilegedContext = PriorityGate.inPrivilegedContext
+        return try await Task.detached {
+            try await PriorityGate.$inPrivilegedContext.withValue(inPrivilegedContext) {
+                try await PriorityGate.$writePriorityOverride.withValue(writePriorityOverride) {
+                    func attemptOnce() async throws -> T {
+                        let lease = try await gate.acquire()
+                        defer { gate.release(lease) }
+                        return try await database.write(body)
+                    }
+                    for attempt in 1...maxAttempts {
+                        do {
+                            return try await attemptOnce()
+                        } catch {
+                            print("[\(label)] Gated write failed (attempt \(attempt)/\(maxAttempts)): \(error)")
+                            if attempt == maxAttempts { throw error }
+                            try? await Task.sleep(for: retryDelay)
+                        }
+                    }
+                    fatalError("Unreachable")
+                }
+            }
+        }.value
+    }
+
+    /// Reset any `inFlight` row abandoned by a previous owner of the queue —
+    /// generalizing the startup `inFlight -> queued` reset (§9.4,
+    /// `recoverPendingMessageQueueAfterCrash`) from *process* start to
+    /// *ownership* start.
     ///
-    /// Re-fetches after each pass to pick up ops inserted during the drain.
-    /// Skips drain when offline to prevent retry storms.
+    /// Why this is safe: §9.4 already establishes that resetting `inFlight`
+    /// rows is sound "before any drain owner or provider call can exist". At
+    /// process start that precondition is trivially true (nothing has run
+    /// yet). But exactly one drain owner exists at a time — `drainPendingQueue`
+    /// guards on `isDraining` and turns a second caller into a `needsRedrain`
+    /// signal rather than a second claimant — so the SAME precondition holds
+    /// at the start of EVERY ownership, not just the first one ever:
+    ///   - a previous owner cannot still have a provider call outstanding —
+    ///     `drainPendingQueue` awaits `queue.execute(...)` for each claimed
+    ///     op, and `executeSingleOp`'s completion/requeue writes go through
+    ///     `retryGatedQueueWrite`'s detached task, whose `.value` is awaited
+    ///     before that call returns — so all of a previous owner's work has
+    ///     landed before `isDraining` flips back to `false` in its `defer`;
+    ///   - a concurrent owner cannot exist by construction of the
+    ///     `isDraining` guard above.
+    ///
+    /// Therefore any row still `inFlight` when a NEW ownership begins was
+    /// claimed by an owner that is now definitely gone without reaching its
+    /// terminal write — a terminal GRDB write that failed every retry
+    /// attempt, or any other unexpected early return between claim and
+    /// completion (the cancellation case is already healed immediately by
+    /// the detached write in `retryGatedQueueWrite`; this is the backstop for
+    /// every OTHER cause). Under the protected-frontier rule (§9.1)
+    /// `claimFrontierOperation` refuses to steal or skip such a row, and
+    /// crash recovery does not re-run mid-session (`preparePendingQueueForExecution`
+    /// caches successful preparation per `AppDatabase` instance) — so leaving
+    /// one stranded would wedge the ENTIRE global FIFO until the next process
+    /// start. This reset closes that wedge class regardless of cause.
+    ///
+    /// Runs once per ownership — immediately after `isDraining` is set, before
+    /// the frontier-claiming loop below — rather than once per outer
+    /// `while true` re-drain iteration: the SAME owner already resolves its
+    /// previously claimed row via the ordinary per-op completion path before
+    /// looping again, so a later iteration can never find a NEW abandoned row
+    /// that this single upfront reset would have missed. Running it again per
+    /// iteration would be harmless but purely redundant gated writes.
+    private func resetAbandonedInFlightRowsAtOwnershipStart(
+        database: PrioritizedDatabase
+    ) async {
+        do {
+            let reset = try await retryGatedQueueWrite(database, label: "Queue ownership reset") { db in
+                try Self.resetInFlightRowsToQueued(db)
+            }
+            if DebugModeManager.isLoggingEnabled(), reset > 0 {
+                print("[Queue] Ownership-start reset: requeued \(reset) abandoned in-flight operation(s)")
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] Ownership-start reset failed: \(error)")
+            }
+        }
+    }
+
+    /// Drain the durable message-action queue: one global FIFO, one job at a
+    /// time, in SQLite insertion (`rowid`) order (§9.1/§9.4). No lanes, no
+    /// per-account concurrency, no batch splitting — a transient failure at
+    /// the protected frontier stops the whole drain rather than letting a
+    /// later row overtake it.
+    ///
+    /// Claim and completion/requeue both go through the shared
+    /// `pendingOperationMutationGate`, but never while provider I/O (or a
+    /// retry sleep) is in flight — `executeSingleOp`'s call to
+    /// `executeOperation` runs entirely outside any gated region.
+    ///
+    /// The inner loop naturally re-observes ops inserted during the drain
+    /// (each claim re-queries the table), so no separate "extra pass" step
+    /// is needed. Skips drain when offline to prevent retry storms.
     func drainPendingQueue() async {
+        guard NetworkMonitor.checkConnected() else { return }
+        // No drain owner, claim, or action-provider call may exist before the
+        // finite released-row conversion and crash recovery both succeed.
+        guard var queueDatabase = await preparePendingQueueForExecution() else { return }
+        let authorizationHook = pendingQueueAuthorizationHookForTesting
+        pendingQueueAuthorizationHookForTesting = nil
+        if let authorizationHook {
+            await authorizationHook()
+        }
+        guard !Task.isCancelled else { return }
         guard !isDraining else {
             needsRedrain = true
             return
         }
-        guard NetworkMonitor.checkConnected() else { return }
         isDraining = true
         defer {
             isDraining = false
-            if needsRedrain {
+            needsRedrain = false
+        }
+
+        // Single-owner ownership-start reset (see doc comment above): must
+        // run BEFORE the first `claimFrontierOperation`/provider call of this
+        // ownership so a row stranded `inFlight` by a now-gone previous owner
+        // can never wedge the frontier for the rest of the process lifetime.
+        await resetAbandonedInFlightRowsAtOwnershipStart(database: queueDatabase)
+
+        while true {
+            needsRedrain = false
+            pruneRecentlyCompleted()
+            let ctx = DrainContext()
+            let passDatabase = queueDatabase
+
+            while !Task.isCancelled {
+                guard let claimed = await claimFrontierOperation(database: passDatabase) else { break }
+                guard let queue = workQueues[claimed.accountId] else {
+                    // Cannot execute the frontier without its provider. Return it
+                    // and stop: a later job must never overtake an unexecuted
+                    // frontier. This blocks the drain only on a not-yet-connected
+                    // provider — account removal already purges that account's
+                    // rows (AccountManagerSetup.removeAccount), so a missing
+                    // provider here is transient state, not an orphaned row.
+                    print("[Queue] No provider for \(claimed.accountId) — returning frontier op \(claimed.id.prefix(8)) to queued and stopping drain")
+                    await requeueClaimedOperation(id: claimed.id, database: passDatabase)
+                    break
+                }
+                let provider = queue.provider
+                // Outcome captured via Mutex (not a plain var) — the closure
+                // passed to queue.execute is @Sendable, so it cannot capture a
+                // mutable local var directly under Swift 6 strict concurrency.
+                let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
+                await queue.execute(priority: .userAction) {
+                    let result = await self.executeSingleOp(
+                        claimed,
+                        provider: provider,
+                        context: ctx,
+                        database: passDatabase
+                    )
+                    outcomeBox.withLock { $0 = result }
+                }
+                if outcomeBox.withLock({ $0 }) == .stopDrain { break }
+            }
+
+            // One owner remains visibly active across every requested re-drain.
+            // Re-prepare here because a concurrent trigger may have installed a
+            // replacement AppDatabase while this pass was awaiting provider I/O.
+            guard needsRedrain, NetworkMonitor.checkConnected() else { break }
+            var nextDatabase: PrioritizedDatabase?
+            repeat {
+                // Consume the request being prepared. A replacement-database caller
+                // that arrives during this await sets the flag again, forcing a retry
+                // against the newest AppDatabase if this preparation becomes obsolete.
                 needsRedrain = false
-                Task { await drainPendingQueue() }
-            }
-        }
-
-        pruneRecentlyCompleted()
-        let ctx = DrainContext()
-
-        // Max 3 passes to pick up ops inserted during drain.
-        for pass in 0..<3 {
-            let ops: [PendingOperation]
-            do {
-                ops = try await dbPool.read({ db in
-                    try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
-                })
-            } catch {
-                print("[Queue] ERROR: Failed to fetch pending ops: \(error)")
-                break
-            }
-            guard !ops.isEmpty else { break }
-
-            if pass == 0 {
-                let summary = ops.map { "\($0.type.rawValue)(\($0.messageIds.count)msgs)" }.joined(separator: ", ")
-                print("[Queue] Draining \(ops.count) ops: \(summary)")
-            } else {
-                print("[Queue] Drain pass \(pass + 1): \(ops.count) ops remaining/new")
-            }
-
-            // Claim all valid ops (unchanged: failedAccounts / provider checks / atomic claim).
-            var claimed: [PendingOperation] = []
-            for op in ops {
-                if ctx.failedAccounts.contains(op.accountId) { continue }
-                guard providers[op.accountId] != nil else {
-                    print("[Queue] No provider for \(op.accountId) — skipping \(op.type.rawValue)")
-                    continue
-                }
-
-                let currentOp: PendingOperation?
-                do {
-                    currentOp = try await dbPool.write { db -> PendingOperation? in
-                        guard var fetched = try PendingOperation.fetchOne(db, key: op.id) else {
-                            return nil
-                        }
-                        if fetched.status == PendingStatus.cancelled.rawValue {
-                            _ = try PendingOperation.deleteOne(db, key: fetched.id)
-                            print("[Queue] Op \(op.id.prefix(8)) cancelled by undo, deleted")
-                            return nil
-                        }
-                        if fetched.status == PendingStatus.inFlight.rawValue {
-                            return nil
-                        }
-                        fetched.status = PendingStatus.inFlight.rawValue
-                        try fetched.save(db)
-                        return fetched
-                    }
-                } catch {
-                    print("[Queue] ERROR: Failed to claim op \(op.id): \(error)")
-                    continue
-                }
-                guard let currentOp else { continue }
-                claimed.append(currentOp)
-            }
-
-            // Connected-component lane grouping (F1) — pure, see buildLanes doc comment.
-            let lanes = Self.buildLanes(claimed)
-            guard !lanes.isEmpty else { break }
-
-            // Launch one Task per lane. Each task drains its lane sequentially,
-            // halting (and requeuing the rest of the lane) on `.haltLane` so a later
-            // op never runs ahead of an unresolved predecessor sharing a message id.
-            // Different lanes (disjoint connected components) run concurrently.
-            var tasks: [Task<Void, Never>] = []
-            for lane in lanes {
-                let capturedLane = lane
-                let capturedCtx = ctx
-                let task = Task { [self] in
-                    for (index, op) in capturedLane.enumerated() {
-                        if capturedCtx.failedAccounts.contains(op.accountId) {
-                            try? await retryWrite(dbPool, label: "Queue") { db in
-                                var updated = op
-                                updated.status = PendingStatus.queued.rawValue
-                                try updated.save(db)
-                            }
-                            continue
-                        }
-                        guard let queue = self.workQueues[op.accountId] else {
-                            try? await retryWrite(dbPool, label: "Queue") { db in
-                                var updated = op
-                                updated.status = PendingStatus.queued.rawValue
-                                try updated.save(db)
-                            }
-                            continue
-                        }
-                        let provider = queue.provider
-                        // Outcome captured via Mutex (not a plain var) — the closure
-                        // passed to queue.execute is @Sendable, so it cannot capture a
-                        // mutable local var directly under Swift 6 strict concurrency.
-                        let outcomeBox = Mutex<SingleOpOutcome>(.proceed)
-                        await queue.execute(priority: .userAction) {
-                            let result = await self.executeSingleOp(op, provider: provider, context: capturedCtx)
-                            outcomeBox.withLock { $0 = result }
-                        }
-                        if outcomeBox.withLock({ $0 }) == .haltLane {
-                            // Requeue the REMAINING claimed ops of this lane — exactly
-                            // like the failedAccounts requeue path above — then stop.
-                            let remaining = capturedLane[(index + 1)...]
-                            for remainingOp in remaining {
-                                try? await retryWrite(dbPool, label: "Queue") { db in
-                                    var updated = remainingOp
-                                    updated.status = PendingStatus.queued.rawValue
-                                    try updated.save(db)
-                                }
-                            }
-                            break
-                        }
-                    }
-                }
-                tasks.append(task)
-            }
-            for task in tasks { await task.value }
-
-            if !ctx.executedAny { break }
-            ctx.executedAny = false
-        }
-
-        // Post-drain: sync destination folders so new UIDs are picked up immediately.
-        if !ctx.foldersToSync.isEmpty {
-            print("[MoveTrace] post-drain sync — syncing \(ctx.foldersToSync.count) destination folders: \(ctx.foldersToSync)")
-            for key in ctx.foldersToSync {
-                let parts = key.split(separator: "|", maxSplits: 1)
-                guard parts.count == 2 else { continue }
-                let accountId = String(parts[0])
-                let folderPath = String(parts[1])
-                guard let queue = workQueues[accountId] else { continue }
-                guard let folder = try? await dbPool.read({ db in
-                    try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
-                }) else {
-                    print("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
-                    continue
-                }
-                do {
-                    try await queue.execute(priority: .userAction) {
-                        try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
-                    }
-                    print("[MoveTrace] post-drain sync — completed for \(folder.name)")
-                } catch {
-                    print("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
-                }
-            }
+                nextDatabase = await preparePendingQueueForExecution()
+            } while nextDatabase == nil
+                && needsRedrain
+                && NetworkMonitor.checkConnected()
+            guard let nextDatabase else { break }
+            queueDatabase = nextDatabase
         }
     }
 
-    /// Execute a single claimed op against its provider. Updates shared DrainContext
-    /// with results (executedAny, failedAccounts, foldersToSync, recentActions).
-    /// Returns the outcome (`.proceed`/`.haltLane`) so the per-lane drain loop knows
-    /// whether it's safe to run this lane's next op. `internal` (not `private`) so
-    /// tests can call it directly against a `MockEmailProvider`.
-    func executeSingleOp(_ currentOp: PendingOperation, provider: any EmailProvider, context: DrainContext) async -> SingleOpOutcome {
+    /// Return a claimed (`.inFlight`) row to `.queued`, payload unchanged.
+    /// Used when the drain cannot execute the claimed frontier (e.g. no
+    /// registered provider yet) and by `executeSingleOp`'s transient-failure
+    /// path. `internal` (not `private`) so tests can call it directly.
+    @discardableResult
+    func requeueClaimedOperation(
+        id: String,
+        database: PrioritizedDatabase? = nil
+    ) async -> Bool {
+        let queueDatabase = database ?? dbPool
+        do {
+            return try await retryGatedQueueWrite(queueDatabase, label: "Queue") { db -> Bool in
+                guard var latest = try PendingOperation.fetchOne(db, key: id),
+                      latest.status == PendingStatus.inFlight.rawValue else {
+                    return false
+                }
+                latest.status = PendingStatus.queued.rawValue
+                try latest.update(db)
+                return true
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] CRITICAL: Failed to requeue claimed op \(id): \(error)")
+            }
+            return false
+        }
+    }
+
+    func executeSingleOp(
+        _ claimedOp: PendingOperation,
+        provider: any EmailProvider,
+        context: DrainContext,
+        database: PrioritizedDatabase? = nil
+    ) async -> SingleOpOutcome {
+        let queueDatabase = database ?? dbPool
+        let currentOp = claimedOp
         let opType = currentOp.type.rawValue
-        let opMsgCount = currentOp.messageIds.count
 
         do {
-            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
-                try await self.executeOperation(currentOp, provider: provider)
+            try await withTimeout(
+                seconds: SyncConfig.pendingOperationTimeoutSeconds
+            ) {
+                try await self.executeOperation(
+                    currentOp,
+                    provider: provider,
+                    database: queueDatabase
+                )
             }
-            // TOCTOU fix: record recentActions BEFORE deleting PendingOp.
+            // TOCTOU fix: publish recent protection BEFORE deleting PendingOp.
             // Sync engine has two guards against re-inserting moved messages:
-            //   1. pendingDestructiveIds — read inside the sync write transaction
-            //   2. recentMoveIdsByFolder — snapshot from actor before the sync write
-            // If we delete the PendingOp first and record recentAction after, there's
-            // a window where neither guard is active (PendingOp gone from DB, recentAction
-            // not yet on actor). By recording recentAction first, at every instant at least
-            // one guard is active:
-            //   - Before step 3 (delete): PendingOp in DB → pendingDestructiveIds catches it
-            //   - After step 2 (record): recentAction on actor → recentMoveIdsByFolder catches it
+            //   1. pendingDestructiveIds — sampled before the actor map and reloaded
+            //      inside the sync write transaction
+            //   2. exact directional membership keys in recentlyCompleted — sampled
+            //      between them
+            // Publishing first and consuming DB→actor→DB keeps at least one visible:
+            //   - Before step 3 (delete): one pending snapshot catches it
+            //   - After step 2 (record): the exact source-membership key catches it
             // If app crashes between steps 2 and 3, the PendingOp re-executes (idempotent).
 
-            // Step 1: Collect rfc822MessageIds (read-only, separate from delete).
-            var actionInfos: [(String, String?, String?)] = [] // (opMsgId, rfc822MessageId, numericMessageId)
-            let trackedTypes: Set<OperationType> = [
-                .archive, .delete, .move,
-                .markRead, .markUnread, .markFlagged, .markUnflagged, .setTag, .removeTag
-            ]
-            if trackedTypes.contains(currentOp.type) {
-                do {
-                    actionInfos = try await dbPool.read { db -> [(String, String?, String?)] in
-                        var infos: [(String, String?, String?)] = []
-                        for msgId in currentOp.messageIds {
-                            let normalizedMsgId = EmailFilter.normalizeMessageId(msgId)
-                            let header = try MessageHeader
-                                .filter(
-                                    (Column("messageId") == msgId || Column("rfc822MessageId") == normalizedMsgId) &&
-                                    Column("accountId") == currentOp.accountId
-                                )
-                                .fetchOne(db)
-                            infos.append((msgId, header?.rfc822MessageId, header?.messageId))
-                        }
-                        return infos
-                    }
-                } catch {
-                    print("[Queue] WARNING: Failed to collect rfc822 info for \(currentOp.id): \(error)")
-                }
-            }
-
-            // Step 2: Record in recentlyCompleted (30s TTL) BEFORE deleting PendingOp.
+            // Step 1: Record in recentlyCompleted (30s TTL) BEFORE deleting PendingOp.
             // Bridges the gap between PendingOp deletion and server-side state propagation.
-            // This ensures sync engine always sees the protection entry.
-            var completedIds: [String] = []
-            for (msgId, rfc822, numericId) in actionInfos {
-                completedIds.append(msgId)
-                if let rfc822 { completedIds.append(rfc822) }
-                if let numericId, numericId != msgId { completedIds.append(numericId) }
+            // Durable message actions already contain canonical RFC Message-IDs, so
+            // protection never reads or publishes transient provider resource IDs.
+            let completedIds = claimedOp.messageIds
+            switch currentOp.type {
+            case .archive, .delete, .move:
+                let destinationIdentities: [(messageId: String, folderPath: String)]
+                if let destinationPath = currentOp.destinationPath {
+                    destinationIdentities = completedIds.map { ($0, destinationPath) }
+                } else {
+                    destinationIdentities = []
+                }
+                recordRecentlyCompletedDestructiveMemberships(
+                    sourceMessageIds: completedIds,
+                    destinationIdentities: destinationIdentities,
+                    accountId: currentOp.accountId,
+                    sourceFolderPath: currentOp.folderPath,
+                    scope: provider.messageFieldScope
+                )
+            case .markRead, .markUnread:
+                recordRecentlyCompletedFieldState(
+                    messageIds: completedIds,
+                    accountId: currentOp.accountId,
+                    folderPath: currentOp.folderPath,
+                    scope: provider.messageFieldScope,
+                    value: .read(currentOp.type == .markRead)
+                )
+            case .markFlagged, .markUnflagged:
+                recordRecentlyCompletedFieldState(
+                    messageIds: completedIds,
+                    accountId: currentOp.accountId,
+                    folderPath: currentOp.folderPath,
+                    scope: provider.messageFieldScope,
+                    value: .flagged(currentOp.type == .markFlagged)
+                )
+            case .setTag, .removeTag:
+                let completedTag: String?
+                if currentOp.type == .setTag {
+                    guard let tagValue = currentOp.tagValue,
+                          ActionTag(rawValue: tagValue) != nil else {
+                        throw QueueRecoveryError.invalidActionTag(currentOp.tagValue)
+                    }
+                    completedTag = tagValue
+                } else {
+                    completedTag = nil
+                }
+                recordRecentlyCompletedFieldState(
+                    messageIds: completedIds,
+                    accountId: currentOp.accountId,
+                    folderPath: currentOp.folderPath,
+                    scope: provider.messageFieldScope,
+                    value: .actionTag(completedTag)
+                )
+            default:
+                recordRecentlyCompletedIdentities(
+                    messageIds: completedIds,
+                    accountId: currentOp.accountId,
+                    folderPath: currentOp.folderPath,
+                    scope: provider.messageFieldScope
+                )
             }
-            recordRecentlyCompleted(messageIds: completedIds)
 
             // Step 3: Delete PendingOp. MUST succeed — remote op already completed.
             // If we don't delete, it re-executes on next drain (idempotent but wasteful).
             do {
-                try await retryWrite(dbPool, label: "Queue") { db in
+                try await retryGatedQueueWrite(queueDatabase, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
             } catch {
                 print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
             }
-            if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
-                context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
-            }
-            // Sync Drafts folder after draft save/delete so MessageHeaders reflect server state.
-            // After saveDraft: the sync's UID remap detection matches our optimistic header
-            // (placeholder messageId) to the real server header by rfc822MessageId, migrating
-            // the header in-place and preserving the body + local state.
-            if [.saveDraft, .deleteDraft].contains(currentOp.type) {
-                context.foldersToSync.insert("\(currentOp.accountId)|\(currentOp.folderPath)")
-            }
-            context.executedAny = true
             return .proceed
         } catch {
-            // UID resolution failed on tag ops — skip (best-effort).
-            // Tag removal is queued before move to prevent flag copying on IMAP MOVE.
-            // If we can't resolve the UID, skipping the tag op is far better than
-            // blocking the entire account's drain (including the actual archive/move).
-            if case ProviderError.uidResolutionFailed = error,
-               [.setTag, .removeTag].contains(currentOp.type) {
-                print("[Queue] Tag op UID resolution failed for \(currentOp.messageIds.first ?? "?") — skipping (best-effort)")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                }
-                context.executedAny = true
-                return .proceed
-            }
-            if isMessageNotFoundError(error) {
-                if currentOp.messageIds.count > 1 {
-                    // Batch op hit messageNotFound — one message is gone but others
-                    // may still need processing. Split into individual single-message
-                    // ops so each can succeed/fail independently.
-                    print("[Queue] Conflict in batch \(opType) (\(opMsgCount) msgs) — splitting into individual ops")
-                    do {
-                        try await dbPool.write { db in
-                            for msgId in currentOp.messageIds {
-                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
-                                // Split ops inherit the batch's queue position — they are
-                                // the SAME user intention, re-shaped. Without this, the
-                                // default `PendingOperation.init` createdAt (Date()) would
-                                // stamp a LATER timestamp than a same-lane sibling op queued
-                                // between the batch and the split, starving the split op
-                                // behind it on every later buildLanes pass (createdAt-order
-                                // invariant).
-                                splitOp.createdAt = currentOp.createdAt
-                                try splitOp.insert(db)
-                            }
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                    } catch {
-                        print("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
-                    }
-                    context.executedAny = true
-                    // Halt the lane rather than .proceed: the split singles are
-                    // freshly queued (not yet executed) and a LATER same-lane op
-                    // sharing a member id (e.g. a chained move of one of the split
-                    // messages) must never run ahead of them this pass — that would
-                    // race/misread state the split children haven't written yet and
-                    // could get itself wrongly confirmed-stale and dropped. Same
-                    // never-run-ahead invariant as the uidResolutionFailed retry
-                    // path below; the lane loop requeues the rest of the lane back
-                    // to `.queued` so it serializes behind the split ops on a later
-                    // pass/drain.
-                    return .haltLane
-                }
-                // Single-message conflict — drop (server wins)
-                print("[Queue] Conflict: \(opType) — message not found, dropping")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                }
-                // If the error was a structurally-confirmed permanent gone (HTTP 404/410
-                // or ProviderError.messageNotFound), also delete the local header. The
-                // message is verified gone on the server; retaining a ghost row causes
-                // other queues (body fetch, AI) to retry forever.
-                // We deliberately DO NOT delete on the string-matching branch of
-                // isMessageNotFoundError — too risky for false positives.
-                if isConfirmedGoneError(error), let msgId = currentOp.messageIds.first {
-                    // Scope delete to the exact (account, folder, messageId) row — broader
-                    // matches risk deleting unrelated messages that happen to share a UID
-                    // in a different IMAP folder.
-                    let hid = MessageIdentity.headerId(accountId: currentOp.accountId, folderPath: currentOp.folderPath, messageId: msgId)
-                    await deleteConfirmedGoneHeader(headerId: hid, reason: "\(opType) 404")
-                }
-                context.executedAny = true
-                return .proceed
-            }
-            // Permanently invalid operation — drop immediately (will never succeed on retry).
-            // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
-            if isPermanentlyInvalidError(error) {
-                print("[Queue] Permanently invalid \(opType): \(error) — dropping")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                }
-                context.executedAny = true
-                return .proceed
-            }
-            // UID resolution failed — message not found in source folder via IMAP SEARCH.
-            // Confirm staleness by checking destination (for move ops) or drop (for flag ops).
-            if case ProviderError.uidResolutionFailed(let failedId) = error {
-                // Batch ops: split into singles so each can be confirmed independently.
-                if currentOp.messageIds.count > 1 {
-                    print("[Queue] UID resolution failed in batch \(opType) (\(opMsgCount) msgs) — splitting into individual ops")
-                    do {
-                        try await dbPool.write { db in
-                            for msgId in currentOp.messageIds {
-                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
-                                // Split ops inherit the batch's queue position — they are
-                                // the SAME user intention, re-shaped. See the identical
-                                // comment in the messageNotFound split above.
-                                splitOp.createdAt = currentOp.createdAt
-                                try splitOp.insert(db)
-                            }
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                    } catch {
-                        print("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
-                    }
-                    context.executedAny = true
-                    // Halt the lane rather than .proceed — see the identical
-                    // never-run-ahead comment on the messageNotFound split above.
-                    // A later same-lane op (e.g. a chained move of one of the
-                    // split messages) must serialize BEHIND the freshly-queued
-                    // split singles, not run ahead of them this pass.
-                    return .haltLane
-                }
-
-                // Single-message op: confirm staleness.
-                if let dest = currentOp.destinationPath, currentOp.type == .move,
-                   let imapProvider = provider as? IMAPProvider {
-                    // Move op on IMAP: check if message is in destination folder.
-                    // Found → confirmed done. Not found → confirmed stale (can't recover). Either way, drop.
-                    // Connection error → can't confirm, fall through to retry.
-                    do {
-                        let existsInDest = try await imapProvider.messageExistsInFolder(rfc822MessageId: failedId, folderPath: dest)
-                        if existsInDest {
-                            print("[Queue] Confirmed done: \(opType) \(failedId) — already in destination \(dest), dropping")
-                        } else {
-                            print("[Queue] Confirmed stale: \(opType) \(failedId) — not in source \(currentOp.folderPath) or destination \(dest), dropping")
-                        }
-                        try? await retryWrite(dbPool, label: "Queue") { db in
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                        context.executedAny = true
-                        return .proceed
-                    } catch {
-                        // If destination folder itself doesn't exist (NONEXISTENT, etc.),
-                        // the message can't be in it — confirmed stale.
-                        let destCheckDesc = "\(error)"
-                        if destCheckDesc.contains("NONEXISTENT") || destCheckDesc.contains("does not exist") || destCheckDesc.contains("Mailbox doesn't exist") {
-                            print("[Queue] Confirmed stale: \(opType) \(failedId) — not in source \(currentOp.folderPath), destination \(dest) no longer exists, dropping")
-                            try? await retryWrite(dbPool, label: "Queue") { db in
-                                _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                            }
-                            context.executedAny = true
-                            return .proceed
-                        }
-                        print("[Queue] UID resolution failed for \(opType) \(failedId), destination check failed: \(error) — will retry")
-                    }
-                } else if currentOp.type != .move {
-                    // Flag/mark op: message not in folder via SEARCH. Per resolveUID's
-                    // documented contract (IMAPProvider.swift) a SEARCH miss can be
-                    // transient (server-side indexing lag, concurrent UID renumbering) —
-                    // so retry with a cap (matching move ops' destination-check treatment)
-                    // instead of an unconditional drop, so we don't discard user intention
-                    // on a false-negative SEARCH.
-                    //
-                    // Caps on the DEDICATED uidResolutionRetryCount, NOT the shared
-                    // retryCount (bumped below by the generic transient-error branch on
-                    // every ordinary connection blip). Reading the shared counter here
-                    // let a few unrelated blips pre-exhaust this budget before the op's
-                    // first real SEARCH miss, causing a false "confirmed stale" drop —
-                    // dropping user intention, the exact bug this cap exists to prevent.
-                    if currentOp.uidResolutionRetryCount >= SyncConfig.maxUidResolutionRetries {
-                        print("[Queue] Confirmed stale: \(opType) \(failedId) — message not in folder \(currentOp.folderPath) after \(currentOp.uidResolutionRetryCount) uidResolution retries, dropping")
-                        try? await retryWrite(dbPool, label: "Queue") { db in
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                        context.executedAny = true
-                        return .proceed
-                    }
-                    print("[Queue] UID resolution failed for \(opType) \(failedId) — message not in folder \(currentOp.folderPath), uidResolution retry \(currentOp.uidResolutionRetryCount + 1)/\(SyncConfig.maxUidResolutionRetries) (not blocking account)")
-                    try? await retryWrite(dbPool, label: "Queue") { db in
-                        var updated = currentOp
-                        updated.status = PendingStatus.queued.rawValue
-                        updated.uidResolutionRetryCount += 1
-                        try updated.save(db)
-                    }
-                    return .haltLane
-                }
-
-                // Fall through: retry (destination check failed or non-IMAP move provider)
-                print("[Queue] UID resolution failed for \(opType) \(currentOp.messageIds.first ?? "?") — will retry (not blocking account)")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    var updated = currentOp
-                    updated.status = PendingStatus.queued.rawValue
-                    try updated.save(db)
-                }
-                return .haltLane
-            }
-            // Connection/transient error — reset op to queued and mark account failed.
-            // NEVER drop on age alone — transient errors don't confirm the op is stale.
-            // Staleness is confirmed by: messageNotFound (server says gone), or
-            // uidResolutionFailed + destination check (not in source or destination).
-            // failedAccounts prevents hammering within a single drain.
+            // Law 4/5: the provider adapter — not the queue — normalizes an
+            // authoritative stale/no-op outcome to a normal return. Once a
+            // provider action method throws at all, the queue treats it
+            // uniformly as transient/uncertain: NEVER drop on age or on a
+            // guessed error shape. Staleness is confirmed only by the
+            // provider's normal return; a throw here always means retry. The
+            // frontier is protected (§9.1): stopping the drain here prevents
+            // any later row from overtaking this unresolved one.
             let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
             print("[Queue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
             // Deep diagnostic on the failing op — fires once per (drain, opId) so a
             // stuck op that retries every drain doesn't fill the log. Dumps full op
-            // fields, error structural unwrap, classifier results, and the DB rows
-            // scoped to the exact message + the involved folders.
-            if !context.diagnosedOpIds.contains(currentOp.id) {
-                context.diagnosedOpIds.insert(currentOp.id)
-                await logStuckOpDiagnostic(currentOp, error: error)
+            // fields, error structural unwrap, and the DB rows scoped to the exact
+            // message + the involved folders.
+            if context.markDiagnosedIfNew(operationId: currentOp.id) {
+                await logStuckOpDiagnostic(
+                    currentOp,
+                    error: error,
+                    database: queueDatabase
+                )
             }
             // Self-heal: a .move op whose destination Folder doesn't exist locally
             // is unsalvageable on retry. This happens when the account's folder list
@@ -608,79 +640,30 @@ extension AccountManager {
             // wins-on-conflict (ADR-IOS-001): if server already moved/deleted the
             // message, sync brings the truth in; if not, the user can re-issue.
             if currentOp.type == .move, let destPath = currentOp.destinationPath {
-                let destMissing: Bool = (try? await dbPool.read { db in
+                let destMissing: Bool = (try? await queueDatabase.read { db in
                     try Folder.fetchOne(db, key: "\(currentOp.accountId):\(destPath)") == nil
                 }) ?? false
                 if destMissing {
                     print("[Queue] Self-heal: dropping \(opType) — destination Folder missing locally: \(currentOp.accountId):\(destPath)")
-                    try? await retryWrite(dbPool, label: "Queue") { db in
+                    try? await retryGatedQueueWrite(queueDatabase, label: "Queue") { db in
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
-                    context.executedAny = true
                     return .proceed
                 }
             }
-            try? await retryWrite(dbPool, label: "Queue") { db in
+            try? await retryGatedQueueWrite(queueDatabase, label: "Queue") { db in
                 var updated = currentOp
                 updated.status = PendingStatus.queued.rawValue
                 // Bump retryCount on each failure so the value matches reality (and
                 // is visible in [QueueDiag] dumps). Previously this stayed at 0
                 // forever, masking the runaway-retry case where we observed
-                // `retryCount=0 ageHours=217` on the same op.
+                // `retryCount=0 ageHours=217` on the same op. Diagnostics-only —
+                // never a drop policy.
                 updated.retryCount += 1
                 try updated.save(db)
             }
-            context.failedAccounts.insert(currentOp.accountId)
-            return .haltLane
+            return .stopDrain
         }
-    }
-
-    /// Returns true if the error indicates the message no longer exists (conflict — drop op).
-    ///
-    /// Matches three classes of signal:
-    /// 1. `ProviderError.messageNotFound` — providers that classify explicitly.
-    /// 2. `ProviderError.networkError` wrapping an HTTP 404. Must unwrap both the
-    ///    `HTTPError.networkError(statusCode:)` shape (Exchange/Gmail providers throw
-    ///    this — a plain Swift enum that does NOT bridge to `NSError` with code=404)
-    ///    AND the `NSError(code: 404)` shape (other paths that throw `NSError` directly).
-    /// 3. IMAP server-side rejection strings ("NONEXISTENT", "UID not found", etc.).
-    ///
-    /// Strict structural matches (1 and 2) are additionally surfaced via
-    /// `isConfirmedGoneError`, which gates destructive header deletion.
-    nonisolated func isMessageNotFoundError(_ error: Error) -> Bool {
-        if case ProviderError.messageNotFound = error { return true }
-        if case ProviderError.networkError(let underlying) = error {
-            if case HTTPError.networkError(let statusCode) = underlying, statusCode == 404 {
-                return true
-            }
-            if (underlying as NSError).code == 404 { return true }
-        }
-        let desc = "\(error)"
-        if desc.contains("no such message") || desc.contains("UID not found") ||
-           desc.contains("Message not found") || desc.contains("NONEXISTENT") { return true }
-        return false
-    }
-
-    /// Stricter sibling of `isMessageNotFoundError` used to decide whether we may also
-    /// DELETE the local messageHeader row. Only fires on structural signals that
-    /// unambiguously confirm the message is gone from the server:
-    ///   - `ProviderError.messageNotFound` (providers that classify explicitly)
-    ///   - HTTP 404 / 410 (server responded with a permanent not-found status)
-    ///
-    /// Deliberately does NOT match the string-matching fallback in
-    /// `isMessageNotFoundError` — IMAP error descriptions can be noisy and we never
-    /// want a false positive to permanently delete user data.
-    nonisolated func isConfirmedGoneError(_ error: Error) -> Bool {
-        if case ProviderError.messageNotFound = error { return true }
-        if case ProviderError.networkError(let underlying) = error {
-            if case HTTPError.networkError(let statusCode) = underlying,
-               statusCode == 404 || statusCode == 410 {
-                return true
-            }
-            let nsCode = (underlying as NSError).code
-            if nsCode == 404 || nsCode == 410 { return true }
-        }
-        return false
     }
 
     /// Delete a single messageHeader (identified by its full primary key) that has
@@ -694,14 +677,22 @@ extension AccountManager {
     /// messageId can identify completely different messages across folders, and
     /// a broader delete would orphan unrelated rows.
     ///
-    /// ONLY call this when `isConfirmedGoneError` returned true (Exchange/Gmail
-    /// 404/410 or ProviderError.messageNotFound) or the IMAP-backfill miss-count
-    /// threshold has been reached after an rfc822 confirmation. Never call on a
-    /// transient connection error.
-    func deleteConfirmedGoneHeader(headerId: String, reason: String) async {
+    /// ONLY call this on a structurally confirmed permanent-gone signal
+    /// (`isHttpGoneStatus` — Exchange/Gmail HTTP 404/410) or the IMAP-backfill
+    /// miss-count threshold reached after an rfc822 confirmation. Never call
+    /// on a transient connection error. The generic `PendingOperation` drain
+    /// no longer calls this (Round E/Law 5 — the queue does not interpret
+    /// provider error types or delete local headers); `BackfillBodyQueue` and
+    /// `ActiveBodyQueue` remain the callers.
+    func deleteConfirmedGoneHeader(
+        headerId: String,
+        reason: String,
+        database: PrioritizedDatabase? = nil
+    ) async {
+        let queueDatabase = database ?? dbPool
         let existed: Bool
         do {
-            existed = try await dbPool.write { db in
+            existed = try await queueDatabase.write { db in
                 try MessageHeader.deleteOne(db, key: headerId)
             }
         } catch {
@@ -721,19 +712,24 @@ extension AccountManager {
     /// so it fires at most once per drain per opId. Logs:
     ///   - Full op fields (accountId, folderPath, destinationPath, retryCount, …)
     ///   - Error structural unwrap (ProviderError → HTTPError statusCode, NSError domain/code)
-    ///   - Classifier verdicts (isMessageNotFound, isConfirmedGone, isPermanentlyInvalid)
     ///   - DB rows scoped to the exact message + the involved folders:
     ///       * MessageHeader rows for each msgId in the op (any folder, same account)
     ///       * Source Folder row (accountId:folderPath)
     ///       * Destination Folder row (accountId:destinationPath)
     ///       * All Folders with role=.trash for the account (sanity check role lookup)
-    func logStuckOpDiagnostic(_ op: PendingOperation, error: Error) async {
+    func logStuckOpDiagnostic(
+        _ op: PendingOperation,
+        error: Error,
+        database: PrioritizedDatabase? = nil
+    ) async {
+        let queueDatabase = database ?? dbPool
         let ageHours = Date().timeIntervalSince(op.createdAt) / 3600
         print("[QueueDiag] === op=\(op.id) type=\(op.type.rawValue) ===")
         print("[QueueDiag] op: accountId=\(op.accountId) folderPath=\(op.folderPath) destinationPath=\(op.destinationPath ?? "<nil>") tagValue=\(op.tagValue ?? "<nil>") userLabelId=\(op.userLabelId ?? "<nil>")")
-        print("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) uidResolutionRetryCount=\(op.uidResolutionRetryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
+        print("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
 
-        // Error structural unwrap — confirms whether classifiers should/shouldn't match
+        // Error structural unwrap — diagnostic only (Round E/Law 5: the queue
+        // no longer interprets provider error types to make decisions).
         print("[QueueDiag] error.type=\(type(of: error)) error=\(error)")
         if case ProviderError.networkError(let underlying) = error {
             print("[QueueDiag] underlying.type=\(type(of: underlying)) underlying=\(underlying)")
@@ -743,11 +739,14 @@ extension AccountManager {
             let ns = underlying as NSError
             print("[QueueDiag] NSError domain=\(ns.domain) code=\(ns.code)")
         }
-        print("[QueueDiag] classifier: isMessageNotFoundError=\(isMessageNotFoundError(error)) isConfirmedGoneError=\(isConfirmedGoneError(error)) isPermanentlyInvalidError=\(isPermanentlyInvalidError(error))")
+        // No provider-error classifier verdicts to print here (Round E/Law
+        // 5): the generic queue no longer interprets provider error types —
+        // ANY throw is uniformly transient/uncertain. The structural unwrap
+        // above is diagnostic only.
 
         // Message-scoped DB dump — only rows relevant to this op + its folders.
         do {
-            try await dbPool.read { db in
+            try await queueDatabase.read { db in
                 for msgId in op.messageIds {
                     let normalized = EmailFilter.normalizeMessageId(msgId)
                     let headers = try MessageHeader
@@ -798,35 +797,15 @@ extension AccountManager {
         print("[QueueDiag] === end op=\(op.id) ===")
     }
 
-    /// Returns true if the error indicates the operation is permanently invalid and should be dropped.
-    /// E.g., Gmail rejects label modifications on system labels like DRAFT — these will never succeed.
-    /// Only matches 400-level errors from REST providers (Gmail/Exchange) to avoid false positives.
-    ///
-    /// Must accept TWO underlying-error shapes — they come from different throw sites:
-    ///   - `HTTPError.networkError(statusCode: 400)` — thrown by `request()` helpers via
-    ///     `catch let e as HTTPError { throw ProviderError.networkError(underlying: e) }`.
-    ///     This is a plain Swift enum; its NSError bridge gives `domain="TabMail.HTTPError"
-    ///     code=1` (the enum case ordinal), NOT `code=400`. So the NSError-domain check
-    ///     below would never match this shape — pattern-match the enum directly.
-    ///   - `NSError(domain: "Gmail"|"Exchange", code: 400)` — thrown by retry-aware paths.
-    nonisolated func isPermanentlyInvalidError(_ error: Error) -> Bool {
-        if case ProviderError.networkError(let underlying) = error {
-            if case HTTPError.networkError(let statusCode) = underlying, statusCode == 400 {
-                return true
-            }
-            let ns = underlying as NSError
-            if ns.code == 400 && (ns.domain == "Gmail" || ns.domain == "Exchange") {
-                return true
-            }
-        }
-        return false
-    }
-
-    func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws {
+    func executeOperation(
+        _ op: PendingOperation,
+        provider: any EmailProvider,
+        database: PrioritizedDatabase? = nil
+    ) async throws {
         switch op.type {
         case .archive, .delete:
             // Legacy enum cases — all new ops use .move. No-op for any stale rows.
-            return
+            break
         case .move:
             guard let dest = op.destinationPath else {
                 print("[MoveTrace] ERROR: move op missing destinationPath")
@@ -857,15 +836,9 @@ extension AccountManager {
             // queued rows flush cleanly. No provider write.
             break
         case .markReplied:
-            if let imap = provider as? IMAPProvider {
-                try await imap.markReplied(ids: op.messageIds, folder: op.folderPath)
-            }
-            // Gmail/Exchange REST APIs don't support \Answered flag — local state preserved by sync
+            try await provider.markReplied(ids: op.messageIds, folder: op.folderPath)
         case .markForwarded:
-            if let imap = provider as? IMAPProvider {
-                try await imap.markForwarded(ids: op.messageIds, folder: op.folderPath)
-            }
-            // Gmail/Exchange REST APIs don't support $Forwarded keyword — local state preserved by sync
+            try await provider.markForwarded(ids: op.messageIds, folder: op.folderPath)
         case .saveDraft:
             // messageIds[0] = local Draft table key (draftId)
             // folderPath = server-side Drafts folder path
@@ -873,77 +846,197 @@ extension AccountManager {
             try await DraftStore.shared.pushDraftToServer(
                 draftId: draftId,
                 provider: provider,
-                draftsFolderPath: op.folderPath
+                draftsFolderPath: op.folderPath,
+                database: database ?? dbPool
             )
         case .deleteDraft:
             // messageIds[0] = serverDraftId (IMAP UID / Gmail ID)
             // folderPath = server-side Drafts folder path
             guard let serverDraftId = op.messageIds.first else { return }
-            // Silently swallow 404/410: some providers (notably Gmail) auto-
-            // delete a draft when the corresponding message is sent, so by the
-            // time our queueDraftDelete runs the server row is already gone.
-            // Treat "not found" as a successful delete.
-            do {
-                try await provider.deleteDraft(draftId: serverDraftId, draftsFolderPath: op.folderPath)
-            } catch {
-                let desc = String(describing: error).lowercased()
-                let isNotFound = desc.contains("404") || desc.contains("410")
-                    || desc.contains("not found") || desc.contains("notfound")
-                    || desc.contains("does not exist")
-                if isNotFound {
-                    print("[Queue] deleteDraft: server draft \(serverDraftId) already gone — treating as success")
-                } else {
-                    throw error
-                }
-            }
+            // Every provider normalizes "already gone" (Gmail auto-deletes a
+            // draft when its message sends; Exchange/IMAP likewise) to a
+            // normal return internally (Law 4) — no queue-side string match.
+            try await provider.deleteDraft(draftId: serverDraftId, draftsFolderPath: op.folderPath)
         case .addUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return }
-            if let gmail = provider as? GmailProvider {
-                try await gmail.modifyMessage(id: msgId, addLabelIds: [labelId])
-            } else if provider is ExchangeProvider {
-                print("[Queue] addUserLabel not yet supported for Exchange")
-            } else if let imap = provider as? IMAPProvider {
-                try await imap.setUserLabel(messageId: msgId, keyword: labelId, add: true, folder: op.folderPath)
-            }
+            guard let labelId = op.userLabelId else { return }
+            try await provider.setUserLabel(
+                ids: op.messageIds,
+                labelId: labelId,
+                present: true,
+                folder: op.folderPath
+            )
         case .removeUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return }
-            if let gmail = provider as? GmailProvider {
-                try await gmail.modifyMessage(id: msgId, removeLabelIds: [labelId])
-            } else if provider is ExchangeProvider {
-                print("[Queue] removeUserLabel not yet supported for Exchange")
-            } else if let imap = provider as? IMAPProvider {
-                try await imap.setUserLabel(messageId: msgId, keyword: labelId, add: false, folder: op.folderPath)
-            }
+            guard let labelId = op.userLabelId else { return }
+            try await provider.setUserLabel(
+                ids: op.messageIds,
+                labelId: labelId,
+                present: false,
+                folder: op.folderPath
+            )
         }
     }
 
-    /// On app launch, recover from any crash during the previous session.
-    /// Resets inFlight ops back to queued (they were mid-execution when app died),
-    /// then drains the entire queue. All operations are idempotent, so re-execution is safe.
-    func reconcilePendingOperations() async {
-        // Crash recovery MUST succeed — inFlight ops from the previous session are stuck
-        // and will never drain unless reset to queued.
-        try? await retryWrite(dbPool, label: "Queue") { db in
-            let staleOps = try PendingOperation
-                .filter(Column("status") == PendingStatus.inFlight.rawValue)
-                .fetchAll(db)
-            if !staleOps.isEmpty {
-                print("[Queue] Crash recovery: resetting \(staleOps.count) inFlight ops to queued")
-                for op in staleOps {
-                    var updated = op
-                    updated.status = PendingStatus.queued.rawValue
-                    try updated.save(db)
-                }
+    /// Shared finite cutover for every message-queue execution entry point.
+    /// Conversion may perform provider lookups, but no row has been claimed and
+    /// `isDraining` is still false. A failed flight publishes no readiness; the
+    /// next external drain trigger retries the complete preparation.
+    private func preparePendingQueueForExecution() async -> PrioritizedDatabase? {
+        guard !Task.isCancelled else { return nil }
+        guard let appDatabase = AppDatabase.shared.withLock({ $0 }) else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] Preparation deferred: app database is unavailable")
             }
-            // Clean up cancelled ops from previous session
-            let cancelledCount = try PendingOperation
-                .filter(Column("status") == PendingStatus.cancelled.rawValue)
-                .deleteAll(db)
-            if cancelledCount > 0 {
-                print("[Queue] Crash recovery: cleaned up \(cancelledCount) cancelled ops")
-            }
+            return nil
         }
-        await drainPendingQueue()
+        if let preparedDatabase = pendingQueuePreparedDatabase,
+           preparedDatabase === appDatabase {
+            return PrioritizedDatabase(pool: appDatabase.dbPool)
+        }
+
+        let flight: PendingQueuePreparationFlight
+        if var existing = pendingQueuePreparationFlight,
+           existing.database === appDatabase {
+            existing.participantCount += 1
+            pendingQueuePreparationFlight = existing
+            flight = existing
+        } else {
+            let database = PrioritizedDatabase(pool: appDatabase.dbPool)
+            let task = Task { [self] in
+                try Task.checkCancellation()
+                try await convertReleasedMessageActionIdentities(using: database)
+                try Task.checkCancellation()
+                try await recoverPendingMessageQueueAfterCrash(using: database)
+            }
+            flight = PendingQueuePreparationFlight(
+                id: UUID(),
+                database: appDatabase,
+                task: task,
+                participantCount: 1
+            )
+            pendingQueuePreparationFlight = flight
+        }
+
+        let result = await flight.task.result
+        let isCurrentDatabase = AppDatabase.shared.withLock {
+            $0.map { $0 === flight.database } ?? false
+        }
+        guard pendingQueuePreparationFlight?.id == flight.id else {
+            guard isCurrentDatabase,
+                  pendingQueuePreparedDatabase.map({ $0 === flight.database }) == true,
+                  !Task.isCancelled else {
+                return nil
+            }
+            return PrioritizedDatabase(pool: flight.database.dbPool)
+        }
+
+        pendingQueuePreparationFlight = nil
+        switch result {
+        case .success where isCurrentDatabase:
+            pendingQueuePreparedDatabase = flight.database
+            guard !Task.isCancelled else { return nil }
+            return PrioritizedDatabase(pool: flight.database.dbPool)
+        case .success:
+            return nil
+        case .failure(let error):
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] Preparation deferred: \(error)")
+            }
+            return nil
+        }
+    }
+
+    /// Shared UPDATE for both the once-per-process startup recovery
+    /// (`recoverPendingMessageQueueAfterCrash`) and the once-per-ownership
+    /// reset (`resetAbandonedInFlightRowsAtOwnershipStart`). Deliberately
+    /// does NOT include the legacy `.cancelled`/`.archive`/`.delete`/
+    /// `.setTag`/`.removeTag` row deletion below — that cleanup is a
+    /// startup-only concern and must never run at ordinary ownership start.
+    nonisolated private static func resetInFlightRowsToQueued(_ db: Database) throws -> Int {
+        try db.execute(
+            sql: "UPDATE pendingOperation SET status = ? WHERE status = ?",
+            arguments: [PendingStatus.queued.rawValue, PendingStatus.inFlight.rawValue]
+        )
+        return db.changesCount
+    }
+
+    /// The conversion transaction intentionally precedes this transaction. If
+    /// the process dies between them, the next flight sees conversion as a no-op
+    /// and retries this recovery before any drain owner can exist.
+    ///
+    /// Runs before any drain owner exists, but gated anyway (§9.4) so a
+    /// concurrent enqueue cannot interleave with this reset/cleanup write.
+    private func recoverPendingMessageQueueAfterCrash(
+        using database: PrioritizedDatabase
+    ) async throws {
+        let counts = try await retryGatedQueueWrite(database, label: "Queue preparation") { db in
+            let recoveredCount = try Self.resetInFlightRowsToQueued(db)
+            try db.execute(
+                sql: """
+                    DELETE FROM pendingOperation
+                    WHERE status = ? OR type IN (?, ?, ?, ?)
+                    """,
+                arguments: [
+                    PendingStatus.cancelled.rawValue,
+                    OperationType.archive.rawValue,
+                    OperationType.delete.rawValue,
+                    OperationType.setTag.rawValue,
+                    OperationType.removeTag.rawValue,
+                ]
+            )
+            return (recovered: recoveredCount, deletedLegacy: db.changesCount)
+        }
+        if DebugModeManager.isLoggingEnabled(),
+           counts.recovered > 0 || counts.deletedLegacy > 0 {
+            print(
+                "[Queue] Startup recovery: requeued \(counts.recovered) in-flight "
+                    + "operation(s), deleted \(counts.deletedLegacy) legacy no-op/cancelled row(s)"
+            )
+        }
+    }
+
+    /// Test-only process-restart seam for a database instance that remains open.
+    /// Call only after the queue is quiescent; database-identity keying handles
+    /// ordinary per-test database replacement automatically.
+    func resetPendingQueuePreparationForTesting() async {
+        precondition(!isDraining, "pending queue must be idle before resetting preparation")
+        let oldTask = pendingQueuePreparationFlight?.task
+        pendingQueuePreparationFlight = nil
+        pendingQueuePreparedDatabase = nil
+        pendingQueueAuthorizationHookForTesting = nil
+        oldTask?.cancel()
+        if let oldTask {
+            _ = await oldTask.result
+        }
+    }
+
+    /// Narrow gate-primitive test seam: proves a concurrent caller actually
+    /// joined the shared preparation flight before the test cancels it.
+    func pendingQueuePreparationParticipantCountForTesting() -> Int {
+        pendingQueuePreparationFlight?.participantCount ?? 0
+    }
+
+    /// Narrow test seam for proving that awaiting a drain also joins any
+    /// requested re-drain instead of leaving unstructured queue work behind.
+    func pendingQueueIsQuiescentForTesting() -> Bool {
+        !isDraining && !needsRedrain
+    }
+
+    /// One-shot gate seam between successful preparation and the first queue
+    /// access. It exists only to prove that a process-global database replacement
+    /// cannot redirect an already-authorized drain onto the unprepared replacement.
+    func setPendingQueueAuthorizationHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        pendingQueueAuthorizationHookForTesting = hook
+    }
+
+    /// On app launch, recover from a previous crash, then drain the queue.
+    /// Outbox and calendar recovery are independent and continue even when
+    /// message identity conversion is waiting on a provider or transient lookup.
+    func reconcilePendingOperations() async {
+        if await preparePendingQueueForExecution() != nil {
+            await drainPendingQueue()
+        }
         await reconcileOutbox()
         await reconcileCalendarQueue()
     }

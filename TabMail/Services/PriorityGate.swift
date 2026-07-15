@@ -181,6 +181,33 @@ struct PrioritizedDatabase: Sendable {
         }
     }
 
+    /// Reserve the single write scheduler before sampling actor-owned protection,
+    /// then open the GRDB transaction without re-entering the scheduler. This closes
+    /// DB-row → actor-publication handoffs: while `snapshot` and `updates` run, a
+    /// queued mutation can neither delete its durable row nor insert a new intention
+    /// invisibly between the two observations.
+    ///
+    /// Keep this boundary narrow: no network, FTS, notification, or recount work.
+    /// `snapshot` must not perform a database access, and `updates` uses the raw pool
+    /// internally so a nested `PrioritizedDatabase.write` cannot deadlock the queue.
+    @discardableResult
+    func writeWithReservedSnapshot<Snapshot: Sendable, T: Sendable>(
+        label: String? = nil,
+        snapshot: @Sendable () async throws -> Snapshot,
+        _ updates: @Sendable (Database, Snapshot) throws -> T
+    ) async throws -> T {
+        let bodyStart = OSAllocatedUnfairLock(initialState: 0.0)
+        return try await DatabaseWriteQueue.shared.execute(
+            priority: effectivePriority, label: label, bodyStart: bodyStart
+        ) {
+            let freshSnapshot = try await snapshot()
+            return try await pool.write { db in
+                bodyStart.withLock { if $0 == 0 { $0 = CFAbsoluteTimeGetCurrent() } }
+                return try updates(db, freshSnapshot)
+            }
+        }
+    }
+
     /// Sync write — can't `await`, so it can't enter the queue; passes through.
     /// (Rare; used from non-async contexts like init/tests, and the synchronous
     /// backfill batch insert. The background loops' boundary `yield()` calls and

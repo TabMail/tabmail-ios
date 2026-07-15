@@ -154,8 +154,177 @@ actor OAuthRefreshCoordinator {
     }
 }
 
+/// Serializes every bounded mutation of the durable message-action queue.
+///
+/// The permit protects queue selection and GRDB mutation only. Callers must
+/// never perform provider I/O, callbacks, sleeps, or retry delays while holding
+/// it. Cancellation removes a queued waiter; if cancellation races with a
+/// handoff, the acquired permit is returned before the error escapes.
+final class PendingOperationMutationGate: Sendable {
+    /// Opaque process-local ownership proof. It is never persisted or used as
+    /// message/Undo identity.
+    struct Lease: Sendable {
+        fileprivate let ownerID: UUID
+    }
+
+    private struct Waiter: Sendable {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private struct State: Sendable {
+        var ownerID: UUID?
+        var waiters: [Waiter] = []
+    }
+
+    private enum Resumption: Sendable {
+        case cancelled(CheckedContinuation<Bool, Never>)
+        case granted(CheckedContinuation<Bool, Never>)
+        case none
+
+        func resume() {
+            switch self {
+            case .cancelled(let continuation):
+                continuation.resume(returning: false)
+            case .granted(let continuation):
+                continuation.resume(returning: true)
+            case .none:
+                break
+            }
+        }
+    }
+
+    private let state = Mutex(State())
+
+    /// Acquires the process-wide permit. Callers must immediately install
+    /// `defer { gate.release(lease) }` before any other throwing operation.
+    func acquire() async throws -> Lease {
+        try Task.checkCancellation()
+        let id = UUID()
+
+        let granted = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let immediateResult = state.withLock { state -> Bool? in
+                    if Task.isCancelled {
+                        return false
+                    }
+                    if state.ownerID == nil {
+                        state.ownerID = id
+                        return true
+                    }
+                    state.waiters.append(Waiter(id: id, continuation: continuation))
+                    return nil
+                }
+                if let immediateResult {
+                    continuation.resume(returning: immediateResult)
+                }
+            }
+        } onCancel: {
+            self.cancelAcquisition(id: id)
+        }
+
+        guard granted else { throw CancellationError() }
+        if Task.isCancelled {
+            releaseIfOwner(id: id)
+            throw CancellationError()
+        }
+        return Lease(ownerID: id)
+    }
+
+    /// Synchronous so release is safe from `defer` on every exit path. A stale
+    /// or duplicated lease is rejected and cannot release a successor's permit.
+    @discardableResult
+    func release(_ lease: Lease) -> Bool {
+        release(ownerID: lease.ownerID, beforeResumingWaiter: nil)
+    }
+
+    private func cancelAcquisition(id: UUID) {
+        let resumption = state.withLock { state -> Resumption in
+            if let index = state.waiters.firstIndex(where: { $0.id == id }) {
+                let waiter = state.waiters.remove(at: index)
+                return .cancelled(waiter.continuation)
+            }
+
+            // Release may have transferred ownership before resuming this
+            // continuation. Reclaim that exact handoff synchronously.
+            guard state.ownerID == id else { return .none }
+            guard !state.waiters.isEmpty else {
+                state.ownerID = nil
+                return .none
+            }
+
+            let next = state.waiters.removeFirst()
+            state.ownerID = next.id
+            return .granted(next.continuation)
+        }
+        resumption.resume()
+    }
+
+    private func releaseIfOwner(id: UUID) {
+        let continuation = state.withLock { state -> CheckedContinuation<Bool, Never>? in
+            guard state.ownerID == id else { return nil }
+            guard !state.waiters.isEmpty else {
+                state.ownerID = nil
+                return nil
+            }
+
+            let next = state.waiters.removeFirst()
+            state.ownerID = next.id
+            return next.continuation
+        }
+        continuation?.resume(returning: true)
+    }
+
+    private func release(
+        ownerID: UUID,
+        beforeResumingWaiter: (@Sendable () -> Void)?
+    ) -> Bool {
+        let result = state.withLock {
+            state -> (released: Bool, continuation: CheckedContinuation<Bool, Never>?) in
+            guard state.ownerID == ownerID else {
+                return (false, nil)
+            }
+            guard !state.waiters.isEmpty else {
+                state.ownerID = nil
+                return (true, nil)
+            }
+
+            let next = state.waiters.removeFirst()
+            state.ownerID = next.id
+            return (true, next.continuation)
+        }
+        if result.continuation != nil {
+            beforeResumingWaiter?()
+        }
+        result.continuation?.resume(returning: true)
+        return result.released
+    }
+
+    #if DEBUG
+    var isHeldForTesting: Bool {
+        state.withLock { $0.ownerID != nil }
+    }
+
+    var waiterCountForTesting: Int {
+        state.withLock { $0.waiters.count }
+    }
+
+    /// Forces the ownership-transfer/cancellation interleaving without sleeps.
+    @discardableResult
+    func releaseForTesting(
+        _ lease: Lease,
+        beforeResumingWaiter: @escaping @Sendable () -> Void
+    ) -> Bool {
+        release(ownerID: lease.ownerID, beforeResumingWaiter: beforeResumingWaiter)
+    }
+    #endif
+}
+
 actor AccountManager {
     static let shared = AccountManager()
+
+    /// One process-wide permit for durable message-action queue mutations.
+    nonisolated let pendingOperationMutationGate = PendingOperationMutationGate()
 
     var providers: [String: any EmailProvider] = [:]
     var workQueues: [String: ProviderWorkQueue] = [:]
@@ -254,7 +423,7 @@ actor AccountManager {
     /// against a `MockEmailProvider`. Overwrites any existing provider/queue
     /// for `accountId` (mirrors `registerDemoProviders`'s replace-on-call
     /// semantics). Mirrors the `…ForTesting()` naming convention
-    /// (`overlayOpRefCountForTesting`).
+    /// (`intentionJournal.recordsForTesting()`).
     func registerProviderForTesting(accountId: String, provider: any EmailProvider) {
         providers[accountId] = provider
         workQueues[accountId] = ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling)
@@ -274,6 +443,25 @@ actor AccountManager {
     var isDraining = false
     /// Set when drainPendingQueue() is called while isDraining — triggers re-drain on completion.
     var needsRedrain = false
+
+    /// One finite pre-execution cutover shared by every message-queue drain caller.
+    /// Keying both the ready marker and the in-flight task to the actual
+    /// AppDatabase instance keeps process-global database swaps isolated without
+    /// adding any durable migration token. The flight retains its database while
+    /// work is active; the ready marker is weak so replacing the process database
+    /// does not keep the old pool alive. A weak identity cannot be retargeted by
+    /// address reuse, while the flight id prevents an older waiter from clearing
+    /// or publishing over a newer flight.
+    struct PendingQueuePreparationFlight: Sendable {
+        let id: UUID
+        let database: AppDatabase
+        let task: Task<Void, any Error>
+        var participantCount: Int
+    }
+
+    weak var pendingQueuePreparedDatabase: AppDatabase?
+    var pendingQueuePreparationFlight: PendingQueuePreparationFlight?
+    var pendingQueueAuthorizationHookForTesting: (@Sendable () async -> Void)?
 
     // MARK: - FIFO Local Write Queue
 
@@ -349,7 +537,28 @@ actor AccountManager {
                 outer.resume()
             }
             Task {
-                await AccountManager.shared.awaitWriteQueueDrain()
+                // Journal-aware drain (ADR-IOS-058 rounds 8-9): a bare FIFO
+                // barrier misses a `record()` whose fold-enqueue Task hasn't
+                // reached the actor yet (unstructured Tasks give no
+                // creation-order arrival guarantee) — the exact race class
+                // round 2 hardened in the TEST drain helpers. Loop the
+                // barrier until the intention journal is fully drained so a
+                // gesture recorded moments before backgrounding gets its
+                // local write + PendingOperation committed BEFORE the WAL
+                // checkpoint fsyncs. The racing TIMER below is the SOLE
+                // bound (never-block-past-deadline, unchanged) — round 9
+                // removed the defensive iteration cap: on an idle queue with
+                // records parked in a read-error retry window
+                // (`intentionResolveRetryDelaySeconds`), near-instant
+                // barrier round-trips exhausted the cap BEFORE the retry
+                // re-enqueued, resuming early and reopening the gap. The
+                // poll interval paces the loop across that window instead
+                // of spinning.
+                repeat {
+                    await AccountManager.shared.awaitWriteQueueDrain()
+                    if AccountManager.shared.intentionJournal.isFullyDrained() { break }
+                    try? await Task.sleep(nanoseconds: UInt64(SyncConfig.backgroundFlushDrainPollSeconds * 1_000_000_000))
+                } while !resumed.withLock({ $0 })
                 finishOnce()
             }
             Task {
@@ -378,8 +587,20 @@ actor AccountManager {
     private(set) var recentlyCompleted: [String: Date] = [:]
 
     func recordRecentlyCompleted(messageIds: [String], ttl: TimeInterval = SyncConfig.recentlyCompletedTTLSeconds) {
-        let expiresAt = Date().addingTimeInterval(ttl)
-        for id in messageIds { recentlyCompleted[id] = expiresAt }
+        let now = Date()
+        let expiresAt = now.addingTimeInterval(ttl)
+        for id in messageIds {
+            // Live protection is monotonic: a later 30-second action completion
+            // must not truncate a push merge's 120-second stale-data shield.
+            // Non-positive TTL remains an intentional test/cleanup expiry.
+            if expiresAt <= now {
+                recentlyCompleted[id] = expiresAt
+            } else if let existing = recentlyCompleted[id] {
+                recentlyCompleted[id] = max(existing, expiresAt)
+            } else {
+                recentlyCompleted[id] = expiresAt
+            }
+        }
     }
 
     func pruneRecentlyCompleted() {
@@ -397,7 +618,7 @@ actor AccountManager {
     /// Pending mutations registered by user actions before their DB writes commit.
     /// Readable synchronously from MainActor (Mutex, no await needed).
     /// `reloadMessages()` snapshots this BEFORE its DB read and applies on top.
-    struct PendingMutation: Sendable {
+    struct PendingMutation: Sendable, Equatable {
         var isRead: Bool?
         var folderId: String?
         var folderPath: String?
@@ -406,357 +627,92 @@ actor AccountManager {
         var actionTag: ActionTag??  // nil = no change, .some(nil) = clear tag
     }
 
-    let optimisticOverlay = Mutex<[String: PendingMutation]>([:])
+    /// Intention journal (ADR-IOS-058): the in-memory, totally-ordered record
+    /// of pending user intentions that `record(...)` appends to and
+    /// `executeFold(triggerId:)` consumes. The display overlay
+    /// (`snapshotOverlay()`) is DERIVED from it —
+    /// `IntentionJournal.derivedOverlay()` folds every pending + in-flight
+    /// record's display, replacing the formerly-imperative overlay dict. See
+    /// `AccountManagerIntentions.swift`. `nonisolated`: `IntentionJournal` is
+    /// itself `Sendable` and self-synchronizing (Mutex-guarded), so exposing
+    /// the reference without an actor hop is safe — and required for
+    /// synchronous test seams (`recordsForTesting()`/
+    /// `isFullyDrainedForTesting()`/`seedDisplayForTesting(id:mutation:)`/
+    /// `resetForTesting()`) called from non-isolated test contexts.
+    nonisolated let intentionJournal = IntentionJournal()
 
-    /// Register an optimistic mutation. Callable synchronously from any isolation domain.
-    nonisolated func registerMutation(id: String, mutation: PendingMutation) {
-        optimisticOverlay.withLock { overlay in
-            var existing = overlay[id] ?? PendingMutation()
-            if let v = mutation.isRead { existing.isRead = v }
-            if let v = mutation.folderId { existing.folderId = v }
-            if let v = mutation.folderPath { existing.folderPath = v }
-            if let v = mutation.isInInbox { existing.isInInbox = v }
-            if let v = mutation.isFlagged { existing.isFlagged = v }
-            if let v = mutation.actionTag { existing.actionTag = v }
-            overlay[id] = existing
-        }
-    }
-
-    /// Remove overlay entries after their DB writes commit.
-    nonisolated func removeOverlayEntries(ids: [String]) {
-        optimisticOverlay.withLock { overlay in
-            for id in ids { overlay.removeValue(forKey: id) }
-        }
-    }
-
-    /// Snapshot the overlay for use in reloadMessages (snapshot BEFORE DB read).
+    /// The overlay is DERIVED (ADR-IOS-058): `snapshotOverlay()` returns the
+    /// intention journal's fold of pending + in-flight records
+    /// (`IntentionJournal.derivedOverlay()`), not an imperatively maintained
+    /// dict. Entry lifetime = "id has pending or in-flight records" — an id
+    /// with no records simply isn't present in the returned dictionary; there
+    /// is no separate removal step. All 8 production consumers —
+    /// `InboxListReader` ×2, `InboxViewModel.flushAIBatch`/
+    /// `insertUndoneMessages`/`insertStagedRows`,
+    /// `MessageDetailViewModel.applyOverlay` ×2, `NavigationStore.refreshFolders`
+    /// — read this synchronously and are unchanged by the interface; only the
+    /// SOURCE moved from an imperatively-maintained dict to a derived read.
     nonisolated func snapshotOverlay() -> [String: PendingMutation] {
-        optimisticOverlay.withLock { $0 }
+        intentionJournal.derivedOverlay()
     }
 
     /// Undo snapshots must capture the VISUALIZED state (act-on-visualized-state
-    /// rule): a queued intent cycle's isRead/isFlagged/actionTag exist only in the
-    /// overlay until the FIFO drains, and a DB-fresh row predates them — an undo
-    /// restoring that row would silently revert the user's most recent gesture.
-    /// Folder fields are deliberately NOT taken from the overlay (a pending move's
-    /// dest must not leak into a snapshot that records the pre-move location).
+    /// rule): a still-pending intention's isRead/isFlagged/actionTag exist only in
+    /// the derived overlay until the fold executes, and a DB-fresh row predates
+    /// them — an undo restoring that row would silently revert the user's most
+    /// recent gesture. Folder fields are deliberately NOT taken from the overlay
+    /// (a pending move's dest must not leak into a snapshot that records the
+    /// pre-move location).
     ///
-    /// MUST be called BEFORE the call site's own `retainOverlayEntry`/
-    /// `registerMutation` — those calls write THIS action's own overlay mutation
-    /// (e.g. the F6 tag-clear on inbox exit), and `registerMutation` merges into
-    /// the SAME coalesced entry this reads. Calling it after would capture this
-    /// action's own not-yet-committed mutation as if it were pre-existing state.
+    /// MUST be called BEFORE the call site's own `record()` call — `record()`
+    /// appends THIS action's own overlay mutation (e.g. the F6 tag-clear on
+    /// inbox exit) into the journal, and the derived overlay folds it into the
+    /// SAME coalesced entry this reads. Calling it after would capture this
+    /// action's own not-yet-executed mutation as if it were pre-existing state.
     nonisolated func overlayAdjustedSnapshot(_ header: MessageHeader) -> MessageHeader {
         guard let m = snapshotOverlay()[header.id] else { return header }
         var h = header
         if let isRead = m.isRead { h.isRead = isRead }
         if let isFlagged = m.isFlagged { h.isFlagged = isFlagged }
-        if let actionTag = m.actionTag { h.actionTag = actionTag }
+        if let actionTag = m.actionTag {
+            h.actionTag = actionTag
+            h.tagSortOrder = actionTag?.sortOrder ?? 99
+        }
         return h
     }
 
-    /// Refcounts in-flight gesture ops per message id, so overlay removal can
-    /// be tied to the LAST op still touching an id rather than to ANY single
-    /// op's completion. `optimisticOverlay` is COALESCED — one `PendingMutation`
-    /// per id holding the latest registered intent — so when N ops for the
-    /// same id are queued FIFO (e.g. alternating `toggleRead` calls queued
-    /// faster than the write lane drains), the FIRST op to complete calling
-    /// `removeOverlayEntries` strips the overlay while ops #2..N are still in
-    /// flight, exposing intermediate DB truth to `reloadMessages` until the
-    /// LAST op lands (log-confirmed 2026-07-10, logmain.log line 1743: a
-    /// 10-op drain of alternating markUnread/markRead produced visible
-    /// flip-backs mid-drain). Same bug class as
-    /// `MessageDetailViewModel.localMovePins` (ADR-IOS-049 amendment, round
-    /// 8): "overlay-presence is the wrong proxy for in-flight-ness — a
-    /// sibling op's drain ends the window early." That precedent also
-    /// motivates the refcount (round 10) over a Set: overlapping ops on the
-    /// same id (e.g. toggleRead + toggleFlag queued together) must each
-    /// retain/release independently.
-    ///
-    /// Gesture paths (`InboxViewModel.toggleRead`/`markRead`/`toggleFlag`,
-    /// `registerGestureIntent` below) call `retainOverlayEntry` at gesture
-    /// time (same call site as `registerMutation`) and `releaseOverlayEntry`
-    /// at the end of their queued closure, on every exit path, in place of a
-    /// direct `removeOverlayEntries` call. The audit promised above ("pending
-    /// their own audit") is DONE: every remaining production call site — the
-    /// move family (archive/delete/move, single + thread, both
-    /// `InboxViewModel` and `MessageDetailViewModel`), `UndoService.undo()`,
-    /// and the inbox/detail `applyManualTag` gesture paths (now routed
-    /// through `registerGestureIntent`'s single-retain-per-cycle protocol) —
-    /// is converted to retain/release. `removeOverlayEntries` itself is now
-    /// called from exactly one production call site: `releaseOverlayEntry`'s
-    /// zero-refcount branch below. (Moves also keep an independent
-    /// refcounted pin lifecycle via `MessageDetailViewModel.localMovePins`
-    /// for the detail view's bubble-snapback window — a separate concern
-    /// from this overlay refcount.)
-    private let overlayOpRefCount = Mutex<[String: Int]>([:])
+    // MARK: - Gesture Intent Adapter (ADR-IOS-058)
 
-    /// Mark one more in-flight gesture op for `id`. Call synchronously at
-    /// gesture time, alongside `registerMutation`.
-    nonisolated func retainOverlayEntry(id: String) {
-        overlayOpRefCount.withLock { counts in
-            counts[id, default: 0] += 1
-        }
-    }
-
-    /// Release one in-flight gesture op for `id`. When the refcount reaches
-    /// zero — or `id` was never retained (defensive; the count never goes
-    /// negative) — removes `id` from the refcount map AND from the overlay
-    /// itself. Call exactly once per `retainOverlayEntry` call, on every exit
-    /// path of the owning queued closure.
-    nonisolated func releaseOverlayEntry(id: String) {
-        let shouldRemoveOverlay = overlayOpRefCount.withLock { counts -> Bool in
-            guard let count = counts[id] else {
-                // Defensive: unmatched release (no retain on record). Treat as
-                // the terminal release so the overlay never strands, but this
-                // indicates a retain/release imbalance at a call site.
-                BackgroundSyncLogger.logInbox("[AccountManager] releaseOverlayEntry — unmatched release for \(id), no retain on record")
-                return true
-            }
-            if count <= 1 {
-                counts.removeValue(forKey: id)
-                return true
-            }
-            counts[id] = count - 1
-            return false
-        }
-        guard shouldRemoveOverlay else { return }
-        removeOverlayEntries(ids: [id])
-    }
-
-    /// Test seam: snapshot the retain/release refcount map (hygiene checks —
-    /// asserting it drains back to empty). Mirrors `NSEDataBridge`'s
-    /// `…ForTesting()` convention.
-    nonisolated func overlayOpRefCountForTesting() -> [String: Int] {
-        overlayOpRefCount.withLock { $0 }
-    }
-
-    // MARK: - Latest-Intent Coalescing (ADR-IOS-057)
-
-    /// One in-flight coalesced gesture cycle per message id. Folds repeated
-    /// gesture intents registered for the same id (rapid `toggleRead`/
-    /// `toggleFlag`/`applyManualTag` taps queued faster than the FIFO write
-    /// queue drains) into a SINGLE queued write that executes the NET,
-    /// per-field intent — see `registerGestureIntent`/`executeIntentCycle`.
-    /// `isReadBaseline`/`isFlaggedBaseline`/`actionTagBaseline` capture the
-    /// visualized state the FIRST touch of that field saw this cycle. The
-    /// executor's skip decision compares each net target against the
-    /// RESOLVED HEADER's current truth, not these baselines (round-3 audit —
-    /// see `executeIntentCycle`): for an undisturbed cycle the two are
-    /// identical, so a perfect cancel-out still performs zero writes, zero
-    /// `PendingOperation`s, zero unread/badge churn. The stored baselines
-    /// remain the gesture-time record: `actionTagBaseline` feeds
-    /// `applyManualTag`'s previousTag/auto-teach signal, and all three are
-    /// groundwork for phase-2 move coalescing
-    /// (`PLAN_OVERLAY_CALLSITE_AUDIT.md` §5).
-    struct IntentCycle: Sendable {
-        var isReadTarget: Bool?      // latest registered target
-        var isReadBaseline: Bool?    // visualized state when the field FIRST joined this cycle
-        var isFlaggedTarget: Bool?
-        var isFlaggedBaseline: Bool?
-        var actionTagTarget: ActionTag??    // .some(x) = touched; latest target (x may be nil = clear)
-        var actionTagBaseline: ActionTag??  // .some(x) = touched; baseline at first touch
-        /// Bumped on EVERY `registerGestureIntent` touch (create or join).
-        /// Lets the executor detect intents that joined during a nil header
-        /// resolve and grant them the fresh resolve attempt they would have
-        /// gotten as their own cycle pre-coalescing — see `executeIntentCycle`'s
-        /// retry loop (round-2 audit).
-        var generation: Int = 0
-    }
-    private let pendingIntentCycles = Mutex<[String: IntentCycle]>([:])
-
-    /// A single-field gesture intent registered against an id's open
-    /// `IntentCycle`. See `registerGestureIntent`.
+    /// A single-field gesture intent for `id`. This is the call-site-facing
+    /// shape `registerGestureIntent` accepts — the 8 production toggle/tag
+    /// call sites (`InboxViewModel.toggleRead`/`toggleFlag`/`applyManualTag`,
+    /// `MessageDetailViewModel.toggleRead`/`applyManualTag`/
+    /// `markReadOnOpenIfNeeded` ×2/`toggleReadForThread`) construct this enum
+    /// unchanged across the ADR-IOS-058 reset; only `registerGestureIntent`'s
+    /// internals moved onto `record()`.
     enum GestureIntent: Sendable {
         case isRead(target: Bool, baseline: Bool)
         case isFlagged(target: Bool, baseline: Bool)
         case actionTag(target: ActionTag?, baseline: ActionTag?)
     }
 
-    /// Register a gesture intent for `id` (ADR-IOS-057). Updates the display
-    /// overlay (`registerMutation`) synchronously — on-screen state always
-    /// reflects the latest intent immediately, unchanged display semantics —
-    /// then folds the intent into `id`'s open `IntentCycle` (creating one if
-    /// none is in flight). Only when a NEW cycle is created does this take
-    /// ONE overlay retain and enqueue ONE executor closure on the FIFO write
-    /// queue; later gestures on the same id while a cycle is still queued
-    /// only update the register + overlay — no new closure, no new write, no
-    /// new `PendingOperation`. Callable synchronously from the MainActor
-    /// gesture paths that used to call `retainOverlayEntry` + `registerMutation`
-    /// + `enqueueWrite` directly.
+    /// Thin adapter over `record()` (ADR-IOS-058, `AccountManagerIntentions.swift`):
+    /// maps a `GestureIntent` to one `record(...)` call and does nothing
+    /// else — `record()` already appends the journal record (which the
+    /// derived overlay reads) and enqueues the fold-executor closure; this
+    /// adapter must not duplicate any of that bookkeeping itself. This
+    /// supersedes the ADR-IOS-057 `IntentCycle` register (per-id coalescing
+    /// at enqueue time) — that coalescing now happens at drain time in
+    /// `IntentionFold.fold`/`executeFold`.
     nonisolated func registerGestureIntent(id: String, _ intent: GestureIntent) {
-        var mutation = PendingMutation()
-        let isNewCycle = pendingIntentCycles.withLock { cycles -> Bool in
-            let isNew = cycles[id] == nil
-            var cycle = cycles[id] ?? IntentCycle()
-            switch intent {
-            case .isRead(let target, let baseline):
-                if cycle.isReadBaseline == nil { cycle.isReadBaseline = baseline }
-                cycle.isReadTarget = target
-                mutation.isRead = target
-            case .isFlagged(let target, let baseline):
-                if cycle.isFlaggedBaseline == nil { cycle.isFlaggedBaseline = baseline }
-                cycle.isFlaggedTarget = target
-                mutation.isFlagged = target
-            case .actionTag(let target, let baseline):
-                if cycle.actionTagBaseline == nil { cycle.actionTagBaseline = .some(baseline) }
-                cycle.actionTagTarget = .some(target)
-                mutation.actionTag = .some(target)
-            }
-            cycle.generation += 1
-            cycles[id] = cycle
-            return isNew
+        switch intent {
+        case .isRead(let target, _):
+            record(ids: [id], kind: .isRead(target), displays: [id: PendingMutation(isRead: target)], origin: .gesture)
+        case .isFlagged(let target, _):
+            record(ids: [id], kind: .isFlagged(target), displays: [id: PendingMutation(isFlagged: target)], origin: .gesture)
+        case .actionTag(let target, let baseline):
+            record(ids: [id], kind: .actionTag(target: target, baseline: baseline), displays: [id: PendingMutation(actionTag: .some(target))], origin: .gesture)
         }
-        // Retain BEFORE registering (new cycle only — an existing cycle
-        // already holds its retain): the overlay entry must not be removable
-        // by a sibling op's final release in the instant between
-        // `registerMutation` landing the intent and this cycle's retain
-        // taking effect. Same invariant the pre-register gesture paths
-        // documented at their retain call sites.
-        if isNewCycle { retainOverlayEntry(id: id) }
-        registerMutation(id: id, mutation: mutation)
-        guard isNewCycle else { return }
-        Task { await self.enqueueWrite { await self.executeIntentCycle(id: id) } }
-    }
-
-    /// Executes the NET per-field intent accumulated in `id`'s coalesced
-    /// gesture cycle and releases the cycle's single overlay retain.
-    ///
-    /// Resolves the header BEFORE consuming the cycle (ADR-IOS-057 round-1
-    /// audit): `resolveHeaderForAction` is a `dbPool.read` that can take
-    /// seconds under writer starvation. A gesture landing during that read
-    /// still finds the cycle open and JOINS it (folded into this executor's
-    /// net write) instead of finding no cycle and opening a second one — the
-    /// split-cycle window that would otherwise let a possible cancel-out slip
-    /// through as two writes. The cycle is consumed (`removeValue`) only
-    /// after the read, on EVERY exit path — a gesture registered after that
-    /// point starts a fresh cycle with its own retain + closure, executing
-    /// strictly later, behind this one. The residual split window is now
-    /// only the write section below: a tap landing there genuinely postdates
-    /// this in-flight write and its own write is semantically necessary (see
-    /// ADR-IOS-057 Consequences — accepted residual).
-    ///
-    /// Nil-resolve retry (round-2 audit): when the header resolves to nil,
-    /// intents that JOINED the cycle during the resolve must not be consumed
-    /// and dropped on the strength of a read that predates them — as their
-    /// own cycle (pre-coalescing) they would have gotten a fresh
-    /// `resolveHeaderForAction` call of their own, and the row can become
-    /// resolvable in the interim (e.g. an NSE merge lands). The loop grants
-    /// exactly that: re-resolve while the cycle's `generation` moved during
-    /// the failed resolve. Each retry requires a NEW gesture to have landed
-    /// mid-resolve, so the loop is bounded by the user's actual tap stream —
-    /// identical to the pre-coalescing cost of one resolve per gesture.
-    func executeIntentCycle(id: String) async {
-        var header: MessageHeader?
-        var cycle: IntentCycle?
-        while true {
-            let generationBeforeResolve = pendingIntentCycles.withLock { $0[id]?.generation }
-            header = await resolveHeaderForAction(id: id)
-            if header != nil {
-                // Successful resolve: consume unconditionally. Intents that
-                // joined at any point up to this consume are folded into this
-                // executor's net write (their baselines are first-touch, so
-                // the math stays exact).
-                cycle = pendingIntentCycles.withLock { $0.removeValue(forKey: id) }
-                break
-            }
-            // Nil resolve: the generation-stability check and the consume
-            // MUST be one atomic lock section (round-3 audit) — with two
-            // separate acquisitions, a gesture joining in the instant
-            // between "generation unchanged" and `removeValue` would be
-            // consumed by a verdict that predates it and silently dropped.
-            let (done, consumed) = pendingIntentCycles.withLock { cycles -> (Bool, IntentCycle?) in
-                guard let current = cycles[id] else { return (true, nil) }
-                guard current.generation == generationBeforeResolve else { return (false, nil) }
-                return (true, cycles.removeValue(forKey: id))
-            }
-            if done {
-                cycle = consumed
-                break
-            }
-            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — nil resolve for \(id) but the cycle changed mid-resolve, retrying resolution")
-        }
-        guard let cycle else {
-            // Defensive: executor ran with no cycle on record (should not
-            // happen — registerGestureIntent always creates a cycle before
-            // enqueueing). Release so the overlay never strands.
-            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — no cycle on record for \(id)")
-            releaseOverlayEntry(id: id)
-            return
-        }
-        guard let header else {
-            // Row vanished between gesture and drain (e.g. deleted by an
-            // earlier queued op) — no-op, but release THIS cycle's retain so
-            // the overlay doesn't strand (mirrors toggleRead's vanished-row
-            // branch).
-            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — header resolution failed for \(id), releasing overlay retain")
-            releaseOverlayEntry(id: id)
-            return
-        }
-        // Skip condition (round-3 audit): each field compares its net target
-        // against the RESOLVED HEADER's current truth, not the cycle's
-        // gesture-time baseline. For an undisturbed cycle the two are
-        // identical (a pure cancel-out stays a zero-write no-op). They
-        // diverge when an out-of-band writer touched the row mid-cycle —
-        // `markAllAsRead` (a LOCAL user action that bypasses the register,
-        // FIFO-ordered before this executor) or a remote sync flip. In both
-        // cases the cycle's net intent is the user's LATEST visualized
-        // state, so it must be asserted ("the user's next action always
-        // takes priority over stale server state" — core philosophy §4), and
-        // skipping instead would flip the row back the moment the overlay
-        // releases — the exact symptom class this register exists to kill.
-        // Bonus: a write the DB already reflects is skipped as redundant
-        // (no PendingOperation, no remote round-trip).
-        var wroteAnything = false
-        if let target = cycle.isReadTarget, target != header.isRead {
-            if target { await markRead([header]) } else { await markUnread([header]) }
-            wroteAnything = true
-        }
-        if let target = cycle.isFlaggedTarget, target != header.isFlagged {
-            await markFlagged([header], flagged: target)
-            wroteAnything = true
-        }
-        if case let .some(target) = cycle.actionTagTarget {
-            if !header.isInInbox {
-                // Tags are inbox-scoped (ADR-IOS-036) and F6 clears actionTag
-                // the moment a row leaves the inbox — both tag-gesture UI
-                // entry points are gated on isInInbox, so a legitimate tag
-                // intent whose RESOLVED header has already left the inbox
-                // means a move (e.g. archive/delete) ran after this gesture:
-                // closure-reorder race, since both enqueue via unstructured
-                // Tasks with no FIFO ordering guarantee between them. The
-                // move is the LATER user action, and its tag-clear wins —
-                // this matches serial-replay ordering. Skip reinstating a
-                // stale tag on a row that already left the inbox.
-                BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — skipping tag write for \(id), header left inbox (isInInbox=false)")
-            } else if target != header.actionTag {
-                // previousTag semantics: `applyManualTag` reads
-                // `message.actionTag` as the "before" value for the LLM
-                // auto-teach signal (originalAction). Feed it the
-                // gesture-time visualized baseline, not drain-time DB
-                // truth — a concurrent AI auto-tag landing in the
-                // gesture→drain gap must not masquerade as the tag the user
-                // overrode.
-                var tagHeader = header
-                tagHeader.actionTag = cycle.actionTagBaseline ?? nil  // outer .some guaranteed when touched
-                await applyManualTag(tagHeader, tag: target)
-                wroteAnything = true
-            }
-        }
-        // Cancel-out (every touched field's target already matches the row):
-        // nothing ran above — no local write, no unreadCount churn, no badge
-        // recount, no PendingOperation, no remote flip.
-        if !wroteAnything {
-            BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — cancel-out no-op for \(id)")
-        }
-        releaseOverlayEntry(id: id)
-    }
-
-    /// Test seam: snapshot the intent-cycle register (hygiene checks —
-    /// asserting it drains back to empty once every cycle has executed).
-    /// Mirrors `overlayOpRefCountForTesting()`.
-    nonisolated func pendingIntentCyclesForTesting() -> [String: IntentCycle] {
-        pendingIntentCycles.withLock { $0 }
     }
 
     /// Guard for outbox drain (used by AccountManagerOutbox).
