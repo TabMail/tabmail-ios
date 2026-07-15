@@ -9,7 +9,11 @@ import GRDB
 
 // MARK: - Suite 1: updateBodies Return Value
 
-@Suite("FlushBatch Safety Net - updateBodies Return Value", .serialized)
+@Suite(
+    "FlushBatch Safety Net - updateBodies Return Value",
+    .serialized,
+    .processGlobalState
+)
 struct UpdateBodiesReturnValueTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -136,7 +140,11 @@ struct UpdateBodiesReturnValueTests {
 
 // MARK: - Suite 2: flushBatch Safety Net (GRDB + FTS Integration)
 
-@Suite("FlushBatch Safety Net - bodyComplete Flag Gating", .serialized)
+@Suite(
+    "FlushBatch Safety Net - bodyComplete Flag Gating",
+    .serialized,
+    .processGlobalState
+)
 struct FlushBatchBodyCompleteTests {
 
     private var index: SearchIndex { SearchIndex.shared }
