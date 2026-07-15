@@ -173,11 +173,27 @@ extension AccountManager {
                             accountId: snapshot.operation.accountId
                         )
                     }
-                    switch try await provider.resolveLegacyMessageActionIdentity(
-                        providerMessageId: storedMessageId,
-                        sourceFolder: snapshot.operation.folderPath,
-                        destinationFolder: snapshot.operation.destinationPath
+                    // Bounded by the same 15s the executor puts on every
+                    // provider action call (`executeSingleOp`). Without it, a
+                    // never-returning resolver hangs THIS single-flight
+                    // preparation forever, and every later drain trigger
+                    // joins the same stuck flight until process restart. A
+                    // timeout is uncertainty, not staleness: it throws, the
+                    // flight fails and publishes no readiness, every
+                    // convertible row stays unchanged/unclaimed, and the next
+                    // external drain trigger retries the whole preparation.
+                    let sourceFolder = snapshot.operation.folderPath
+                    let destinationFolder = snapshot.operation.destinationPath
+                    let providerResolution = try await withTimeout(
+                        seconds: SyncConfig.pendingOperationTimeoutSeconds
                     ) {
+                        try await provider.resolveLegacyMessageActionIdentity(
+                            providerMessageId: storedMessageId,
+                            sourceFolder: sourceFolder,
+                            destinationFolder: destinationFolder
+                        )
+                    }
+                    switch providerResolution {
                     case .resolved(let rfc822MessageId):
                         guard let normalized = MessageIdentity.durableActionRFC822MessageId(
                             rfc822MessageId

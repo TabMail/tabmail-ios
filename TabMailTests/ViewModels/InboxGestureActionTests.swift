@@ -1860,6 +1860,104 @@ struct InboxGestureActionTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
     }
 
+    /// Fix 1 (P1): a self-sent message (labels `{INBOX, SENT, UNREAD}`)
+    /// archives fine (source scope INBOX excludes only real role folders),
+    /// but pre-fix its Undo — the ordinary inverse move, source scope
+    /// archivePath — resolved via `GmailProvider`'s ACTION-scope archive
+    /// membership check, which excluded SENT. Zero candidates matched, so
+    /// the move silently no-opped: the message never returned to INBOX.
+    /// Gmail-only (Exchange/IMAP have no All-Mail-label archive scope, so
+    /// this bug class is Gmail-specific) — not folded into the parameterized
+    /// `statefulRESTArchiveUndoFinalOutcome` above.
+    @Test("Gmail undo-of-archive resolves a SENT-labeled self-sent message back to the inbox")
+    func gmailArchiveUndoResolvesSentLabeledSelfSentMessage() async throws {
+        let rfc822MessageId = "gmail-self-sent-undo-\(UUID().uuidString.lowercased())@example.com"
+        let providerMessageId = "gmail-self-sent-resource-\(UUID().uuidString.lowercased())"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: rfc822MessageId,
+            providerMessageId: providerMessageId,
+            labels: ["INBOX", "SENT", "UNREAD"]
+        )])
+        defer { server.close() }
+        let provider = server.provider()
+        let (pool, inbox, _, dir, previous) = try makeTestDB(
+            provider: .gmail,
+            inboxPath: "INBOX",
+            archivePath: GmailProvider.archivePath
+        )
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+            UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal()
+        UndoService.shared.dismissAll()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: "acc1",
+            provider: provider
+        )
+
+        do {
+            let header = makeDurableHeader(
+                folder: inbox,
+                messageId: providerMessageId,
+                isRead: false,
+                rfc822MessageId: "<\(rfc822MessageId)>"
+            )
+            try await pool.writeWithoutTransaction { db in try header.insert(db) }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            #expect(viewModel.archive(header.id))
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            // Forward archive asserted against PROVIDER truth only — no
+            // intermediate archive-folder sync here (the spec's sequence is
+            // archive → drain → undo → drain → sync): the archive LISTING
+            // legitimately excludes SENT-labeled mail (shipped UI behavior,
+            // `allMailExclusionQuery`), so syncing the archive folder now
+            // would correctly delete the local row from the invisible-in-
+            // All-Mail-list message — a different, accepted behavior, not
+            // the ACTION-scope resolution defect this test pins.
+            let archivedRemote = server.snapshots(rfc822MessageId: rfc822MessageId)
+            #expect(archivedRemote.count == 1)
+            guard archivedRemote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(!archivedRemote[0].labels.contains("INBOX"))
+            #expect(archivedRemote[0].labels.contains("SENT"), "the self-sent message keeps its SENT label through archive")
+
+            let syncEngine = await AccountManager.shared.syncEngine
+            await UndoService.shared.undo()
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+            try await syncEngine.syncFolderMessages(folder: inbox, provider: provider)
+
+            let restoredRemote = server.snapshots(rfc822MessageId: rfc822MessageId)
+            #expect(restoredRemote.count == 1)
+            guard restoredRemote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(restoredRemote[0].labels.contains("INBOX"), "undo of archive must restore the SENT-labeled message to INBOX — was silently dropped pre-fix")
+
+            let local = try await durableRows(pool: pool, rfc822MessageId: rfc822MessageId)
+            #expect(local.count == 1)
+            guard local.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(local[0].folderId == inbox.id)
+            #expect(local[0].isInInbox)
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+    }
+
     @Test(
         "cold notification archive automatically drains to final provider and local state",
         arguments: StatefulRESTKind.allCases

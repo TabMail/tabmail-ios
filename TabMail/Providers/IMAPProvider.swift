@@ -402,10 +402,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// text (Law 5 forbids the queue from guessing that way; doing it here
     /// would just relocate the exact fragility). A caller with a defined
     /// "stale means no-op" outcome for its operation (`move`,
-    /// `mutateActionMessages`) catches this and returns normally per Law 4;
-    /// a caller without one (`fetchAttachment`, `appendToSentFolder`,
-    /// `saveDraft`, `deleteDraft`) lets it propagate like any other error —
-    /// unchanged behavior from before this type existed.
+    /// `mutateActionMessages`, and — owner decision, Fix 3 — the draft paths
+    /// `saveDraft`/`deleteDraft`) catches this and returns normally per
+    /// Law 4. `fetchAttachment` and `appendToSentFolder` let it propagate
+    /// like any other error. Honesty note: propagation is NOT "unchanged
+    /// behavior from before this type existed" — the released queue's string
+    /// classifiers used to DROP ops whose errors matched mailbox-gone shapes,
+    /// so a propagating caller under the ADR-IOS-060 queue (every throw =
+    /// transient, retry forever) wedges the global FIFO where the old queue
+    /// dropped. That is exactly why the draft paths now catch it.
     private struct IMAPActionMailboxAbsent: Error {}
 
     /// Authoritative existence probe used only after a SELECT already failed
@@ -1532,6 +1537,38 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
 
         let senderAddr = senderEmail
+        do {
+            return try await saveDraftOnActionConnection(
+                draft,
+                messageId: messageId,
+                existingDraftId: existingDraftId,
+                draftsFolderPath: draftsFolderPath,
+                senderAddr: senderAddr
+            )
+        } catch is IMAPActionMailboxAbsent {
+            // Drafts mailbox CONFIRMED absent (LIST probe, Law 4) — owner
+            // decision (Fix 3): terminal no-op, NOT propagation. Under the
+            // one-global-FIFO queue (ADR-IOS-060) every propagated throw is
+            // "transient — retry forever", so a gone Drafts mailbox would
+            // wedge the entire queue behind this row. The local draft stays
+            // safe in the Drafts table (server push skipped; the user's next
+            // edit re-queues), and nothing is lost. "unknown" is the
+            // established serverId sentinel for "no trackable server copy"
+            // (see the APPEND-succeeded-but-UID-not-found branch below).
+            print("[IMAP] Drafts mailbox absent — draft save completed as no-op (local draft intact; mailbox '\(draftsFolderPath)' confirmed gone)")
+            return DraftSaveResult(serverId: "unknown")
+        }
+    }
+
+    /// Body of `saveDraft` — split out so the mailbox-absent terminal no-op
+    /// catch above stays readable.
+    private func saveDraftOnActionConnection(
+        _ draft: DraftMessage,
+        messageId: String,
+        existingDraftId: String?,
+        draftsFolderPath: String,
+        senderAddr: String
+    ) async throws -> DraftSaveResult {
         return try await withActionConnection(folder: draftsFolderPath) { server in
             // Delete existing draft by UID if updating.
             // If existingDraftId is non-numeric (e.g., UID changed), fall back to Message-ID search.
@@ -1586,6 +1623,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // a FAILED search throws a different, unclassified error above
             // and still retries.
             print("[IMAP] deleteDraft: draft \(draftId) — Message-ID search confirmed absent, treating as already deleted")
+        } catch is IMAPActionMailboxAbsent {
+            // Drafts mailbox CONFIRMED absent (LIST probe, Law 4) — owner
+            // decision (Fix 3): a gone mailbox means the server draft is gone
+            // with it. Terminal no-op; propagating would wedge the global
+            // FIFO behind an unsatisfiable delete (see saveDraft above).
+            print("[IMAP] Drafts mailbox absent — draft delete completed as no-op (mailbox '\(draftsFolderPath)' confirmed gone, draft \(draftId) gone with it)")
         }
     }
 

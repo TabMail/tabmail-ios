@@ -627,6 +627,77 @@ struct LegacyPendingOperationIdentityConverterTests {
         #expect(changedAfter.operation.retryCount == 9)
     }
 
+    /// Fix 2 (P1): `resolveLegacyMessageActionIdentity` had no timeout — a
+    /// never-returning provider call hung the single-flight preparation
+    /// flight forever, and every later `drainPendingQueue()` call joins that
+    /// SAME stuck flight (§9.4's `pendingQueuePreparationFlight`) until
+    /// process restart. The fix wraps the call in the same
+    /// `SyncConfig.pendingOperationTimeoutSeconds` bound the executor already
+    /// uses elsewhere — a timeout throws, the flight fails, publishes no
+    /// readiness, and the row stays unclaimed for the next trigger to retry.
+    @Test("a never-returning legacy identity resolver times out instead of hanging the preparation flight forever")
+    func neverReturningResolverTimesOutInsteadOfHangingForever() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let accountId = "converter-hang-\(UUID().uuidString)"
+        let legacyOp = PendingOperation(
+            type: .markRead,
+            messageIds: ["hang-resource"],
+            accountId: accountId,
+            folderPath: "INBOX"
+        )
+        try await fixture.pool.write { db in
+            try insertAccountAndFolders(db: db, accountId: accountId, provider: .gmail)
+            try legacyOp.insert(db)
+        }
+
+        let (latchStream, latch) = AsyncStream<Void>.makeStream()
+        let provider = MockEmailProvider(messageFieldScope: .account)
+        await provider.setLegacyIdentityResolutionHandler { _, _, _ in
+            var iterator = latchStream.makeAsyncIterator()
+            _ = await iterator.next()
+            return .resolved(rfc822MessageId: "unreached@example.com")
+        }
+
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        do {
+            // Bounded by the SAME production timeout the fix installs, plus a
+            // small margin — proves the drain call itself returns instead of
+            // hanging indefinitely (not a fixed arbitrary sleep).
+            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds + 5) {
+                await AccountManager.shared.drainPendingQueue()
+            }
+        } catch {
+            latch.finish()
+            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+            throw error
+        }
+
+        // The flight failed and cleared — no participant left waiting on it.
+        #expect(
+            await AccountManager.shared.pendingQueuePreparationParticipantCountForTesting() == 0,
+            "the preparation flight must be cleared after the timeout, not stranded"
+        )
+        // No row was claimed — the timeout is uncertainty, not staleness.
+        let afterTimeout = try #require(try storedOperation(id: legacyOp.id, pool: fixture.pool))
+        #expect(afterTimeout.operation.status == PendingStatus.queued.rawValue)
+        #expect(afterTimeout.operation.messageIds == ["hang-resource"], "payload unchanged — not claimed, not converted")
+
+        // Release the latch and let the resolver succeed — the next external
+        // drain trigger retries the complete preparation from scratch.
+        latch.finish()
+        await provider.setLegacyIdentityResolutionHandler { _, _, _ in
+            .resolved(rfc822MessageId: "resolved-after-release@example.com")
+        }
+        try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        let afterRetry = try storedOperation(id: legacyOp.id, pool: fixture.pool)
+        #expect(afterRetry == nil, "the row converts and drains once the resolver actually returns")
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+    }
+
     @Test("malformed legacy member JSON blocks conversion before provider access")
     func malformedJSONBlocksWithoutMutation() async throws {
         let fixture = try makeFixture()

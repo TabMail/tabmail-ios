@@ -219,11 +219,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                                 return false
                             }
                             if let label { return message.labels.contains(label) }
-                            return Self.isArchiveMembership(message.labels)
+                            return Self.satisfiesQueryExclusions(query, labels: message.labels)
                         }
                         if let label { return message.labels.contains(label) }
                         return query == GmailProvider.allMailExclusionQuery
-                            && Self.isArchiveMembership(message.labels)
+                            && Self.satisfiesQueryExclusions(query, labels: message.labels)
                     }
                     .sorted { $0.providerMessageId < $1.providerMessageId }
                     .prefix(maxResults)
@@ -264,9 +264,28 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return String(suffix.prefix(while: { !$0.isWhitespace }))
     }
 
-    private static func isArchiveMembership(_ labels: Set<String>) -> Bool {
-        let excluded: Set<String> = ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"]
-        return excluded.isDisjoint(with: labels)
+    /// Honor the `-in:<role>` exclusions the QUERY itself carries against the
+    /// message's labels — real Gmail evaluates whatever query the client sent,
+    /// so the fixture must too instead of hardcoding one exclusion set (Fix 1
+    /// audit: fixtures model the provider, never our adapter). The LISTING
+    /// query (`allMailExclusionQuery`) carries `-in:sent`, so Sent-only mail
+    /// stays out of the Archive list (shipped UI behavior); the ACTION-scope
+    /// query does NOT, so a self-sent message (labels `{SENT}` or
+    /// `{SENT, UNREAD}`) resolves in archive scope — the OLD hardcoded set
+    /// mirrored the provider bug that silently no-opped Undo-of-archive for
+    /// self-sent mail.
+    private static func satisfiesQueryExclusions(_ query: String, labels: Set<String>) -> Bool {
+        let roleByToken: [String: String] = [
+            "-in:inbox": "INBOX",
+            "-in:sent": "SENT",
+            "-in:trash": "TRASH",
+            "-in:spam": "SPAM",
+            "-in:draft": "DRAFT",
+        ]
+        for (token, label) in roleByToken where query.contains(token) {
+            if labels.contains(label) { return false }
+        }
+        return true
     }
 
     private static func metadataResponse(_ message: Message) -> FakeHTTP.CannedResponse {

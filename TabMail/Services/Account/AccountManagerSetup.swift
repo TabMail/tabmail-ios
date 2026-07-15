@@ -503,7 +503,15 @@ extension AccountManager {
         }
 
         let wasPrimary = account.isPrimary
-        try? await dbPool.write { db in
+        // Gated (§9.3, Fix 4): this transaction deletes `pendingOperation`
+        // rows, so it MUST coordinate through the shared mutation gate like
+        // every other mutator of that table — a bare `dbPool.write` here was
+        // the one linearizability hole in gated admission (it could interleave
+        // with a drain claim/completion or an admission insert). The body is a
+        // synchronous DB closure (no provider I/O, no awaits), as the gate
+        // contract requires. Single attempt preserves the old best-effort
+        // `try?` semantics.
+        try? await retryGatedQueueWrite(dbPool, label: "removeAccount", maxAttempts: 1) { db in
             // Clean up non-cascaded tables first
             try PendingOperation.filter(Column("accountId") == acctId).deleteAll(db)
             try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE ? || ':%'", arguments: [acctId])

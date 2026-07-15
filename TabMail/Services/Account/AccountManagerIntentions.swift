@@ -346,6 +346,13 @@ extension AccountManager {
         await intentionJournal.awaitCompletion(of: seq)
     }
 
+    /// Seq sentinel for a refused empty-`ids` `record()` call (Fix 5). Never
+    /// assigned by the journal (`nextSeq` increments from 0 — 2^64 appends
+    /// away), so `awaitCompletion(of:)` finds it neither pending nor in
+    /// flight and resumes immediately: the honest "already-complete" receipt
+    /// for a record that appended nothing.
+    private static let refusedEmptyRecordSeq = UInt64.max
+
     @discardableResult
     nonisolated private func recordReturningSeq(
         ids: [String],
@@ -353,6 +360,18 @@ extension AccountManager {
         displays: [String: PendingMutation],
         origin: IntentionOrigin
     ) -> UInt64 {
+        // Fix 5: an empty-ids record is UNCONSUMABLE — `consumeComponent`
+        // walks records by shared member ids, and an empty `ids` array can
+        // never intersect any component, so the record would sit in the
+        // journal forever: `isFullyDrained()` false forever (wedging the
+        // journal-aware background flush) and any `recordAndWait` caller's
+        // receipt parked forever. Every current caller guards its own input;
+        // this is the choke-point backstop. Ungated log (error-adjacent
+        // always-on signal): a hit means a caller regressed.
+        guard !ids.isEmpty else {
+            print("[Journal] ERROR: record() called with empty ids — dropped")
+            return Self.refusedEmptyRecordSeq
+        }
         let (recorded, needsFold) = intentionJournal.append(ids: ids, kind: kind, displays: displays, origin: origin)
         if needsFold, let triggerId = recorded.ids.first {
             Task { await self.enqueueWrite { await self.executeFold(triggerId: triggerId) } }

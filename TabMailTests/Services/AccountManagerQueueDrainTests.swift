@@ -611,6 +611,102 @@ struct AccountManagerQueueDrainTests {
         #expect(finalOps[0].type == .markRead)
     }
 
+    /// Fix 4: `removeAccount`'s `PendingOperation` purge was a bare
+    /// `dbPool.write`, the one mutator of the `pendingOperation` table that
+    /// did not coordinate through `pendingOperationMutationGate` (§9.3's
+    /// "all fifteen production append sites" list never covered this DELETE
+    /// path). Mirrors `durableAdmissionCommitsLocalMutationAndQueueRowUnderOneGate`'s
+    /// pattern: hold the gate lease directly, prove the purge is BLOCKED
+    /// while another writer holds it, then release and prove it completes.
+    @Test("removeAccount purges PendingOperation rows under the same gate as every other mutator — a held lease blocks the purge until released")
+    func removeAccountRoutesPendingOperationPurgeThroughTheGate() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-removeaccount-gate-\(suffix)"
+        // .caldav short-circuits PushNotificationService's unsubscribe/revoke
+        // calls (no network I/O) — this test isolates the PendingOperation
+        // gate race, not push/provider plumbing.
+        try await insertAccount(id: accountId, provider: .caldav, pool: pool)
+        let op = PendingOperation(
+            type: .markRead,
+            messageIds: ["removeaccount-gate-\(suffix)@example.com"],
+            accountId: accountId,
+            folderPath: "INBOX"
+        )
+        try insertOp(op, pool: pool)
+
+        var account = Account(
+            emailAddress: "removeaccount-gate-\(suffix)@example.com",
+            displayName: "Gate Test",
+            provider: .caldav
+        )
+        account.id = accountId
+        let accountToRemove = account
+
+        let gate = AccountManager.shared.pendingOperationMutationGate
+        let lease = try await gate.acquire()
+
+        let removeTask = Task { @Sendable in
+            await AccountManager.shared.removeAccount(accountToRemove)
+        }
+
+        do {
+            // Deterministically wait until removeAccount's purge is blocked
+            // trying to acquire the gate we're holding — no fixed sleep,
+            // bounded so a regression (the bare, ungated write) can't hang
+            // the suite: it fails this wait instead.
+            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                while gate.waiterCountForTesting < 1 {
+                    try Task.checkCancellation()
+                    await Task.yield()
+                }
+            }
+
+            // Linearizability point (Fix 4): while the lease is held by
+            // another writer, removeAccount's purge must not have committed.
+            let blockedOps = try fetchOpsForAccount(accountId, pool: pool)
+            #expect(blockedOps.count == 1, "removeAccount's purge must not commit while another writer holds the gate")
+        } catch {
+            gate.release(lease)
+            removeTask.cancel()
+            throw error
+        }
+
+        gate.release(lease)
+        try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+            await removeTask.value
+        }
+
+        let finalOps = try fetchOpsForAccount(accountId, pool: pool)
+        #expect(finalOps.isEmpty, "the purge completes once the gate is free — no stranded row")
+        let finalAccount = try await pool.read { db in try Account.fetchOne(db, key: accountId) }
+        #expect(finalAccount == nil)
+        #expect(!gate.isHeldForTesting, "the gate must not be leaked by removeAccount")
+
+        // The queue is not wedged: a canary op on a different, still-
+        // registered account still drains to completion.
+        let canaryAccountId = "acc-removeaccount-canary-\(suffix)"
+        let canaryMessageId = "removeaccount-canary-\(suffix)@example.com"
+        try await insertAccount(id: canaryAccountId, provider: .gmail, pool: pool)
+        let canaryProvider = MockEmailProvider()
+        try await withRegisteredProvider(accountId: canaryAccountId, provider: canaryProvider) {
+            let canaryOp = PendingOperation(
+                type: .markRead,
+                messageIds: [canaryMessageId],
+                accountId: canaryAccountId,
+                folderPath: "INBOX"
+            )
+            try insertOp(canaryOp, pool: pool)
+            await AccountManager.shared.drainPendingQueue()
+            #expect(try fetchOp(canaryOp.id, pool: pool) == nil, "a scenario-unrelated canary op must still drain — the queue must not be wedged")
+            let sawCanary = await canaryProvider.markedReadIds.contains { $0.ids == [canaryMessageId] }
+            #expect(sawCanary, "the canary must have actually reached its provider")
+        }
+        #expect(!gate.isHeldForTesting, "the gate is free after the canary drains")
+    }
+
     @Test(".setTag completes immediately: op deleted and provider never called")
     func setTagCompletesImmediatelyBestEffort() async throws {
         let (pool, dir, previous) = try await makeTestDB()

@@ -166,6 +166,32 @@ struct StatefulGmailActionServerTests {
         #expect(inboxHeaders[0].rfc822MessageId == rfc822MessageId)
     }
 
+    @Test("undo-of-archive resolves a SENT-labeled self-sent message back to INBOX (Fix 1: ACTION-scope archive membership must not exclude SENT)")
+    func undoArchiveResolvesSentLabeledSelfSentMessage() async throws {
+        let rfc822MessageId = "gmail-self-sent@example.com"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: rfc822MessageId,
+            providerMessageId: "gmail-self-sent-1",
+            labels: ["SENT"]
+        )])
+        defer { server.close() }
+        let provider = server.provider()
+
+        // A self-sent message that was already archived (INBOX removed,
+        // SENT retained) — Undo issues the ordinary inverse move, source
+        // scope = archivePath. Pre-fix, the ACTION-scope archive membership
+        // check excluded SENT, so this resolved zero candidates and silently
+        // no-opped — the message never returned to INBOX.
+        try await provider.move(
+            ids: [rfc822MessageId], from: GmailProvider.archivePath, to: "INBOX"
+        )
+
+        let restored = server.snapshots(rfc822MessageId: rfc822MessageId)
+        #expect(restored.count == 1)
+        guard restored.count == 1 else { return }
+        #expect(restored[0].labels.contains("INBOX"), "undo-of-archive must restore a SENT-labeled self-sent message to INBOX")
+    }
+
     @Test("missing and duplicate RFC identities no-op while one-shot lookup failure retries")
     func staleAmbiguousAndTransient() async throws {
         let duplicateRFC = "gmail-duplicate@example.com"

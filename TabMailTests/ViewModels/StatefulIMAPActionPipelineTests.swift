@@ -1206,6 +1206,98 @@ struct StatefulIMAPActionPipelineTests {
     /// and the drain must stop (protected frontier) rather than guess. A
     /// later drain, once the injected one-shot failure(s) are consumed,
     /// completes the move normally.
+    /// Fix 3 (P1, owner-decided): the Drafts mailbox can be confirmed absent
+    /// (moved/renamed/deleted remotely) between a local optimistic draft save
+    /// and the durable drain. Pre-fix, `saveDraft`'s `withActionConnection`
+    /// call had no `catch is IMAPActionMailboxAbsent` — the confirmed-absent
+    /// signal (Law 4) propagated as an ordinary throw, and the global FIFO
+    /// treats every throw as "transient — requeue unchanged, stop the
+    /// drain": the saveDraft row retries forever and wedges every later op
+    /// behind it, including this test's unrelated archive.
+    @Test("saveDraft against a confirmed-absent Drafts mailbox terminal-no-ops instead of wedging the global FIFO, and an unrelated archive still drains")
+    func saveDraftMailboxGoneFinalOutcome() async throws {
+        let rfc822MessageId = "imap-draft-gone-\(UUID().uuidString.lowercased())@example.com"
+        let uid = 231
+        let message = FakeIMAPServer.makeMessage(uid: uid, rfc822Text: rfc822(messageId: rfc822MessageId))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [message], "Archive": [], "Drafts": []])
+        server.markMailboxDeleted("Drafts", includeNonexistentCode: true)
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        let (pool, inbox, _, previous) = try makeTestDB()
+        defer { restore(previous: previous) }
+        resetProcessState()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: "acc1",
+            provider: provider
+        )
+
+        do {
+            let draftId = "draft-gone-\(UUID().uuidString.lowercased())"
+            var draft = Draft(
+                id: draftId,
+                accountId: "acc1",
+                toJSON: "[\"recipient@example.com\"]",
+                ccJSON: "[]",
+                bccJSON: "[]",
+                subject: "Draft with a gone mailbox",
+                body: "Body",
+                replyToId: nil,
+                isForward: false,
+                editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970
+            )
+            draft.rfc822MessageId = "draft-rfc-\(UUID().uuidString.lowercased())@example.com"
+            let draftToInsert = draft
+            let saveDraftOp = PendingOperation(
+                type: .saveDraft,
+                messageIds: [draftId],
+                accountId: "acc1",
+                folderPath: "Drafts"
+            )
+            let header = makeHeader(folder: inbox, uid: uid, rfc822MessageId: rfc822MessageId)
+            try await pool.writeWithoutTransaction { db in
+                try draftToInsert.insert(db)
+                try saveDraftOp.insert(db)
+                try header.insert(db)
+            }
+            let viewModel = InboxViewModel(folders: [inbox])
+
+            // Unrelated archive queued right after the saveDraft — proves the
+            // protected-front frontier is never wedged by the confirmed-
+            // absent no-op (mirrors mailboxGoneSourceFinalOutcome /
+            // mailboxGoneDestinationFinalOutcome above).
+            #expect(viewModel.archive(header.id))
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            let remaining = try await pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(remaining == 0, "the gone-mailbox saveDraft must terminal-no-op, not wedge the FIFO forever")
+
+            let archiveRemote = try await provider.fetchMessages(folder: "Archive", limit: 10, offset: 0)
+            #expect(archiveRemote.count == 1, "the unrelated archive must still have executed remotely")
+            #expect(server.messageIDs(in: "INBOX").isEmpty)
+
+            // No draft was ever appended to the (confirmed-gone) Drafts mailbox.
+            #expect(server.messageIDs(in: "Drafts").isEmpty)
+
+            // The local draft row stays intact — nothing lost.
+            let localDraft = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
+            #expect(localDraft != nil)
+            #expect(localDraft?.subject == "Draft with a gone mailbox")
+
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            try? await provider.disconnect()
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+        try await provider.disconnect()
+    }
+
     @Test(
         "public move whose destination SELECT transiently fails blocks the frontier then succeeds on retry",
         arguments: [false, true]

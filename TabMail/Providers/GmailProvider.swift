@@ -65,10 +65,25 @@ actor GmailProvider: EmailProvider {
     static let archivePath = "__GMAIL_ALL_MAIL__"
 
     /// Query-exclusion translation of the synthetic All Mail folder: messages not
-    /// in inbox, sent, trash, spam, or drafts. Every folder-scoped method MUST use
-    /// this (and omit `labelIds`) when `folder == archivePath` — the synthetic path
-    /// is not a real Gmail label ID and the API rejects it with 400 "Invalid label".
+    /// in inbox, sent, trash, spam, or drafts. Every folder-scoped LISTING method
+    /// MUST use this (and omit `labelIds`) when `folder == archivePath` — the
+    /// synthetic path is not a real Gmail label ID and the API rejects it with
+    /// 400 "Invalid label". ACTION-path resolution uses
+    /// `allMailActionExclusionQuery` instead (see below).
     static let allMailExclusionQuery = "-in:inbox -in:sent -in:trash -in:spam -in:draft"
+
+    /// ACTION-scope translation of the synthetic All Mail folder: for durable
+    /// message-action resolution/membership, "in archive scope" means NOT in
+    /// INBOX/TRASH/SPAM — the real All Mail semantics for actionable mail.
+    /// DRAFT stays excluded (draft-labeled messages are not message-action
+    /// targets). SENT is deliberately NOT excluded: a self-sent message
+    /// (labels `{INBOX, SENT}`) archives to `{SENT}` and MUST stay resolvable
+    /// in archive scope, or its Undo — `move(from: archivePath, to: INBOX)` —
+    /// resolves zero candidates and terminally no-ops, silently dropping the
+    /// undo. The LISTING path above keeps its released exclusion set
+    /// (Sent-only mail staying out of the Archive list is shipped UI
+    /// behavior); only resolution/membership for ACTIONS uses this one.
+    static let allMailActionExclusionQuery = "-in:inbox -in:trash -in:spam -in:draft"
 
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let userEmail: String
@@ -627,7 +642,9 @@ actor GmailProvider: EmailProvider {
 
         var query = "rfc822msgid:\(rfc822MessageId)"
         if folder == Self.archivePath {
-            query += " " + Self.allMailExclusionQuery
+            // ACTION scope, not the listing exclusion set — SENT must remain
+            // resolvable in archive scope (see allMailActionExclusionQuery).
+            query += " " + Self.allMailActionExclusionQuery
         }
         var queryItems = [
             (name: "q", value: query),
@@ -702,9 +719,14 @@ actor GmailProvider: EmailProvider {
         return ref.id
     }
 
+    /// ACTION-path membership only (resolution + legacy identity conversion).
+    /// Archive scope mirrors `allMailActionExclusionQuery`: SENT is NOT
+    /// excluded (a self-sent message archived to `{SENT}` is in archive scope
+    /// for actions — excluding it silently no-opped Undo-of-archive); DRAFT
+    /// stays excluded (draft-labeled messages are not message-action targets).
     private func labels(_ labelIds: [String], belongToActionFolder folder: String) -> Bool {
         if folder == Self.archivePath {
-            let excludedLabelIds: Set<String> = ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"]
+            let excludedLabelIds: Set<String> = ["INBOX", "TRASH", "SPAM", "DRAFT"]
             return excludedLabelIds.isDisjoint(with: labelIds)
         }
         return labelIds.contains(folder)

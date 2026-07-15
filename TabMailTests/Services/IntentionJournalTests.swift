@@ -254,4 +254,37 @@ struct IntentionJournalTests {
         journal.reinsertAfterReadError(consumed)
         #expect(journal.recordsForTesting().map(\.seq) == [a.seq, interim.seq], "seq order restored across the reinsert")
     }
+
+    // MARK: - record() with empty ids (Fix 5)
+
+    /// An empty-`ids` record can never be consumed: `consumeComponent`'s
+    /// component search starts from a triggerId and an empty `ids` array can
+    /// never match one (`record.ids.contains(where: componentIds.contains)`
+    /// is vacuously false), so it would sit in the journal forever —
+    /// `isFullyDrained()` false forever, and any `recordAndWait` caller's
+    /// `awaitCompletion` hangs forever. All callers currently guard
+    /// themselves; `AccountManager.record`/`recordAndWait` must refuse an
+    /// empty-ids call BEFORE appending, as defense in depth.
+    @Test("AccountManager.record with empty ids is refused before appending — recordAndWait resumes immediately instead of hanging forever")
+    func recordWithEmptyIdsIsRefusedBeforeAppending() async {
+        let outcome = RaceOutcome()
+        Task {
+            await AccountManager.shared.recordAndWait(
+                ids: [], kind: .isRead(true), displays: [:], origin: .gesture
+            )
+            await outcome.declare("resumed")
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            await outcome.declare("timedOut")
+        }
+
+        let winner = await awaitWinner(outcome)
+        #expect(winner == "resumed", "record() with empty ids must never append an unconsumable record — recordAndWait must not hang")
+
+        #expect(
+            !AccountManager.shared.intentionJournal.recordsForTesting().contains { $0.ids.isEmpty },
+            "no journal residue from the refused empty-ids record — no legitimate caller ever appends one"
+        )
+    }
 }
