@@ -23,10 +23,12 @@ struct PendingOperationSnapshotTests {
     @Test("containsAnyKey matches by rfc822MessageId when messageId differs")
     func containsAnyKey_rfc822() {
         let set: Set<String> = ["abc@example.com"]
-        // IMAP-style: PendingOperation.messageIds holds the rfc822 (stableId),
-        // server returns numeric UID — only the rfc822 leg can match.
+        // Durable message actions hold canonical RFC identity while provider
+        // sync rows still expose a transient transport ID.
         #expect(set.containsAnyKey(messageId: "12345", rfc822MessageId: "abc@example.com"))
+        #expect(set.containsAnyKey(messageId: "provider-token", rfc822MessageId: " <abc@example.com> "))
         #expect(!set.containsAnyKey(messageId: "12345", rfc822MessageId: "other@example.com"))
+        #expect(!set.containsAnyKey(messageId: "12345", rfc822MessageId: "opaque-provider-token"))
     }
 
     @Test("containsAnyKey ignores empty rfc822MessageId")
@@ -59,8 +61,8 @@ struct PendingOperationSnapshotTests {
         #expect(!s.destructive.contains("d"))
     }
 
-    @Test("Snapshot classifies flag ops")
-    func snapshot_flag() {
+    @Test("Snapshot excludes local action-tag rows from provider field protection")
+    func snapshot_fieldClasses() {
         let ops = [
             PendingOperation(type: .markRead,      messageIds: ["a"], accountId: "acc1", folderPath: "INBOX"),
             PendingOperation(type: .markUnread,    messageIds: ["b"], accountId: "acc1", folderPath: "INBOX"),
@@ -71,20 +73,181 @@ struct PendingOperationSnapshotTests {
             PendingOperation(type: .archive,       messageIds: ["g"], accountId: "acc1", folderPath: "INBOX"),
         ]
         let s = PendingOperationSnapshot(ops: ops)
-        #expect(s.flag == ["a", "b", "c", "d", "e", "f"])
+        #expect(s.read == ["a", "b"])
+        #expect(s.flagged == ["c", "d"])
+        #expect(s.flag == ["a", "b", "c", "d"])
         #expect(!s.flag.contains("g"))
     }
 
-    @Test("Snapshot 'all' includes every op type")
+    @Test("Snapshot destructive memberships are exact account-scoped source and destination rows")
+    func snapshot_destructiveMembershipScope() {
+        let first = PendingOperation(
+            type: .move,
+            messageIds: ["same-provider-id"],
+            accountId: "acc1",
+            folderPath: "Folder_A",
+            destinationPath: "Folder_B"
+        )
+        let second = PendingOperation(
+            type: .move,
+            messageIds: ["same-provider-id"],
+            accountId: "acc2",
+            folderPath: "Folder_A",
+            destinationPath: "Folder_C"
+        )
+        let sourceOnly = PendingOperation(
+            type: .delete,
+            messageIds: ["delete-id"],
+            accountId: "acc1",
+            folderPath: "Folder_D"
+        )
+
+        let snapshot = PendingOperationSnapshot(ops: [first, second, sourceOnly])
+        #expect(snapshot.destructiveSourceMemberships == [
+            MessageIdentity.membershipKey(
+                accountId: "acc1", folderPath: "Folder_A", messageId: "same-provider-id",
+                membership: .removedSource
+            ),
+            MessageIdentity.membershipKey(
+                accountId: "acc2", folderPath: "Folder_A", messageId: "same-provider-id",
+                membership: .removedSource
+            ),
+            MessageIdentity.membershipKey(
+                accountId: "acc1", folderPath: "Folder_D", messageId: "delete-id",
+                membership: .removedSource
+            ),
+        ])
+        #expect(snapshot.destructiveDestinationMemberships == [
+            MessageIdentity.membershipKey(
+                accountId: "acc1", folderPath: "Folder_B", messageId: "same-provider-id",
+                membership: .addedDestination
+            ),
+            MessageIdentity.membershipKey(
+                accountId: "acc2", folderPath: "Folder_C", messageId: "same-provider-id",
+                membership: .addedDestination
+            ),
+        ])
+    }
+
+    @Test("Snapshot membership keys cannot collide across colon boundaries")
+    func snapshot_membershipKeysDisambiguateColonBoundaries() {
+        let first = PendingOperation(
+            type: .move,
+            messageIds: ["B:C"],
+            accountId: "account",
+            folderPath: "A",
+            destinationPath: "D"
+        )
+        let second = PendingOperation(
+            type: .move,
+            messageIds: ["C"],
+            accountId: "account",
+            folderPath: "A:B",
+            destinationPath: "D:B"
+        )
+
+        let snapshot = PendingOperationSnapshot(ops: [first, second])
+        #expect(snapshot.destructiveSourceMemberships.count == 2)
+        #expect(snapshot.destructiveDestinationMemberships.count == 2)
+        #expect(snapshot.destructiveSourceMemberships.contains(MessageIdentity.membershipKey(
+            accountId: "account",
+            folderPath: "A",
+            messageId: "B:C",
+            membership: .removedSource
+        )))
+        #expect(snapshot.destructiveSourceMemberships.contains(MessageIdentity.membershipKey(
+            accountId: "account",
+            folderPath: "A:B",
+            messageId: "C",
+            membership: .removedSource
+        )))
+        #expect(!snapshot.destructiveSourceMemberships.contains(MessageIdentity.membershipKey(
+            accountId: "account",
+            folderPath: "A",
+            messageId: "C",
+            membership: .removedSource
+        )))
+    }
+
+    @Test("Snapshot merge unions every purpose-scoped protection set")
+    func snapshot_mergeUnionsEverySet() {
+        let before = PendingOperationSnapshot(ops: [
+            PendingOperation(
+                type: .move,
+                messageIds: ["m1"],
+                accountId: "acc1",
+                folderPath: "Folder_A",
+                destinationPath: "Folder_B"
+            ),
+            PendingOperation(
+                type: .markRead,
+                messageIds: ["read-1"],
+                accountId: "acc1",
+                folderPath: "Folder_A"
+            ),
+        ])
+        let duringWrite = PendingOperationSnapshot(ops: [
+            PendingOperation(
+                type: .move,
+                messageIds: ["m2"],
+                accountId: "acc2",
+                folderPath: "Folder_C",
+                destinationPath: "Folder_D"
+            ),
+            PendingOperation(
+                type: .markFlagged,
+                messageIds: ["flagged-1"],
+                accountId: "acc2",
+                folderPath: "Folder_C"
+            ),
+            PendingOperation(
+                type: .setTag,
+                messageIds: ["tag-1"],
+                accountId: "acc2",
+                folderPath: "Folder_C",
+                tagValue: ActionTag.reply.rawValue
+            ),
+        ])
+
+        let merged = before.merging(duringWrite)
+        #expect(merged.destructive == ["m1", "m2"])
+        #expect(merged.destructiveSourceMemberships == [
+            MessageIdentity.membershipKey(
+                accountId: "acc1", folderPath: "Folder_A", messageId: "m1",
+                membership: .removedSource
+            ),
+            MessageIdentity.membershipKey(
+                accountId: "acc2", folderPath: "Folder_C", messageId: "m2",
+                membership: .removedSource
+            ),
+        ])
+        #expect(merged.destructiveDestinationMemberships == [
+            MessageIdentity.membershipKey(
+                accountId: "acc1", folderPath: "Folder_B", messageId: "m1",
+                membership: .addedDestination
+            ),
+            MessageIdentity.membershipKey(
+                accountId: "acc2", folderPath: "Folder_D", messageId: "m2",
+                membership: .addedDestination
+            ),
+        ])
+        #expect(merged.read == ["read-1"])
+        #expect(merged.flagged == ["flagged-1"])
+        #expect(merged.messageActions == ["m1", "read-1", "m2", "flagged-1"])
+    }
+
+    @Test("Snapshot keeps message-action RFC identities separate from draft resources")
     func snapshot_all() {
         let ops = [
             PendingOperation(type: .saveDraft,      messageIds: ["d1"], accountId: "acc1", folderPath: "Drafts"),
+            PendingOperation(type: .deleteDraft,    messageIds: ["d2"], accountId: "acc1", folderPath: "Drafts"),
             PendingOperation(type: .archive,        messageIds: ["a1"], accountId: "acc1", folderPath: "INBOX"),
             PendingOperation(type: .markRead,       messageIds: ["m1"], accountId: "acc1", folderPath: "INBOX"),
             PendingOperation(type: .addUserLabel,   messageIds: ["u1"], accountId: "acc1", folderPath: "INBOX", userLabelId: "l1"),
         ]
         let s = PendingOperationSnapshot(ops: ops)
-        #expect(s.all == ["d1", "a1", "m1", "u1"])
+        #expect(s.messageActions == ["a1", "m1", "u1"])
+        #expect(s.draftResources == ["d1", "d2"])
     }
 
     @Test("Snapshot loads only the requested account")
@@ -103,15 +266,15 @@ struct PendingOperationSnapshotTests {
         #expect(!snap.destructive.contains("m2"))
     }
 
-    // MARK: - Regression: IMAP move undo
+    // MARK: - Regression: IMAP move RFC identity
 
-    @Test("IMAP move regression: snapshot built from rfc822 stableId matches numeric UID via rfc822 leg")
-    func snapshot_imapMoveRegression() {
-        // Reproduces the original bug: the user archives an IMAP message with
-        // numeric UID "8421" and rfc822 "<abc@imap>" (stored bare). The pending
+    @Test("IMAP move snapshot built from RFC identity matches numeric UID via RFC leg")
+    func snapshot_imapMoveRfcIdentityRegression() {
+        // Reproduces the original identity mismatch: an IMAP message has
+        // numeric UID "8421" and a generic RFC id (stored bare). The pending
         // op carries stableId == rfc822. A naive `set.contains(info.messageId)`
         // check would miss this — only `containsAnyKey` catches both legs.
-        let rfc822 = "abc@imap"
+        let rfc822 = "message-id@example.com"
         let op = PendingOperation(
             type: .archive,
             messageIds: [rfc822],

@@ -7,6 +7,9 @@ import Foundation
 import GRDB
 @testable import TabMail
 
+// Classification: PendingStatus.cancelled remains valid for calendar-operation
+// cancellation; email actions do not use it.
+
 @Suite("PendingCalendarOperation")
 struct PendingCalendarOperationTests {
 

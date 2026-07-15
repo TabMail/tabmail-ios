@@ -42,6 +42,8 @@ struct PendingOperationTests {
     func pendingStatusRawValues() {
         #expect(PendingStatus.queued.rawValue == "queued")
         #expect(PendingStatus.inFlight.rawValue == "inFlight")
+        // Classification: cancelled remains a shared calendar-operation state;
+        // email actions do not use it.
         #expect(PendingStatus.cancelled.rawValue == "cancelled")
     }
 
@@ -61,7 +63,6 @@ struct PendingOperationTests {
         #expect(op.destinationPath == nil)
         #expect(op.tagValue == nil)
         #expect(op.retryCount == 0)
-        #expect(op.uidResolutionRetryCount == 0)
         #expect(op.status == PendingStatus.queued.rawValue)
     }
 

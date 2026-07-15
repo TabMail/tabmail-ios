@@ -32,6 +32,18 @@ enum PendingStatus: String, Codable, Sendable {
 struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
     static let databaseTableName = "pendingOperation"
 
+    /// Operation kinds that new provider-neutral message-action admissions
+    /// may persist. Legacy `.archive` / `.delete` rows remain readable by the
+    /// snapshot/drain compatibility paths, but new callers must express both
+    /// as `.move` with an explicit destination.
+    private static let newlyAdmittedMessageActionTypes: Set<OperationType> = [
+        .move,
+        .markRead, .markUnread,
+        .markFlagged, .markUnflagged,
+        .markReplied, .markForwarded,
+        .addUserLabel, .removeUserLabel,
+    ]
+
     var id: String
     var type: OperationType
     var messageIdsJSON: String
@@ -45,17 +57,6 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     var userLabelId: String?
     var createdAt: Date
     var retryCount: Int
-    /// Dedicated retry budget for `ProviderError.uidResolutionFailed` (IMAP
-    /// SEARCH-by-Message-ID miss) on non-move, non-tag ops — separate from
-    /// `retryCount`, which the generic transient-error branch also increments
-    /// on every ordinary connection blip. Without a dedicated counter, a few
-    /// unrelated blips could pre-exhaust `SyncConfig.maxUidResolutionRetries`
-    /// before the op ever hit a real SEARCH miss, causing a false "confirmed
-    /// stale" drop on the FIRST uidResolutionFailed — dropping user intention.
-    /// Default 0 backed by the v67 migration's `DEFAULT 0` column (existing
-    /// rows are backfilled by the ALTER TABLE, so decode never sees a missing
-    /// column post-migration).
-    var uidResolutionRetryCount: Int = 0
     /// PendingStatus rawValue — stored as String for GRDB compatibility
     var status: String
 
@@ -89,63 +90,251 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.userLabelId = userLabelId
         self.createdAt = Date()
         self.retryCount = 0
-        self.uidResolutionRetryCount = 0
         self.status = PendingStatus.queued.rawValue
+    }
+
+    /// Sole constructor for newly admitted durable message actions. Draft
+    /// resource operations deliberately continue to use the ordinary
+    /// initializer because their provider resource IDs are a separate domain.
+    static func durableMessageAction(
+        type: OperationType,
+        messageIds: [String],
+        accountId: String,
+        folderPath: String,
+        destinationPath: String? = nil,
+        userLabelId: String? = nil
+    ) -> PendingOperation? {
+        guard newlyAdmittedMessageActionTypes.contains(type),
+              !messageIds.isEmpty,
+              !accountId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !folderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+
+        switch type {
+        case .move:
+            guard let destinationPath,
+                  !destinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  userLabelId == nil
+            else { return nil }
+        case .addUserLabel, .removeUserLabel:
+            guard destinationPath == nil,
+                  let userLabelId,
+                  !userLabelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+        case .markRead, .markUnread, .markFlagged, .markUnflagged, .markReplied, .markForwarded:
+            guard destinationPath == nil, userLabelId == nil else { return nil }
+        default:
+            return nil
+        }
+
+        let normalizedIds = messageIds.compactMap {
+            MessageIdentity.durableActionRFC822MessageId($0)
+        }
+        guard normalizedIds.count == messageIds.count else { return nil }
+
+        return PendingOperation(
+            type: type,
+            messageIds: normalizedIds,
+            accountId: accountId,
+            folderPath: folderPath,
+            destinationPath: destinationPath,
+            userLabelId: userLabelId
+        )
+    }
+}
+
+// MARK: - Undo matching (ADR-IOS-060 §9.6)
+
+extension PendingOperation {
+    /// Pure, provider-independent structural inverse used ONLY by Undo's
+    /// bounded durable-admission matching (§8.3/§9.3). Not persisted, not a
+    /// queue capability, and never compared against by the executor. Returns
+    /// nil for an operation with no well-defined inverse — a non-reversible
+    /// operation (e.g. permanent delete, which this queue never models)
+    /// cannot reconcile durable work.
+    struct Flipped: Equatable {
+        let type: OperationType
+        let accountId: String
+        let folderPath: String
+        let destinationPath: String?
+        let userLabelId: String?
+    }
+
+    func flipped() -> Flipped? {
+        switch type {
+        case .move:
+            guard let destinationPath else { return nil }
+            return Flipped(
+                type: .move,
+                accountId: accountId,
+                folderPath: destinationPath,
+                destinationPath: folderPath,
+                userLabelId: nil
+            )
+        case .markRead:
+            return Flipped(type: .markUnread, accountId: accountId, folderPath: folderPath, destinationPath: nil, userLabelId: nil)
+        case .markUnread:
+            return Flipped(type: .markRead, accountId: accountId, folderPath: folderPath, destinationPath: nil, userLabelId: nil)
+        case .markFlagged:
+            return Flipped(type: .markUnflagged, accountId: accountId, folderPath: folderPath, destinationPath: nil, userLabelId: nil)
+        case .markUnflagged:
+            return Flipped(type: .markFlagged, accountId: accountId, folderPath: folderPath, destinationPath: nil, userLabelId: nil)
+        case .addUserLabel:
+            guard let userLabelId else { return nil }
+            return Flipped(type: .removeUserLabel, accountId: accountId, folderPath: folderPath, destinationPath: nil, userLabelId: userLabelId)
+        case .removeUserLabel:
+            guard let userLabelId else { return nil }
+            return Flipped(type: .addUserLabel, accountId: accountId, folderPath: folderPath, destinationPath: nil, userLabelId: userLabelId)
+        default:
+            return nil
+        }
+    }
+
+    /// Structural equality of `self` against a candidate's `flipped()` shape —
+    /// exact operation kind/account/source/destination/label, used only by
+    /// Undo's admission matcher. Member-set equality is checked separately by
+    /// the caller (a partial-overlap batch never matches).
+    func matchesFlip(of candidate: PendingOperation) -> Bool {
+        guard let flipped = candidate.flipped() else { return false }
+        return flipped.type == type
+            && flipped.accountId == accountId
+            && flipped.folderPath == folderPath
+            && flipped.destinationPath == destinationPath
+            && flipped.userLabelId == userLabelId
     }
 }
 
 // MARK: - Sync Filter Snapshot
 //
-// Pending-op IDs queued by `AccountManagerActions` are `MessageHeader.stableId`:
-// - Gmail/Exchange: stableId == messageId (provider-stable IDs)
-// - IMAP:           stableId == rfc822MessageId when UID is numeric, else UID
-//
-// Server-returned `MessageHeaderInfo` carries `messageId` plus optional
-// `rfc822MessageId`. A one-key check against `info.messageId` misses every IMAP
-// pending op (where the queued key is rfc822). A one-key check against rfc822
-// misses optimistic ops queued before the server assigned a Message-ID.
-//
-// The only safe check is two-key: `messageId` OR `rfc822MessageId`. Every sync
-// path (Gmail delta, Exchange delta, IMAP fullSync, BackfillDeep) must use the
-// same snapshot so the filter can't drift between them.
+// New durable message-action rows carry normalized RFC Message-ID for every
+// provider. During the finite legacy conversion window, snapshots still match
+// both provider `messageId` and `rfc822MessageId` so released rows remain
+// protected until startup conversion has classified them.
 
-/// Snapshot of pending operation IDs for the sync filter. Always load INSIDE
-/// a write transaction — a separate read creates a TOCTOU window where a user
-/// action inserts a `PendingOperation` between the snapshot and the sync write,
-/// leading to UNIQUE constraint violations or silent undo.
+/// Snapshot of pending operation IDs for the sync filter. Mutation decisions
+/// always include a load INSIDE the write transaction; a preflight observation
+/// may be merged into it only to bridge the queue's publish-then-delete boundary.
+/// Relying on a separate read alone creates a TOCTOU window where a user action
+/// inserts a `PendingOperation` before the sync write.
 struct PendingOperationSnapshot: Sendable {
     /// IDs from `.archive`, `.delete`, `.move` ops. Used to skip inserting a
     /// message into a folder the user is optimistically moving out of.
     let destructive: Set<String>
-    /// IDs from flag/tag ops (`.markRead`, `.markUnread`, `.markFlagged`,
-    /// `.markUnflagged`, `.setTag`, `.removeTag`). Used to skip overwriting
-    /// flags/tags the user just toggled.
-    let flag: Set<String>
-    /// IDs from all queued ops (any type). Used to skip deletions of rows the
-    /// user has any pending action against.
-    let all: Set<String>
+    /// Exact source-folder memberships removed by destructive operations.
+    /// Gmail delta uses this purpose-scoped form so protecting source label A
+    /// never suppresses an unrelated external label X on the same message.
+    let destructiveSourceMemberships: Set<String>
+    /// Exact optimistic destination memberships created by destructive moves.
+    /// These rows survive stale provider metadata without protecting unrelated
+    /// memberships or letting a pending field toggle hide a remote label removal.
+    let destructiveDestinationMemberships: Set<String>
+    /// IDs from read-state operations.
+    let read: Set<String>
+    /// IDs from flagged-state operations.
+    let flagged: Set<String>
+    /// Compatibility union for provider-backed field classes.
+    var flag: Set<String> { read.union(flagged) }
+    /// RFC identities from queued message actions. Draft resource IDs are
+    /// deliberately excluded so a provider/draft token can never be mistaken
+    /// for a provider-neutral message-action identity.
+    let messageActions: Set<String>
+    /// Provider-specific draft resources used only by draft sync paths.
+    let draftResources: Set<String>
 
     static let destructiveTypes: Set<OperationType> = [.archive, .delete, .move]
-    static let flagTypes: Set<OperationType> = [
-        .markRead, .markUnread, .markFlagged, .markUnflagged, .setTag, .removeTag
-    ]
+    static let readTypes: Set<OperationType> = [.markRead, .markUnread]
+    static let flaggedTypes: Set<OperationType> = [.markFlagged, .markUnflagged]
+    static let draftTypes: Set<OperationType> = [.saveDraft, .deleteDraft]
+    static let messageActionTypes: Set<OperationType> = destructiveTypes
+        .union(readTypes)
+        .union(flaggedTypes)
+        .union([.markReplied, .markForwarded, .addUserLabel, .removeUserLabel])
 
     /// Build from a pre-fetched list of ops. Callers load ops once inside the
     /// write transaction and pass them here so the filter classification is
-    /// the only work duplicated — not the DB query.
+    /// the only work duplicated — not the DB query. Cancelled rows are forensic
+    /// cleanup state, not live intentions, and never protect sync fields/membership.
     init(ops: [PendingOperation]) {
         var destructive = Set<String>()
-        var flag = Set<String>()
-        var all = Set<String>()
-        for op in ops {
+        var destructiveSourceMemberships = Set<String>()
+        var destructiveDestinationMemberships = Set<String>()
+        var read = Set<String>()
+        var flagged = Set<String>()
+        var messageActions = Set<String>()
+        var draftResources = Set<String>()
+        for op in ops where op.status == PendingStatus.queued.rawValue
+            || op.status == PendingStatus.inFlight.rawValue {
             let ids = op.messageIds
-            all.formUnion(ids)
-            if Self.destructiveTypes.contains(op.type) { destructive.formUnion(ids) }
-            if Self.flagTypes.contains(op.type) { flag.formUnion(ids) }
+            if Self.messageActionTypes.contains(op.type) { messageActions.formUnion(ids) }
+            if Self.draftTypes.contains(op.type) { draftResources.formUnion(ids) }
+            if Self.destructiveTypes.contains(op.type) {
+                destructive.formUnion(ids)
+                destructiveSourceMemberships.formUnion(ids.map {
+                    MessageIdentity.membershipKey(
+                        accountId: op.accountId,
+                        folderPath: op.folderPath,
+                        messageId: $0,
+                        membership: .removedSource
+                    )
+                })
+                if let destinationPath = op.destinationPath {
+                    destructiveDestinationMemberships.formUnion(ids.map {
+                        MessageIdentity.membershipKey(
+                            accountId: op.accountId,
+                            folderPath: destinationPath,
+                            messageId: $0,
+                            membership: .addedDestination
+                        )
+                    })
+                }
+            }
+            if Self.readTypes.contains(op.type) { read.formUnion(ids) }
+            if Self.flaggedTypes.contains(op.type) { flagged.formUnion(ids) }
         }
         self.destructive = destructive
-        self.flag = flag
-        self.all = all
+        self.destructiveSourceMemberships = destructiveSourceMemberships
+        self.destructiveDestinationMemberships = destructiveDestinationMemberships
+        self.read = read
+        self.flagged = flagged
+        self.messageActions = messageActions
+        self.draftResources = draftResources
+    }
+
+    private init(
+        destructive: Set<String>,
+        destructiveSourceMemberships: Set<String>,
+        destructiveDestinationMemberships: Set<String>,
+        read: Set<String>,
+        flagged: Set<String>,
+        messageActions: Set<String>,
+        draftResources: Set<String>
+    ) {
+        self.destructive = destructive
+        self.destructiveSourceMemberships = destructiveSourceMemberships
+        self.destructiveDestinationMemberships = destructiveDestinationMemberships
+        self.read = read
+        self.flagged = flagged
+        self.messageActions = messageActions
+        self.draftResources = draftResources
+    }
+
+    /// Union two observations taken on opposite sides of the
+    /// recently-completed publication boundary. The queue publishes recent
+    /// protection before deleting its durable operation, so reading DB first,
+    /// then the actor map, then unioning this snapshot with an in-transaction
+    /// reload guarantees at least one side of every transition is observed.
+    func merging(_ other: PendingOperationSnapshot) -> PendingOperationSnapshot {
+        PendingOperationSnapshot(
+            destructive: destructive.union(other.destructive),
+            destructiveSourceMemberships: destructiveSourceMemberships
+                .union(other.destructiveSourceMemberships),
+            destructiveDestinationMemberships: destructiveDestinationMemberships
+                .union(other.destructiveDestinationMemberships),
+            read: read.union(other.read),
+            flagged: flagged.union(other.flagged),
+            messageActions: messageActions.union(other.messageActions),
+            draftResources: draftResources.union(other.draftResources)
+        )
     }
 
     /// Load all pending ops for an account inside the current write transaction.
@@ -160,15 +349,16 @@ struct PendingOperationSnapshot: Sendable {
 }
 
 extension Set where Element == String {
-    /// Two-key membership check for sync filters. Returns true if this set
-    /// contains either `messageId` or a non-empty `rfc822MessageId`.
-    ///
-    /// Required because `PendingOperation.messageIds` is keyed by
-    /// `MessageHeader.stableId` which is rfc822 for IMAP and messageId for
-    /// Gmail/Exchange — a single-key check misses IMAP pending ops.
+    /// Temporary two-key compatibility check used while released provider-ID
+    /// rows are converted at startup. New message-action admissions always
+    /// match through the RFC leg; the provider-ID leg exists only until that
+    /// finite migration and its call sites are removed.
     func containsAnyKey(messageId: String, rfc822MessageId: String?) -> Bool {
         if contains(messageId) { return true }
-        if let rfc = rfc822MessageId, !rfc.isEmpty, contains(rfc) { return true }
+        if let rfc = MessageIdentity.durableActionRFC822MessageId(rfc822MessageId),
+           contains(rfc) {
+            return true
+        }
         return false
     }
 }

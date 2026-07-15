@@ -13,6 +13,109 @@ import Foundation
 @Suite("MessageIdentity")
 struct MessageIdentityTests {
 
+    @Test("durable action identity accepts bare or balanced brackets and preserves case")
+    func durableActionIdentityNormalizesAcceptedForms() {
+        #expect(MessageIdentity.durableActionRFC822MessageId(
+            "  <Case.Sensitive@Example.COM>  "
+        ) == "Case.Sensitive@Example.COM")
+        #expect(MessageIdentity.durableActionRFC822MessageId(
+            "bare@example.com"
+        ) == "bare@example.com")
+    }
+
+    @Test("durable action identity rejects malformed and provider-specific identities")
+    func durableActionIdentityRequiresRFCShape() {
+        #expect(MessageIdentity.durableActionRFC822MessageId(nil) == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("   ") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("opaque-provider-token") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("<missing-close@example.com") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("missing-open@example.com>") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("<<nested@example.com>>") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("legacy opaque token") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("local@@example.com") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("@example.com") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("local@") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("local @example.com") == nil)
+        #expect(MessageIdentity.durableActionRFC822MessageId("line@example.com\r\nInjected: value") == nil)
+    }
+
+    @Test("durable action address admits RFC identity and scope together")
+    func durableActionAddressRequiresCompleteScope() {
+        let address = MessageIdentity.durableActionAddress(
+            accountId: "account",
+            folderPath: "INBOX",
+            rfc822MessageId: " <member@example.com> "
+        )
+        #expect(address?.accountId == "account")
+        #expect(address?.folderPath == "INBOX")
+        #expect(address?.rfc822MessageId == "member@example.com")
+        #expect(MessageIdentity.durableActionAddress(
+            accountId: " ", folderPath: "INBOX", rfc822MessageId: "member@example.com"
+        ) == nil)
+        #expect(MessageIdentity.durableActionAddress(
+            accountId: "account", folderPath: "\n", rfc822MessageId: "member@example.com"
+        ) == nil)
+    }
+
+    @Test("durable message-action factory normalizes all members and rejects other identity domains")
+    func durableMessageActionFactoryEnforcesBoundary() {
+        let operation = PendingOperation.durableMessageAction(
+            type: .move,
+            messageIds: ["<first@example.com>", "second@example.com"],
+            accountId: "account",
+            folderPath: "INBOX",
+            destinationPath: "Archive"
+        )
+        #expect(operation?.messageIds == ["first@example.com", "second@example.com"])
+        #expect(PendingOperation.durableMessageAction(
+            type: .markRead,
+            messageIds: ["line@example.com\r\nInjected: value"],
+            accountId: "account",
+            folderPath: "INBOX"
+        ) == nil)
+        #expect(PendingOperation.durableMessageAction(
+            type: .saveDraft,
+            messageIds: ["provider-draft-resource"],
+            accountId: "account",
+            folderPath: "Drafts"
+        ) == nil)
+        #expect(PendingOperation.durableMessageAction(
+            type: .archive,
+            messageIds: ["archive@example.com"],
+            accountId: "account",
+            folderPath: "INBOX",
+            destinationPath: "Archive"
+        ) == nil)
+        #expect(PendingOperation.durableMessageAction(
+            type: .delete,
+            messageIds: ["delete@example.com"],
+            accountId: "account",
+            folderPath: "INBOX",
+            destinationPath: "Trash"
+        ) == nil)
+        #expect(PendingOperation.durableMessageAction(
+            type: .move,
+            messageIds: ["move@example.com"],
+            accountId: "account",
+            folderPath: "INBOX",
+            destinationPath: " \n"
+        ) == nil)
+        #expect(PendingOperation.durableMessageAction(
+            type: .addUserLabel,
+            messageIds: ["label@example.com"],
+            accountId: "account",
+            folderPath: "INBOX",
+            userLabelId: "\t"
+        ) == nil)
+        #expect(PendingOperation.durableMessageAction(
+            type: .removeUserLabel,
+            messageIds: ["label@example.com"],
+            accountId: "account",
+            folderPath: "INBOX",
+            userLabelId: "label-id"
+        )?.userLabelId == "label-id")
+    }
+
     @Test("headerId is the accountId:folderPath:messageId composite")
     func headerIdFormat() {
         let id = MessageIdentity.headerId(accountId: "acct-1", folderPath: "INBOX", messageId: "msg-42")
@@ -58,10 +161,143 @@ struct MessageIdentityTests {
         // then accountId was prefixed again). Assert the shared helper
         // produces the flat shape the main-app cache stores under.
         let key = MessageIdentity.aiCacheKey(
-            accountId: "dup", folderPath: "INBOX", rfc822MessageId: "r@x"
+            accountId: "dup", folderPath: "INBOX", rfc822MessageId: "identity@example.com"
         )
-        #expect(key == "dup:INBOX:r@x")
-        #expect(key != "dup:dup:INBOX:r@x")
+        #expect(key == "dup:INBOX:identity@example.com")
+        #expect(key != "dup:dup:INBOX:identity@example.com")
+    }
+
+    @Test("recent provenance keys cannot collide when folder and message contain colons")
+    func recentProvenanceKeysLengthPrefixComponents() {
+        let accountId = "acct"
+        let firstFolder = "Foo"
+        let firstMessageId = "bar:baz"
+        let secondFolder = "Foo:bar"
+        let secondMessageId = "baz"
+
+        #expect(MessageIdentity.recentlyCompletedFolderKey(
+            accountId: accountId,
+            folderPath: firstFolder,
+            messageId: firstMessageId
+        ) != MessageIdentity.recentlyCompletedFolderKey(
+            accountId: accountId,
+            folderPath: secondFolder,
+            messageId: secondMessageId
+        ))
+        #expect(MessageIdentity.recentlyCompletedFieldKey(
+            accountId: accountId,
+            folderPath: firstFolder,
+            messageId: firstMessageId,
+            field: .read
+        ) != MessageIdentity.recentlyCompletedFieldKey(
+            accountId: accountId,
+            folderPath: secondFolder,
+            messageId: secondMessageId,
+            field: .read
+        ))
+        #expect(MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: accountId,
+            folderPath: firstFolder,
+            messageId: firstMessageId,
+            value: .read(false)
+        ) != MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: accountId,
+            folderPath: secondFolder,
+            messageId: secondMessageId,
+            value: .read(false)
+        ))
+        #expect(MessageIdentity.recentlyCompletedPushKey(
+            accountId: accountId,
+            folderPath: firstFolder,
+            messageId: firstMessageId
+        ) != MessageIdentity.recentlyCompletedPushKey(
+            accountId: accountId,
+            folderPath: secondFolder,
+            messageId: secondMessageId
+        ))
+        #expect(MessageIdentity.membershipKey(
+            accountId: accountId,
+            folderPath: firstFolder,
+            messageId: firstMessageId,
+            membership: .addedDestination
+        ) != MessageIdentity.membershipKey(
+            accountId: accountId,
+            folderPath: secondFolder,
+            messageId: secondMessageId,
+            membership: .addedDestination
+        ))
+    }
+
+    @Test("field-value provenance distinguishes polarity, type, and action-tag nil")
+    func recentFieldValueKeysPreserveExactValue() {
+        let readTrue = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "message",
+            value: .read(true)
+        )
+        let readFalse = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "message",
+            value: .read(false)
+        )
+        let flaggedTrue = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "message",
+            value: .flagged(true)
+        )
+        let removedTag = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "message",
+            value: .actionTag(nil)
+        )
+        let literalNilTag = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "message",
+            value: .actionTag("nil")
+        )
+        let emptyTag = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "message",
+            value: .actionTag("")
+        )
+
+        #expect(readTrue != readFalse)
+        #expect(readTrue != flaggedTrue)
+        #expect(removedTag != literalNilTag)
+        #expect(removedTag != emptyTag)
+        #expect(Set([
+            readTrue, readFalse, flaggedTrue, removedTag, literalNilTag, emptyTag,
+        ]).count == 6)
+    }
+
+    @Test("field-value provenance scopes account and folder boundaries independently")
+    func recentFieldValueKeysScopeIdentity() {
+        let accountA = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account:A",
+            messageId: "message",
+            value: .flagged(false)
+        )
+        let accountB = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            messageId: "A:message",
+            value: .flagged(false)
+        )
+        let folderA = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            folderPath: "Folder:A",
+            messageId: "message",
+            value: .actionTag(ActionTag.archive.rawValue)
+        )
+        let folderB = MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: "account",
+            folderPath: "Folder",
+            messageId: "A:message",
+            value: .actionTag(ActionTag.archive.rawValue)
+        )
+
+        #expect(accountA != accountB)
+        #expect(folderA != folderB)
+        #expect(accountA != folderA)
     }
 
     @Test("MessageHeader.id goes through MessageIdentity — same composite")

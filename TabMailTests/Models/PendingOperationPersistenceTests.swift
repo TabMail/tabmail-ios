@@ -188,33 +188,17 @@ struct PendingOperationPersistenceTests {
         #expect(fetched?.status == PendingStatus.queued.rawValue)
     }
 
-    @Test("Status transition: queued → cancelled")
-    func statusTransitionQueuedToCancelled() throws {
-        let db = try TestDatabase.make()
-        var op = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        try db.write { try op.insert($0) }
-
-        op.status = PendingStatus.cancelled.rawValue
-        try db.write { try op.save($0) }
-
-        let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
-        #expect(fetched?.status == PendingStatus.cancelled.rawValue)
-    }
-
-    @Test("Filter by status works for all statuses")
-    func filterByStatus() throws {
+    @Test("Filter by status distinguishes queued and in-flight work")
+    func filterByLiveStatus() throws {
         let db = try TestDatabase.make()
 
-        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
         op2.status = PendingStatus.inFlight.rawValue
-        var op3 = PendingOperation(type: .markFlagged, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
-        op3.status = PendingStatus.cancelled.rawValue
 
         try db.write { dbConn in
             try op1.insert(dbConn)
             try op2.insert(dbConn)
-            try op3.insert(dbConn)
         }
 
         let queued = try db.read {
@@ -226,11 +210,6 @@ struct PendingOperationPersistenceTests {
             try PendingOperation.filter(Column("status") == PendingStatus.inFlight.rawValue).fetchAll($0)
         }
         #expect(inFlight.count == 1)
-
-        let cancelled = try db.read {
-            try PendingOperation.filter(Column("status") == PendingStatus.cancelled.rawValue).fetchAll($0)
-        }
-        #expect(cancelled.count == 1)
     }
 
     // MARK: - Duplicate prevention / uniqueness
@@ -343,59 +322,6 @@ struct PendingOperationPersistenceTests {
 
         let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
         #expect(fetched?.retryCount == 3)
-    }
-
-    // MARK: - uidResolutionRetryCount (dedicated budget, separate from retryCount)
-
-    @Test("uidResolutionRetryCount defaults to 0 and round-trips independently of retryCount")
-    func uidResolutionRetryCountDefaultsAndPersists() throws {
-        let db = try TestDatabase.make()
-        var op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        try db.write { try op.insert($0) }
-
-        let inserted = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
-        #expect(inserted?.uidResolutionRetryCount == 0)
-
-        // Bump retryCount (simulating unrelated generic-branch blips) and
-        // uidResolutionRetryCount (simulating real SEARCH misses) independently —
-        // they must not clobber each other.
-        op.retryCount = 5
-        op.uidResolutionRetryCount = 2
-        try db.write { try op.save($0) }
-
-        let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
-        #expect(fetched?.retryCount == 5)
-        #expect(fetched?.uidResolutionRetryCount == 2)
-    }
-
-    // MARK: - deleteAll by filter
-
-    @Test("deleteAll by status removes matching ops only")
-    func deleteAllByStatus() throws {
-        let db = try TestDatabase.make()
-
-        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
-        op2.status = PendingStatus.cancelled.rawValue
-        var op3 = PendingOperation(type: .markFlagged, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
-        op3.status = PendingStatus.cancelled.rawValue
-
-        try db.write { dbConn in
-            try op1.insert(dbConn)
-            try op2.insert(dbConn)
-            try op3.insert(dbConn)
-        }
-
-        let deletedCount = try db.write {
-            try PendingOperation
-                .filter(Column("status") == PendingStatus.cancelled.rawValue)
-                .deleteAll($0)
-        }
-        #expect(deletedCount == 2)
-
-        let remaining = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(remaining.count == 1)
-        #expect(remaining[0].status == PendingStatus.queued.rawValue)
     }
 
     // MARK: - All operation types persist
