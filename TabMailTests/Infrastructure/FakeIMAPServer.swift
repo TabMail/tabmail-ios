@@ -93,6 +93,15 @@ final class FakeIMAPServer: @unchecked Sendable {
     let password: String
     private(set) var port: Int
 
+    /// Wire-order CAPABILITY tokens this server advertises, both in the
+    /// connection greeting and the `CAPABILITY` command response. Defaults
+    /// to the original hardcoded set. SPEC-B4 constructs a server WITHOUT
+    /// `MOVE`/`UIDPLUS` to force SwiftMail's COPY+STORE+EXPUNGE fallback
+    /// (RFC 6851 — see `IMAPServer+Manipulation.swift`'s `move` in the
+    /// pinned SwiftMail fork).
+    static let defaultCapabilities = ["IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "UIDPLUS", "MOVE", "IDLE"]
+    private let capabilities: [String]
+
     private var listenFd: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private let queue = DispatchQueue(label: "FakeIMAPServer")
@@ -100,19 +109,27 @@ final class FakeIMAPServer: @unchecked Sendable {
     private var state: State
     private var clientFds: [Int32] = []
 
-    init(host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass", messages: [Message]) {
+    init(
+        host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass",
+        capabilities: [String] = FakeIMAPServer.defaultCapabilities, messages: [Message]
+    ) {
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.capabilities = capabilities
         self.state = State(messagesByMailbox: ["INBOX": messages])
     }
 
-    init(host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass", mailboxes: [String: [Message]]) {
+    init(
+        host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass",
+        capabilities: [String] = FakeIMAPServer.defaultCapabilities, mailboxes: [String: [Message]]
+    ) {
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.capabilities = capabilities
         self.state = State(messagesByMailbox: mailboxes)
     }
 
@@ -369,7 +386,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     }
 
     private func handleClient(fd: Int32) {
-        sendLine(fd: fd, "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS MOVE IDLE] FakeIMAP ready\r\n")
+        sendLine(fd: fd, "* OK [CAPABILITY \(capabilities.joined(separator: " "))] FakeIMAP ready\r\n")
 
         var buffer = Data()
         var authenticated = false
@@ -507,7 +524,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     private func handleCommand(tag: String, command: String, args: String, authenticated: inout Bool, selectedMailbox: inout String?) -> String {
         switch command {
         case "CAPABILITY":
-            return "* CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS MOVE IDLE\r\n\(tag) OK CAPABILITY completed\r\n"
+            return "* CAPABILITY \(capabilities.joined(separator: " "))\r\n\(tag) OK CAPABILITY completed\r\n"
         case "LOGIN":
             authenticated = true
             return "\(tag) OK LOGIN completed\r\n"
@@ -564,6 +581,22 @@ final class FakeIMAPServer: @unchecked Sendable {
             return response
         case "ID":
             return "* ID NIL\r\n\(tag) OK ID completed\r\n"
+        case "EXPUNGE":
+            // Plain (non-UID) EXPUNGE — RFC 3501 §6.4.3. Mailbox-WIDE: removes
+            // every \Deleted-flagged message in the SELECTed mailbox, not just
+            // a targeted set. This is what SwiftMail's MOVE fallback issues
+            // when UIDPLUS is absent (`expungeMoveFallback`, SPEC-B4).
+            guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
+            withState { state in
+                let sourceMessages = state.messagesByMailbox[selectedMailbox] ?? []
+                let mailboxFlags = state.flagsByMailbox[selectedMailbox] ?? [:]
+                let deletedUIDs = Set(sourceMessages.map(\.uid).filter { mailboxFlags[$0]?.contains("\\Deleted") ?? false })
+                state.messagesByMailbox[selectedMailbox] = sourceMessages.filter { !deletedUIDs.contains($0.uid) }
+                for uid in deletedUIDs {
+                    state.flagsByMailbox[selectedMailbox]?.removeValue(forKey: uid)
+                }
+            }
+            return "\(tag) OK EXPUNGE completed\r\n"
         case "NOOP":
             return "\(tag) OK NOOP completed\r\n"
         case "LOGOUT":
@@ -662,6 +695,30 @@ final class FakeIMAPServer: @unchecked Sendable {
                 }
             }
             return "\(tag) OK UID EXPUNGE completed\r\n"
+        case "COPY":
+            // RFC 3501 §6.4.7 — leaves the SOURCE untouched, unlike MOVE.
+            // This is the first step of SwiftMail's no-MOVE-capability
+            // fallback (COPY + STORE \Deleted + EXPUNGE, SPEC-B4).
+            let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
+            guard components.count == 2 else { return "\(tag) BAD Invalid UID COPY\r\n" }
+            let uids = Set(parseUIDSet(components[0]))
+            let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
+            withState { state in
+                let sourceMessages = state.messagesByMailbox[mailbox] ?? []
+                let copying = sourceMessages.filter { uids.contains($0.uid) }
+                var destinationMessages = state.messagesByMailbox[destination] ?? []
+                var nextUID = (destinationMessages.map(\.uid).max() ?? 0) + 1
+                let sourceFlags = state.flagsByMailbox[mailbox] ?? [:]
+                var destinationFlags = state.flagsByMailbox[destination] ?? [:]
+                for message in copying {
+                    destinationMessages.append(message.replacingUID(nextUID))
+                    destinationFlags[nextUID] = sourceFlags[message.uid] ?? []
+                    nextUID += 1
+                }
+                state.messagesByMailbox[destination] = destinationMessages
+                state.flagsByMailbox[destination] = destinationFlags
+            }
+            return "\(tag) OK UID COPY completed\r\n"
         default:
             return "\(tag) BAD Unknown UID subcommand\r\n"
         }

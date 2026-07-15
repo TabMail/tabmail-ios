@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 
 /// Actor-owned ordering state for Gmail's `/labels` catalog. Kept as a small
 /// value type so out-of-order response handling can be tested deterministically
@@ -84,6 +85,17 @@ actor GmailProvider: EmailProvider {
     /// (Sent-only mail staying out of the Archive list is shipped UI
     /// behavior); only resolution/membership for ACTIONS uses this one.
     static let allMailActionExclusionQuery = "-in:inbox -in:trash -in:spam -in:draft"
+
+    #if DEBUG
+    /// TEST-ONLY: skip the post-search Message-ID metadata re-verification in
+    /// `resolveActionMessageId` (SPEC-B1 mutation-check seam). Lets a test
+    /// prove which layer actually protects a decoy candidate from mutation —
+    /// the ambiguity count guard (`refs.count == 1`) or this later
+    /// defense-in-depth compare — by disabling ONLY this compare and
+    /// observing whether the pinned assertions still hold. Defaults to off;
+    /// tests must restore it to `false` when done.
+    static let skipActionMetadataVerificationForTesting = Mutex<Bool>(false)
+    #endif
 
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let userEmail: String
@@ -699,10 +711,17 @@ actor GmailProvider: EmailProvider {
         else {
             throw ProviderError.actionIdentityResolutionFailed(rfc822MessageId)
         }
-        guard MessageIdentity.durableActionRFC822MessageId(
-            header.rfc822MessageId
-        ) == rfc822MessageId else {
-            throw ProviderError.actionIdentityResolutionFailed(rfc822MessageId)
+        #if DEBUG
+        let skipMetadataVerification = Self.skipActionMetadataVerificationForTesting.withLock { $0 }
+        #else
+        let skipMetadataVerification = false
+        #endif
+        if !skipMetadataVerification {
+            guard MessageIdentity.durableActionRFC822MessageId(
+                header.rfc822MessageId
+            ) == rfc822MessageId else {
+                throw ProviderError.actionIdentityResolutionFailed(rfc822MessageId)
+            }
         }
         let labelIds = message.labelIds ?? []
         guard labels(labelIds, belongToActionFolder: folder) else { return nil }

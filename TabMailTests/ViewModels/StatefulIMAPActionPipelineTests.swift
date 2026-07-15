@@ -1529,4 +1529,69 @@ struct StatefulIMAPActionPipelineTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
         try await provider.disconnect()
     }
+
+    // MARK: - Provider API doc-pins (web-verified API audit, 2026-07)
+
+    /// SPEC-B4: a server advertising NEITHER `MOVE` NOR `UIDPLUS` forces
+    /// SwiftMail's COPY + STORE(\Deleted) + EXPUNGE fallback (RFC 6851 —
+    /// `IMAPServer+Manipulation.swift`'s `move`, pinned SwiftMail fork:
+    /// native MOVE requires BOTH capabilities for a `MessageIdentifierSet<UID>`
+    /// source, since a UID-addressed op also needs UIDPLUS for the atomic
+    /// path). Archives through the real pipeline and asserts source empty,
+    /// destination exactly one copy, and flags preserved — plus the exact
+    /// wire commands the fallback must (and must not) issue.
+    @Test("public archive through a server with NO MOVE/UIDPLUS capability uses the COPY+STORE+EXPUNGE fallback: source empty, destination exactly one copy, flags preserved")
+    func moveFallbackWithoutMoveOrUidplusCapability() async throws {
+        let rfc822MessageId = "imap-fallback-\(UUID().uuidString.lowercased())@example.com"
+        let uid = 301
+        let message = FakeIMAPServer.makeMessage(uid: uid, rfc822Text: rfc822(messageId: rfc822MessageId))
+        let server = FakeIMAPServer(
+            capabilities: ["IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "IDLE"],
+            mailboxes: ["INBOX": [message], "Archive": []]
+        )
+        server.setFlags(["\\Flagged"], in: "INBOX", uid: uid)
+        try server.start()
+        defer { server.stop() }
+        let provider = provider(for: server)
+        try await provider.connect()
+        let (pool, _, _, previous) = try makeTestDB()
+        defer { restore(previous: previous) }
+        resetProcessState()
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: provider)
+
+        do {
+            let op = PendingOperation(
+                type: .move, messageIds: [rfc822MessageId], accountId: "acc1",
+                folderPath: "INBOX", destinationPath: "Archive"
+            )
+            try await pool.writeWithoutTransaction { db in try op.insert(db) }
+            try await drainProviderQueue(pool: pool)
+
+            let remaining = try await pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(remaining == 0, "the move completes through the fallback")
+
+            #expect(server.messageIDs(in: "INBOX").isEmpty, "source is empty after the fallback")
+            let archived = try await provider.fetchMessages(folder: "Archive", limit: 10, offset: 0)
+            #expect(archived.count == 1, "destination has exactly one copy")
+            guard archived.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                try? await provider.disconnect()
+                return
+            }
+            #expect(archived[0].rfc822MessageId == rfc822MessageId)
+            #expect(archived[0].isFlagged, "flags are preserved across the fallback")
+
+            let commands = server.recordedCommands()
+            #expect(commands.contains { $0.hasPrefix("UID COPY") }, "the fallback issues UID COPY")
+            #expect(commands.contains { $0.contains("STORE") && $0.contains("\\Deleted") }, "the fallback flags \\Deleted before expunging")
+            #expect(commands.contains { $0 == "EXPUNGE" }, "the fallback issues a plain EXPUNGE (no UIDPLUS)")
+            #expect(!commands.contains { $0.hasPrefix("UID MOVE") }, "native MOVE must never be used without the capability")
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            try? await provider.disconnect()
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+        try await provider.disconnect()
+    }
 }

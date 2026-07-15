@@ -68,6 +68,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var unclassified400ProviderIds: Set<String> = []
         var unclassified400Served = 0
         var modifyLog: [ModifyCall] = []
+        /// Provider ids that should ALSO match an `rfc822msgid:` search for a
+        /// DIFFERENT (superstring) Message-ID — models a real observed Gmail
+        /// search-index quirk where a message whose Message-ID is a
+        /// superstring of the queried id can surface as a decoy candidate
+        /// alongside the true match (SPEC-B1). Keyed by provider id so the
+        /// decoy's OWN Message-ID (returned by metadata fetch) stays truthful.
+        var substringDecoyMatches: [String: String] = [:]
+        /// rfc822 Message-IDs whose next search response should carry a
+        /// spurious `nextPageToken` even though the implied next page is
+        /// empty — models a dangling-pagination edge case (SPEC-B3).
+        var spuriousNextPageTokenTargets: Set<String> = []
     }
 
     private final class StateBox: Sendable {
@@ -155,6 +166,25 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// ones) for ordering/attempt-count assertions.
     func modifyLog() -> [ModifyCall] {
         state.value.withLock { $0.modifyLog }
+    }
+
+    /// SPEC-B1: simulate Gmail's real `rfc822msgid:` search occasionally
+    /// surfacing a DECOY message alongside the true match for a DIFFERENT
+    /// queried id — a superstring/substring search-index collision (e.g. a
+    /// decoy whose real Message-ID is `xabc@x.com` also matching a search
+    /// for `abc@x.com`). `decoyProviderMessageId` must already be seeded;
+    /// its own Message-ID is untouched, so metadata verification still sees
+    /// its TRUE identity — only the SEARCH RESULT LIST gains the extra ref.
+    func addSubstringDecoyMatchForTesting(decoyProviderMessageId: String, matchesQuery rfc822MessageId: String) {
+        state.value.withLock { $0.substringDecoyMatches[decoyProviderMessageId] = rfc822MessageId }
+    }
+
+    /// SPEC-B3: the next `rfc822msgid:` search for `rfc822MessageId` returns
+    /// its normal ref(s) PLUS a spurious `nextPageToken` — modeling Gmail
+    /// claiming more results exist when the implied next page is actually
+    /// empty. Persists until cleared; a real drain only searches once per op.
+    func armSpuriousNextPageTokenForTesting(rfc822MessageId: String) {
+        _ = state.value.withLock { $0.spuriousNextPageTokenTargets.insert(rfc822MessageId) }
     }
 
     /// Gmail's structured error-body shape with a reason/message that matches
@@ -254,6 +284,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let queryItems = components?.queryItems ?? []
             let query = queryItems.first(where: { $0.name == "q" })?.value ?? ""
             let label = queryItems.first(where: { $0.name == "labelIds" })?.value
+            let includeSpamTrash = queryItems.first(where: { $0.name == "includeSpamTrash" })?.value == "true"
             let maxResults = queryItems.first(where: { $0.name == "maxResults" })?.value
                 .flatMap(Int.init) ?? Int.max
             let actionRFC = Self.rfcIdentity(fromSearchQuery: query)
@@ -277,10 +308,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let refs = state.value.withLock { model in
                 model.messagesByProviderId.values
                     .filter { message in
+                        // Real Gmail excludes SPAM/TRASH-labeled messages from
+                        // ANY list/search response unless includeSpamTrash=true
+                        // is sent — regardless of an explicit labelIds= filter
+                        // (SPEC-B2). Applies uniformly, matching the real API.
+                        if !includeSpamTrash, !message.labels.isDisjoint(with: ["TRASH", "SPAM"]) {
+                            return false
+                        }
                         if let rfc822MessageId = actionRFC {
-                            guard message.rfc822MessageId == rfc822MessageId else {
-                                return false
-                            }
+                            let isExactMatch = message.rfc822MessageId == rfc822MessageId
+                            let isDecoyMatch = model.substringDecoyMatches[message.providerMessageId] == rfc822MessageId
+                            guard isExactMatch || isDecoyMatch else { return false }
                             if let label { return message.labels.contains(label) }
                             return Self.satisfiesQueryExclusions(query, labels: message.labels)
                         }
@@ -292,7 +330,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     .prefix(maxResults)
                     .map { ["id": $0.providerMessageId, "threadId": "thread-\($0.providerMessageId)"] }
             }
-            let body = (try? JSONSerialization.data(withJSONObject: ["messages": refs])) ?? Data()
+            var responseObject: [String: Any] = ["messages": refs]
+            if let rfc822MessageId = actionRFC,
+               state.value.withLock({ $0.spuriousNextPageTokenTargets.contains(rfc822MessageId) }) {
+                responseObject["nextPageToken"] = "spurious-canary-page-2"
+            }
+            let body = (try? JSONSerialization.data(withJSONObject: responseObject)) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
         http.register(path: "/messages/", method: "POST") { [state] request in

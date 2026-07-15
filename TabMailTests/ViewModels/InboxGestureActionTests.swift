@@ -3318,7 +3318,7 @@ struct InboxGestureActionTests {
         defer {
             restoreTestDB(previous: previous, dir: dir)
             clearOverlay(); resetStagedGlobal()
-            AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 = nil }
+            AccountManager.simulatePrimaryResolveFailuresForTesting.withLock { $0 = [:] }
         }
         clearOverlay(); resetStagedGlobal()
 
@@ -3332,7 +3332,7 @@ struct InboxGestureActionTests {
         // Arm the one-shot failure BEFORE the gesture: the fold's FIRST
         // resolve throws, records reinsert, the retry fires after the paced
         // delay and executes the write.
-        AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 = id }
+        AccountManager.armPrimaryResolveFailuresForTesting(id: id, count: 1)
         vm.toggleRead(id)
 
         // The failed fold must leave the intent PENDING (not dropped): the
@@ -3360,7 +3360,7 @@ struct InboxGestureActionTests {
         #expect(executed, "the retry must execute the intent — a read error must never drop it")
         await drainWriteQueue()
         #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting())
-        #expect(AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 } == nil, "the one-shot seam was consumed")
+        #expect(AccountManager.remainingPrimaryResolveFailuresForTesting(id: id) == nil, "the one-shot seam was consumed")
     }
 
     @Test("Round D-0: archive then return to inbox in one batch RETAINS the tag — no resurrect-guard, no write, no PendingOperation, no AI-cache touch")

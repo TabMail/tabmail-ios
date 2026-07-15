@@ -357,6 +357,77 @@ struct PendingOperationMutationGateTests {
         #expect(gate.waiterCountForTesting == 0)
         #expect(!gate.isHeldForTesting)
     }
+
+    /// Deadlock-audit item 8: many independent tasks race `acquire()`→
+    /// release() on a SHARED gate, roughly half pre-cancelled before they
+    /// even start racing (and thus cancelled at every possible point along
+    /// `acquire()`'s await chain across the whole run, since scheduling
+    /// order is nondeterministic), asserting via a plain `Mutex`-protected
+    /// counter that AT MOST ONE task is ever "inside" (between a successful
+    /// `acquire()` and its matching `release()`) at any instant. Protects
+    /// `withTaskCancellationHandler`'s unregistration semantics
+    /// (`cancelAcquisition`'s queued-waiter-removal vs. "already became
+    /// owner, forward the handoff" race — see that function's doc comment)
+    /// against refactors: a regression here is exactly two owners observed
+    /// simultaneously inside the gate, or a stranded waiter/owner afterward.
+    /// Flat, TOP-LEVEL `Task` handles only (mirrors `permitIsFIFOAndSerial`
+    /// elsewhere in this file) — nesting a nested `TaskGroup`/`Task` inside
+    /// an outer `group.addTask` closure trips Swift 6's `sending`-parameter
+    /// checker on the shared `Mutex`-protected captures even though `Mutex`
+    /// itself is safe for this exact pattern. Bounded time (no sleeps;
+    /// `Task.yield` only), wrapped in `withTimeout` so a real deadlock fails
+    /// fast instead of hanging CI.
+    @Test("many tasks stress the gate with random cancellation: at most one owner is ever inside, no leaks, bounded time")
+    func gateStressWithRandomCancellationNeverAdmitsTwoOwners() async throws {
+        let gate = PendingOperationMutationGate()
+        let insideCount = Mutex<Int>(0)
+        let maxObservedInside = Mutex<Int>(0)
+        let violationDetected = Mutex<Bool>(false)
+        let totalAttempts = 500
+
+        try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+            var attempts: [Task<Void, Never>] = []
+            attempts.reserveCapacity(totalAttempts)
+            for _ in 0..<totalAttempts {
+                let attempt = Task<Void, Never> { @Sendable in
+                    do {
+                        let lease = try await gate.acquire()
+                        let current = insideCount.withLock { count -> Int in
+                            count += 1
+                            return count
+                        }
+                        maxObservedInside.withLock { $0 = max($0, current) }
+                        if current > 1 {
+                            violationDetected.withLock { $0 = true }
+                        }
+                        // No sleeps — yield gives every other task a
+                        // scheduling chance to race for the gate while this
+                        // one is "inside".
+                        await Task.yield()
+                        insideCount.withLock { $0 -= 1 }
+                        gate.release(lease)
+                    } catch is CancellationError {
+                        // Expected under random cancellation.
+                    } catch {
+                        Issue.record("unexpected error from gate.acquire(): \(error)")
+                    }
+                }
+                if Bool.random() {
+                    attempt.cancel()
+                }
+                attempts.append(attempt)
+            }
+            for attempt in attempts {
+                await attempt.value
+            }
+        }
+
+        #expect(!violationDetected.withLock { $0 }, "at most one task may ever be inside the gate at a time")
+        #expect(maxObservedInside.withLock { $0 } <= 1)
+        #expect(insideCount.withLock { $0 } == 0, "no leaked in-flight owner")
+        #expect(!gate.isHeldForTesting, "the gate must end unheld")
+        #expect(gate.waiterCountForTesting == 0, "no waiter may be stranded")
+    }
 }
 
 /// Real-`executeSingleOp` tests for durable completion and generic retry outcomes.
@@ -2552,5 +2623,432 @@ struct AccountManagerQueueDrainTests {
         #expect(laterMessage.count == 1)
         guard laterMessage.count == 1 else { return }
         #expect(laterMessage[0].isRead, "the later markRead was not wedged behind the gone-label op")
+    }
+
+    // MARK: - Provider API doc-pins (web-verified API audit, 2026-07)
+
+    /// SPEC-B1: a real observed Gmail `rfc822msgid:` search-index quirk can
+    /// surface a DECOY message (whose true Message-ID is a SUPERSTRING of
+    /// the queried id) alongside the true match. Two refs make the op
+    /// ambiguous — the count guard in `resolveActionMessageId`
+    /// (`refs.count == 1`) is what protects both candidates from mutation,
+    /// not the later metadata-compare (verified by the mutation-check for
+    /// this test, which disables ONLY the compare via
+    /// `GmailProvider.skipActionMetadataVerificationForTesting` and confirms
+    /// the assertions still hold — the count guard alone is sufficient).
+    @Test("Gmail rfc822msgid substring decoy: two refs authoritative-no-op through the real drain, decoy never mutated")
+    func gmailRfc822MsgidSubstringDecoyNeverMutated() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-gmail-decoy-\(suffix)"
+        let targetRFC = "abc-\(suffix)@example.com"
+        let decoyRFC = "xabc-\(suffix)@example.com"
+        let targetProviderId = "gmail-target-\(suffix)"
+        let decoyProviderId = "gmail-decoy-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: targetRFC, providerMessageId: targetProviderId, labels: ["INBOX", "UNREAD"]),
+            .init(rfc822MessageId: decoyRFC, providerMessageId: decoyProviderId, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+        server.addSubstringDecoyMatchForTesting(decoyProviderMessageId: decoyProviderId, matchesQuery: targetRFC)
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+        let op = PendingOperation(type: .markRead, messageIds: [targetRFC], accountId: accountId, folderPath: "INBOX")
+        try insertOp(op, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        #expect(try fetchOp(op.id, pool: pool) == nil, "two-ref ambiguity is authoritative — the row leaves the queue")
+        let target = server.snapshots(rfc822MessageId: targetRFC)
+        let decoy = server.snapshots(rfc822MessageId: decoyRFC)
+        #expect(target.count == 1)
+        #expect(decoy.count == 1)
+        guard target.count == 1, decoy.count == 1 else { return }
+        #expect(target[0].labels.contains("UNREAD"), "the true match must NOT be mutated while ambiguous")
+        #expect(decoy[0].labels.contains("UNREAD"), "the decoy must NEVER be mutated")
+    }
+
+    /// SPEC-B2: `resolveActionMessageId` unconditionally sends
+    /// `includeSpamTrash=true` — real Gmail excludes TRASH/SPAM-labeled
+    /// messages from EVERY list/search response otherwise, even given an
+    /// explicit `labelIds=TRASH` filter. A markRead recorded against the
+    /// TRASH scope only resolves because of this parameter.
+    @Test("Gmail markRead against TRASH scope resolves only because includeSpamTrash=true is sent")
+    func gmailTrashScopedMarkReadRequiresIncludeSpamTrash() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-gmail-trash-\(suffix)"
+        let rfc822MessageId = "trash-\(suffix)@example.com"
+        let providerMessageId = "gmail-trash-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: rfc822MessageId, providerMessageId: providerMessageId, labels: ["TRASH", "UNREAD"]),
+        ])
+        defer { server.close() }
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+        let op = PendingOperation(type: .markRead, messageIds: [rfc822MessageId], accountId: accountId, folderPath: "TRASH")
+        try insertOp(op, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        #expect(try fetchOp(op.id, pool: pool) == nil, "the markRead resolves and completes")
+        let snapshot = server.snapshots(rfc822MessageId: rfc822MessageId)
+        #expect(snapshot.count == 1)
+        guard snapshot.count == 1 else { return }
+        #expect(snapshot[0].isRead, "remote UNREAD must be removed — includeSpamTrash=true made the TRASH-scoped search resolve")
+    }
+
+    /// SPEC-B3: a search response with exactly one ref PLUS a non-nil
+    /// `nextPageToken` is treated as ambiguous (the guard requires
+    /// `response.nextPageToken == nil`), even when the implied next page
+    /// would be empty. This pins the CURRENT deliberate
+    /// ambiguity-conservative choice as a doc-pin, not a bug.
+    @Test("Gmail spurious nextPageToken on a single-ref search pins the ambiguity-conservative no-op")
+    func gmailSpuriousNextPageTokenPinsAmbiguityConservativeNoOp() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-gmail-nextpage-\(suffix)"
+        let rfc822MessageId = "nextpage-\(suffix)@example.com"
+        let providerMessageId = "gmail-nextpage-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: rfc822MessageId, providerMessageId: providerMessageId, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+        server.armSpuriousNextPageTokenForTesting(rfc822MessageId: rfc822MessageId)
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+        let op = PendingOperation(type: .markRead, messageIds: [rfc822MessageId], accountId: accountId, folderPath: "INBOX")
+        try insertOp(op, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        #expect(try fetchOp(op.id, pool: pool) == nil, "a dangling nextPageToken is authoritative — the row leaves the queue as a no-op")
+        let snapshot = server.snapshots(rfc822MessageId: rfc822MessageId)
+        #expect(snapshot.count == 1)
+        guard snapshot.count == 1 else { return }
+        #expect(snapshot[0].labels.contains("UNREAD"), "no mutation applies while a next page is (spuriously) claimed to exist")
+    }
+
+    /// GAP-4: the SOURCE-scoped variant of the deleted-label 400 (the list
+    /// query's `labelIds` names a deleted label) — distinct from the
+    /// already-covered DESTINATION variant in
+    /// `gmailMoveToDeletedDestinationLabelSelfHealsAndLaterOpProceeds` (a
+    /// `.move`'s destination). Here a plain `.markRead` is recorded against
+    /// a SOURCE folder scope whose Gmail label was deleted remotely between
+    /// enqueue and drain.
+    @Test("Gmail markRead against a remotely deleted SOURCE label terminal-no-ops through the real drain, and a later op still proceeds")
+    func gmailSourceScopedDeletedLabelTerminalNoOpsAndLaterOpProceeds() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-gmail-gone-source-\(suffix)"
+        let deletedLabelId = "Label_gone_source_\(suffix)"
+        let rfc822MessageId = "gone-source-\(suffix)@example.com"
+        let providerMessageId = "gmail-gone-source-\(suffix)"
+        let otherRFC = "gone-source-other-\(suffix)@example.com"
+        let otherProviderId = "gmail-gone-source-other-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: rfc822MessageId, providerMessageId: providerMessageId, labels: [deletedLabelId, "UNREAD"]),
+            .init(rfc822MessageId: otherRFC, providerMessageId: otherProviderId, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+        server.markLabelDeleted(deletedLabelId)
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+
+        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+        var staleOp = PendingOperation(
+            type: .markRead, messageIds: [rfc822MessageId], accountId: accountId, folderPath: deletedLabelId
+        )
+        staleOp.createdAt = t0
+        var laterOp = PendingOperation(
+            type: .markRead, messageIds: [otherRFC], accountId: accountId, folderPath: "INBOX"
+        )
+        laterOp.createdAt = t0.addingTimeInterval(1)
+        try insertOp(staleOp, pool: pool)
+        try insertOp(laterOp, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        let remaining = try await pool.read { db in
+            try PendingOperation.filter(Column("accountId") == accountId).fetchCount(db)
+        }
+        #expect(remaining == 0, "the gone-source-label markRead terminal-no-ops and the later op completes")
+
+        let untouched = server.snapshots(rfc822MessageId: rfc822MessageId)
+        #expect(untouched.count == 1)
+        guard untouched.count == 1 else { return }
+        #expect(untouched[0].labels.contains("UNREAD"), "the markRead never applied — the source scope is gone")
+
+        let laterMessage = server.snapshots(rfc822MessageId: otherRFC)
+        #expect(laterMessage.count == 1)
+        guard laterMessage.count == 1 else { return }
+        #expect(laterMessage[0].isRead, "the later markRead was not wedged behind the gone-source-label op")
+    }
+
+    /// GAP-9: another TabMail client moves the message (removes it from the
+    /// recorded SOURCE label) between enqueue and drain. The queued
+    /// markRead's source-scoped search then resolves ZERO refs —
+    /// authoritative no-op. The message's remote read-state is left exactly
+    /// as the "other client" left it; this test pins that queue/remote-state
+    /// delta as the end state (an ordinary later sync reconciling any LOCAL
+    /// optimistic flip is a separate mechanism, out of scope here).
+    @Test("Gmail message moved by another client between enqueue and drain: markRead resolves zero refs, remote read-state unchanged, op completes as no-op")
+    func gmailMovedByAnotherClientBetweenEnqueueAndDrain() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-gmail-moved-\(suffix)"
+        let rfc822MessageId = "moved-\(suffix)@example.com"
+        let providerMessageId = "gmail-moved-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: rfc822MessageId, providerMessageId: providerMessageId, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+        let op = PendingOperation(type: .markRead, messageIds: [rfc822MessageId], accountId: accountId, folderPath: "INBOX")
+        try insertOp(op, pool: pool)
+
+        // "Another client" archives the message BEFORE this device drains its
+        // queued markRead — a second, independent provider instance against
+        // the SAME backing fixture state, exactly as a second real device
+        // would hit the same Gmail account.
+        let otherClientProvider = server.provider()
+        try await otherClientProvider.move(ids: [rfc822MessageId], from: "INBOX", to: GmailProvider.archivePath)
+        let movedAway = server.snapshots(rfc822MessageId: rfc822MessageId)
+        #expect(movedAway.count == 1)
+        guard movedAway.count == 1 else { return }
+        #expect(!movedAway[0].labels.contains("INBOX"), "setup: the other client's move must have actually left INBOX")
+
+        try await withRegisteredProvider(accountId: accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+
+        #expect(try fetchOp(op.id, pool: pool) == nil, "zero refs in the now-stale source scope is authoritative — the row leaves the queue")
+        let final = server.snapshots(rfc822MessageId: rfc822MessageId)
+        #expect(final.count == 1)
+        guard final.count == 1 else { return }
+        #expect(final[0].labels.contains("UNREAD"), "remote read-state is unchanged by the no-op'd markRead")
+        #expect(!final[0].labels.contains("INBOX"), "the message stays wherever the other client left it")
+    }
+
+    // MARK: - Queue liveness/deadlock audit pins (2026-07)
+
+    /// The STATIC liveness invariants — hold even while the queue is
+    /// legitimately blocked on a not-yet-registered provider, mirrors
+    /// `AccountManagerQueueLivenessTests`/`AccountManagerQueueDemotionTests`'
+    /// copies (duplicated per-file by this suite family's convention).
+    private func assertQueueLivenessInvariants(pool: DatabasePool) async throws {
+        #expect(!AccountManager.shared.pendingOperationMutationGate.isHeldForTesting, "the mutation gate must not be leaked")
+        #expect(AccountManager.shared.pendingOperationMutationGate.waiterCountForTesting == 0, "no waiter may be stranded")
+        #expect(await AccountManager.shared.pendingQueueIsQuiescentForTesting(), "isDraining/needsRedrain must both be false")
+        let inFlightCount = try await pool.read { db in
+            try PendingOperation.filter(Column("status") == PendingStatus.inFlight.rawValue).fetchCount(db)
+        }
+        #expect(inFlightCount == 0, "no row may be left stranded inFlight")
+    }
+
+    /// Deadlock-audit item 7: an owner mid-drain requests a redrain, then
+    /// loses the re-preparation race to an obsolete database swap WITHOUT a
+    /// rescuing second redrain landing during the await — contrast with
+    /// `ownerRetainsNewestDatabaseRedrainRequestAcrossObsoletePreparation`,
+    /// which covers the RESCUE case (a third caller's redrain request lands
+    /// during the obsolete flight's await, so the owner retries once more
+    /// and succeeds within the same call). Here nothing rescues it: the
+    /// owner's `repeat` loop legitimately gives up
+    /// (`nextDatabase == nil && !needsRedrain`) and DROPS the redrain,
+    /// returning with the newest database's op untouched. Pins that this
+    /// drop is safe: static liveness invariants hold immediately after, and
+    /// a later, wholly independent `drainPendingQueue()` call completes the
+    /// leftover op.
+    @Test("a dropped redrain after an obsolete re-preparation is safe: quiescent, no stranded state, and a later external drain completes the leftover op")
+    func redrainDropOnFailedRepreparationIsRecoveredByALaterExternalDrain() async throws {
+        let (firstPool, firstDir, firstPrevious) = try await makeTestDB()
+        defer { restoreTestDB(pool: firstPool, previous: firstPrevious, dir: firstDir) }
+        guard let firstDatabase = AppDatabase.shared.withLock({ $0 }) else {
+            Issue.record("first test database was not installed")
+            return
+        }
+
+        let (secondPool, secondDir, secondPrevious) = try await makeTestDB()
+        defer { restoreTestDB(pool: secondPool, previous: secondPrevious, dir: secondDir) }
+        guard let secondDatabase = AppDatabase.shared.withLock({ $0 }) else {
+            Issue.record("second test database was not installed")
+            return
+        }
+
+        let (thirdPool, thirdDir, thirdPrevious) = try await makeTestDB()
+        defer { restoreTestDB(pool: thirdPool, previous: thirdPrevious, dir: thirdDir) }
+        guard let thirdDatabase = AppDatabase.shared.withLock({ $0 }) else {
+            Issue.record("third test database was not installed")
+            return
+        }
+        AppDatabase.shared.withLock { $0 = firstDatabase }
+
+        let suffix = UUID().uuidString.lowercased()
+        let firstAccountId = "acc-redrain-drop-first-\(suffix)"
+        let thirdAccountId = "acc-redrain-drop-third-\(suffix)"
+        let firstMessageId = "redrain-drop-first-\(suffix)@example.com"
+        let leftoverMessageId = "redrain-drop-leftover-\(suffix)@example.com"
+
+        let firstProviderGate = QueuePreparationTestGate()
+        let secondPreparationGate = QueuePreparationTestGate()
+        let firstProvider = MockEmailProvider()
+        await firstProvider.setMarkReadHook {
+            await firstProviderGate.arriveAndWaitForRelease()
+        }
+        let leftoverProvider = MockEmailProvider()
+
+        let firstOperation = PendingOperation(
+            type: .markRead, messageIds: [firstMessageId], accountId: firstAccountId, folderPath: "INBOX"
+        )
+        let leftoverOperation = PendingOperation(
+            type: .markRead, messageIds: [leftoverMessageId], accountId: thirdAccountId, folderPath: "INBOX"
+        )
+        try insertOp(firstOperation, pool: firstPool)
+        try insertOp(leftoverOperation, pool: thirdPool)
+
+        await AccountManager.shared.registerProviderForTesting(accountId: firstAccountId, provider: firstProvider)
+        await AccountManager.shared.registerProviderForTesting(accountId: thirdAccountId, provider: leftoverProvider)
+
+        let owner = Task { await AccountManager.shared.drainPendingQueue() }
+        var redrainCaller: Task<Void, Never>?
+        do {
+            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                await firstProviderGate.waitUntilArrival()
+            }
+
+            // Ask the active owner for another pass while A is still current
+            // — this is the ONE redrain request this test grants. Unlike the
+            // rescue-case sibling test, no SECOND redrain lands later.
+            let redrain = Task { await AccountManager.shared.drainPendingQueue() }
+            redrainCaller = redrain
+            try await joinDrainTask(redrain)
+            #expect(await AccountManager.shared.needsRedrain)
+
+            AppDatabase.shared.withLock { $0 = secondDatabase }
+            // Hold database B's preparation flight open so it can be swapped
+            // out from under the owner before it resolves.
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting {
+                await secondPreparationGate.arriveAndWaitForRelease()
+            }
+
+            await firstProviderGate.releaseAll()
+            try await waitForPreparationParticipants(1)
+
+            // Swap to C WITHOUT any further redrain request landing — this is
+            // the "drop": B's flight will resolve `.success` but obsolete,
+            // and `needsRedrain` stays false, so the owner's repeat loop
+            // gives up instead of retrying.
+            AppDatabase.shared.withLock { $0 = thirdDatabase }
+            // C's own (future, separate) flight must not block — clear the
+            // hook now so it never captures it.
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting(nil)
+            await secondPreparationGate.releaseAll()
+
+            try await joinDrainTask(owner)
+
+            // The drop: the owner returned WITHOUT ever draining C's leftover op.
+            #expect(try fetchOp(leftoverOperation.id, pool: thirdPool) != nil, "the leftover op is genuinely dropped by this drain call")
+            #expect(await leftoverProvider.markedReadIds.isEmpty)
+
+            try await assertQueueLivenessInvariants(pool: thirdPool)
+
+            // A later, wholly independent external drain call picks the
+            // leftover op back up and completes it.
+            await AccountManager.shared.drainPendingQueue()
+            #expect(try fetchOp(leftoverOperation.id, pool: thirdPool) == nil, "a later external drain completes the leftover op")
+            #expect(await leftoverProvider.markedReadIds.contains { $0.ids == [leftoverMessageId] })
+            try await assertQueueLivenessInvariants(pool: thirdPool)
+        } catch {
+            owner.cancel()
+            redrainCaller?.cancel()
+            await AccountManager.shared.setPendingQueuePreparationHookForTesting(nil)
+            await firstProviderGate.releaseAll()
+            await secondPreparationGate.releaseAll()
+            try? await joinDrainTask(owner)
+            if let redrainCaller { try? await joinDrainTask(redrainCaller) }
+            await AccountManager.shared.unregisterProviderForTesting(accountId: firstAccountId)
+            await AccountManager.shared.unregisterProviderForTesting(accountId: thirdAccountId)
+            throw error
+        }
+
+        await AccountManager.shared.unregisterProviderForTesting(accountId: firstAccountId)
+        await AccountManager.shared.unregisterProviderForTesting(accountId: thirdAccountId)
+    }
+
+    /// Deadlock-audit item 9: pins that every DB write executed WHILE
+    /// `pendingOperationMutationGate.isHeldForTesting` is true runs at
+    /// `.priority` tier — "gated writes can never park behind the merge's
+    /// privileged section" (the `DatabaseWriteQueue`/`PriorityGate` ADR).
+    /// Drives the real drain loop's two gated write call sites
+    /// (`claimFrontierOperation`'s claim write, `retryGatedQueueWrite`'s
+    /// completion write) through `DatabaseWriteQueue.shared`'s test
+    /// observer, sampling `pendingOperationMutationGate.isHeldForTesting`
+    /// synchronously at the moment each write starts (the observer fires
+    /// from inside `execute(priority:)`, which is itself invoked from
+    /// inside `database.write`, which both call sites invoke ONLY while
+    /// still holding the gate's lease — see both functions' `defer { ...
+    /// release(lease) }` placement).
+    @Test("every DB write that runs while the pending-operation mutation gate is held executes at .priority tier")
+    func gatedWritesAlwaysRunAtPriorityTier() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-tier-\(suffix)"
+        let messageId = "tier-\(suffix)@example.com"
+        let provider = MockEmailProvider()
+
+        let recorded = Mutex<[(priority: WritePriority, gateHeld: Bool)]>([])
+        await DatabaseWriteQueue.shared.setTestObserverForTesting { priority, _ in
+            let gateHeld = AccountManager.shared.pendingOperationMutationGate.isHeldForTesting
+            recorded.withLock { $0.append((priority, gateHeld)) }
+        }
+
+        let operation = PendingOperation(type: .markRead, messageIds: [messageId], accountId: accountId, folderPath: "INBOX")
+        try insertOp(operation, pool: pool)
+
+        do {
+            try await withRegisteredProvider(accountId: accountId, provider: provider) {
+                await AccountManager.shared.drainPendingQueue()
+            }
+        } catch {
+            await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
+            throw error
+        }
+        await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
+
+        #expect(try fetchOp(operation.id, pool: pool) == nil, "sanity: the op actually drained")
+
+        let entries = recorded.withLock { $0 }
+        #expect(!entries.isEmpty, "the drain must have produced at least one observed write")
+        let gatedEntries = entries.filter { $0.gateHeld }
+        #expect(!gatedEntries.isEmpty, "at least one write (claim or completion) must have run while the gate was held")
+        for entry in gatedEntries {
+            #expect(entry.priority == .priority, "a write observed while the gate is held must be .priority tier, was \(entry.priority)")
+        }
     }
 }

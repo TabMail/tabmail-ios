@@ -289,15 +289,36 @@ final class IntentionJournal: Sendable {
 extension AccountManager {
 
     #if DEBUG
-    /// TEST-ONLY one-shot fault injection for the PRIMARY resolve in
-    /// `executeFold` — exercises the reinsert + paced-retry path (records
-    /// stay, one delayed re-enqueue, intent executes on the retry). Consumed
-    /// (reset to false) by the injection site on first use.
-    /// ID-SCOPED (test-review round 3): the seam holds the TARGET id and
-    /// fires only for a fold whose component contains it — a concurrent fold
-    /// from another suite (`.serialized` does not cross suites) can neither
-    /// consume the injection nor trip the arming test's polls.
-    static let simulatePrimaryResolveFailureForTesting = Mutex<String?>(nil)
+    /// TEST-ONLY fault injection for the PRIMARY resolve in `executeFold` —
+    /// exercises the reinsert + paced-retry path (records stay, one delayed
+    /// re-enqueue per failed attempt, intent executes once the count is
+    /// exhausted). Per-id REMAINING-COUNT map (deadlock-audit item 11:
+    /// extended from a one-shot armed-id `Bool` so a test can prove
+    /// `recordAndWait` resumes only after N consecutive paced retries, not
+    /// just one) — arm via `armPrimaryResolveFailuresForTesting(id:count:)`;
+    /// each matching fold attempt decrements the count and fires (throws)
+    /// until it reaches zero, at which point the id is removed and the fold
+    /// resolves normally.
+    /// ID-SCOPED (test-review round 3, preserved): the seam holds TARGET ids
+    /// and fires only for a fold whose component contains one — a concurrent
+    /// fold from another suite (`.serialized` does not cross suites) can
+    /// neither consume the injection nor trip the arming test's polls.
+    static let simulatePrimaryResolveFailuresForTesting = Mutex<[String: Int]>([:])
+
+    /// Arm `id` to fail the PRIMARY resolve exactly `count` consecutive
+    /// times (one paced retry between each, per the existing reinsert/retry
+    /// contract), then resolve normally on the next attempt after that.
+    /// `count: 1` reproduces the original one-shot seam's behavior exactly.
+    static func armPrimaryResolveFailuresForTesting(id: String, count: Int) {
+        simulatePrimaryResolveFailuresForTesting.withLock { $0[id] = count }
+    }
+
+    /// Remaining armed-failure count for `id` — `nil` once exhausted/never
+    /// armed. Test helper for polling "has this id's seam been fully
+    /// consumed yet" without reaching into the dictionary's raw shape.
+    static func remainingPrimaryResolveFailuresForTesting(id: String) -> Int? {
+        simulatePrimaryResolveFailuresForTesting.withLock { $0[id] }
+    }
 
     /// TEST-ONLY recorder for the redundant-isRead SKIP branch's notification
     /// clear in `executeFold` phase 2: when the fold skips the isRead write
@@ -409,14 +430,20 @@ extension AccountManager {
         let resolved: [MessageHeader]
         do {
             #if DEBUG
-            // TEST-ONLY one-shot, ID-SCOPED fault injection (pins
-            // `primaryResolveReadErrorReinsertsAndRetriesWithoutDropping`):
-            // fires only for the fold whose component contains the armed id,
-            // so concurrent folds from OTHER suites can't consume it
-            // (test-review round 3).
-            let primaryFault = AccountManager.simulatePrimaryResolveFailureForTesting.withLock { target -> Bool in
-                guard let t = target, allIds.contains(t) else { return false }
-                target = nil
+            // TEST-ONLY per-id remaining-count, ID-SCOPED fault injection
+            // (pins `primaryResolveReadErrorReinsertsAndRetriesWithoutDropping`
+            // and the multi-shot extension, deadlock-audit item 11): fires
+            // only for the fold whose component contains an armed id with a
+            // remaining count > 0, so concurrent folds from OTHER suites
+            // can't consume it (test-review round 3).
+            let primaryFault = AccountManager.simulatePrimaryResolveFailuresForTesting.withLock { targets -> Bool in
+                guard let matchedId = allIds.first(where: { (targets[$0] ?? 0) > 0 }) else { return false }
+                let remaining = (targets[matchedId] ?? 0) - 1
+                if remaining <= 0 {
+                    targets.removeValue(forKey: matchedId)
+                } else {
+                    targets[matchedId] = remaining
+                }
                 return true
             }
             if primaryFault { throw ProviderError.notConnected }

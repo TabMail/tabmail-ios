@@ -731,7 +731,7 @@ struct CoordinatedToolActionTests {
             // regression (receipt stranded past the deadline) stays ONE red
             // test instead of cascading into later suites.
             clearOverlay()
-            AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 = nil }
+            AccountManager.simulatePrimaryResolveFailuresForTesting.withLock { $0 = [:] }
         }
         clearOverlay()
 
@@ -743,7 +743,7 @@ struct CoordinatedToolActionTests {
         // call: the fold's FIRST resolve throws, records reinsert, the retry
         // fires after the paced delay. (The seam lives in executeFold only —
         // recordRoleMove's display-only pre-resolve is unaffected.)
-        AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 = id }
+        AccountManager.armPrimaryResolveFailuresForTesting(id: id, count: 1)
 
         // Child task: the receipt-returning call, with an atomic flag set on
         // return.
@@ -760,7 +760,7 @@ struct CoordinatedToolActionTests {
         // InboxGestureActionTests.annihilationDuringPrimaryResolveRetryWindow.
         var reinserted = false
         for _ in 0..<300 where !reinserted {
-            let seamConsumed = AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 == nil }
+            let seamConsumed = AccountManager.remainingPrimaryResolveFailuresForTesting(id: id) == nil
             if seamConsumed && AccountManager.shared.intentionJournal.recordsForTesting().contains(where: { $0.ids.contains(id) }) {
                 reinserted = true
             } else {
@@ -803,6 +803,97 @@ struct CoordinatedToolActionTests {
         #expect(moveOps[0].destinationPath == archive.path)
 
         #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
-        #expect(AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 } == nil, "the one-shot seam was consumed")
+        #expect(AccountManager.remainingPrimaryResolveFailuresForTesting(id: id) == nil, "the one-shot seam was consumed")
+    }
+
+    /// Deadlock-audit item 11: extends the seam above from one-shot to a
+    /// per-id REMAINING-COUNT (`armPrimaryResolveFailuresForTesting(id:count:)`)
+    /// so a test can prove `recordAndWait` resumes only after N CONSECUTIVE
+    /// paced read-error retries — not just one. Each of the `failureCount`
+    /// throwing attempts independently schedules exactly one delayed
+    /// re-invocation of `executeFold` (`SyncConfig.intentionResolveRetryDelaySeconds`
+    /// between each), so proof of "multiple consecutive retries actually
+    /// chained" is a TIMING bound (wall-clock elapsed before resume must be
+    /// at least `(failureCount - 1)` full cadences — a single-shot seam
+    /// could never take that long) rather than polling the seam's internal
+    /// dictionary snapshots, which would be racy against how fast the first
+    /// attempt fires after `record()`.
+    @Test("recordAndWait resumes only after N consecutive paced primary-resolve retries — multi-shot extension of the read-error seam")
+    func receiptWaitsAcrossMultipleConsecutivePrimaryResolveRetries() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay()
+            AccountManager.simulatePrimaryResolveFailuresForTesting.withLock { $0 = [:] }
+        }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-receipt-multi-retry")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        let failureCount = 3
+        AccountManager.armPrimaryResolveFailuresForTesting(id: id, count: failureCount)
+
+        let returned = Mutex(false)
+        let armedAt = Date()
+        Task {
+            await AccountManager.shared.recordRoleMove(ids: [id], role: .archive, origin: .tool)
+            returned.withLock { $0 = true }
+        }
+
+        // Light secondary evidence (best-effort, not exact-sequence-pinned to
+        // avoid a race against how fast the first attempt fires): the seam's
+        // remaining count must visibly step DOWN more than once before it is
+        // fully consumed — proves more than one attempt was actually made.
+        var distinctRemainingValuesSeen = Set<Int>()
+        var seamExhausted = false
+        for _ in 0..<3000 where !seamExhausted {
+            if let remaining = AccountManager.remainingPrimaryResolveFailuresForTesting(id: id) {
+                distinctRemainingValuesSeen.insert(remaining)
+            } else {
+                seamExhausted = true
+            }
+            if !seamExhausted {
+                #expect(returned.withLock { $0 } == false, "the receipt must not resume before every armed failure is consumed")
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        #expect(seamExhausted, "setup: all \(failureCount) armed failures must eventually be consumed")
+        #expect(distinctRemainingValuesSeen.count >= 2, "more than one attempt must have been observed decrementing the armed count")
+
+        // PRIMARY evidence: the receipt must not resume before roughly
+        // `(failureCount - 1)` full paced-retry cadences have elapsed — a
+        // single retry (the old one-shot seam's ceiling) could never reach
+        // this bound. Generous 0.5-cadence slack for scheduling jitter.
+        var resumed = false
+        for _ in 0..<2000 where !resumed {
+            if returned.withLock({ $0 }) {
+                resumed = true
+            } else {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        #expect(resumed, "the receipt must resume once the FINAL paced retry executed the intent")
+        let elapsed = Date().timeIntervalSince(armedAt)
+        let minimumExpectedElapsed = (Double(failureCount) - 0.5) * SyncConfig.intentionResolveRetryDelaySeconds
+        #expect(
+            elapsed >= minimumExpectedElapsed,
+            "resumed after only \(elapsed)s — too fast for \(failureCount) consecutive paced retries at \(SyncConfig.intentionResolveRetryDelaySeconds)s each"
+        )
+
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == archive.id, "the final retry must have executed the archive — no read error may ever drop the intent")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let moveOps = ops.filter { $0.type == .move }
+        #expect(moveOps.count == 1, "exactly one .move op — every failed attempt wrote nothing")
+        guard moveOps.count == 1 else { return }
+        #expect(moveOps[0].destinationPath == archive.path)
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+        #expect(AccountManager.remainingPrimaryResolveFailuresForTesting(id: id) == nil, "the multi-shot seam was fully consumed")
     }
 }

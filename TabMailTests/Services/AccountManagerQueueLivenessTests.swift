@@ -652,4 +652,123 @@ struct AccountManagerQueueLivenessTests {
             try await assertQueueNotWedged(pool: pool, accountId: accountId, provider: provider)
         }
     }
+
+    // MARK: - 8. Cross-drain canary (deadlock audit item 10)
+
+    /// Deadlock-audit item 10: `drainPendingQueue()`, the outbox's gated
+    /// completion write (`finalizeOutboxMessageForTesting` exercises the
+    /// exact same `retryGatedQueueWrite` completion path `drainOutbox`'s
+    /// real send flow uses — only the network send itself is out of scope
+    /// here), and `reconcileCalendarQueue()` (→ `drainCalendarQueue`,
+    /// entirely UNGATED — `PendingCalendarOperation` writes never touch
+    /// `pendingOperationMutationGate`, confirmed by reading
+    /// `AccountManagerCalendarQueue.swift`) run CONCURRENTLY on a SHARED
+    /// account. The two gated systems' finalizations are deliberately
+    /// forced to contend: the gate is held externally until BOTH
+    /// `drainPendingQueue`'s claim and the outbox's completion write are
+    /// queued as waiters, proving the shared FIFO permit admits two
+    /// DIFFERENT subsystems safely (no deadlock) while the wholly
+    /// independent calendar queue proceeds alongside without interference.
+    /// Ends with this suite's DEFINITIVE `assertQueueNotWedged` helper.
+    @Test("drainPendingQueue + outbox finalize + calendar reconcile run concurrently on a shared account with gated finalizations contending safely, ending not-wedged")
+    func crossDrainCanaryPendingOutboxCalendarConcurrentlyOnSharedAccount() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-cross-drain-\(suffix)"
+        let pendingMessageId = "cross-drain-pending-\(suffix)@example.com"
+        let calendarEventId = "cross-drain-event-\(suffix)"
+
+        try await pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "cross-drain-\(suffix)@example.com",
+                displayName: "Cross Drain Test",
+                provider: .imap
+            )
+            account.id = accountId
+            try account.insert(db)
+        }
+
+        let emailProvider = MockEmailProvider()
+        let calendarProvider = MockCalendarProvider()
+        // `registerDemoProviders` only populates `providers`/`calendarProviders`,
+        // not `workQueues` — `registerProviderForTesting` (mirrors
+        // `connectAccount`'s ProviderWorkQueue construction) is what
+        // `claimFrontierOperation` actually needs to find a home for the
+        // claimed frontier op; `calendarProviders` is set directly since no
+        // test seam creates a work queue for it (calendar drain doesn't use
+        // one).
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: emailProvider)
+        await AccountManager.shared.setCalendarProviderForTesting(calendarProvider, accountId: accountId)
+
+        let pendingOp = PendingOperation(type: .markRead, messageIds: [pendingMessageId], accountId: accountId, folderPath: "INBOX")
+        try insertOp(pendingOp, pool: pool)
+
+        let outboxMessage = OutboxMessage(
+            accountId: accountId,
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "Cross-drain canary", body: "Body")
+        )
+        try await pool.writeWithoutTransaction { db in try outboxMessage.insert(db) }
+
+        let calendarOp = PendingCalendarOperation(
+            operationType: .delete,
+            accountId: accountId,
+            eventId: calendarEventId,
+            arguments: [:]
+        )
+        try await pool.writeWithoutTransaction { db in try calendarOp.insert(db) }
+
+        let gate = AccountManager.shared.pendingOperationMutationGate
+        let externalLease = try await gate.acquire()
+
+        let pendingTask = Task { await AccountManager.shared.drainPendingQueue() }
+        let outboxTask = Task { await AccountManager.shared.finalizeOutboxMessageForTesting(outboxMessage) }
+        let calendarTask = Task { await AccountManager.shared.reconcileCalendarQueue() }
+
+        do {
+            // Wait until BOTH gated systems are genuinely queued behind the
+            // externally-held lease — proves this is a real contention
+            // scenario, not a lucky race.
+            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                while gate.waiterCountForTesting < 2 {
+                    try Task.checkCancellation()
+                    await Task.yield()
+                }
+            }
+
+            gate.release(externalLease)
+
+            try await joinDrainTask(pendingTask)
+            try await joinDrainTask(outboxTask)
+            try await joinDrainTask(calendarTask)
+        } catch {
+            gate.release(externalLease)
+            pendingTask.cancel()
+            outboxTask.cancel()
+            calendarTask.cancel()
+            try? await joinDrainTask(pendingTask)
+            try? await joinDrainTask(outboxTask)
+            try? await joinDrainTask(calendarTask)
+            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+            await AccountManager.shared.unsetCalendarProviderForTesting(accountId: accountId)
+            throw error
+        }
+
+        #expect(try fetchOp(pendingOp.id, pool: pool) == nil, "the pending-operation queue completed on its own gated path")
+        let readCalls = await emailProvider.markedReadIds
+        #expect(readCalls.contains { $0.ids == [pendingMessageId] })
+
+        let outboxRemaining = try await pool.read { db in try OutboxMessage.fetchOne(db, key: outboxMessage.id) }
+        #expect(outboxRemaining == nil, "the outbox finalize completed on its own gated path")
+
+        let calendarRemaining = try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: calendarOp.id) }
+        #expect(calendarRemaining == nil, "the (ungated) calendar queue completed independently, unaffected by the gate contention")
+        let deletedEvents = await calendarProvider.deletedEvents
+        #expect(deletedEvents.contains { $0.eventId == calendarEventId })
+
+        try await assertQueueNotWedged(pool: pool, accountId: accountId, provider: emailProvider)
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+        await AccountManager.shared.unsetCalendarProviderForTesting(accountId: accountId)
+    }
 }

@@ -205,7 +205,7 @@ struct WriteQueueFlushTests {
         let journal = AccountManager.shared.intentionJournal
         journal.resetForTesting()
         defer {
-            AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 = nil }
+            AccountManager.simulatePrimaryResolveFailuresForTesting.withLock { $0 = [:] }
             journal.resetForTesting()
         }
 
@@ -218,7 +218,7 @@ struct WriteQueueFlushTests {
         // the paced retry re-enqueues the fold, which then resolves cleanly
         // (the id has no row — vanished drop) and completes the record.
         let id = "wqf-round9-retry-window"
-        AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 = id }
+        AccountManager.armPrimaryResolveFailuresForTesting(id: id, count: 1)
         AccountManager.shared.record(
             ids: [id],
             kind: .isRead(true),
@@ -234,7 +234,7 @@ struct WriteQueueFlushTests {
         await AccountManager.awaitWriteQueueDrainOrTimeout(timeoutSeconds: SyncConfig.backgroundWriteQueueFlushTimeoutSeconds)
 
         #expect(journal.isFullyDrained(), "the flush barrier resumed inside the read-error retry window with the reinserted record still pending — the round-9 iteration-cap regression")
-        #expect(AccountManager.simulatePrimaryResolveFailureForTesting.withLock { $0 } == nil, "the one-shot seam was consumed — the injected primary-resolve failure actually fired")
+        #expect(AccountManager.remainingPrimaryResolveFailuresForTesting(id: id) == nil, "the one-shot seam was consumed — the injected primary-resolve failure actually fired")
         // Cross-constant relationship pin (plan §4 invariant 10): the flush
         // deadline must comfortably dominate the resolve-retry cadence, or a
         // gesture parked in the retry window misses the WAL fsync on

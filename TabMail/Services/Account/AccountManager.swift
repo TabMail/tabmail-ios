@@ -439,6 +439,20 @@ actor AccountManager {
         workQueues.removeValue(forKey: accountId)
     }
 
+    /// Test seam: populate `calendarProviders` for `accountId` — mirrors
+    /// `registerProviderForTesting`'s email-side seam, but for
+    /// `reconcileCalendarQueue()`/`drainCalendarQueue()`, which look up
+    /// `calendarProviders` directly (no `ProviderWorkQueue`; the calendar
+    /// queue has no per-account concurrency ceiling).
+    func setCalendarProviderForTesting(_ provider: any CalendarProvider, accountId: String) {
+        calendarProviders[accountId] = provider
+    }
+
+    /// Test seam: undo `setCalendarProviderForTesting`.
+    func unsetCalendarProviderForTesting(accountId: String) {
+        calendarProviders.removeValue(forKey: accountId)
+    }
+
     /// Guard for pending queue drain (used by AccountManagerQueue).
     var isDraining = false
     /// Set when drainPendingQueue() is called while isDraining — triggers re-drain on completion.
