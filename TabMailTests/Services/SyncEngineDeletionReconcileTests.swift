@@ -519,7 +519,7 @@ struct DeletionReconcileDeletePathTests {
         #expect(deletedIds.isEmpty)
     }
 
-    @Test("Recently-completed op protects by messageId and by rfc822")
+    @Test("Folder-scoped completion protects by messageId and by rfc822")
     func recentlyCompletedProtects() throws {
         let (db, folder) = try makeImapFixture()
         try TestDatabase.insertMessageHeader(
@@ -530,16 +530,79 @@ struct DeletionReconcileDeletePathTests {
             folderPath: folder.path, rfc822MessageId: "recent-401@example.com"
         )
         let now = Date()
+        let recentByMessageId = MessageIdentity.recentlyCompletedFolderKey(
+            accountId: "acc1",
+            folderPath: folder.path,
+            messageId: "400"
+        )
+        let recentByRFC822 = MessageIdentity.recentlyCompletedFolderKey(
+            accountId: "acc1",
+            folderPath: folder.path,
+            messageId: "recent-401@example.com"
+        )
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
                 folderRole: .inbox, uids: [400, 401],
-                recentlyCompleted: ["400": now, "recent-401@example.com": now],
+                recentlyCompleted: [recentByMessageId: now, recentByRFC822: now],
                 db: conn
             )
         }
         #expect(deletedIds.isEmpty)
         #expect(try db.read { try MessageHeader.fetchCount($0) } == 2)
+    }
+
+    @Test("Legacy bare completion ids do not protect an IMAP folder")
+    func legacyBareRecentlyCompletedIdDoesNotProtect() throws {
+        let (db, folder) = try makeImapFixture()
+        try TestDatabase.insertMessageHeader(
+            db, messageId: "402", folderId: folder.id, accountId: "acc1",
+            folderPath: folder.path, rfc822MessageId: "legacy-402@example.com"
+        )
+        let now = Date()
+        let deletedIds = try db.write { conn in
+            try SyncEngine.deleteConfirmedGhostHeaders(
+                folderId: folder.id, folderPath: folder.path, accountId: "acc1",
+                folderRole: .inbox, uids: [402],
+                recentlyCompleted: ["402": now, "legacy-402@example.com": now],
+                db: conn
+            )
+        }
+        #expect(deletedIds.count == 1)
+        #expect(try db.read { try MessageHeader.fetchCount($0) } == 0)
+    }
+
+    @Test("Completed source removal does not retain its confirmed-absent UID")
+    func completedSourceRemovalDoesNotProtect() throws {
+        let (db, folder) = try makeImapFixture()
+        try TestDatabase.insertMessageHeader(
+            db, messageId: "404", folderId: folder.id, accountId: "acc1",
+            folderPath: folder.path, rfc822MessageId: "removed-source-404@example.com"
+        )
+        let identity = "removed-source-404@example.com"
+        let now = Date()
+        let genericKey = MessageIdentity.recentlyCompletedFolderKey(
+            accountId: "acc1",
+            folderPath: folder.path,
+            messageId: identity
+        )
+        let removedSourceKey = MessageIdentity.membershipKey(
+            accountId: "acc1",
+            folderPath: folder.path,
+            messageId: identity,
+            membership: .removedSource
+        )
+
+        let deletedIds = try db.write { conn in
+            try SyncEngine.deleteConfirmedGhostHeaders(
+                folderId: folder.id, folderPath: folder.path, accountId: "acc1",
+                folderRole: .inbox, uids: [404],
+                recentlyCompleted: [genericKey: now, removedSourceKey: now],
+                db: conn
+            )
+        }
+        #expect(deletedIds.count == 1)
+        #expect(try db.read { try MessageHeader.fetchCount($0) } == 0)
     }
 
     @Test("In-flight outbox send protects the optimistic Sent row")

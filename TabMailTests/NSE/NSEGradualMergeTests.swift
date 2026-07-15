@@ -23,7 +23,7 @@ import Synchronization
 /// Drives the REAL `NSEDataBridge.mergeNSEStagingData` against a real pool-backed
 /// `AppDatabase` + a real staging DB built at a temp path via the
 /// `stagingPathOverride` test seam (the unit-test host has no App Group entitlement).
-@Suite("NSE gradual staging merge", .serialized)
+@Suite("NSE gradual staging merge", .serialized, .processGlobalState)
 @MainActor
 struct NSEGradualMergeTests {
 
@@ -187,6 +187,12 @@ struct NSEGradualMergeTests {
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageAICache WHERE actionTag = 'reply'") ?? 0
         }
         #expect(cacheCount == 1)
+        let pendingTagOperations = try await pool.read { db in
+            try PendingOperation
+                .filter([OperationType.setTag, .removeTag].map(\.rawValue).contains(Column("type")))
+                .fetchCount(db)
+        }
+        #expect(pendingTagOperations == 0, "NSE action tags stay in the local header/cache and never enter the provider queue")
         // Terminal → staging row DELETED.
         #expect(try stagingRowExists(q) == false)
     }

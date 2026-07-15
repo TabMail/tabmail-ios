@@ -33,7 +33,7 @@ import GRDB
 /// progress while a background writer held the single writer connection:
 ///   • BEFORE the fix (synchronous write): ~0 heartbeats → main actor frozen.
 ///   • AFTER the fix (async write): heartbeat keeps ticking → main actor live.
-@Suite("NSE merge must not block the main actor", .serialized)
+@Suite("NSE merge must not block the main actor", .serialized, .processGlobalState)
 @MainActor
 struct NSEMergeMainActorBlockTests {
 
@@ -151,7 +151,7 @@ struct NSEMergeMainActorBlockTests {
                     var h = MessageHeader(
                         messageId: "arch-\(i)", subject: "Archived message \(i)",
                         from: "Sender \(i)", fromAddress: "s\(i)@example.com",
-                        to: "user@gmail.com",
+                        to: "recipient@example.com",
                         date: Date(timeIntervalSince1970: Double(1_600_000_000 + i)),
                         snippet: "archived snippet \(i)",
                         folderId: "acc1:INBOX", accountId: "acc1",

@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-@Suite("NSE Data Bridge — Mirroring, Settings, and Merge")
+@Suite("NSE Data Bridge — Mirroring, Settings, and Merge", .serialized, .processGlobalState)
 struct NSEDataBridgeTests {
 
     // MARK: - Helpers

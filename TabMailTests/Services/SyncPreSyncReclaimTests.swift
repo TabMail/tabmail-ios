@@ -129,7 +129,7 @@ struct SyncPreSyncReclaimTests {
         var incoming = makeSyncHeader(accountId: "acct-o", messageId: "m-1", folderPath: "AQMk-FOLDER")
 
         try db.write { db in
-            try reclaim(
+            _ = try reclaim(
                 existing: preSync, incoming: &incoming,
                 accountId: "acct-o", folderPath: "AQMk-FOLDER", db: db
             )
@@ -165,7 +165,7 @@ struct SyncPreSyncReclaimTests {
 
         var incoming = makeSyncHeader(accountId: "acct-o", messageId: "m-2", folderPath: "AQMk-FOLDER")
         try db.write { db in
-            try reclaim(
+            _ = try reclaim(
                 existing: preSync, incoming: &incoming,
                 accountId: "acct-o", folderPath: "AQMk-FOLDER", db: db
             )
@@ -263,7 +263,7 @@ struct SyncPreSyncReclaimTests {
         // guards the general case). Reclaim must move the cache row.
         var incoming = makeSyncHeader(accountId: "acct-o", messageId: "m-3", folderPath: "DIFF-FOLDER")
         try db.write { db in
-            try reclaim(
+            _ = try reclaim(
                 existing: preSync, incoming: &incoming,
                 accountId: "acct-o", folderPath: "DIFF-FOLDER", db: db
             )

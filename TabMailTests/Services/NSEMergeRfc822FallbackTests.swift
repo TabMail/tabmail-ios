@@ -11,7 +11,7 @@ import GRDB
 /// rfc822MessageId fallback". The commit changed `NSEDataBridge.mergeNSE-
 /// StagingData` to add a second lookup by (accountId, rfc822MessageId) when
 /// the primary (accountId, messageId) lookup misses. Without it, an IMAP
-/// archive → undo round-trip re-assigns a fresh UID in INBOX, the push
+/// move sequence re-assigns a fresh UID in INBOX, the push
 /// notification carries that new UID as messageId, the primary lookup misses,
 /// and the merge inserts a duplicate header.
 ///
@@ -71,11 +71,11 @@ struct NSEMergeRfc822FallbackTests {
         }
     }
 
-    @Test("Primary misses, fallback matches by rfc822 (archive→undo UID remap)")
+    @Test("Primary misses, RFC fallback matches after a provider UID remap")
     func fallbackByRfc822() throws {
-        // Existing header under the PRE-archive UID ("uid-100"). User archives,
-        // then undoes → server MOVE-BACK assigns a fresh UID ("uid-555") in
-        // INBOX. Push notification fires with the new UID as messageId.
+        // Existing header under an earlier folder-local UID ("uid-100"). A
+        // later move sequence assigns a fresh UID ("uid-555") in INBOX. The
+        // push notification carries the new UID as messageId.
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1", email: "u@ex.com")
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")

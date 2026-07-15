@@ -137,6 +137,25 @@ enum UserLabelStore {
             .filter { !shouldExcludeLabel(id: $0.id, name: $0.name) }
     }
 
+    /// Resolve a selected set of account-local provider label IDs without
+    /// scanning or leaking labels from another account that uses the same IDs.
+    static func labels(
+        ids: Set<String>,
+        accountId: String,
+        in db: Database
+    ) throws -> [UserLabel] {
+        guard !ids.isEmpty else { return [] }
+        return try UserLabel
+            .filter(
+                Column("accountId") == accountId
+                    && Column("isSystem") == false
+                    && ids.contains(Column("id"))
+            )
+            .order(Column("name").collating(.localizedCaseInsensitiveCompare))
+            .fetchAll(db)
+            .filter { !shouldExcludeLabel(id: $0.id, name: $0.name) }
+    }
+
     /// Labels applied to a specific message (non-system only, excluded keywords filtered).
     static func labelsForMessage(_ messageId: String, in db: Database) throws -> [UserLabel] {
         let rows = try MessageUserLabel
@@ -172,6 +191,7 @@ enum UserLabelStore {
         let appliedIds = Set(
             try MessageUserLabel
                 .filter(Column("messageId") == messageId)
+                .filter(Column("accountId") == accountId)
                 .fetchAll(db)
                 .map(\.userLabelId)
         )
@@ -183,10 +203,15 @@ enum UserLabelStore {
                 SELECT mul.userLabelId, COUNT(DISTINCT mul.messageId) as cnt
                 FROM messageUserLabel mul
                 JOIN messageHeader mh ON mh.id = mul.messageId
-                WHERE mh.folderId IN (\(inboxFolderIds.map { _ in "?" }.joined(separator: ",")))
+                WHERE mul.accountId = ?
+                  AND mh.folderId IN (\(inboxFolderIds.map { _ in "?" }.joined(separator: ",")))
                 GROUP BY mul.userLabelId
                 """
-            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(inboxFolderIds))
+            let rows = try Row.fetchAll(
+                db,
+                sql: sql,
+                arguments: StatementArguments([accountId] + inboxFolderIds)
+            )
             for row in rows {
                 frequency[row["userLabelId"]] = row["cnt"]
             }

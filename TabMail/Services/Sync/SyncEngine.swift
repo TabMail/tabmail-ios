@@ -61,6 +61,15 @@ actor SyncEngine {
     /// via `AppDatabase.backgroundPool` directly (`.background`).
     var dbPool: PrioritizedDatabase { AppDatabase.syncPool }
 
+    /// Snapshot the actor-owned half of the sync stale-protection handoff. Callers
+    /// take this only after reserving `DatabaseWriteQueue`, so a completion cannot
+    /// delete its pending row between this snapshot and the following transaction.
+    nonisolated static func freshRecentlyCompletedSnapshot() async -> [String: Date] {
+        let manager = AccountManager.shared
+        await manager.pruneRecentlyCompleted()
+        return await manager.recentlyCompleted
+    }
+
     /// Read current fast sync mode state from AccountManager (MainActor hop).
     func getIsFastSync() async -> Bool {
         await MainActor.run { AccountManagerState.shared.fastSyncModeActive }
@@ -168,7 +177,9 @@ actor SyncEngine {
         maintenanceTask = Task.detached(priority: .utility) {
             // Capture undo-protected IDs via MainActor hop (UndoService is @MainActor)
             let undoProtectedBodyIds = await MainActor.run {
-                Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
+                Set(UndoService.shared.undoStack.flatMap { action in
+                    action.commands.flatMap { $0.members.map(\.originalHeaderId) }
+                })
             }
             SyncEngine.runWALMaintenance(
                 dbPool: pool, includePrune: includePrune,
@@ -606,8 +617,7 @@ actor SyncEngine {
                     header.hasAttachments = info.hasAttachments
                     header.isReplied = info.isReplied
                     header.isForwarded = info.isForwarded
-                    header.actionTag = info.actionTag
-                    header.tagSortOrder = info.actionTag?.sortOrder ?? 99
+                    header.setActionTag(info.actionTag, at: info.actionTagSetAt ?? Date())
                     try MessageAICache.restoreIfCached(
                         into: &header,
                         accountId: folder.accountId,
@@ -615,18 +625,9 @@ actor SyncEngine {
                         db: db
                     )
                     // ReplyDetect: if message is already replied and tagged as "reply", override to "none"
-                    // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                    // AI cache keeps original LLM value — only the local MessageHeader changes.
                     if header.isReplied && header.actionTag == .reply {
-                        header.actionTag = ActionTag.none
-                        header.tagSortOrder = ActionTag.none.sortOrder
-                        let tagOp = PendingOperation(
-                            type: .setTag,
-                            messageIds: [header.stableId],
-                            accountId: folder.accountId,
-                            folderPath: folder.path,
-                            tagValue: ActionTag.none.rawValue
-                        )
-                        try tagOp.insert(db)
+                        header.setActionTag(ActionTag.none)
                         print("[ReplyDetect] Scroll insert: reply→none for \(header.messageId) (already replied)")
                     }
                     try header.save(db)

@@ -3,358 +3,1964 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Testing
+import Dispatch
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
-// MARK: - Suite 1: Delta Sync — DB Patterns
-
-@Suite("Delta Sync — DB Patterns")
-struct DeltaSyncDBPatternTests {
-
-    @Test("Messages added: insert new headers from delta")
-    func insertNewHeadersFromDelta() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Simulate inserting a new message discovered by delta sync
-        let date = Date(timeIntervalSince1970: 1700000000)
-        var header = MessageHeader(
-            messageId: "gmailId123",
-            subject: "Delta New Message",
-            from: "alice@example.com",
-            fromAddress: "alice@example.com",
-            to: "test@gmail.com",
-            date: date,
-            snippet: "New message from delta",
-            folderId: "acc1:INBOX",
-            accountId: "acc1",
-            folderPath: "INBOX",
-            isInInbox: true
-        )
-        header.rfc822MessageId = "<msg123@example.com>"
-        header.isRead = false
-        try db.write { dbConn in try header.insert(dbConn) }
-
-        // Verify the header was inserted
-        let fetched = try db.read { dbConn in
-            try MessageHeader.filter(Column("messageId") == "gmailId123").fetchOne(dbConn)
-        }
-        #expect(fetched != nil)
-        #expect(fetched?.subject == "Delta New Message")
-        #expect(fetched?.rfc822MessageId == "<msg123@example.com>")
-        #expect(fetched?.folderId == "acc1:INBOX")
-        #expect(fetched?.isInInbox == true)
+private final class GmailDeltaMetadataRequestGate: @unchecked Sendable {
+    private struct State {
+        var isEnabled = false
+        var requestArrived = false
+        var arrivalWaiter: CheckedContinuation<Void, Never>?
     }
 
-    @Test("Messages deleted: remove headers by messageId")
-    func removeHeadersByMessageId() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try TestDatabase.insertMessageHeader(db, messageId: "msg-to-delete", accountId: "acc1")
+    private let state = Mutex(State())
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
 
-        // Delta sync says this message was deleted — remove it
-        let removedCount = try db.write { dbConn -> Int in
-            let matches = try MessageHeader
-                .filter(Column("messageId") == "msg-to-delete")
-                .fetchAll(dbConn)
-            for msg in matches {
-                try msg.delete(dbConn)
+    func enable() {
+        state.withLock {
+            $0.isEnabled = true
+            $0.requestArrived = false
+            $0.arrivalWaiter = nil
+        }
+    }
+
+    func arriveAndWaitForRelease() {
+        let arrival: (shouldWait: Bool, waiter: CheckedContinuation<Void, Never>?) =
+            state.withLock {
+                guard $0.isEnabled else { return (false, nil) }
+                $0.requestArrived = true
+                let waiter = $0.arrivalWaiter
+                $0.arrivalWaiter = nil
+                return (true, waiter)
             }
-            return matches.count
+        arrival.waiter?.resume()
+        if arrival.shouldWait {
+            releaseSemaphore.wait()
         }
-
-        #expect(removedCount == 1)
-
-        let remaining = try db.read { dbConn in
-            try MessageHeader.filter(Column("messageId") == "msg-to-delete").fetchOne(dbConn)
-        }
-        #expect(remaining == nil)
     }
 
-    @Test("Messages deleted: skip if pending operation exists")
-    func skipDeleteIfPendingOpExists() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try TestDatabase.insertMessageHeader(db, messageId: "msg-with-pending", accountId: "acc1")
-
-        // Insert a pending operation for this message
-        let pendingOp = PendingOperation(
-            type: .move,
-            messageIds: ["msg-with-pending"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            destinationPath: "Archive"
-        )
-        try db.write { dbConn in try pendingOp.insert(dbConn) }
-
-        // Delta sync deletion should skip messages with pending ops (mirrors gmailDeltaSync pattern)
-        let deleteSet: Set<String> = ["msg-with-pending"]
-        let accountIdCapture = "acc1"
-        let removedIds: [String] = try db.write { dbConn in
-            let pendingAllIds = Set(
-                try PendingOperation
-                    .filter(Column("accountId") == accountIdCapture)
-                    .fetchAll(dbConn)
-                    .flatMap(\.messageIds)
-            )
-            var ids: [String] = []
-            for deleteId in deleteSet where !pendingAllIds.contains(deleteId) {
-                let matches = try MessageHeader
-                    .filter(Column("messageId") == deleteId)
-                    .fetchAll(dbConn)
-                for msg in matches {
-                    ids.append(msg.id)
-                    try msg.delete(dbConn)
+    func waitUntilRequestArrives() async {
+        await withCheckedContinuation { continuation in
+            let shouldResume = state.withLock {
+                if $0.requestArrived {
+                    return true
                 }
+                $0.arrivalWaiter = continuation
+                return false
             }
-            return ids
+            if shouldResume { continuation.resume() }
         }
-
-        // Message should NOT have been deleted
-        #expect(removedIds.isEmpty)
-
-        let stillExists = try db.read { dbConn in
-            try MessageHeader.filter(Column("messageId") == "msg-with-pending").fetchOne(dbConn)
-        }
-        #expect(stillExists != nil)
     }
 
-    @Test("Labels changed: update header flags (isRead, isFlagged)")
-    func updateHeaderFlagsOnLabelChange() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "msg-flags", accountId: "acc1", isRead: false
-        )
-        #expect(header.isRead == false)
-        #expect(header.isFlagged == false)
-
-        // Simulate delta sync flag update (like gmailDeltaSync's existsLocally && belongsInFolder path)
-        try db.write { dbConn in
-            guard var existing = try MessageHeader.fetchOne(dbConn, key: header.id) else {
-                Issue.record("Header not found")
-                return
+    func release() {
+        let release = state.withLock {
+            guard $0.isEnabled else { return false }
+            $0.isEnabled = false
+            if $0.requestArrived {
+                return true
             }
-            existing.isRead = true
-            existing.isFlagged = true
-            try existing.update(dbConn)
+            $0.arrivalWaiter?.resume()
+            $0.arrivalWaiter = nil
+            return false
         }
-
-        let updated = try db.read { dbConn in
-            try MessageHeader.fetchOne(dbConn, key: header.id)
-        }
-        #expect(updated?.isRead == true)
-        #expect(updated?.isFlagged == true)
-    }
-
-    @Test("History cursor updated after successful delta")
-    func historyCursorUpdated() throws {
-        let db = try TestDatabase.make()
-        var account = try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        account.lastHistoryId = "12345"
-        try db.write { dbConn in try account.update(dbConn) }
-
-        // After successful delta sync, update the cursor
-        let newHistoryId = "12399"
-        try db.write { dbConn in
-            _ = try Account.filter(Column("id") == "acc1")
-                .updateAll(dbConn, Column("lastHistoryId").set(to: newHistoryId))
-        }
-
-        let fetched = try db.read { dbConn in
-            try Account.fetchOne(dbConn, key: "acc1")
-        }
-        #expect(fetched?.lastHistoryId == "12399")
-    }
-
-    @Test("History cursor cleared when 404 (expired history)")
-    func historyCursorClearedOn404() throws {
-        let db = try TestDatabase.make()
-        var account = try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        account.lastHistoryId = "old-expired-id"
-        try db.write { dbConn in try account.update(dbConn) }
-
-        // When history.list returns 404, clear the cursor so next sync does full
-        try db.write { dbConn in
-            _ = try Account.filter(Column("id") == "acc1")
-                .updateAll(dbConn, Column("lastHistoryId").set(to: nil as String?))
-        }
-
-        let fetched = try db.read { dbConn in
-            try Account.fetchOne(dbConn, key: "acc1")
-        }
-        #expect(fetched?.lastHistoryId == nil)
+        if release { releaseSemaphore.signal() }
     }
 }
 
-// MARK: - Suite 2: Tag Operations — Provider + DB
+private actor GmailDeltaProtectionCheckpointGate {
+    private var didArrive = false
+    private var shouldRelease = false
+    private var arrivalWaiter: CheckedContinuation<Void, Never>?
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
 
-@Suite("Tag Operations — Provider + DB")
-struct TagOperationTests {
+    func arriveAndWaitForRelease() async {
+        didArrive = true
+        arrivalWaiter?.resume()
+        arrivalWaiter = nil
 
-    @Test("setTag creates PendingOperation with correct type and tagValue")
-    func setTagCreatesPendingOp() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        guard !shouldRelease else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiter = continuation
+        }
+    }
 
-        let op = PendingOperation(
-            type: .setTag,
-            messageIds: ["msg-1"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            tagValue: ActionTag.reply.rawValue
+    func waitUntilArrival() async {
+        guard !didArrive else { return }
+        await withCheckedContinuation { continuation in
+            arrivalWaiter = continuation
+        }
+    }
+
+    func release() {
+        shouldRelease = true
+        arrivalWaiter?.resume()
+        arrivalWaiter = nil
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+private final class GmailDeltaFolderScopeURLProtocol: URLProtocol, @unchecked Sendable {
+    private struct RemoteFlags: Sendable {
+        var isRead = true
+        var isFlagged = true
+        var labelIds = ["Folder_A", "Folder_B", "Folder_X"]
+        var historyDeletesMessage = false
+    }
+
+    static let messageId = "gmail-delta-folder-scope-message"
+    static let sourcePath = "Folder_A"
+    static let destinationPath = "Folder_B"
+    static let externalPath = "Folder_X"
+    static let metadataGate = GmailDeltaMetadataRequestGate()
+    private static let remoteFlags = Mutex(RemoteFlags())
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    static func configureRemoteFlags(isRead: Bool, isFlagged: Bool) {
+        remoteFlags.withLock {
+            $0.isRead = isRead
+            $0.isFlagged = isFlagged
+            // Every existing test starts from the canonical three-membership
+            // response. A removal test may narrow this afterwards without
+            // leaking static URLProtocol state into the next case.
+            $0.labelIds = [sourcePath, destinationPath, externalPath]
+            $0.historyDeletesMessage = false
+        }
+    }
+
+    static func configureRemoteLabels(_ labelIds: [String]) {
+        remoteFlags.withLock { $0.labelIds = labelIds }
+    }
+
+    static func configureMessageDeletedHistory() {
+        remoteFlags.withLock { $0.historyDeletesMessage = true }
+    }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            respond(statusCode: 400, body: Data())
+            return
+        }
+
+        if url.path.hasSuffix("/history") {
+            respond(statusCode: 200, body: Data(Self.historyJSON.utf8))
+        } else if url.path.contains("/messages/\(Self.messageId)") {
+            let body = Data(Self.messageJSON.utf8)
+            Self.metadataGate.arriveAndWaitForRelease()
+            respond(statusCode: 200, body: body)
+        } else {
+            respond(
+                statusCode: 599,
+                body: Data("unmatched Gmail delta test request".utf8)
+            )
+        }
+    }
+
+    override func stopLoading() {}
+
+    private func respond(statusCode: Int, body: Data) {
+        let url = request.url ?? URL(string: "about:blank")!
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    private static var historyJSON: String {
+        if remoteFlags.withLock({ $0.historyDeletesMessage }) {
+            return """
+            {
+              "historyId": "history-after",
+              "history": [{
+                "messagesDeleted": [{
+                  "message": {"id": "\(messageId)"}
+                }]
+              }]
+            }
+            """
+        }
+        return """
+        {
+          "historyId": "history-after",
+          "history": [{
+            "labelsAdded": [{
+              "message": {
+                "id": "\(messageId)",
+                "labelIds": [\(labelIdsJSON)]
+              },
+              "labelIds": ["\(externalPath)"]
+            }]
+          }]
+        }
+        """
+    }
+
+    private static var messageJSON: String {
+        let internalDate = Int64(Date().timeIntervalSince1970 * 1000)
+        return """
+        {
+          "id": "\(messageId)",
+          "threadId": "gmail-delta-folder-scope-thread",
+          "internalDate": "\(internalDate)",
+          "labelIds": [\(labelIdsJSON)],
+          "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+              {"name": "Subject", "value": "Folder scoped delta"},
+              {"name": "From", "value": "sender@example.com"},
+              {"name": "To", "value": "recipient@example.com"},
+              {"name": "Message-Id", "value": "<gmail-delta-folder-scope@example.com>"}
+            ]
+          }
+        }
+        """
+    }
+
+    private static var labelIdsJSON: String {
+        let flags = remoteFlags.withLock { $0 }
+        var labelIds = flags.labelIds
+        if !flags.isRead { labelIds.append("UNREAD") }
+        if flags.isFlagged { labelIds.append("STARRED") }
+        return labelIds.map { "\"\($0)\"" }.joined(separator: ", ")
+    }
+
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GmailDeltaFolderScopeURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+}
+
+private final class ExchangeDeltaFieldURLProtocol: URLProtocol, @unchecked Sendable {
+    private struct State: Sendable {
+        var messageId = ""
+        var folderPath = ""
+        var receivedDateTime = ""
+        var isRead = false
+        var isFlagged = false
+    }
+
+    private static let state = Mutex(State())
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    static func configure(
+        messageId: String,
+        folderPath: String,
+        receivedDateTime: String,
+        isRead: Bool,
+        isFlagged: Bool
+    ) {
+        state.withLock {
+            $0.messageId = messageId
+            $0.folderPath = folderPath
+            $0.receivedDateTime = receivedDateTime
+            $0.isRead = isRead
+            $0.isFlagged = isFlagged
+        }
+    }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            respond(statusCode: 400, body: Data())
+            return
+        }
+        let snapshot = Self.state.withLock { $0 }
+        if url.path.contains("field-purpose-delta") {
+            let json = """
+            {
+              "value": [{"id": "\(snapshot.messageId)"}],
+              "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/messages/field-purpose-delta-after"
+            }
+            """
+            respond(statusCode: 200, body: Data(json.utf8))
+        } else if url.path.contains("/messages/\(snapshot.messageId)") {
+            let flagStatus = snapshot.isFlagged ? "flagged" : "notFlagged"
+            let json = """
+            {
+              "id": "\(snapshot.messageId)",
+              "subject": "Exchange field purpose",
+              "from": {"emailAddress": {"name": "Sender", "address": "sender@example.com"}},
+              "toRecipients": [{"emailAddress": {"address": "recipient@example.com"}}],
+              "receivedDateTime": "\(snapshot.receivedDateTime)",
+              "isRead": \(snapshot.isRead),
+              "flag": {"flagStatus": "\(flagStatus)"},
+              "hasAttachments": false,
+              "internetMessageId": "<exchange-field-purpose@example.com>",
+              "conversationId": "exchange-field-purpose-thread",
+              "bodyPreview": "remote",
+              "parentFolderId": "\(snapshot.folderPath)"
+            }
+            """
+            respond(statusCode: 200, body: Data(json.utf8))
+        } else {
+            respond(
+                statusCode: 599,
+                body: Data("unmatched Exchange delta field test request".utf8)
+            )
+        }
+    }
+
+    override func stopLoading() {}
+
+    private func respond(statusCode: Int, body: Data) {
+        let url = request.url ?? URL(string: "about:blank")!
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ExchangeDeltaFieldURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+}
+
+// MARK: - Suite 1b: Gmail Delta — Folder-Scoped Recent Completion
+
+/// Drives both real production paths involved in the regression: queue completion
+/// publishes recent protection, then `SyncEngine.performDeltaSync` consumes a real
+/// Gmail history + metadata response through `GmailProvider`.
+@Suite("Gmail Delta — folder-scoped recent completion", .serialized, .processGlobalState)
+struct GmailDeltaFolderScopedRecentCompletionTests {
+
+    private func makeTestDB() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: dir.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
         )
-        try db.write { dbConn in try op.insert(dbConn) }
-
-        let fetched = try db.read { dbConn in
-            try PendingOperation.fetchOne(dbConn, key: op.id)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let old = current
+            current = appDatabase
+            return old
         }
-        #expect(fetched != nil)
-        #expect(fetched?.type == .setTag)
-        #expect(fetched?.tagValue == "reply")
-        #expect(fetched?.messageIds == ["msg-1"])
+        return (pool, dir, previous)
     }
 
-    @Test("removeTag creates PendingOperation with nil tagValue")
-    func removeTagCreatesPendingOp() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        let op = PendingOperation(
-            type: .removeTag,
-            messageIds: ["msg-1"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            tagValue: nil
-        )
-        try db.write { dbConn in try op.insert(dbConn) }
-
-        let fetched = try db.read { dbConn in
-            try PendingOperation.fetchOne(dbConn, key: op.id)
-        }
-        #expect(fetched != nil)
-        #expect(fetched?.type == .removeTag)
-        #expect(fetched?.tagValue == nil)
+    private func restoreTestDB(
+        pool: DatabasePool,
+        previous: AppDatabase?,
+        dir: URL
+    ) {
+        AppDatabase.shared.withLock { $0 = previous }
+        try? pool.close()
+        try? FileManager.default.removeItem(at: dir)
     }
 
-    @Test("setTag updates DB header actionTag and tagSortOrder")
-    func setTagUpdatesHeaderFields() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "msg-tag", accountId: "acc1")
-
-        // Verify initial state
-        #expect(header.actionTag == nil)
-        #expect(header.tagSortOrder == 99)
-
-        // Update the header with a tag (mirrors optimistic UI update pattern)
-        try db.write { dbConn in
-            guard var existing = try MessageHeader.fetchOne(dbConn, key: header.id) else {
-                Issue.record("Header not found")
-                return
-            }
-            let tag = ActionTag.archive
-            existing.actionTag = tag
-            existing.tagSortOrder = tag.sortOrder
-            try existing.update(dbConn)
-        }
-
-        let updated = try db.read { dbConn in
-            try MessageHeader.fetchOne(dbConn, key: header.id)
-        }
-        #expect(updated?.actionTag == .archive)
-        #expect(updated?.tagSortOrder == ActionTag.archive.sortOrder)
-        #expect(updated?.tagSortOrder == 2)
-    }
-
-    @Test("removeTag clears DB header actionTag")
-    func removeTagClearsHeaderActionTag() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "msg-tag-remove", accountId: "acc1", actionTag: .reply
+    private func verifyCompletedFieldOperation(
+        _ operationType: OperationType,
+        initialIsRead: Bool,
+        initialIsFlagged: Bool,
+        remoteIsRead: Bool,
+        remoteIsFlagged: Bool,
+        expectedIsRead: Bool,
+        expectedIsFlagged: Bool,
+        removeLocalBeforeDelta: Bool = false
+    ) async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: remoteIsRead,
+            isFlagged: remoteIsFlagged
         )
 
-        #expect(header.actionTag == .reply)
+        let accountId = "gmail-delta-field-purpose-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        let durableMessageId = "gmail-delta-folder-scope@example.com"
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
 
-        // Clear the tag
-        try db.write { dbConn in
-            guard var existing = try MessageHeader.fetchOne(dbConn, key: header.id) else {
-                Issue.record("Header not found")
-                return
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Field-purpose delta",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        header.rfc822MessageId = durableMessageId
+        header.headerComplete = true
+        header.isRead = initialIsRead
+        header.isFlagged = initialIsFlagged
+
+        var operation = PendingOperation(
+            type: operationType,
+            messageIds: [durableMessageId],
+            accountId: accountId,
+            folderPath: destination.path
+        )
+        operation.status = PendingStatus.inFlight.rawValue
+
+        let syncedAccount = account
+        let persistedHeader = header
+        let claimedOperation = operation
+        try await pool.write { db in
+            try syncedAccount.insert(db)
+            try destination.insert(db)
+            try persistedHeader.insert(db)
+            try claimedOperation.insert(db)
+        }
+
+        let manager = AccountManager.shared
+        await manager.recordRecentlyCompleted(
+            messageIds: [messageId, "gmail-delta-folder-scope@example.com"],
+            ttl: -1
+        )
+        await manager.pruneRecentlyCompleted()
+
+        // Match Gmail's account-wide message identity. A folder-scoped mock
+        // would publish keys the real Gmail delta consumer never reads.
+        let actionProvider = MockEmailProvider(messageFieldScope: .account)
+        let outcome = await manager.executeSingleOp(
+            claimedOperation,
+            provider: actionProvider,
+            context: AccountManager.DrainContext()
+        )
+        #expect(outcome == .proceed)
+        let completedValue: MessageIdentity.RecentlyCompletedFieldValue
+        switch operationType {
+        case .markRead:
+            let readCalls = await actionProvider.markedReadIds
+            #expect(readCalls.map(\.ids) == [[durableMessageId]])
+            #expect(readCalls.map(\.folder) == [destination.path])
+            completedValue = .read(true)
+        case .markUnread:
+            let unreadCalls = await actionProvider.markedUnreadIds
+            #expect(unreadCalls.map(\.ids) == [[durableMessageId]])
+            #expect(unreadCalls.map(\.folder) == [destination.path])
+            completedValue = .read(false)
+        case .markFlagged, .markUnflagged:
+            let flagCalls = await actionProvider.markedFlaggedIds
+            #expect(flagCalls.map(\.ids) == [[durableMessageId]])
+            #expect(flagCalls.map(\.flagged) == [operationType == .markFlagged])
+            #expect(flagCalls.map(\.folder) == [destination.path])
+            completedValue = .flagged(operationType == .markFlagged)
+        default:
+            Issue.record("unsupported completed field operation \(operationType.rawValue)")
+            return
+        }
+
+        let recentAfterCompletion = await manager.recentlyCompleted
+        #expect(recentAfterCompletion[MessageIdentity.recentlyCompletedFieldKey(
+            accountId: accountId,
+            messageId: durableMessageId,
+            field: completedValue.field
+        )] != nil)
+        #expect(recentAfterCompletion[MessageIdentity.recentlyCompletedFieldValueKey(
+            accountId: accountId,
+            messageId: durableMessageId,
+            value: completedValue
+        )] != nil)
+        #expect(recentAfterCompletion[messageId] == nil,
+                "queue completion must not regress to an unscoped legacy id")
+
+        if removeLocalBeforeDelta {
+            let removed = try await pool.write { db in
+                try MessageHeader.deleteOne(db, key: persistedHeader.id)
             }
-            existing.actionTag = nil
-            existing.tagSortOrder = 99
-            try existing.update(dbConn)
+            #expect(removed)
         }
 
-        let updated = try db.read { dbConn in
-            try MessageHeader.fetchOne(dbConn, key: header.id)
+        let gmailProvider = GmailProvider(
+            userEmail: syncedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let result = try await SyncEngine().performDeltaSync(
+            account: syncedAccount,
+            provider: gmailProvider
+        )
+        #expect(result.succeeded)
+        #expect(result.hadChanges)
+
+        let refreshed = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedHeader.id)
         }
-        #expect(updated?.actionTag == nil)
-        #expect(updated?.tagSortOrder == 99)
+        let requiredRefreshed = try #require(refreshed)
+        #expect(requiredRefreshed.isRead == expectedIsRead)
+        #expect(requiredRefreshed.isFlagged == expectedIsFlagged)
+        let advancedAccount = try await pool.read { db in
+            try Account.fetchOne(db, key: accountId)
+        }
+        #expect(advancedAccount?.lastHistoryId == "history-after")
     }
 
-    @Test("Multiple messages tagged in batch")
-    func batchTagging() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let h1 = try TestDatabase.insertMessageHeader(db, messageId: "batch-1", accountId: "acc1")
-        let h2 = try TestDatabase.insertMessageHeader(db, messageId: "batch-2", accountId: "acc1")
-        let h3 = try TestDatabase.insertMessageHeader(db, messageId: "batch-3", accountId: "acc1")
+    private func rowSurvivesDeletedHistory(
+        pendingOperationType: OperationType?
+    ) async throws -> Bool {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: true,
+            isFlagged: false
+        )
+        GmailDeltaFolderScopeURLProtocol.configureMessageDeletedHistory()
 
-        // Tag all messages in a single transaction
-        let tag = ActionTag.delete
-        try db.write { dbConn in
-            for headerId in [h1.id, h2.id, h3.id] {
-                guard var header = try MessageHeader.fetchOne(dbConn, key: headerId) else { continue }
-                header.actionTag = tag
-                header.tagSortOrder = tag.sortOrder
-                try header.update(dbConn)
+        let accountId = "gmail-delta-delete-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+        let folder = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Deleted history",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "local",
+            folderId: folder.id,
+            accountId: accountId,
+            folderPath: folder.path,
+            isInInbox: false
+        )
+        header.rfc822MessageId = "<gmail-delta-delete@example.com>"
+        header.headerComplete = true
+
+        let persistedAccount = account
+        let persistedHeader = header
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try folder.insert(db)
+            try persistedHeader.insert(db)
+            if let pendingOperationType {
+                try PendingOperation(
+                    type: pendingOperationType,
+                    messageIds: ["gmail-delta-delete@example.com"],
+                    accountId: accountId,
+                    folderPath: folder.path
+                ).insert(db)
             }
         }
 
-        // Also queue pending ops for each
-        try db.write { dbConn in
-            for msgId in ["batch-1", "batch-2", "batch-3"] {
-                let op = PendingOperation(
-                    type: .setTag,
-                    messageIds: [msgId],
-                    accountId: "acc1",
-                    folderPath: "INBOX",
-                    tagValue: tag.rawValue
-                )
-                try op.insert(dbConn)
+        let provider = GmailProvider(
+            userEmail: persistedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let result = try await SyncEngine().performDeltaSync(
+            account: persistedAccount,
+            provider: provider
+        )
+        #expect(result.succeeded)
+        #expect(result.hadChanges)
+
+        let advancedAccount = try await pool.read { db in
+            try Account.fetchOne(db, key: accountId)
+        }
+        #expect(advancedAccount?.lastHistoryId == "history-after")
+        return try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedHeader.id) != nil
+        }
+    }
+
+    private func verifyOrphanReclaimReadResolution(
+        operationType: OperationType,
+        localIsRead: Bool,
+        remoteIsRead: Bool,
+        expectedIsRead: Bool,
+        operationCompleted: Bool
+    ) async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: remoteIsRead,
+            isFlagged: true
+        )
+        GmailDeltaFolderScopeURLProtocol.configureRemoteLabels([
+            GmailDeltaFolderScopeURLProtocol.destinationPath,
+        ])
+
+        let accountId = "gmail-delta-orphan-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        let durableMessageId = "gmail-delta-folder-scope@example.com"
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+        let allMail = Folder(
+            name: "All Mail",
+            path: GmailProvider.archivePath,
+            role: .archive,
+            accountId: accountId
+        )
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        // The primary key encodes Folder B, but the persisted folderId points at
+        // synthetic All Mail. Gmail's tracked-folder loop skips All Mail, then
+        // reaches Folder B through the real orphan-reclaim branch.
+        var orphan = MessageHeader(
+            messageId: messageId,
+            subject: "Orphan reclaim",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "local",
+            folderId: allMail.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        orphan.rfc822MessageId = "<\(durableMessageId)>"
+        orphan.headerComplete = true
+        orphan.isRead = localIsRead
+        orphan.isFlagged = false
+
+        var readOperation = PendingOperation(
+            type: operationType,
+            messageIds: [durableMessageId],
+            accountId: accountId,
+            folderPath: destination.path
+        )
+        if operationCompleted {
+            readOperation.status = PendingStatus.inFlight.rawValue
+        }
+        let persistedAccount = account
+        let persistedOrphan = orphan
+        let persistedReadOperation = readOperation
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try allMail.insert(db)
+            try destination.insert(db)
+            try persistedOrphan.insert(db)
+            try persistedReadOperation.insert(db)
+        }
+
+        let manager = AccountManager.shared
+        if operationCompleted {
+            let outcome = await manager.executeSingleOp(
+                persistedReadOperation,
+                provider: MockEmailProvider(messageFieldScope: .account),
+                context: AccountManager.DrainContext()
+            )
+            #expect(outcome == .proceed)
+        }
+
+        let fieldKey = MessageIdentity.recentlyCompletedFieldKey(
+            accountId: accountId,
+            messageId: durableMessageId,
+            field: .read
+        )
+        let genericKey = MessageIdentity.recentlyCompletedAccountKey(
+            accountId: accountId,
+            messageId: durableMessageId
+        )
+        let provider = GmailProvider(
+            userEmail: persistedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+
+        do {
+            let result = try await SyncEngine().performDeltaSync(
+                account: persistedAccount,
+                provider: provider
+            )
+            #expect(result.succeeded)
+            #expect(result.hadChanges)
+
+            let reclaimed = try #require(try await pool.read { db in
+                try MessageHeader.fetchOne(db, key: persistedOrphan.id)
+            })
+            #expect(reclaimed.folderId == destination.id)
+            #expect(reclaimed.folderPath == destination.path)
+            #expect(reclaimed.isRead == expectedIsRead)
+            #expect(reclaimed.isFlagged,
+                    "an unrelated remote flagged change must still converge")
+        } catch {
+            await ActiveBodyQueue.shared.cancelAllInFlight()
+            try? await SearchIndex.shared.removeMessages(headerIds: [persistedOrphan.id])
+            await manager.recordRecentlyCompleted(
+                messageIds: [fieldKey, genericKey],
+                ttl: -1
+            )
+            await manager.pruneRecentlyCompleted()
+            throw error
+        }
+
+        await ActiveBodyQueue.shared.cancelAllInFlight()
+        try await SearchIndex.shared.removeMessages(headerIds: [persistedOrphan.id])
+        await manager.recordRecentlyCompleted(
+            messageIds: [fieldKey, genericKey],
+            ttl: -1
+        )
+        await manager.pruneRecentlyCompleted()
+    }
+
+    @Test("completed markRead protects read state but not an unrelated remote star")
+    func completedMarkReadDoesNotSuppressRemoteStar() async throws {
+        try await verifyCompletedFieldOperation(
+            .markRead,
+            initialIsRead: true,
+            initialIsFlagged: false,
+            remoteIsRead: false,
+            remoteIsFlagged: true,
+            expectedIsRead: true,
+            expectedIsFlagged: true
+        )
+    }
+
+    @Test("completed markFlagged protects star state but not an unrelated remote read")
+    func completedMarkFlaggedDoesNotSuppressRemoteRead() async throws {
+        try await verifyCompletedFieldOperation(
+            .markFlagged,
+            initialIsRead: false,
+            initialIsFlagged: true,
+            remoteIsRead: true,
+            remoteIsFlagged: false,
+            expectedIsRead: true,
+            expectedIsFlagged: true
+        )
+    }
+
+    @Test("completed markUnread restores a missing row with its exact negative value")
+    func completedMarkUnreadRestoresMissingRowWithNegativeValue() async throws {
+        try await verifyCompletedFieldOperation(
+            .markUnread,
+            initialIsRead: false,
+            initialIsFlagged: false,
+            remoteIsRead: true,
+            remoteIsFlagged: true,
+            expectedIsRead: false,
+            expectedIsFlagged: true,
+            removeLocalBeforeDelta: true
+        )
+    }
+
+    @Test("unprotected deleted history removes the durable row")
+    func deletedHistoryRemovesUnprotectedRow() async throws {
+        let survives = try await rowSurvivesDeletedHistory(pendingOperationType: nil)
+        #expect(survives == false)
+    }
+
+    @Test("pending destructive operation protects a row from deleted history")
+    func pendingDeleteProtectsRowFromDeletedHistory() async throws {
+        let survives = try await rowSurvivesDeletedHistory(pendingOperationType: .delete)
+        #expect(survives)
+    }
+
+    @Test("orphan reclaim preserves pending read but applies remote flagged")
+    func orphanReclaimPreservesPendingReadIntent() async throws {
+        try await verifyOrphanReclaimReadResolution(
+            operationType: .markRead,
+            localIsRead: true,
+            remoteIsRead: false,
+            expectedIsRead: true,
+            operationCompleted: false
+        )
+    }
+
+    @Test("orphan reclaim preserves completed read but applies remote flagged")
+    func orphanReclaimPreservesCompletedReadIntent() async throws {
+        try await verifyOrphanReclaimReadResolution(
+            operationType: .markRead,
+            localIsRead: true,
+            remoteIsRead: false,
+            expectedIsRead: true,
+            operationCompleted: true
+        )
+    }
+
+    @Test("orphan reclaim preserves pending unread but applies remote flagged")
+    func orphanReclaimPreservesPendingUnreadIntent() async throws {
+        try await verifyOrphanReclaimReadResolution(
+            operationType: .markUnread,
+            localIsRead: false,
+            remoteIsRead: true,
+            expectedIsRead: false,
+            operationCompleted: false
+        )
+    }
+
+    @Test("orphan reclaim preserves completed unread but applies remote flagged")
+    func orphanReclaimPreservesCompletedUnreadIntent() async throws {
+        try await verifyOrphanReclaimReadResolution(
+            operationType: .markUnread,
+            localIsRead: false,
+            remoteIsRead: true,
+            expectedIsRead: false,
+            operationCompleted: true
+        )
+    }
+
+    @Test("push provenance survives field completion and protects only its exact row")
+    func pushAndCompletedFieldComposeWithoutLosingRowProtection() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: false,
+            isFlagged: false
+        )
+        GmailDeltaFolderScopeURLProtocol.configureRemoteLabels([])
+
+        let accountId = "gmail-delta-push-protection-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        let unprotectedFolder = Folder(
+            name: "Folder X",
+            path: GmailDeltaFolderScopeURLProtocol.externalPath,
+            role: .custom,
+            accountId: accountId
+        )
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Push-merged delta protection",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "local push metadata",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        header.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        header.headerComplete = true
+        header.isRead = true
+        header.isFlagged = true
+        var unprotectedHeader = header
+        unprotectedHeader.id = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: unprotectedFolder.path,
+            messageId: messageId
+        )
+        unprotectedHeader.folderId = unprotectedFolder.id
+        unprotectedHeader.folderPath = unprotectedFolder.path
+
+        var operation = PendingOperation(
+            type: .markRead,
+            messageIds: ["gmail-delta-folder-scope@example.com"],
+            accountId: accountId,
+            folderPath: destination.path
+        )
+        operation.status = PendingStatus.inFlight.rawValue
+
+        let persistedAccount = account
+        let persistedHeader = header
+        let persistedUnprotectedHeader = unprotectedHeader
+        let claimedOperation = operation
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try destination.insert(db)
+            try unprotectedFolder.insert(db)
+            try persistedHeader.insert(db)
+            try persistedUnprotectedHeader.insert(db)
+            try claimedOperation.insert(db)
+        }
+
+        let manager = AccountManager.shared
+        let rfcIdentity = "gmail-delta-folder-scope@example.com"
+        let providerPushKey = MessageIdentity.recentlyCompletedPushKey(
+            accountId: accountId,
+            folderPath: destination.path,
+            messageId: messageId
+        )
+        let rfcPushKey = MessageIdentity.recentlyCompletedPushKey(
+            accountId: accountId,
+            folderPath: destination.path,
+            messageId: rfcIdentity
+        )
+        await manager.recordRecentlyCompleted(
+            messageIds: [providerPushKey, rfcPushKey],
+            ttl: SyncConfig.pushMergeStaleProtectionTTLSeconds
+        )
+
+        // A real queue completion now publishes a narrower field-purpose key.
+        // The push row must retain its independent provenance and longer lifetime.
+        let actionProvider = MockEmailProvider(messageFieldScope: .account)
+        let outcome = await manager.executeSingleOp(
+            claimedOperation,
+            provider: actionProvider,
+            context: AccountManager.DrainContext()
+        )
+        #expect(outcome == .proceed)
+        let recentAfterCompletion = await manager.recentlyCompleted
+        #expect(recentAfterCompletion[providerPushKey] != nil)
+        #expect(recentAfterCompletion[MessageIdentity.recentlyCompletedFieldKey(
+            accountId: accountId,
+            messageId: rfcIdentity,
+            field: .read
+        )] != nil)
+
+        let provider = GmailProvider(
+            userEmail: persistedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let result = try await SyncEngine().performDeltaSync(
+            account: persistedAccount,
+            provider: provider
+        )
+        #expect(result.succeeded)
+        #expect(result.hadChanges)
+
+        let refreshed = try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedHeader.id)
+        })
+        #expect(refreshed.isRead)
+        #expect(refreshed.isFlagged)
+        let unprotectedSurvived = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedUnprotectedHeader.id) != nil
+        }
+        #expect(unprotectedSurvived == false,
+                "push provenance must not blanket another folder membership")
+    }
+
+    @Test("push provenance protects an exact row from a transient deleted event")
+    func pushProtectsExactRowFromDeletedHistory() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: true,
+            isFlagged: true
+        )
+        GmailDeltaFolderScopeURLProtocol.configureMessageDeletedHistory()
+
+        let accountId = "gmail-delta-push-delete-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        let unprotectedFolder = Folder(
+            name: "Folder X",
+            path: GmailDeltaFolderScopeURLProtocol.externalPath,
+            role: .custom,
+            accountId: accountId
+        )
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Push delete protection",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "local push metadata",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        header.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        header.headerComplete = true
+        var unprotectedHeader = header
+        unprotectedHeader.id = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: unprotectedFolder.path,
+            messageId: messageId
+        )
+        unprotectedHeader.folderId = unprotectedFolder.id
+        unprotectedHeader.folderPath = unprotectedFolder.path
+
+        let persistedAccount = account
+        let persistedHeader = header
+        let persistedUnprotectedHeader = unprotectedHeader
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try destination.insert(db)
+            try unprotectedFolder.insert(db)
+            try persistedHeader.insert(db)
+            try persistedUnprotectedHeader.insert(db)
+        }
+
+        await AccountManager.shared.recordRecentlyCompleted(
+            messageIds: [MessageIdentity.recentlyCompletedPushKey(
+                accountId: accountId,
+                folderPath: destination.path,
+                messageId: messageId
+            )],
+            ttl: SyncConfig.pushMergeStaleProtectionTTLSeconds
+        )
+
+        let provider = GmailProvider(
+            userEmail: persistedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let result = try await SyncEngine().performDeltaSync(
+            account: persistedAccount,
+            provider: provider
+        )
+        #expect(result.succeeded)
+        #expect(result.hadChanges)
+
+        let rowSurvived = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedHeader.id) != nil
+        }
+        #expect(rowSurvived)
+        let unprotectedSurvived = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedUnprotectedHeader.id) != nil
+        }
+        #expect(unprotectedSurvived == false,
+                "push provenance must protect only the exact deleted membership")
+    }
+
+    @Test("legacy bare recent id from another account cannot protect this account")
+    func bareRecentIdentityCannotCrossAccounts() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: false,
+            isFlagged: false
+        )
+
+        let accountId = "gmail-delta-cross-account-b-\(UUID().uuidString)"
+        let otherAccountId = "gmail-delta-cross-account-a-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Cross-account protection",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "local",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        header.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        header.headerComplete = true
+        header.isRead = true
+        header.isFlagged = true
+
+        let persistedAccount = account
+        let persistedHeader = header
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try destination.insert(db)
+            try persistedHeader.insert(db)
+        }
+
+        let manager = AccountManager.shared
+        await manager.recordRecentlyCompleted(messageIds: [
+            messageId,
+            MessageIdentity.recentlyCompletedFieldKey(
+                accountId: otherAccountId,
+                messageId: messageId,
+                field: .read
+            ),
+        ])
+
+        do {
+            let provider = GmailProvider(
+                userEmail: persistedAccount.emailAddress,
+                accessToken: { _ in "test-token" },
+                session: GmailDeltaFolderScopeURLProtocol.makeSession()
+            )
+            let result = try await SyncEngine().performDeltaSync(
+                account: persistedAccount,
+                provider: provider
+            )
+            #expect(result.succeeded)
+            #expect(result.hadChanges)
+
+            let refreshed = try #require(try await pool.read { db in
+                try MessageHeader.fetchOne(db, key: persistedHeader.id)
+            })
+            #expect(refreshed.isRead == false)
+            #expect(refreshed.isFlagged == false)
+        } catch {
+            await manager.recordRecentlyCompleted(messageIds: [messageId], ttl: -1)
+            await manager.pruneRecentlyCompleted()
+            throw error
+        }
+
+        await manager.recordRecentlyCompleted(messageIds: [messageId], ttl: -1)
+        await manager.pruneRecentlyCompleted()
+    }
+
+    @Test("pending field operation does not suppress an unrelated remote label removal")
+    func pendingReadDoesNotSuppressRemoteLabelRemoval() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: true,
+            isFlagged: false
+        )
+        GmailDeltaFolderScopeURLProtocol.configureRemoteLabels([
+            GmailDeltaFolderScopeURLProtocol.externalPath
+        ])
+
+        let accountId = "gmail-delta-field-membership-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+        let source = Folder(
+            name: "Folder A",
+            path: GmailDeltaFolderScopeURLProtocol.sourcePath,
+            role: .custom,
+            accountId: accountId
+        )
+        let external = Folder(
+            name: "Folder X",
+            path: GmailDeltaFolderScopeURLProtocol.externalPath,
+            role: .custom,
+            accountId: accountId
+        )
+        var sourceHeader = MessageHeader(
+            messageId: messageId,
+            subject: "Remote label removal",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: source.id,
+            accountId: accountId,
+            folderPath: source.path,
+            isInInbox: false
+        )
+        sourceHeader.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        sourceHeader.headerComplete = true
+        sourceHeader.isRead = true
+        let pendingRead = PendingOperation(
+            type: .markRead,
+            messageIds: ["gmail-delta-folder-scope@example.com"],
+            accountId: accountId,
+            folderPath: source.path
+        )
+
+        let persistedAccount = account
+        let persistedSourceHeader = sourceHeader
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try source.insert(db)
+            try external.insert(db)
+            try persistedSourceHeader.insert(db)
+            try pendingRead.insert(db)
+        }
+
+        let provider = GmailProvider(
+            userEmail: persistedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let result = try await SyncEngine().performDeltaSync(
+            account: persistedAccount,
+            provider: provider
+        )
+        #expect(result.succeeded)
+        #expect(result.hadChanges)
+
+        let sourceHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: source.path,
+            messageId: messageId
+        )
+        let externalHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: external.path,
+            messageId: messageId
+        )
+        let memberships = try await pool.read { db in
+            try MessageHeader
+                .filter(Column("accountId") == accountId && Column("messageId") == messageId)
+                .fetchAll(db)
+        }
+        #expect(memberships.contains(where: { $0.id == sourceHeaderId }) == false)
+        #expect(memberships.contains(where: { $0.id == externalHeaderId }))
+
+        await ActiveBodyQueue.shared.cancelAllInFlight()
+        try? await SearchIndex.shared.removeMessages(
+            headerIds: [sourceHeaderId, externalHeaderId]
+        )
+    }
+
+    @Test("recent move protects only its source membership; external label and remote flags still apply")
+    func recentMoveDoesNotSuppressUnrelatedExternalLabelOrFlags() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: true,
+            isFlagged: true
+        )
+
+        let accountId = "gmail-delta-folder-scope-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+
+        let source = Folder(
+            name: "Folder A",
+            path: GmailDeltaFolderScopeURLProtocol.sourcePath,
+            role: .custom,
+            accountId: accountId
+        )
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        let external = Folder(
+            name: "Folder X",
+            path: GmailDeltaFolderScopeURLProtocol.externalPath,
+            role: .custom,
+            accountId: accountId
+        )
+
+        var destinationHeader = MessageHeader(
+            messageId: messageId,
+            subject: "Folder scoped delta",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        destinationHeader.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        destinationHeader.headerComplete = true
+
+        var operation = PendingOperation(
+            type: .move,
+            messageIds: ["gmail-delta-folder-scope@example.com"],
+            accountId: accountId,
+            folderPath: source.path,
+            destinationPath: destination.path
+        )
+        operation.status = PendingStatus.inFlight.rawValue
+
+        let syncedAccount = account
+        let persistedDestinationHeader = destinationHeader
+        let claimedOperation = operation
+        try await pool.write { db in
+            try syncedAccount.insert(db)
+            try source.insert(db)
+            try destination.insert(db)
+            try external.insert(db)
+            try persistedDestinationHeader.insert(db)
+            try claimedOperation.insert(db)
+        }
+
+        let moveProvider = MockEmailProvider()
+        let outcome = await AccountManager.shared.executeSingleOp(
+            claimedOperation,
+            provider: moveProvider,
+            context: AccountManager.DrainContext()
+        )
+        #expect(outcome == .proceed)
+        let moveCalls = await moveProvider.movedIds
+        #expect(moveCalls.map { $0.from } == [source.path])
+        #expect(moveCalls.map { $0.to } == [destination.path])
+
+        let gmailProvider = GmailProvider(
+            userEmail: syncedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let syncEngine = SyncEngine()
+
+        let sourceHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: source.path,
+            messageId: messageId
+        )
+        let destinationHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: destination.path,
+            messageId: messageId
+        )
+        let externalHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: external.path,
+            messageId: messageId
+        )
+        let cleanupHeaderIds = [sourceHeaderId, destinationHeaderId, externalHeaderId]
+
+        do {
+            let result = try await syncEngine.performDeltaSync(
+                account: syncedAccount,
+                provider: gmailProvider
+            )
+            #expect(result.succeeded)
+            #expect(result.hadChanges)
+
+            let memberships = try await pool.read { db in
+                try MessageHeader
+                    .filter(
+                        Column("accountId") == accountId &&
+                        Column("messageId") == messageId
+                    )
+                    .fetchAll(db)
+            }
+            #expect(Set(memberships.map(\.folderPath)) == Set([destination.path, external.path]))
+            #expect(memberships.contains(where: { $0.id == sourceHeaderId }) == false)
+            #expect(memberships.contains(where: { $0.id == destinationHeaderId }))
+            #expect(memberships.contains(where: { $0.id == externalHeaderId }))
+            let refreshedDestination = try #require(
+                memberships.first(where: { $0.id == destinationHeaderId })
+            )
+            #expect(refreshedDestination.isRead)
+            #expect(refreshedDestination.isFlagged)
+        } catch {
+            await ActiveBodyQueue.shared.cancelAllInFlight()
+            try? await SearchIndex.shared.removeMessages(headerIds: cleanupHeaderIds)
+            throw error
+        }
+
+        await ActiveBodyQueue.shared.cancelAllInFlight()
+        try? await SearchIndex.shared.removeMessages(headerIds: cleanupHeaderIds)
+    }
+
+    @Test("delta snapshot before move completion still protects the stale source membership")
+    func moveCompletionDuringMetadataFetchProtectsSourceMembership() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: true,
+            isFlagged: true
+        )
+
+        let accountId = "gmail-delta-snapshot-race-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+
+        let source = Folder(
+            name: "Folder A",
+            path: GmailDeltaFolderScopeURLProtocol.sourcePath,
+            role: .custom,
+            accountId: accountId
+        )
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        let external = Folder(
+            name: "Folder X",
+            path: GmailDeltaFolderScopeURLProtocol.externalPath,
+            role: .custom,
+            accountId: accountId
+        )
+
+        var destinationHeader = MessageHeader(
+            messageId: messageId,
+            subject: "Folder scoped delta",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        destinationHeader.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        destinationHeader.headerComplete = true
+
+        var operation = PendingOperation(
+            type: .move,
+            messageIds: ["gmail-delta-folder-scope@example.com"],
+            accountId: accountId,
+            folderPath: source.path,
+            destinationPath: destination.path
+        )
+        operation.status = PendingStatus.inFlight.rawValue
+
+        let syncedAccount = account
+        let persistedDestinationHeader = destinationHeader
+        let claimedOperation = operation
+        try await pool.write { db in
+            try syncedAccount.insert(db)
+            try source.insert(db)
+            try destination.insert(db)
+            try external.insert(db)
+            try persistedDestinationHeader.insert(db)
+            try claimedOperation.insert(db)
+        }
+
+        let sourceHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: source.path,
+            messageId: messageId
+        )
+        let destinationHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: destination.path,
+            messageId: messageId
+        )
+        let externalHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: external.path,
+            messageId: messageId
+        )
+        let cleanupHeaderIds = [sourceHeaderId, destinationHeaderId, externalHeaderId]
+        let sourceMembershipKey = MessageIdentity.membershipKey(
+            accountId: accountId,
+            folderPath: source.path,
+            messageId: "gmail-delta-folder-scope@example.com",
+            membership: .removedSource
+        )
+
+        let manager = AccountManager.shared
+        await manager.recordRecentlyCompleted(
+            messageIds: [sourceMembershipKey],
+            ttl: -1
+        )
+        await manager.pruneRecentlyCompleted()
+        let recentBeforeDelta = await manager.recentlyCompleted
+        #expect(recentBeforeDelta[sourceMembershipKey] == nil)
+
+        let gmailProvider = GmailProvider(
+            userEmail: syncedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let syncEngine = SyncEngine()
+        let metadataGate = GmailDeltaFolderScopeURLProtocol.metadataGate
+        metadataGate.enable()
+
+        let deltaTask = Task {
+            try await syncEngine.performDeltaSync(
+                account: syncedAccount,
+                provider: gmailProvider
+            )
+        }
+
+        do {
+            // Reaching the metadata request proves delta already captured its old
+            // recently-completed snapshot. Hold the response while the real action
+            // path publishes the source-membership completion.
+            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                await metadataGate.waitUntilRequestArrives()
+            }
+
+            let moveProvider = MockEmailProvider()
+            let outcome = await manager.executeSingleOp(
+                claimedOperation,
+                provider: moveProvider,
+                context: AccountManager.DrainContext()
+            )
+            #expect(outcome == .proceed)
+
+            let recentAfterCompletion = await manager.recentlyCompleted
+            #expect(recentAfterCompletion[sourceMembershipKey] != nil)
+
+            metadataGate.release()
+            let result = try await deltaTask.value
+            #expect(result.succeeded)
+            #expect(result.hadChanges)
+
+            let memberships = try await pool.read { db in
+                try MessageHeader
+                    .filter(
+                        Column("accountId") == accountId &&
+                        Column("messageId") == messageId
+                    )
+                    .fetchAll(db)
+            }
+            #expect(Set(memberships.map(\.folderPath)) == Set([destination.path, external.path]))
+            #expect(memberships.contains(where: { $0.id == sourceHeaderId }) == false)
+            #expect(memberships.contains(where: { $0.id == destinationHeaderId }))
+            #expect(memberships.contains(where: { $0.id == externalHeaderId }))
+        } catch {
+            metadataGate.release()
+            deltaTask.cancel()
+            _ = try? await deltaTask.value
+            await ActiveBodyQueue.shared.cancelAllInFlight()
+            try? await SearchIndex.shared.removeMessages(headerIds: cleanupHeaderIds)
+            throw error
+        }
+
+        await ActiveBodyQueue.shared.cancelAllInFlight()
+        try? await SearchIndex.shared.removeMessages(headerIds: cleanupHeaderIds)
+    }
+
+    @Test("move completion between recent and pending snapshots protects stale source membership")
+    func moveCompletionInProtectionSnapshotMicrogapProtectsSourceMembership() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        GmailDeltaFolderScopeURLProtocol.metadataGate.release()
+        GmailDeltaFolderScopeURLProtocol.configureRemoteFlags(
+            isRead: true,
+            isFlagged: true
+        )
+
+        let accountId = "gmail-delta-protection-microgap-\(UUID().uuidString)"
+        let messageId = GmailDeltaFolderScopeURLProtocol.messageId
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .gmail
+        )
+        account.id = accountId
+        account.lastHistoryId = "history-before"
+
+        let source = Folder(
+            name: "Folder A",
+            path: GmailDeltaFolderScopeURLProtocol.sourcePath,
+            role: .custom,
+            accountId: accountId
+        )
+        let destination = Folder(
+            name: "Folder B",
+            path: GmailDeltaFolderScopeURLProtocol.destinationPath,
+            role: .custom,
+            accountId: accountId
+        )
+        let external = Folder(
+            name: "Folder X",
+            path: GmailDeltaFolderScopeURLProtocol.externalPath,
+            role: .custom,
+            accountId: accountId
+        )
+
+        var destinationHeader = MessageHeader(
+            messageId: messageId,
+            subject: "Folder scoped delta",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: destination.id,
+            accountId: accountId,
+            folderPath: destination.path,
+            isInInbox: false
+        )
+        destinationHeader.rfc822MessageId = "gmail-delta-folder-scope@example.com"
+        destinationHeader.headerComplete = true
+
+        var operation = PendingOperation(
+            type: .move,
+            messageIds: ["gmail-delta-folder-scope@example.com"],
+            accountId: accountId,
+            folderPath: source.path,
+            destinationPath: destination.path
+        )
+        operation.status = PendingStatus.inFlight.rawValue
+
+        let syncedAccount = account
+        let persistedDestinationHeader = destinationHeader
+        let claimedOperation = operation
+        try await pool.write { db in
+            try syncedAccount.insert(db)
+            try source.insert(db)
+            try destination.insert(db)
+            try external.insert(db)
+            try persistedDestinationHeader.insert(db)
+            try claimedOperation.insert(db)
+        }
+
+        let sourceHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: source.path,
+            messageId: messageId
+        )
+        let sourceMembershipKey = MessageIdentity.membershipKey(
+            accountId: accountId,
+            folderPath: source.path,
+            messageId: "gmail-delta-folder-scope@example.com",
+            membership: .removedSource
+        )
+        let destinationHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: destination.path,
+            messageId: messageId
+        )
+        let externalHeaderId = MessageIdentity.headerId(
+            accountId: accountId,
+            folderPath: external.path,
+            messageId: messageId
+        )
+        let cleanupHeaderIds = [sourceHeaderId, destinationHeaderId, externalHeaderId]
+
+        let manager = AccountManager.shared
+        await manager.recordRecentlyCompleted(
+            messageIds: [sourceMembershipKey],
+            ttl: -1
+        )
+        await manager.pruneRecentlyCompleted()
+        let recentBeforeDelta = await manager.recentlyCompleted
+        #expect(recentBeforeDelta[sourceMembershipKey] == nil)
+
+        let checkpoint = SyncEngine.GmailDeltaProtectionCheckpointForTesting
+            .afterNetworkBeforeProtectionReservation(accountId: accountId)
+        let checkpointGate = GmailDeltaProtectionCheckpointGate()
+        SyncEngine.gmailDeltaProtectionCheckpointHooksForTesting.withLock {
+            $0[checkpoint] = {
+                await checkpointGate.arriveAndWaitForRelease()
             }
         }
 
-        // Verify all headers updated
-        let headers = try db.read { dbConn in
-            try MessageHeader.filter(Column("accountId") == "acc1")
-                .order(Column("messageId").asc)
-                .fetchAll(dbConn)
-        }
-        #expect(headers.count == 3)
-        for header in headers {
-            #expect(header.actionTag == .delete)
-            #expect(header.tagSortOrder == 3)
+        let gmailProvider = GmailProvider(
+            userEmail: syncedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: GmailDeltaFolderScopeURLProtocol.makeSession()
+        )
+        let syncEngine = SyncEngine()
+        let deltaTask = Task {
+            try await syncEngine.performDeltaSync(
+                account: syncedAccount,
+                provider: gmailProvider
+            )
         }
 
-        // Verify all pending ops created
-        let ops = try db.read { dbConn in
-            try PendingOperation.filter(Column("type") == OperationType.setTag.rawValue).fetchAll(dbConn)
+        do {
+            // Delta has completed its network reads but has not yet reserved the
+            // writer and sampled actor + durable protection as one boundary.
+            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+                await checkpointGate.waitUntilArrival()
+            }
+
+            let moveProvider = MockEmailProvider()
+            let outcome = await manager.executeSingleOp(
+                claimedOperation,
+                provider: moveProvider,
+                context: AccountManager.DrainContext()
+            )
+            #expect(outcome == .proceed)
+
+            let recentAfterCompletion = await manager.recentlyCompleted
+            #expect(recentAfterCompletion[sourceMembershipKey] != nil)
+
+            await checkpointGate.release()
+            let result = try await deltaTask.value
+            #expect(result.succeeded)
+            #expect(result.hadChanges)
+
+            let memberships = try await pool.read { db in
+                try MessageHeader
+                    .filter(
+                        Column("accountId") == accountId &&
+                        Column("messageId") == messageId
+                    )
+                    .fetchAll(db)
+            }
+            #expect(Set(memberships.map(\.folderPath)) == Set([destination.path, external.path]))
+            #expect(memberships.contains(where: { $0.id == sourceHeaderId }) == false)
+            #expect(memberships.contains(where: { $0.id == destinationHeaderId }))
+            #expect(memberships.contains(where: { $0.id == externalHeaderId }))
+        } catch {
+            SyncEngine.gmailDeltaProtectionCheckpointHooksForTesting.withLock {
+                _ = $0.removeValue(forKey: checkpoint)
+            }
+            await checkpointGate.release()
+            deltaTask.cancel()
+            _ = try? await deltaTask.value
+            await ActiveBodyQueue.shared.cancelAllInFlight()
+            try? await SearchIndex.shared.removeMessages(headerIds: cleanupHeaderIds)
+            throw error
         }
-        #expect(ops.count == 3)
+
+        SyncEngine.gmailDeltaProtectionCheckpointHooksForTesting.withLock {
+            _ = $0.removeValue(forKey: checkpoint)
+        }
+        await ActiveBodyQueue.shared.cancelAllInFlight()
+        try? await SearchIndex.shared.removeMessages(headerIds: cleanupHeaderIds)
+    }
+}
+
+// MARK: - Suite 1c: Exchange Delta — Field-Scoped Protection
+
+/// Drives real Graph delta/history parsing and the real Exchange upsert. Advancing
+/// the delta cursor makes a cross-field suppression permanent, so a read intention
+/// may protect only read and a flagged intention may protect only flagged.
+@Suite("Exchange Delta — field-scoped protection", .serialized, .processGlobalState)
+struct ExchangeDeltaFieldScopedProtectionTests {
+    private enum ProtectedField {
+        case read
+        case flagged
+
+        var operationType: OperationType {
+            switch self {
+            case .read: .markRead
+            case .flagged: .markFlagged
+            }
+        }
+    }
+
+    private func makeTestDB() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: dir.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let old = current
+            current = appDatabase
+            return old
+        }
+        return (pool, dir, previous)
+    }
+
+    private func restoreTestDB(
+        pool: DatabasePool,
+        previous: AppDatabase?,
+        dir: URL
+    ) {
+        AppDatabase.shared.withLock { $0 = previous }
+        try? pool.close()
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    private func verifyProtection(
+        _ protectedField: ProtectedField,
+        operationCompleted: Bool
+    ) async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let accountId = "exchange-delta-field-\(UUID().uuidString)"
+        let messageId = "exchange-current-\(UUID().uuidString)"
+        let folderPath = "graph-folder-d"
+        let now = Date()
+        let receivedDateTime = ISO8601DateFormatter().string(from: now)
+        let protectsRead = protectedField.operationType == .markRead
+
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Recipient",
+            provider: .outlook
+        )
+        account.id = accountId
+        account.lastHistoryId =
+            "https://graph.microsoft.com/v1.0/me/messages/field-purpose-delta-before"
+        let folder = Folder(
+            name: "Folder D",
+            path: folderPath,
+            role: .inbox,
+            accountId: accountId
+        )
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Exchange field purpose",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: now.addingTimeInterval(-60),
+            snippet: "local",
+            folderId: folder.id,
+            accountId: accountId,
+            folderPath: folder.path,
+            isInInbox: true
+        )
+        header.rfc822MessageId = "exchange-field-purpose@example.com"
+        let durableMessageId = "exchange-field-purpose@example.com"
+        header.headerComplete = true
+        header.isRead = protectsRead
+        header.isFlagged = !protectsRead
+
+        var operation = PendingOperation(
+            type: protectedField.operationType,
+            messageIds: [durableMessageId],
+            accountId: accountId,
+            folderPath: folder.path
+        )
+        operation.status = operationCompleted
+            ? PendingStatus.inFlight.rawValue
+            : PendingStatus.queued.rawValue
+
+        let persistedAccount = account
+        let persistedHeader = header
+        let persistedOperation = operation
+        try await pool.write { db in
+            try persistedAccount.insert(db)
+            try folder.insert(db)
+            try persistedHeader.insert(db)
+            try persistedOperation.insert(db)
+        }
+
+        if operationCompleted {
+            let actionProvider = MockEmailProvider(messageFieldScope: .account)
+            let outcome = await AccountManager.shared.executeSingleOp(
+                persistedOperation,
+                provider: actionProvider,
+                context: AccountManager.DrainContext()
+            )
+            #expect(outcome == .proceed)
+            let completedValue: MessageIdentity.RecentlyCompletedFieldValue = protectsRead
+                ? .read(true)
+                : .flagged(true)
+            let recentlyCompleted = await AccountManager.shared.recentlyCompleted
+            #expect(recentlyCompleted[MessageIdentity.recentlyCompletedFieldKey(
+                accountId: accountId,
+                messageId: durableMessageId,
+                field: completedValue.field
+            )] != nil)
+            #expect(recentlyCompleted[MessageIdentity.recentlyCompletedFieldValueKey(
+                accountId: accountId,
+                messageId: durableMessageId,
+                value: completedValue
+            )] != nil)
+        }
+
+        ExchangeDeltaFieldURLProtocol.configure(
+            messageId: messageId,
+            folderPath: folder.path,
+            receivedDateTime: receivedDateTime,
+            isRead: !protectsRead,
+            isFlagged: protectsRead
+        )
+        let provider = ExchangeProvider(
+            userEmail: persistedAccount.emailAddress,
+            accessToken: { _ in "test-token" },
+            session: ExchangeDeltaFieldURLProtocol.makeSession()
+        )
+        let result = try await SyncEngine().performDeltaSync(
+            account: persistedAccount,
+            provider: provider
+        )
+        #expect(result.succeeded)
+        #expect(result.hadChanges)
+
+        let refreshed = try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: persistedHeader.id)
+        })
+        #expect(refreshed.isRead)
+        #expect(refreshed.isFlagged)
+        let advancedAccount = try #require(try await pool.read { db in
+            try Account.fetchOne(db, key: accountId)
+        })
+        #expect(advancedAccount.lastHistoryId?.contains("field-purpose-delta-after") == true)
+    }
+
+    @Test("pending markRead protects read but applies unrelated remote flagged")
+    func pendingReadDoesNotSuppressRemoteFlagged() async throws {
+        try await verifyProtection(.read, operationCompleted: false)
+    }
+
+    @Test("completed markRead protects read but applies unrelated remote flagged")
+    func completedReadDoesNotSuppressRemoteFlagged() async throws {
+        try await verifyProtection(.read, operationCompleted: true)
+    }
+
+    @Test("pending markFlagged protects flagged but applies unrelated remote read")
+    func pendingFlaggedDoesNotSuppressRemoteRead() async throws {
+        try await verifyProtection(.flagged, operationCompleted: false)
+    }
+
+    @Test("completed markFlagged protects flagged but applies unrelated remote read")
+    func completedFlaggedDoesNotSuppressRemoteRead() async throws {
+        try await verifyProtection(.flagged, operationCompleted: true)
     }
 }
 
@@ -366,7 +1972,9 @@ struct PendingCalendarOperationGRDBTests {
     @Test("Insert and fetch by status")
     func insertAndFetchByStatus() throws {
         let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
+        try TestDatabase.insertAccount(
+            db, id: "acc1", email: "calendar@example.com", provider: .gmail
+        )
 
         let op = PendingCalendarOperation(
             operationType: .create,
@@ -383,6 +1991,7 @@ struct PendingCalendarOperationGRDBTests {
                 .fetchAll(dbConn)
         }
         #expect(queued.count == 1)
+        guard queued.count == 1 else { return }
         #expect(queued[0].id == op.id)
         #expect(queued[0].operationType == CalendarOperationType.create.rawValue)
         #expect(queued[0].eventId == "evt-1")
@@ -400,7 +2009,9 @@ struct PendingCalendarOperationGRDBTests {
     @Test("Status transitions: pending → inFlight → completed (deleted)")
     func statusTransitions() throws {
         let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
+        try TestDatabase.insertAccount(
+            db, id: "acc1", email: "calendar@example.com", provider: .gmail
+        )
 
         let op = PendingCalendarOperation(
             operationType: .edit,
@@ -439,7 +2050,9 @@ struct PendingCalendarOperationGRDBTests {
     @Test("Retry count increment on failure")
     func retryCountIncrement() throws {
         let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
+        try TestDatabase.insertAccount(
+            db, id: "acc1", email: "calendar@example.com", provider: .gmail
+        )
 
         let op = PendingCalendarOperation(
             operationType: .delete,
@@ -497,8 +2110,12 @@ struct PendingCalendarOperationGRDBTests {
     @Test("Filter by accountId")
     func filterByAccountId() throws {
         let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "user1@gmail.com", provider: .gmail)
-        try TestDatabase.insertAccount(db, id: "acc2", email: "user2@gmail.com", provider: .gmail)
+        try TestDatabase.insertAccount(
+            db, id: "acc1", email: "calendar-one@example.com", provider: .gmail
+        )
+        try TestDatabase.insertAccount(
+            db, id: "acc2", email: "calendar-two@example.com", provider: .gmail
+        )
 
         let op1 = PendingCalendarOperation(
             operationType: .create,
@@ -540,7 +2157,9 @@ struct PendingCalendarOperationGRDBTests {
     @Test("Cascade delete with account")
     func cascadeDeleteWithAccount() throws {
         let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc-del", email: "delete-me@gmail.com", provider: .gmail)
+        try TestDatabase.insertAccount(
+            db, id: "acc-del", email: "delete-me@example.com", provider: .gmail
+        )
 
         let op = PendingCalendarOperation(
             operationType: .create,
@@ -564,332 +2183,5 @@ struct PendingCalendarOperationGRDBTests {
             try PendingCalendarOperation.filter(Column("accountId") == "acc-del").fetchCount(dbConn)
         }
         #expect(afterDelete == 0)
-    }
-}
-
-// MARK: - Suite 4: Backfill Window Calculation
-
-@Suite("Backfill Window Calculation")
-struct BackfillWindowCalculationTests {
-
-    /// UTC midnight calendar used by backfill for date alignment.
-    private static var utcCalendar: Calendar {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        return cal
-    }
-
-    @Test("Window boundaries align to UTC midnight")
-    func windowBoundariesAlignToUTCMidnight() {
-        let cal = Self.utcCalendar
-
-        // Given an arbitrary date/time
-        let arbitrary = Date(timeIntervalSince1970: 1700055555) // 2023-11-15 15:25:55 UTC
-
-        // Align to start of day (UTC midnight)
-        let startOfDay = cal.startOfDay(for: arbitrary)
-        let components = cal.dateComponents([.hour, .minute, .second], from: startOfDay)
-
-        #expect(components.hour == 0)
-        #expect(components.minute == 0)
-        #expect(components.second == 0)
-
-        // Verify it's still the same day
-        let dayComponents = cal.dateComponents([.year, .month, .day], from: startOfDay)
-        let origDayComponents = cal.dateComponents([.year, .month, .day], from: arbitrary)
-        #expect(dayComponents.year == origDayComponents.year)
-        #expect(dayComponents.month == origDayComponents.month)
-        #expect(dayComponents.day == origDayComponents.day)
-    }
-
-    @Test("1-day overlap between consecutive windows")
-    func oneDayOverlapBetweenWindows() {
-        let cal = Self.utcCalendar
-
-        // Simulate two consecutive 30-day backfill windows
-        let windowEnd = cal.startOfDay(for: Date(timeIntervalSince1970: 1700000000)) // 2023-11-14 UTC
-        let windowDays = 30
-        let windowStart = cal.date(byAdding: .day, value: -windowDays, to: windowEnd)!
-
-        // Next window: ends at previous windowStart, with 1-day overlap
-        let nextWindowEnd = windowStart
-        let overlapDays = 1
-        let searchSince = cal.date(byAdding: .day, value: -overlapDays, to: nextWindowEnd)!
-
-        // searchSince should be 1 day before the next window's end
-        let diff = cal.dateComponents([.day], from: searchSince, to: nextWindowEnd)
-        #expect(diff.day == overlapDays)
-
-        // The overlap region is: [searchSince, nextWindowEnd) = 1 day
-        // This ensures boundary messages are not missed
-        let overlapSeconds = nextWindowEnd.timeIntervalSince(searchSince)
-        #expect(overlapSeconds == Double(overlapDays * 86400))
-    }
-
-    @Test("backfillUidCursor tracks progress")
-    func backfillUidCursorTracksProgress() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@imap.com", provider: .imap)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Initially nil
-        #expect(folder.backfillUidCursor == nil)
-
-        // After fetching a batch, update cursor to lowest UID fetched
-        try db.write { dbConn in
-            _ = try Folder.filter(Column("id") == folder.id)
-                .updateAll(dbConn, Column("backfillUidCursor").set(to: 500))
-        }
-
-        let afterFirst = try db.read { dbConn in
-            try Folder.fetchOne(dbConn, key: folder.id)
-        }
-        #expect(afterFirst?.backfillUidCursor == 500)
-
-        // After next batch, cursor moves further back
-        try db.write { dbConn in
-            _ = try Folder.filter(Column("id") == folder.id)
-                .updateAll(dbConn, Column("backfillUidCursor").set(to: 200))
-        }
-
-        let afterSecond = try db.read { dbConn in
-            try Folder.fetchOne(dbConn, key: folder.id)
-        }
-        #expect(afterSecond?.backfillUidCursor == 200)
-    }
-
-    @Test("backfillComplete flag set after final window")
-    func backfillCompleteFlagSetAfterFinalWindow() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@imap.com", provider: .imap)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Initially false
-        #expect(folder.backfillComplete == false)
-
-        // After all windows are processed, mark complete
-        try db.write { dbConn in
-            _ = try Folder.filter(Column("id") == folder.id)
-                .updateAll(dbConn, Column("backfillComplete").set(to: true))
-        }
-
-        let completed = try db.read { dbConn in
-            try Folder.fetchOne(dbConn, key: folder.id)
-        }
-        #expect(completed?.backfillComplete == true)
-
-        // Verify that resetting backfillComplete works (e.g. via Smart Reindex)
-        try db.write { dbConn in
-            _ = try Folder.filter(Column("id") == folder.id)
-                .updateAll(dbConn, Column("backfillComplete").set(to: false))
-        }
-
-        let reset = try db.read { dbConn in
-            try Folder.fetchOne(dbConn, key: folder.id)
-        }
-        #expect(reset?.backfillComplete == false)
-    }
-}
-
-// MARK: - Suite: Unread Recount Timing
-
-@Suite("Delta Sync — Unread Recount After Header Mutations")
-struct DeltaSyncUnreadRecountTests {
-
-    @Test("Unread count is recountable immediately after header insert (before FTS/body)")
-    func recountableImmediatelyAfterInsert() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Simulate delta sync: headers are written in a write transaction
-        try db.write { dbConn in
-            for i in 0..<5 {
-                var header = MessageHeader(
-                    messageId: "msg\(i)",
-                    subject: "Subject \(i)",
-                    from: "sender@test.com",
-                    fromAddress: "sender@test.com",
-                    to: "test@gmail.com",
-                    date: Date(),
-                    snippet: "Snippet \(i)",
-                    folderId: folder.id,
-                    accountId: "acc1",
-                    folderPath: "INBOX",
-                    isInInbox: true
-                )
-                header.isRead = (i < 2) // 2 read, 3 unread
-                try header.insert(dbConn)
-            }
-        }
-
-        // Immediately after the write transaction — BEFORE any FTS or body fetch —
-        // the unread count should be available via the same grouped COUNT query
-        // that UnreadCountManager.performRecount uses.
-        let folderIds = [folder.id]
-        let recountResult = try db.read { dbConn -> [String: Int] in
-            let placeholders = folderIds.map { _ in "?" }.joined(separator: ", ")
-            let sql = """
-                SELECT folderId, COUNT(*) as cnt
-                FROM messageHeader
-                WHERE folderId IN (\(placeholders)) AND isRead = 0
-                GROUP BY folderId
-                """
-            let rows = try Row.fetchAll(dbConn, sql: sql, arguments: StatementArguments(folderIds))
-            var counts: [String: Int] = [:]
-            for row in rows {
-                let fid: String = row["folderId"]
-                let cnt: Int = row["cnt"]
-                counts[fid] = cnt
-            }
-            return counts
-        }
-
-        #expect(recountResult[folder.id] == 3, "Unread count should be correct right after header insert")
-
-        // Apply to folder (what performRecount does)
-        try db.write { dbConn in
-            try dbConn.execute(
-                sql: "UPDATE folder SET unreadCount = ? WHERE id = ?",
-                arguments: [recountResult[folder.id] ?? 0, folder.id]
-            )
-        }
-        let updatedFolder = try db.read { try Folder.fetchOne($0, key: folder.id) }
-        #expect(updatedFolder?.unreadCount == 3)
-    }
-
-    @Test("Unread count is recountable after flag-only delta (no new headers)")
-    func recountableAfterFlagOnlyDelta() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Pre-existing messages — 3 unread
-        for i in 0..<3 {
-            try TestDatabase.insertMessageHeader(db, messageId: "msg\(i)", folderId: folder.id, accountId: "acc1", isRead: false)
-        }
-
-        // Simulate delta flag change: mark msg0 as read (no new headers)
-        try db.write {
-            try $0.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE messageId = 'msg0'")
-        }
-
-        // Recount should reflect the flag change
-        let count = try db.read {
-            try MessageHeader.filter(
-                Column("folderId") == folder.id && Column("isRead") == false
-            ).fetchCount($0)
-        }
-        #expect(count == 2, "Recount must reflect flag-only changes (no new/deleted headers)")
-    }
-
-    @Test("Unread count is recountable after deletion-only delta (no new headers)")
-    func recountableAfterDeletionOnlyDelta() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Pre-existing: 4 unread messages
-        for i in 0..<4 {
-            try TestDatabase.insertMessageHeader(db, messageId: "msg\(i)", folderId: folder.id, accountId: "acc1", isRead: false)
-        }
-
-        // Simulate delta deletion: remove msg0 and msg1
-        try db.write {
-            try MessageHeader.filter(Column("messageId") == "msg0").deleteAll($0)
-            try MessageHeader.filter(Column("messageId") == "msg1").deleteAll($0)
-        }
-
-        // Recount should reflect deletions
-        let count = try db.read {
-            try MessageHeader.filter(
-                Column("folderId") == folder.id && Column("isRead") == false
-            ).fetchCount($0)
-        }
-        #expect(count == 2, "Recount must reflect deletion-only changes (no new headers)")
-    }
-
-    @Test("runSyncMessages flag-only update produces empty newHeaders — recount still needed")
-    func flagOnlyUpdateEmptyNewHeaders() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Pre-existing messages: 2 unread
-        try TestDatabase.insertMessageHeader(db, messageId: "msg0", folderId: folder.id, accountId: "acc1", isRead: false)
-        try TestDatabase.insertMessageHeader(db, messageId: "msg1", folderId: folder.id, accountId: "acc1", isRead: false)
-
-        // Simulate what runSyncMessages does when server says msg0 is now read:
-        // Updates existing row (flag change), no new headers inserted, no stale IDs.
-        let newHeaders: [MessageHeader] = []
-        let staleIds: [String] = []
-
-        try db.write { dbConn in
-            if var existing = try MessageHeader
-                .filter(Column("messageId") == "msg0" && Column("folderId") == folder.id)
-                .fetchOne(dbConn) {
-                existing.isRead = true  // Server says read
-                try existing.update(dbConn)
-                // Note: existing message updated — NOT added to newHeaders
-            }
-        }
-
-        // This is the key assertion: newHeaders and staleIds are both empty,
-        // but the unread count has changed. The recount MUST fire unconditionally.
-        #expect(newHeaders.isEmpty, "Flag-only updates don't produce newHeaders")
-        #expect(staleIds.isEmpty, "Flag-only updates don't produce staleIds")
-
-        // Verify recount gives the correct answer
-        let unreadCount = try db.read {
-            try MessageHeader.filter(
-                Column("folderId") == folder.id && Column("isRead") == false
-            ).fetchCount($0)
-        }
-        #expect(unreadCount == 1, "Recount must reflect flag change even with empty newHeaders/staleIds")
-
-        // Apply recount to folder
-        try db.write {
-            try $0.execute(
-                sql: "UPDATE folder SET unreadCount = ? WHERE id = ?",
-                arguments: [unreadCount, folder.id]
-            )
-        }
-        let updatedFolder = try db.read { try Folder.fetchOne($0, key: folder.id) }
-        #expect(updatedFolder?.unreadCount == 1)
-    }
-
-    @Test("Mixed delta: deletes + inserts + flag changes — single recount captures all")
-    func mixedDeltaSingleRecount() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@gmail.com", provider: .gmail)
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Start with 4 unread messages
-        for i in 0..<4 {
-            try TestDatabase.insertMessageHeader(db, messageId: "msg\(i)", folderId: folder.id, accountId: "acc1", isRead: false)
-        }
-
-        // Simulate mixed delta:
-        // 1. Delete msg0 (was unread → -1 unread)
-        try db.write {
-            _ = try MessageHeader.filter(Column("messageId") == "msg0").deleteAll($0)
-        }
-
-        // 2. Mark msg1 as read (flag change → -1 unread)
-        try db.write {
-            try $0.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE messageId = 'msg1'")
-        }
-
-        // 3. Insert new unread message (+1 unread)
-        try TestDatabase.insertMessageHeader(db, messageId: "msg4", folderId: folder.id, accountId: "acc1", isRead: false)
-
-        // Net: 4 - 1(delete) - 1(read) + 1(new) = 3 unread
-        // A single recount AFTER all mutations must capture the combined effect.
-        let unreadCount = try db.read {
-            try MessageHeader.filter(
-                Column("folderId") == folder.id && Column("isRead") == false
-            ).fetchCount($0)
-        }
-        #expect(unreadCount == 3, "Single recount after mixed delta must reflect combined delete+flag+insert")
     }
 }

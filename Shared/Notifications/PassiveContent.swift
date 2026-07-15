@@ -24,4 +24,8 @@ func applyPassiveSettings(
     if let b = overrideBody { c.body = b }
     c.interruptionLevel = .passive
     c.sound = nil
+    c.categoryIdentifier = ""
+    var userInfo = c.userInfo
+    userInfo.removeValue(forKey: EmailNotificationBuilder.actionMessageIdUserInfoKey)
+    c.userInfo = userInfo
 }

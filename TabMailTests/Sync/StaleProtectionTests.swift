@@ -13,7 +13,7 @@ import GRDB
 /// REAL `SyncEngine.runSyncMessages` against an AppDatabase-backed pool + a MockEmailProvider
 /// whose fetch returns nothing (the propagation-lag race). `.serialized` because it swaps
 /// the `AppDatabase.shared` singleton.
-@Suite("Stale-detection drop-race protection", .serialized)
+@Suite("Stale-detection drop-race protection", .serialized, .processGlobalState)
 struct StaleProtectionTests {
 
     /// Real DatabasePool-backed AppDatabase (runs all migrations) swapped into the shared
@@ -34,17 +34,17 @@ struct StaleProtectionTests {
     /// Account + IMAP inbox + one durable "just-arrived" message. Returns (folder, headerId).
     private func seed(_ pool: DatabasePool) throws -> (folder: Folder, headerId: String) {
         try pool.writeWithoutTransaction { db in
-            var acc = Account(emailAddress: "u@ex.com", displayName: "U", provider: .imap)
+            var acc = Account(emailAddress: "user@example.com", displayName: "U", provider: .imap)
             acc.id = "acc1"
             try acc.insert(db)
             let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
             try folder.insert(db)
             var h = MessageHeader(
-                messageId: "500", subject: "New", from: "Alice", fromAddress: "a@ex.com",
-                to: "u@ex.com", date: Date(), snippet: "hi", folderId: "acc1:INBOX",
+                messageId: "500", subject: "New", from: "Alice", fromAddress: "sender@example.com",
+                to: "user@example.com", date: Date(), snippet: "hi", folderId: "acc1:INBOX",
                 accountId: "acc1", folderPath: "INBOX", isInInbox: true
             )
-            h.rfc822MessageId = "<new-500@ex.com>"
+            h.rfc822MessageId = "<new-500@example.com>"
             h.headerComplete = true
             try h.insert(db)
         }
@@ -66,10 +66,17 @@ struct StaleProtectionTests {
         defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
         let (folder, headerId) = try seed(pool)
 
-        // Exactly what the merge registers: provider messageId + normalized rfc822.
+        // Exactly what the merge registers: account/folder-qualified push
+        // provenance for both provider transport ID and normalized RFC ID.
         let recent: [String: Date] = [
-            "500": Date(),
-            EmailFilter.normalizeMessageId("<new-500@ex.com>"): Date()
+            MessageIdentity.recentlyCompletedPushKey(
+                accountId: "acc1", folderPath: "INBOX", messageId: "500"
+            ): Date(),
+            MessageIdentity.recentlyCompletedPushKey(
+                accountId: "acc1",
+                folderPath: "INBOX",
+                messageId: EmailFilter.normalizeMessageId("<new-500@example.com>")
+            ): Date(),
         ]
         let result = try await SyncEngine.runSyncMessages(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,

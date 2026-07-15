@@ -103,6 +103,11 @@ private actor MockQueue {
 
     func repopulateFromDatabase() async {
         await log.record("repopulate_\(name)")
+        // `cancelAllInFlight` makes the old workload idle, but repopulating a queue that
+        // was configured with pending checks represents new durable work discovered in DB.
+        if checksRemaining > 0 {
+            _idle = false
+        }
         repopulated = true
     }
 
@@ -600,9 +605,10 @@ struct SyncStartupDrainBudgetTests {
         #expect(hasStart, "Drain loop must start with 5s budget")
         #expect(!hasSkipped, "Drain must not be skipped with 5s budget")
         // With queues permanently busy, drain must poll until deadline
-        if hasPoll {
-            #expect(hasDeadline, "Should exit at deadline after polling")
-        }
+        #expect(hasPoll, "Permanently busy queues must be polled")
+        #expect(hasDeadline, "Should exit at deadline after polling")
+        #expect(elapsed >= budgetSeconds, "Busy drain returned before its deadline: \(elapsed)s")
+        #expect(elapsed < budgetSeconds + 1.0, "Busy drain exceeded its deadline allowance: \(elapsed)s")
     }
 
     @Test("Budget with sync slower than budget — drain still runs full budget")
@@ -857,6 +863,8 @@ struct SyncStartupCancellationTests {
         // The drain loop checks Task.isCancelled and will exit
         let events = await log.events
         let hasBudgetDone = events.contains("drain_budget_done")
+        #expect(hasCancelled, "Drain loop must observe task cancellation")
+        #expect(!events.contains("drain_check_deadline"), "Cancellation must exit before the deadline")
         #expect(hasBudgetDone, "Should still complete budget drain flow after cancellation")
     }
 

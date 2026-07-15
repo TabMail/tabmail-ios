@@ -9,7 +9,7 @@ import GRDB
 
 // MARK: - Suite 1: Real indexHeadersForFTS Sets headerComplete
 
-@Suite("Integration Pipeline - FTS Header Indexing", .serialized)
+@Suite("Integration Pipeline - FTS Header Indexing", .serialized, .processGlobalState)
 struct FTSHeaderIndexingIntegrationTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -79,7 +79,11 @@ struct FTSHeaderIndexingIntegrationTests {
 
 // MARK: - Suite 2: Real recoverIncompleteHeaders
 
-@Suite("Integration Pipeline - Recover Incomplete Headers", .serialized)
+@Suite(
+    "Integration Pipeline - Recover Incomplete Headers",
+    .serialized,
+    .processGlobalState
+)
 struct RecoverIncompleteHeadersIntegrationTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -162,7 +166,7 @@ struct RecoverIncompleteHeadersIntegrationTests {
 
 // MARK: - Suite 3: flushBatch with Mixed FTS State
 
-@Suite("Integration Pipeline - FlushBatch Mixed FTS", .serialized)
+@Suite("Integration Pipeline - FlushBatch Mixed FTS", .serialized, .processGlobalState)
 struct FlushBatchMixedFTSTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -250,7 +254,7 @@ struct FlushBatchMixedFTSTests {
 
 // MARK: - Suite 4: End-to-End Pipeline
 
-@Suite("Integration Pipeline - End-to-End", .serialized)
+@Suite("Integration Pipeline - End-to-End", .serialized, .processGlobalState)
 struct EndToEndPipelineTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -353,12 +357,12 @@ struct EndToEndPipelineTests {
     }
 }
 
-// MARK: - Suite 5: Migration v38-v40 Index Verification
+// MARK: - Suite 5: Current Migration Index Verification
 
 @Suite("Integration Pipeline - Migration Index Verification")
 struct MigrationIndexVerificationTests {
 
-    @Test("Migrations v38-v40 create all expected indexes on messageHeader")
+    @Test("Current migrations create all expected indexes on messageHeader")
     func migrationIndexesExist() throws {
         let db = try TestDatabase.make()
 
@@ -383,11 +387,15 @@ struct MigrationIndexVerificationTests {
         #expect(indexNames.contains("messageHeader_embeddingIncomplete"),
                 "v50 embeddingIncomplete partial index should exist (supersedes v38 embeddingStatus). Found: \(indexNames)")
 
-        // v39 restored indexes
+        // v39 restored the simple folderId index. v70 later removes the
+        // two-column unread index because v62's date-suffixed composite has
+        // the same leading keys and also serves the ordered unread list.
         #expect(indexNames.contains("messageHeader_folderId"),
                 "v39 restored folderId index should exist. Found: \(indexNames)")
-        #expect(indexNames.contains("messageHeader_folderId_isRead"),
-                "v39 restored folderId_isRead index should exist. Found: \(indexNames)")
+        #expect(indexNames.contains("messageHeader_folderId_isRead_date"),
+                "v62 folderId_isRead_date replacement index should exist. Found: \(indexNames)")
+        #expect(!indexNames.contains("messageHeader_folderId_isRead"),
+                "v70 should remove the redundant v39 folderId_isRead index. Found: \(indexNames)")
 
         // v40 indexes
         #expect(indexNames.contains("messageHeader_messageId_accountId"),
@@ -459,19 +467,20 @@ struct MigrationIndexVerificationTests {
         #expect(columns[0] == "folderId")
     }
 
-    @Test("v39 folderId_isRead index is (folderId, isRead)")
-    func folderIdIsReadIndex() throws {
+    @Test("v70 unread replacement index is (folderId, isRead, date)")
+    func folderIdIsReadDateIndex() throws {
         let db = try TestDatabase.make()
 
         let columns: [String] = try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: "PRAGMA index_info(messageHeader_folderId_isRead)")
+            try Row.fetchAll(dbConn, sql: "PRAGMA index_info(messageHeader_folderId_isRead_date)")
                 .sorted { ($0["seqno"] as Int) < ($1["seqno"] as Int) }
                 .map { $0["name"] as String }
         }
 
-        #expect(columns.count == 2, "folderId_isRead index should have 2 columns. Got: \(columns)")
-        guard columns.count == 2 else { return }
+        #expect(columns.count == 3, "folderId_isRead_date index should have 3 columns. Got: \(columns)")
+        guard columns.count == 3 else { return }
         #expect(columns[0] == "folderId")
         #expect(columns[1] == "isRead")
+        #expect(columns[2] == "date")
     }
 }

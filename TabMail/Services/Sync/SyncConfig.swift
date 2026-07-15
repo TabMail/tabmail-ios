@@ -240,23 +240,19 @@ enum SyncConfig {
     /// Failed items move to back of FIFO, yielding to others. After max retries,
     /// item is removed from in-memory queue; repopulateFromDatabase catches it on next foreground.
     static let maxQueueRetries = 3
-    /// Max retries for a non-move, non-tag `PendingOperation` that hits
-    /// `ProviderError.uidResolutionFailed` (IMAP SEARCH-by-Message-ID miss) before
-    /// confirming it stale and dropping it. `IMAPProvider.resolveUID`'s documented
-    /// contract (IMAPProvider.swift) is that a SEARCH miss "likely" means the message
-    /// exists but SEARCH couldn't find it — a transient signal (server-side indexing
-    /// lag, concurrent UID renumbering), not a confirmed absence. Move ops get a
-    /// stronger signal (destination-folder existence check) so they don't need this
-    /// cap. Tag ops (.setTag/.removeTag) are local-only (ADR-IOS-036) and keep their
-    /// immediate best-effort drop regardless of this cap.
-    ///
-    /// This is a genuinely DEDICATED budget: tracked via
-    /// `PendingOperation.uidResolutionRetryCount`, a counter separate from the
-    /// generic `retryCount` (bumped by the transient connection-error branch on
-    /// every ordinary blip). Reading the shared `retryCount` here would let
-    /// unrelated blips pre-exhaust this cap before the op's first real SEARCH
-    /// miss — a v66-era bug fixed by the v67 migration.
-    static let maxUidResolutionRetries = 3
+    /// Intention fold (ADR-IOS-058): delay before re-running a fold whose
+    /// header resolve failed with a genuine DB READ ERROR (not a vanished
+    /// row). The retry loop is unbounded by design — dropping records on a
+    /// read failure would discard user intention — but paced to one resolve
+    /// attempt per interval; reachability is narrow (WAL reads don't abort
+    /// under suspension).
+    static let intentionResolveRetryDelaySeconds: TimeInterval = 1.0
+    /// Journal-aware background flush (ADR-IOS-058 round-9): pause between
+    /// FIFO-barrier round-trips while the intention journal is still
+    /// non-drained — paces the drain loop across the read-error retry window
+    /// above instead of spinning; the flush's racing timeout remains the
+    /// sole hard bound.
+    static let backgroundFlushDrainPollSeconds: TimeInterval = 0.05
     /// FTS orphan prune (one-time sweep): entries paged per FTS read.
     static let ftsOrphanPruneChunk = 500
     /// FTS orphan prune: delay before re-verifying candidates against GRDB —
@@ -339,6 +335,9 @@ enum SyncConfig {
     /// Reply cache TTL — precomputed replies older than this are regenerated (seconds).
     /// Matches TB's SETTINGS.replyTTLSeconds in config.js.
     static let replyTTLSeconds: TimeInterval = 604_800 // 1 week
+    /// Age before an out-of-inbox action tag is reclaimed by sweepStaleActionTags.
+    /// Matches TB's SETTINGS.actionTTLSeconds (1 week). Inbox tags are never swept.
+    static let actionTagTTLSeconds: TimeInterval = 604_800
     /// AI cache TTL — MessageAICache entries not refreshed within this period are purged.
     /// Entries are touched during inbox sync; entries for messages that leave inbox expire.
     static let aiCacheTTLDays = 7
@@ -446,6 +445,12 @@ enum SyncConfig {
     /// milliseconds each, and iOS grants ~30s total for the bracket. On
     /// timeout the checkpoint proceeds anyway; the un-drained tail closures
     /// still run later (never dropped), they just miss this fsync window.
+    /// CONSTRAINT (ADR-IOS-058 rounds 8-9): the drain is JOURNAL-aware and
+    /// must ride THROUGH the `intentionResolveRetryDelaySeconds` (~1s)
+    /// read-error retry window — this timeout must comfortably dominate that
+    /// cadence or a gesture parked in the retry window misses the fsync.
+    /// Pinned by WriteQueueFlushTests' relationship assert; do not lower
+    /// below ~2x the retry delay.
     static let backgroundWriteQueueFlushTimeoutSeconds: Double = 10
 
     /// Max headers per `insertBackfillBatch` write TRANSACTION. The backfill walk

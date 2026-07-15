@@ -278,10 +278,12 @@ final class SyncScheduler {
             stepLog("step1 cancelAllInFlight SKIPPED (verified continuous-foreground)")
         }
 
-        // 2. Recover incomplete headers (headerComplete=0 → FTS index → set flag).
-        // Kept on the critical path: crash-recovery for rows GRDB has but FTS doesn't.
+        // 2. Finish durable ordinary-sync re-key FTS id changes first, then recover any
+        // incomplete headers (headerComplete=0 → FTS index → set flag). Both stay on
+        // the critical path: they are crash recovery for GRDB/FTS two-phase writes.
+        await manager.syncEngine.recoverPendingFTSRekeys()
         await manager.syncEngine.recoverIncompleteHeaders()
-        stepLog("step2 recoverIncompleteHeaders")
+        stepLog("step2 recoverPendingFTSRekeys + recoverIncompleteHeaders")
         BootProfiler.mark("syncStartup: recoverIncompleteHeaders done (critical-path scan)")
 
         // 3. Repopulate queues — detached so sync starts immediately.
@@ -459,7 +461,9 @@ final class SyncScheduler {
             // the foreground poll runs this same WAL pass too; both converge here. Runs
             // off-main and abandons on suspend at each step.
             if !Task.isCancelled {
-                let undoIds = Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
+                let undoIds = Set(UndoService.shared.undoStack.flatMap { action in
+                    action.commands.flatMap { $0.members.map(\.originalHeaderId) }
+                })
                 await Task.detached(priority: .utility) {
                     SyncEngine.runWALMaintenance(
                         dbPool: AppDatabase.dbPool, includePrune: true,

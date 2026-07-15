@@ -39,7 +39,7 @@ import Synchronization
 /// `NSEMergeStageMemoTests`/`NSEGradualMergeTests`. Static globals
 /// (`stageMemo`, `latestStagedRows`, `latestStagedBodies`) are process-wide —
 /// reset them at the start of every test.
-@Suite("NSE merge — stale-by-move staged row invalidation", .serialized)
+@Suite("NSE merge — stale-by-move staged row invalidation", .serialized, .processGlobalState)
 @MainActor
 struct NSEStaleStagedRowInvalidationTests {
 

@@ -271,7 +271,7 @@ struct FolderSyncDeletionEdgeCaseTests {
 
         // Delete all acc1 folders
         try db.write { dbConn in
-            try Folder.filter(Column("accountId") == "acc1").deleteAll(dbConn)
+            _ = try Folder.filter(Column("accountId") == "acc1").deleteAll(dbConn)
         }
 
         let acc1Folders = try db.read { try Folder.filter(Column("accountId") == "acc1").fetchAll($0) }
@@ -294,7 +294,7 @@ struct FolderSyncDeletionEdgeCaseTests {
 
         // Delete the folder
         try db.write { dbConn in
-            try Folder.filter(Column("id") == "acc1:Projects").deleteAll(dbConn)
+            _ = try Folder.filter(Column("id") == "acc1:Projects").deleteAll(dbConn)
         }
 
         // Verify deleted
@@ -612,4 +612,3 @@ struct FolderSyncProviderFlowTests {
         #expect(sentFolder != nil)
     }
 }
-

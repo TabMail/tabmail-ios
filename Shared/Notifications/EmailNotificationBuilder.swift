@@ -25,6 +25,17 @@ import UserNotifications
 /// existing notification.
 enum EmailNotificationBuilder {
 
+    /// Provider message IDs are transport/deep-link identifiers. Notification
+    /// actions use only this normalized RFC Message-ID field.
+    static let actionMessageIdUserInfoKey = "rfc822MessageId"
+
+    /// Normalize the action identity at the notification boundary. Newlines
+    /// are never valid inside a Message-ID and must not survive into a durable
+    /// action payload.
+    static func normalizedActionMessageId(_ raw: String?) -> String? {
+        MessageIdentity.durableActionRFC822MessageId(raw)
+    }
+
     /// Bundle of facts about a newly-arrived email that feed the importance
     /// gate AND the notification layout. Kept as one struct so future signals
     /// (reminder + action combined, sender allow-lists, subject keywords,
@@ -158,15 +169,27 @@ enum EmailNotificationBuilder {
         _ c: UNMutableNotificationContent,
         signal s: Signal,
         accountId: String,
-        messageId: String
+        messageId: String,
+        rfc822MessageId: String?
     ) -> Bool {
         c.title = s.senderName.isEmpty ? "New email" : "New email - \(s.senderName)"
         c.subtitle = s.subject
-        c.categoryIdentifier = categoryIdentifier(forActionTag: s.actionTag)
         c.threadIdentifier = accountId
         var info = c.userInfo
+        // `messageId` remains the momentary provider identifier used to open
+        // or fetch the notification's message. It must never be interpreted as
+        // the durable action identity.
         info["messageId"] = messageId
         info["accountId"] = accountId
+        if let actionMessageId = normalizedActionMessageId(rfc822MessageId) {
+            info[actionMessageIdUserInfoKey] = actionMessageId
+            c.categoryIdentifier = categoryIdentifier(forActionTag: s.actionTag)
+        } else {
+            // No durable provider-neutral identity means no action buttons.
+            // The notification itself remains visible and deep-linkable.
+            info.removeValue(forKey: actionMessageIdUserInfoKey)
+            c.categoryIdentifier = ""
+        }
         c.userInfo = info
 
         if let rc = s.reminderContent, !rc.isEmpty {

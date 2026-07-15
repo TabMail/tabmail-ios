@@ -215,34 +215,6 @@ struct MergeIdempotenceTests {
         #expect(row?["htmlContent"] == "<p>rendered NSE body</p>")
     }
 
-    @Test("setTag pendingOperation is deduped by deterministic id — no dupes on merge retry")
-    func pendingOpDedup() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "u@ex.com")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Simulate merge inserting setTag pendingOp twice (e.g. crash between
-        // merge-write and staging-row-delete → merge re-runs).
-        let detId = "setTag:acc1:msg100:reply"
-        let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: ["msg100"]))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        for _ in 0..<2 {
-            try db.write { db in
-                // try? because second insert is expected to violate PK UNIQUE.
-                try? db.execute(sql: """
-                    INSERT INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, tagValue, createdAt, status, retryCount)
-                    VALUES (?, 'setTag', ?, ?, 'INBOX', ?, ?, 'queued', 0)
-                    """, arguments: [detId, messageIdsJSON, "acc1", "reply", Date()])
-            }
-        }
-
-        let count: Int = try db.read {
-            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM pendingOperation WHERE id = ?",
-                             arguments: [detId])!
-        }
-        #expect(count == 1, "Deterministic id must dedup — one op, not two")
-    }
-
     @Test("Sync-arrives-after-NSE: header already exists, body not re-fetched")
     func syncAfterNSEIsNoOp() throws {
         let db = try TestDatabase.make()

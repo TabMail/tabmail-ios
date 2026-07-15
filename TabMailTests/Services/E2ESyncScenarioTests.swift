@@ -63,7 +63,6 @@ private func simulateRunSyncMessages(
     folder: Folder,
     messages: [MessageHeaderInfo],
     limit: Int,
-    undoProtectedIds: Set<String> = [],
     windowMode: StaleWindowMode = .date
 ) throws -> (newHeaders: [MessageHeader], staleIds: [String]) {
     let folderPath = folder.path
@@ -72,32 +71,6 @@ private func simulateRunSyncMessages(
     let isInInbox = folder.role == .inbox
 
     return try db.write { dbConn in
-        // Load pending operations
-        let pendingOps = try PendingOperation.fetchAll(dbConn)
-        let opsForThisFolder = pendingOps.filter { $0.accountId == accountId && $0.folderPath == folderPath }
-        let pendingDestructiveIds = Set(
-            opsForThisFolder
-                .filter { [.archive, .delete, .move].contains($0.type) }
-                .flatMap(\.messageIds)
-        )
-        let pendingFlagIds = Set(
-            opsForThisFolder
-                .filter { [.markRead, .markUnread, .markFlagged, .markUnflagged, .setTag, .removeTag].contains($0.type) }
-                .flatMap(\.messageIds)
-        )
-        let isPendingDestructive: (MessageHeaderInfo) -> Bool = { info in
-            pendingDestructiveIds.contains(info.messageId) ||
-            (info.rfc822MessageId.map { pendingDestructiveIds.contains($0) } ?? false)
-        }
-        let isPendingFlag: (MessageHeaderInfo) -> Bool = { info in
-            pendingFlagIds.contains(info.messageId) ||
-            (info.rfc822MessageId.map { pendingFlagIds.contains($0) } ?? false)
-        }
-        let opsTargetingThisFolder = pendingOps.filter {
-            $0.accountId == accountId && ($0.folderPath == folderPath || $0.destinationPath == folderPath)
-        }
-        let pendingAllIds = Set(opsTargetingThisFolder.flatMap(\.messageIds))
-
         var newHeaders: [MessageHeader] = []
         var staleIds: [String] = []
 
@@ -108,30 +81,22 @@ private func simulateRunSyncMessages(
         let stale = SyncEngine.selectStaleHeaders(
             candidates: allLocal, fetched: messages, limit: limit, windowMode: windowMode)
 
-        let protectedIds = pendingAllIds.union(undoProtectedIds)
-        let isProtected: (MessageHeader) -> Bool = { msg in
-            protectedIds.contains(msg.messageId) ||
-            (msg.rfc822MessageId.map { protectedIds.contains($0) } ?? false)
-        }
-        let staleFiltered = stale.filter { !isProtected($0) }
+        let staleFiltered = stale
         staleIds = staleFiltered.map(\.id)
         for msg in staleFiltered {
             try msg.delete(dbConn)
         }
 
         // Upsert
-        for info in messages where !isPendingDestructive(info) {
+        for info in messages {
             if var existing = try MessageHeader
                 .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
                 .fetchOne(dbConn) {
-                let hasPendingFlags = isPendingFlag(info)
-                if !hasPendingFlags {
-                    existing.isRead = info.isRead
-                    existing.isFlagged = info.isFlagged
-                    if isInInbox, let serverTag = info.actionTag {
-                        existing.actionTag = serverTag
-                        existing.tagSortOrder = serverTag.sortOrder
-                    }
+                existing.isRead = info.isRead
+                existing.isFlagged = info.isFlagged
+                if isInInbox, let serverTag = info.actionTag {
+                    existing.actionTag = serverTag
+                    existing.tagSortOrder = serverTag.sortOrder
                 }
                 existing.date = info.date
                 existing.from = info.from
@@ -355,50 +320,6 @@ struct E2ESyncErrorRecoveryTests {
         #expect(!bodyExists)
     }
 
-    @Test("Provider throws during move — PendingOperation stays in queue for retry")
-    func providerThrowsMoveOperationStaysForRetry() async throws {
-        let db = try TestDatabase.make()
-        let provider = MockEmailProvider()
-
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@example.com")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
-        try TestDatabase.insertMessageHeader(db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX")
-
-        // Insert PendingOperation for move
-        let op = PendingOperation(
-            type: .archive,
-            messageIds: ["100"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            destinationPath: "Archive"
-        )
-        let opId = op.id
-        try await db.write { try op.insert($0) }
-
-        // Provider throws on move
-        await provider.setMoveThrows(TestSyncError("connection lost"))
-
-        do {
-            try await provider.move(ids: ["100"], from: "INBOX", to: "Archive")
-            Issue.record("Expected move to throw")
-        } catch {
-            // Simulate drain failure: increment retryCount
-            try await db.write { dbConn in
-                if var pendingOp = try PendingOperation.fetchOne(dbConn, key: opId) {
-                    pendingOp.retryCount += 1
-                    try pendingOp.update(dbConn)
-                }
-            }
-        }
-
-        // PendingOperation still in queue with incremented retryCount
-        let pendingOp = try await db.read { try PendingOperation.fetchOne($0, key: opId) }
-        #expect(pendingOp != nil)
-        #expect(pendingOp?.retryCount == 1)
-        #expect(pendingOp?.status == PendingStatus.queued.rawValue)
-    }
-
     @Test("Provider throws during send — OutboxMessage marked for retry")
     func providerThrowsSendOutboxMarkedForRetry() async throws {
         let db = try TestDatabase.make()
@@ -449,7 +370,7 @@ struct E2ESyncErrorRecoveryTests {
 @Suite("E2E Sync — Optimistic UI Flow")
 struct E2ESyncOptimisticUITests {
 
-    @Test("Archive flow: optimistic move + PendingOperation + provider call + cleanup")
+    @Test("Archive flow leaves the message in Archive and dispatches the provider move")
     func archiveOptimisticFlow() async throws {
         let db = try TestDatabase.make()
         let provider = MockEmailProvider()
@@ -480,33 +401,14 @@ struct E2ESyncOptimisticUITests {
             try archived.insert(dbConn)
         }
 
-        // 2. Queue PendingOperation
-        let op = PendingOperation(
-            type: .archive,
-            messageIds: ["100"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            destinationPath: "Archive"
-        )
-        let opId = op.id
-        try await db.write { try op.insert($0) }
-
         // 3. Drain: execute provider call
         try await provider.move(ids: ["100"], from: "INBOX", to: "Archive")
 
-        // Delete PendingOperation on success
-        try await db.write { dbConn in
-            _ = try PendingOperation.deleteOne(dbConn, key: opId)
-        }
-
-        // 4. Verify
+        // Verify final local and provider-observable state.
         let inboxCount = try await db.read { try MessageHeader.filter(Column("folderId") == "acc1:INBOX").fetchCount($0) }
         let archiveCount = try await db.read { try MessageHeader.filter(Column("folderId") == "acc1:Archive").fetchCount($0) }
-        let pendingCount = try await db.read { try PendingOperation.fetchCount($0) }
-
         #expect(inboxCount == 0)
         #expect(archiveCount == 1)
-        #expect(pendingCount == 0)
 
         // Verify provider was called correctly
         let moved = await provider.movedIds
@@ -516,7 +418,7 @@ struct E2ESyncOptimisticUITests {
         #expect(moved[0].to == "Archive")
     }
 
-    @Test("Mark read flow: optimistic update + drain + verify provider called")
+    @Test("Mark-read flow leaves the row read and dispatches the provider call")
     func markReadOptimisticFlow() async throws {
         let db = try TestDatabase.make()
         let provider = MockEmailProvider()
@@ -533,26 +435,11 @@ struct E2ESyncOptimisticUITests {
             }
         }
 
-        // 2. Queue PendingOperation
-        let op = PendingOperation(
-            type: .markRead,
-            messageIds: ["100"],
-            accountId: "acc1",
-            folderPath: "INBOX"
-        )
-        let opId = op.id
-        try await db.write { try op.insert($0) }
-
-        // 3. Drain
         try await provider.markRead(ids: ["100"], folder: "INBOX")
-        try await db.write { _ = try PendingOperation.deleteOne($0, key: opId) }
 
-        // 4. Verify
+        // Verify final local and provider-observable state.
         let header = try await db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:100") }
         #expect(header?.isRead == true)
-
-        let pendingCount = try await db.read { try PendingOperation.fetchCount($0) }
-        #expect(pendingCount == 0)
 
         let markedRead = await provider.markedReadIds
         #expect(markedRead.count == 1)
@@ -560,7 +447,7 @@ struct E2ESyncOptimisticUITests {
         #expect(markedRead[0].folder == "INBOX")
     }
 
-    @Test("Flag flow: optimistic + drain + provider call")
+    @Test("Flag flow leaves the row flagged and dispatches the provider call")
     func flagOptimisticFlow() async throws {
         let db = try TestDatabase.make()
         let provider = MockEmailProvider()
@@ -577,21 +464,9 @@ struct E2ESyncOptimisticUITests {
             }
         }
 
-        // 2. Queue
-        let op = PendingOperation(
-            type: .markFlagged,
-            messageIds: ["100"],
-            accountId: "acc1",
-            folderPath: "INBOX"
-        )
-        let opId = op.id
-        try await db.write { try op.insert($0) }
-
-        // 3. Drain
         try await provider.markFlagged(ids: ["100"], flagged: true, folder: "INBOX")
-        try await db.write { _ = try PendingOperation.deleteOne($0, key: opId) }
 
-        // 4. Verify
+        // Verify final local and provider-observable state.
         let header = try await db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:100") }
         #expect(header?.isFlagged == true)
 
@@ -601,64 +476,6 @@ struct E2ESyncOptimisticUITests {
         #expect(flagged[0].flagged == true)
     }
 
-    @Test("Undo archive: restore message to inbox + delete PendingOperation")
-    func undoArchiveRestoreToInbox() async throws {
-        let db = try TestDatabase.make()
-        let provider = MockEmailProvider()
-
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@example.com")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
-
-        // Start with archived message
-        try TestDatabase.insertMessageHeader(db, messageId: "100", subject: "Undone", folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false)
-
-        // 1. Optimistic undo: move back to inbox
-        try await db.write { dbConn in
-            try MessageHeader.filter(Column("id") == "acc1:Archive:100").deleteAll(dbConn)
-            let restored = MessageHeader(
-                messageId: "100",
-                subject: "Undone",
-                from: "sender@example.com",
-                fromAddress: "sender@example.com",
-                to: "recipient@example.com",
-                date: Date(),
-                snippet: "Test snippet",
-                folderId: "acc1:INBOX",
-                accountId: "acc1",
-                folderPath: "INBOX",
-                isInInbox: true
-            )
-            try restored.insert(dbConn)
-        }
-
-        // 2. Queue undo PendingOperation (move back)
-        let op = PendingOperation(
-            type: .move,
-            messageIds: ["100"],
-            accountId: "acc1",
-            folderPath: "Archive",
-            destinationPath: "INBOX"
-        )
-        let opId = op.id
-        try await db.write { try op.insert($0) }
-
-        // 3. Drain
-        try await provider.move(ids: ["100"], from: "Archive", to: "INBOX")
-        try await db.write { _ = try PendingOperation.deleteOne($0, key: opId) }
-
-        // 4. Verify
-        let inboxCount = try await db.read { try MessageHeader.filter(Column("folderId") == "acc1:INBOX").fetchCount($0) }
-        let archiveCount = try await db.read { try MessageHeader.filter(Column("folderId") == "acc1:Archive").fetchCount($0) }
-
-        #expect(inboxCount == 1)
-        #expect(archiveCount == 0)
-
-        let moved = await provider.movedIds
-        #expect(moved.count == 1)
-        #expect(moved[0].from == "Archive")
-        #expect(moved[0].to == "INBOX")
-    }
 }
 
 // MARK: - Suite 4: E2E Sync — Incremental Sync
@@ -754,44 +571,6 @@ struct E2ESyncIncrementalTests {
         #expect(headerAfter?.isFlagged == true)
     }
 
-    @Test("Concurrent sync and user action: pending op protects message from stale removal")
-    func pendingOpProtectsMessageFromStaleRemoval() throws {
-        let db = try TestDatabase.make()
-
-        try TestDatabase.insertAccount(db, id: "acc1", email: "test@example.com")
-        let folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // First sync: 2 messages
-        let firstBatch = [
-            makeHeaderInfo(messageId: "101", subject: "Keep Me"),
-            makeHeaderInfo(messageId: "102", subject: "Archive Me"),
-        ]
-        _ = try simulateRunSyncMessages(db: db, folder: folder, messages: firstBatch, limit: 50)
-
-        // User archives message 102 — PendingOperation exists
-        let op = PendingOperation(
-            type: .archive,
-            messageIds: ["102"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            destinationPath: "Archive"
-        )
-        try db.write { try op.insert($0) }
-
-        // Second sync: server still shows 102 (hasn't processed archive yet)
-        // But what if server no longer shows 102? The pending op protects it.
-        let secondBatch = [
-            makeHeaderInfo(messageId: "101", subject: "Keep Me"),
-            // 102 not returned — normally would be stale
-        ]
-        let result = try simulateRunSyncMessages(db: db, folder: folder, messages: secondBatch, limit: 50)
-
-        // 102 should NOT be removed because of pending destructive op
-        #expect(result.staleIds.isEmpty)
-
-        let count = try db.read { try MessageHeader.filter(Column("folderId") == folder.id).fetchCount($0) }
-        #expect(count == 2)
-    }
 }
 
 // MARK: - Suite 5: E2E Sync — Provider Call Ordering
@@ -1003,4 +782,3 @@ struct ArchiveRewalkHealTests {
         #expect(gmailState.cursor == 999)
     }
 }
-

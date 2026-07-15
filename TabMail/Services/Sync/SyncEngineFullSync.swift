@@ -89,7 +89,14 @@ extension SyncEngine {
             // Remove local folders that no longer exist remotely
             let remotePaths = Set(remoteFolders.map(\.path))
             for folder in localFolders where !remotePaths.contains(folder.path) {
-                // CASCADE handles messageHeader deletion automatically
+                // NOTE (round-33 audit): this used to say "CASCADE handles messageHeader
+                // deletion automatically". That is FALSE — migration v2 made
+                // messageHeader.folderId a plain column with NO foreign key to folder
+                // (see AppDatabase's v2 migration). Deleting the folder row therefore
+                // leaves its headers ORPHANED: they survive, still pointing at a
+                // folderPath that now has no metadata. Downstream code must treat an
+                // unreadable folder role as UNKNOWN rather than assume it is benign —
+                // undo's supersede guard does exactly that.
                 try folder.delete(db)
             }
 
@@ -155,15 +162,6 @@ extension SyncEngine {
 
         print("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
 
-        // Capture actor state — single actor hop
-        let mgr = AccountManager.shared
-        // Snapshot recentlyCompleted — replaces per-folder recentActions. Prune
-        // first: the reads below are presence checks (`!= nil`) that don't consult
-        // per-entry expiry, so an unpruned map would treat expired entries as
-        // still protected forever.
-        await mgr.pruneRecentlyCompleted()
-        let recentlyCompletedSnapshot = await mgr.recentlyCompleted
-
         // Heavy per-folder sync — run off main thread.
         // All network + DB operations (provider.fetchMessages, dbPool.read/write) are
         // thread-safe. Running here avoids dozens of MainActor await-resume hops.
@@ -176,9 +174,12 @@ extension SyncEngine {
             await PriorityGate.shared.yield("sync-fts")
             ReplyParentResolver.postParentNotifications(result.replyDetectIds)
             if !result.ftsRekeys.isEmpty {
-                // In-place FTS re-key (UID remap / remnant canonicalization) —
-                // preserves the indexed body text + embedding under the new id.
-                try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys)
+                // Replay the durable marker instead of issuing a best-effort direct
+                // FTS write. The marker survives process death and clears only after
+                // current searchable metadata passes the GRDB/FTS CAS.
+                await self.recoverPendingFTSRekeys(
+                    headerIds: result.ftsRekeys.map(\.newId)
+                )
             }
             if !result.staleIds.isEmpty {
                 try? await SearchIndex.shared.removeMessages(headerIds: result.staleIds)
@@ -227,7 +228,7 @@ extension SyncEngine {
                 do {
                     let result = try await Self.runSyncMessages(
                         for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
-                        dbPool: pool, recentlyCompleted: recentlyCompletedSnapshot
+                        dbPool: pool
                     )
                     print("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
                     allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
@@ -244,7 +245,7 @@ extension SyncEngine {
                         do {
                             let retryResult = try await Self.runSyncMessages(
                                 for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
-                                dbPool: pool, recentlyCompleted: recentlyCompletedSnapshot
+                                dbPool: pool
                             )
                             allMigratedIds.append(contentsOf: await processSyncResult(retryResult, folder: folder))
                         } catch {
@@ -360,14 +361,9 @@ extension SyncEngine {
         provider: any EmailProvider,
         limit: Int
     ) async throws {
-        let syncMgr = AccountManager.shared
-        // Prune before snapshotting — the reads in runSyncMessages are presence
-        // checks (`!= nil`) that don't consult per-entry expiry.
-        await syncMgr.pruneRecentlyCompleted()
-        let recentlyCompletedSnapshot = await syncMgr.recentlyCompleted
         let result = try await Self.runSyncMessages(
             for: folder, provider: provider, limit: limit,
-            dbPool: dbPool, recentlyCompleted: recentlyCompletedSnapshot
+            dbPool: dbPool
         )
 
         if !result.uidMigratedOldIds.isEmpty {
@@ -384,9 +380,9 @@ extension SyncEngine {
         await UnreadCountManager.shared.requestRecount(folderId: folder.id)
 
         if !result.ftsRekeys.isEmpty {
-            // In-place FTS re-key (UID remap / remnant canonicalization) —
-            // preserves the indexed body text + embedding under the new id.
-            try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys)
+            await recoverPendingFTSRekeys(
+                headerIds: result.ftsRekeys.map(\.newId)
+            )
         }
         if !result.staleIds.isEmpty {
             removeHeadersFromFTS(result.staleIds)
@@ -428,8 +424,8 @@ extension SyncEngine {
     /// row, preserving AI fields and the richest cached body) and re-keys the
     /// survivor to the canonical PK. Returns the canonical row (nil when the
     /// message has no local row yet), the header ids of merge-loser rows
-    /// deleted along the way (callers must drop them from FTS via staleIds),
-    /// and the (oldId, newId) pair when a re-key happened (callers must
+    /// deleted along the way (diagnostic/test evidence only),
+    /// and every (oldId, newId) identity merge/re-key pair (callers must
     /// re-key the FTS entry IN PLACE via `SearchIndex.rekeyHeaders` — this
     /// preserves the FTS rowid, the indexed body text, and the messages_vec
     /// embedding; the re-keyed old id must NOT ride the staleIds channel).
@@ -438,18 +434,167 @@ extension SyncEngine {
     /// (no OR-merge from losers — that would claim an FTS body the survivor's
     /// row doesn't have, the PLAN_FTS_BODY_LOSS class). A survivor with
     /// `bodyComplete = 0` re-enters the standard body pipeline naturally.
+    private struct LocalIdentityGraphState {
+        var bodies: [MessageBody] = []
+        var userLabelIds = Set<String>()
+        var referencedRfc822Ids = Set<String>()
+    }
+
+    struct LocalIdentityFieldAuthority: Sendable {
+        enum ActionTagState: Sendable {
+            case unprotected
+            case value(ActionTag?)
+        }
+
+        var read: Bool?
+        var flagged: Bool?
+        var actionTag: ActionTagState
+
+        static let none = LocalIdentityFieldAuthority(
+            read: nil,
+            flagged: nil,
+            actionTag: .unprotected
+        )
+    }
+
+    /// Capture every dependent row before deleting any identity generation. Header
+    /// deletion cascades all three relationships, so gathering only the first match loses
+    /// complementary body/label/reference state from later generations.
+    private nonisolated static func captureLocalIdentityGraphState(
+        for rows: [MessageHeader],
+        db: Database
+    ) throws -> LocalIdentityGraphState {
+        var state = LocalIdentityGraphState()
+        for row in rows {
+            if let body = try MessageBody.fetchOne(db, key: row.id) {
+                state.bodies.append(body)
+            }
+            state.userLabelIds.formUnion(try String.fetchAll(
+                db,
+                sql: "SELECT userLabelId FROM messageUserLabel WHERE messageId = ?",
+                arguments: [row.id]
+            ))
+            state.referencedRfc822Ids.formUnion(try String.fetchAll(
+                db,
+                sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+                arguments: [row.id]
+            ))
+        }
+        return state
+    }
+
+    /// Preserve local-only fields across identity generations. Completion flags are
+    /// intentionally not merged: they describe one concrete FTS row, and recovery chooses
+    /// the richest rowid before those flags re-enter their normal queues.
+    private nonisolated static func mergeLocalIdentityFields(
+        from rows: [MessageHeader],
+        into target: inout MessageHeader,
+        authority: LocalIdentityFieldAuthority = .none
+    ) {
+        for row in rows {
+            if target.actionTag == nil, let tag = row.actionTag {
+                target.actionTag = tag
+                // Carry the source generation's stamp so the TTL clock isn't reset by
+                // an identity-generation merge. A source row missing its own stamp
+                // (pre-migration / a writer that skipped it) fails safe by stamping now.
+                target.actionTagSetAt = row.actionTagSetAt ?? Date()
+            }
+            if target.summaryBlurb == nil { target.summaryBlurb = row.summaryBlurb }
+            if target.summaryTodos == nil { target.summaryTodos = row.summaryTodos }
+            if target.reminderDate == nil { target.reminderDate = row.reminderDate }
+            if target.reminderTime == nil { target.reminderTime = row.reminderTime }
+            if target.reminderContent == nil { target.reminderContent = row.reminderContent }
+            if target.cachedReply == nil { target.cachedReply = row.cachedReply }
+            target.isReplied = target.isReplied || row.isReplied
+            target.isForwarded = target.isForwarded || row.isForwarded
+            target.hasAttachments = target.hasAttachments || row.hasAttachments
+            target.notified = target.notified || row.notified
+        }
+        applyLocalIdentityFieldAuthority(authority, to: &target)
+    }
+
+    /// Apply only evidence that encodes the exact local value. Coarse recently-completed
+    /// keys still suppress stale remote overwrites, but cannot choose between opposite
+    /// values after identity generations collide.
+    private nonisolated static func applyLocalIdentityFieldAuthority(
+        _ authority: LocalIdentityFieldAuthority,
+        to target: inout MessageHeader
+    ) {
+        if let read = authority.read { target.isRead = read }
+        if let flagged = authority.flagged { target.isFlagged = flagged }
+        if case .value(let actionTag) = authority.actionTag {
+            target.actionTag = actionTag
+            // Reasserting the user's own recent local intention (recorded seconds
+            // ago, by construction of "recently completed") — re-stamping now is
+            // fine and keeps the pair consistent; a nil value clears the stamp.
+            target.actionTagSetAt = actionTag != nil ? Date() : nil
+        }
+        target.normalizeActionTagSortOrder()
+    }
+
+    /// Union inherited durable obligations with every identity generation removed by the
+    /// current GRDB transaction. Corrupt source markers throw and roll the transaction
+    /// back, retaining forensic state instead of silently declaring FTS convergence.
+    private nonisolated static func pendingFTSRekeySourceIds(
+        from rows: [MessageHeader],
+        removing sourceIds: [String],
+        finalId: String
+    ) throws -> [String] {
+        var ordered: [String] = []
+        for row in rows {
+            ordered.append(contentsOf: try row.decodedPendingFTSRekeySourceIds())
+        }
+        ordered.append(contentsOf: sourceIds)
+        var seen = Set<String>()
+        return ordered.filter { $0 != finalId && seen.insert($0).inserted }
+    }
+
+    /// Reattach the union captured above under the final identity after all source rows
+    /// have been deleted. `MessageBody.merged` is field-wise and throws on malformed
+    /// non-empty attachment payloads, making the enclosing GRDB transaction fail closed.
+    private nonisolated static func restoreLocalIdentityGraphState(
+        _ state: LocalIdentityGraphState,
+        finalId: String,
+        accountId: String,
+        db: Database
+    ) throws {
+        if let body = try MessageBody.merged(state.bodies, headerId: finalId) {
+            try body.save(db)
+        }
+        for userLabelId in state.userLabelIds {
+            try MessageUserLabel(
+                messageId: finalId,
+                accountId: accountId,
+                userLabelId: userLabelId
+            )
+                .insert(db, onConflict: .ignore)
+        }
+        let existingReferenceIds = Set(try String.fetchAll(
+            db,
+            sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+            arguments: [finalId]
+        ))
+        for referencedRfc822Id in state.referencedRfc822Ids.subtracting(existingReferenceIds) {
+            try MessageReference(
+                messageHeaderId: finalId,
+                referencedRfc822Id: referencedRfc822Id
+            ).insert(db)
+        }
+    }
+
     nonisolated static func canonicalizeLocalRows(
         accountId: String,
         folderPath: String,
         folderId: String,
         messageId: String,
         isInInbox: Bool,
+        fieldAuthority: LocalIdentityFieldAuthority = .none,
         db: Database
-    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekeys: [(oldId: String, newId: String)]) {
         let rows = try MessageHeader
             .filter(Column("messageId") == messageId && Column("folderId") == folderId)
             .fetchAll(db)
-        guard !rows.isEmpty else { return (nil, [], nil) }
+        guard !rows.isEmpty else { return (nil, [], []) }
 
         let canonicalId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
         // Fast path — a single row already under the canonical PK is the
@@ -457,43 +602,29 @@ extension SyncEngine {
         // per-message cost of the upsert loop is identical to the plain
         // fetchOne this replaced (ADR-IOS-029 hot-path discipline).
         if rows.count == 1 && rows[0].id == canonicalId {
-            return (rows[0], [], nil)
+            return (rows[0], [], [])
         }
 
         var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
         var removedIds: [String] = []
 
-        // Preserve the richest cached body across all rows BEFORE any delete —
-        // MessageBody is keyed 1:1 by header id and CASCADE-deletes with it.
-        var bestBody: MessageBody?
-        for row in rows {
-            if let body = try MessageBody.fetchOne(db, key: row.id),
-               bestBody == nil || (bestBody?.htmlContent?.isEmpty ?? true) {
-                bestBody = body
-            }
-        }
+        let graphState = try captureLocalIdentityGraphState(for: rows, db: db)
 
         // Merge AI/local state from duplicates into the survivor, then drop them.
+        mergeLocalIdentityFields(
+            from: rows,
+            into: &survivor,
+            authority: fieldAuthority
+        )
         for row in rows where row.id != survivor.id {
-            if survivor.actionTag == nil, let tag = row.actionTag {
-                survivor.actionTag = tag
-                survivor.tagSortOrder = row.tagSortOrder
-            }
-            if survivor.summaryBlurb == nil { survivor.summaryBlurb = row.summaryBlurb }
-            if survivor.summaryTodos == nil { survivor.summaryTodos = row.summaryTodos }
-            if survivor.reminderDate == nil { survivor.reminderDate = row.reminderDate }
-            if survivor.reminderTime == nil { survivor.reminderTime = row.reminderTime }
-            if survivor.reminderContent == nil { survivor.reminderContent = row.reminderContent }
-            if survivor.cachedReply == nil { survivor.cachedReply = row.cachedReply }
-            survivor.isReplied = survivor.isReplied || row.isReplied
-            survivor.isForwarded = survivor.isForwarded || row.isForwarded
-            survivor.isRead = survivor.isRead || row.isRead
             // Deliberately NOT merging bodyComplete/bodyEmptyConfirmed — the
-            // survivor's flags must describe its OWN FTS row, and the losers'
-            // FTS rows leave via staleIds.
+            // survivor's flags must describe its OWN FTS row. Loser FTS rows
+            // converge through ftsRekeys, where rowid richness is verified.
             try row.delete(db)
             removedIds.append(row.id)
-            print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
+            }
         }
 
         let willRekey = survivor.id != canonicalId
@@ -502,39 +633,60 @@ extension SyncEngine {
             survivor.isInInbox = isInInbox
         }
 
-        var ftsRekey: (oldId: String, newId: String)?
+        var ftsRekeys: [(oldId: String, newId: String)] = []
         if willRekey {
             // Defensive — the canonical PK can be held by a row in ANOTHER
             // folder (a message optimistically moved OUT of this folder keeps
             // its PK). Don't steal it; keep the remnant PK and retry on a
             // later sync once that row has been canonicalized in its own folder.
-            guard try MessageHeader.fetchOne(db, key: canonicalId) == nil else {
-                print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
+            if try MessageHeader.fetchOne(db, key: canonicalId) != nil {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
+                }
                 if !removedIds.isEmpty { try survivor.update(db) }
-                return (survivor, removedIds, nil)
+            } else {
+                // Re-key the optimistic-move remnant to the canonical PK. The PK
+                // can't be UPDATEd in place (messageBody references it with
+                // ON DELETE CASCADE), so delete + reinsert, body reattached below.
+                let oldId = survivor.id
+                try survivor.delete(db)
+                survivor.id = canonicalId
+                survivor.folderPath = folderPath
+                try survivor.insert(db)
+                ftsRekeys.append((oldId: oldId, newId: canonicalId))
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
+                }
             }
-            // Re-key the optimistic-move remnant to the canonical PK. The PK
-            // can't be UPDATEd in place (messageBody references it with
-            // ON DELETE CASCADE), so delete + reinsert, body reattached below.
-            let oldId = survivor.id
-            try survivor.delete(db)
-            survivor.id = canonicalId
-            survivor.folderPath = folderPath
-            try survivor.insert(db)
-            ftsRekey = (oldId: oldId, newId: canonicalId)
-            print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
         } else if !removedIds.isEmpty {
             try survivor.update(db)
         }
 
-        // Reattach the preserved body under the final id if none is present.
-        if let body = bestBody, try MessageBody.fetchOne(db, key: survivor.id) == nil {
-            var rekeyedBody = body
-            rekeyedBody.id = survivor.id
-            try rekeyedBody.insert(db)
-        }
+        // Every identity-proven duplicate loser converges through the FTS rekey channel.
+        // Sending losers through staleIds would delete their body/vector before
+        // SearchIndex's collision-richness comparison can choose the best rowid.
+        ftsRekeys.append(contentsOf: removedIds.map {
+            (oldId: $0, newId: survivor.id)
+        })
 
-        return (survivor, removedIds, ftsRekey)
+        survivor.pendingFTSRekeySourceIds = try pendingFTSRekeySourceIds(
+            from: rows,
+            removing: ftsRekeys.map(\.oldId),
+            finalId: survivor.id
+        )
+        try survivor.update(db)
+
+        // Reattach the field-wise merged body under the final id. A malformed nonempty
+        // attachment payload throws and rolls back the whole canonicalization transaction,
+        // preserving every source row rather than silently cascading opaque metadata.
+        try restoreLocalIdentityGraphState(
+            graphState,
+            finalId: survivor.id,
+            accountId: accountId,
+            db: db
+        )
+
+        return (survivor, removedIds, ftsRekeys)
     }
 
     /// SINGLE SOURCE OF TRUTH for "which local rows may be stale-deleted after a
@@ -621,6 +773,52 @@ extension SyncEngine {
         return remoteIds.subtracting(existingLocalIds)
     }
 
+    /// Reconcile the provider's label set for one existing local row. Remote
+    /// additions are always safe; removals require an explicitly authoritative
+    /// set so an early Gmail delta with no loaded label catalog cannot erase
+    /// valid membership.
+    private nonisolated static func reconcileUserLabelAssociations(
+        messageId: String,
+        accountId: String,
+        remoteLabelIds: [String],
+        remoteSetIsAuthoritative: Bool,
+        db: Database
+    ) throws {
+        let remoteIds = Set(remoteLabelIds.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        })
+        for labelId in remoteIds {
+            try UserLabel(
+                id: labelId,
+                accountId: accountId,
+                name: labelId,
+                isSystem: false
+            ).insert(db, onConflict: .ignore)
+            try MessageUserLabel(
+                messageId: messageId,
+                accountId: accountId,
+                userLabelId: labelId
+            )
+                .insert(db, onConflict: .ignore)
+        }
+
+        guard remoteSetIsAuthoritative else { return }
+        let localIds = try String.fetchSet(
+            db,
+            MessageUserLabel
+                .select(Column("userLabelId"))
+                .filter(Column("messageId") == messageId)
+        )
+        let staleIds = localIds.subtracting(remoteIds)
+        guard !staleIds.isEmpty else { return }
+        try MessageUserLabel
+            .filter(
+                Column("messageId") == messageId
+                    && staleIds.contains(Column("userLabelId"))
+            )
+            .deleteAll(db)
+    }
+
     /// Core message sync logic — runs entirely off the main thread.
     /// Fetches messages from provider, performs stale detection + upsert in a single
     /// DB write transaction. No MainActor state accessed.
@@ -629,13 +827,17 @@ extension SyncEngine {
         provider: any EmailProvider,
         limit: Int,
         dbPool: PrioritizedDatabase,
-        recentlyCompleted: [String: Date] = [:]
+        recentlyCompleted: [String: Date]? = nil
     ) async throws -> SyncMessagesResult {
         let messages = try await provider.fetchMessages(folder: folder.path, limit: limit, offset: 0)
         let folderPath = folder.path
         let folderId = folder.id
         let accountId = folder.accountId
         let isInInbox = folder.role == .inbox
+        // Gmail/Graph fields are message-wide across label/folder rows. IMAP
+        // UIDs and flags are mailbox-local. This provider-declared contract also
+        // scopes explicit generic completions without concrete-type inference.
+        let accountScopesFieldIntentions = provider.messageFieldScope == .account
 
         let remoteIds = Set(messages.map(\.messageId))
 
@@ -647,7 +849,13 @@ extension SyncEngine {
         // in-flight write (DatabaseWriteQueue can't preempt SQLite), so a single long
         // folder write here is the residual cap to chunk. Remove once confirmed bounded.
         let writeStart = CFAbsoluteTimeGetCurrent()
-        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]) = try await dbPool.write { db in
+        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]) = try await dbPool.writeWithReservedSnapshot(
+            label: "sync.messages",
+            snapshot: {
+                if let recentlyCompleted { return recentlyCompleted }
+                return await Self.freshRecentlyCompletedSnapshot()
+            }
+        ) { db, recentlyCompletedSnapshot in
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
             // IMAP UIDs are per-folder — UID "500" in INBOX and UID "500" in Archive are different
@@ -658,22 +866,267 @@ extension SyncEngine {
             // — an optimistic move places the row at the destination with the source UID;
             // that row must survive the sync pass at the destination until the drain executes.
             let pendingOps = try PendingOperation.fetchAll(db)
-            let opsForThisFolder = pendingOps.filter { $0.accountId == accountId && $0.folderPath == folderPath }
+            let accountPendingOps = pendingOps.filter { $0.accountId == accountId }
+            let activeAccountPendingOps = accountPendingOps.filter {
+                $0.status == PendingStatus.queued.rawValue
+                    || $0.status == PendingStatus.inFlight.rawValue
+            }
+            let accountPendingSnapshot = PendingOperationSnapshot(ops: activeAccountPendingOps)
+            let opsForThisFolder = activeAccountPendingOps.filter {
+                $0.folderPath == folderPath
+            }
             let thisFolderSnapshot = PendingOperationSnapshot(ops: opsForThisFolder)
             let pendingDestructiveIds = thisFolderSnapshot.destructive
-            let pendingFlagIds = thisFolderSnapshot.flag
+            let fieldOpsForThisScope = activeAccountPendingOps.filter {
+                accountScopesFieldIntentions || $0.folderPath == folderPath
+            }
+            let fieldSnapshot = PendingOperationSnapshot(ops: fieldOpsForThisScope)
+            let scopedGenericTypes: Set<OperationType> = [
+                .markReplied, .markForwarded,
+                .addUserLabel, .removeUserLabel,
+            ]
+            var pendingGenericIds = Set(activeAccountPendingOps.filter {
+                scopedGenericTypes.contains($0.type)
+                    && (accountScopesFieldIntentions || $0.folderPath == folderPath)
+            }.flatMap(\.messageIds))
+            if folder.role == .drafts {
+                pendingGenericIds.formUnion(thisFolderSnapshot.draftResources)
+            }
+
+            let identityIds: (String, String?) -> [String] = { messageId, rfc822MessageId in
+                var ids = [messageId]
+                if let rfc822MessageId, !rfc822MessageId.isEmpty {
+                    ids.append(rfc822MessageId)
+                }
+                return ids
+            }
+            let hasPendingMembership: (
+                PendingOperationSnapshot,
+                MessageIdentity.RecentlyCompletedMembership,
+                String,
+                String?
+            ) -> Bool = { snapshot, membership, messageId, rfc822MessageId in
+                identityIds(messageId, rfc822MessageId).contains { identityId in
+                    let membershipKey = MessageIdentity.membershipKey(
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        messageId: identityId,
+                        membership: membership
+                    )
+                    switch membership {
+                    case .removedSource:
+                        return snapshot.destructiveSourceMemberships.contains(membershipKey)
+                    case .addedDestination:
+                        return snapshot.destructiveDestinationMemberships.contains(membershipKey)
+                    }
+                }
+            }
 
             let isPendingDestructive: (MessageHeaderInfo) -> Bool = { info in
-                pendingDestructiveIds.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
+                hasPendingMembership(
+                    accountPendingSnapshot,
+                    .removedSource,
+                    info.messageId,
+                    info.rfc822MessageId
+                )
             }
-            let isPendingFlag: (MessageHeaderInfo) -> Bool = { info in
-                pendingFlagIds.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
+            let isPendingRead: (MessageHeaderInfo) -> Bool = { info in
+                fieldSnapshot.read.containsAnyKey(
+                    messageId: info.messageId,
+                    rfc822MessageId: info.rfc822MessageId
+                )
             }
-            // Recently completed guard — bridges gap between PendingOp deletion and
-            // server-side state propagation (30s TTL). Replaces per-folder recentActions.
-            let isRecentlyCompleted: (MessageHeaderInfo) -> Bool = { info in
-                recentlyCompleted[info.messageId] != nil ||
-                (info.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false)
+            let isPendingFlagged: (MessageHeaderInfo) -> Bool = { info in
+                fieldSnapshot.flagged.containsAnyKey(
+                    messageId: info.messageId,
+                    rfc822MessageId: info.rfc822MessageId
+                )
+            }
+            let isPendingActionTag: (MessageHeaderInfo) -> Bool = { _ in false }
+            let isPendingGeneric: (String, String?) -> Bool = { messageId, rfc822MessageId in
+                pendingGenericIds.containsAnyKey(
+                    messageId: messageId,
+                    rfc822MessageId: rfc822MessageId
+                )
+            }
+            // Recently completed guard — every key is account/folder-qualified and
+            // purpose-explicit. Legacy bare ids are intentionally ignored because the
+            // actor map is shared across accounts.
+            let isRecentlyCompletedGeneric: (String, String?) -> Bool = {
+                messageId, rfc822MessageId in
+                identityIds(messageId, rfc822MessageId).contains { identityId in
+                    let key = accountScopesFieldIntentions
+                        ? MessageIdentity.recentlyCompletedAccountKey(
+                            accountId: accountId,
+                            messageId: identityId
+                        )
+                        : MessageIdentity.recentlyCompletedFolderKey(
+                            accountId: accountId,
+                            folderPath: folderPath,
+                            messageId: identityId
+                        )
+                    return recentlyCompletedSnapshot[key] != nil
+                }
+            }
+            let isRecentlyCompletedField: (
+                MessageIdentity.RecentlyCompletedField,
+                String,
+                String?
+            ) -> Bool = { field, messageId, rfc822MessageId in
+                identityIds(messageId, rfc822MessageId).contains { identityId in
+                    let key = accountScopesFieldIntentions
+                        ? MessageIdentity.recentlyCompletedFieldKey(
+                            accountId: accountId,
+                            messageId: identityId,
+                            field: field
+                        )
+                        : MessageIdentity.recentlyCompletedFieldKey(
+                            accountId: accountId,
+                            folderPath: folderPath,
+                            messageId: identityId,
+                            field: field
+                        )
+                    return recentlyCompletedSnapshot[key] != nil
+                }
+            }
+            let latestRecentlyCompletedFieldValue: (
+                MessageIdentity.RecentlyCompletedField,
+                String,
+                String?
+            ) -> MessageIdentity.RecentlyCompletedFieldValue? = {
+                field, messageId, rfc822MessageId in
+                let candidates: [MessageIdentity.RecentlyCompletedFieldValue]
+                switch field {
+                case .read:
+                    candidates = [.read(false), .read(true)]
+                case .flagged:
+                    candidates = [.flagged(false), .flagged(true)]
+                case .actionTag:
+                    candidates = [.actionTag(nil)] + ActionTag.allCases.map {
+                        .actionTag($0.rawValue)
+                    }
+                }
+
+                let evidence = candidates.compactMap { value -> (
+                    value: MessageIdentity.RecentlyCompletedFieldValue,
+                    expiry: Date
+                )? in
+                    let latestExpiry = identityIds(messageId, rfc822MessageId)
+                        .compactMap { identityId -> Date? in
+                            let key = accountScopesFieldIntentions
+                                ? MessageIdentity.recentlyCompletedFieldValueKey(
+                                    accountId: accountId,
+                                    messageId: identityId,
+                                    value: value
+                                )
+                                : MessageIdentity.recentlyCompletedFieldValueKey(
+                                    accountId: accountId,
+                                    folderPath: folderPath,
+                                    messageId: identityId,
+                                    value: value
+                                )
+                            return recentlyCompletedSnapshot[key]
+                        }
+                        .max()
+                    return latestExpiry.map { (value, $0) }
+                }
+                guard let maximumExpiry = evidence.map(\.expiry).max() else { return nil }
+                let winners = evidence.filter { $0.expiry == maximumExpiry }
+                // Equal-expiry opposite receipts provide no ordering authority. Leave
+                // the exact value unchanged while the coarse field key still blocks
+                // stale remote state from overwriting the local row.
+                guard winners.count == 1 else { return nil }
+                return winners[0].value
+            }
+            let latestPendingFieldOperation: (
+                Set<OperationType>,
+                MessageHeaderInfo
+            ) -> PendingOperation? = { operationTypes, info in
+                fieldOpsForThisScope
+                    .filter { operation in
+                        operationTypes.contains(operation.type)
+                            && Set(operation.messageIds).containsAnyKey(
+                                messageId: info.messageId,
+                                rfc822MessageId: info.rfc822MessageId
+                            )
+                    }
+                    .max { lhs, rhs in
+                        if lhs.createdAt != rhs.createdAt {
+                            return lhs.createdAt < rhs.createdAt
+                        }
+                        return lhs.id < rhs.id
+                    }
+            }
+            let localFieldAuthority: (MessageHeaderInfo) -> LocalIdentityFieldAuthority = {
+                info in
+                var authority = LocalIdentityFieldAuthority.none
+                if let operation = latestPendingFieldOperation(
+                    PendingOperationSnapshot.readTypes,
+                    info
+                ) {
+                    authority.read = operation.type == .markRead
+                } else if let recent = latestRecentlyCompletedFieldValue(
+                    .read,
+                    info.messageId,
+                    info.rfc822MessageId
+                ), case .read(let value) = recent {
+                    authority.read = value
+                }
+                if let operation = latestPendingFieldOperation(
+                    PendingOperationSnapshot.flaggedTypes,
+                    info
+                ) {
+                    authority.flagged = operation.type == .markFlagged
+                } else if let recent = latestRecentlyCompletedFieldValue(
+                    .flagged,
+                    info.messageId,
+                    info.rfc822MessageId
+                ), case .flagged(let value) = recent {
+                    authority.flagged = value
+                }
+                if let recent = latestRecentlyCompletedFieldValue(
+                    .actionTag,
+                    info.messageId,
+                    info.rfc822MessageId
+                ), case .actionTag(let rawValue) = recent {
+                    if let rawValue {
+                        if let tag = ActionTag(rawValue: rawValue) {
+                            authority.actionTag = .value(tag)
+                        }
+                    } else {
+                        authority.actionTag = .value(nil)
+                    }
+                }
+                return authority
+            }
+            let isRecentlyPushMerged: (String, String?) -> Bool = {
+                messageId, rfc822MessageId in
+                identityIds(messageId, rfc822MessageId).contains { identityId in
+                    recentlyCompletedSnapshot[MessageIdentity.recentlyCompletedPushKey(
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        messageId: identityId
+                    )] != nil
+                }
+            }
+            let userLabelsAreProtected: (MessageHeaderInfo) -> Bool = { info in
+                isPendingGeneric(info.messageId, info.rfc822MessageId)
+                    || isRecentlyCompletedGeneric(info.messageId, info.rfc822MessageId)
+                    || isRecentlyPushMerged(info.messageId, info.rfc822MessageId)
+            }
+            let isRecentlyCompletedMembership: (
+                MessageIdentity.RecentlyCompletedMembership,
+                String,
+                String?
+            ) -> Bool = { membership, messageId, rfc822MessageId in
+                identityIds(messageId, rfc822MessageId).contains { identityId in
+                    recentlyCompletedSnapshot[MessageIdentity.membershipKey(
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        messageId: identityId,
+                        membership: membership
+                    )] != nil
+                }
             }
             let opsTargetingThisFolder = pendingOps.filter {
                 $0.accountId == accountId && ($0.folderPath == folderPath || $0.destinationPath == folderPath)
@@ -741,7 +1194,13 @@ extension SyncEngine {
                     // messageId is a numeric IMAP UID; CAST avoids a lexicographic compare.
                     if let floorUID = messages.compactMap({ Int64($0.messageId) }).min() {
                         candidates = try MessageHeader.fetchAll(db, sql:
-                            "SELECT * FROM messageHeader WHERE folderId = ? AND CAST(messageId AS INTEGER) >= ?",
+                            """
+                            SELECT * FROM messageHeader
+                            WHERE folderId = ?
+                              AND messageId GLOB '[0-9]*'
+                              AND messageId NOT GLOB '*[^0-9]*'
+                              AND CAST(messageId AS INTEGER) >= ?
+                            """,
                             arguments: [folderId, floorUID])
                     } else {
                         candidates = []  // no parseable UID floor → delete nothing (safe)
@@ -761,11 +1220,27 @@ extension SyncEngine {
             // Don't delete messages with pending operations or recently completed ops.
             // Undo-restored messages are protected by their PendingOp(move-back).
             let isProtectedByPending: (MessageHeader) -> Bool = { msg in
-                pendingAllIds.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId)
+                hasPendingMembership(
+                    accountPendingSnapshot,
+                    .addedDestination,
+                    msg.messageId,
+                    msg.rfc822MessageId
+                ) || fieldSnapshot.flag.containsAnyKey(
+                    messageId: msg.messageId,
+                    rfc822MessageId: msg.rfc822MessageId
+                ) || isPendingGeneric(msg.messageId, msg.rfc822MessageId)
             }
             let isProtectedByRecent: (MessageHeader) -> Bool = { msg in
-                recentlyCompleted[msg.messageId] != nil ||
-                (msg.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false)
+                isRecentlyCompletedGeneric(msg.messageId, msg.rfc822MessageId)
+                    || isRecentlyPushMerged(msg.messageId, msg.rfc822MessageId)
+                    || isRecentlyCompletedMembership(
+                        .addedDestination,
+                        msg.messageId,
+                        msg.rfc822MessageId
+                    )
+                    || isRecentlyCompletedField(.read, msg.messageId, msg.rfc822MessageId)
+                    || isRecentlyCompletedField(.flagged, msg.messageId, msg.rfc822MessageId)
+                    || isRecentlyCompletedField(.actionTag, msg.messageId, msg.rfc822MessageId)
             }
             // Protect optimistic Sent headers: outbox messages with sentMessageId set are
             // in-flight (sent but IMAP APPEND may not have completed). Their rfc822MessageId
@@ -780,7 +1255,6 @@ extension SyncEngine {
                     outboxProtectedRfc822s.insert(EmailFilter.normalizeMessageId(raw))
                 }
             }
-            let protectedIds = pendingAllIds
             let pendingSkipped = stale.filter { isProtectedByPending($0) || isProtectedByRecent($0) }
             if !pendingSkipped.isEmpty {
                 print("[MoveTrace] fullSync \(folder.name) — skipping stale delete for \(pendingSkipped.count) msgs with pending/recent ops: \(pendingSkipped.map(\.messageId))")
@@ -800,6 +1274,8 @@ extension SyncEngine {
             // changes, etc. Migrate the local row in-place to preserve local state (body, AI cache).
             var uidMigratedRemoteIds = Set<String>()
             var uidMigratedOldMsgIds: [String] = []
+            var uidMigratedOldMsgIdSet = Set<String>()
+            var uidRemapConflictProtectedOldIds = Set<String>()
             // Which remote ids are NEW (not already local) — bounded membership check;
             // see `newRemoteIds(in:folderId:remoteIds:cachedLocalIds:)`. Reuses the
             // allLocalIds set from stale detection when it was already loaded.
@@ -812,64 +1288,153 @@ extension SyncEngine {
             var newMessagesByRfc822: [String: [MessageHeaderInfo]] = [:]
             for msg in messages where newRemoteIds.contains(msg.messageId) {
                 if let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
-                    newMessagesByRfc822[rfc822, default: []].append(msg)
+                    newMessagesByRfc822[
+                        EmailFilter.normalizeMessageId(rfc822),
+                        default: []
+                    ].append(msg)
+                }
+            }
+            var staleMessagesByRfc822: [String: [MessageHeader]] = [:]
+            for staleMessage in stale {
+                if let rfc822 = staleMessage.rfc822MessageId, !rfc822.isEmpty {
+                    staleMessagesByRfc822[
+                        EmailFilter.normalizeMessageId(rfc822),
+                        default: []
+                    ].append(staleMessage)
                 }
             }
             for staleMsg in stale {
                 guard let rfc822 = staleMsg.rfc822MessageId, !rfc822.isEmpty else { continue }
-                guard let match = newMessagesByRfc822[rfc822]?.first(where: {
+                let normalizedRfc822 = EmailFilter.normalizeMessageId(rfc822)
+                guard let match = newMessagesByRfc822[normalizedRfc822]?.first(where: {
                     !uidMigratedRemoteIds.contains($0.messageId)
-                }) else { continue }
-                let oldId = staleMsg.id
+                }), let staleGenerations = staleMessagesByRfc822[normalizedRfc822] else {
+                    continue
+                }
                 let newMsgId = match.messageId
                 let newId = "\(accountId):\(folderPath):\(newMsgId)"
-                print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
-                // Fetch body BEFORE deleting header — CASCADE would delete body too
-                let oldBody = try MessageBody.fetchOne(db, key: oldId)
-                try staleMsg.delete(db)
-                var migrated = staleMsg
+                let oldIds = staleGenerations.map(\.id)
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] UID remap: rfc822=\(rfc822) \(staleGenerations.count) old generation(s)→\(newMsgId) in \(folder.name)")
+                }
+
+                let occupiedTarget = try MessageHeader.fetchOne(db, key: newId)
+                if let occupiedTarget {
+                    let targetIdentity = occupiedTarget.rfc822MessageId.map {
+                        EmailFilter.normalizeMessageId($0)
+                    }
+                    guard targetIdentity == EmailFilter.normalizeMessageId(rfc822) else {
+                        // A primary-key collision without matching immutable identity is not
+                        // merge authority. Preserve the old row for a later observation.
+                        uidRemapConflictProtectedOldIds.insert(staleMsg.messageId)
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] UID remap: refusing occupied target \(newId) without matching RFC Message-ID")
+                        }
+                        continue
+                    }
+                }
+
+                let identityRows = staleGenerations + (occupiedTarget.map { [$0] } ?? [])
+                let graphState = try Self.captureLocalIdentityGraphState(
+                    for: identityRows,
+                    db: db
+                )
+                let remapFieldAuthority = localFieldAuthority(match)
+                var migrated = occupiedTarget ?? staleMsg
+                Self.mergeLocalIdentityFields(
+                    from: identityRows,
+                    into: &migrated,
+                    authority: remapFieldAuthority
+                )
                 migrated.id = newId
                 migrated.messageId = newMsgId
+                migrated.folderId = folderId
+                migrated.folderPath = folderPath
+                migrated.isInInbox = isInInbox
                 // If the remote match has a broken (epoch 0) date from IMAP parse
                 // failure, the entire remote record can't be trusted — preserve all
                 // local fields (isRead, isFlagged, date). The UID remap still happens
                 // so future syncs find the message, but we don't copy the broken
                 // remote state. Next sync cycle will update with valid data.
                 if match.date.timeIntervalSince1970 >= 86400 {
-                    migrated.isRead = match.isRead
-                    migrated.isFlagged = match.isFlagged
+                    let pushProtected = isRecentlyPushMerged(
+                        match.messageId,
+                        match.rfc822MessageId
+                    )
+                    if remapFieldAuthority.read == nil,
+                       !isRecentlyCompletedField(
+                           .read,
+                           match.messageId,
+                           match.rfc822MessageId
+                       ),
+                       !pushProtected {
+                        migrated.isRead = match.isRead
+                    }
+                    if remapFieldAuthority.flagged == nil,
+                       !isRecentlyCompletedField(
+                           .flagged,
+                           match.messageId,
+                           match.rfc822MessageId
+                       ),
+                       !pushProtected {
+                        migrated.isFlagged = match.isFlagged
+                    }
                     migrated.date = match.date
                 }
-                // Defensive — if a concurrent path already inserted this id, skip
-                // instead of throwing UNIQUE. The migrated row's PK was just
-                // rewritten; a prior upsert iteration for the same (accountId,
-                // folderPath, newMsgId) could have beaten us to it.
-                guard try MessageHeader.fetchOne(db, key: newId) == nil else {
-                    print("[Sync] UID remap: SKIPPING migrate-insert for \(newId) — already present")
-                    continue
+                migrated.pendingFTSRekeySourceIds = try Self.pendingFTSRekeySourceIds(
+                    from: identityRows,
+                    removing: oldIds,
+                    finalId: newId
+                )
+
+                // Only after every source/dependent row and inherited obligation has
+                // been captured may the old generation cascade away.
+                for staleGeneration in staleGenerations {
+                    try staleGeneration.delete(db)
                 }
-                try migrated.insert(db)
-                if var body = oldBody {
-                    body.id = newId
-                    try body.insert(db)
+                if occupiedTarget != nil {
+                    try migrated.update(db)
+                } else {
+                    try migrated.insert(db)
+                }
+                try Self.restoreLocalIdentityGraphState(
+                    graphState,
+                    finalId: newId,
+                    accountId: accountId,
+                    db: db
+                )
+                if !userLabelsAreProtected(match) {
+                    try Self.reconcileUserLabelAssociations(
+                        messageId: newId,
+                        accountId: accountId,
+                        remoteLabelIds: match.userLabelIds,
+                        remoteSetIsAuthoritative: match.userLabelIdsAreAuthoritative,
+                        db: db
+                    )
                 }
                 // Move the FTS entry to the new id IN PLACE (preserves the
                 // indexed body text + the messages_vec embedding). Previously
                 // the old FTS row ghosted forever (search hits deep-linking to
                 // a deleted header id) and the new id was invisible to search.
-                ftsRekeys.append((oldId: oldId, newId: newId, newMessageId: newMsgId))
+                ftsRekeys.append(contentsOf: oldIds.map {
+                    (oldId: $0, newId: newId, newMessageId: newMsgId)
+                })
                 uidMigratedRemoteIds.insert(newMsgId)
-                uidMigratedOldMsgIds.append(staleMsg.messageId)
+                for staleGeneration in staleGenerations
+                    where uidMigratedOldMsgIdSet.insert(staleGeneration.messageId).inserted {
+                    uidMigratedOldMsgIds.append(staleGeneration.messageId)
+                }
             }
 
-            let uidMigratedSet = Set(uidMigratedOldMsgIds)
             let isProtected: (MessageHeader) -> Bool = { msg in
-                protectedIds.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId) ||
-                recentlyCompleted[msg.messageId] != nil ||
-                (msg.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false) ||
+                isProtectedByPending(msg) ||
+                isProtectedByRecent(msg) ||
+                uidRemapConflictProtectedOldIds.contains(msg.messageId) ||
                 (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
             }
-            let staleFiltered = stale.filter { !isProtected($0) && !uidMigratedSet.contains($0.messageId) }
+            let staleFiltered = stale.filter {
+                !isProtected($0) && !uidMigratedOldMsgIdSet.contains($0.messageId)
+            }
             // Append, never assign — re-keyed old ids ride ftsRekeys (the FTS
             // entry MOVES, it must not be removed), but staleIds may already
             // carry entries from earlier loop passes and the canonicalizer in
@@ -886,12 +1451,24 @@ extension SyncEngine {
                 print("[Sync] \(folder.name): removed \(staleFiltered.count) stale messages")
             }
 
-            // Insert new / update existing.
-            // Skip messages with pending destructive ops or recently completed ops —
-            // prevents re-inserting optimistically removed messages or overwriting flags
-            // during the gap between PendingOp deletion and server propagation.
-            let skippedByPending = messages.filter { isPendingDestructive($0) }
-            let skippedByRecent = messages.filter { isRecentlyCompleted($0) && !isPendingDestructive($0) }
+            // Insert new / update existing. Source membership is directional: it
+            // blocks only stale re-insertion into this exact folder. Generic completion
+            // protects stale row deletion above, not unrelated mutable fields. Only an
+            // NSE push merge protects the full row's freshly-arrived payload.
+            let skippedByPending = messages.filter {
+                isPendingDestructive($0)
+                    || isPendingGeneric($0.messageId, $0.rfc822MessageId)
+            }
+            let skippedByRecent = messages.filter {
+                (isRecentlyPushMerged($0.messageId, $0.rfc822MessageId)
+                    || isRecentlyCompletedMembership(
+                        .removedSource,
+                        $0.messageId,
+                        $0.rfc822MessageId
+                    ))
+                    && !isPendingDestructive($0)
+                    && !isPendingGeneric($0.messageId, $0.rfc822MessageId)
+            }
             let skippedByPendingIds = Set(skippedByPending.map(\.messageId))
             let skippedByRecentIds = Set(skippedByRecent.map(\.messageId))
             let allSkippedIds = skippedByPendingIds.union(skippedByRecentIds)
@@ -916,32 +1493,39 @@ extension SyncEngine {
             var upsReconSeconds = 0.0
             let upsLoopT0 = CFAbsoluteTimeGetCurrent()
             for info in messages where !allSkippedIds.contains(info.messageId) && !uidMigratedRemoteIds.contains(info.messageId) {
+                let fieldAuthority = localFieldAuthority(info)
                 // Canonicalize PKs + merge duplicate rows (optimistic-move
                 // remnants keep their old "accountId:<oldPath>:<msgId>" PK
                 // forever for stable-id providers — see canonicalizeLocalRows).
                 // Drafts/Sent are exempt: DraftStore's push migration manages
                 // their row identity.
                 let reconT0 = CFAbsoluteTimeGetCurrent()
-                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?)
+                let recon: (
+                    row: MessageHeader?,
+                    removedIds: [String],
+                    ftsRekeys: [(oldId: String, newId: String)]
+                )
                 if folder.role == .drafts || folder.role == .sent {
                     recon = (try MessageHeader
                         .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
-                        .fetchOne(db), [], nil)
+                        .fetchOne(db), [], [])
                 } else {
                     recon = try Self.canonicalizeLocalRows(
                         accountId: accountId, folderPath: folderPath,
                         folderId: folderId, messageId: info.messageId,
-                        isInInbox: isInInbox, db: db
+                        isInInbox: isInInbox,
+                        fieldAuthority: fieldAuthority,
+                        db: db
                     )
                 }
                 upsReconSeconds += CFAbsoluteTimeGetCurrent() - reconT0
-                if !recon.removedIds.isEmpty {
-                    staleIds.append(contentsOf: recon.removedIds)
-                }
-                if let rekey = recon.ftsRekey {
-                    // FTS entry moves to the new id in place — body text and
-                    // embedding ride along. messageId is unchanged here.
-                    ftsRekeys.append((oldId: rekey.oldId, newId: rekey.newId, newMessageId: nil))
+                if !recon.ftsRekeys.isEmpty {
+                    // Every identity-proven duplicate/re-key moves through the in-place
+                    // channel. No loser rides staleIds: SearchIndex must see both entries
+                    // to preserve the richest indexed body/vector on collision.
+                    ftsRekeys.append(contentsOf: recon.ftsRekeys.map {
+                        (oldId: $0.oldId, newId: $0.newId, newMessageId: nil)
+                    })
                 }
                 if var existing = recon.row {
                     // Pre-mutation snapshot so the write below can be SKIPPED when the
@@ -958,6 +1542,68 @@ extension SyncEngine {
                     // normally via the dedup + stale-check paths above; this guard
                     // only prevents destructive metadata refresh on existing rows.
                     if folder.role == .drafts || folder.role == .sent {
+                        // The current server-id row can coexist with one or more older
+                        // optimistic generations. Remote messageId + RFC Message-ID
+                        // proves their shared identity even though the lagging Drafts/Sent
+                        // summary must not overwrite the current row's local metadata.
+                        // Merge those generations before taking the metadata fast-path so
+                        // their graph state and durable FTS obligations cannot persist as
+                        // phantom duplicates forever.
+                        if let rfc822 = info.rfc822MessageId, !rfc822.isEmpty {
+                            let optimisticRows = try MessageHeader
+                                .filter(Column("folderId") == folderId
+                                        && Column("rfc822MessageId") == rfc822
+                                        && Column("id") != existing.id)
+                                .fetchAll(db)
+                            if !optimisticRows.isEmpty {
+                                let identityRows = [existing] + optimisticRows
+                                let sourceIds = optimisticRows.map(\.id)
+                                let graphState = try Self.captureLocalIdentityGraphState(
+                                    for: identityRows,
+                                    db: db
+                                )
+                                Self.mergeLocalIdentityFields(
+                                    from: identityRows,
+                                    into: &existing,
+                                    authority: fieldAuthority
+                                )
+                                existing.pendingFTSRekeySourceIds = try Self
+                                    .pendingFTSRekeySourceIds(
+                                        from: identityRows,
+                                        removing: sourceIds,
+                                        finalId: existing.id
+                                    )
+                                for optimistic in optimisticRows {
+                                    try optimistic.delete(db)
+                                }
+                                try existing.update(db)
+                                try Self.restoreLocalIdentityGraphState(
+                                    graphState,
+                                    finalId: existing.id,
+                                    accountId: accountId,
+                                    db: db
+                                )
+                                ftsRekeys.append(contentsOf: sourceIds.map {
+                                    (
+                                        oldId: $0,
+                                        newId: existing.id,
+                                        newMessageId: existing.messageId
+                                    )
+                                })
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Sync] DraftDedup: merged \(sourceIds.count) optimistic \(folder.role.rawValue) generation(s) into existing \(existing.id)")
+                                }
+                            }
+                        }
+                        if !userLabelsAreProtected(info) {
+                            try Self.reconcileUserLabelAssociations(
+                                messageId: existing.id,
+                                accountId: accountId,
+                                remoteLabelIds: info.userLabelIds,
+                                remoteSetIsAuthoritative: info.userLabelIdsAreAuthoritative,
+                                db: db
+                            )
+                        }
                         // Preserve local drafts/sent content — the server's drafts.list /
                         // summary metadata lags behind the real message right after a local
                         // push. Counted in `upsDraftSentSkip`, reported in the aggregate
@@ -973,28 +1619,60 @@ extension SyncEngine {
                         upsDraftSentSkip += 1
                         continue
                     }
-                    // Update existing message with latest data from server.
-                    // Skip flag/tag overwrites if message has pending queue ops OR
-                    // recently completed ops (server may lag behind the executed change).
-                    let hasPendingFlags = isPendingFlag(info) || isRecentlyCompleted(info)
-                    if !hasPendingFlags {
+                    // Update independently mutable fields independently. Protecting a
+                    // local read operation must not discard a concurrent server flag or
+                    // action-tag change before this full-sync observation is consumed.
+                    let protectWholeRow = isRecentlyPushMerged(
+                        info.messageId,
+                        info.rfc822MessageId
+                    )
+                    if !isPendingRead(info)
+                        && !isRecentlyCompletedField(
+                            .read,
+                            info.messageId,
+                            info.rfc822MessageId
+                        )
+                        && !protectWholeRow {
                         existing.isRead = info.isRead
-                        existing.isFlagged = info.isFlagged
-                        if isInInbox, let serverTag = info.actionTag {
-                            if existing.actionTag != serverTag {
-                                print("[Sync] Remote tag change detected for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
-                                try MessageAICache.writeThrough(
-                                    accountId: accountId,
-                                    folderPath: folderPath,
-                                    rfc822MessageId: existing.rfc822MessageId,
-                                    actionTag: serverTag,
-                                    db: db
-                                )
-                            }
-                            existing.actionTag = serverTag
-                            existing.tagSortOrder = serverTag.sortOrder
-                        }
                     }
+                    if !isPendingFlagged(info)
+                        && !isRecentlyCompletedField(
+                            .flagged,
+                            info.messageId,
+                            info.rfc822MessageId
+                        )
+                        && !protectWholeRow {
+                        existing.isFlagged = info.isFlagged
+                    }
+                    if !isPendingActionTag(info),
+                       !isRecentlyCompletedField(
+                           .actionTag,
+                           info.messageId,
+                           info.rfc822MessageId
+                       ),
+                       !protectWholeRow,
+                       isInInbox,
+                       let serverTag = info.actionTag {
+                        if existing.actionTag != serverTag {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] Remote tag change detected for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                            }
+                            try MessageAICache.writeThrough(
+                                accountId: accountId,
+                                folderPath: folderPath,
+                                rfc822MessageId: existing.rfc822MessageId,
+                                actionTag: serverTag,
+                                db: db
+                            )
+                        }
+                        existing.actionTag = serverTag
+                        existing.tagSortOrder = serverTag.sortOrder
+                        // `info.actionTagSetAt` is nil for every real provider today
+                        // (ADR-IOS-036) — carried for completeness should one ever
+                        // populate it; stamp now otherwise.
+                        existing.actionTagSetAt = info.actionTagSetAt ?? Date()
+                    }
+                    Self.applyLocalIdentityFieldAuthority(fieldAuthority, to: &existing)
                     existing.date = info.date
                     existing.from = info.from
                     existing.fromAddress = info.fromAddress
@@ -1010,20 +1688,20 @@ extension SyncEngine {
                     existing.rfc822MessageId = info.rfc822MessageId
                     existing.referencesJSON = MessageHeader.encodeReferences(info.references)
                     // ReplyDetect: if message is replied (server or local) and has reply tag, override to none
-                    // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                    // AI cache keeps original LLM value — only the local MessageHeader changes.
                     if existing.isReplied && existing.actionTag == .reply {
-                        existing.actionTag = ActionTag.none
-                        existing.tagSortOrder = ActionTag.none.sortOrder
-                        let tagOp = PendingOperation(
-                            type: .setTag,
-                            messageIds: [existing.stableId],
-                            accountId: accountId,
-                            folderPath: folderPath,
-                            tagValue: ActionTag.none.rawValue
-                        )
-                        try tagOp.insert(db)
+                        existing.setActionTag(ActionTag.none)
                         replyDetectIds.append(existing.id)
                         print("[ReplyDetect] Sync update: reply→none for \(info.messageId) (already replied)")
+                    }
+                    if !userLabelsAreProtected(info) {
+                        try Self.reconcileUserLabelAssociations(
+                            messageId: existing.id,
+                            accountId: accountId,
+                            remoteLabelIds: info.userLabelIds,
+                            remoteSetIsAuthoritative: info.userLabelIdsAreAuthoritative,
+                            db: db
+                        )
                     }
                     // Change-detection: write ONLY when the server actually changed a
                     // column. The old unconditional `existing.update(db)` rewrote every
@@ -1066,9 +1744,10 @@ extension SyncEngine {
                 header.isReplied = info.isReplied
                 header.isForwarded = info.isForwarded
                 // Action tags are inbox-scoped — only apply server tags for inbox messages.
+                // Providers send nil actionTag today (ADR-IOS-036 local-only); `setActionTag`
+                // still stamps correctly should a provider ever send a non-nil value.
                 if isInInbox {
-                    header.actionTag = info.actionTag
-                    header.tagSortOrder = info.actionTag?.sortOrder ?? 99
+                    header.setActionTag(info.actionTag, at: info.actionTagSetAt ?? Date())
                 }
                 try MessageAICache.restoreIfCached(
                     into: &header,
@@ -1076,19 +1755,11 @@ extension SyncEngine {
                     folderPath: folderPath,
                     db: db
                 )
+                Self.applyLocalIdentityFieldAuthority(fieldAuthority, to: &header)
                 // ReplyDetect: if message is already replied and tagged as "reply", override to "none"
-                // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                // AI cache keeps original LLM value — only the local MessageHeader changes.
                 if header.isReplied && header.actionTag == .reply {
-                    header.actionTag = ActionTag.none
-                    header.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
-                        type: .setTag,
-                        messageIds: [header.stableId],
-                        accountId: accountId,
-                        folderPath: folderPath,
-                        tagValue: ActionTag.none.rawValue
-                    )
-                    try tagOp.insert(db)
+                    header.setActionTag(ActionTag.none)
                     replyDetectIds.append(header.id)
                     print("[ReplyDetect] Sync insert: reply→none for \(header.messageId) (already replied)")
                 }
@@ -1097,60 +1768,81 @@ extension SyncEngine {
                 // sync returns the real UID, match by rfc822MessageId and update in place
                 // to prevent duplicate rows.
                 if (folder.role == .drafts || folder.role == .sent),
-                   let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
-                   let optimistic = try MessageHeader
-                    .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
-                    .fetchOne(db) {
-                    let oldId = optimistic.id
-                    // Capture body for migration — defer insert until after header (FK constraint)
-                    var deferredBody: MessageBody?
-                    if let body = try MessageBody.fetchOne(db, key: oldId) {
-                        var newBody = body
-                        newBody.id = header.id
-                        try MessageBody.deleteOne(db, key: oldId)
-                        deferredBody = newBody
-                    }
+                   let rfc822 = header.rfc822MessageId, !rfc822.isEmpty {
+                    let optimisticRows = try MessageHeader
+                        .filter(Column("folderId") == folderId
+                                && Column("rfc822MessageId") == rfc822
+                                && Column("messageId") != header.messageId)
+                        .fetchAll(db)
+                    if !optimisticRows.isEmpty {
+                    let oldIds = optimisticRows.map(\.id)
+                    let graphState = try Self.captureLocalIdentityGraphState(
+                        for: optimisticRows,
+                        db: db
+                    )
+                    Self.mergeLocalIdentityFields(
+                        from: optimisticRows,
+                        into: &header,
+                        authority: fieldAuthority
+                    )
+                    header.pendingFTSRekeySourceIds = try Self.pendingFTSRekeySourceIds(
+                        from: optimisticRows,
+                        removing: oldIds,
+                        finalId: header.id
+                    )
                     // MessageAICache uses composite key, not headerId — unlikely for drafts
                     // but clean up if present. Shared-helper keys so any drift between
                     // writers (NSE, sync, device-sync peer) surfaces at compile time.
-                    let cacheKey = MessageIdentity.aiCacheKey(
-                        accountId: accountId, folderPath: folderPath,
-                        rfc822MessageId: optimistic.rfc822MessageId
-                    )
                     let newCacheKey = MessageIdentity.aiCacheKey(
                         accountId: accountId, folderPath: folderPath,
                         rfc822MessageId: header.rfc822MessageId
                     )
-                    if let cacheKey, let newCacheKey, cacheKey != newCacheKey,
-                       try MessageAICache.fetchOne(db, key: cacheKey) != nil {
-                        try db.execute(sql: "UPDATE messageAICache SET key = ? WHERE key = ?", arguments: [newCacheKey, cacheKey])
+                    for optimistic in optimisticRows {
+                        let cacheKey = MessageIdentity.aiCacheKey(
+                            accountId: accountId, folderPath: folderPath,
+                            rfc822MessageId: optimistic.rfc822MessageId
+                        )
+                        if let cacheKey, let newCacheKey, cacheKey != newCacheKey,
+                           try MessageAICache.fetchOne(db, key: cacheKey) != nil {
+                            try db.execute(
+                                sql: "UPDATE messageAICache SET key = ? WHERE key = ?",
+                                arguments: [newCacheKey, cacheKey]
+                            )
+                        }
+                        try optimistic.delete(db)
                     }
-                    try optimistic.delete(db)
                     guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
-                        if folder.role == .drafts || folder.role == .sent {
+                        if DebugModeManager.isLoggingEnabled() {
                             print("[Sync] DraftDedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot). remoteSnippet=\(String(header.snippet.prefix(60)))")
-                        } else {
-                            print("[Sync] Dedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
                         }
                         continue
                     }
                     try header.insert(db)
-                    if let body = deferredBody { try body.insert(db) }
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
-                    // Insert user label associations
-                    for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
-                            .insert(db, onConflict: .ignore)
+                    try Self.restoreLocalIdentityGraphState(
+                        graphState,
+                        finalId: header.id,
+                        accountId: accountId,
+                        db: db
+                    )
+                    if !userLabelsAreProtected(info) {
+                        try Self.reconcileUserLabelAssociations(
+                            messageId: header.id,
+                            accountId: accountId,
+                            remoteLabelIds: info.userLabelIds,
+                            remoteSetIsAuthoritative: info.userLabelIdsAreAuthoritative,
+                            db: db
+                        )
                     }
                     newHeaders.append(header)
-                    if folder.role == .drafts || folder.role == .sent {
-                        print("[Sync] DraftDedup: replaced optimistic \(folder.role.rawValue) header \(oldId) → \(header.id) | oldSnippet=\(String(optimistic.snippet.prefix(60))) | newSnippet=\(String(header.snippet.prefix(60)))")
-                    } else {
-                        print("[Sync] Dedup: replaced optimistic \(folder.role == .drafts ? "draft" : "sent") header \(oldId) with \(header.id)")
+                    ftsRekeys.append(contentsOf: oldIds.map {
+                        (oldId: $0, newId: header.id, newMessageId: header.messageId)
+                    })
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] DraftDedup: replaced \(oldIds.count) optimistic \(folder.role.rawValue) header generation(s) → \(header.id)")
                     }
                     continue
+                    }
                 }
 
                 // Pre-sync reclaim: if NSE (or any other writer) inserted this
@@ -1177,87 +1869,80 @@ extension SyncEngine {
                         .filter(Column("isInInbox") == true)
                         .filter(Column("id") != header.id)
                         .fetchAll(db)
-                    if preSyncRows.count > 1 {
+                    if !preSyncRows.isEmpty {
+                    let oldIds = preSyncRows.map(\.id)
+                    if DebugModeManager.isLoggingEnabled(), preSyncRows.count > 1 {
                         print("[Sync] Pre-sync reclaim: \(preSyncRows.count) matching inbox rows for \(info.messageId) — merging all")
                     }
-                    if let preSync = preSyncRows.first {
-                    let oldId = preSync.id
-                    // Preserve locally-computed AI work — sync has no actionTag
-                    // / summaryBlurb / reminder fields for Outlook (Graph does
-                    // not store them) and for Gmail they arrive via provider
-                    // labels only, so unconditionally preferring preSync's
-                    // fields when header's are nil keeps NSE's output.
-                    if header.actionTag == nil, let tag = preSync.actionTag {
-                        header.actionTag = tag
-                        header.tagSortOrder = tag.sortOrder
-                    }
-                    if header.summaryBlurb == nil {
-                        header.summaryBlurb = preSync.summaryBlurb
-                        header.summaryTodos = preSync.summaryTodos
-                        header.reminderDate = preSync.reminderDate
-                        header.reminderTime = preSync.reminderTime
-                        header.reminderContent = preSync.reminderContent
-                    }
-                    if header.cachedReply == nil { header.cachedReply = preSync.cachedReply }
-                    header.notified = header.notified || preSync.notified
-                    // Migrate MessageBody (FK to old id) before delete.
-                    var deferredBody: MessageBody?
-                    if let body = try MessageBody.fetchOne(db, key: oldId) {
-                        var newBody = body
-                        newBody.id = header.id
-                        try MessageBody.deleteOne(db, key: oldId)
-                        deferredBody = newBody
-                    }
-                    // Migrate AI cache key (folderPath changed → key changed).
-                    let oldCacheKey = MessageIdentity.aiCacheKey(
-                        accountId: accountId, folderPath: preSync.folderPath,
-                        rfc822MessageId: preSync.rfc822MessageId
+                    let graphState = try Self.captureLocalIdentityGraphState(
+                        for: preSyncRows,
+                        db: db
                     )
+                    Self.mergeLocalIdentityFields(
+                        from: preSyncRows,
+                        into: &header,
+                        authority: fieldAuthority
+                    )
+                    header.pendingFTSRekeySourceIds = try Self.pendingFTSRekeySourceIds(
+                        from: preSyncRows,
+                        removing: oldIds,
+                        finalId: header.id
+                    )
+
+                    // Migrate every source cache key before deleting any generation.
                     let newCacheKey = MessageIdentity.aiCacheKey(
                         accountId: accountId, folderPath: folderPath,
                         rfc822MessageId: header.rfc822MessageId
                     )
-                    if let oldCacheKey, let newCacheKey, oldCacheKey != newCacheKey,
-                       try MessageAICache.fetchOne(db, key: oldCacheKey) != nil {
-                        try db.execute(
-                            sql: "UPDATE messageAICache SET key = ? WHERE key = ?",
-                            arguments: [newCacheKey, oldCacheKey]
+                    for preSync in preSyncRows {
+                        let oldCacheKey = MessageIdentity.aiCacheKey(
+                            accountId: accountId, folderPath: preSync.folderPath,
+                            rfc822MessageId: preSync.rfc822MessageId
+                        )
+                        if let oldCacheKey, let newCacheKey, oldCacheKey != newCacheKey,
+                           try MessageAICache.fetchOne(db, key: oldCacheKey) != nil {
+                            if try MessageAICache.fetchOne(db, key: newCacheKey) == nil {
+                                try db.execute(
+                                    sql: "UPDATE messageAICache SET key = ? WHERE key = ?",
+                                    arguments: [newCacheKey, oldCacheKey]
+                                )
+                            } else {
+                                try db.execute(
+                                    sql: "DELETE FROM messageAICache WHERE key = ?",
+                                    arguments: [oldCacheKey]
+                                )
+                            }
+                        }
+                    }
+                    for preSync in preSyncRows {
+                        try preSync.delete(db)
+                    }
+                    try header.insert(db)
+                    try ThreadUtils.insertMessageReferences(for: header, db: db)
+                    try Self.restoreLocalIdentityGraphState(
+                        graphState,
+                        finalId: header.id,
+                        accountId: accountId,
+                        db: db
+                    )
+                    if !userLabelsAreProtected(info) {
+                        try Self.reconcileUserLabelAssociations(
+                            messageId: header.id,
+                            accountId: accountId,
+                            remoteLabelIds: info.userLabelIds,
+                            remoteSetIsAuthoritative: info.userLabelIdsAreAuthoritative,
+                            db: db
                         )
                     }
-                    try preSync.delete(db)
-                    try header.insert(db)
-                    if let body = deferredBody { try body.insert(db) }
-                    try ThreadUtils.insertMessageReferences(for: header, db: db)
-                    for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
-                            .insert(db, onConflict: .ignore)
-                    }
                     newHeaders.append(header)
-                    print("[Sync] Reclaimed pre-sync inbox row \(oldId) → \(header.id) (folderPath drift, preserved AI)")
-                    // Clean up any additional duplicates — their AI fields
-                    // already merged via the fetchAll scan isn't worth doing
-                    // (the first row won the preservation race; the tail are
-                    // stale dupes). Just delete to prevent orphaned cache
-                    // rows / body rows sticking around after reclaim.
-                    for extra in preSyncRows.dropFirst() {
-                        let extraId = extra.id
-                        if let oldCacheKey = MessageIdentity.aiCacheKey(
-                            accountId: accountId, folderPath: extra.folderPath,
-                            rfc822MessageId: extra.rfc822MessageId
-                        ) {
-                            try db.execute(
-                                sql: "DELETE FROM messageAICache WHERE key = ?",
-                                arguments: [oldCacheKey]
-                            )
-                        }
-                        try MessageBody.deleteOne(db, key: extraId)
-                        try extra.delete(db)
-                        print("[Sync] Pre-sync reclaim: removed duplicate inbox row \(extraId)")
+                    ftsRekeys.append(contentsOf: oldIds.map {
+                        (oldId: $0, newId: header.id, newMessageId: header.messageId)
+                    })
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] Reclaimed \(oldIds.count) pre-sync inbox row generation(s) → \(header.id) (preserved local state)")
                     }
                     continue
-                    }  // closes `if let preSync`
+                    }
                 }  // closes `if isInInbox`
 
                 // Check for orphaned row: same id (accountId:folderPath:messageId) but
@@ -1284,8 +1969,28 @@ extension SyncEngine {
                     orphaned.folderPath = folderPath
                     orphaned.isInInbox = isInInbox
                     orphaned.messageId = header.messageId
-                    orphaned.isRead = header.isRead
-                    orphaned.isFlagged = header.isFlagged
+                    let protectWholeRow = isRecentlyPushMerged(
+                        info.messageId,
+                        info.rfc822MessageId
+                    )
+                    if !isPendingRead(info)
+                        && !isRecentlyCompletedField(
+                            .read,
+                            info.messageId,
+                            info.rfc822MessageId
+                        )
+                        && !protectWholeRow {
+                        orphaned.isRead = header.isRead
+                    }
+                    if !isPendingFlagged(info)
+                        && !isRecentlyCompletedField(
+                            .flagged,
+                            info.messageId,
+                            info.rfc822MessageId
+                        )
+                        && !protectWholeRow {
+                        orphaned.isFlagged = header.isFlagged
+                    }
                     orphaned.date = header.date
                     orphaned.from = header.from
                     orphaned.fromAddress = header.fromAddress
@@ -1299,15 +2004,27 @@ extension SyncEngine {
                     orphaned.subject = header.subject
                     orphaned.snippet = header.snippet
                     orphaned.hasAttachments = header.hasAttachments
-                    orphaned.actionTag = header.actionTag
-                    orphaned.tagSortOrder = header.tagSortOrder
+                    if !isPendingActionTag(info),
+                       !isRecentlyCompletedField(
+                           .actionTag,
+                           info.messageId,
+                           info.rfc822MessageId
+                       ),
+                       !protectWholeRow {
+                        orphaned.actionTag = header.actionTag
+                        orphaned.tagSortOrder = header.tagSortOrder
+                        orphaned.actionTagSetAt = header.actionTagSetAt
+                    }
+                    Self.applyLocalIdentityFieldAuthority(fieldAuthority, to: &orphaned)
                     try orphaned.update(db)
-                    // Update user label associations for reclaimed orphan
-                    for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: orphaned.id, userLabelId: labelId)
-                            .insert(db, onConflict: .ignore)
+                    if !userLabelsAreProtected(info) {
+                        try Self.reconcileUserLabelAssociations(
+                            messageId: orphaned.id,
+                            accountId: accountId,
+                            remoteLabelIds: info.userLabelIds,
+                            remoteSetIsAuthoritative: info.userLabelIdsAreAuthoritative,
+                            db: db
+                        )
                     }
                     newHeaders.append(orphaned)
                 } else {
@@ -1329,12 +2046,14 @@ extension SyncEngine {
                         print("[Sync] DraftInsert: INSERTED id=\(header.id) msgId=\(header.messageId) rfc822=\(header.rfc822MessageId ?? "nil") snippet=\(String(header.snippet.prefix(60)))")
                     }
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
-                    // Insert user label associations
-                    for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
-                            .insert(db, onConflict: .ignore)
+                    if !userLabelsAreProtected(info) {
+                        try Self.reconcileUserLabelAssociations(
+                            messageId: header.id,
+                            accountId: accountId,
+                            remoteLabelIds: info.userLabelIds,
+                            remoteSetIsAuthoritative: info.userLabelIdsAreAuthoritative,
+                            db: db
+                        )
                     }
                     newHeaders.append(header)
                 }

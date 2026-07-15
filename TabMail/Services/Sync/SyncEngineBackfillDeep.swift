@@ -335,8 +335,7 @@ extension SyncEngine {
                             header.hasAttachments = info.hasAttachments
                             header.isReplied = info.isReplied
                             header.isForwarded = info.isForwarded
-                            header.actionTag = info.actionTag
-                            header.tagSortOrder = info.actionTag?.sortOrder ?? 99
+                            header.setActionTag(info.actionTag, at: info.actionTagSetAt ?? Date())
                             try MessageAICache.restoreIfCached(
                                 into: &header,
                                 accountId: accountId,
@@ -344,18 +343,9 @@ extension SyncEngine {
                                 db: db
                             )
                             // ReplyDetect: if message is already replied and tagged as "reply", override to "none"
-                            // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                            // AI cache keeps original LLM value — only the local MessageHeader changes.
                             if header.isReplied && header.actionTag == .reply {
-                                header.actionTag = ActionTag.none
-                                header.tagSortOrder = ActionTag.none.sortOrder
-                                let tagOp = PendingOperation(
-                                    type: .setTag,
-                                    messageIds: [header.stableId],
-                                    accountId: accountId,
-                                    folderPath: folderPath,
-                                    tagValue: ActionTag.none.rawValue
-                                )
-                                try tagOp.insert(db)
+                                header.setActionTag(ActionTag.none)
                                 print("[ReplyDetect] Backfill insert: reply→none for \(header.messageId) (already replied)")
                             }
                             try header.insert(db)
@@ -367,7 +357,11 @@ extension SyncEngine {
                                 // already synced via fetchFolders). INSERT OR IGNORE for idempotency.
                                 try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
                                     .insert(db, onConflict: .ignore)
-                                try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                                try MessageUserLabel(
+                                    messageId: header.id,
+                                    accountId: accountId,
+                                    userLabelId: labelId
+                                )
                                     .insert(db, onConflict: .ignore)
                             }
 
@@ -505,4 +499,3 @@ extension SyncEngine {
         }
     }
 }
-

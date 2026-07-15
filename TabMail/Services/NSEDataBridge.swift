@@ -579,8 +579,8 @@ enum NSEDataBridge {
         /// The value-guarded summary/reminder UPDATE fires whenever any of the
         /// five summary/reminder fields is non-nil.
         let hasSummary: Bool
-        /// The value-guarded action UPDATE (+ `tagSortOrder`, +
-        /// `queueSetTagPendingOp`) fires whenever `actionTag` is non-nil.
+        /// The value-guarded local action UPDATE (+ `tagSortOrder`) fires
+        /// whenever `actionTag` is non-nil.
         let hasAction: Bool
         /// The `notified`-only UPDATE (the `else if msg.notified` branch) can
         /// flip independently of `hasAction` — must be tracked separately or
@@ -628,8 +628,12 @@ enum NSEDataBridge {
     /// invisible until staging drains. Load-bearing — see `verifyDurable`.
     private static func partitionByStageMemo(
         _ processed: [StagedMessage]
-    ) async -> (writeSet: [StagedMessage], skipSet: [StagedMessage]) {
-        guard !processed.isEmpty else { return ([], []) }
+    ) async -> (
+        writeSet: [StagedMessage],
+        skipSet: [StagedMessage],
+        verifiedPushIdentities: [DurablePushIdentity]
+    ) {
+        guard !processed.isEmpty else { return ([], [], []) }
         let memoSnapshot = stageMemo.withLock { $0 }
         var writeSet: [StagedMessage] = []
         var candidates: [StagedMessage] = []
@@ -640,18 +644,20 @@ enum NSEDataBridge {
                 writeSet.append(msg)
             }
         }
-        guard !candidates.isEmpty else { return (writeSet, []) }
-        let durableIds = await verifyDurable(candidates)
+        guard !candidates.isEmpty else { return (writeSet, [], []) }
+        let durableByStagingId = await verifyDurable(candidates)
         var skipSet: [StagedMessage] = []
+        var verifiedPushIdentities: [DurablePushIdentity] = []
         for msg in candidates {
-            if durableIds.contains(msg.id) {
+            if let identity = durableByStagingId[msg.id] {
                 skipSet.append(msg)
+                verifiedPushIdentities.append(identity)
             } else {
                 _ = stageMemo.withLock { $0.removeValue(forKey: msg.id) }
                 writeSet.append(msg)
             }
         }
-        return (writeSet, skipSet)
+        return (writeSet, skipSet, verifiedPushIdentities)
     }
 
     /// Durability verification for stage-memo candidates: confirms the durable
@@ -664,27 +670,96 @@ enum NSEDataBridge {
     /// inside the merge itself (`PriorityGate.privileged`), so going through
     /// `PrioritizedDatabase.read` would re-enter the read-through-merge check
     /// for no benefit (its recursion guard would no-op it anyway) — the raw
-    /// pool is the direct, minimal path. Returns the subset of `candidates`
-    /// (by `.id`) that verified durable.
-    private static func verifyDurable(_ candidates: [StagedMessage]) async -> Set<String> {
-        guard !candidates.isEmpty else { return [] }
-        return (try? await AppDatabase.rawPool.read { db -> Set<String> in
-            var durable: Set<String> = []
+    /// pool is the direct, minimal path. Returns the exact durable identity for
+    /// each candidate (keyed by staging id), so a verified skip does not need a
+    /// second, fallible read after the merge.
+    private static func verifyDurable(
+        _ candidates: [StagedMessage]
+    ) async -> [String: DurablePushIdentity] {
+        guard !candidates.isEmpty else { return [:] }
+        return (try? await AppDatabase.rawPool.read { db -> [String: DurablePushIdentity] in
+            var durable: [String: DurablePushIdentity] = [:]
             for msg in candidates {
                 guard let ref = try DurableIdentityLookup.find(
                     db: db, accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId,
                     rfc822MessageId: msg.rfc822MessageId
-                ) else { continue }
+                ), let header = try MessageHeader.fetchOne(db, key: ref.id) else { continue }
                 if msg.htmlContent != nil || msg.textContent != nil {
                     let hasBody = try Bool.fetchOne(db, sql: """
                         SELECT EXISTS(SELECT 1 FROM messageBody WHERE id = ?)
                         """, arguments: [ref.id]) ?? false
                     guard hasBody else { continue }
                 }
-                durable.insert(msg.id)
+                durable[msg.id] = Self.durablePushIdentity(for: header)
             }
             return durable
-        }) ?? []
+        }) ?? [:]
+    }
+
+    /// Exact main-GRDB identities eligible for push-merge stale protection.
+    /// These values are captured inside the savepoint that wrote/verified the
+    /// row, then promoted only after the enclosing transaction commits. Staged
+    /// metadata alone is never provenance, and a rolled-back transaction never
+    /// contributes an identity.
+    struct DurablePushIdentity: Hashable, Sendable {
+        let accountId: String
+        let folderPath: String
+        let messageId: String
+        let rfc822MessageId: String?
+    }
+
+    private enum DurablePushIdentityError: Error {
+        case missingCommittedHeader(String)
+        case missingCommittedHeaderId(String)
+    }
+
+    private static func durablePushIdentity(
+        headerId: String,
+        db: Database
+    ) throws -> DurablePushIdentity {
+        guard let header = try MessageHeader.fetchOne(db, key: headerId) else {
+            throw DurablePushIdentityError.missingCommittedHeader(headerId)
+        }
+        return durablePushIdentity(for: header)
+    }
+
+    private static func durablePushIdentity(for header: MessageHeader) -> DurablePushIdentity {
+        DurablePushIdentity(
+            accountId: header.accountId,
+            folderPath: header.folderPath,
+            messageId: header.messageId,
+            rfc822MessageId: header.rfc822MessageId
+        )
+    }
+
+    static func committedPushIdentities(
+        phase1: [DurablePushIdentity],
+        phase2: [DurablePushIdentity],
+        verifiedSkips: [DurablePushIdentity]
+    ) -> Set<DurablePushIdentity> {
+        Set(phase1).union(phase2).union(verifiedSkips)
+    }
+
+    static func recentPushProtectionKeys(
+        for identities: Set<DurablePushIdentity>
+    ) -> Set<String> {
+        var keys: Set<String> = []
+        for identity in identities {
+            keys.insert(MessageIdentity.recentlyCompletedPushKey(
+                accountId: identity.accountId,
+                folderPath: identity.folderPath,
+                messageId: identity.messageId
+            ))
+            if let rfc822MessageId = identity.rfc822MessageId,
+               !rfc822MessageId.isEmpty {
+                keys.insert(MessageIdentity.recentlyCompletedPushKey(
+                    accountId: identity.accountId,
+                    folderPath: identity.folderPath,
+                    messageId: EmailFilter.normalizeMessageId(rfc822MessageId)
+                ))
+            }
+        }
+        return keys
     }
 
     /// One staged row found STALE-BY-MOVE by `detectStaleByMoveRows`. `id` is
@@ -1022,7 +1097,8 @@ enum NSEDataBridge {
             // stale-protection refresh below also runs over the full set.
             // See `partitionByStageMemo` / `StageKey` / `stageMemo`.
             // ============================================================
-            let (writeSet, skipSet) = await Self.partitionByStageMemo(processed)
+            let (writeSet, skipSet, verifiedPushIdentities) =
+                await Self.partitionByStageMemo(processed)
             let writeSetById = Dictionary(uniqueKeysWithValues: writeSet.map { ($0.id, $0) })
             if !skipSet.isEmpty {
                 BootProfiler.mark("merge: skipped \(skipSet.count) unchanged staged row(s) (stage-memo, durable-verified)")
@@ -1051,6 +1127,7 @@ enum NSEDataBridge {
             // and phase 2 still has the row to write the body from.
             // ============================================================
             var phase1HeaderIds: [String] = []
+            var phase1PushIdentities: [DurablePushIdentity] = []
             // DIAGNOSTIC (debug-gated): split the phase-1 write into THREE parts so a
             // multi-second EXEC can be attributed precisely:
             //   acquireWriter = queue + SQLite writer-lock wait (e.g. blocked behind a
@@ -1067,14 +1144,22 @@ enum NSEDataBridge {
             // queue behind / hold the single GRDB writer for nothing.
             if !writeSet.isEmpty {
             do {
-                phase1HeaderIds = try await AppDatabase.dbPool.write(label: "merge.phase1") { db -> [String] in
+                let phase1Result: (
+                    headerIds: [String],
+                    pushIdentities: [DurablePushIdentity]
+                ) = try await AppDatabase.dbPool.write(label: "merge.phase1") { db in
                     // Writer acquired — everything before here was queue + writer-lock wait.
                     phase1LoopStart.withLock { $0 = CFAbsoluteTimeGetCurrent() }
                     var localIds: [String] = []
+                    var localPushIdentities: [DurablePushIdentity] = []
                     for msg in writeSet {
                         // Per-message savepoint: a failure leaves THIS row in
                         // staging for retry (same contract as phase 2's loop) —
                         // siblings still commit.
+                        var committedRow: (
+                            headerId: String,
+                            pushIdentity: DurablePushIdentity
+                        )?
                         do {
                             try db.inSavepoint {
                                 // Find existing header: provider messageId first,
@@ -1084,7 +1169,9 @@ enum NSEDataBridge {
                                     db: db, accountId: msg.accountId, folderPath: msg.folderPath,
                                     messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId
                                 )
+                                let headerId: String
                                 if let id = existingRef?.id {
+                                    headerId = id
                                     // Already visible (sync or a prior merge). SEED
                                     // the snippet ONLY if the header has none yet —
                                     // so the fast header render has something to
@@ -1113,7 +1200,6 @@ enum NSEDataBridge {
                                             arguments: [seed, id]
                                         )
                                     }
-                                    localIds.append(id)
                                 } else {
                                     // No header yet — create the header-only row
                                     // (snippet + thread + junctions; NO body blob,
@@ -1122,13 +1208,21 @@ enum NSEDataBridge {
                                     _ = try Self.insertNewHeaderFromStaging(
                                         msg, db: db, ftsBatch: &dummyFts, headerOnly: true
                                     )
-                                    localIds.append(MessageIdentity.headerId(
+                                    headerId = MessageIdentity.headerId(
                                         accountId: msg.accountId,
                                         folderPath: msg.folderPath,
                                         messageId: msg.messageId
-                                    ))
+                                    )
                                 }
+                                committedRow = (
+                                    headerId,
+                                    try Self.durablePushIdentity(headerId: headerId, db: db)
+                                )
                                 return .commit
+                            }
+                            if let committedRow {
+                                localIds.append(committedRow.headerId)
+                                localPushIdentities.append(committedRow.pushIdentity)
                             }
                         } catch {
                             // Savepoint rolled back + re-threw; outer tx still
@@ -1138,8 +1232,10 @@ enum NSEDataBridge {
                         }
                     }
                     phase1BodyEnd.withLock { $0 = CFAbsoluteTimeGetCurrent() }
-                    return localIds
+                    return (localIds, localPushIdentities)
                 }
+                phase1HeaderIds = phase1Result.headerIds
+                phase1PushIdentities = phase1Result.pushIdentities
                 if DebugModeManager.isLoggingEnabled() {
                     let loopStart = phase1LoopStart.withLock { $0 }
                     let bodyEnd = phase1BodyEnd.withLock { $0 }
@@ -1237,6 +1333,9 @@ enum NSEDataBridge {
             // total_changes delta). Drives the SECOND, end-of-merge render so a
             // no-op re-merge doesn't reload. Assigned from writeResult.realChanged.
             var mainWriteChanged = false
+            // Exact durable identities captured inside phase 2 savepoints.
+            // Assigned only after the outer transaction commits successfully.
+            var phase2PushIdentities: [DurablePushIdentity] = []
 
             // Tracks whether the outer dbPool.write actually committed. Per-
             // message savepoints can RELEASE successfully but if the outer
@@ -1266,7 +1365,15 @@ enum NSEDataBridge {
                 // late-surfacing residual is writer contention, not the write itself.
                 let writeReqT0 = CFAbsoluteTimeGetCurrent()
                 BootProfiler.mark("merge: requesting GRDB writer for \(writeSet.count) staged msg(s)")
-                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool, committedIds: [String]) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
+                let writeResult: (
+                    ids: [String],
+                    committed: Int,
+                    fts: [(headerId: String, textContent: String)],
+                    headers: [String],
+                    realChanged: Bool,
+                    committedIds: [String],
+                    pushIdentities: [DurablePushIdentity]
+                ) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
                     BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
                     // Connection-level write counter snapshot. The delta over this
                     // whole transaction tells us whether phase 2 changed anything
@@ -1282,6 +1389,7 @@ enum NSEDataBridge {
                     var localCommittedMsgIds: [String] = []
                     var localFtsAccumulator: [(headerId: String, textContent: String)] = []
                     var localHeaderAccumulator: [String] = []
+                    var localPushIdentityAccumulator: [DurablePushIdentity] = []
                     for msg in writeSet {
                         // Per-message savepoint: a single bad row (FK
                         // violation, ThreadUtils throw, FTS contention, etc.)
@@ -1303,6 +1411,7 @@ enum NSEDataBridge {
                         // newly inserted). Captured regardless of body so the post-tx
                         // flush can index it + flip headerComplete → inbox-visible.
                         var committedHeaderId: String?
+                        var committedPushIdentity: DurablePushIdentity?
                         do {
                             try db.inSavepoint {
                                 // Find existing MessageHeader in main DB.
@@ -1399,29 +1508,31 @@ enum NSEDataBridge {
                                     // `ORDER BY tagSortOrder ASC, date DESC`, so a
                                     // 'reply' tag with the default 99 sort lands at
                                     // the bottom (caught via [TriageSortDiag]). OR-in
-                                    // `notified`. Queue the IMAP tag write here too
-                                    // (idempotent via deterministic id), since it
-                                    // only matters once a tag exists.
+                                    // `notified`. Action tags remain local-only.
                                     if let actionRaw = msg.actionTag {
                                         let aiTagSortOrder = ActionTag(rawValue: actionRaw)?.sortOrder ?? 99
                                         // Value-guarded (same rationale as summary): a re-merge of
                                         // a row whose tag is already applied is a 0-row no-op. The
                                         // third OR-term keeps the notified 0→1 flip working (the
                                         // CASE sets notified=1 only when msg.notified is true).
+                                        // `actionTagSetAt` only re-stamps when the tag VALUE actually
+                                        // changes (the CASE re-checks the pre-update column) — a
+                                        // notified-only re-merge of an already-applied tag must not
+                                        // reset the TTL clock (SyncConfig.actionTagTTLSeconds).
+                                        let now = Date()
                                         try db.execute(sql: """
                                             UPDATE messageHeader SET
                                                 actionTag = ?, tagSortOrder = ?,
+                                                actionTagSetAt = CASE WHEN actionTag IS NOT ? THEN ? ELSE actionTagSetAt END,
                                                 notified = CASE WHEN ? THEN 1 ELSE notified END
                                             WHERE id = ? AND (
                                                 actionTag IS NOT ? OR tagSortOrder IS NOT ?
                                                 OR (? = 1 AND notified = 0)
                                             )
                                             """, arguments: [
-                                                actionRaw, aiTagSortOrder, msg.notified, headerId,
+                                                actionRaw, aiTagSortOrder, actionRaw, now, msg.notified, headerId,
                                                 actionRaw, aiTagSortOrder, msg.notified
                                             ])
-                                        try queueSetTagPendingOp(db: db, accountId: msg.accountId,
-                                                                 messageId: msg.messageId, tag: msg.actionTag)
                                     } else if msg.notified {
                                         // Notification delivered but no action tag (AI failed / passive).
                                         // `AND notified = 0`: a re-merge of an already-notified kept
@@ -1506,12 +1617,6 @@ enum NSEDataBridge {
                                         messageId: msg.messageId
                                     )
 
-                                    // Queue IMAP tag write so the tag propagates to the server.
-                                    // Without this, the fresh-header branch would set header.actionTag
-                                    // locally but never sync it to the provider.
-                                    try queueSetTagPendingOp(db: db, accountId: msg.accountId,
-                                                             messageId: msg.messageId, tag: msg.actionTag)
-
                                     // Also cache AI results for resilience.
                                     // Same shared-helper key as the existing-header branch.
                                     if msg.aiCompleted,
@@ -1541,6 +1646,13 @@ enum NSEDataBridge {
                                             ])
                                     }
                                 }
+                                guard let committedHeaderId else {
+                                    throw DurablePushIdentityError.missingCommittedHeaderId(msg.id)
+                                }
+                                committedPushIdentity = try Self.durablePushIdentity(
+                                    headerId: committedHeaderId,
+                                    db: db
+                                )
                                 return .commit
                             }
                             // Savepoint committed — promote local FTS batch and
@@ -1548,6 +1660,9 @@ enum NSEDataBridge {
                             localFtsAccumulator.append(contentsOf: localFtsBatch)
                             if let hid = committedHeaderId {
                                 localHeaderAccumulator.append(hid)
+                            }
+                            if let committedPushIdentity {
+                                localPushIdentityAccumulator.append(committedPushIdentity)
                             }
                             localCommitted += 1
                             localCommittedMsgIds.append(msg.id)
@@ -1571,7 +1686,15 @@ enum NSEDataBridge {
                         }
                     }
                     let tcEnd = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
-                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart, committedIds: localCommittedMsgIds)
+                    return (
+                        ids: localMergedIds,
+                        committed: localCommitted,
+                        fts: localFtsAccumulator,
+                        headers: localHeaderAccumulator,
+                        realChanged: tcEnd > tcStart,
+                        committedIds: localCommittedMsgIds,
+                        pushIdentities: localPushIdentityAccumulator
+                    )
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
@@ -1584,6 +1707,7 @@ enum NSEDataBridge {
                 ftsBatch = writeResult.fts
                 allMergedHeaderIds = writeResult.headers
                 mainWriteChanged = writeResult.realChanged
+                phase2PushIdentities = writeResult.pushIdentities
                 outerCommitted = true
                 // Main tx done. With the "writer ACQUIRED after Xms" mark above this
                 // decomposes the merge: START→found = read; found→ACQUIRED = writer
@@ -1613,35 +1737,26 @@ enum NSEDataBridge {
             }
             } // if !writeSet.isEmpty (phase 2)
 
-            // STALE-DETECTION RACE FIX: a message that just became durable via this
-            // push-merge is NOT registered in pending-ops / recentlyCompleted, so a
-            // concurrent/next sync whose server fetch TRANSIENTLY misses it (STATUS/
-            // fetch propagation lag — the thing flushServerState fights) STALE-DELETES
-            // it. Symptom: insta-merge shows the new mail, a sync drops it, a later
-            // sync brings it back. Register EVERY staged id (not just `writeSet`'s —
-            // 5b: a KEPT gradual row this pass SKIPPED still needs its protection
-            // refreshed, the race it guards against doesn't care whether THIS pass
-            // wrote anything) as recently-arrived so stale detection (fullSync +
-            // reconcile + delta all read AccountManager.shared.recentlyCompleted)
-            // SKIPS them for `SyncConfig.pushMergeStaleProtectionTTLSeconds`, by
-            // which point the server reliably returns them. Protecting-from-deletion
-            // is the safe direction (never deletes; worst case a genuinely-gone
-            // message lingers one extra TTL). Keys: provider messageId (exact) +
-            // normalized rfc822 (survives UID-remap), matching both stale-check
-            // paths. Uses the longer push-merge TTL (not the default
-            // action-completion TTL) — see SyncConfig.pushMergeStaleProtectionTTLSeconds.
+            // STALE-DETECTION RACE FIX: publish only identities captured by a
+            // successful phase-1/phase-2 transaction or the verification read
+            // that admitted a memo skip. There is deliberately NO post-commit
+            // GRDB read here: a transient read failure must not erase protection
+            // for rows that just committed. Conversely, an outer rollback never
+            // assigns either phase accumulator and therefore publishes nothing.
+            // Exact account+folder keys avoid cross-account collisions and avoid
+            // freezing sibling Gmail label rows.
             do {
-                var protectIds: [String] = []
-                for m in processed {
-                    protectIds.append(m.messageId)
-                    if let rfc = m.rfc822MessageId, !rfc.isEmpty {
-                        protectIds.append(EmailFilter.normalizeMessageId(rfc))
-                    }
-                }
-                await AccountManager.shared.recordRecentlyCompleted(
-                    messageIds: protectIds, ttl: SyncConfig.pushMergeStaleProtectionTTLSeconds
+                let durablePushRows = Self.committedPushIdentities(
+                    phase1: phase1PushIdentities,
+                    phase2: phase2PushIdentities,
+                    verifiedSkips: verifiedPushIdentities
                 )
-                BootProfiler.mark("merge: stale-protected \(processed.count) recently-arrived msg(s) (\(Int(SyncConfig.pushMergeStaleProtectionTTLSeconds))s) — prevents pre-verify drop")
+                let protectIds = Self.recentPushProtectionKeys(for: durablePushRows)
+                await AccountManager.shared.recordRecentlyCompleted(
+                    messageIds: Array(protectIds),
+                    ttl: SyncConfig.pushMergeStaleProtectionTTLSeconds
+                )
+                BootProfiler.mark("merge: stale-protected \(durablePushRows.count) durable recently-arrived msg(s) (\(Int(SyncConfig.pushMergeStaleProtectionTTLSeconds))s) — prevents pre-verify drop")
             }
 
             // Drive the render/recount off REAL durable changes AND outer-tx
@@ -1796,7 +1911,7 @@ enum NSEDataBridge {
         }
 
         // 2. Process inbox removals — messages archived/deleted/moved while app was sleeping
-        if mergeInboxRemovals(from: nseDB) { didMutate = true; endOfMergeChanged = true }
+        if await mergeInboxRemovals(from: nseDB) { didMutate = true; endOfMergeChanged = true }
 
         // Consume pending task results
         if consumePendingTaskResults(from: nseDB) { didMutate = true; endOfMergeChanged = true }
@@ -1919,7 +2034,7 @@ enum NSEDataBridge {
     /// Returns true if any header rows were removed from main GRDB.
     /// Per-removal success tracking: failed rows stay in staging and retry
     /// next wake; only committed removals are cleared.
-    private static func mergeInboxRemovals(from nseDB: DatabaseQueue) -> Bool {
+    private static func mergeInboxRemovals(from nseDB: DatabaseQueue) async -> Bool {
         struct Removal {
             let id: String
             let accountId: String
@@ -1928,7 +2043,7 @@ enum NSEDataBridge {
 
         let removals: [Removal]
         do {
-            removals = try nseDB.read { db in
+            removals = try await nseDB.read { db in
                 guard try db.tableExists("nse_inbox_removal") else { return [] }
                 return try Row.fetchAll(db, sql: "SELECT * FROM nse_inbox_removal").map { row in
                     Removal(id: row["id"], accountId: row["accountId"], messageId: row["messageId"])
@@ -1949,7 +2064,11 @@ enum NSEDataBridge {
         var outerCommitted = false
 
         do {
-            try AppDatabase.dbPool.write { db in
+            let writeResult: (ids: [String], deleted: Int) = try await AppDatabase.dbPool.write(
+                label: "merge.inbox-removals"
+            ) { db in
+                var localIds: [String] = []
+                var localDeleted = 0
                 // Resolve inbox folder ids once per merge using the authoritative
                 // role marker. Replaces the old `folderId LIKE '%:INBOX'` scan,
                 // which was both unindexable and semantically wrong for accounts
@@ -1958,7 +2077,7 @@ enum NSEDataBridge {
                     sql: "SELECT id FROM folder WHERE role = ?",
                     arguments: [FolderRole.inbox.rawValue]
                 )
-                guard !inboxFolderIds.isEmpty else { return }
+                guard !inboxFolderIds.isEmpty else { return ([], 0) }
                 let inboxPlaceholders = inboxFolderIds.map { _ in "?" }.joined(separator: ", ")
 
                 for removal in removals {
@@ -1973,13 +2092,16 @@ enum NSEDataBridge {
                             WHERE accountId = ? AND messageId = ?
                               AND folderId IN (\(inboxPlaceholders))
                             """, arguments: StatementArguments([removal.accountId, removal.messageId] + inboxFolderIds))
-                        deletedTotal += db.changesCount
-                        successfullyConsumedIds.append(removal.id)
+                        localDeleted += db.changesCount
+                        localIds.append(removal.id)
                     } catch {
                         print("[NSEDataBridge] Per-removal failed for \(removal.id): \(error) — left in staging for retry")
                     }
                 }
+                return (localIds, localDeleted)
             }
+            successfullyConsumedIds = writeResult.ids
+            deletedTotal = writeResult.deleted
             // dbPool.write returned normally → outer tx committed; the per-
             // removal DELETEs are durable and we can safely clear staging.
             outerCommitted = true
@@ -2001,8 +2123,9 @@ enum NSEDataBridge {
         }
 
         // Clear only the removals that committed.
-        try? nseDB.write { db in
-            for id in successfullyConsumedIds {
+        let consumedIds = successfullyConsumedIds
+        try? await nseDB.write { db in
+            for id in consumedIds {
                 try db.execute(sql: "DELETE FROM nse_inbox_removal WHERE id = ?", arguments: [id])
             }
         }
@@ -2011,7 +2134,7 @@ enum NSEDataBridge {
         // Best-effort UI hygiene — uncommitted removals will retry next wake
         // and clear their notifications then.
         let center = UNUserNotificationCenter.current()
-        let consumedSet = Set(successfullyConsumedIds)
+        let consumedSet = Set(consumedIds)
         for removal in removals where consumedSet.contains(removal.id) {
             let notificationId = "email-\(removal.accountId)-\(removal.messageId)"
             center.removeDeliveredNotifications(withIdentifiers: [notificationId])
@@ -2144,34 +2267,18 @@ enum NSEDataBridge {
 
     // MARK: - Clear Notification on Read
 
+    #if DEBUG
+    static let clearNotificationRecorderForTesting = Mutex<(@Sendable (String, String) -> Void)?>(nil)
+    #endif
+
     /// Remove the notification for a message from Notification Center.
     /// Call when user reads a message in the app.
     static func clearNotification(accountId: String, messageId: String) {
         let notificationId = "email-\(accountId)-\(messageId)"
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [notificationId])
-    }
-
-    // MARK: - Pending op queue (idempotent)
-
-    /// Queue a `setTag` pending operation with a deterministic id, so re-runs
-    /// of the merge (e.g. after a crash between write + staging-row delete)
-    /// don't stack duplicate ops for the same message+tag. The deterministic
-    /// id + `INSERT OR IGNORE` makes dedup explicit — on collision the existing
-    /// queued op is preserved; other SQL errors surface via `throws`.
-    ///
-    /// Skips entirely when tag is nil, empty, or "none" (no IMAP write needed).
-    fileprivate static func queueSetTagPendingOp(
-        db: GRDB.Database, accountId: String, messageId: String, tag: String?
-    ) throws {
-        guard let tag, !tag.isEmpty, tag != "none" else { return }
-        let messageIdsJSON = (try? JSONSerialization.data(withJSONObject: [messageId]))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        // Deterministic id: (accountId, messageId, setTag, tag) tuple.
-        let id = "setTag:\(accountId):\(messageId):\(tag)"
-        try db.execute(sql: """
-            INSERT OR IGNORE INTO pendingOperation (id, type, messageIdsJSON, accountId, folderPath, tagValue, createdAt, status, retryCount)
-            VALUES (?, 'setTag', ?, ?, 'INBOX', ?, ?, 'queued', 0)
-            """, arguments: [id, messageIdsJSON, accountId, tag, Date()])
+        #if DEBUG
+        clearNotificationRecorderForTesting.withLock { $0 }?(accountId, messageId)
+        #endif
     }
 
     // MARK: - NSE-rendered Body Persistence (merge path)
@@ -2655,7 +2762,6 @@ enum NSEDataBridge {
     ///     labels.
     ///   • `ReachedOutStore.markNotified` if the NSE delivered an active
     ///     reminder notification.
-    ///   • `pendingOperation` row for IMAP tag sync (via `queueSetTagPendingOp`).
     ///   • `messageAICache` entry if AI completed.
     ///
     /// Returns `true` if the INSERT created a new row; `false` if sync raced
@@ -2746,8 +2852,7 @@ enum NSEDataBridge {
                 header.reminderContent = msg.reminderContent
             }
             if let aiRaw = msg.actionTag, let aiTag = ActionTag(rawValue: aiRaw) {
-                header.actionTag = aiTag
-                header.tagSortOrder = aiTag.sortOrder
+                header.setActionTag(aiTag)
             }
         }
         // INSERT OR IGNORE — if sync already created it, don't overwrite.
@@ -2821,7 +2926,11 @@ enum NSEDataBridge {
                     id: labelId, accountId: msg.accountId,
                     name: labelId, isSystem: false
                 ).insert(db, onConflict: .ignore)
-                try MessageUserLabel(messageId: newHeaderId, userLabelId: labelId)
+                try MessageUserLabel(
+                    messageId: newHeaderId,
+                    accountId: msg.accountId,
+                    userLabelId: labelId
+                )
                     .insert(db, onConflict: .ignore)
             }
         }

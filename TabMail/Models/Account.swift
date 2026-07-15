@@ -23,6 +23,16 @@ enum AccountProvider: String, Codable, Sendable {
         case .caldav: return "CalDAV"
         }
     }
+
+    /// Whether the mail adapter implements remote user-label mutations.
+    var supportsRemoteUserLabels: Bool {
+        switch self {
+        case .gmail, .imap, .icloud:
+            true
+        case .outlook, .caldav:
+            false
+        }
+    }
 }
 
 struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable, Equatable {

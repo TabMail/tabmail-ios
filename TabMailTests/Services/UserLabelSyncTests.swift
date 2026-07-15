@@ -47,7 +47,7 @@ struct UserLabelSyncTests {
 
         // Simulate what backfill does: insert header + labels in same transaction
         try db.write { db in
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: "100", subject: "Test", from: "Sender",
                 fromAddress: "sender@test.com", to: "to@test.com",
                 date: Date(), snippet: "", folderId: "acc1:INBOX",
@@ -59,7 +59,7 @@ struct UserLabelSyncTests {
             for labelId in labelIds {
                 try UserLabel(id: labelId, accountId: "acc1", name: labelId, isSystem: false)
                     .insert(db, onConflict: .ignore)
-                try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                try MessageUserLabel(messageId: header.id, accountId: "acc1", userLabelId: labelId)
                     .insert(db, onConflict: .ignore)
             }
         }
@@ -85,99 +85,18 @@ struct UserLabelSyncTests {
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false)
                 .insert(db, onConflict: .ignore)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1")
+            try MessageUserLabel(messageId: header.id, accountId: "acc1", userLabelId: "L1")
                 .insert(db, onConflict: .ignore)
         }
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false)
                 .insert(db, onConflict: .ignore)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1")
+            try MessageUserLabel(messageId: header.id, accountId: "acc1", userLabelId: "L1")
                 .insert(db, onConflict: .ignore)
         }
 
         let count = try db.read { try MessageUserLabel.fetchCount($0) }
         #expect(count == 1)
-    }
-
-    // MARK: - Optimistic UI Flow
-
-    @Test("Apply label: inserts join row + queues PendingOperation")
-    func applyLabelFlow() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db)
-
-        try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-        }
-
-        // Simulate applyUserLabel
-        try db.write { db in
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1")
-                .insert(db, onConflict: .ignore)
-            var op = PendingOperation(
-                type: .addUserLabel,
-                messageIds: [header.stableId],
-                accountId: header.accountId,
-                folderPath: header.folderId,
-                userLabelId: "L1"
-            )
-            try op.insert(db)
-        }
-
-        // Verify join row exists
-        let joinCount = try db.read { try MessageUserLabel.fetchCount($0) }
-        #expect(joinCount == 1)
-
-        // Verify PendingOperation exists
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .addUserLabel)
-        #expect(ops[0].userLabelId == "L1")
-    }
-
-    @Test("Remove label: deletes join row + queues PendingOperation")
-    func removeLabelFlow() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db)
-
-        // Setup: label applied
-        try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1").insert(db)
-        }
-
-        // Simulate removeUserLabel
-        try db.write { db in
-            try MessageUserLabel
-                .filter(Column("messageId") == header.id && Column("userLabelId") == "L1")
-                .deleteAll(db)
-            var op = PendingOperation(
-                type: .removeUserLabel,
-                messageIds: [header.stableId],
-                accountId: header.accountId,
-                folderPath: header.folderId,
-                userLabelId: "L1"
-            )
-            try op.insert(db)
-        }
-
-        // Verify join row gone
-        let joinCount = try db.read { try MessageUserLabel.fetchCount($0) }
-        #expect(joinCount == 0)
-
-        // Verify PendingOperation exists
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .removeUserLabel)
-        #expect(ops[0].userLabelId == "L1")
-
-        // UserLabel still exists (we never delete label definitions)
-        let labelCount = try db.read { try UserLabel.fetchCount($0) }
-        #expect(labelCount == 1)
     }
 
     // MARK: - MessageSnapshot with Labels
@@ -192,8 +111,8 @@ struct UserLabelSyncTests {
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
             try UserLabel(id: "L2", accountId: "acc1", name: "Play", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: header.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: header.id, accountId: "acc1", userLabelId: "L2").insert(db)
         }
 
         let snapshot = try db.read { db in
@@ -236,8 +155,8 @@ struct UserLabelSyncTests {
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
             try UserLabel(id: "L2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: msg1.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg2.id, accountId: "acc1", userLabelId: "L2").insert(db)
         }
 
         // Load labels for both messages (simulating thread union)
@@ -246,12 +165,12 @@ struct UserLabelSyncTests {
             try UserLabelStore.loadLabels(for: allIds, in: db)
         }
 
-        // Union: collect all labels, deduplicate by ID
-        var seenIds: Set<String> = []
+        // Union: collect all labels, deduplicate by account + provider ID.
+        var seenLabels: Set<UserLabelIdentity> = []
         var unionLabels: [UserLabel] = []
         for id in allIds {
             for label in labelsByMsg[id] ?? [] {
-                if seenIds.insert(label.id).inserted {
+                if seenLabels.insert(label.scopedIdentity).inserted {
                     unionLabels.append(label)
                 }
             }
@@ -274,8 +193,8 @@ struct UserLabelSyncTests {
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
             // Both messages have the same label
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg2.id, accountId: "acc1", userLabelId: "L1").insert(db)
         }
 
         let allIds = [msg1.id, msg2.id]
@@ -283,11 +202,11 @@ struct UserLabelSyncTests {
             try UserLabelStore.loadLabels(for: allIds, in: db)
         }
 
-        var seenIds: Set<String> = []
+        var seenLabels: Set<UserLabelIdentity> = []
         var unionLabels: [UserLabel] = []
         for id in allIds {
             for label in labelsByMsg[id] ?? [] {
-                if seenIds.insert(label.id).inserted {
+                if seenLabels.insert(label.scopedIdentity).inserted {
                     unionLabels.append(label)
                 }
             }
@@ -357,5 +276,198 @@ struct UserLabelSyncTests {
         let segments = UserLabelDisplaySegment.expand([label])
         #expect(segments.count == 1)
         #expect(segments[0].displayName == "Simple")
+    }
+}
+
+@Suite("UserLabel menu durable admission", .serialized, .processGlobalState)
+@MainActor
+struct UserLabelMenuAdmissionTests {
+    private func makeTestDB(provider: AccountProvider = .gmail) throws -> (
+        pool: DatabasePool,
+        header: MessageHeader,
+        label: UserLabel,
+        dir: URL,
+        previous: AppDatabase?
+    ) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: dir.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prior = current
+            current = appDatabase
+            return prior
+        }
+
+        var account = Account(
+            emailAddress: "user-label@example.com",
+            displayName: "Test",
+            provider: provider
+        )
+        account.id = "user-label-admission-account"
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+        var header = MessageHeader(
+            messageId: "provider-message-id",
+            subject: "Label admission",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "Body",
+            folderId: inbox.id,
+            accountId: account.id,
+            folderPath: inbox.path,
+            isInInbox: true
+        )
+        header.headerComplete = true
+        header.rfc822MessageId = "  <label-action@example.com>  "
+        let label = UserLabel(
+            id: "Label_Test",
+            accountId: account.id,
+            name: "Test Label",
+            isSystem: false
+        )
+        let storedHeader = header
+        try pool.writeWithoutTransaction { db in
+            try account.insert(db)
+            try inbox.insert(db)
+            try storedHeader.insert(db)
+            try label.insert(db)
+        }
+        return (pool, storedHeader, label, dir, previous)
+    }
+
+    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
+        AppDatabase.shared.withLock { $0 = previous }
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    @Test("real menu apply/remove transactions preserve local final state behind RFC admission")
+    func applyAndRemoveUseProductionTransaction() async throws {
+        let (pool, header, label, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir) }
+
+        let menu = UserLabelMenuView(messageSnapshot: MessageSnapshot(from: header))
+        let appliedResult = await menu.applyLabel(label)
+        #expect(appliedResult)
+        let applied = try await pool.read { db in
+            try MessageUserLabel
+                .filter(Column("messageId") == header.id && Column("userLabelId") == label.id)
+                .fetchCount(db)
+        }
+        #expect(applied == 1)
+        let applyOperations = try await pool.read { db in
+            try PendingOperation.fetchAll(db)
+        }
+        #expect(applyOperations.count == 1)
+        guard applyOperations.count == 1 else { return }
+        #expect(applyOperations[0].type == .addUserLabel)
+        #expect(applyOperations[0].messageIds == ["label-action@example.com"])
+        #expect(applyOperations[0].accountId == header.accountId)
+        #expect(applyOperations[0].folderPath == header.folderPath)
+        #expect(applyOperations[0].userLabelId == label.id)
+
+        let removedResult = await menu.removeLabel(label)
+        #expect(removedResult)
+        let remaining = try await pool.read { db in
+            try MessageUserLabel
+                .filter(Column("messageId") == header.id && Column("userLabelId") == label.id)
+                .fetchCount(db)
+        }
+        #expect(remaining == 0)
+        let allOperations = try await pool.read { db in
+            try PendingOperation.order(Column("createdAt")).fetchAll(db)
+        }
+        #expect(allOperations.count == 2)
+        guard allOperations.count == 2 else { return }
+        #expect(allOperations.map(\.type) == [.addUserLabel, .removeUserLabel])
+        #expect(allOperations.allSatisfy { $0.messageIds == ["label-action@example.com"] })
+    }
+
+    @Test("real menu transaction rechecks fresh header identity before local or durable mutation")
+    func freshInvalidHeaderRefusesApply() async throws {
+        let (pool, header, label, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir) }
+
+        let menu = UserLabelMenuView(messageSnapshot: MessageSnapshot(from: header))
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET rfc822MessageId = NULL WHERE id = ?",
+                arguments: [header.id]
+            )
+        }
+
+        let appliedResult = await menu.applyLabel(label)
+        #expect(!appliedResult)
+        let result = try await pool.read { db in
+            (
+                try MessageUserLabel.fetchCount(db),
+                try PendingOperation.fetchCount(db)
+            )
+        }
+        #expect(result.0 == 0)
+        #expect(result.1 == 0)
+    }
+
+    @Test("real menu transaction refuses a label owned by another account")
+    func mismatchedLabelAccountRefusesMutation() async throws {
+        let (pool, header, label, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir) }
+
+        let foreignLabel = UserLabel(
+            id: label.id,
+            accountId: "different-account",
+            name: "Different Account Label",
+            isSystem: false
+        )
+        let menu = UserLabelMenuView(messageSnapshot: MessageSnapshot(from: header))
+
+        #expect(!(await menu.applyLabel(foreignLabel)))
+        #expect(!(await menu.removeLabel(foreignLabel)))
+        let result = try await pool.read { db in
+            (
+                try MessageUserLabel.fetchCount(db),
+                try PendingOperation.fetchCount(db)
+            )
+        }
+        #expect(result.0 == 0)
+        #expect(result.1 == 0)
+    }
+
+    @Test(
+        "unsupported providers refuse menu label admission without changing final local or durable state",
+        arguments: [AccountProvider.outlook, .caldav]
+    )
+    func unsupportedProviderRefusesMutation(provider: AccountProvider) async throws {
+        let (pool, header, label, dir, previous) = try makeTestDB(provider: provider)
+        defer { restoreTestDB(previous: previous, dir: dir) }
+
+        let menu = UserLabelMenuView(messageSnapshot: MessageSnapshot(from: header))
+        #expect(!(await menu.applyLabel(label)))
+
+        try await pool.writeWithoutTransaction { db in
+            try MessageUserLabel(
+                messageId: header.id,
+                accountId: header.accountId,
+                userLabelId: label.id
+            ).insert(db, onConflict: .ignore)
+        }
+        #expect(!(await menu.removeLabel(label)))
+
+        let final = try await pool.read { db in
+            (
+                try MessageUserLabel
+                    .filter(Column("messageId") == header.id && Column("userLabelId") == label.id)
+                    .fetchCount(db),
+                try PendingOperation.fetchCount(db)
+            )
+        }
+        #expect(final.0 == 1)
+        #expect(final.1 == 0)
     }
 }

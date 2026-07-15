@@ -5,17 +5,27 @@
 import Foundation
 import GRDB
 
+/// Provider label identifiers are unique only within an account.
+struct UserLabelIdentity: Hashable, Sendable {
+    let accountId: String
+    let id: String
+}
+
 // MARK: - UserLabel
 
-/// A user-visible label (Gmail label, IMAP keyword, or Exchange category).
+/// A user-visible remote label (Gmail label or IMAP keyword).
 /// TabMail's internal `tm_*` labels are NOT stored here — those are handled by ActionTag.
 struct UserLabel: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashable, Sendable {
     static let databaseTableName = "userLabel"
 
-    var id: String            // Gmail: label ID (e.g., "Label_123"), IMAP: keyword string (lowercased)
-    var accountId: String     // FK → account.id
+    var id: String            // Account-local Gmail label ID or IMAP keyword
+    var accountId: String     // FK → account.id; forms the durable identity with id
     var name: String          // Display name
     var isSystem: Bool        // Gmail system labels (STARRED, IMPORTANT, etc.) — stored but filtered from display
+
+    var scopedIdentity: UserLabelIdentity {
+        UserLabelIdentity(accountId: accountId, id: id)
+    }
 }
 
 // MARK: - MessageUserLabel
@@ -25,11 +35,15 @@ struct MessageUserLabel: Codable, FetchableRecord, PersistableRecord, Sendable {
     static let databaseTableName = "messageUserLabel"
 
     var messageId: String     // FK → messageHeader.id
-    var userLabelId: String   // FK → userLabel.id
+    var accountId: String     // FK component → userLabel.accountId
+    var userLabelId: String   // FK component → userLabel.id
 
     // MARK: - Associations
 
-    static let userLabel = belongsTo(UserLabel.self, using: ForeignKey(["userLabelId"]))
+    static let userLabel = belongsTo(
+        UserLabel.self,
+        using: ForeignKey(["accountId", "userLabelId"], to: ["accountId", "id"])
+    )
 }
 
 // MARK: - MessageUserLabelWithUserLabel

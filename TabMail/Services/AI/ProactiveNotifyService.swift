@@ -388,7 +388,8 @@ actor ProactiveNotifyService {
                     dueTime: r.dueTime
                 ),
                 accountId: header?.accountId ?? "",
-                messageId: r.messageId ?? ""
+                messageId: r.messageId ?? "",
+                rfc822MessageId: header?.rfc822MessageId
             )
             var info = content.userInfo
             info["hash"] = r.hash

@@ -373,8 +373,7 @@ enum DemoSeed {
             header.rfc822MessageId = rfc822
             header.isRead = m.isRead
             header.isFlagged = m.isFlagged
-            header.actionTag = m.action
-            header.tagSortOrder = m.action?.sortOrder ?? 99
+            header.setActionTag(m.action)
             header.summaryBlurb = m.summaryBlurb
             // Empty-string sentinel = "reply pipeline ran, no reply needed"
             // (MessageSnapshot.swift:32). Without this, a tagged demo message

@@ -82,6 +82,22 @@ struct PassiveContentTests {
         #expect(c.sound == nil)
     }
 
+    @Test("Passive fallback removes email actions and their durable identity")
+    func actionMetadataIsCleared() {
+        let c = workerAlert()
+        c.categoryIdentifier = "EMAIL_TAG_DELETE"
+        c.userInfo = [
+            "messageId": "provider-resource-id",
+            EmailNotificationBuilder.actionMessageIdUserInfoKey: "action@example.com",
+        ]
+
+        applyPassiveSettings(c)
+
+        #expect(c.categoryIdentifier.isEmpty)
+        #expect(c.userInfo["messageId"] as? String == "provider-resource-id")
+        #expect(c.userInfo[EmailNotificationBuilder.actionMessageIdUserInfoKey] == nil)
+    }
+
     @Test("Override + passive normalisation happen together")
     func overrideAndNormalisationCombined() {
         let c = workerAlert()

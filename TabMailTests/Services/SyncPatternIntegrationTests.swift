@@ -159,36 +159,143 @@ struct MessageHeaderInfoToMessageHeaderInsertTests {
         #expect(h.isInInbox == true)
     }
 
-    @Test("Action tags are only applied for inbox messages")
-    func actionTagsOnlyForInbox() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-
-        let isInInbox = false
-        var header = MessageHeader(
-            messageId: "100",
-            subject: "Test",
-            from: "Alice",
-            fromAddress: "alice@example.com",
-            to: "bob@example.com",
+    /// Production-realistic mock message: action tags are LOCAL-ONLY
+    /// (ADR-IOS-036), so a provider DTO ALWAYS carries `actionTag: nil`
+    /// (`GmailProvider`/`ExchangeProvider` build their DTOs that way). Sync
+    /// must therefore never take a tag FROM the wire, and — crucially — must
+    /// never let a nil DTO CLEAR a tag the header already holds locally.
+    private func nilTagRemote(messageId: String, rfc822: String, subject: String = "Test") -> MessageHeaderInfo {
+        MessageHeaderInfo(
+            messageId: messageId,
+            rfc822MessageId: rfc822,
+            inReplyTo: nil,
+            references: [],
+            threadId: nil,
+            subject: subject,
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "user@example.com",
+            cc: "",
+            bcc: "",
+            replyTo: nil,
             date: Date(),
             snippet: "test",
-            folderId: "acc1:Archive",
-            accountId: "acc1",
-            folderPath: "Archive",
-            isInInbox: isInInbox
+            isRead: false,
+            isFlagged: false,
+            hasAttachments: false,
+            isReplied: false,
+            isForwarded: false,
+            actionTag: nil
         )
-        // Simulate the sync pattern: only apply actionTag if isInInbox
-        if isInInbox {
+    }
+
+    // Round D-0 (2026-07-14): action tags live WITH the header and are retained
+    // across folders — sync must no longer null a local tag on a non-inbox row
+    // (the old `normalizeInboxScopedActionTag` did; `normalizeActionTagSortOrder`
+    // does not). These two tests pin the two real D-0 sync paths with a
+    // PRODUCTION-REALISTIC provider (DTO `actionTag: nil`) and pass an explicit
+    // EMPTY `recentlyCompleted` so the outcome does NOT depend on the
+    // process-global `AccountManager.shared.recentlyCompleted` field-authority
+    // map (that global leaks across suites — a prior retarget of this test
+    // omitted the argument and read the global, making it green in a focused
+    // run but red in the full run depending on what a preceding suite left in
+    // the map for identity `100`/`<message@example.com>` under `acc1`).
+
+    @Test("Round D-0: sync UPDATE of an EXISTING non-inbox header must not clear its local-only actionTag — a provider DTO with actionTag: nil never overwrites a local tag")
+    func syncUpdatePreservesLocalTagOnNonInboxHeader() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("sync.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+
+        let messageId = "100"
+        let rfc822 = "<archive-local-tag@example.com>"
+        let folder = try await pool.write { db -> Folder in
+            var account = Account(emailAddress: "user@example.com", displayName: "User", provider: .imap)
+            account.id = "acc1"
+            try account.insert(db)
+            let folder = Folder(name: "Archive", path: "Archive", role: .archive, accountId: account.id)
+            try folder.insert(db)
+            // Existing LOCAL header already in Archive (non-inbox) carrying a
+            // local-only tag — e.g. one the user tagged in the inbox and then
+            // archived (Round D-0: the tag rode along with the move).
+            var header = MessageHeader(
+                messageId: messageId, subject: "Test", from: "Sender", fromAddress: "sender@example.com",
+                to: "user@example.com", date: Date(), snippet: "test",
+                folderId: folder.id, accountId: account.id, folderPath: folder.path, isInInbox: false
+            )
+            header.rfc822MessageId = rfc822
+            header.headerComplete = true
             header.actionTag = .archive
             header.tagSortOrder = ActionTag.archive.sortOrder
+            try header.insert(db)
+            return folder
         }
-        try db.write { try header.insert($0) }
 
-        let fetched = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(fetched?.actionTag == nil)
-        #expect(fetched?.tagSortOrder == 99)
+        let provider = MockEmailProvider()
+        await provider.setFetchMessagesResult([nilTagRemote(messageId: messageId, rfc822: rfc822)])
+
+        // Explicit empty field-authority map → deterministic, independent of
+        // any cross-suite process-global `recentlyCompleted` state.
+        _ = try await SyncEngine.runSyncMessages(
+            for: folder,
+            provider: provider,
+            limit: 50,
+            dbPool: PrioritizedDatabase(pool: pool),
+            recentlyCompleted: [:]
+        )
+
+        let fetched = try await pool.read { try MessageHeader.fetchOne($0, key: "acc1:Archive:100") }
+        #expect(fetched?.actionTag == .archive, "Round D-0: the local tag must SURVIVE the sync UPDATE of a non-inbox header — the nil DTO tag must not clear it, and normalizeActionTagSortOrder must not null it for being out-of-inbox")
+        #expect(fetched?.tagSortOrder == ActionTag.archive.sortOrder, "tagSortOrder stays derived from the retained tag, not reset to the no-tag sentinel")
+        #expect(fetched?.isInInbox == false)
+    }
+
+    @Test("Round D-0: sync INSERT of a NEW non-inbox header restores its local-only actionTag from the AI cache and retains it — not nulled for being out-of-inbox")
+    func syncInsertRestoresAndRetainsCachedTagOnNonInboxHeader() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("sync.sqlite").path)
+        try AppDatabase.runMigrations(on: pool)
+
+        let messageId = "100"
+        let rfc822 = "<archive-cached-tag@example.com>"
+        let folder = try await pool.write { db -> Folder in
+            var account = Account(emailAddress: "user@example.com", displayName: "User", provider: .imap)
+            account.id = "acc1"
+            try account.insert(db)
+            let folder = Folder(name: "Archive", path: "Archive", role: .archive, accountId: account.id)
+            try folder.insert(db)
+            // Local-only tag persisted ONLY in the AI cache (the header was
+            // evicted / never present locally). The cache is the durable
+            // source of a local-only tag across header deletion.
+            let cacheKey = try #require(MessageAICache.cacheKey(
+                accountId: account.id, folderPath: folder.path, rfc822MessageId: rfc822
+            ))
+            var cache = MessageAICache(key: cacheKey, rfc822MessageId: rfc822)
+            cache.actionTag = .archive
+            try cache.insert(db)
+            return folder
+        }
+
+        let provider = MockEmailProvider()
+        await provider.setFetchMessagesResult([nilTagRemote(messageId: messageId, rfc822: rfc822)])
+
+        let result = try await SyncEngine.runSyncMessages(
+            for: folder,
+            provider: provider,
+            limit: 50,
+            dbPool: PrioritizedDatabase(pool: pool),
+            recentlyCompleted: [:]
+        )
+        #expect(result.newHeaders.count == 1)
+
+        let fetched = try await pool.read { try MessageHeader.fetchOne($0, key: "acc1:Archive:100") }
+        #expect(fetched?.actionTag == .archive, "Round D-0: the cached local-only tag is restored onto the new non-inbox header and RETAINED — normalizeActionTagSortOrder no longer nulls it for being out-of-inbox")
+        #expect(fetched?.tagSortOrder == ActionTag.archive.sortOrder, "tagSortOrder stays derived from the restored tag")
+        #expect(fetched?.isInInbox == false)
     }
 
     @Test("ThreadId computed from subject when provider returns nil")

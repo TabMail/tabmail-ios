@@ -117,14 +117,6 @@ struct InsertBackfillBatchDedupTests {
                 if header.isReplied && header.actionTag == .reply {
                     header.actionTag = ActionTag.none
                     header.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
-                        type: .setTag,
-                        messageIds: [header.stableId],
-                        accountId: accountId,
-                        folderPath: folderPath,
-                        tagValue: ActionTag.none.rawValue
-                    )
-                    try tagOp.insert(db)
                 }
 
                 try header.insert(db)
@@ -262,7 +254,7 @@ struct InsertBackfillBatchDedupTests {
         try TestDatabase.insertAccount(db, id: "acc1")
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
 
-        // Pending move uses rfc822MessageId (IMAP undo pattern)
+        // Pending move uses the provider-neutral RFC Message-ID.
         try db.write { db in
             try PendingOperation(
                 type: .move,
@@ -406,14 +398,6 @@ struct InsertBackfillBatchReplyDetectTests {
                 if header.isReplied && header.actionTag == .reply {
                     header.actionTag = ActionTag.none
                     header.tagSortOrder = ActionTag.none.sortOrder
-                    let tagOp = PendingOperation(
-                        type: .setTag,
-                        messageIds: [header.stableId],
-                        accountId: "acc1",
-                        folderPath: "INBOX",
-                        tagValue: ActionTag.none.rawValue
-                    )
-                    try tagOp.insert(db)
                 }
                 try header.insert(db)
                 count += 1
@@ -434,11 +418,8 @@ struct InsertBackfillBatchReplyDetectTests {
         let header = try db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:100") }
         #expect(header?.actionTag == ActionTag.none, "ReplyDetect should override reply→none")
 
-        // Check that a setTag pending op was created
         let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .setTag)
-        #expect(ops[0].tagValue == ActionTag.none.rawValue)
+        #expect(ops.isEmpty, "ReplyDetect clears the local action tag without a durable provider operation")
     }
 
     @Test("ReplyDetect does NOT override when isReplied is false")

@@ -235,10 +235,33 @@ extension SyncEngine {
 
         // SAME protection set as the stale flow (see runSyncMessages).
         let pendingOps = try PendingOperation.fetchAll(db)
-        let opsTargetingThisFolder = pendingOps.filter {
-            $0.accountId == accountId && ($0.folderPath == folderPath || $0.destinationPath == folderPath)
+        let accountPendingOps = pendingOps.filter { $0.accountId == accountId }
+        let accountPendingSnapshot = PendingOperationSnapshot(ops: accountPendingOps)
+        let folderFieldSnapshot = PendingOperationSnapshot(ops: accountPendingOps.filter {
+            $0.folderPath == folderPath
+        })
+        let genericTypes: Set<OperationType> = [
+            .markReplied, .markForwarded,
+            .addUserLabel, .removeUserLabel,
+        ]
+        var pendingGenericIds = Set(accountPendingOps.filter {
+            ($0.status == PendingStatus.queued.rawValue
+                || $0.status == PendingStatus.inFlight.rawValue)
+                && $0.folderPath == folderPath
+                && genericTypes.contains($0.type)
+        }.flatMap(\.messageIds))
+        if folderRole == .drafts {
+            pendingGenericIds.formUnion(folderFieldSnapshot.draftResources)
         }
-        let pendingAllIds = Set(opsTargetingThisFolder.flatMap(\.messageIds))
+
+        let identityIds: (MessageHeader) -> [String] = { msg in
+            var ids = [msg.messageId]
+            if let rfc822MessageId = msg.rfc822MessageId,
+               !rfc822MessageId.isEmpty {
+                ids.append(rfc822MessageId)
+            }
+            return ids
+        }
 
         var outboxProtectedRfc822s = Set<String>()
         if folderRole == .sent {
@@ -252,10 +275,63 @@ extension SyncEngine {
         }
 
         let isProtected: (MessageHeader) -> Bool = { msg in
-            pendingAllIds.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId) ||
-            recentlyCompleted[msg.messageId] != nil ||
-            (msg.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false) ||
-            (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
+            let ids = identityIds(msg)
+            let pendingDestination = ids.contains { identityId in
+                accountPendingSnapshot.destructiveDestinationMemberships.contains(
+                    MessageIdentity.membershipKey(
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        messageId: identityId,
+                        membership: .addedDestination
+                    )
+                )
+            }
+            let pendingField = folderFieldSnapshot.flag.containsAnyKey(
+                messageId: msg.messageId,
+                rfc822MessageId: msg.rfc822MessageId
+            )
+            let pendingGeneric = pendingGenericIds.containsAnyKey(
+                messageId: msg.messageId,
+                rfc822MessageId: msg.rfc822MessageId
+            )
+            let recent = ids.contains { identityId in
+                let removedSource = recentlyCompleted[MessageIdentity.membershipKey(
+                    accountId: accountId,
+                    folderPath: folderPath,
+                    messageId: identityId,
+                    membership: .removedSource
+                )] != nil
+                let generic = recentlyCompleted[MessageIdentity.recentlyCompletedFolderKey(
+                    accountId: accountId,
+                    folderPath: folderPath,
+                    messageId: identityId
+                )] != nil
+                return (generic && !removedSource)
+                    || recentlyCompleted[MessageIdentity.recentlyCompletedPushKey(
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        messageId: identityId
+                    )] != nil
+                    || recentlyCompleted[MessageIdentity.membershipKey(
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        messageId: identityId,
+                        membership: .addedDestination
+                    )] != nil
+                    || MessageIdentity.RecentlyCompletedField.allCases.contains { field in
+                        recentlyCompleted[MessageIdentity.recentlyCompletedFieldKey(
+                            accountId: accountId,
+                            folderPath: folderPath,
+                            messageId: identityId,
+                            field: field
+                        )] != nil
+                    }
+            }
+            return pendingDestination
+                || pendingField
+                || pendingGeneric
+                || recent
+                || (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
         }
 
         let deletable = candidates.filter { !isProtected($0) }
@@ -272,15 +348,14 @@ extension SyncEngine {
     @discardableResult
     func deleteServerConfirmedDeletions(folder: Folder, uids: [UInt32], reason: String) async throws -> Int {
         guard !uids.isEmpty else { return 0 }
-        // Prune before snapshotting — deleteConfirmedGhostHeaders does a presence
-        // check (`!= nil`) that doesn't consult per-entry expiry.
-        await AccountManager.shared.pruneRecentlyCompleted()
-        let recentlyCompleted = await AccountManager.shared.recentlyCompleted
         let folderId = folder.id
         let folderPath = folder.path
         let accountId = folder.accountId
         let folderRole = folder.role
-        let deletedIds: [String] = try await dbPool.write { db in
+        let deletedIds: [String] = try await dbPool.writeWithReservedSnapshot(
+            label: "sync.reconcile.delete",
+            snapshot: { await Self.freshRecentlyCompletedSnapshot() }
+        ) { db, recentlyCompleted in
             try Self.deleteConfirmedGhostHeaders(
                 folderId: folderId,
                 folderPath: folderPath,

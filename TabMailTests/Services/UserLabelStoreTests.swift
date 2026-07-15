@@ -161,9 +161,9 @@ struct UserLabelStoreTests {
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
             try UserLabel(id: "L2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L2").insert(db)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, accountId: "acc1", userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: msg2.id, accountId: "acc1", userLabelId: "L1").insert(db)
         }
         let result = try db.read { db in
             try UserLabelStore.loadLabels(for: [msg1.id, msg2.id], in: db)
@@ -181,8 +181,8 @@ struct UserLabelStoreTests {
         try db.write { db in
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
             try UserLabel(id: "SYS", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "SYS").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "SYS").insert(db)
         }
         let result = try db.read { db in
             try UserLabelStore.loadLabels(for: [msg.id], in: db)
@@ -210,9 +210,9 @@ struct UserLabelStoreTests {
             try UserLabel(id: "L1", accountId: "acc1", name: "Zebra", isSystem: false).insert(db)
             try UserLabel(id: "L2", accountId: "acc1", name: "Alpha", isSystem: false).insert(db)
             try UserLabel(id: "L3", accountId: "acc1", name: "Middle", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L2").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L3").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "L3").insert(db)
         }
         let result = try db.read { db in
             try UserLabelStore.loadLabels(for: [msg.id], in: db)
@@ -286,14 +286,140 @@ struct UserLabelStoreTests {
             try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
             try UserLabel(id: "L2", accountId: "acc1", name: "Play", isSystem: false).insert(db)
             try UserLabel(id: "SYS", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "SYS").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg.id, accountId: "acc1", userLabelId: "SYS").insert(db)
         }
         let labels = try db.read { db in
             try UserLabelStore.labelsForMessage(msg.id, in: db)
         }
         #expect(labels.count == 1)
         #expect(labels[0].name == "Work")
+    }
+
+    @Test("provider label IDs are isolated by account and cascades preserve the other account")
+    func providerLabelIdsAreAccountLocal() throws {
+        let db = try TestDatabase.make()
+        let accountA = "account-a"
+        let accountB = "account-b"
+        let sharedProviderLabelId = "Label_42"
+
+        try TestDatabase.insertAccount(
+            db,
+            id: accountA,
+            email: "account-a@example.com"
+        )
+        try TestDatabase.insertAccount(
+            db,
+            id: accountB,
+            email: "account-b@example.com"
+        )
+        try TestDatabase.insertFolder(db, accountId: accountA)
+        try TestDatabase.insertFolder(db, accountId: accountB)
+        let messageA = try TestDatabase.insertMessageHeader(
+            db,
+            messageId: "message-a",
+            folderId: "\(accountA):INBOX",
+            accountId: accountA
+        )
+        let messageB = try TestDatabase.insertMessageHeader(
+            db,
+            messageId: "message-b",
+            folderId: "\(accountB):INBOX",
+            accountId: accountB
+        )
+
+        try db.write { db in
+            try UserLabel(
+                id: sharedProviderLabelId,
+                accountId: accountA,
+                name: "Account A Project",
+                isSystem: false
+            ).insert(db)
+            try UserLabel(
+                id: sharedProviderLabelId,
+                accountId: accountB,
+                name: "Account B Project",
+                isSystem: false
+            ).insert(db, onConflict: .ignore)
+            try MessageUserLabel(
+                messageId: messageA.id,
+                accountId: accountA,
+                userLabelId: sharedProviderLabelId
+            ).insert(db)
+            try MessageUserLabel(
+                messageId: messageB.id,
+                accountId: accountB,
+                userLabelId: sharedProviderLabelId
+            ).insert(db)
+        }
+
+        let labelsA = try db.read {
+            try UserLabelStore.allLabels(accountId: accountA, in: $0)
+        }
+        let labelsB = try db.read {
+            try UserLabelStore.allLabels(accountId: accountB, in: $0)
+        }
+        let selectedLabelsA = try db.read {
+            try UserLabelStore.labels(
+                ids: [sharedProviderLabelId],
+                accountId: accountA,
+                in: $0
+            )
+        }
+        let selectedLabelsB = try db.read {
+            try UserLabelStore.labels(
+                ids: [sharedProviderLabelId],
+                accountId: accountB,
+                in: $0
+            )
+        }
+        let messageLabelsA = try db.read {
+            try UserLabelStore.labelsForMessage(messageA.id, in: $0)
+        }
+        let messageLabelsB = try db.read {
+            try UserLabelStore.labelsForMessage(messageB.id, in: $0)
+        }
+
+        #expect(labelsA.count == 1)
+        #expect(labelsB.count == 1)
+        #expect(selectedLabelsA.count == 1)
+        #expect(selectedLabelsB.count == 1)
+        #expect(messageLabelsA.count == 1)
+        #expect(messageLabelsB.count == 1)
+
+        try db.write { db in
+            _ = try Account.deleteOne(db, key: accountA)
+        }
+
+        let survivingLabelsB = try db.read {
+            try UserLabelStore.allLabels(accountId: accountB, in: $0)
+        }
+        let survivingMessageLabelsB = try db.read {
+            try UserLabelStore.labelsForMessage(messageB.id, in: $0)
+        }
+        #expect(survivingLabelsB.count == 1)
+        #expect(survivingMessageLabelsB.count == 1)
+
+        guard labelsA.count == 1,
+              labelsB.count == 1,
+              selectedLabelsA.count == 1,
+              selectedLabelsB.count == 1,
+              messageLabelsA.count == 1,
+              messageLabelsB.count == 1,
+              survivingLabelsB.count == 1,
+              survivingMessageLabelsB.count == 1
+        else { return }
+
+        #expect(labelsA[0].name == "Account A Project")
+        #expect(labelsB[0].name == "Account B Project")
+        #expect(selectedLabelsA[0].name == "Account A Project")
+        #expect(selectedLabelsB[0].name == "Account B Project")
+        #expect(messageLabelsA[0].accountId == accountA)
+        #expect(messageLabelsA[0].name == "Account A Project")
+        #expect(messageLabelsB[0].accountId == accountB)
+        #expect(messageLabelsB[0].name == "Account B Project")
+        #expect(survivingLabelsB[0].name == "Account B Project")
+        #expect(survivingMessageLabelsB[0].accountId == accountB)
     }
 
     // MARK: - Menu Sorting
@@ -311,12 +437,12 @@ struct UserLabelStoreTests {
             try UserLabel(id: "L2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
             try UserLabel(id: "L3", accountId: "acc1", name: "Rare", isSystem: false).insert(db)
             // msg1 has "Work" (applied to target message)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, accountId: "acc1", userLabelId: "L1").insert(db)
             // "Personal" appears on 2 inbox messages (higher frequency)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L2").insert(db)
-            try MessageUserLabel(messageId: msg3.id, userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: msg2.id, accountId: "acc1", userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: msg3.id, accountId: "acc1", userLabelId: "L2").insert(db)
             // "Rare" appears on 1 inbox message
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L3").insert(db)
+            try MessageUserLabel(messageId: msg2.id, accountId: "acc1", userLabelId: "L3").insert(db)
         }
         let inboxFolderId = "acc1:INBOX"
         let sorted = try db.read { db in
@@ -368,12 +494,17 @@ struct UserLabelStoreTests {
         #expect(fetched?.userLabelId == "Label_42")
     }
 
-    @Test("Migration v31 creates index on messageUserLabel.userLabelId")
+    @Test("Migration v71 indexes account-scoped message label membership")
     func migrationCreatesIndex() throws {
         let db = try TestDatabase.make()
-        let indexes = try db.read { db in
-            try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messageUserLabel'")
+        let indexColumns = try db.read { db in
+            try Row.fetchAll(
+                db,
+                sql: "PRAGMA index_info(idx_messageUserLabel_accountId_userLabelId)"
+            )
+            .sorted { ($0["seqno"] as Int) < ($1["seqno"] as Int) }
+            .map { $0["name"] as String }
         }
-        #expect(indexes.contains("idx_messageUserLabel_userLabelId"))
+        #expect(indexColumns == ["accountId", "userLabelId"])
     }
 }
