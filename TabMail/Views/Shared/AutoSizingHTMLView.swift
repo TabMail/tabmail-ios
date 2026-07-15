@@ -50,7 +50,21 @@ struct AutoSizingHTMLView: View {
         // (ADR-IOS-039): same content + same width → identical re-measurement,
         // which the `!=` guard in handleHeightMessage then drops, so a seeded
         // row doesn't move at all.
-        _height = State(initialValue: headerId.flatMap { HeightSeedCache.shared[$0] } ?? 1)
+        let seededHeight = headerId.flatMap { HeightSeedCache.shared[$0] }
+        _height = State(initialValue: seededHeight ?? 1)
+        // Same row-recreation problem, applied to the reveal flag: a
+        // HeightSeedCache entry is only ever written from the numeric-height
+        // branch of handleHeightMessage, which the fit pipeline reaches after
+        // JS `reveal()` has already fired for this exact content — so its
+        // presence means this message rendered successfully earlier in this
+        // session. Without this, a List-recycled row re-enters with
+        // hasRevealed reset to false and flashes the "Loading message…"
+        // placeholder for ~200ms-1s while the recreated WKWebView redundantly
+        // redoes a load it already completed (logmain.log 2026-07-14: same
+        // messageId flips content → loadingSpinner → content on scroll-back).
+        // `.onChange(of: html)` still resets this if the content genuinely
+        // changed (e.g. pull-to-refresh) — see below.
+        _hasRevealed = State(initialValue: seededHeight != nil)
     }
 
     /// Loading placeholder only for real message bodies (compose/eml/tooltip
@@ -98,13 +112,23 @@ struct AutoSizingHTMLView: View {
             .animation(.none, value: trailingPad)
             .padding(.bottom, 12)
             // Reset the placeholder when the bound content changes (pull-to-
-            // refresh swaps in a new body), then arm a safety timeout so a
-            // missed reveal signal can never strand the placeholder forever.
-            // `.task(id: html)` restarts on every content change and is
+            // refresh swaps in a new body). MUST be `.onChange`, not a reset
+            // inside the `.task` below: `.task(id:)` re-runs on every
+            // RECREATION of this view (List row recycling), not only on id
+            // changes, so a reset there wipes the seeded hasRevealed one frame
+            // after init and re-flashes the placeholder on scroll-back — the
+            // exact symptom the init seeding exists to prevent. `.onChange`
+            // fires only on actual value changes, never on initial appearance.
+            .onChange(of: html) { _, _ in
+                guard headerId != nil else { return }
+                if hasRevealed { hasRevealed = false }
+            }
+            // Safety timeout so a missed reveal signal can never strand the
+            // placeholder forever. `.task(id: html)` restarts on every content
+            // change (re-arming the timeout for the new document) and is
             // cancelled on disappear.
             .task(id: html) {
                 guard headerId != nil else { return }
-                if hasRevealed { hasRevealed = false }
                 try? await Task.sleep(for: .seconds(4))
                 if !hasRevealed { hasRevealed = true }
             }
