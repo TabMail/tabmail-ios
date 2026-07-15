@@ -18,6 +18,9 @@ configFiles:
 settings:
   base:
     SWIFT_VERSION: "6.0"
+    # No target links AppIntents.framework. Disable Xcode's metadata pass so
+    # warning-free builds do not emit one "extraction skipped" warning per target.
+    ENABLE_APPINTENTS_METADATA_EXTRACTION: NO
     # DEVELOPMENT_TEAM is sourced from Secrets.xcconfig (gitignored) by
     # Scripts/xcodegen.sh and expanded here at generation time, so the Apple
     # Developer Team ID stays out of the public repo. It MUST be referenced here
