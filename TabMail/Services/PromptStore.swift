@@ -286,7 +286,7 @@ final class PromptStore {
     nonisolated static let actionCompactThresholdKey = "action.compact.threshold"
     nonisolated static let defaultActionCompactThreshold = 100
     nonisolated static let actionCompactThresholdCharsKey = "action.compact.threshold.chars"
-    nonisolated static let defaultActionCompactThresholdChars = 8000
+    nonisolated static let defaultActionCompactThresholdChars = 16000
 
     // MARK: - Demo overlay key redirection (ADR-IOS-038)
 
