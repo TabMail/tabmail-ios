@@ -6,7 +6,7 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("BackendConfig")
+@Suite("BackendConfig", .serialized, .processGlobalState)
 struct BackendConfigTests {
 
     @Test("apiBaseURL is valid HTTPS URL")

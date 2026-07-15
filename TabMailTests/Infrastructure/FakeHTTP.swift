@@ -9,24 +9,30 @@ import Synchronization
 ///
 /// Usage:
 /// ```swift
-/// let session = FakeHTTP.makeSession()
-/// FakeHTTP.register(
+/// let http = FakeHTTP.Scenario()
+/// defer { http.close() }
+/// http.register(
 ///     path: "/messages/m-1",
 ///     method: "GET",
 ///     response: .json(fixture: "Gmail/message-nested-eml.json")
 /// )
-/// let provider = GmailProvider(userEmail: "x@y", accessToken: { _ in "tok" }, session: session)
+/// let provider = GmailProvider(
+///     userEmail: "user@example.com",
+///     accessToken: { _ in "tok" },
+///     session: http.session
+/// )
 /// // ... exercise provider; assertions check marker HTML / attachments.
-/// FakeHTTP.reset()  // in test tearDown.
 /// ```
 ///
-/// Matching is path-prefix + method. Registration order matters — the FIRST
-/// matching entry wins. Unmatched requests return HTTP 599 with an explanatory
-/// body so test output pinpoints the missing fixture.
+/// Matching is path-prefix + method. The longest matching prefix wins; for
+/// equal-length matches, the first registration wins. Unmatched requests return
+/// HTTP 599 with an explanatory body so test output pinpoints the missing fixture.
 ///
 /// Fixtures live under `TabMailTests/Fixtures/` and are sourced from the cited
 /// reference URLs in `Fixtures/README.md`. NEVER author fixtures from memory.
 final class FakeHTTP: URLProtocol, @unchecked Sendable {
+
+    private static let scopeHeader = "X-TabMail-Test-HTTP-Scope"
 
     // MARK: - Registration API
 
@@ -75,27 +81,170 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         }
     }
 
+    /// Immutable request snapshot passed to a stateful test response handler.
+    /// The handler remains synchronous because `URLProtocol.startLoading()` is
+    /// synchronous; mutable provider models should protect their state with
+    /// `Mutex`, just like the fake's own registry.
+    struct Request: Sendable {
+        let method: String
+        let url: URL
+        let body: Data?
+    }
+
+    fileprivate enum RegisteredResponse: Sendable {
+        case canned(CannedResponse)
+        case dynamic(@Sendable (Request) -> CannedResponse)
+
+        func response(for request: Request) -> CannedResponse {
+            switch self {
+            case .canned(let response): response
+            case .dynamic(let handler): handler(request)
+            }
+        }
+    }
+
     private struct Matcher: Sendable {
         let method: String
         let pathPrefix: String
-        let response: CannedResponse
+        let response: RegisteredResponse
     }
 
     private struct State: Sendable {
         var matchers: [Matcher] = []
-        /// Records every URL the fake served — test assertions can verify a
+        /// Records every request the fake served — test assertions can verify a
         /// fallback call was made (e.g. Exchange's second-round
-        /// `microsoft.graph.itemattachment/item/attachments` call).
-        var calls: [(method: String, url: String)] = []
+        /// `microsoft.graph.itemattachment/item/attachments` call) or inspect an
+        /// exact provider payload at the HTTP boundary.
+        var calls: [(method: String, url: String, body: Data?)] = []
     }
 
-    private static let state = Mutex(State())
+    fileprivate final class StateBox: Sendable {
+        private let state = Mutex(State())
+
+        func register(path: String, method: String, response: RegisteredResponse) {
+            state.withLock { value in
+                value.matchers.append(Matcher(
+                    method: method.uppercased(),
+                    pathPrefix: path,
+                    response: response
+                ))
+            }
+        }
+
+        func take(method: String, url: URL, body: Data?) -> CannedResponse? {
+            let registered: RegisteredResponse? = state.withLock { value in
+                value.calls.append((method: method.uppercased(), url: url.absoluteString, body: body))
+                var best: (length: Int, response: RegisteredResponse)?
+                for matcher in value.matchers {
+                    guard matcher.method == method.uppercased() else { continue }
+                    let hit = url.path.hasPrefix(matcher.pathPrefix)
+                        || url.absoluteString.contains(matcher.pathPrefix)
+                    guard hit else { continue }
+                    if best == nil || matcher.pathPrefix.count > best!.length {
+                        best = (matcher.pathPrefix.count, matcher.response)
+                    }
+                }
+                return best?.response
+            }
+            return registered?.response(for: Request(
+                method: method.uppercased(),
+                url: url,
+                body: body
+            ))
+        }
+
+        func recordedCalls() -> [(method: String, url: String, body: Data?)] {
+            state.withLock { $0.calls }
+        }
+
+        func reset() {
+            state.withLock { value in
+                value.matchers.removeAll()
+                value.calls.removeAll()
+            }
+        }
+    }
+
+    private static let registry = Mutex<[String: StateBox]>([:])
+
+    /// Per-test HTTP namespace. Its registrations, request log, and reset/close
+    /// lifecycle cannot affect another scenario, even when both URLSessions
+    /// request the same method and URL concurrently.
+    final class Scenario: @unchecked Sendable {
+        fileprivate let id: String
+        fileprivate let box: StateBox
+        private let isClosed = Mutex(false)
+
+        let session: URLSession
+
+        init() {
+            let id = UUID().uuidString
+            self.id = id
+            self.box = StateBox()
+            self.session = FakeHTTP.makeSession(scopeID: id)
+            FakeHTTP.registry.withLock { $0[id] = box }
+        }
+
+        fileprivate init(id: String) {
+            self.id = id
+            self.box = StateBox()
+            self.session = FakeHTTP.makeSession(scopeID: id)
+            FakeHTTP.registry.withLock { $0[id] = box }
+        }
+
+        func register(path: String, method: String = "GET", response: CannedResponse) {
+            box.register(path: path, method: method, response: .canned(response))
+        }
+
+        /// Register a synchronous stateful response. The handler runs outside
+        /// FakeHTTP's registry lock, so it may safely own an independent Mutex
+        /// model and derive each response from prior requests.
+        func register(
+            path: String,
+            method: String = "GET",
+            handler: @escaping @Sendable (Request) -> CannedResponse
+        ) {
+            box.register(path: path, method: method, response: .dynamic(handler))
+        }
+
+        func recordedCalls() -> [(method: String, url: String, body: Data?)] {
+            box.recordedCalls()
+        }
+
+        func reset() {
+            box.reset()
+        }
+
+        /// Invalidates this scenario's session and unregisters only this
+        /// scenario. Safe to call more than once and from `defer`.
+        func close() {
+            let shouldClose = isClosed.withLock { closed in
+                guard !closed else { return false }
+                closed = true
+                return true
+            }
+            guard shouldClose else { return }
+
+            session.invalidateAndCancel()
+            box.reset()
+            FakeHTTP.registry.withLock { values in
+                guard values[id] === box else { return }
+                _ = values.removeValue(forKey: id)
+            }
+        }
+
+        deinit {
+            close()
+        }
+    }
+
+    /// Transitional namespace for the still-serialized Exchange mock suite.
+    /// New and migrated tests must use `Scenario` instead of these static APIs.
+    private static let legacyScenario = Scenario(id: "legacy")
 
     /// Register a canned response. Matched on `httpMethod` + URL path-prefix.
     static func register(path: String, method: String = "GET", response: CannedResponse) {
-        state.withLock { s in
-            s.matchers.append(Matcher(method: method.uppercased(), pathPrefix: path, response: response))
-        }
+        legacyScenario.register(path: path, method: method, response: response)
     }
 
     /// Record a call and return the response, if any matcher fits.
@@ -105,39 +254,40 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
     /// e.g. `"/messages/m-1?format=full"`, work too). Longest-prefix is
     /// important because a generic `/attachments` registration must not
     /// swallow more specific `/attachments/{id}?$expand=...` calls.
-    fileprivate static func take(method: String, url: URL) -> CannedResponse? {
-        state.withLock { s in
-            s.calls.append((method: method.uppercased(), url: url.absoluteString))
-            var best: (length: Int, response: CannedResponse)? = nil
-            for m in s.matchers {
-                guard m.method == method.uppercased() else { continue }
-                let hit = url.path.hasPrefix(m.pathPrefix) || url.absoluteString.contains(m.pathPrefix)
-                guard hit else { continue }
-                if best == nil || m.pathPrefix.count > best!.length {
-                    best = (m.pathPrefix.count, m.response)
-                }
-            }
-            return best?.response
+    fileprivate static func take(
+        request: URLRequest,
+        method: String,
+        url: URL,
+        body: Data?
+    ) -> CannedResponse? {
+        let box: StateBox?
+        if let scopeID = request.value(forHTTPHeaderField: scopeHeader) {
+            box = registry.withLock { $0[scopeID] }
+        } else {
+            box = legacyScenario.box
         }
+        return box?.take(method: method, url: url, body: body)
     }
 
-    /// Return all (method, url) pairs the fake has served so far.
-    static func recordedCalls() -> [(method: String, url: String)] {
-        state.withLock { $0.calls }
+    /// Return every request the fake has served so far.
+    static func recordedCalls() -> [(method: String, url: String, body: Data?)] {
+        legacyScenario.recordedCalls()
     }
 
     /// Clear all registrations and call log. Call in each test's teardown.
     static func reset() {
-        state.withLock { s in
-            s.matchers.removeAll()
-            s.calls.removeAll()
-        }
+        legacyScenario.reset()
     }
 
     /// Build a `URLSession` that routes through this protocol.
     static func makeSession() -> URLSession {
+        makeSession(scopeID: legacyScenario.id)
+    }
+
+    private static func makeSession(scopeID: String) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [FakeHTTP.self] + (config.protocolClasses ?? [])
+        config.httpAdditionalHeaders = [scopeHeader: scopeID]
         return URLSession(configuration: config)
     }
 
@@ -150,7 +300,12 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         guard let url = request.url else { return fail(code: 400, body: "no url") }
         let method = request.httpMethod ?? "GET"
 
-        guard let canned = FakeHTTP.take(method: method, url: url) else {
+        guard let canned = FakeHTTP.take(
+            request: request,
+            method: method,
+            url: url,
+            body: Self.bodyData(from: request)
+        ) else {
             return fail(code: 599, body: "FakeHTTP: no matcher for \(method) \(url)")
         }
 
@@ -166,6 +321,22 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+
+    private static func bodyData(from request: URLRequest) -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
 
     private func fail(code: Int, body: String) {
         let url = request.url ?? URL(string: "about:blank")!

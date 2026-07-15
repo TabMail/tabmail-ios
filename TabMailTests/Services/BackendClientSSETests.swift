@@ -626,19 +626,19 @@ struct BackendClientResumeIntegrationTests {
 
     @Test("truncated streaming final → ChatConnectionLostError carrying conversation_state")
     func truncatedYieldsResumable() async {
-        FakeHTTP.reset()
-        defer { FakeHTTP.reset() }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
         // A `final` event whose JSON is cut mid-token, then the stream ends. The
         // parser flushes the partial final → decodeFinalEvent can't parse it →
         // streamTruncated → the tool loop converts it to ChatConnectionLostError.
         let body = Self.primer
             + "event: keepalive\ndata: {}\n\n"
             + "event: final\ndata: {\"assistant\":\"this got cut o"
-        FakeHTTP.register(
+        http.register(
             path: "/completions/chat", method: "POST",
             response: .bytes(Data(body.utf8), contentType: "text/event-stream", statusCode: 200)
         )
-        let client = BackendClient(llmSession: FakeHTTP.makeSession())
+        let client = BackendClient(llmSession: http.session)
 
         let msg = HarmonyMessage(role: "tool", content: "search result", thinking: nil, tool_calls: nil, tool_call_id: "call-1")
         let convState = ConversationState(harmony_messages: [msg], current_round: 3)
@@ -659,14 +659,14 @@ struct BackendClientResumeIntegrationTests {
 
     @Test("complete streaming final decodes — no false truncation")
     func completeFinalDecodes() async {
-        FakeHTTP.reset()
-        defer { FakeHTTP.reset() }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
         let body = Self.primer + "event: final\ndata: {\"assistant\":\"all good\"}\n\n"
-        FakeHTTP.register(
+        http.register(
             path: "/completions/chat", method: "POST",
             response: .bytes(Data(body.utf8), contentType: "text/event-stream", statusCode: 200)
         )
-        let client = BackendClient(llmSession: FakeHTTP.makeSession())
+        let client = BackendClient(llmSession: http.session)
         let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
 
         do {

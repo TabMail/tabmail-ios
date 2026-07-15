@@ -6,28 +6,77 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("DebugModeManager")
+@Suite("DebugModeManager", .serialized, .processGlobalState)
 @MainActor
 struct DebugModeManagerTests {
 
     private let unlockedKey = "debug_mode_unlocked"
     private let devServersKey = "debug_use_dev_servers"
 
-    /// Reset UserDefaults state before each test.
-    private func cleanUp() {
+    private struct PreservedState {
+        let unlockedDefault: Any?
+        let devServersDefault: Any?
+        let managerUnlocked: Bool
+        let tapCount: Int
+        let allowAllUsersForTesting: Bool
+    }
+
+    /// Install the clean singleton/default state each test requires while
+    /// retaining the process state that must be restored before the suite's
+    /// process-global lease is released.
+    private func setUpCleanState() -> PreservedState {
+        let manager = DebugModeManager.shared
+        let state = PreservedState(
+            unlockedDefault: UserDefaults.standard.object(forKey: unlockedKey),
+            devServersDefault: UserDefaults.standard.object(forKey: devServersKey),
+            managerUnlocked: manager.isUnlocked,
+            tapCount: manager.tapCount,
+            allowAllUsersForTesting: manager.allowAllUsersForTesting
+        )
+
+        manager.isUnlocked = false
+        manager.resetTapCount()
+        manager.allowAllUsersForTesting = true
         UserDefaults.standard.removeObject(forKey: unlockedKey)
         UserDefaults.standard.removeObject(forKey: devServersKey)
-        // Re-sync singleton from UserDefaults
-        DebugModeManager.shared.isUnlocked = false
-        DebugModeManager.shared.resetTapCount()
-        DebugModeManager.shared.allowAllUsersForTesting = true
+        DebugModeManager.invalidateLoggingCache()
+        return state
+    }
+
+    private func restore(_ state: PreservedState) {
+        let manager = DebugModeManager.shared
+
+        // Reconstruct the private tap counter under the test bypass before
+        // restoring the bypass itself. `tapCount` can only be 0...9 because
+        // the tenth tap unlocks and resets it.
+        manager.resetTapCount()
+        manager.allowAllUsersForTesting = true
+        manager.isUnlocked = false
+        for _ in 0..<state.tapCount {
+            _ = manager.registerTap()
+        }
+        manager.isUnlocked = state.managerUnlocked
+        manager.allowAllUsersForTesting = state.allowAllUsersForTesting
+
+        if let value = state.unlockedDefault {
+            UserDefaults.standard.set(value, forKey: unlockedKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: unlockedKey)
+        }
+        if let value = state.devServersDefault {
+            UserDefaults.standard.set(value, forKey: devServersKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: devServersKey)
+        }
+        DebugModeManager.invalidateLoggingCache()
     }
 
     // MARK: - Tap counting
 
     @Test("Tapping fewer than 10 times does not unlock")
     func tapsBelow10DoNotUnlock() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         for _ in 0..<9 {
             let unlocked = mgr.registerTap()
@@ -38,7 +87,8 @@ struct DebugModeManagerTests {
 
     @Test("Exactly 10 taps unlocks and returns true")
     func tenTapsUnlocks() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         for _ in 0..<9 {
             _ = mgr.registerTap()
@@ -50,7 +100,8 @@ struct DebugModeManagerTests {
 
     @Test("Tap counter resets after unlock")
     func tapCounterResetsOnUnlock() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         for _ in 0..<10 {
             _ = mgr.registerTap()
@@ -60,7 +111,8 @@ struct DebugModeManagerTests {
 
     @Test("registerTap returns false when already unlocked")
     func alreadyUnlockedReturnsFalse() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         mgr.isUnlocked = true
         for _ in 0..<15 {
@@ -71,7 +123,8 @@ struct DebugModeManagerTests {
 
     @Test("resetTapCount clears counter")
     func resetClearsCounter() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         for _ in 0..<5 {
             _ = mgr.registerTap()
@@ -85,7 +138,8 @@ struct DebugModeManagerTests {
 
     @Test("remainingTaps is nil before 3 taps")
     func remainingTapsNilBeforeThreshold() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         #expect(mgr.remainingTaps == nil) // 0 taps
         _ = mgr.registerTap()
@@ -96,7 +150,8 @@ struct DebugModeManagerTests {
 
     @Test("remainingTaps shows countdown from tap 3 onward")
     func remainingTapsShowsCountdown() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         for _ in 0..<3 { _ = mgr.registerTap() }
         #expect(mgr.remainingTaps == 7) // 10 - 3
@@ -110,7 +165,8 @@ struct DebugModeManagerTests {
 
     @Test("remainingTaps is nil after unlock (counter reset)")
     func remainingTapsNilAfterUnlock() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         for _ in 0..<10 { _ = mgr.registerTap() }
         #expect(mgr.isUnlocked)
@@ -121,7 +177,8 @@ struct DebugModeManagerTests {
 
     @Test("Unlock state persists to UserDefaults")
     func unlockPersistsToUserDefaults() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         mgr.isUnlocked = true
         #expect(UserDefaults.standard.bool(forKey: unlockedKey) == true)
@@ -133,7 +190,8 @@ struct DebugModeManagerTests {
 
     @Test("Locking debug mode resets dev servers to false")
     func lockingResetsDevServers() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         let mgr = DebugModeManager.shared
         mgr.isUnlocked = true
         BackendConfig.useDevServers = true
@@ -146,7 +204,8 @@ struct DebugModeManagerTests {
 
     @Test("BackendConfig.useDevServers returns false when debug mode locked")
     func devServersLockedReturnsFalse() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         // Even if the raw UserDefaults value is true, locked mode forces false
         UserDefaults.standard.set(true, forKey: devServersKey)
         UserDefaults.standard.set(false, forKey: unlockedKey)
@@ -155,7 +214,8 @@ struct DebugModeManagerTests {
 
     @Test("BackendConfig.useDevServers respects stored value when debug mode unlocked")
     func devServersUnlockedRespectsValue() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         UserDefaults.standard.set(true, forKey: unlockedKey)
         UserDefaults.standard.set(true, forKey: devServersKey)
         #expect(BackendConfig.useDevServers == true)
@@ -166,7 +226,8 @@ struct DebugModeManagerTests {
 
     @Test("BackendConfig URLs use production when debug mode locked")
     func urlsUseProductionWhenLocked() {
-        cleanUp()
+        let state = setUpCleanState()
+        defer { restore(state) }
         UserDefaults.standard.set(false, forKey: unlockedKey)
         UserDefaults.standard.set(true, forKey: devServersKey) // would be dev, but locked
         #expect(BackendConfig.apiBaseURL.absoluteString == "https://api.tabmail.ai")
@@ -179,10 +240,10 @@ struct DebugModeManagerTests {
 
 /// Tests for `isLoggingEnabled()` caching + invalidation (the `0xdead10cc`
 /// fix: the keychain-derived gate is memoized so it no longer does a
-/// synchronous Keychain XPC on every log call). Serialized because the
-/// memoized flag, the shared `tabmail_session` keychain item, and the
-/// `debug_mode_unlocked` default are all process-wide global state.
-@Suite("DebugModeManager.isLoggingEnabled", .serialized)
+/// synchronous Keychain XPC on every log call). `.serialized` prevents sibling
+/// overlap; `.processGlobalState` excludes other suites while the memoized
+/// flag, shared `tabmail_session`, and debug default are replaced.
+@Suite("DebugModeManager.isLoggingEnabled", .serialized, .processGlobalState)
 @MainActor
 struct DebugModeLoggingGateTests {
 

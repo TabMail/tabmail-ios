@@ -6,38 +6,6 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("BackendClient 403 Backoff Constants")
-struct BackendClient403Tests {
-
-    @Test("Initial backoff delay is 1 second")
-    func initialDelay() {
-        // The static constant is private, but we can test the behavior through the actor
-        // BackendClient.forbiddenInitialDelay = 1
-        // We verify the documented behavior via integration
-        #expect(true) // Existence test — constants tested via BackendError
-    }
-
-    @Test("Max backoff delay is 300 seconds (5 min)")
-    func maxDelay() {
-        // BackendClient.forbiddenMaxDelay = 300
-        #expect(true) // Architecture guard
-    }
-
-    @Test("BackendClient initializes with default URL")
-    func defaultInit() {
-        _ = BackendClient()
-        // If this doesn't crash, the default URL is valid
-        #expect(true)
-    }
-
-    @Test("BackendClient initializes with default init")
-    func customURLInit() {
-        // BackendClient uses BackendConfig.apiBaseURL (no custom init)
-        _ = BackendClient()
-        #expect(true)
-    }
-}
-
 @Suite("BackendClient Request Types")
 struct BackendClientRequestTypeTests {
 

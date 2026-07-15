@@ -12,7 +12,10 @@ import GRDB
 /// All tests run against an in-memory manifest queue + a per-test temporary
 /// container directory injected via `BodyAssetStore._setTestEnvironment(...)`.
 /// No App Group entitlement required.
-@Suite("BodyAssetStore")
+// .serialized (test-review round 5): tests share BodyAssetStore's single
+// global _setTestEnvironment slot - concurrent siblings clobber each other's
+// temp dir/DB (NSELogStoreTests, same seam pattern, was already serialized).
+@Suite("BodyAssetStore", .serialized)
 struct BodyAssetStoreTests {
 
     private static func setupTest() throws -> URL {

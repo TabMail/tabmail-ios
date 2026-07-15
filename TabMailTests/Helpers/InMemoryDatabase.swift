@@ -64,7 +64,8 @@ enum TestDatabase {
         isInInbox: Bool = true,
         isRead: Bool = false,
         rfc822MessageId: String? = nil,
-        actionTag: ActionTag? = nil
+        actionTag: ActionTag? = nil,
+        actionTagSetAt: Date? = nil
     ) throws -> MessageHeader {
         var header = MessageHeader(
             messageId: messageId,
@@ -84,6 +85,11 @@ enum TestDatabase {
         header.actionTag = actionTag
         if let tag = actionTag {
             header.tagSortOrder = tag.sortOrder
+            // Defaults to nil (not `Date()`) when the caller doesn't specify one —
+            // preserves every pre-existing call site's behavior under the sweep's
+            // fail-safe NULL-is-eligible rule (SyncConfig.actionTagTTLSeconds).
+            // Tests exercising TTL semantics pass this explicitly.
+            header.actionTagSetAt = actionTagSetAt
         }
         try db.write { try header.insert($0) }
         return header

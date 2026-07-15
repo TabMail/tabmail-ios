@@ -235,14 +235,16 @@ struct AICacheResultExtendedTests {
 struct DeviceSyncErrorRedactionTests {
 
     @Test("Failing-URL token query never reaches the log string")
-    func tokenStrippedFromFailingURL() {
-        let leakyURL = "wss://sync.tabmail.ai/ws?token=eyJhbGciOiJFUzI1NiJ9.SECRET.SIG"
+    func tokenStrippedFromFailingURL() throws {
+        let leakyURL = try #require(
+            URL(string: "wss://sync.tabmail.ai/ws?token=eyJhbGciOiJFUzI1NiJ9.SECRET.SIG")
+        )
         let error = NSError(
             domain: NSURLErrorDomain,
             code: NSURLErrorCancelled,
             userInfo: [
-                NSURLErrorFailingURLStringErrorKey: leakyURL,
-                NSLocalizedDescriptionKey: "cancelled \(leakyURL)",
+                NSURLErrorFailingURLErrorKey: leakyURL,
+                NSLocalizedDescriptionKey: "cancelled \(leakyURL.absoluteString)",
             ]
         )
 

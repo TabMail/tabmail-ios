@@ -564,16 +564,16 @@ struct ReplyTemplateEdgeCaseTests {
         #expect(t1 != t2)
     }
 
-    @Test("Decoder defaults enabled to true when missing")
+    @Test("Decoder defaults enabled to true when null or missing")
     func decoderDefaultEnabled() throws {
-        let json = #"{"id": "x", "name": "Y", "enabled": null}"#
-        // enabled is Bool?, decodeIfPresent returns nil for null → defaults to true
-        // Actually this will throw because Bool can't decode null — test with missing key
-        let json2 = #"{"id": "x", "name": "Y"}"#
+        let nullJSON = #"{"id": "null", "name": "Null", "enabled": null}"#
+        let missingJSON = #"{"id": "missing", "name": "Missing"}"#
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let template = try decoder.decode(ReplyTemplate.self, from: Data(json2.utf8))
-        #expect(template.enabled == true)
+        let nullTemplate = try decoder.decode(ReplyTemplate.self, from: Data(nullJSON.utf8))
+        let missingTemplate = try decoder.decode(ReplyTemplate.self, from: Data(missingJSON.utf8))
+        #expect(nullTemplate.enabled == true)
+        #expect(missingTemplate.enabled == true)
     }
 
     @Test("Decoder defaults deleted to false when missing")

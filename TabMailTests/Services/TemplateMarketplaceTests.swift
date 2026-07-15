@@ -225,20 +225,16 @@ struct TemplateMarketplaceCodableRoundTripTests {
         let original = TemplateMarketplaceClient.DownloadedTemplate(
             id: "dl-1", name: "Test", instructions: ["x"], exampleReply: "Hi", enabled: true
         )
-        // DownloadedTemplate is not directly constructible via init in actor context,
-        // but we can test via JSON round-trip
-        let json = """
-        {"id": "dl-1", "name": "Test", "instructions": ["x"], "exampleReply": "Hi", "enabled": true}
-        """.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(TemplateMarketplaceClient.DownloadedTemplate.self, from: json)
+        let encoded = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(TemplateMarketplaceClient.DownloadedTemplate.self, from: encoded)
         let reEncoded = try JSONEncoder().encode(decoded)
         let reDecoded = try JSONDecoder().decode(TemplateMarketplaceClient.DownloadedTemplate.self, from: reEncoded)
 
-        #expect(reDecoded.id == "dl-1")
-        #expect(reDecoded.name == "Test")
-        #expect(reDecoded.instructions == ["x"])
-        #expect(reDecoded.exampleReply == "Hi")
-        #expect(reDecoded.enabled == true)
+        #expect(reDecoded.id == original.id)
+        #expect(reDecoded.name == original.name)
+        #expect(reDecoded.instructions == original.instructions)
+        #expect(reDecoded.exampleReply == original.exampleReply)
+        #expect(reDecoded.enabled == original.enabled)
     }
 
     @Test("MyTemplate encode-decode round-trip with rejection")

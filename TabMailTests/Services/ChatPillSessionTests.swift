@@ -1083,25 +1083,9 @@ struct ChatIdTranslatorRemapTests {
         #expect(numericAfterMove == numericId) // Same! Not a new ID.
     }
 
-    @Test("Tool output translation: real IDs → numeric for LLM")
-    func toolOutputTranslation() async {
+    @Test("Tool output translation: event IDs → numeric for LLM")
+    func toolOutputTranslation() async throws {
         let translator = ChatIdTranslator.createIsolated()
-
-        // Simulate inbox_read tool output with real IDs
-        let toolOutput = """
-        unique_id: acc1:INBOX:msg1
-        subject: Budget Review
-        from: alice@co.com
-
-        unique_id: acc1:INBOX:msg2
-        subject: Meeting Notes
-        from: bob@co.com
-        """
-
-        // The tool output has real IDs in unique_id fields
-        // But unique_id is handled by processToolOutputForLLM pattern (event_id etc.)
-        // For email IDs, inbox_read tool already outputs numeric IDs (pre-translated)
-        // Let's test the event_id path which goes through processToolOutputForLLM:
 
         let eventOutput = "event_id: google-cal-event-abc\ntitle: Team Standup"
         let translated = await translator.processToolOutputForLLM(eventOutput)
@@ -1113,10 +1097,9 @@ struct ChatIdTranslatorRemapTests {
         // The numeric ID should resolve back to the real event ID
         let eventNumericStr = translated.replacingOccurrences(of: "event_id: ", with: "")
             .components(separatedBy: "\n").first ?? ""
-        if let eventNumericId = Int(eventNumericStr) {
-            let resolvedEventId = await translator.toRealId(eventNumericId)
-            #expect(resolvedEventId == "google-cal-event-abc")
-        }
+        let eventNumericId = try #require(Int(eventNumericStr))
+        let resolvedEventId = await translator.toRealId(eventNumericId)
+        #expect(resolvedEventId == "google-cal-event-abc")
     }
 
     @Test("Ref counting: evicted turns free their IDs")
@@ -1686,10 +1669,10 @@ struct ServerDraftComposeRoutingTests {
         try TestDatabase.insertAccount(db, id: "acc1")
         try TestDatabase.insertFolder(db, name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
 
-        var draft = MessageHeader(
+        let draft = MessageHeader(
             messageId: "draft5", subject: "New Message",
             from: "me@example.com", fromAddress: "me@example.com",
-            to: "alice@co.com, Bob <bob@co.com>", date: Date(), snippet: "",
+            to: "alice@example.com, Recipient <recipient@example.com>", date: Date(), snippet: "",
             folderId: "acc1:Drafts", accountId: "acc1",
             folderPath: "Drafts", isInInbox: false
         )
@@ -1697,7 +1680,7 @@ struct ServerDraftComposeRoutingTests {
 
         let fetched = try db.read { try MessageHeader.fetchOne($0, key: "acc1:Drafts:draft5") }
         let recipients = Draft.parseRecipients(fetched!.to)
-        #expect(recipients == ["alice@co.com", "bob@co.com"])
+        #expect(recipients == ["alice@example.com", "recipient@example.com"])
     }
 }
 

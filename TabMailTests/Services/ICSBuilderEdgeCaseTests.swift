@@ -1132,10 +1132,10 @@ struct ICSBuilderBuildInvitationBodyCoverageTests {
             attendees: []
         )
         let html = ICSBuilder.buildInvitationBody(spec)
-        // Empty description should not produce a <p> tag
+        // Exactly two paragraphs: When + footer. `components` includes the tail.
         let descCount = html.components(separatedBy: "</p>").count
-        // Only "Sent via TabMail" paragraph + the When paragraph
-        #expect(!html.contains("</p><p>"))
+        #expect(descCount == 3)
+        #expect(!html.contains("<p></p>"))
     }
 
     @Test("buildInvitationBody includes Sent via TabMail footer")

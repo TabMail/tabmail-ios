@@ -45,7 +45,10 @@ struct EmailNotificationBuilderTests {
             actionTag: nil
         )
 
-        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg1")
+        let wasActive = EmailNotificationBuilder.fill(
+            content, signal: signal, accountId: "acc1", messageId: "msg1",
+            rfc822MessageId: "msg1@example.com"
+        )
 
         #expect(!wasActive)
         #expect(content.interruptionLevel == .passive)
@@ -66,7 +69,10 @@ struct EmailNotificationBuilderTests {
             actionTag: "reply"
         )
 
-        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg2")
+        let wasActive = EmailNotificationBuilder.fill(
+            content, signal: signal, accountId: "acc1", messageId: "msg2",
+            rfc822MessageId: "msg2@example.com"
+        )
 
         #expect(wasActive)
         #expect(content.interruptionLevel == .active)
@@ -80,7 +86,10 @@ struct EmailNotificationBuilderTests {
         let content = UNMutableNotificationContent()
         let signal = EmailNotificationBuilder.Signal(senderName: "Carol", subject: "No AI yet")
 
-        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg3")
+        let wasActive = EmailNotificationBuilder.fill(
+            content, signal: signal, accountId: "acc1", messageId: "msg3",
+            rfc822MessageId: "msg3@example.com"
+        )
 
         #expect(!wasActive)
         #expect(content.interruptionLevel == .passive)
@@ -111,7 +120,10 @@ struct EmailNotificationBuilderTests {
             dueDate: todayString
         )
 
-        _ = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg4")
+        _ = EmailNotificationBuilder.fill(
+            content, signal: signal, accountId: "acc1", messageId: "msg4",
+            rfc822MessageId: "msg4@example.com"
+        )
 
         #expect(content.body == "Today \u{2014} Renew the domain")
         #expect(content.interruptionLevel == .passive)
@@ -137,7 +149,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             archiveContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "FYI", actionTag: "archive"),
-            accountId: "acc1", messageId: "msg5"
+            accountId: "acc1", messageId: "msg5", rfc822MessageId: "msg5@example.com"
         )
         #expect(archiveContent.categoryIdentifier == "EMAIL_TAG_ARCHIVE")
 
@@ -145,7 +157,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             deleteContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Spam-ish", actionTag: "delete"),
-            accountId: "acc1", messageId: "msg6"
+            accountId: "acc1", messageId: "msg6", rfc822MessageId: "msg6@example.com"
         )
         #expect(deleteContent.categoryIdentifier == "EMAIL_TAG_DELETE")
 
@@ -153,7 +165,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             replyContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Question", actionTag: "reply"),
-            accountId: "acc1", messageId: "msg7"
+            accountId: "acc1", messageId: "msg7", rfc822MessageId: "msg7@example.com"
         )
         #expect(replyContent.categoryIdentifier == "EMAIL")
 
@@ -161,8 +173,45 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             bareContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "No AI yet"),
-            accountId: "acc1", messageId: "msg8"
+            accountId: "acc1", messageId: "msg8", rfc822MessageId: "msg8@example.com"
         )
         #expect(bareContent.categoryIdentifier == "EMAIL")
+    }
+
+    @Test("fill keeps provider transport identity separate from normalized RFC action identity")
+    func fillSeparatesTransportAndActionIdentity() {
+        let content = UNMutableNotificationContent()
+        _ = EmailNotificationBuilder.fill(
+            content,
+            signal: EmailNotificationBuilder.Signal(senderName: "Sender", subject: "Subject"),
+            accountId: "acc1",
+            messageId: "provider-resource-id",
+            rfc822MessageId: " <action-id@example.com> "
+        )
+
+        #expect(content.userInfo["messageId"] as? String == "provider-resource-id")
+        #expect(content.userInfo[EmailNotificationBuilder.actionMessageIdUserInfoKey] as? String == "action-id@example.com")
+        #expect(content.categoryIdentifier == "EMAIL")
+    }
+
+    @Test("fill without a valid RFC action identity remains visible but has no actionable category")
+    func missingActionIdentitySuppressesCategory() {
+        for invalidId in [nil, "", "   ", "bad\r\nid"] as [String?] {
+            let content = UNMutableNotificationContent()
+            content.categoryIdentifier = "EMAIL_TAG_DELETE"
+            content.userInfo = [EmailNotificationBuilder.actionMessageIdUserInfoKey: "stale@example.com"]
+
+            _ = EmailNotificationBuilder.fill(
+                content,
+                signal: EmailNotificationBuilder.Signal(senderName: "Sender", subject: "Subject", actionTag: "delete"),
+                accountId: "acc1",
+                messageId: "provider-resource-id",
+                rfc822MessageId: invalidId
+            )
+
+            #expect(content.categoryIdentifier.isEmpty)
+            #expect(content.userInfo["messageId"] as? String == "provider-resource-id")
+            #expect(content.userInfo[EmailNotificationBuilder.actionMessageIdUserInfoKey] == nil)
+        }
     }
 }

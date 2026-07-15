@@ -100,11 +100,11 @@ struct EmlParsingTests {
     }
 
     @Test("parseNestedSection / nestedSection round-trip")
-    func compoundSectionRoundTrip() {
+    func compoundSectionRoundTrip() throws {
         let encoded = EmlParsing.nestedSection(parent: "parent-att-id", index: 3)
-        let decoded = try? #require(EmlParsing.parseNestedSection(encoded))
-        #expect(decoded?.parent == "parent-att-id")
-        #expect(decoded?.index == 3)
+        let decoded = try #require(EmlParsing.parseNestedSection(encoded))
+        #expect(decoded.parent == "parent-att-id")
+        #expect(decoded.index == 3)
 
         // Plain (non-nested) section is recognized as non-compound.
         #expect(EmlParsing.parseNestedSection("plain-id") == nil)

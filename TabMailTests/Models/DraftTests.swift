@@ -289,7 +289,7 @@ struct DraftGRDBPersistenceTests {
         )
 
         try db.write { try draft.insert($0) }
-        try db.write { try draft.delete($0) }
+        try db.write { _ = try draft.delete($0) }
 
         let fetched = try db.read { try Draft.fetchOne($0, key: "new:delete-test") }
         #expect(fetched == nil)

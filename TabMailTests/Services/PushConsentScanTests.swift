@@ -23,9 +23,10 @@ import Synchronization
 ///
 /// These tests install a temp file-backed `AppDatabase.shared` and a mock
 /// `PushConsentChecking` on the shared `PushNotificationService` actor, then
-/// drive the scan and observe `.pushConsentErrorsDetected`. The suite
-/// is `.serialized` because it mutates process-global singletons.
-@Suite("PushConsentScan", .serialized)
+/// drive the scan and observe `.pushConsentErrorsDetected`. `.serialized`
+/// prevents sibling overlap and `.processGlobalState` excludes other suites
+/// that replace the same process-global singletons/defaults.
+@Suite("PushConsentScan", .serialized, .processGlobalState)
 struct PushConsentScanTests {
 
     // MARK: - Mock
@@ -108,18 +109,23 @@ struct PushConsentScanTests {
 
         await PushNotificationService.shared._setConsentCheckerForTesting(mock)
         // Reset first-scan-success flag at the START of each test so
-        // behavior is deterministic regardless of prior test order (the
-        // service is a process singleton; the suite is .serialized but
-        // state leaks otherwise).
+        // behavior is deterministic regardless of prior test order. Suite
+        // serialization prevents sibling overlap, but does not reset state.
         await PushNotificationService.shared._resetConsentScanStateForTesting()
-        defer {
-            Task {
-                await PushNotificationService.shared._setConsentCheckerForTesting(nil)
-                await PushNotificationService.shared._resetConsentScanStateForTesting()
-            }
+
+        do {
+            try await body()
+        } catch {
+            // Async cleanup must finish before `.processGlobalState` releases
+            // its lease; an unstructured deferred Task can otherwise reset the
+            // singleton after the next process-global test has installed it.
+            await PushNotificationService.shared._setConsentCheckerForTesting(nil)
+            await PushNotificationService.shared._resetConsentScanStateForTesting()
+            throw error
         }
 
-        try await body()
+        await PushNotificationService.shared._setConsentCheckerForTesting(nil)
+        await PushNotificationService.shared._resetConsentScanStateForTesting()
     }
 
     /// Subscribes to `.pushConsentErrorsDetected`, runs `action`, and
@@ -159,8 +165,8 @@ struct PushConsentScanTests {
         let mock = MockConsentChecker()
         try await withHarness(
             accounts: [
-                ("a@gmail.com", .gmail),
-                ("b@outlook.com", .outlook),
+                ("gmail-a@example.com", .gmail),
+                ("outlook-b@example.com", .outlook),
             ],
             mock: mock
         ) {
@@ -175,17 +181,17 @@ struct PushConsentScanTests {
     func mixedStatuses() async throws {
         let mock = MockConsentChecker()
         mock.outcomes = [
-            "ok@gmail.com":     .gmail(.success(.ok)),
-            "err@gmail.com":    .gmail(.success(.error(reason: "refresh_failed"))),
-            "miss@outlook.com": .outlook(.success(.missing)),
-            "ok@outlook.com":   .outlook(.success(.ok)),
+            "gmail-ok@example.com":     .gmail(.success(.ok)),
+            "gmail-err@example.com":    .gmail(.success(.error(reason: "refresh_failed"))),
+            "outlook-miss@example.com": .outlook(.success(.missing)),
+            "outlook-ok@example.com":   .outlook(.success(.ok)),
         ]
         try await withHarness(
             accounts: [
-                ("ok@gmail.com", .gmail),
-                ("err@gmail.com", .gmail),
-                ("miss@outlook.com", .outlook),
-                ("ok@outlook.com", .outlook),
+                ("gmail-ok@example.com", .gmail),
+                ("gmail-err@example.com", .gmail),
+                ("outlook-miss@example.com", .outlook),
+                ("outlook-ok@example.com", .outlook),
             ],
             mock: mock
         ) {
@@ -194,7 +200,7 @@ struct PushConsentScanTests {
             }
             #expect(emails != nil)
             guard let emails else { return }
-            #expect(Set(emails) == Set(["err@gmail.com", "miss@outlook.com"]))
+            #expect(Set(emails) == Set(["gmail-err@example.com", "outlook-miss@example.com"]))
         }
     }
 
@@ -202,15 +208,15 @@ struct PushConsentScanTests {
     func errorThrownKeepsInBanner_afterPriming() async throws {
         let mock = MockConsentChecker()
         mock.outcomes = [
-            "flaky@gmail.com":  .gmail(.failure(MockError.timeout)),
-            "ok@gmail.com":     .gmail(.success(.ok)),
-            "flaky2@outlook.com": .outlook(.failure(MockError.timeout)),
+            "gmail-flaky@example.com":  .gmail(.failure(MockError.timeout)),
+            "gmail-ok@example.com":     .gmail(.success(.ok)),
+            "outlook-flaky-two@example.com": .outlook(.failure(MockError.timeout)),
         ]
         try await withHarness(
             accounts: [
-                ("flaky@gmail.com", .gmail),
-                ("ok@gmail.com", .gmail),
-                ("flaky2@outlook.com", .outlook),
+                ("gmail-flaky@example.com", .gmail),
+                ("gmail-ok@example.com", .gmail),
+                ("outlook-flaky-two@example.com", .outlook),
             ],
             mock: mock
         ) {
@@ -218,9 +224,9 @@ struct PushConsentScanTests {
             // sticky-on-error is active for the scan we actually measure.
             // All three accounts return .ok here.
             mock.outcomes = [
-                "flaky@gmail.com":    .gmail(.success(.ok)),
-                "ok@gmail.com":       .gmail(.success(.ok)),
-                "flaky2@outlook.com": .outlook(.success(.ok)),
+                "gmail-flaky@example.com":    .gmail(.success(.ok)),
+                "gmail-ok@example.com":       .gmail(.success(.ok)),
+                "outlook-flaky-two@example.com": .outlook(.success(.ok)),
             ]
             _ = try await observePost {
                 await PushNotificationService.shared.checkPushConsentStatusForForeground()
@@ -228,16 +234,16 @@ struct PushConsentScanTests {
 
             // Now inject flakiness for the real measurement.
             mock.outcomes = [
-                "flaky@gmail.com":    .gmail(.failure(MockError.timeout)),
-                "ok@gmail.com":       .gmail(.success(.ok)),
-                "flaky2@outlook.com": .outlook(.failure(MockError.timeout)),
+                "gmail-flaky@example.com":    .gmail(.failure(MockError.timeout)),
+                "gmail-ok@example.com":       .gmail(.success(.ok)),
+                "outlook-flaky-two@example.com": .outlook(.failure(MockError.timeout)),
             ]
             let emails = try await observePost {
                 await PushNotificationService.shared.checkPushConsentStatusForForeground()
             }
             #expect(emails != nil)
             guard let emails else { return }
-            #expect(Set(emails) == Set(["flaky@gmail.com", "flaky2@outlook.com"]))
+            #expect(Set(emails) == Set(["gmail-flaky@example.com", "outlook-flaky-two@example.com"]))
         }
     }
 
@@ -245,20 +251,20 @@ struct PushConsentScanTests {
     func firstScanThrownIsNotError() async throws {
         let mock = MockConsentChecker()
         mock.outcomes = [
-            "flaky@gmail.com":    .gmail(.failure(MockError.timeout)),
-            "ok@gmail.com":       .gmail(.success(.ok)),
-            "flaky2@outlook.com": .outlook(.failure(MockError.timeout)),
+            "gmail-flaky@example.com":    .gmail(.failure(MockError.timeout)),
+            "gmail-ok@example.com":       .gmail(.success(.ok)),
+            "outlook-flaky-two@example.com": .outlook(.failure(MockError.timeout)),
         ]
         try await withHarness(
             accounts: [
-                ("flaky@gmail.com", .gmail),
-                ("ok@gmail.com", .gmail),
-                ("flaky2@outlook.com", .outlook),
+                ("gmail-flaky@example.com", .gmail),
+                ("gmail-ok@example.com", .gmail),
+                ("outlook-flaky-two@example.com", .outlook),
             ],
             mock: mock
         ) {
             // First scan — flag starts false (harness resets). Even though
-            // two accounts throw, the ok@gmail.com probe is authoritative, so
+            // two accounts throw, the gmail-ok@example.com probe is authoritative, so
             // a post DOES fire, but the throws are NOT included.
             let emails = try await observePost {
                 await PushNotificationService.shared.checkPushConsentStatusForForeground()
@@ -271,13 +277,13 @@ struct PushConsentScanTests {
     func firstScanAllThrows_noPost() async throws {
         let mock = MockConsentChecker()
         mock.outcomes = [
-            "a@gmail.com":   .gmail(.failure(MockError.timeout)),
-            "b@outlook.com": .outlook(.failure(MockError.timeout)),
+            "gmail-a@example.com":   .gmail(.failure(MockError.timeout)),
+            "outlook-b@example.com": .outlook(.failure(MockError.timeout)),
         ]
         try await withHarness(
             accounts: [
-                ("a@gmail.com", .gmail),
-                ("b@outlook.com", .outlook),
+                ("gmail-a@example.com", .gmail),
+                ("outlook-b@example.com", .outlook),
             ],
             mock: mock
         ) {
@@ -293,10 +299,10 @@ struct PushConsentScanTests {
     func toggleOffNoPost() async throws {
         let mock = MockConsentChecker()
         mock.outcomes = [
-            "err@gmail.com": .gmail(.success(.error(reason: "x"))),
+            "gmail-err@example.com": .gmail(.success(.error(reason: "x"))),
         ]
         try await withHarness(
-            accounts: [("err@gmail.com", .gmail)],
+            accounts: [("gmail-err@example.com", .gmail)],
             mock: mock,
             nseEnabled: false
         ) {

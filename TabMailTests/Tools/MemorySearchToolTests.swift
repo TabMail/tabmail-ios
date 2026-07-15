@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-@Suite("MemorySearchTool", .serialized)
+@Suite("MemorySearchTool", .serialized, .processGlobalState)
 struct MemorySearchToolTests {
 
     /// Creates a MemorySearchTool with a file-backed DB, runs the body, then restores AppDatabase.shared.
@@ -164,8 +164,8 @@ struct MemorySearchToolTests {
         try await withTool { tool in
             let result = try await tool.execute(arguments: [
                 "query": .string("hello"),
-                "from_date": .string("2024-01-01"),
-                "to_date": .string("2024-12-31"),
+                "from_date": .string(TestFixtureDate.iso8601Date(daysFromAnchor: -30)),
+                "to_date": .string(TestFixtureDate.iso8601Date()),
             ])
             #expect(!result.contains("missing query"))
         }

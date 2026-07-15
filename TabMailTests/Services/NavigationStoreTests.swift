@@ -2,10 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): the 3 splitGate_* tests drive
-// AccountManager.registerMutation directly to seed the overlay before refreshFolders();
-// invariant = badge move-delta source/dest truth table (plan section 4 item 11, must survive).
-// Retarget the SEED call to record(intention:); the store.folders assertions are unaffected.
+// ADR-IOS-058 §9l step 5: the 3 splitGate_* tests seed the DERIVED overlay via
+// `intentionJournal.seedDisplayForTesting(id:mutation:)` before refreshFolders();
+// invariant = badge move-delta source/dest truth table (plan section 4 item 11), unaffected.
 
 import Testing
 import Foundation
@@ -154,7 +153,7 @@ struct NavigationStoreTests {
 /// methods (not just their query patterns) against a real `AppDatabase` so the
 /// sync→async conversion (Half A / PLAN_HANG_FIX) can be verified before/after.
 /// `.serialized` because it swaps the `AppDatabase.shared` singleton.
-@Suite("NavigationStore refresh behavior", .serialized)
+@Suite("NavigationStore refresh behavior", .serialized, .processGlobalState)
 struct NavigationStoreRefreshTests {
 
     @MainActor
@@ -179,7 +178,7 @@ struct NavigationStoreRefreshTests {
 
     private static func insertFolders(_ db: Database, _ specs: [(String, String, FolderRole)], accountId: String) throws {
         for (name, path, role) in specs {
-            var f = Folder(name: name, path: path, role: role, accountId: accountId)
+            let f = Folder(name: name, path: path, role: role, accountId: accountId)
             try f.insert(db)
         }
     }
@@ -235,8 +234,7 @@ struct NavigationStoreRefreshTests {
     }
 
     private func clearOverlay() {
-        let snapshot = AccountManager.shared.snapshotOverlay()
-        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+        AccountManager.shared.intentionJournal.resetForTesting()
     }
 
     /// Characterizes the pre-fix bug AND pins the fix: a message that is
@@ -265,7 +263,7 @@ struct NavigationStoreRefreshTests {
             let header = makeInboxArchiveHeader(folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", messageId: "m1", isRead: true)
             try await pool.write { db in try header.insert(db) }
 
-            AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: false, folderId: "acc1:Archive"))
+            AccountManager.shared.intentionJournal.seedDisplayForTesting(id: header.id, mutation: .init(isRead: false, folderId: "acc1:Archive"))
 
             let store = NavigationStore()
             await store.refreshFolders()
@@ -296,7 +294,7 @@ struct NavigationStoreRefreshTests {
             let header = makeInboxArchiveHeader(folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", messageId: "m2", isRead: false)
             try await pool.write { db in try header.insert(db) }
 
-            AccountManager.shared.registerMutation(id: header.id, mutation: .init(isRead: true, folderId: "acc1:Archive"))
+            AccountManager.shared.intentionJournal.seedDisplayForTesting(id: header.id, mutation: .init(isRead: true, folderId: "acc1:Archive"))
 
             let store = NavigationStore()
             await store.refreshFolders()
@@ -326,7 +324,7 @@ struct NavigationStoreRefreshTests {
             let header = makeInboxArchiveHeader(folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", messageId: "m3", isRead: false)
             try await pool.write { db in try header.insert(db) }
 
-            AccountManager.shared.registerMutation(id: header.id, mutation: .init(folderId: "acc1:Archive"))
+            AccountManager.shared.intentionJournal.seedDisplayForTesting(id: header.id, mutation: .init(folderId: "acc1:Archive"))
 
             let store = NavigationStore()
             await store.refreshFolders()

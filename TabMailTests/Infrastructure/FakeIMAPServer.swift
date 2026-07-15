@@ -53,6 +53,39 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// bytes here (keyed by section string, e.g. `"1"`, `"2"`, `"2.1"`).
         /// Falls back to slicing `body` only when nil.
         let partBodies: [String: Data]?
+
+        func replacingUID(_ uid: Int) -> Message {
+            Message(
+                uid: uid,
+                raw: raw,
+                subject: subject,
+                from: from,
+                to: to,
+                date: date,
+                internalDate: internalDate,
+                messageID: messageID,
+                contentType: contentType,
+                charset: charset,
+                body: body,
+                headerData: headerData,
+                customBodystructure: customBodystructure,
+                partBodies: partBodies
+            )
+        }
+    }
+
+    private struct State {
+        var messagesByMailbox: [String: [Message]]
+        var flagsByMailbox: [String: [Int: Set<String>]] = [:]
+        var commandLog: [String] = []
+        var injectedFailureCountdowns: [String: [Int]] = [:]
+        var consumedInjectedFailureCount = 0
+        /// Mailboxes SELECT must reject as gone. Value = whether the NO
+        /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
+        /// "hint" shape) or is a plain unstructured NO (the non-RFC-5530
+        /// shape some real servers send). LIST also excludes these names
+        /// regardless of shape — the LIST probe is the authority either way.
+        var deletedMailboxes: [String: Bool] = [:]
     }
 
     let host: String
@@ -63,7 +96,8 @@ final class FakeIMAPServer: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private let queue = DispatchQueue(label: "FakeIMAPServer")
-    private let messages: [Message]
+    private let stateLock = NSLock()
+    private var state: State
     private var clientFds: [Int32] = []
 
     init(host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass", messages: [Message]) {
@@ -71,7 +105,71 @@ final class FakeIMAPServer: @unchecked Sendable {
         self.port = port
         self.username = username
         self.password = password
-        self.messages = messages
+        self.state = State(messagesByMailbox: ["INBOX": messages])
+    }
+
+    init(host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass", mailboxes: [String: [Message]]) {
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.state = State(messagesByMailbox: mailboxes)
+    }
+
+    private func withState<T>(_ body: (inout State) -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return body(&state)
+    }
+
+    func messageIDs(in mailbox: String) -> [String] {
+        withState { state in
+            (state.messagesByMailbox[mailbox] ?? []).map(\.messageID)
+        }
+    }
+
+    func flags(in mailbox: String, uid: Int) -> Set<String> {
+        withState { state in
+            state.flagsByMailbox[mailbox]?[uid] ?? []
+        }
+    }
+
+    func recordedCommands() -> [String] {
+        withState { $0.commandLog }
+    }
+
+    func consumedInjectedFailureCount() -> Int {
+        withState { $0.consumedInjectedFailureCount }
+    }
+
+    func failNextCommand(containing fragment: String) {
+        failCommand(containing: fragment, onMatch: 1)
+    }
+
+    func failCommand(containing fragment: String, onMatch: Int) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(max(0, onMatch - 1))
+        }
+    }
+
+    func setFlags(_ flags: Set<String>, in mailbox: String, uid: Int) {
+        withState { state in
+            state.flagsByMailbox[mailbox, default: [:]][uid] = flags
+        }
+    }
+
+    /// Simulate a mailbox deleted remotely between enqueue and drain: SELECT
+    /// (and EXAMINE) of `name` now fails with a NO response, and LIST no
+    /// longer reports it present. `includeNonexistentCode`:
+    ///   - `true` — NO response carries `[NONEXISTENT]` (RFC 5530 §3), the
+    ///     shape some servers send.
+    ///   - `false` — plain unstructured `NO select failed` with no response
+    ///     code, the non-RFC-5530 shape other real servers send. The provider
+    ///     adapter must not rely on parsing this shape at all — the LIST
+    ///     probe is the sole authority in both cases.
+    func markMailboxDeleted(_ name: String, includeNonexistentCode: Bool) {
+        withState { $0.deletedMailboxes[name] = includeNonexistentCode }
     }
 
     enum ServerError: Error {
@@ -271,7 +369,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     }
 
     private func handleClient(fd: Int32) {
-        sendLine(fd: fd, "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS IDLE] FakeIMAP ready\r\n")
+        sendLine(fd: fd, "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS MOVE IDLE] FakeIMAP ready\r\n")
 
         var buffer = Data()
         var authenticated = false
@@ -281,15 +379,54 @@ final class FakeIMAPServer: @unchecked Sendable {
 
         var idleTag: String? = nil
 
-        while true {
+        /// Blocking read of more bytes into `buffer`. Returns false when the
+        /// connection closed (caller must stop processing this client).
+        func readMore() -> Bool {
             let n = read(fd, readBuf, 65536)
-            if n <= 0 { break }
+            guard n > 0 else { return false }
             buffer.append(readBuf, count: n)
+            return true
+        }
+
+        clientLoop: while true {
+            if !readMore() { break }
 
             while let crlfRange = buffer.range(of: Data("\r\n".utf8)) {
-                let lineData = buffer[buffer.startIndex..<crlfRange.lowerBound]
-                buffer = Data(buffer[crlfRange.upperBound...])
+                var lineData = buffer[buffer.startIndex..<crlfRange.lowerBound]
+                var consumedThrough = crlfRange.upperBound
 
+                // IMAP literal handling (RFC 3501 §4.3, RFC 7888 non-
+                // synchronizing literals). NIOIMAP switches a long/otherwise
+                // "unsafe" quoted-string argument (e.g. a HEADER search
+                // criterion value) to a trailing `{N}` / `{N+}` literal
+                // marker followed by exactly N raw bytes, then the command's
+                // own terminating CRLF. This fake only ever needs to splice
+                // ONE trailing literal per logical command line back in as a
+                // quoted string — the CAPABILITY response above already
+                // advertises LITERAL+, so a client is entitled to send one.
+                while let spec = Self.trailingLiteralSpec(lineData) {
+                    if spec.needsContinuationResponse {
+                        sendLine(fd: fd, "+ OK\r\n")
+                    }
+                    while buffer.count < consumedThrough + spec.length {
+                        if !readMore() { break clientLoop }
+                    }
+                    let literalBytes = buffer[consumedThrough..<(consumedThrough + spec.length)]
+                    let literalString = String(data: literalBytes, encoding: .utf8) ?? ""
+                    var afterLiteral = consumedThrough + spec.length
+                    while buffer.count < afterLiteral + 2 {
+                        if !readMore() { break clientLoop }
+                    }
+                    // The literal's raw bytes are followed by the command's
+                    // own terminating CRLF (RFC 3501 literal syntax — no
+                    // other separator is valid here).
+                    guard buffer[afterLiteral] == 0x0D, buffer[afterLiteral + 1] == 0x0A else { break clientLoop }
+                    afterLiteral += 2
+                    lineData = Self.splicingLiteral(into: lineData, literal: literalString)
+                    consumedThrough = afterLiteral
+                }
+
+                buffer = Data(buffer[consumedThrough...])
                 guard let line = String(data: lineData, encoding: .utf8) else { continue }
 
                 if let tag = idleTag, line.uppercased() == "DONE" {
@@ -307,6 +444,28 @@ final class FakeIMAPServer: @unchecked Sendable {
                 let tag = parts[0]
                 let command = parts[1].uppercased()
                 let args = parts.count > 2 ? parts[2] : ""
+                let recordedCommand = ([command] + (args.isEmpty ? [] : [args])).joined(separator: " ")
+                let shouldFail = withState { state -> Bool in
+                    state.commandLog.append(recordedCommand)
+                    let upper = recordedCommand.uppercased()
+                    guard let key = state.injectedFailureCountdowns.keys.sorted().first(where: {
+                        upper.contains($0) && !(state.injectedFailureCountdowns[$0] ?? []).isEmpty
+                    }), var countdowns = state.injectedFailureCountdowns[key]
+                    else { return false }
+                    if countdowns[0] == 0 {
+                        countdowns.removeFirst()
+                        state.injectedFailureCountdowns[key] = countdowns
+                        state.consumedInjectedFailureCount += 1
+                        return true
+                    }
+                    countdowns[0] -= 1
+                    state.injectedFailureCountdowns[key] = countdowns
+                    return false
+                }
+                if shouldFail {
+                    sendLine(fd: fd, "\(tag) NO Injected test failure\r\n")
+                    continue
+                }
 
                 if command == "IDLE" {
                     sendLine(fd: fd, "+ idling\r\n")
@@ -348,16 +507,27 @@ final class FakeIMAPServer: @unchecked Sendable {
     private func handleCommand(tag: String, command: String, args: String, authenticated: inout Bool, selectedMailbox: inout String?) -> String {
         switch command {
         case "CAPABILITY":
-            return "* CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS IDLE\r\n\(tag) OK CAPABILITY completed\r\n"
+            return "* CAPABILITY IMAP4rev1 AUTH=PLAIN LITERAL+ ID NAMESPACE UIDPLUS MOVE IDLE\r\n\(tag) OK CAPABILITY completed\r\n"
         case "LOGIN":
             authenticated = true
             return "\(tag) OK LOGIN completed\r\n"
         case "SELECT", "EXAMINE":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
             let mailbox = args.trimmingCharacters(in: .init(charactersIn: "\" "))
+            if let includeNonexistentCode = withState({ $0.deletedMailboxes[mailbox] }) {
+                // Deliberately two distinct real-world shapes: `[NONEXISTENT]`
+                // (RFC 5530 §3) is a fast-path HINT the adapter may use, but
+                // never the sole authority — a plain, code-less NO is exactly
+                // as authoritative-refusable once the adapter's LIST probe
+                // (not this response text) confirms absence.
+                return includeNonexistentCode
+                    ? "\(tag) NO [NONEXISTENT] Mailbox does not exist\r\n"
+                    : "\(tag) NO Mailbox does not exist\r\n"
+            }
             selectedMailbox = mailbox
+            let messages = withState { $0.messagesByMailbox[mailbox] ?? [] }
             let count = messages.count
-            let uidnext = (messages.last?.uid ?? 0) + 1
+            let uidnext = (messages.map(\.uid).max() ?? 0) + 1
             return """
             * \(count) EXISTS\r
             * 0 RECENT\r
@@ -369,15 +539,29 @@ final class FakeIMAPServer: @unchecked Sendable {
 
             """
         case "UID":
-            guard selectedMailbox != nil else { return "\(tag) NO No mailbox selected\r\n" }
-            return handleUID(tag: tag, args: args)
+            guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
+            return handleUID(tag: tag, args: args, mailbox: selectedMailbox)
         case "FETCH":
-            guard selectedMailbox != nil else { return "\(tag) NO No mailbox selected\r\n" }
-            return handleFetch(tag: tag, args: args, uidMode: false)
+            guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
+            return handleFetch(tag: tag, args: args, uidMode: false, mailbox: selectedMailbox)
         case "NAMESPACE":
             return "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n\(tag) OK NAMESPACE completed\r\n"
         case "LIST":
-            return "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\(tag) OK LIST completed\r\n"
+            // Reflects actual mailbox presence (unlike the old static "always
+            // INBOX" stub) so `mailboxConfirmedAbsent`'s LIST probe is
+            // meaningfully exercised: a name is "present" only if it has a
+            // `messagesByMailbox` entry and was never `markMailboxDeleted`.
+            let pattern = args.replacingOccurrences(of: "\"", with: "")
+                .split(separator: " ").map(String.init).last ?? "*"
+            let matches: [String] = withState { state in
+                state.messagesByMailbox.keys
+                    .filter { state.deletedMailboxes[$0] == nil }
+                    .filter { Self.imapListPatternMatches(pattern: pattern, name: $0) }
+                    .sorted()
+            }
+            var response = matches.map { "* LIST (\\HasNoChildren) \"/\" \"\($0)\"\r\n" }.joined()
+            response += "\(tag) OK LIST completed\r\n"
+            return response
         case "ID":
             return "* ID NIL\r\n\(tag) OK ID completed\r\n"
         case "NOOP":
@@ -389,7 +573,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
-    private func handleUID(tag: String, args: String) -> String {
+    private func handleUID(tag: String, args: String, mailbox: String) -> String {
         let parts = args.split(separator: " ", maxSplits: 1).map(String.init)
         guard let subcmd = parts.first?.uppercased() else {
             return "\(tag) BAD Missing UID subcommand\r\n"
@@ -397,7 +581,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         let subargs = parts.count > 1 ? parts[1] : ""
         switch subcmd {
         case "FETCH":
-            return handleFetch(tag: tag, args: subargs, uidMode: true)
+            return handleFetch(tag: tag, args: subargs, uidMode: true, mailbox: mailbox)
         case "SEARCH":
             // Honor HEADER "Message-ID" "<...>" criterion when present; otherwise
             // return all UIDs (legacy behavior). Minimal filter to support
@@ -411,16 +595,92 @@ final class FakeIMAPServer: @unchecked Sendable {
                 // from the raw header value and typically includes "<...>".
                 let bracketSet = CharacterSet(charactersIn: "<>")
                 let bareQuery = quoted.trimmingCharacters(in: bracketSet)
-                let matched = messages
-                    .filter { $0.messageID.trimmingCharacters(in: bracketSet) == bareQuery }
+                let matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
+                    .filter {
+                        $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
+                    }
                     .map { String($0.uid) }
                 return "* SEARCH \(matched.joined(separator: " "))\r\n\(tag) OK UID SEARCH completed\r\n"
             }
-            let uids = messages.map { String($0.uid) }.joined(separator: " ")
+            let uids = withState { $0.messagesByMailbox[mailbox] ?? [] }
+                .map { String($0.uid) }
+                .joined(separator: " ")
             return "* SEARCH \(uids)\r\n\(tag) OK UID SEARCH completed\r\n"
+        case "STORE":
+            let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
+            guard components.count == 2 else { return "\(tag) BAD Invalid UID STORE\r\n" }
+            let uids = parseUIDSet(components[0])
+            let operation = components[1].uppercased()
+            let flags = Self.parenthesizedTokens(components[1])
+            withState { state in
+                var mailboxFlags = state.flagsByMailbox[mailbox] ?? [:]
+                for uid in uids {
+                    var current = mailboxFlags[uid] ?? []
+                    if operation.contains("+FLAGS") {
+                        current.formUnion(flags)
+                    } else if operation.contains("-FLAGS") {
+                        current.subtract(flags)
+                    } else {
+                        current = flags
+                    }
+                    mailboxFlags[uid] = current
+                }
+                state.flagsByMailbox[mailbox] = mailboxFlags
+            }
+            return "\(tag) OK UID STORE completed\r\n"
+        case "MOVE":
+            let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
+            guard components.count == 2 else { return "\(tag) BAD Invalid UID MOVE\r\n" }
+            let uids = Set(parseUIDSet(components[0]))
+            let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
+            withState { state in
+                let sourceMessages = state.messagesByMailbox[mailbox] ?? []
+                let moving = sourceMessages.filter { uids.contains($0.uid) }
+                state.messagesByMailbox[mailbox] = sourceMessages.filter { !uids.contains($0.uid) }
+
+                var destinationMessages = state.messagesByMailbox[destination] ?? []
+                var nextUID = (destinationMessages.map(\.uid).max() ?? 0) + 1
+                var sourceFlags = state.flagsByMailbox[mailbox] ?? [:]
+                var destinationFlags = state.flagsByMailbox[destination] ?? [:]
+                for message in moving {
+                    destinationMessages.append(message.replacingUID(nextUID))
+                    destinationFlags[nextUID] = sourceFlags.removeValue(forKey: message.uid) ?? []
+                    nextUID += 1
+                }
+                state.messagesByMailbox[destination] = destinationMessages
+                state.flagsByMailbox[mailbox] = sourceFlags
+                state.flagsByMailbox[destination] = destinationFlags
+            }
+            return "\(tag) OK UID MOVE completed\r\n"
+        case "EXPUNGE":
+            let uids = Set(parseUIDSet(subargs))
+            withState { state in
+                let sourceMessages = state.messagesByMailbox[mailbox] ?? []
+                state.messagesByMailbox[mailbox] = sourceMessages.filter { !uids.contains($0.uid) }
+                for uid in uids {
+                    state.flagsByMailbox[mailbox]?.removeValue(forKey: uid)
+                }
+            }
+            return "\(tag) OK UID EXPUNGE completed\r\n"
         default:
             return "\(tag) BAD Unknown UID subcommand\r\n"
         }
+    }
+
+    private func parseUIDSet(_ value: String) -> [Int] {
+        value.split(separator: ",").flatMap { component -> [Int] in
+            let bounds = component.split(separator: ":").compactMap { Int($0) }
+            if bounds.count == 2 {
+                return Array(bounds[0]...bounds[1])
+            }
+            return bounds.first.map { [$0] } ?? []
+        }
+    }
+
+    private static func parenthesizedTokens(_ value: String) -> Set<String> {
+        guard let open = value.firstIndex(of: "("),
+              let close = value[open...].firstIndex(of: ")") else { return [] }
+        return Set(value[value.index(after: open)..<close].split(separator: " ").map(String.init))
     }
 
     /// Extract the first quoted token from a fragment. Used to parse
@@ -432,7 +692,59 @@ final class FakeIMAPServer: @unchecked Sendable {
         return String(s[afterOpen..<close])
     }
 
-    private func handleFetch(tag: String, args: String, uidMode: Bool) -> String {
+    /// Detects a trailing IMAP literal marker (`{N}` or `{N+}`, RFC 3501
+    /// §4.3 / RFC 7888) at the end of a not-yet-terminated command line.
+    /// `needsContinuationResponse` is true for the synchronizing `{N}` form
+    /// (server must send `+ OK` before the client sends the N bytes) and
+    /// false for the non-synchronizing `{N+}` form (client sends immediately
+    /// — this fake's CAPABILITY advertises LITERAL+, so real clients use
+    /// this form here).
+    private static func trailingLiteralSpec(_ lineData: Data) -> (length: Int, needsContinuationResponse: Bool)? {
+        guard let line = String(data: lineData, encoding: .utf8), line.hasSuffix("}"),
+              let open = line.lastIndex(of: "{") else { return nil }
+        var digits = line[line.index(after: open)..<line.index(before: line.endIndex)]
+        let needsContinuationResponse: Bool
+        if digits.hasSuffix("+") {
+            needsContinuationResponse = false
+            digits = digits.dropLast()
+        } else {
+            needsContinuationResponse = true
+        }
+        guard !digits.isEmpty, digits.allSatisfy(\.isNumber), let length = Int(digits) else { return nil }
+        return (length, needsContinuationResponse)
+    }
+
+    /// Replace a trailing `{N[+]}` literal marker with a quoted, escaped
+    /// form of its now-known bytes, so the existing quoted-string-based
+    /// command handlers (SELECT/SEARCH/etc.) parse the reconstructed line
+    /// exactly as they would a client that chose quoted-string encoding.
+    private static func splicingLiteral(into lineData: Data, literal: String) -> Data {
+        guard let line = String(data: lineData, encoding: .utf8),
+              let open = line.lastIndex(of: "{") else { return lineData }
+        let prefix = line[line.startIndex..<open]
+        let escaped = literal
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return Data("\(prefix)\"\(escaped)\"".utf8)
+    }
+
+    /// Minimal IMAP LIST pattern match (RFC 3501 §6.3.8): `*` matches any run
+    /// of characters (including none), `%` likewise (this fake has no
+    /// mailbox hierarchy to distinguish them from `*`). Every mailbox name
+    /// this test infra uses is a flat identifier with no wildcard
+    /// metacharacters of its own, so an exact match is used whenever the
+    /// pattern itself has none.
+    private static func imapListPatternMatches(pattern: String, name: String) -> Bool {
+        guard !pattern.isEmpty, pattern != "*" else { return true }
+        guard pattern.contains("*") || pattern.contains("%") else { return pattern == name }
+        let escaped = NSRegularExpression.escapedPattern(for: pattern)
+            .replacingOccurrences(of: "\\*", with: ".*")
+            .replacingOccurrences(of: "\\%", with: ".*")
+        guard let regex = try? NSRegularExpression(pattern: "^" + escaped + "$") else { return false }
+        return regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+    }
+
+    private func handleFetch(tag: String, args: String, uidMode: Bool, mailbox: String) -> String {
         let seqStr: String
         let itemsStr: String
 
@@ -447,18 +759,25 @@ final class FakeIMAPServer: @unchecked Sendable {
             itemsStr = fetchParts[1].uppercased()
         }
 
-        let matched = parseSequenceSet(seqStr, uidMode: uidMode)
+        let snapshot = withState { state in
+            (
+                messages: state.messagesByMailbox[mailbox] ?? [],
+                flags: state.flagsByMailbox[mailbox] ?? [:]
+            )
+        }
+        let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
         var response = ""
 
         for msg in matched {
-            let seqnum = (messages.firstIndex(where: { $0.uid == msg.uid }) ?? 0) + 1
+            let seqnum = (snapshot.messages.firstIndex(where: { $0.uid == msg.uid }) ?? 0) + 1
             var fetchItems: [String] = []
 
             if itemsStr.contains("UID") || uidMode {
                 fetchItems.append("UID \(msg.uid)")
             }
             if itemsStr.contains("FLAGS") {
-                fetchItems.append("FLAGS (\\Seen)")
+                let flags = (snapshot.flags[msg.uid] ?? []).sorted().joined(separator: " ")
+                fetchItems.append("FLAGS (\(flags))")
             }
             if itemsStr.contains("ENVELOPE") {
                 fetchItems.append("ENVELOPE \(buildEnvelope(msg))")
@@ -510,7 +829,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         return response
     }
 
-    private func parseSequenceSet(_ seqStr: String, uidMode: Bool) -> [Message] {
+    private func parseSequenceSet(_ seqStr: String, uidMode: Bool, messages: [Message]) -> [Message] {
         var results: [Message] = []
         for part in seqStr.split(separator: ",").map(String.init) {
             if part.contains(":") {

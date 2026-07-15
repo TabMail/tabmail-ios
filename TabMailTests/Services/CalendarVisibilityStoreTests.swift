@@ -6,7 +6,10 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("CalendarVisibilityStore")
+// These tests reset/reuse keys on the real process-wide UserDefaults.standard.
+// `.serialized` prevents sibling overlap; `.processGlobalState` prevents the
+// separate visibility-filter suite from resetting the same keys concurrently.
+@Suite("CalendarVisibilityStore", .serialized, .processGlobalState)
 struct CalendarVisibilityStoreTests {
 
     private func makeCal(id: String, primary: Bool? = nil, selected: Bool? = nil) -> GCalCalendar {

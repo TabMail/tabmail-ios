@@ -22,7 +22,7 @@ import GRDB
 /// Responsiveness (the merge no longer freezes the UI) is established by the
 /// identical `await dbPool.write` mechanism already validated in
 /// `NSEMergeMainActorBlockTests`; it isn't re-measured here.
-@Suite("NavigationStore favorites/primary — async write", .serialized)
+@Suite("NavigationStore favorites/primary — async write", .serialized, .processGlobalState)
 @MainActor
 struct NavigationStoreFavoritesAsyncTests {
 

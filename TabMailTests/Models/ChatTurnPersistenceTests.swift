@@ -261,7 +261,7 @@ struct ChatTurnPersistenceTests {
             try db.write { try makeTurn(id: "t\(i)", timestamp: Double(i * 1000)).insert($0) }
         }
 
-        try db.write { try ChatTurn.deleteAll($0) }
+        try db.write { _ = try ChatTurn.deleteAll($0) }
         let count = try db.read { try ChatTurn.fetchCount($0) }
         #expect(count == 0)
     }

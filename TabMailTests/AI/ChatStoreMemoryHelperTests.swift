@@ -14,7 +14,7 @@ import GRDB
 ///   - `loadHistoryTurns(forSessionId:)` (kept from v2)
 ///
 /// Uses `.serialized` because we rebind `AppDatabase.shared`.
-@Suite("ChatStore Memory Helpers", .serialized)
+@Suite("ChatStore Memory Helpers", .serialized, .processGlobalState)
 struct ChatStoreMemoryHelperTests {
 
     // MARK: - Fixtures
@@ -217,7 +217,7 @@ struct ChatStoreMemoryHelperTests {
 
         // Seed 5 chatHistory turns with ascending timestamps.
         for i in 1...5 {
-            try await MainActor.run {
+            _ = try await MainActor.run {
                 try insertHistoryTurn(pool, id: "t\(i)", timestamp: Double(i * 1000), sessionId: "s")
             }
         }
@@ -238,7 +238,7 @@ struct ChatStoreMemoryHelperTests {
         defer { Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) } }
 
         for i in 1...3 {
-            try await MainActor.run {
+            _ = try await MainActor.run {
                 try insertHistoryTurn(pool, id: "t\(i)", timestamp: Double(i * 1000), sessionId: "s")
             }
         }

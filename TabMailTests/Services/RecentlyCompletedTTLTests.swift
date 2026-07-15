@@ -17,7 +17,7 @@ import Foundation
 /// different TTLs: the default `SyncConfig.recentlyCompletedTTLSeconds` (30s, action
 /// completion) and the longer `SyncConfig.pushMergeStaleProtectionTTLSeconds` (120s,
 /// push-merge arrival — see NSEDataBridge's registration call).
-@Suite("AccountManager.recentlyCompleted per-entry TTL")
+@Suite("AccountManager.recentlyCompleted per-entry TTL", .processGlobalState)
 struct RecentlyCompletedTTLTests {
 
     /// Unique key per test — `AccountManager.shared` is a live singleton shared
@@ -88,5 +88,28 @@ struct RecentlyCompletedTTLTests {
         let mapAfterPrune = await AccountManager.shared.recentlyCompleted
         #expect(mapAfterPrune[expiredKey] == nil, "the expired entry must be pruned")
         #expect(mapAfterPrune[liveKey] != nil, "the live entry must survive the same prune pass")
+    }
+
+    @Test("a shorter live refresh cannot truncate an existing push-protection expiry")
+    @MainActor
+    func shorterRefreshPreservesLongerExpiry() async throws {
+        let key = uniqueKey("monotonic-live-expiry")
+
+        await AccountManager.shared.recordRecentlyCompleted(
+            messageIds: [key],
+            ttl: SyncConfig.pushMergeStaleProtectionTTLSeconds
+        )
+        let longSnapshot = await AccountManager.shared.recentlyCompleted
+        let longExpiry = try #require(longSnapshot[key])
+
+        await AccountManager.shared.recordRecentlyCompleted(messageIds: [key])
+        let shortRefreshSnapshot = await AccountManager.shared.recentlyCompleted
+        let expiryAfterShortRefresh = try #require(shortRefreshSnapshot[key])
+
+        #expect(expiryAfterShortRefresh == longExpiry)
+
+        // Explicitly expired writes remain the test/maintenance escape hatch.
+        await AccountManager.shared.recordRecentlyCompleted(messageIds: [key], ttl: -1)
+        await AccountManager.shared.pruneRecentlyCompleted()
     }
 }

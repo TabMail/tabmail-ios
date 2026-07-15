@@ -716,15 +716,15 @@ struct CalDAVMergePatchTests {
     }
 
     @Test("appending RRULE when master has none inserts before END:VEVENT")
-    func appendNewRRule() {
+    func appendNewRRule() throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=5"]
         let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("RRULE:FREQ=DAILY;COUNT=5"))
         // Still well-formed: one BEGIN/END pair, RRULE inside.
         let lines = merged.components(separatedBy: "\r\n")
-        let rruleIdx = try? #require(lines.firstIndex { $0.hasPrefix("RRULE:") })
-        let endIdx = try? #require(lines.firstIndex(of: "END:VEVENT"))
-        if let r = rruleIdx, let e = endIdx { #expect(r < e) }
+        let rruleIdx = try #require(lines.firstIndex { $0.hasPrefix("RRULE:") })
+        let endIdx = try #require(lines.firstIndex(of: "END:VEVENT"))
+        #expect(rruleIdx < endIdx)
     }
 }

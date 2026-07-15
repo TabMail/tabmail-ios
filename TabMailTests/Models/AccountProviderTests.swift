@@ -34,6 +34,15 @@ struct AccountProviderTests {
         let provider = try JSONDecoder().decode(AccountProvider.self, from: json.data(using: .utf8)!)
         #expect(provider == .gmail)
     }
+
+    @Test("Remote user-label capability matches implemented mail adapters")
+    func remoteUserLabelCapability() {
+        #expect(AccountProvider.gmail.supportsRemoteUserLabels)
+        #expect(AccountProvider.imap.supportsRemoteUserLabels)
+        #expect(AccountProvider.icloud.supportsRemoteUserLabels)
+        #expect(!AccountProvider.outlook.supportsRemoteUserLabels)
+        #expect(!AccountProvider.caldav.supportsRemoteUserLabels)
+    }
 }
 
 @Suite("Account Extended")

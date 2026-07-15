@@ -6,6 +6,17 @@ import Testing
 import UIKit
 @testable import TabMail
 
+@MainActor
+private func makeSceneBackedTestWindow(frame: CGRect) throws -> UIWindow {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let scene = try #require(
+        scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+    )
+    let window = UIWindow(windowScene: scene)
+    window.frame = frame
+    return window
+}
+
 /// Unit tests for `CaretAwareUIScrollView.contentOffsetThatShows` — the pure
 /// scroll-offset math that computes where to scroll so a target rect lands
 /// inside the visible rect, while clamping to the valid scroll range.
@@ -15,6 +26,7 @@ import UIKit
 /// - If the target is above the visible area, scroll up (decrease y) just enough.
 /// - If the target is below the visible area, scroll down just enough.
 /// - The resulting offset must stay within [-insets.top, contentSize.height + insets.bottom - boundsHeight].
+@MainActor
 @Suite("CaretAwareUIScrollView — contentOffsetThatShows")
 struct CaretAwareScrollViewTests {
 
@@ -244,6 +256,7 @@ struct CaretAwareRuntimeContractTests {
 
 /// Tests for the superview-walking helper used by `DisableAutoScrollToVisible`
 /// to locate the enclosing SwiftUI ScrollView's underlying UIScrollView.
+@MainActor
 @Suite("UIView.enclosingUIScrollView")
 struct EnclosingUIScrollViewTests {
 
@@ -329,17 +342,17 @@ struct VisibleAreaAboveKeyboardTests {
     private func makeScrollViewInWindow(
         scrollViewFrame: CGRect,
         windowFrame: CGRect = CGRect(x: 0, y: 0, width: 400, height: 800)
-    ) -> (UIWindow, CaretAwareUIScrollView) {
+    ) throws -> (UIWindow, CaretAwareUIScrollView) {
         let scroll = CaretAwareUIScrollView(frame: scrollViewFrame)
-        let window = UIWindow(frame: windowFrame)
+        let window = try makeSceneBackedTestWindow(frame: windowFrame)
         window.addSubview(scroll)
         return (window, scroll)
     }
 
     @Test("Returns full bounds minus insets when keyboard frame is .zero")
-    func noKeyboardReturnsFullBounds() {
+    func noKeyboardReturnsFullBounds() throws {
         CaretAwareUIScrollView.currentKeyboardFrame = .zero
-        let (_, scroll) = makeScrollViewInWindow(
+        let (_, scroll) = try makeScrollViewInWindow(
             scrollViewFrame: CGRect(x: 0, y: 0, width: 320, height: 600)
         )
         let result = scroll.visibleAreaAboveKeyboard()
@@ -361,10 +374,10 @@ struct VisibleAreaAboveKeyboardTests {
     }
 
     @Test("Returns full bounds when the keyboard does not intersect the scroll view")
-    func keyboardBelowScrollViewReturnsFullBounds() {
+    func keyboardBelowScrollViewReturnsFullBounds() throws {
         // Scroll view is at window y=0..400. Keyboard is at window y=600..900
         // — entirely below the scroll view, no intersection.
-        let (_, scroll) = makeScrollViewInWindow(
+        let (_, scroll) = try makeScrollViewInWindow(
             scrollViewFrame: CGRect(x: 0, y: 0, width: 320, height: 400)
         )
         CaretAwareUIScrollView.currentKeyboardFrame = CGRect(x: 0, y: 600, width: 320, height: 300)
@@ -375,10 +388,10 @@ struct VisibleAreaAboveKeyboardTests {
     }
 
     @Test("Shrinks visible rect to end at keyboard top when keyboard overlaps bottom")
-    func keyboardOverlappingBottomShrinksVisible() {
+    func keyboardOverlappingBottomShrinksVisible() throws {
         // Scroll view: window y=0..600. Keyboard: y=400..800 (overlaps bottom 200pt).
         // Expected visible = y=0..400, height=400.
-        let (_, scroll) = makeScrollViewInWindow(
+        let (_, scroll) = try makeScrollViewInWindow(
             scrollViewFrame: CGRect(x: 0, y: 0, width: 320, height: 600)
         )
         CaretAwareUIScrollView.currentKeyboardFrame = CGRect(x: 0, y: 400, width: 320, height: 400)
@@ -391,10 +404,10 @@ struct VisibleAreaAboveKeyboardTests {
     }
 
     @Test("Visible rect is unaffected when keyboard is entirely above the scroll view")
-    func keyboardAboveScrollViewReturnsFullBounds() {
+    func keyboardAboveScrollViewReturnsFullBounds() throws {
         // Scroll view at window y=400..700. Keyboard at y=0..300 (entirely above).
         // The keyboard doesn't intersect; return full bounds.
-        let (_, scroll) = makeScrollViewInWindow(
+        let (_, scroll) = try makeScrollViewInWindow(
             scrollViewFrame: CGRect(x: 0, y: 400, width: 320, height: 300)
         )
         CaretAwareUIScrollView.currentKeyboardFrame = CGRect(x: 0, y: 0, width: 320, height: 300)
@@ -425,9 +438,11 @@ struct CaretAwareDoesNotGateInputTests {
     /// child, and the text view as first responder. Returns everything so
     /// the caller can keep it alive for the duration of one test.
     private func makeFirstResponderTextView()
-        -> (UIWindow, CaretAwareUIScrollView, UITextView)
+        throws -> (UIWindow, CaretAwareUIScrollView, UITextView)
     {
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        let window = try makeSceneBackedTestWindow(
+            frame: CGRect(x: 0, y: 0, width: 400, height: 800)
+        )
         let scroll = CaretAwareUIScrollView(
             frame: CGRect(x: 0, y: 0, width: 400, height: 400)
         )
@@ -441,14 +456,14 @@ struct CaretAwareDoesNotGateInputTests {
     }
 
     @Test("scrollRectToVisible does not swap the focused UITextView's class")
-    func doesNotSwapTextViewClass() {
-        let (window, scroll, textView) = makeFirstResponderTextView()
+    func doesNotSwapTextViewClass() throws {
+        let (window, scroll, textView) = try makeFirstResponderTextView()
         defer {
             _ = textView.resignFirstResponder()
             window.isHidden = true
         }
 
-        let classBefore = object_getClass(textView)
+        let classBefore: AnyClass? = object_getClass(textView)
         // Off-screen rect, smaller than the visible area, so the early-return
         // path (focusRect already inside visibleRect) is bypassed AND the
         // caret-substitution path doesn't kick in. This is the exact code path
@@ -457,7 +472,7 @@ struct CaretAwareDoesNotGateInputTests {
             CGRect(x: 0, y: 800, width: 100, height: 20),
             animated: false
         )
-        let classAfter = object_getClass(textView)
+        let classAfter: AnyClass? = object_getClass(textView)
 
         #expect(
             classBefore == classAfter,
@@ -466,8 +481,8 @@ struct CaretAwareDoesNotGateInputTests {
     }
 
     @Test("Text input lands immediately after a scrollRectToVisible call")
-    func textInputSurvivesScrollEvent() {
-        let (window, scroll, textView) = makeFirstResponderTextView()
+    func textInputSurvivesScrollEvent() throws {
+        let (window, scroll, textView) = try makeFirstResponderTextView()
         defer {
             _ = textView.resignFirstResponder()
             window.isHidden = true
@@ -491,8 +506,8 @@ struct CaretAwareDoesNotGateInputTests {
     }
 
     @Test("deleteBackward lands immediately after a scrollRectToVisible call")
-    func deleteBackwardSurvivesScrollEvent() {
-        let (window, scroll, textView) = makeFirstResponderTextView()
+    func deleteBackwardSurvivesScrollEvent() throws {
+        let (window, scroll, textView) = try makeFirstResponderTextView()
         defer {
             _ = textView.resignFirstResponder()
             window.isHidden = true
