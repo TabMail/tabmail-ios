@@ -8,7 +8,7 @@ import Foundation
 
 /// Tests verifying that SearchIndex only handles FTS content — no flag management.
 /// All flags (bodyComplete, bodyEmptyConfirmed) are in GRDB only.
-@Suite("SearchIndex body writes (no flags)", .serialized)
+@Suite("SearchIndex body writes (no flags)", .serialized, .processGlobalState)
 struct SearchIndexBodyWriteTests {
 
     private var index: SearchIndex { SearchIndex.shared }

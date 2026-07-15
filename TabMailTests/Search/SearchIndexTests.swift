@@ -17,9 +17,9 @@ struct FTSHeaderRecordFieldTests {
             headerId: "acc1:INBOX:1",
             messageId: "<msg1@example.com>",
             subject: "Hello",
-            from: "alice@test.com",
-            to: "bob@test.com",
-            dateMs: 1_700_000_000_000
+            from: "alice@example.com",
+            to: "bob@example.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         #expect(record.cc == "")
         #expect(record.bcc == "")
@@ -27,6 +27,7 @@ struct FTSHeaderRecordFieldTests {
 
     @Test("All fields stored correctly")
     func allFields() {
+        let dateMs = TestFixtureDate.milliseconds(daysFromAnchor: -15)
         let record = FTSHeaderRecord(
             headerId: "acc2:Sent:42",
             messageId: "<msg42@example.com>",
@@ -35,7 +36,7 @@ struct FTSHeaderRecordFieldTests {
             to: "team@company.com",
             cc: "manager@company.com",
             bcc: "auditor@company.com",
-            dateMs: 1_710_000_000_000
+            dateMs: dateMs
         )
         #expect(record.headerId == "acc2:Sent:42")
         #expect(record.messageId == "<msg42@example.com>")
@@ -44,7 +45,7 @@ struct FTSHeaderRecordFieldTests {
         #expect(record.to == "team@company.com")
         #expect(record.cc == "manager@company.com")
         #expect(record.bcc == "auditor@company.com")
-        #expect(record.dateMs == 1_710_000_000_000)
+        #expect(record.dateMs == dateMs)
     }
 
     @Test("Empty strings are valid field values")
@@ -64,18 +65,19 @@ struct FTSSearchResultFieldTests {
 
     @Test("All fields stored correctly")
     func allFields() {
+        let dateMs = TestFixtureDate.milliseconds(daysFromAnchor: -15)
         let result = FTSSearchResult(
             headerId: "acc1:INBOX:99",
             messageId: "<msg99@example.com>",
             snippet: "...quarterly [budget] review...",
             rank: -8.5,
-            dateMs: 1_710_000_000_000
+            dateMs: dateMs
         )
         #expect(result.headerId == "acc1:INBOX:99")
         #expect(result.messageId == "<msg99@example.com>")
         #expect(result.snippet == "...quarterly [budget] review...")
         #expect(result.rank == -8.5)
-        #expect(result.dateMs == 1_710_000_000_000)
+        #expect(result.dateMs == dateMs)
     }
 
     @Test("BM25 rank is typically negative")
@@ -99,7 +101,7 @@ struct FTSSearchResultFieldTests {
 
 // MARK: - SearchIndex Actor Tests (uses SearchIndex.shared — already initialized by app startup)
 
-@Suite("SearchIndex CRUD Operations", .serialized)
+@Suite("SearchIndex CRUD Operations", .serialized, .processGlobalState)
 struct SearchIndexCRUDTests {
 
     /// Use the shared singleton which is initialized during app startup in the test host.
@@ -114,7 +116,7 @@ struct SearchIndexCRUDTests {
                 subject: "First Message",
                 from: "alice@test.com",
                 to: "bob@test.com",
-                dateMs: 1_700_000_000_000
+                dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
             ),
             FTSHeaderRecord(
                 headerId: "test_crud_1:INBOX:2",
@@ -122,7 +124,7 @@ struct SearchIndexCRUDTests {
                 subject: "Second Message",
                 from: "carol@test.com",
                 to: "dave@test.com",
-                dateMs: 1_710_000_000_000
+                dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -15)
             ),
         ]
 
@@ -155,7 +157,8 @@ struct SearchIndexCRUDTests {
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "<emailq1@test.com>",
             subject: "Aggregate report", from: "noreply-dmarc-helper@domain.com",
-            to: "admin@domain.com", dateMs: 1_700_000_000_000
+            to: "admin@domain.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
 
         // The test-host's persistent fts.db may carry shards from older runs that
@@ -278,7 +281,7 @@ struct SearchIndexCRUDTests {
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "<body1@test.com>",
             subject: "Body Test", from: "a@test.com", to: "b@test.com",
-            dateMs: 1_700_000_000_000
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
 
         try await index.removeMessages(headerIds: [hid])
@@ -305,7 +308,7 @@ struct SearchIndexCRUDTests {
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "<remove1@test.com>",
             subject: "To Be Removed", from: "x@test.com", to: "y@test.com",
-            dateMs: 1_700_000_000_000
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
 
         try await index.removeMessages(headerIds: [hid])
@@ -336,11 +339,14 @@ struct SearchIndexCRUDTests {
     func documentCountForAccount() async throws {
         let records = [
             FTSHeaderRecord(headerId: "test_acct_count_a:INBOX:1", messageId: "m1", subject: "S1",
-                            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
+                            from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
             FTSHeaderRecord(headerId: "test_acct_count_a:INBOX:2", messageId: "m2", subject: "S2",
-                            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
+                            from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
             FTSHeaderRecord(headerId: "test_acct_count_b:INBOX:1", messageId: "m3", subject: "S3",
-                            from: "c@c.com", to: "d@d.com", dateMs: 1_700_000_000_000),
+                            from: "other-sender@example.com", to: "other-recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
         ]
         try await index.removeMessages(headerIds: records.map(\.headerId))
         let inserted = try await index.indexHeaders(records)
@@ -362,11 +368,14 @@ struct SearchIndexCRUDTests {
     func removeMessagesForAccount() async throws {
         let records = [
             FTSHeaderRecord(headerId: "test_acct_rm_a:INBOX:1", messageId: "m1", subject: "S1",
-                            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
+                            from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
             FTSHeaderRecord(headerId: "test_acct_rm_a:INBOX:2", messageId: "m2", subject: "S2",
-                            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
+                            from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
             FTSHeaderRecord(headerId: "test_acct_rm_b:INBOX:1", messageId: "m3", subject: "S3",
-                            from: "c@c.com", to: "d@d.com", dateMs: 1_700_000_000_000),
+                            from: "other-sender@example.com", to: "other-recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
         ]
         try await index.removeMessages(headerIds: records.map(\.headerId))
         try await index.removeMessagesForAccount(accountId: "test_acct_rm_a")
@@ -390,9 +399,11 @@ struct SearchIndexCRUDTests {
     func updateBodies() async throws {
         let records = [
             FTSHeaderRecord(headerId: "test_bulk_body:INBOX:1", messageId: "m1",
-                            subject: "Bulk 1", from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
+                            subject: "Bulk 1", from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)),
             FTSHeaderRecord(headerId: "test_bulk_body:INBOX:2", messageId: "m2",
-                            subject: "Bulk 2", from: "a@a.com", to: "b@b.com", dateMs: 1_710_000_000_000),
+                            subject: "Bulk 2", from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -15)),
         ]
         try await index.removeMessages(headerIds: records.map(\.headerId))
         let inserted = try await index.indexHeaders(records)
@@ -422,7 +433,8 @@ struct SearchIndexCRUDTests {
         let hid = "test_clear_body:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "m1", subject: "Clear Test",
-            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
+            from: "sender@example.com", to: "recipient@example.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
@@ -449,8 +461,8 @@ struct SearchIndexCRUDTests {
         let hid = "test_ccbcc:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "m1", subject: "CcBcc Test",
-            from: "a@a.com", to: "b@b.com", cc: "", bcc: "",
-            dateMs: 1_700_000_000_000
+            from: "sender@example.com", to: "recipient@example.com", cc: "", bcc: "",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
@@ -491,7 +503,8 @@ struct SearchIndexCRUDTests {
         let hid = "test_bodytext:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "m1", subject: "Body Text Test",
-            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
+            from: "sender@example.com", to: "recipient@example.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
@@ -508,7 +521,8 @@ struct SearchIndexCRUDTests {
         let hid = "test_bodytext2:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "m1", subject: "Body Text Test",
-            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
+            from: "sender@example.com", to: "recipient@example.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
@@ -536,7 +550,7 @@ struct SearchIndexCRUDTests {
             headerId: hid, messageId: "m1",
             subject: "Zephyranthes Budgeticus Forecasticus",
             from: "finance@company.com", to: "team@company.com",
-            dateMs: 1_700_000_000_000
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
@@ -621,7 +635,8 @@ struct SearchIndexCRUDTests {
         let hid = "test_store_emb:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "m1", subject: "Embed Store Test",
-            from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
+            from: "sender@example.com", to: "recipient@example.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
@@ -633,15 +648,210 @@ struct SearchIndexCRUDTests {
         try await index.removeMessages(headerIds: [hid])
     }
 
+    // MARK: - rekeyHeaders collision richness
+    // Round G candidate 5 (FTS collision selection): the richer body/vector must
+    // win a rekey collision, not whichever entry happened to land first.
+
+    @Test("rekeyHeaders collision prefers a persisted vector before body length")
+    func rekeyCollisionPrefersPersistedVector() async throws {
+        let oldId = "test_rekey_vector:Source:old"
+        let newId = "test_rekey_vector:Destination:new"
+        let headerIds = [oldId, newId]
+        let dateMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let oldBody = "Short body with vector."
+        let newBody = String(repeating: "Longer body without vector. ", count: 8)
+
+        try await index.removeMessages(headerIds: headerIds)
+        let inserted = try await index.indexHeaders([
+            FTSHeaderRecord(
+                headerId: oldId, messageId: "old-provider-id",
+                subject: "Old vector generation", from: "sender@example.com",
+                to: "recipient@example.com", dateMs: dateMs
+            ),
+            FTSHeaderRecord(
+                headerId: newId, messageId: "new-provider-id",
+                subject: "New skeletal generation", from: "sender@example.com",
+                to: "recipient@example.com", dateMs: dateMs
+            ),
+        ])
+        #expect(inserted == 2)
+
+        try await index.updateBody(headerId: oldId, body: oldBody)
+        try await index.updateBody(headerId: newId, body: newBody)
+        try await index.storeEmbedding(
+            headerId: oldId,
+            embedding: [Float](repeating: 0.25, count: SearchConfig.embeddingDims)
+        )
+        let oldRowid = try await index.testRowidForHeader(oldId)
+        let originalNewRowid = try await index.testRowidForHeader(newId)
+        #expect(oldRowid != nil)
+        #expect(originalNewRowid != nil)
+        #expect(oldRowid != originalNewRowid)
+
+        try await index.rekeyHeaders([(
+            oldId: oldId,
+            newId: newId,
+            newMessageId: "new-provider-id"
+        )])
+
+        #expect(try await index.isIndexed(headerId: oldId) == false)
+        #expect(try await index.isIndexed(headerId: newId))
+        #expect(try await index.testRowidForHeader(newId) == oldRowid,
+                "the vector-bearing rowid must survive the collision")
+        #expect(try await index.bodyText(headerId: newId) == oldBody,
+                "vector precedence must beat the competing longer body")
+
+        try await index.removeMessages(headerIds: headerIds)
+    }
+
+    @Test("rekeyHeaders collision uses body length when neither entry has a vector")
+    func rekeyCollisionUsesBodyLengthWithoutVectors() async throws {
+        let oldId = "test_rekey_length:Source:old"
+        let newId = "test_rekey_length:Destination:new"
+        let headerIds = [oldId, newId]
+        let dateMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let oldBody = String(repeating: "Richer complete body text. ", count: 8)
+        let newBody = "Short complete body."
+
+        try await index.removeMessages(headerIds: headerIds)
+        let inserted = try await index.indexHeaders([
+            FTSHeaderRecord(
+                headerId: oldId, messageId: "old-provider-id",
+                subject: "Old complete generation", from: "sender@example.com",
+                to: "recipient@example.com", dateMs: dateMs
+            ),
+            FTSHeaderRecord(
+                headerId: newId, messageId: "new-provider-id",
+                subject: "New complete generation", from: "sender@example.com",
+                to: "recipient@example.com", dateMs: dateMs
+            ),
+        ])
+        #expect(inserted == 2)
+
+        try await index.updateBody(headerId: oldId, body: oldBody)
+        try await index.updateBody(headerId: newId, body: newBody)
+        let oldRowid = try await index.testRowidForHeader(oldId)
+        let originalNewRowid = try await index.testRowidForHeader(newId)
+        #expect(oldRowid != nil)
+        #expect(originalNewRowid != nil)
+        #expect(oldRowid != originalNewRowid)
+
+        try await index.rekeyHeaders([(
+            oldId: oldId,
+            newId: newId,
+            newMessageId: "new-provider-id"
+        )])
+
+        #expect(try await index.isIndexed(headerId: oldId) == false)
+        #expect(try await index.isIndexed(headerId: newId))
+        #expect(try await index.testRowidForHeader(newId) == oldRowid,
+                "the longer equal-presence body must keep its original rowid")
+        #expect(try await index.bodyText(headerId: newId) == oldBody)
+
+        try await index.removeMessages(headerIds: headerIds)
+    }
+
+    // MARK: - Round G candidate 6: vector-table existence check before mutation
+
+    /// Round G candidate 6 (`deleteEntry`). On a connection where the sqlite-vec
+    /// vec0 module never registered `messages_vec` doesn't exist at all.
+    /// `deleteEntry` must check `sqlite_master` before issuing
+    /// `DELETE FROM messages_vec` rather than assume the table is there —
+    /// this is exercised through the real `removeMessages` production path
+    /// used by sync pruning and account deletion.
+    @Test("removeMessages tolerates a missing sqlite-vec table")
+    func removeMessagesToleratesMissingVectorTable() async throws {
+        let hid = "test_novec_remove:INBOX:1"
+        try? await index.removeMessages(headerIds: [hid])
+        let inserted = try await index.indexHeaders([
+            FTSHeaderRecord(
+                headerId: hid, messageId: "m1", subject: "No vec table remove test",
+                from: "a@a.com", to: "b@b.com",
+                dateMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            ),
+        ])
+        #expect(inserted == 1)
+        _ = try await index.updateBodies([(headerId: hid, body: "novecremovaltoken content")])
+
+        try await index.testDropVectorTable()
+        do {
+            // Must not throw despite messages_vec being absent — a bare
+            // (non-optional) DELETE against the missing table would abort
+            // the whole removeMessages write transaction.
+            try await index.removeMessages(headerIds: [hid])
+            #expect(try await index.isIndexed(headerId: hid) == false)
+        } catch {
+            try? await index.testRecreateVectorTable()
+            Issue.record("removeMessages threw with messages_vec absent: \(error)")
+            return
+        }
+        try await index.testRecreateVectorTable()
+    }
+
+    /// Round G candidate 6 (`entryRichness`). The richness comparison used by
+    /// `rekeyHeaders` collisions must also tolerate a missing `messages_vec`
+    /// — it falls back to body-length comparison instead of throwing.
+    @Test("rekeyHeaders collision richness tolerates a missing sqlite-vec table")
+    func rekeyCollisionRichnessToleratesMissingVectorTable() async throws {
+        let oldId = "test_novec_rekey:Source:old"
+        let newId = "test_novec_rekey:Destination:new"
+        let headerIds = [oldId, newId]
+        let dateMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let oldBody = String(repeating: "Richer complete body text without a vec table. ", count: 8)
+        let newBody = "Short complete body."
+
+        try? await index.removeMessages(headerIds: headerIds)
+        let inserted = try await index.indexHeaders([
+            FTSHeaderRecord(
+                headerId: oldId, messageId: "old-provider-id",
+                subject: "Old generation no vec table", from: "sender@example.com",
+                to: "recipient@example.com", dateMs: dateMs
+            ),
+            FTSHeaderRecord(
+                headerId: newId, messageId: "new-provider-id",
+                subject: "New generation no vec table", from: "sender@example.com",
+                to: "recipient@example.com", dateMs: dateMs
+            ),
+        ])
+        #expect(inserted == 2)
+        try await index.updateBody(headerId: oldId, body: oldBody)
+        try await index.updateBody(headerId: newId, body: newBody)
+
+        try await index.testDropVectorTable()
+        do {
+            try await index.rekeyHeaders([(
+                oldId: oldId,
+                newId: newId,
+                newMessageId: "new-provider-id"
+            )])
+            #expect(try await index.isIndexed(headerId: oldId) == false)
+            #expect(try await index.isIndexed(headerId: newId))
+            #expect(try await index.bodyText(headerId: newId) == oldBody,
+                    "richer body wins on presence/length even without a vec table to compare")
+        } catch {
+            try? await index.testRecreateVectorTable()
+            Issue.record("rekeyHeaders threw with messages_vec absent: \(error)")
+            return
+        }
+        try await index.testRecreateVectorTable()
+        try await index.removeMessages(headerIds: headerIds)
+    }
+
     @Test("keywordSearch with date range filters results")
     func keywordSearchWithDateRange() async throws {
+        let includedDateMs = TestFixtureDate.milliseconds(daysFromAnchor: -2)
+        let excludedDateMs = TestFixtureDate.milliseconds(daysFromAnchor: -30)
+        let fromDateMs = TestFixtureDate.milliseconds(daysFromAnchor: -7)
+        let toDateMs = TestFixtureDate.milliseconds(daysFromAnchor: 1)
         let records = [
             FTSHeaderRecord(headerId: "test_date_range:INBOX:1", messageId: "m1",
-                            subject: "Xylophone Zygote January Report",
-                            from: "a@a.com", to: "b@b.com", dateMs: 1_704_067_200_000),
+                            subject: "Xylophone Zygote Included Report",
+                            from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: includedDateMs),
             FTSHeaderRecord(headerId: "test_date_range:INBOX:2", messageId: "m2",
-                            subject: "Xylophone Zygote June Report",
-                            from: "a@a.com", to: "b@b.com", dateMs: 1_719_792_000_000),
+                            subject: "Xylophone Zygote Excluded Report",
+                            from: "sender@example.com", to: "recipient@example.com",
+                            dateMs: excludedDateMs),
         ]
         try await index.removeMessages(headerIds: records.map(\.headerId))
         let inserted = try await index.indexHeaders(records)
@@ -649,15 +859,11 @@ struct SearchIndexCRUDTests {
 
         let results = try await index.keywordSearch(
             query: "xylophone",
-            fromDateMs: 1_704_067_200_000,
-            toDateMs: 1_711_929_600_000
+            fromDateMs: fromDateMs,
+            toDateMs: toDateMs
         )
-        let foundJan = results.contains { $0.headerId == "test_date_range:INBOX:1" }
-        let foundJun = results.contains { $0.headerId == "test_date_range:INBOX:2" }
-        if !results.isEmpty {
-            #expect(foundJan)
-            #expect(!foundJun)
-        }
+        #expect(results.contains { $0.headerId == "test_date_range:INBOX:1" })
+        #expect(!results.contains { $0.headerId == "test_date_range:INBOX:2" })
 
         try await index.removeMessages(headerIds: records.map(\.headerId))
     }
@@ -667,15 +873,15 @@ struct SearchIndexCRUDTests {
         let hid = "test_field_search:INBOX:1"
         let record = FTSHeaderRecord(
             headerId: hid, messageId: "m1", subject: "Important Report",
-            from: "alice@company.com", to: "team@company.com",
-            dateMs: 1_700_000_000_000
+            from: "alice@example.com", to: "team@example.com",
+            dateMs: TestFixtureDate.milliseconds(daysFromAnchor: -30)
         )
         try await index.removeMessages(headerIds: [hid])
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let results = try await index.keywordSearch(query: "from:alice")
-        #expect(results.count >= 0)
+        #expect(results.contains { $0.headerId == hid })
 
         try await index.removeMessages(headerIds: [hid])
     }

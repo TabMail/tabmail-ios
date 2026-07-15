@@ -43,6 +43,23 @@ struct FTSSearchResult {
     let dateMs: Int64
 }
 
+private enum SearchIndexHeaderMetadataRefreshError: LocalizedError, Sendable {
+    case missingIndexedIdentity(String)
+    case missingShardRow(String)
+    case missingMetadataRow(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingIndexedIdentity(let headerId):
+            "No complete FTS identity mapping exists for \(headerId)."
+        case .missingShardRow(let headerId):
+            "The FTS shard row is missing for \(headerId)."
+        case .missingMetadataRow(let headerId):
+            "The FTS metadata row vanished for \(headerId)."
+        }
+    }
+}
+
 actor SearchIndex {
     static let shared = SearchIndex()
 
@@ -209,13 +226,19 @@ actor SearchIndex {
                 )
                 """)
 
-            // Vector search via sqlite-vec KNN (matching TB's messages_vec table)
-            try db.execute(sql: """
-                CREATE VIRTUAL TABLE IF NOT EXISTS messages_vec USING vec0(
-                    embedding FLOAT[\(SearchConfig.embeddingDims)] distance_metric=cosine
-                )
-                """)
+            try Self.createVectorTable(db: db)
         }
+    }
+
+    /// Vector search via sqlite-vec KNN (matching TB's messages_vec table).
+    /// Shared by `createSchema()` and `testRecreateVectorTable()` so the
+    /// CREATE statement can't drift between the real and test-only paths.
+    private static func createVectorTable(db: Database) throws {
+        try db.execute(sql: """
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_vec USING vec0(
+                embedding FLOAT[\(SearchConfig.embeddingDims)] distance_metric=cosine
+            )
+            """)
     }
 
     /// Migrate FTS schema for new features (runs after createSchema).
@@ -621,6 +644,25 @@ actor SearchIndex {
         }
     }
 
+    /// TEST ONLY: whether the header's current message_meta row owns an embedding.
+    func testHasEmbeddingForHeader(_ headerId: String) async throws -> Bool {
+        guard let dbPool else { return false }
+        return try await dbPool.read { db in
+            try Bool.fetchOne(
+                db,
+                sql: """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM message_meta AS meta
+                        JOIN messages_vec AS vec ON vec.rowid = meta.rowid
+                        WHERE meta.headerId = ?
+                    )
+                    """,
+                arguments: [headerId]
+            ) ?? false
+        }
+    }
+
     /// TEST ONLY: drop a year shard table and forget the year.
     func testDropShard(year: Int) async throws {
         guard let dbPool else { return }
@@ -629,6 +671,27 @@ actor SearchIndex {
             try db.execute(sql: "DROP TABLE IF EXISTS \(table)")
         }
         knownYears.remove(year)
+    }
+
+    /// TEST ONLY: drop the sqlite-vec `messages_vec` table to simulate a
+    /// device/connection where the vec0 module failed to register. Mutation
+    /// paths (`deleteEntry`, `entryRichness`, `storeEmbedding`) must check
+    /// `sqlite_master` before touching `messages_vec` rather than assume it
+    /// exists.
+    func testDropVectorTable() async throws {
+        guard let dbPool else { return }
+        try await dbPool.write { db in
+            try db.execute(sql: "DROP TABLE IF EXISTS messages_vec")
+        }
+    }
+
+    /// TEST ONLY: restore `messages_vec` after `testDropVectorTable()` so
+    /// later tests in the shared FTS database see the table again.
+    func testRecreateVectorTable() async throws {
+        guard let dbPool else { return }
+        try await dbPool.write { db in
+            try Self.createVectorTable(db: db)
+        }
     }
 
     // MARK: - Document Count
@@ -956,7 +1019,13 @@ actor SearchIndex {
         let table = ftsTableName(year: year)
         try db.execute(sql: "DELETE FROM \(table) WHERE rowid = ?", arguments: [rowid])
         try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [rowid])
-        try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [rowid])
+        let vectorTableExists = try Bool.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='messages_vec'"
+        ) ?? false
+        if vectorTableExists {
+            try db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [rowid])
+        }
         try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [headerId])
     }
 
@@ -967,14 +1036,19 @@ actor SearchIndex {
     /// canonicalization. `newMessageId` optionally refreshes the FTS msgId
     /// column (UID remaps change the provider message id).
     ///
-    /// If the new id already exists in FTS (e.g. a leftover orphan or a
-    /// concurrent index), the old entry is removed instead — two rows must
-    /// never share a headerId (`message_ids.headerId` is the primary key).
+    /// If the new id already exists in FTS (e.g. a concurrent header-only sync),
+    /// keep the richer entry: body presence, then vector presence, then body length.
+    /// This prevents a rekey collision from deleting the old row's indexed body and
+    /// embedding merely because a skeletal new-id header landed first.
     func rekeyHeaders(_ rekeys: [(oldId: String, newId: String, newMessageId: String?)]) throws {
         ensureReady()
         guard let dbPool, !rekeys.isEmpty else { return }
         try dbPool.write { [self] db in
             for rekey in rekeys {
+                // A self-rekey is already converged. Treat it as an explicit no-op:
+                // collision handling would otherwise compare the row with itself and
+                // delete its FTS body, metadata, and embedding.
+                guard rekey.oldId != rekey.newId else { continue }
                 guard let resolved = try resolveRowidAndYear(rekey.oldId, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 let newExists = try Bool.fetchOne(
@@ -983,9 +1057,41 @@ actor SearchIndex {
                     arguments: [rekey.newId]
                 ) ?? false
                 if newExists {
-                    print("[SearchIndex] rekeyHeaders: \(rekey.newId.prefix(40)) already indexed — removing old entry \(rekey.oldId.prefix(40))")
-                    try deleteEntry(headerId: rekey.oldId, rowid: resolved.rowid, year: resolved.year, db: db)
-                    continue
+                    guard let newResolved = try resolveRowidAndYear(rekey.newId, db: db) else {
+                        continue
+                    }
+                    let oldRichness = try entryRichness(
+                        rowid: resolved.rowid,
+                        year: resolved.year,
+                        db: db
+                    )
+                    let newRichness = try entryRichness(
+                        rowid: newResolved.rowid,
+                        year: newResolved.year,
+                        db: db
+                    )
+                    if Self.isRicher(oldRichness, than: newRichness) {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SearchIndex] rekeyHeaders: preserving richer old entry \(rekey.oldId.prefix(40)) over skeletal \(rekey.newId.prefix(40))")
+                        }
+                        try deleteEntry(
+                            headerId: rekey.newId,
+                            rowid: newResolved.rowid,
+                            year: newResolved.year,
+                            db: db
+                        )
+                    } else {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SearchIndex] rekeyHeaders: \(rekey.newId.prefix(40)) already indexed — removing old entry \(rekey.oldId.prefix(40))")
+                        }
+                        try deleteEntry(
+                            headerId: rekey.oldId,
+                            rowid: resolved.rowid,
+                            year: resolved.year,
+                            db: db
+                        )
+                        continue
+                    }
                 }
                 try db.execute(sql: "UPDATE message_ids SET headerId = ? WHERE headerId = ?",
                                arguments: [rekey.newId, rekey.oldId])
@@ -994,6 +1100,120 @@ actor SearchIndex {
                 if let newMessageId = rekey.newMessageId {
                     try db.execute(sql: "UPDATE \(table) SET msgId = ? WHERE rowid = ?",
                                    arguments: [newMessageId, resolved.rowid])
+                }
+            }
+        }
+    }
+
+    private func entryRichness(
+        rowid: Int64,
+        year: Int,
+        db: Database
+    ) throws -> (hasBody: Bool, hasVector: Bool, bodyLength: Int) {
+        let table = ftsTableName(year: year)
+        let body = try String.fetchOne(
+            db,
+            sql: "SELECT body FROM \(table) WHERE rowid = ?",
+            arguments: [rowid]
+        ) ?? ""
+        let hasBody = !body.isEmpty && body != " "
+        let vectorTableExists = try Bool.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='messages_vec'"
+        ) ?? false
+        let hasVector: Bool
+        if vectorTableExists {
+            hasVector = (try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM messages_vec WHERE rowid = ?",
+                arguments: [rowid]
+            ) ?? 0) > 0
+        } else {
+            hasVector = false
+        }
+        return (hasBody, hasVector, body.count)
+    }
+
+    private nonisolated static func isRicher(
+        _ lhs: (hasBody: Bool, hasVector: Bool, bodyLength: Int),
+        than rhs: (hasBody: Bool, hasVector: Bool, bodyLength: Int)
+    ) -> Bool {
+        if lhs.hasBody != rhs.hasBody { return lhs.hasBody }
+        if lhs.hasVector != rhs.hasVector { return lhs.hasVector }
+        return lhs.bodyLength > rhs.bodyLength
+    }
+
+    /// Refresh every searchable header field for an already-indexed identity while
+    /// preserving its FTS rowid, body text, and optional vector. Recovery calls this
+    /// after durable GRDB re-key markers are replayed so a crash cannot leave a current
+    /// header id paired with stale source-generation metadata.
+    func refreshHeaderMetadata(_ records: [FTSHeaderRecord]) throws {
+        ensureReady()
+        guard let dbPool, !records.isEmpty else { return }
+        try dbPool.write { [self] db in
+            for record in records {
+                guard let resolved = try resolveRowidAndYear(record.headerId, db: db) else {
+                    throw SearchIndexHeaderMetadataRefreshError
+                        .missingIndexedIdentity(record.headerId)
+                }
+                let desiredYear = yearFromDateMs(record.dateMs)
+                let currentTable = ftsTableName(year: resolved.year)
+                let current = try Row.fetchOne(
+                    db,
+                    sql: "SELECT body FROM \(currentTable) WHERE rowid = ?",
+                    arguments: [resolved.rowid]
+                )
+                guard let current else {
+                    throw SearchIndexHeaderMetadataRefreshError
+                        .missingShardRow(record.headerId)
+                }
+                if desiredYear == resolved.year {
+                    try db.execute(
+                        sql: """
+                        UPDATE \(currentTable)
+                        SET msgId = ?, subject = ?, from_ = ?, to_ = ?, cc = ?, bcc = ?
+                        WHERE rowid = ?
+                        """,
+                        arguments: [
+                            record.messageId, record.subject, record.from, record.to,
+                            record.cc, record.bcc, resolved.rowid,
+                        ]
+                    )
+                } else {
+                    let body: String = current["body"]
+                    try ensureShard(year: desiredYear, db: db)
+                    let desiredTable = ftsTableName(year: desiredYear)
+                    try db.execute(
+                        sql: """
+                        INSERT INTO \(desiredTable)
+                            (rowid, msgId, subject, from_, to_, cc, bcc, body)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        arguments: [
+                            resolved.rowid, record.messageId, record.subject, record.from,
+                            record.to, record.cc, record.bcc, body,
+                        ]
+                    )
+                    try db.execute(
+                        sql: "DELETE FROM \(currentTable) WHERE rowid = ?",
+                        arguments: [resolved.rowid]
+                    )
+                }
+
+                try db.execute(
+                    sql: """
+                    UPDATE message_meta
+                    SET headerId = ?, dateMs = ?, shardYear = ?, folderId = ?
+                    WHERE rowid = ?
+                    """,
+                    arguments: [
+                        record.headerId, record.dateMs, desiredYear, record.folderId,
+                        resolved.rowid,
+                    ]
+                )
+                guard db.changesCount == 1 else {
+                    throw SearchIndexHeaderMetadataRefreshError
+                        .missingMetadataRow(record.headerId)
                 }
             }
         }

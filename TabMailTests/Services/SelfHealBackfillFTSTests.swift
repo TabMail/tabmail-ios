@@ -18,7 +18,11 @@ import GRDB
 /// Tests use the production `AppDatabase.dbPool` and `SearchIndex.shared`
 /// singletons (what the function operates on) and clean up both GRDB and FTS
 /// state at the end of each test so runs don't pollute each other.
-@Suite("SyncEngine.selfHealBackfillFTSMembership — orphan detection + re-index")
+@Suite(
+    "SyncEngine.selfHealBackfillFTSMembership — orphan detection + re-index",
+    .serialized,
+    .processGlobalState
+)
 struct SelfHealBackfillFTSTests {
 
     // MARK: - Fixture
@@ -237,7 +241,11 @@ struct SelfHealBackfillFTSTests {
 /// GRDB — the inverse direction of the self-heals above. Uses the production
 /// `AppDatabase.dbPool` + `SearchIndex.shared` (what the function operates on)
 /// with unique prefixes + cleanup, mirroring the suites above.
-@Suite("SyncEngine.pruneFTSOrphans — dead FTS entry removal", .serialized)
+@Suite(
+    "SyncEngine.pruneFTSOrphans — dead FTS entry removal",
+    .serialized,
+    .processGlobalState
+)
 struct FTSOrphanPruneTests {
 
     private func makeRecord(_ headerId: String) -> FTSHeaderRecord {

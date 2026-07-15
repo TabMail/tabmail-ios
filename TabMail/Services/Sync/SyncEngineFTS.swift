@@ -7,12 +7,227 @@ import GRDB
 
 extension SyncEngine {
 
+    private enum PendingFTSRekeyClearResult: Sendable {
+        case cleared
+        case rowVanished
+        case rowChanged
+    }
+
+    /// Only fields mirrored into FTS participate in the marker-clear CAS. Local-only
+    /// state may legitimately change while recovery is running and must not force an
+    /// unrelated retry; any searchable metadata change must retain the marker so the
+    /// next pass refreshes the index from the newest GRDB row.
+    private struct PendingFTSRekeyMetadataSnapshot: Equatable, Sendable {
+        let id: String
+        let messageId: String
+        let subject: String
+        let from: String
+        let fromAddress: String
+        let to: String
+        let cc: String
+        let bcc: String
+        let date: Date
+        let accountId: String
+        let folderId: String
+        let folderPath: String
+
+        init(_ header: MessageHeader) {
+            id = header.id
+            messageId = header.messageId
+            subject = header.subject
+            from = header.from
+            fromAddress = header.fromAddress
+            to = header.to
+            cc = header.cc
+            bcc = header.bcc
+            date = header.date
+            accountId = header.accountId
+            folderId = header.folderId
+            folderPath = header.folderPath
+        }
+
+        var ftsRecord: FTSHeaderRecord {
+            FTSHeaderRecord(
+                headerId: id,
+                messageId: messageId,
+                subject: subject,
+                from: "\(from) <\(fromAddress)>",
+                to: to,
+                cc: cc,
+                bcc: bcc,
+                dateMs: Int64(date.timeIntervalSince1970 * 1000),
+                folderId: folderId
+            )
+        }
+    }
+
     /// Clear bulk index task from dictionary (called from Task defer).
     func clearBulkIndexTask(accountId: String) {
         bulkIndexTasks[accountId] = nil
     }
 
     // MARK: - FTS Indexing Helpers
+
+    /// Cursor-walk every durable re-key obligation without materializing the entire set.
+    /// A target that remains marked (corruption, transient FTS error, or a CAS race) does
+    /// not starve later ids because the cursor always advances over the current page.
+    func recoverPendingFTSRekeys() async {
+        let pageSize = SyncConfig.ftsIndexBatchSize
+        guard pageSize > 0 else {
+            BackgroundSyncLogger.log("[FTS] CRITICAL: pending re-key page size is not positive")
+            return
+        }
+
+        var cursor = ""
+        while true {
+            let headerIds: [String]
+            let pageCursor = cursor
+            do {
+                headerIds = try await dbPool.read { db in
+                    try String.fetchAll(
+                        db,
+                        sql: """
+                        SELECT id FROM messageHeader
+                        WHERE pendingFTSRekeySourceIdsJSON IS NOT NULL AND id > ?
+                        ORDER BY id
+                        LIMIT ?
+                        """,
+                        arguments: [pageCursor, pageSize]
+                    )
+                }
+            } catch {
+                BackgroundSyncLogger.log("[FTS] Pending re-key scan failed: \(error)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[FTS] Pending re-key scan failed: \(error)")
+                }
+                return
+            }
+            guard let lastId = headerIds.last else { return }
+            await recoverPendingFTSRekeys(headerIds: headerIds)
+            cursor = lastId
+        }
+    }
+
+    /// Recover only the requested current header ids. The cursor-walk startup scan
+    /// (`recoverPendingFTSRekeys()`) calls this once per page so a page that fails or
+    /// stalls never blocks pages ahead of it. Stable de-duplication preserves caller
+    /// order for deterministic collision recovery.
+    func recoverPendingFTSRekeys(headerIds: [String]) async {
+        var seen = Set<String>()
+        for headerId in headerIds where seen.insert(headerId).inserted {
+            do {
+                try await recoverPendingFTSRekey(headerId: headerId)
+            } catch {
+                // The durable raw marker remains for the next targeted drain/startup.
+                BackgroundSyncLogger.log(
+                    "[FTS] Pending re-key recovery for \(headerId) failed: \(error)"
+                )
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[FTS] Pending re-key recovery for \(headerId) failed: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Drain one ordinary-sync re-key obligation (full-sync survivor merge or UID-remap
+    /// canonicalization — see `SyncEngineFullSync`) that GRDB committed but FTS has not
+    /// yet acknowledged. Every external write is followed by a fresh GRDB read. The marker
+    /// clears only when its raw JSON and all FTS-mirrored metadata still match the values
+    /// just written; otherwise replay remains fail-closed.
+    private func recoverPendingFTSRekey(headerId: String) async throws {
+        guard let header = try await dbPool.read({ db in
+            try MessageHeader.fetchOne(db, key: headerId)
+        }), let sourceIdsJSON = header.pendingFTSRekeySourceIdsJSON else { return }
+
+        let sourceIds: [String]
+        do {
+            sourceIds = try header.decodedPendingFTSRekeySourceIds()
+        } catch {
+            BackgroundSyncLogger.log(
+                "[FTS] CRITICAL: corrupt pending re-key marker retained for \(headerId): \(error)"
+            )
+            if DebugModeManager.isLoggingEnabled() {
+                print("[FTS] Corrupt pending re-key marker retained for \(headerId): \(error)")
+            }
+            return
+        }
+
+        let rekeys = sourceIds.compactMap { sourceId in
+            sourceId == header.id ? nil : (
+                oldId: sourceId,
+                newId: header.id,
+                newMessageId: header.messageId
+            )
+        }
+        if !rekeys.isEmpty {
+            try await SearchIndex.shared.rekeyHeaders(rekeys)
+        }
+
+        var currentIndexed = try await SearchIndex.shared.isIndexed(headerId: header.id)
+        if !currentIndexed {
+            // Neither the old nor new FTS entry survived. Make GRDB completion flags
+            // truthful and obtain the exact row version to re-index. A changed marker is
+            // a newer obligation and is deliberately left to its own recovery pass.
+            let recoveryHeader = try await dbPool.write { db -> MessageHeader? in
+                guard var current = try MessageHeader.fetchOne(db, key: header.id),
+                      current.pendingFTSRekeySourceIdsJSON == sourceIdsJSON else { return nil }
+                current.headerComplete = false
+                current.bodyComplete = current.bodyEmptyConfirmed
+                current.embeddingComplete = current.bodyEmptyConfirmed
+                try current.update(db)
+                return current
+            }
+            guard let recoveryHeader else { return }
+            await indexHeadersForFTS([recoveryHeader])
+            currentIndexed = try await SearchIndex.shared.isIndexed(headerId: header.id)
+        }
+
+        guard currentIndexed else { return }
+        guard let currentHeader = try await dbPool.read({ db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }) else {
+            try await SearchIndex.shared.removeMessages(headerIds: [header.id])
+            return
+        }
+        guard currentHeader.pendingFTSRekeySourceIdsJSON == sourceIdsJSON else { return }
+
+        // Validate again after the fresh read. A concurrent writer may have replaced a
+        // valid marker with corrupt forensic state; never clear or normalize it here.
+        do {
+            _ = try currentHeader.decodedPendingFTSRekeySourceIds()
+        } catch {
+            BackgroundSyncLogger.log(
+                "[FTS] CRITICAL: corrupt pending re-key marker retained for \(header.id): \(error)"
+            )
+            return
+        }
+
+        let metadata = PendingFTSRekeyMetadataSnapshot(currentHeader)
+        try await SearchIndex.shared.refreshHeaderMetadata([metadata.ftsRecord])
+        let clearResult = try await dbPool.write { db -> PendingFTSRekeyClearResult in
+            guard let latest = try MessageHeader.fetchOne(db, key: header.id) else {
+                return .rowVanished
+            }
+            guard latest.pendingFTSRekeySourceIdsJSON == sourceIdsJSON,
+                  PendingFTSRekeyMetadataSnapshot(latest) == metadata else {
+                return .rowChanged
+            }
+            try db.execute(
+                sql: """
+                UPDATE messageHeader SET pendingFTSRekeySourceIdsJSON = NULL
+                WHERE id = ? AND pendingFTSRekeySourceIdsJSON = ?
+                """,
+                arguments: [header.id, sourceIdsJSON]
+            )
+            if db.changesCount == 1 {
+                return .cleared
+            }
+            return .rowChanged
+        }
+        if case .rowVanished = clearResult {
+            try await SearchIndex.shared.removeMessages(headerIds: [header.id])
+        }
+    }
 
     /// Convert inserted MessageHeaders into FTS index records.
     /// Awaitable — completes before body fetch can start, preventing the race condition

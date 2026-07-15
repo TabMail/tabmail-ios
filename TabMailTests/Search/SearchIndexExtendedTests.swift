@@ -8,7 +8,7 @@ import Foundation
 
 // MARK: - SearchIndex Extended Tests: Edge Cases & Deeper Coverage
 
-@Suite("SearchIndex Edge Cases", .serialized)
+@Suite("SearchIndex Edge Cases", .serialized, .processGlobalState)
 struct SearchIndexEdgeCaseTests {
 
     private var index: SearchIndex { SearchIndex.shared }

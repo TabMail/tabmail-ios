@@ -6,7 +6,7 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("SearchIndex Folder Scope", .serialized)
+@Suite("SearchIndex Folder Scope", .serialized, .processGlobalState)
 struct SearchIndexFolderScopeTests {
 
     private var index: SearchIndex { SearchIndex.shared }
