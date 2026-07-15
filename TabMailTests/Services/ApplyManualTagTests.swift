@@ -2,280 +2,290 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import Testing
 import Foundation
 import GRDB
+import Testing
 @testable import TabMail
 
-// MARK: - ApplyManualTag Integration Tests
+@Suite("AccountManager.applyManualTag — real path", .serialized, .processGlobalState)
+struct ApplyManualTagTests {
+    private struct Fixture {
+        let pool: DatabasePool
+        let directory: URL
+        let previous: AppDatabase?
+        let accountId: String
+        let inbox: Folder
+    }
 
-/// Tests for the manual tag teaching algorithm (applyManualTag).
-/// This method handles:
-/// 1. Self-sent email blocking
-/// 2. Optimistic UI update
-/// 3. Tag queue write
-/// 4. AI cache update
-///
-/// We replicate the DB-level logic of the method.
+    private func makeFixture(accountEmail: String) throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-@Suite("ApplyManualTag — Self-Sent Blocking")
-struct ApplyManualTagSelfSentTests {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let previous = current
+            current = appDatabase
+            return previous
+        }
 
-    @Test("Self-sent messages are blocked from manual tagging")
-    func selfSentBlocked() throws {
-        let db = try TestDatabase.make()
-        let account = try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", from: "user@example.com",
+        let accountId = "apply-manual-tag-\(UUID().uuidString)"
+        var account = Account(
+            emailAddress: accountEmail,
+            displayName: "Test",
+            provider: .gmail
+        )
+        account.id = accountId
+        let inbox = Folder(
+            name: "INBOX",
+            path: "INBOX",
+            role: .inbox,
+            accountId: accountId
+        )
+        try pool.writeWithoutTransaction { db in
+            try account.insert(db)
+            try inbox.insert(db)
+        }
+        return Fixture(
+            pool: pool,
+            directory: directory,
+            previous: previous,
+            accountId: accountId,
+            inbox: inbox
+        )
+    }
+
+    private func restore(_ fixture: Fixture) {
+        // applyManualTag starts an unstructured cache/refinement task. Retain
+        // the test DB when the host had no prior AppDatabase so a trailing
+        // actor turn cannot dereference a closed/nil process database.
+        guard fixture.previous != nil else { return }
+        AppDatabase.shared.withLock { $0 = fixture.previous }
+        try? fixture.pool.close()
+        try? FileManager.default.removeItem(at: fixture.directory)
+    }
+
+    private func makeHeader(
+        fixture: Fixture,
+        fromAddress: String,
+        actionTag: ActionTag? = nil,
+        rfc822MessageId: String? = nil
+    ) throws -> MessageHeader {
+        var header = MessageHeader(
+            messageId: "message-\(UUID().uuidString)",
+            subject: "Test subject",
+            from: "Sender",
+            fromAddress: fromAddress,
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "Test snippet",
+            folderId: fixture.inbox.id,
+            accountId: fixture.accountId,
+            folderPath: fixture.inbox.path,
+            isInInbox: true
+        )
+        header.rfc822MessageId = rfc822MessageId
+        header.actionTag = actionTag
+        header.tagSortOrder = actionTag?.sortOrder ?? 99
+        try fixture.pool.writeWithoutTransaction { try header.insert($0) }
+        return header
+    }
+
+    @Test("self-sent rejection is case-insensitive and stops every write step")
+    func selfSentCaseInsensitiveRejectionUsesProductionGuard() async throws {
+        let fixture = try makeFixture(accountEmail: "User@Example.COM")
+        defer { restore(fixture) }
+        let header = try makeHeader(
+            fixture: fixture,
             fromAddress: "user@example.com",
-            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX"
+            rfc822MessageId: "<self-sent@example.com>"
         )
 
-        // Replicate self-sent check
-        let isSelfSent = msg.fromAddress.lowercased() == account.emailAddress.lowercased()
-        #expect(isSelfSent, "Should detect self-sent message")
+        await AccountManager.shared.applyManualTag(header, tag: .reply)
 
-        // Tag should NOT be applied — original tag should remain nil
-        let header = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
-        #expect(header?.actionTag == nil)
+        let stored = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(stored?.actionTag == nil)
+        #expect(stored?.tagSortOrder == 99)
+        let operations = try await fixture.pool.read { try PendingOperation.fetchAll($0) }
+        #expect(operations.isEmpty)
+        let cacheRows = try await fixture.pool.read { try MessageAICache.fetchAll($0) }
+        #expect(cacheRows.isEmpty)
     }
 
-    @Test("Self-sent check is case-insensitive")
-    func selfSentCaseInsensitive() throws {
-        let db = try TestDatabase.make()
-        let account = try TestDatabase.insertAccount(db, id: "acc1", email: "User@Example.COM")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", from: "user@example.com",
-            fromAddress: "user@example.com",
-            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX"
+    @Test("non-self manual tag stays local: header/cache update, no durable provider operation")
+    func persistentCacheWriteThroughUsesProductionPath() async throws {
+        let fixture = try makeFixture(accountEmail: "recipient@example.com")
+        defer { restore(fixture) }
+        let rfc822MessageId = "<manual-tag-cache@example.com>"
+        let header = try makeHeader(
+            fixture: fixture,
+            fromAddress: "sender@example.com",
+            actionTag: .archive,
+            rfc822MessageId: rfc822MessageId
         )
 
-        let isSelfSent = msg.fromAddress.lowercased() == account.emailAddress.lowercased()
-        #expect(isSelfSent, "Case-insensitive match should detect self-sent")
+        // The tag is intentionally unchanged: Step 3 still writes the cache,
+        // while Step 4 correctly skips its unrelated action-refinement job.
+        await AccountManager.shared.applyManualTag(header, tag: .archive)
+
+        let cacheKey = try #require(MessageAICache.cacheKey(
+            accountId: fixture.accountId,
+            folderPath: fixture.inbox.path,
+            rfc822MessageId: rfc822MessageId
+        ))
+        _ = try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+            while true {
+                if try await fixture.pool.read({ db in
+                    try MessageAICache.fetchOne(db, key: cacheKey) != nil
+                }) {
+                    return true
+                }
+                try Task.checkCancellation()
+                try await Task.sleep(for: .seconds(SyncConfig.backgroundFlushDrainPollSeconds))
+            }
+        }
+        let cache = try await fixture.pool.read { db in
+            try MessageAICache.fetchOne(db, key: cacheKey)
+        }
+        #expect(cache?.actionTag == .archive)
+
+        let operations = try await fixture.pool.read { try PendingOperation.fetchAll($0) }
+        #expect(operations.isEmpty, "manual action tags are local-only and must not enter the durable provider queue")
+
+        let refinements = try await fixture.pool.read { try PendingAIRefinement.fetchAll($0) }
+        #expect(refinements.isEmpty)
     }
 
-    @Test("Non-self messages are allowed")
-    func nonSelfAllowed() throws {
-        let db = try TestDatabase.make()
-        let account = try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", from: "other@example.com",
-            fromAddress: "other@example.com",
-            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX"
+    @Test("manual tag SET stamps actionTagSetAt; clearing it back to nil nils the stamp (Round D-0b)")
+    func manualTagStampsAndClearsActionTagSetAt() async throws {
+        let fixture = try makeFixture(accountEmail: "recipient@example.com")
+        defer { restore(fixture) }
+        let header = try makeHeader(
+            fixture: fixture,
+            fromAddress: "sender@example.com",
+            actionTag: nil,
+            rfc822MessageId: "<manual-tag-stamp@example.com>"
         )
 
-        let isSelfSent = msg.fromAddress.lowercased() == account.emailAddress.lowercased()
-        #expect(!isSelfSent, "Different sender should not be blocked")
+        let before = Date()
+        await AccountManager.shared.applyManualTag(header, tag: .archive)
+
+        let stamped = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(stamped?.actionTag == .archive)
+        let setAt = try #require(stamped?.actionTagSetAt)
+        #expect(setAt >= before)
+
+        // Clearing the tag must nil the stamp right back out with it.
+        await AccountManager.shared.applyManualTag(try #require(stamped), tag: nil)
+        let cleared = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
+        }
+        #expect(cleared?.actionTag == nil)
+        #expect(cleared?.actionTagSetAt == nil)
     }
-}
 
-@Suite("ApplyManualTag — Optimistic UI Update")
-struct ApplyManualTagOptimisticTests {
-
-    @Test("Optimistic UI updates tag immediately in GRDB")
-    func optimisticTagUpdate() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1",
-            folderPath: "INBOX", actionTag: .reply
+    @Test("clearing a manual tag stays local and queues no removeTag operation")
+    func clearingTagStaysLocal() async throws {
+        let fixture = try makeFixture(accountEmail: "recipient@example.com")
+        defer { restore(fixture) }
+        let header = try makeHeader(
+            fixture: fixture,
+            fromAddress: "sender@example.com",
+            actionTag: .archive,
+            rfc822MessageId: "<manual-tag-remove@example.com>"
         )
 
-        // Optimistic update to .archive
-        let newTag: ActionTag = .archive
-        try db.write { db in
-            guard var header = try MessageHeader.fetchOne(db, key: msg.id) else { return }
-            header.actionTag = newTag
-            header.tagSortOrder = newTag.sortOrder
-            try header.save(db)
+        await AccountManager.shared.applyManualTag(header, tag: nil)
+
+        let cacheKey = try #require(MessageAICache.cacheKey(
+            accountId: fixture.accountId,
+            folderPath: fixture.inbox.path,
+            rfc822MessageId: header.rfc822MessageId
+        ))
+        _ = try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+            while true {
+                if try await fixture.pool.read({ db in
+                    try MessageAICache.fetchOne(db, key: cacheKey) != nil
+                }) {
+                    return true
+                }
+                try Task.checkCancellation()
+                try await Task.sleep(for: .seconds(SyncConfig.backgroundFlushDrainPollSeconds))
+            }
         }
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
-        #expect(updated?.actionTag == .archive)
-        #expect(updated?.tagSortOrder == ActionTag.archive.sortOrder)
-    }
-
-    @Test("Tag removal sets nil and sort order to 99")
-    func tagRemovalSetsNil() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1",
-            folderPath: "INBOX", actionTag: .reply
-        )
-
-        let newTag: ActionTag? = nil
-        try db.write { db in
-            guard var header = try MessageHeader.fetchOne(db, key: msg.id) else { return }
-            header.actionTag = newTag
-            header.tagSortOrder = newTag?.sortOrder ?? 99
-            try header.save(db)
+        let stored = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: header.id)
         }
+        #expect(stored?.actionTag == nil)
+        #expect(stored?.tagSortOrder == 99)
 
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
-        #expect(updated?.actionTag == nil)
-        #expect(updated?.tagSortOrder == 99)
+        let operations = try await fixture.pool.read { try PendingOperation.fetchAll($0) }
+        #expect(operations.isEmpty, "clearing a local action tag must not enter the durable provider queue")
     }
-}
 
-@Suite("ApplyManualTag — Tag Queue Write")
-struct ApplyManualTagQueueTests {
+    @Test("Local-only wiring: manual/AI/sync/outbox/NSE admit no durable action-tag jobs")
+    func allProductionActionTagWritersStayLocal() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let projectRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
 
-    @Test("setTag pending op is created for new tag")
-    func setTagOpCreated() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1",
-            folderPath: "INBOX", rfc822MessageId: "<msg@example.com>"
-        )
+        let productionSites: [(category: String, paths: [String])] = [
+            ("manual and direct AI", [
+                "TabMail/Services/Account/AccountManagerAI.swift",
+                "TabMail/Services/AI/ActiveAIQueue.swift",
+                "TabMail/Services/Account/AccountManagerQueue.swift",
+            ]),
+            ("sync reply detection", [
+                "TabMail/Services/Sync/ReplyParentResolver.swift",
+                "TabMail/Services/Sync/SyncEngine.swift",
+                "TabMail/Services/Sync/SyncEngineBackfillDeep.swift",
+                "TabMail/Services/Sync/SyncEngineDeltaSync.swift",
+                "TabMail/Services/Sync/SyncEngineFullSync.swift",
+            ]),
+            ("outbox", ["TabMail/Services/Account/AccountManagerOutbox.swift"]),
+            ("NSE merge", ["TabMail/Services/NSEDataBridge.swift"]),
+        ]
+        let forbiddenAdmissions = [
+            "queueTagWrite(",
+            "queueSetTagPendingOp(",
+            "type: .setTag",
+            "type: .removeTag",
+            "VALUES (?, 'setTag'",
+            "VALUES (?, 'removeTag'",
+        ]
 
-        // Simulate queueTagWrite
-        let tag: ActionTag = .archive
-        try db.write { db in
-            try PendingOperation(
-                type: .setTag,
-                messageIds: [msg.stableId],
-                accountId: "acc1",
-                folderPath: "INBOX",
-                tagValue: tag.rawValue
-            ).insert(db)
+        for site in productionSites {
+            for relativePath in site.paths {
+                let path = projectRoot.appendingPathComponent(relativePath)
+                let source: String
+                do {
+                    source = try String(contentsOf: path, encoding: .utf8)
+                } catch {
+                    Issue.record("Cannot audit \(relativePath); update the local-only wiring contract if the file moved: \(error)")
+                    continue
+                }
+                let normalized = source.replacingOccurrences(
+                    of: "\\s+", with: " ", options: .regularExpression
+                )
+                for forbidden in forbiddenAdmissions {
+                    #expect(
+                        !normalized.contains(forbidden),
+                        "\(site.category) must keep action tags local-only; \(relativePath) contains durable admission pattern \(forbidden)"
+                    )
+                }
+            }
         }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .setTag)
-        #expect(ops[0].tagValue == "archive")
-    }
-
-    @Test("removeTag pending op is created when removing tag")
-    func removeTagOpCreated() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let msg = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1",
-            folderPath: "INBOX", actionTag: .reply
-        )
-
-        // Remove tag = nil → use removeTag type
-        try db.write { db in
-            try PendingOperation(
-                type: .removeTag,
-                messageIds: [msg.stableId],
-                accountId: "acc1",
-                folderPath: "INBOX",
-                tagValue: "reply"  // previous tag value for IMAP keyword removal
-            ).insert(db)
-        }
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .removeTag)
-    }
-}
-
-@Suite("ApplyManualTag — AI Cache Update")
-struct ApplyManualTagAICacheTests {
-
-    @Test("AI cache is updated with new tag via writeThrough")
-    func aiCacheUpdated() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // Write through to AI cache
-        try db.write { db in
-            try MessageAICache.writeThrough(
-                accountId: "acc1",
-                folderPath: "INBOX",
-                rfc822MessageId: "<msg@example.com>",
-                actionTag: .archive,
-                db: db
-            )
-        }
-
-        // Verify cache has the tag
-        let key = MessageAICache.cacheKey(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "<msg@example.com>")!
-        let cached = try db.read { try MessageAICache.filter(Column("key") == key).fetchOne($0) }
-        #expect(cached?.actionTag == .archive)
-    }
-
-    @Test("AI cache update overwrites previous tag")
-    func aiCacheOverwrites() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        // First write
-        try db.write { db in
-            try MessageAICache.writeThrough(
-                accountId: "acc1",
-                folderPath: "INBOX",
-                rfc822MessageId: "<msg@example.com>",
-                actionTag: .reply,
-                db: db
-            )
-        }
-        // Overwrite with archive
-        try db.write { db in
-            try MessageAICache.writeThrough(
-                accountId: "acc1",
-                folderPath: "INBOX",
-                rfc822MessageId: "<msg@example.com>",
-                actionTag: .archive,
-                db: db
-            )
-        }
-
-        let key = MessageAICache.cacheKey(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "<msg@example.com>")!
-        let cached = try db.read { try MessageAICache.filter(Column("key") == key).fetchOne($0) }
-        #expect(cached?.actionTag == .archive, "Second write should overwrite first")
-    }
-
-    @Test("AI cache requires rfc822MessageId — nil is a no-op")
-    func aiCacheRequiresRfc822() throws {
-        let key = MessageAICache.cacheKey(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: nil)
-        #expect(key == nil, "cacheKey should return nil when rfc822MessageId is nil")
-    }
-}
-
-@Suite("ApplyManualTag — Auto-Prompt Update Guard")
-struct ApplyManualTagAutoPromptTests {
-
-    @Test("Auto-update fires when original != userTag")
-    func autoUpdateFiresOnDifferentTag() throws {
-        let originalAction = "reply"
-        let userManualTag = "archive"
-        let tag: ActionTag? = .archive
-
-        let shouldFire = tag != nil && originalAction != userManualTag
-        #expect(shouldFire, "Should fire auto-update when tags differ")
-    }
-
-    @Test("Auto-update skipped when original == userTag")
-    func autoUpdateSkippedOnSameTag() throws {
-        let originalAction = "archive"
-        let userManualTag = "archive"
-        let tag: ActionTag? = .archive
-
-        let shouldFire = tag != nil && originalAction != userManualTag
-        #expect(!shouldFire, "Should skip auto-update when tags are the same")
-    }
-
-    @Test("Auto-update skipped when tag is nil (remove)")
-    func autoUpdateSkippedOnRemove() throws {
-        let originalAction = "reply"
-        let userManualTag = ""
-        let tag: ActionTag? = nil
-
-        let shouldFire = tag != nil && originalAction != userManualTag
-        #expect(!shouldFire, "Should skip auto-update when tag is nil")
     }
 }

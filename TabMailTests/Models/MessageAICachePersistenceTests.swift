@@ -48,7 +48,7 @@ struct MessageAICachePersistenceTests {
     @Test("Delete cache entry")
     func deleteEntry() throws {
         let db = try TestDatabase.make()
-        var cache = MessageAICache(key: "k1")
+        let cache = MessageAICache(key: "k1")
         try db.write { try cache.insert($0) }
 
         _ = try db.write { try cache.delete($0) }
@@ -639,11 +639,11 @@ struct MessageAICachePersistenceTests {
     func filterByRfc822MessageId() throws {
         let db = try TestDatabase.make()
         try db.write {
-            var c1 = MessageAICache(key: "k1", rfc822MessageId: "<a@test.com>")
+            let c1 = MessageAICache(key: "k1", rfc822MessageId: "<a@test.com>")
             try c1.insert($0)
-            var c2 = MessageAICache(key: "k2", rfc822MessageId: "<b@test.com>")
+            let c2 = MessageAICache(key: "k2", rfc822MessageId: "<b@test.com>")
             try c2.insert($0)
-            var c3 = MessageAICache(key: "k3", rfc822MessageId: "<a@test.com>")
+            let c3 = MessageAICache(key: "k3", rfc822MessageId: "<a@test.com>")
             try c3.insert($0)
         }
 

@@ -88,8 +88,11 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             // (matches TB's messageProcessor.js ReplyDetect logic)
             // AI cache keeps the original LLM value (like TB's action:orig: key)
             let effectiveTag = (cachedTag == .reply && header.isReplied) ? ActionTag.none : cachedTag
-            header.actionTag = effectiveTag
-            header.tagSortOrder = effectiveTag.sortOrder
+            // Stamp actionTagSetAt to NOW rather than carrying any prior stamp:
+            // MessageAICache has no timestamp of its own, and a restore means the
+            // tag is live again on this (possibly brand-new) header — the simplest
+            // correct behavior is to start its TTL clock fresh from restoration.
+            header.setActionTag(effectiveTag)
             if effectiveTag != cachedTag {
                 print("[ReplyDetect] Cache restore: reply→none for \(header.messageId) (already replied)")
             }

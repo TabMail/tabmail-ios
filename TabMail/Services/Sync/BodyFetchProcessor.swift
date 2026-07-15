@@ -236,10 +236,11 @@ enum BodyFetchProcessor {
                                     summaryBlurb = 'This message has no content.',
                                     actionTag = ?,
                                     tagSortOrder = ?,
+                                    actionTagSetAt = ?,
                                     embeddingComplete = 1
                                 WHERE id = ?
                             """,
-                            arguments: [ActionTag.delete.rawValue, ActionTag.delete.sortOrder, item.headerId]
+                            arguments: [ActionTag.delete.rawValue, ActionTag.delete.sortOrder, Date(), item.headerId]
                         )
                     }
                 } catch {

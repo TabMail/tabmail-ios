@@ -205,6 +205,42 @@ struct ThreadGroupBuilderTests {
         #expect(result[0].threadTag == nil)
     }
 
+    // MARK: - Round D-0: threadTag must not leak a retained out-of-inbox tag
+
+    @Test("Round D-0: an out-of-inbox member's RETAINED tag must not leak into the threadTag of an otherwise-inbox thread")
+    func threadTagExcludesOutOfInboxMemberTag() {
+        // m1 is the higher-priority tag (reply, sortOrder 0) but has already
+        // left the inbox (e.g. archived) — Round D-0 retains its actionTag on
+        // the header, so a naive `members.compactMap(\.actionTag)` would pick
+        // it up and leak a "Reply" chip onto a thread row whose only INBOX
+        // member is tagged .archive (sortOrder 2, lower priority).
+        var outOfInbox = makeSnapshot(messageId: "m1", date: baseDate, computedThreadId: "t1", actionTag: .reply)
+        outOfInbox.isInInbox = false
+        let inInbox = makeSnapshot(messageId: "m2", date: baseDate.addingTimeInterval(60), computedThreadId: "t1", actionTag: .archive)
+        let result = ThreadGroupBuilder.buildDisplayGroups(from: [outOfInbox, inInbox])
+        #expect(result[0].threadTag == .archive, "the out-of-inbox member's retained .reply tag must not win over the inbox member's .archive tag")
+    }
+
+    @Test("Round D-0: an INBOX member's tag is picked up even when an out-of-inbox sibling has none — no vice-versa suppression")
+    func threadTagIncludesInboxMemberTagDespiteUntaggedOutOfInboxSibling() {
+        var outOfInboxUntagged = makeSnapshot(messageId: "m1", date: baseDate, computedThreadId: "t1")
+        outOfInboxUntagged.isInInbox = false
+        let inInboxTagged = makeSnapshot(messageId: "m2", date: baseDate.addingTimeInterval(60), computedThreadId: "t1", actionTag: .reply)
+        let result = ThreadGroupBuilder.buildDisplayGroups(from: [outOfInboxUntagged, inInboxTagged])
+        #expect(result[0].threadTag == .reply, "the inbox member's own tag must surface normally")
+    }
+
+    @Test("Round D-0: threadTag is nil when every tagged member has left the inbox, even though the tags themselves are retained on the headers")
+    func threadTagNilWhenOnlyOutOfInboxMembersAreTagged() {
+        var outOfInbox1 = makeSnapshot(messageId: "m1", date: baseDate, computedThreadId: "t1", actionTag: .reply)
+        outOfInbox1.isInInbox = false
+        var outOfInbox2 = makeSnapshot(messageId: "m2", date: baseDate.addingTimeInterval(60), computedThreadId: "t1", actionTag: .archive)
+        outOfInbox2.isInInbox = false
+        let inInboxUntagged = makeSnapshot(messageId: "m3", date: baseDate.addingTimeInterval(120), computedThreadId: "t1")
+        let result = ThreadGroupBuilder.buildDisplayGroups(from: [outOfInbox1, outOfInbox2, inInboxUntagged])
+        #expect(result[0].threadTag == nil, "no inbox member carries a tag, so the aggregate must be nil despite two retained tags existing on the headers")
+    }
+
     @Test("Gmail messages with same computedThreadId grouped even without header chain")
     func gmailComputedThreadId() {
         // Gmail: computedThreadId = native threadId, no inReplyTo/references needed

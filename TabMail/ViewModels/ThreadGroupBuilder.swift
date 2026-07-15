@@ -56,8 +56,14 @@ enum ThreadGroupBuilder {
                 }
             }
 
-            // Thread tag: highest priority (lowest sortOrder) among all members
-            let threadTag = members.compactMap(\.actionTag).min(by: { $0.sortOrder < $1.sortOrder })
+            // Thread tag: highest priority (lowest sortOrder) among INBOX
+            // members only. Tags are retained across folders (ADR-IOS-036,
+            // Round D-0) — a thread can mix members across folders (e.g. an
+            // archived earlier message alongside an inbox reply), and an
+            // out-of-inbox member's retained tag must not leak an aggregate
+            // chip onto an inbox thread row (or suppress/override the tag of
+            // an inbox member that's genuinely the highest priority).
+            let threadTag = members.filter(\.isInInbox).compactMap(\.actionTag).min(by: { $0.sortOrder < $1.sortOrder })
 
             let hasUnread = members.contains { !$0.isRead }
 

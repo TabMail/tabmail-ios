@@ -304,6 +304,12 @@ extension SyncEngine {
             try Folder.filter(Column("accountId") == account.id && Column("role") != FolderRole.inbox.rawValue).fetchAll(db)
         }) ?? []
 
+        // TTL cutoff (Round D-0b): a tag is eligible for reclaim once
+        // `actionTagSetAt` is older than this. Computed once — `Date()` inside
+        // the per-message loop would let the sweep's own running time nudge
+        // the cutoff message-to-message.
+        let cutoff = Date().addingTimeInterval(-SyncConfig.actionTagTTLSeconds)
+
         var cleared = 0
         for folder in folders {
             guard cleared < maxPerSweep else { break }
@@ -322,6 +328,16 @@ extension SyncEngine {
                     continue
                 }
 
+                // TTL guard: only reclaim once the tag is older than
+                // SyncConfig.actionTagTTLSeconds. A NULL `actionTagSetAt`
+                // (legacy pre-migration row, or a writer that failed to stamp
+                // it) is deliberately fail-safe — treated as already expired,
+                // degrading to the pre-TTL "clear on next touch" behavior
+                // instead of leaking the tag forever.
+                if let setAt = msg.actionTagSetAt, setAt > cutoff {
+                    continue
+                }
+
                 // Clear local state — action tags are local-only (ADR-IOS-036),
                 // no server-side sync needed.
                 let tag = msg.actionTag
@@ -330,7 +346,8 @@ extension SyncEngine {
                     _ = try MessageHeader.filter(Column("id") == msg.id)
                         .updateAll(db,
                             Column("actionTag").set(to: nil as String?),
-                            Column("tagSortOrder").set(to: 99)
+                            Column("tagSortOrder").set(to: 99),
+                            Column("actionTagSetAt").set(to: nil as Date?)
                         )
                 }
 

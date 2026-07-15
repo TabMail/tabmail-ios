@@ -32,8 +32,7 @@ extension AccountManager {
             try? await dbPool.write { db in
                 guard var msg = try MessageHeader.fetchOne(db, key: msgId) else { return }
                 msg.summaryBlurb = "This message has no content."
-                msg.actionTag = .delete
-                msg.tagSortOrder = ActionTag.delete.sortOrder
+                msg.setActionTag(.delete)
                 try msg.save(db)
             }
             NotificationCenter.default.post(name: .messageDataDidChange, object: message.id)
@@ -160,21 +159,18 @@ extension AccountManager {
                             return
                         }
 
-                        let tagToWrite: ActionTag? = try? await dbPool.write { db in
-                            guard var msg = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
+                        try? await dbPool.write { db in
+                            guard var msg = try MessageHeader.fetchOne(db, key: headerId) else { return }
                             msg.summaryBlurb = blurb
                             msg.summaryTodos = summary.todos
                             msg.reminderDate = summary.reminderDate
                             msg.reminderTime = summary.reminderTime
                             msg.reminderContent = summary.reminderContent
 
-                            var tagForWrite: ActionTag?
                             var cacheActionTag: ActionTag?
                             if let action, !hasExistingAction {
                                 let effectiveAction = (action == .reply && msg.isReplied) ? ActionTag.none : action
-                                msg.actionTag = effectiveAction
-                                msg.tagSortOrder = effectiveAction.sortOrder
-                                tagForWrite = effectiveAction
+                                msg.setActionTag(effectiveAction)
                                 cacheActionTag = action
                                 if effectiveAction != action {
                                     print("[ReplyDetect] AI direct: reply→none for \(messageId)")
@@ -201,14 +197,9 @@ extension AccountManager {
                                 cachedReply: msg.cachedReply,
                                 db: db
                             )
-                            return tagForWrite
                         }
 
                         NotificationCenter.default.post(name: .messageDataDidChange, object: headerId)
-
-                        if let tagToWrite, !hasExistingAction {
-                            AccountManager.queueTagWrite(accountId: accountId, messageId: messageId, rfc822MessageId: rfc822MessageId, tag: tagToWrite, folder: folderPath)
-                        }
 
                         // Post active local notification when this message is reply-tagged
                         // (if not already notified by NSE). Gate lives inside via
@@ -248,8 +239,7 @@ extension AccountManager {
                             let effectiveAction: ActionTag = (try? await dbPool.write { db -> ActionTag in
                                 guard var msg = try MessageHeader.fetchOne(db, key: headerId) else { return action }
                                 let resolved = (action == .reply && msg.isReplied) ? ActionTag.none : action
-                                msg.actionTag = resolved
-                                msg.tagSortOrder = resolved.sortOrder
+                                msg.setActionTag(resolved)
                                 try msg.save(db)
                                 try MessageAICache.writeThrough(
                                     accountId: accountId,
@@ -263,7 +253,6 @@ extension AccountManager {
                             if effectiveAction != action {
                                 print("[ReplyDetect] AI direct action-only: reply→none for \(messageId)")
                             }
-                            AccountManager.queueTagWrite(accountId: accountId, messageId: messageId, rfc822MessageId: rfc822MessageId, tag: effectiveAction, folder: folderPath)
                             NotificationCenter.default.post(name: .messageDataDidChange, object: headerId)
                             print("[AI] Action-only for single message \(messageId): \(effectiveAction.displayName)")
                         }
@@ -332,9 +321,8 @@ extension AccountManager {
     /// Apply a manual tag override from the user (long-press context menu).
     /// Matches TB addon's "Tag as Reply/None/Archive/Delete" flow:
     /// 1. Update GRDB state (optimistic UI)
-    /// 2. Write tag to IMAP/Gmail
-    /// 3. Update persistent AI cache
-    /// 4. Fire-and-forget: auto-update user_action.md via LLM patch
+    /// 2. Update persistent AI cache
+    /// 3. Enqueue the user_action.md refinement
     func applyManualTag(_ message: MessageHeader, tag: ActionTag?) async {
         // Block self-sent tagging (matches TB's isInternalSender check)
         guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {
@@ -373,18 +361,15 @@ extension AccountManager {
         // Step 1: Update GRDB state immediately (optimistic UI)
         try? await dbPool.write { db in
             guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return }
-            msg.actionTag = tag
-            msg.tagSortOrder = tag?.sortOrder ?? 99
+            msg.setActionTag(tag)
             try msg.save(db)
         }
 
-        // Step 2: Queue tag write for async execution
-        AccountManager.queueTagWrite(accountId: accountId, messageId: messageId, rfc822MessageId: rfc822MessageId, tag: tag, folder: folderPath)
         Task { @MainActor in NotificationCenter.default.post(name: .inboxDataDidChange, object: nil) }
 
-        // Steps 3-4 run asynchronously
+        // Steps 2-3 run asynchronously
         Task {
-            // Step 3: Update persistent AI cache
+            // Step 2: Update persistent AI cache
             try? await dbPool.write { db in
                 try MessageAICache.writeThrough(
                     accountId: accountId,
@@ -396,7 +381,7 @@ extension AccountManager {
             }
             print("[ManualTag] Applied \(tag?.displayName ?? "remove") to \(messageId)")
 
-            // Step 4: Enqueue auto-update user_action.md for durable retry via BackfillAIQueue.
+            // Step 3: Enqueue auto-update user_action.md for durable retry via BackfillAIQueue.
             // Previously a fire-and-forget LLM call — now persisted to GRDB first so it
             // survives app kill / suspend / network drop. The queue drains on BGProcessing
             // and foreground. `currentUserActionMd` is read live at drain time.
@@ -467,7 +452,8 @@ extension AccountManager {
         let content = UNMutableNotificationContent()
         EmailNotificationBuilder.fill(
             content, signal: signal,
-            accountId: header.accountId, messageId: header.messageId
+            accountId: header.accountId, messageId: header.messageId,
+            rfc822MessageId: header.rfc822MessageId
         )
 
         try await UNUserNotificationCenter.current().add(

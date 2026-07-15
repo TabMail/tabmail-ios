@@ -658,8 +658,7 @@ actor ActiveAIQueue {
                     }
                     if let pa = cached.action, msg.actionTag == nil, let tag = ActionTag(rawValue: pa) {
                         let effective = (tag == .reply && msg.isReplied) ? ActionTag.none : tag
-                        msg.actionTag = effective
-                        msg.tagSortOrder = effective.sortOrder
+                        msg.setActionTag(effective)
                         changed = true
                         BackgroundSyncLogger.logAIProcessing("DeviceSync action HIT for \(Self.logId(job.headerId)): \(tag.rawValue)")
                     }
@@ -995,8 +994,7 @@ actor ActiveAIQueue {
                 let effectiveAction: ActionTag = (try? await dbPool.write { db -> ActionTag in
                     guard var updMsg = try MessageHeader.fetchOne(db, key: job.headerId) else { return action }
                     let resolved = (action == .reply && updMsg.isReplied) ? ActionTag.none : action
-                    updMsg.actionTag = resolved
-                    updMsg.tagSortOrder = resolved.sortOrder
+                    updMsg.setActionTag(resolved)
                     try updMsg.save(db)
                     try MessageAICache.writeThrough(
                         accountId: account.id,
@@ -1010,11 +1008,6 @@ actor ActiveAIQueue {
                 if effectiveAction != action {
                     print("[ReplyDetect] ActiveAI action: reply→none for \(message.messageId)")
                 }
-                AccountManager.queueTagWrite(
-                    accountId: account.id, messageId: message.messageId,
-                    rfc822MessageId: message.rfc822MessageId,
-                    tag: effectiveAction, folder: message.folderPath
-                )
                 NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                 let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 print("[ActiveAI] Action for \(message.messageId): \(effectiveAction.displayName) in \(elapsed)ms")

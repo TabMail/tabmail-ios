@@ -57,11 +57,8 @@ enum ReplyParentResolver {
         // rows. Index-backed via `messageHeader_rfc822MessageId`
         // (AppDatabase.swift:349).
         let placeholders = Array(repeating: "?", count: normalized.count).joined(separator: ",")
-        // stableId is a Swift-side computed property on MessageHeader (rfc822 if
-        // messageId is a numeric UID, else messageId) — fetch the inputs and
-        // recompute in Swift rather than rely on a SQL column.
         let sql = """
-            SELECT id, messageId, rfc822MessageId, folderPath, accountId, actionTag
+            SELECT id, actionTag
             FROM messageHeader
             WHERE accountId = ?
               AND rfc822MessageId IN (\(placeholders))
@@ -74,44 +71,23 @@ enum ReplyParentResolver {
         var updated: [String] = []
         for row in rows {
             let id: String = row["id"]
-            let messageId: String = row["messageId"]
-            let rowRfc822: String? = row["rfc822MessageId"]
-            let folderPath: String = row["folderPath"]
-            let parentAccountId: String = row["accountId"]
             let actionTagRaw: String? = row["actionTag"]
             let actionTag = actionTagRaw.flatMap(ActionTag.init(rawValue:))
-
-            // Mirror MessageHeader.stableId: prefer rfc822 for numeric UIDs (IMAP),
-            // else messageId (Gmail/Exchange already have stable IDs).
-            let stableId: String = {
-                if UInt32(messageId) != nil, let rfc822 = rowRfc822, !rfc822.isEmpty {
-                    return rfc822
-                }
-                return messageId
-            }()
 
             try db.execute(
                 sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?",
                 arguments: [id]
             )
 
-            // Mirror the existing ReplyDetect tag-clear at
-            // SyncEngineFullSync.swift:617-630: the user's actual reply makes
-            // any "Reply" suggestion tag obsolete, and the local clear must
-            // be mirrored to the server via setTag.
+            // The user's actual reply makes any "Reply" suggestion obsolete.
+            // Action tags are local-only (ADR-IOS-036), so this is solely a
+            // MessageHeader update and never admits a durable provider job.
             let clearedReplyTag = (actionTag == .reply)
             if clearedReplyTag {
                 try db.execute(
-                    sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
-                    arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, id]
+                    sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ?, actionTagSetAt = ? WHERE id = ?",
+                    arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, Date(), id]
                 )
-                try PendingOperation(
-                    type: .setTag,
-                    messageIds: [stableId],
-                    accountId: parentAccountId,
-                    folderPath: folderPath,
-                    tagValue: ActionTag.none.rawValue
-                ).insert(db)
             }
 
             updated.append(id)

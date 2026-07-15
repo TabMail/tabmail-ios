@@ -164,22 +164,74 @@ struct ThreadGroupTests {
         #expect(info?.memberCount == 2)
     }
 
+    @Test("ThreadGroup keeps colliding provider label IDs from different accounts")
+    func displayInfoScopesLabelIdentityByAccount() throws {
+        let sharedProviderId = "Label_42"
+        let first = makeSnapshot(
+            accountId: "account-a",
+            messageId: "message-a",
+            userLabels: [
+                UserLabel(
+                    id: sharedProviderId,
+                    accountId: "account-a",
+                    name: "Account A Project",
+                    isSystem: false
+                ),
+            ]
+        )
+        let second = makeSnapshot(
+            accountId: "account-b",
+            messageId: "message-b",
+            userLabels: [
+                UserLabel(
+                    id: sharedProviderId,
+                    accountId: "account-b",
+                    name: "Account B Project",
+                    isSystem: false
+                ),
+            ]
+        )
+        let group = ThreadGroup(
+            id: "cross-account-thread",
+            representative: first,
+            memberCount: 2,
+            allSenders: ["Sender A", "Sender B"],
+            threadTag: nil,
+            hasUnread: true,
+            members: [first, second]
+        )
+
+        let info = try #require(group.displayInfo)
+        #expect(info.unionLabels.count == 2)
+        guard info.unionLabels.count == 2 else { return }
+        #expect(Set(info.unionLabels.map(\.scopedIdentity)) == [
+            UserLabelIdentity(accountId: "account-a", id: sharedProviderId),
+            UserLabelIdentity(accountId: "account-b", id: sharedProviderId),
+        ])
+    }
+
     // Helper to create a minimal MessageSnapshot via MessageHeader
-    private func makeSnapshot(actionTag: ActionTag? = nil, isInInbox: Bool = true) -> MessageSnapshot {
+    private func makeSnapshot(
+        actionTag: ActionTag? = nil,
+        isInInbox: Bool = true,
+        accountId: String = "acc1",
+        messageId: String = "1",
+        userLabels: [UserLabel] = []
+    ) -> MessageSnapshot {
         var header = MessageHeader(
-            messageId: "1",
+            messageId: messageId,
             subject: "Test",
             from: "Alice",
             fromAddress: "alice@example.com",
             to: "bob@example.com",
             date: Date(),
             snippet: "",
-            folderId: "acc1:INBOX",
-            accountId: "acc1",
+            folderId: "\(accountId):INBOX",
+            accountId: accountId,
             folderPath: "INBOX",
             isInInbox: isInInbox
         )
         header.actionTag = actionTag
-        return MessageSnapshot(from: header)
+        return MessageSnapshot(from: header, userLabels: userLabels)
     }
 }

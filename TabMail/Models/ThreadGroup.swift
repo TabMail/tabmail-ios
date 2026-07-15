@@ -17,7 +17,7 @@ struct ThreadDisplayInfo {
     /// True when any member with an actionTag still has no cached reply (AI reply not yet generated).
     /// Used to show shimmer on the thread-level tag badge.
     let anyMemberStillProcessingReply: Bool
-    /// Union of user labels across all thread members (deduped by ID, sorted alphabetically).
+    /// Union of user labels across all thread members (deduped by account + provider ID, sorted alphabetically).
     let unionLabels: [UserLabel]
 }
 
@@ -39,12 +39,13 @@ struct ThreadGroup: Identifiable, Equatable {
         let inboxMembers = members.filter({ $0.isInInbox })
         let allTagged = inboxMembers.allSatisfy { $0.actionTag != nil }
         let anyStillProcessing = inboxMembers.contains { $0.actionTag != nil && !$0.isReplyProcessed }
-        // Union of user labels across all thread members, deduped by ID
-        var seenIds: Set<String> = []
+        // A unified thread may contain members from multiple accounts. Raw
+        // provider label IDs are account-local and cannot be the union key.
+        var seenLabels: Set<UserLabelIdentity> = []
         var union: [UserLabel] = []
         for member in members {
             for label in member.userLabels {
-                if seenIds.insert(label.id).inserted {
+                if seenLabels.insert(label.scopedIdentity).inserted {
                     union.append(label)
                 }
             }

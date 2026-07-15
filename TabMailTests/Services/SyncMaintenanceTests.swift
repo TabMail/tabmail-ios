@@ -304,7 +304,6 @@ struct BodyCacheEvictionTests {
         try makeStaleBody(db, headerId: header.id, hoursAgo: SyncConfig.bodyCacheTTLHours + 1)
 
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date())!
-        let undoProtected: Set<String> = []
         _ = 3
 
         // Replicate eviction logic
@@ -312,7 +311,6 @@ struct BodyCacheEvictionTests {
         try db.write { dbConn in
             let batch = try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchAll(dbConn)
             for body in batch {
-                if undoProtected.contains(body.id) { continue }
                 guard let h = try MessageHeader.fetchOne(dbConn, key: body.id) else {
                     try body.delete(dbConn)
                     evicted += 1
@@ -353,36 +351,6 @@ struct BodyCacheEvictionTests {
         #expect(evicted == 0)
     }
 
-    @Test("Undo-protected bodies are skipped")
-    func undoProtectedSkipped() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:Sent", folderPath: "Sent", isInInbox: false
-        )
-        try makeStaleBody(db, headerId: header.id, hoursAgo: SyncConfig.bodyCacheTTLHours + 1)
-
-        let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date())!
-        let undoProtected: Set<String> = [header.id]
-
-        var evicted = 0
-        var skipped = 0
-        try db.write { dbConn in
-            let batch = try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchAll(dbConn)
-            for body in batch {
-                if undoProtected.contains(body.id) {
-                    skipped += 1
-                    continue
-                }
-                try body.delete(dbConn)
-                evicted += 1
-            }
-        }
-        #expect(evicted == 0)
-        #expect(skipped == 1)
-    }
-
     // NOTE: Orphaned body test removed — FK cascade (messageBody.id → messageHeader ON DELETE CASCADE)
     // makes it impossible to create orphan bodies in production. No test needed.
 
@@ -408,8 +376,6 @@ struct BodyCacheEvictionTests {
         }
 
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date())!
-        let undoProtected: Set<String> = []
-
         // Build recent cache (most recent N per folder)
         var recentCache: [String: Set<String>] = [:]
         var evicted = 0
@@ -418,7 +384,6 @@ struct BodyCacheEvictionTests {
         try db.write { dbConn in
             let batch = try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchAll(dbConn)
             for body in batch {
-                if undoProtected.contains(body.id) { skipCount += 1; continue }
                 guard let header = try MessageHeader.fetchOne(dbConn, key: body.id) else {
                     try body.delete(dbConn); evicted += 1; continue
                 }
@@ -994,6 +959,200 @@ struct StaleTagSweepTests {
             }
         }
         #expect(cleared == 3)
+    }
+}
+
+// MARK: - Stale Action Tag Sweep — TTL Semantics (Round D-0b)
+
+/// Drives the REAL `SyncEngine.sweepStaleActionTags` — not a hand-rolled
+/// reimplementation like `StaleTagSweepTests` above — against a temp-file
+/// `DatabasePool` swapped into `AppDatabase.shared`. This is the only way to
+/// get genuine red/green signal on the TTL logic itself
+/// (`SyncConfig.actionTagTTLSeconds`, migration v72).
+@Suite("Stale Action Tag Sweep — TTL Semantics (Round D-0b)", .serialized, .processGlobalState)
+struct StaleTagSweepTTLTests {
+    private struct Fixture {
+        let pool: DatabasePool
+        let directory: URL
+        let previous: AppDatabase?
+        let accountId: String
+        let account: Account
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let previous = current
+            current = appDatabase
+            return previous
+        }
+
+        let accountId = "sweep-ttl-\(UUID().uuidString)"
+        var account = Account(
+            emailAddress: "recipient@example.com",
+            displayName: "Test",
+            provider: .gmail
+        )
+        account.id = accountId
+        try pool.writeWithoutTransaction { db in try account.insert(db) }
+
+        return Fixture(pool: pool, directory: directory, previous: previous, accountId: accountId, account: account)
+    }
+
+    private func restore(_ fixture: Fixture) {
+        AppDatabase.shared.withLock { $0 = fixture.previous }
+        try? fixture.pool.close()
+        try? FileManager.default.removeItem(at: fixture.directory)
+    }
+
+    @discardableResult
+    private func insertHeader(
+        fixture: Fixture,
+        folder: Folder,
+        messageId: String,
+        rfc822MessageId: String? = nil,
+        actionTag: ActionTag?,
+        actionTagSetAt: Date?,
+        isInInbox: Bool
+    ) throws -> MessageHeader {
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Test",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "snippet",
+            folderId: folder.id,
+            accountId: fixture.accountId,
+            folderPath: folder.path,
+            isInInbox: isInInbox
+        )
+        header.rfc822MessageId = rfc822MessageId
+        header.actionTag = actionTag
+        header.tagSortOrder = actionTag?.sortOrder ?? 99
+        header.actionTagSetAt = actionTagSetAt
+        try fixture.pool.writeWithoutTransaction { try header.insert($0) }
+        return header
+    }
+
+    @Test("Sweep SPARES a young out-of-inbox tag (age < TTL)")
+    func sparesYoungTag() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: fixture.accountId)
+        try await fixture.pool.writeWithoutTransaction { try archive.insert($0) }
+
+        let young = Date().addingTimeInterval(-3600) // 1 hour ago
+        let header = try insertHeader(
+            fixture: fixture, folder: archive, messageId: "young1",
+            actionTag: .archive, actionTagSetAt: young, isInInbox: false
+        )
+
+        await SyncEngine().sweepStaleActionTags(account: fixture.account, provider: MockEmailProvider())
+
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(stored?.actionTag == .archive)
+        #expect(stored?.actionTagSetAt != nil)
+    }
+
+    @Test("Sweep CLEARS an expired out-of-inbox tag and nils actionTagSetAt")
+    func clearsExpiredTag() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: fixture.accountId)
+        try await fixture.pool.writeWithoutTransaction { try archive.insert($0) }
+
+        let expired = Date().addingTimeInterval(-(SyncConfig.actionTagTTLSeconds + 3600))
+        let header = try insertHeader(
+            fixture: fixture, folder: archive, messageId: "expired1",
+            actionTag: .archive, actionTagSetAt: expired, isInInbox: false
+        )
+
+        await SyncEngine().sweepStaleActionTags(account: fixture.account, provider: MockEmailProvider())
+
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(stored?.actionTag == nil)
+        #expect(stored?.tagSortOrder == 99)
+        #expect(stored?.actionTagSetAt == nil)
+    }
+
+    @Test("Inbox tags are never swept regardless of age")
+    func inboxNeverSweptRegardlessOfAge() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: fixture.accountId)
+        try await fixture.pool.writeWithoutTransaction { try inbox.insert($0) }
+
+        let veryOld = Date().addingTimeInterval(-10 * SyncConfig.actionTagTTLSeconds)
+        let header = try insertHeader(
+            fixture: fixture, folder: inbox, messageId: "inbox1",
+            actionTag: .reply, actionTagSetAt: veryOld, isInInbox: true
+        )
+
+        await SyncEngine().sweepStaleActionTags(account: fixture.account, provider: MockEmailProvider())
+
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(stored?.actionTag == .reply)
+        #expect(stored?.actionTagSetAt != nil)
+    }
+
+    @Test("NULL actionTagSetAt on an out-of-inbox tag is swept (fail-safe pin)")
+    func nullActionTagSetAtIsSweptFailSafe() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: fixture.accountId)
+        try await fixture.pool.writeWithoutTransaction { try archive.insert($0) }
+
+        let header = try insertHeader(
+            fixture: fixture, folder: archive, messageId: "nullstamp1",
+            actionTag: .delete, actionTagSetAt: nil, isInInbox: false
+        )
+
+        await SyncEngine().sweepStaleActionTags(account: fixture.account, provider: MockEmailProvider())
+
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(stored?.actionTag == nil)
+        #expect(stored?.actionTagSetAt == nil)
+    }
+
+    @Test("Gmail rfc822-still-in-inbox guard still skips an EXPIRED tag")
+    func gmailGuardSkipsExpiredTag() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: fixture.accountId)
+        let allMail = Folder(name: "All Mail", path: "AllMail", role: .custom, accountId: fixture.accountId)
+        try await fixture.pool.writeWithoutTransaction { db in
+            try inbox.insert(db)
+            try allMail.insert(db)
+        }
+
+        let rfc = "<gmail-dup@example.com>"
+        let expired = Date().addingTimeInterval(-(SyncConfig.actionTagTTLSeconds + 3600))
+        _ = try insertHeader(
+            fixture: fixture, folder: inbox, messageId: "inbox-dup",
+            rfc822MessageId: rfc, actionTag: .reply, actionTagSetAt: expired, isInInbox: true
+        )
+        let allMailHeader = try insertHeader(
+            fixture: fixture, folder: allMail, messageId: "allmail-dup",
+            rfc822MessageId: rfc, actionTag: .reply, actionTagSetAt: expired, isInInbox: false
+        )
+
+        await SyncEngine().sweepStaleActionTags(account: fixture.account, provider: MockEmailProvider())
+
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: allMailHeader.id) }
+        #expect(stored?.actionTag == .reply, "Gmail duplicate-label guard must win over an expired TTL")
+        #expect(stored?.actionTagSetAt != nil)
     }
 }
 

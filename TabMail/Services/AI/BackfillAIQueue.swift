@@ -44,7 +44,7 @@ actor BackfillAIQueue {
 
     /// Enqueue a tag-teach refinement. UPSERTs on `dedupKey` so re-teaching the
     /// same (message, tag) supersedes the earlier snapshot in place.
-    /// Errors are caught and logged (matches `AccountManagerQueue.queueTagWrite` pattern).
+    /// Errors are caught and logged; callers do not block the manual-tag UI path.
     func enqueueActionRefine(_ snapshot: ActionRefineSnapshot) async {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         do {

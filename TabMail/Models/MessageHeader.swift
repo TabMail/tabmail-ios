@@ -5,6 +5,23 @@
 import Foundation
 import GRDB
 
+enum MessageHeaderFTSRekeyStateError: LocalizedError, Sendable, Equatable {
+    case malformedSourceIds
+    case emptySourceIds
+    case blankSourceId
+
+    var errorDescription: String? {
+        switch self {
+        case .malformedSourceIds:
+            return "Pending FTS re-key source ids are malformed."
+        case .emptySourceIds:
+            return "A pending FTS re-key marker has no source ids."
+        case .blankSourceId:
+            return "A pending FTS re-key source id is blank."
+        }
+    }
+}
+
 /// TabMail action tags. Raw values are plain action names ("delete", "archive", etc.).
 /// Action tags are local-only (ADR-IOS-036) — `MessageHeader.actionTag`,
 /// `MessageAICache.actionTag`, and Device Sync probe state. We no longer
@@ -131,6 +148,15 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     var actionTag: ActionTag?
     var tagSortOrder: Int = 99  // Mirrors actionTag?.sortOrder ?? 99 for triage sorting
 
+    /// When `actionTag` was last assigned a non-nil value. Nil whenever
+    /// `actionTag` is nil. Drives `sweepStaleActionTags`'s TTL reclaim
+    /// (`SyncConfig.actionTagTTLSeconds`, migration v72) — inbox tags are
+    /// never swept regardless of age; only an out-of-inbox tag older than
+    /// the TTL is reclaimed. A NULL stamp on a non-nil tag (pre-migration
+    /// legacy row, or a writer that failed to stamp) is treated as
+    /// immediately eligible — fail-safe toward MORE reclaiming, never less.
+    var actionTagSetAt: Date? = nil
+
     // AI-generated summary fields
     var summaryBlurb: String?
     var summaryTodos: String?
@@ -180,6 +206,53 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// repopulate to avoid cross-DB FTS queries.
     var embeddingComplete: Bool = false
 
+    /// Durable cross-database obligations created when ordinary sync (full-sync survivor
+    /// merges, UID-remap canonicalization — see `SyncEngineFullSync`) merges/re-keys one
+    /// or more header generations. GRDB commits this ordered, de-duplicated source-id list
+    /// atomically with the header write; SyncEngine clears it only after every source has
+    /// converged into the current FTS id and that id's folder metadata is verified.
+    var pendingFTSRekeySourceIdsJSON: String? = nil
+
+    var pendingFTSRekeySourceIds: [String] {
+        get {
+            (try? decodedPendingFTSRekeySourceIds()) ?? []
+        }
+        set {
+            let sourceIds = Self.orderedUniqueFTSRekeySourceIds(newValue)
+            pendingFTSRekeySourceIdsJSON = sourceIds.isEmpty
+                ? nil
+                : (try? String(data: JSONEncoder().encode(sourceIds), encoding: .utf8))
+        }
+    }
+
+    /// Decode a durable cross-database obligation at recovery and mutation boundaries.
+    /// A non-nil malformed or empty marker must never look settled: callers retain the
+    /// raw value and fail closed instead of clearing it or guessing which FTS id to move.
+    func decodedPendingFTSRekeySourceIds() throws -> [String] {
+        guard let json = pendingFTSRekeySourceIdsJSON else { return [] }
+        guard let data = json.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            throw MessageHeaderFTSRekeyStateError.malformedSourceIds
+        }
+        guard !decoded.isEmpty else {
+            throw MessageHeaderFTSRekeyStateError.emptySourceIds
+        }
+        guard decoded.allSatisfy({
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            throw MessageHeaderFTSRekeyStateError.blankSourceId
+        }
+        return Self.orderedUniqueFTSRekeySourceIds(decoded)
+    }
+
+    private static func orderedUniqueFTSRekeySourceIds(_ sourceIds: [String]) -> [String] {
+        var seen = Set<String>()
+        return sourceIds.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && seen.insert($0).inserted
+        }
+    }
+
     /// Decoded References header — array of normalized message IDs from the thread ancestor chain.
     var references: [String] {
         guard let json = referencesJSON,
@@ -200,15 +273,44 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
         return json
     }
 
-    /// Returns the most stable identifier for use in PendingOperation queues.
-    /// For IMAP messages (numeric UIDs), prefers rfc822MessageId which survives
-    /// UIDVALIDITY changes and UID remaps after MOVE. For Gmail/Exchange (non-numeric
-    /// stable IDs), returns messageId.
+    /// Legacy mixed identity helper retained for non-queue local keys.
+    /// Durable message actions must use `MessageIdentity.durableActionAddress` instead,
+    /// which requires one canonical RFC Message-ID across every mail provider.
     var stableId: String {
         if UInt32(messageId) != nil, let rfc822 = rfc822MessageId, !rfc822.isEmpty {
             return rfc822
         }
         return messageId
+    }
+
+    /// `actionTag` is retained across folders (Round D-0, 2026-07-14) — it is
+    /// inbox-scoped PRESENTATION, not an inbox-scoped invariant, and is never
+    /// cleared just because a row currently sits outside the inbox (a tag
+    /// renderer gates display on `isInInbox` instead; `sweepStaleActionTags`
+    /// is the only place that reclaims it, as periodic disk hygiene, never a
+    /// sync-path write). This call site only re-derives the DERIVED sort key
+    /// so it stays paired with whatever `actionTag` already holds. Identity
+    /// merges and provider re-keys may change a row's folder after copying
+    /// local fields, so call this only after `isInInbox` reaches its final
+    /// value for the row.
+    mutating func normalizeActionTagSortOrder() {
+        tagSortOrder = actionTag?.sortOrder ?? 99
+    }
+
+    /// Set `actionTag` (and its two derived companions, `tagSortOrder` and
+    /// `actionTagSetAt`) atomically. Use this instead of assigning `actionTag`
+    /// directly wherever a model-save path applies a NEW tag value or clears
+    /// one: a non-nil `tag` stamps `actionTagSetAt = date` (defaults to now —
+    /// the moment this write happens); nil clears both `tagSortOrder` (→ 99)
+    /// and `actionTagSetAt` (→ nil) together, preserving the invariant
+    /// `actionTag != nil ⇒ actionTagSetAt != nil`. Callers CARRYING a stamp
+    /// forward from another row/generation (identity merges, AI-cache
+    /// restores, provider-DTO round-trips) should pass that source's
+    /// `actionTagSetAt` as `date` instead of accepting the `Date()` default.
+    mutating func setActionTag(_ tag: ActionTag?, at date: Date = Date()) {
+        actionTag = tag
+        actionTagSetAt = tag == nil ? nil : date
+        tagSortOrder = tag?.sortOrder ?? 99
     }
 
     // MARK: - GRDB Associations

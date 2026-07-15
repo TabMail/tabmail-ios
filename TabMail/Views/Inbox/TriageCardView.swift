@@ -23,8 +23,11 @@ struct TriageRowView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Tag color stripe on far left
-            if let tag = message.actionTag {
+            // Tag color stripe on far left — inbox only (ADR-IOS-036): the
+            // tag is retained across folders, so display must gate on
+            // isInInbox or a retained tag could leak a stale stripe onto a
+            // row that has since left the inbox.
+            if let tag = message.actionTag, message.isInInbox {
                 tagStripe(tag: tag)
             } else if message.isInInbox && anyAISourceEnabled {
                 Theme.textSecondary.opacity(0.2)
@@ -77,7 +80,7 @@ struct TriageRowView: View {
                             .fontWeight(.regular)
                             .foregroundStyle(Theme.textUnread)
                             .lineLimit(1)
-                        if let tag = message.actionTag {
+                        if let tag = message.actionTag, message.isInInbox {
                             Spacer(minLength: 4)
                             Text(tag.displayName)
                                 .font(.caption2)

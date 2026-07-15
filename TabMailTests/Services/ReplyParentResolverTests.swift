@@ -265,9 +265,9 @@ struct ReplyParentResolverTests {
         #expect(updated[0] == parent.id)
     }
 
-    // MARK: - 10. Two replies same parent → one tag-clear PendingOperation
+    // MARK: - 10. Two replies same parent → one local clear, no provider operation
 
-    @Test("Two batch entries referencing the same .reply-tagged parent → exactly one setTag PendingOperation")
+    @Test("Two batch entries referencing the same .reply-tagged parent → local clear, no setTag PendingOperation")
     func doubleTagClearGuard() throws {
         let db = try TestDatabase.make()
         try insertParent(db, rfc822: "a@x", actionTag: .reply)
@@ -286,13 +286,13 @@ struct ReplyParentResolverTests {
                 .filter(Column("type") == OperationType.setTag.rawValue)
                 .fetchCount(db)
         }
-        #expect(setTagCount == 1, "Set dedup must prevent a second setTag PendingOperation")
+        #expect(setTagCount == 0, "action tags are local-only and must never enter the durable provider queue")
     }
 
-    // MARK: - 11. Clears Reply action tag and queues server setTag op
+    // MARK: - 11. Clears Reply action tag locally
 
-    @Test("Parent with actionTag = .reply → tag cleared to .none and setTag PendingOp queued")
-    func clearsReplyActionTagAndQueuesServerOp() throws {
+    @Test("Parent with actionTag = .reply → tag cleared to .none with no durable tag op")
+    func clearsReplyActionTagLocally() throws {
         let db = try TestDatabase.make()
         let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
 
@@ -310,18 +310,8 @@ struct ReplyParentResolverTests {
         #expect(after?.tagSortOrder == ActionTag.none.sortOrder)
         #expect(after?.isReplied == true)
 
-        let setTagOps = try db.read { db in
-            try PendingOperation
-                .filter(Column("type") == OperationType.setTag.rawValue)
-                .fetchAll(db)
-        }
-        #expect(setTagOps.count == 1)
-        guard setTagOps.count == 1 else { return }
-        #expect(setTagOps[0].tagValue == ActionTag.none.rawValue)
-        #expect(setTagOps[0].accountId == "acc1")
-        #expect(setTagOps[0].folderPath == "INBOX")
-        // messageIds JSON should contain the parent's stableId
-        #expect(setTagOps[0].messageIds.contains(parent.stableId))
+        let pendingOperations = try db.read { try PendingOperation.fetchAll($0) }
+        #expect(pendingOperations.isEmpty, "reply discovery must not create a provider operation for a local action tag")
     }
 
     // MARK: - 12. Other action tags are NOT cleared

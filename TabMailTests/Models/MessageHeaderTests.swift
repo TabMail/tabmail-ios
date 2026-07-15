@@ -9,6 +9,22 @@ import Foundation
 @Suite("MessageHeader")
 struct MessageHeaderTests {
 
+    private func makeHeader() -> MessageHeader {
+        MessageHeader(
+            messageId: "current-provider-id",
+            subject: "Message",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "",
+            folderId: "account:INBOX",
+            accountId: "account",
+            folderPath: "INBOX",
+            isInInbox: true
+        )
+    }
+
     @Test("stableId returns rfc822MessageId when present and messageId is numeric UID")
     func stableIdWithRfc822() {
         var header = MessageHeader(
@@ -108,6 +124,27 @@ struct MessageHeaderTests {
         header.tagSortOrder = ActionTag.archive.sortOrder
         #expect(header.tagSortOrder == 2)
     }
+
+    @Test("action-tag sort-order normalization derives tagSortOrder from actionTag and retains the tag regardless of inbox membership (Round D-0)")
+    func normalizeActionTagSortOrder() {
+        var inbox = makeHeader()
+        inbox.actionTag = .archive
+        inbox.tagSortOrder = ActionTag.delete.sortOrder
+        inbox.normalizeActionTagSortOrder()
+        #expect(inbox.actionTag == .archive)
+        #expect(inbox.tagSortOrder == ActionTag.archive.sortOrder)
+
+        // Leaving the inbox no longer clears the tag — it's inbox-scoped
+        // PRESENTATION (display gates on isInInbox), not an invariant. Only
+        // the derived sort key is re-normalized, and it stays paired with the
+        // RETAINED tag rather than resetting to the no-tag sentinel.
+        var archived = inbox
+        archived.isInInbox = false
+        archived.normalizeActionTagSortOrder()
+        #expect(archived.actionTag == .archive, "the tag is retained across folders — no longer an inbox-scoped invariant")
+        #expect(archived.tagSortOrder == ActionTag.archive.sortOrder, "the sort key stays derived from the retained tag, not the old no-tag sentinel (99)")
+    }
+
 }
 
 @Suite("ActionTag Decoding")

@@ -16,8 +16,12 @@ struct ThreadChildCardView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Left tag color bar (full height)
-            if let tag = message.actionTag {
+            // Left tag color bar (full height) — inbox only (ADR-IOS-036):
+            // the tag is retained across folders, but a thread child card can
+            // render an out-of-inbox member (e.g. a Sent/Archived reply in an
+            // otherwise-inbox thread), so display must gate on isInInbox or a
+            // retained tag would leak a stale chip onto a non-inbox row.
+            if let tag = message.actionTag, message.isInInbox {
                 RoundedRectangle(cornerRadius: 2)
                     .fill(Theme.tagColor(tag))
                     .frame(width: 3)
@@ -68,7 +72,7 @@ struct ThreadChildCardView: View {
                             .fontWeight(.light)
                             .foregroundStyle(Theme.textSecondary)
                             .lineLimit(1)
-                        if let tag = message.actionTag {
+                        if let tag = message.actionTag, message.isInInbox {
                             Spacer(minLength: 4)
                             Menu {
                                 retagMenu
