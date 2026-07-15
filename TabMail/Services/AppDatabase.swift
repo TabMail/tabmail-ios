@@ -1858,6 +1858,10 @@ final class AppDatabase: Sendable {
             // tried to CREATE the already-existing `messageHeader_folderId_date` —
             // that NAME COLLISION is what bricked it; that duplicate is removed here.)
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_isRead_date ON messageHeader(folderId, isRead, date)")
+            // The new composite's leading pair serves every count/equality query
+            // handled by the older v21 tree. Keeping both duplicates each read-state
+            // write and gives the planner overlapping choices.
+            try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_folderId_isRead")
         }
 
         migrator.registerMigration("v63_addFolderUidValidity") { db in
@@ -1925,24 +1929,194 @@ final class AppDatabase: Sendable {
             // lexicographic, not numeric), so it SCANNED the whole folder (tens of
             // thousands of rows on Archive / All Mail) and held the GRDB writer through
             // stale detection. This EXPRESSION index turns it into a folderId seek + UID
-            // range-scan. Non-numeric messageIds (Gmail/Exchange) index as CAST=0 — benign;
-            // those providers use the `.date` stale window, not this query.
+            // range-scan. Only non-empty ASCII-decimal identities can be IMAP UIDs.
+            // Gmail and Exchange use the `.date` stale window, so keeping their ids out
+            // of this partial index avoids unrelated write and disk cost.
             //
             // IF NOT EXISTS is REQUIRED (see v62): a suspension/kill after the index
             // commits but before GRDB records the migration would re-run and brick.
-            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_uidInt ON messageHeader(folderId, CAST(messageId AS INTEGER))")
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_folderId_numericUid
+                ON messageHeader(folderId, CAST(messageId AS INTEGER))
+                WHERE messageId GLOB '[0-9]*'
+                  AND messageId NOT GLOB '*[^0-9]*'
+            """)
         }
 
         migrator.registerMigration("v67_addUidResolutionRetryCount") { db in
-            // Dedicated retry budget for uidResolutionFailed (IMAP SEARCH-by-Message-ID
-            // miss) on non-move, non-tag ops. Previously this cap read the SHARED
-            // retryCount, which the generic transient-error branch ALSO increments —
-            // a few ordinary connection blips could pre-exhaust the budget before the
-            // op's first real SEARCH miss, causing a false "confirmed stale" drop
-            // (dropping user intention). See SyncConfig.maxUidResolutionRetries.
+            // Released schema history. ADR-IOS-060 removed the runtime retry-budget
+            // model because lookup uncertainty must never become a stale decision.
+            // Keep the physical column so existing databases retain their migration
+            // history; current PendingOperation coding deliberately ignores it.
             try db.alter(table: "pendingOperation") { t in
                 t.add(column: "uidResolutionRetryCount", .integer).notNull().defaults(to: 0)
             }
+        }
+
+        migrator.registerMigration("v68_addUndoToken") { _ in
+            // Superseded by ADR-IOS-060 (2026-07-14). This column backed the
+            // pre-V2 durable-token/status-cancellation Undo formula, replaced by
+            // the protected-front bounded reconciliation in
+            // `AccountManagerActions.optimisticMoveToFolder`/`PendingOperation.flipped()`.
+            // Runtime `PendingOperation` no longer has an `undoToken` property and
+            // never reads or writes this column. Unreleased (never shipped from
+            // `origin/main`), so a fresh database no longer creates the column at
+            // all — the migration body is intentionally empty. The identifier
+            // stays registered (never renamed/removed) because GRDB's
+            // `DatabaseMigrator` records applied migrations by identifier string
+            // in `grdb_migrations` and only ever runs the body of an identifier
+            // that isn't already in that table (`unappliedExecutions` maps an
+            // applied, non-merged identifier to `nil`; see
+            // `DatabaseMigrator.swift`). An existing development database that
+            // already ran the old body keeps its inert nullable `undoToken`
+            // column forever — that is accepted per §12 and is not a reason to
+            // add another corrective migration.
+        }
+
+        migrator.registerMigration("v69_addMoveRecoveryAndFTSRekey") { db in
+            // The `queueParentRowId` column this migration used to add backed
+            // batch-split queue recovery, deleted with the connected-component
+            // queue machinery (ADR-IOS-060 §12/§13). A fresh database no longer
+            // creates it. Same GRDB applied-identifier rule as v68 above: this
+            // identifier is already applied on any database that ran the old
+            // body, so its inert nullable column persists there without error
+            // and without another corrective migration.
+            //
+            // GRDB and FTS are separate databases. Ordinary sync can merge several
+            // old/current-id materializations at once, so the durable obligation is an
+            // ordered source-id list rather than one lossy marker. Startup replays every
+            // source and clears the list only after verifying the current FTS id + folder.
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "pendingFTSRekeySourceIdsJSON", .text)
+            }
+            // Recovery filters the non-null marker but paginates in primary-key
+            // order. Key the sparse index by id so an empty steady-state journal
+            // is an empty index probe, not a walk of every messageHeader row.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_pendingFTSRekeys
+                ON messageHeader(id)
+                WHERE pendingFTSRekeySourceIdsJSON IS NOT NULL
+            """)
+        }
+
+        migrator.registerMigration("v70_trimMessageHeaderIndexes") { db in
+            // v62/v66 are already released. Create the numeric-only replacement
+            // before dropping the old full UID tree so an interrupted migration
+            // never leaves the stale-window query without a usable index.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_folderId_numericUid
+                ON messageHeader(folderId, CAST(messageId AS INTEGER))
+                WHERE messageId GLOB '[0-9]*'
+                  AND messageId NOT GLOB '*[^0-9]*'
+            """)
+            try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_folderId_uidInt")
+            // v62's (folderId,isRead,date) leading pair fully supersedes this
+            // older tree for unread counts and equality filters.
+            try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_folderId_isRead")
+            try db.execute(sql: "ANALYZE")
+        }
+
+        // Provider label identifiers are account-local. Rebuild the two label
+        // tables so the account participates in both the parent identity and
+        // the child foreign key. The junction primary key stays message-led:
+        // messageHeader.id is global and therefore already determines account.
+        migrator.registerMigration("v71_accountScopeUserLabels", foreignKeyChecks: .deferred) { db in
+            let oldJunctionCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM messageUserLabel"
+            ) ?? 0
+            let attributableJunctionCount = try Int.fetchOne(db, sql: """
+                SELECT COUNT(*)
+                FROM messageUserLabel mul
+                JOIN messageHeader mh ON mh.id = mul.messageId
+                """) ?? 0
+            guard attributableJunctionCount == oldJunctionCount else {
+                throw DatabaseError(
+                    resultCode: .SQLITE_CONSTRAINT,
+                    message: "messageUserLabel contains a row without its messageHeader"
+                )
+            }
+
+            // Move the old tables aside first, then create the final names.
+            // Creating a temporary child that references a temporary parent
+            // would leave SQLite pointing at the temporary name after rename.
+            try db.rename(table: "messageUserLabel", to: "messageUserLabel_v70")
+            try db.rename(table: "userLabel", to: "userLabel_v70")
+
+            try db.create(table: "userLabel") { t in
+                t.column("accountId", .text).notNull()
+                    .references("account", onDelete: .cascade)
+                t.column("id", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("isSystem", .integer).notNull().defaults(to: false)
+                t.primaryKey(["accountId", "id"])
+            }
+            try db.execute(sql: """
+                INSERT INTO userLabel (accountId, id, name, isSystem)
+                SELECT accountId, id, name, isSystem
+                FROM userLabel_v70
+                """)
+
+            // A legacy global-ID collision may already have discarded one
+            // account's parent metadata while leaving its message membership.
+            // Recover only the identity; never copy another account's name or
+            // system bit. Provider sync will replace the fail-closed raw-ID
+            // placeholder with authoritative metadata.
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO userLabel (accountId, id, name, isSystem)
+                SELECT DISTINCT mh.accountId, mul.userLabelId, mul.userLabelId, 0
+                FROM messageUserLabel_v70 mul
+                JOIN messageHeader mh ON mh.id = mul.messageId
+                """)
+
+            try db.create(table: "messageUserLabel") { t in
+                t.column("messageId", .text).notNull()
+                    .references("messageHeader", onDelete: .cascade)
+                t.column("accountId", .text).notNull()
+                t.column("userLabelId", .text).notNull()
+                t.primaryKey(["messageId", "userLabelId"])
+                t.foreignKey(
+                    ["accountId", "userLabelId"],
+                    references: "userLabel",
+                    columns: ["accountId", "id"],
+                    onDelete: .cascade
+                )
+            }
+            try db.execute(sql: """
+                INSERT INTO messageUserLabel (messageId, accountId, userLabelId)
+                SELECT mul.messageId, mh.accountId, mul.userLabelId
+                FROM messageUserLabel_v70 mul
+                JOIN messageHeader mh ON mh.id = mul.messageId
+                """)
+
+            try db.drop(table: "messageUserLabel_v70")
+            try db.drop(table: "userLabel_v70")
+            try db.create(
+                index: "idx_messageUserLabel_accountId_userLabelId",
+                on: "messageUserLabel",
+                columns: ["accountId", "userLabelId"]
+            )
+        }
+
+        // Round D-0b: real TTL semantics for `sweepStaleActionTags` (mirrors TB's
+        // SETTINGS.actionTTLSeconds — SyncConfig.actionTagTTLSeconds, 1 week).
+        // Nullable, no default, NO INDEX: the sweep is a bounded ~15-minute
+        // maintenance scan over out-of-inbox rows only (SyncEngineMaintenance.swift),
+        // so an index here is unjustified — we just finished an index audit
+        // (v70). Backfill every already-tagged row with a stamp AT MIGRATION TIME
+        // so it gets a full TTL from upgrade, keeping the invariant
+        // `actionTag != nil ⇒ actionTagSetAt != nil` true from day one — including
+        // for the historic v53/legacy raw-SQL rows whose actionTag is the string
+        // 'none' (still NOT NULL in SQL, so still covered by this WHERE clause).
+        migrator.registerMigration("v72_addActionTagSetAt") { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "actionTagSetAt", .datetime)
+            }
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET actionTagSetAt = ?
+                WHERE actionTag IS NOT NULL
+                """, arguments: [Date()])
         }
     }
 }

@@ -78,7 +78,7 @@ struct DatabaseDataIntegrityTests {
 
         // Background body render tries INSERT OR IGNORE
         try db.write { db in
-            var body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Background content</p>")
+            let body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Background content</p>")
             try body.insert(db, onConflict: .ignore)
         }
 
@@ -92,7 +92,7 @@ struct DatabaseDataIntegrityTests {
         let db = try TestDatabase.make()
         // No account inserted
         do {
-            var folder = Folder(name: "Orphan", path: "Orphan", role: .custom, accountId: "nonexistent")
+            let folder = Folder(name: "Orphan", path: "Orphan", role: .custom, accountId: "nonexistent")
             try db.write { try folder.insert($0) }
             Issue.record("Expected FK violation")
         } catch {
@@ -108,7 +108,7 @@ struct DatabaseDataIntegrityTests {
 
         // Try header with non-existent accountId
         do {
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: "1", subject: "Orphan", from: "a@b.com",
                 fromAddress: "a@b.com", to: "c@d.com", date: Date(),
                 snippet: "", folderId: "acc1:INBOX",
@@ -180,7 +180,7 @@ struct DatabaseDataIntegrityTests {
         // Insert 3 messages with different dates
         let now = Date()
         for i in 0..<3 {
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: "\(i)", subject: "Msg \(i)",
                 from: "a@b.com", fromAddress: "a@b.com", to: "c@d.com",
                 date: now.addingTimeInterval(Double(i) * -3600),

@@ -32,27 +32,97 @@ struct DatabaseIndexTests {
         #expect(!indexes.contains("messageHeader_accountId"),
                 "messageHeader_accountId should be dropped by v64 (superseded by the accountId,messageId composite)")
         // v66: expression index for the IMAP UID-window stale slice.
-        #expect(indexes.contains("messageHeader_folderId_uidInt"),
+        #expect(indexes.contains("messageHeader_folderId_numericUid"),
                 "v66 (folderId, CAST(messageId AS INTEGER)) expression index missing — the stale slice will folder-scan")
+        #expect(!indexes.contains("messageHeader_folderId_uidInt"),
+                "the full v66 UID tree should be replaced by its numeric-only partial index")
+        // v62's date-suffixed composite has the complete (folderId, isRead)
+        // leading key, so retaining the older v21 tree only duplicates every
+        // read-state write and gives the planner an overlapping choice.
+        #expect(indexes.contains("messageHeader_folderId_isRead_date"))
+        #expect(!indexes.contains("messageHeader_folderId_isRead"),
+                "v21 unread index is fully superseded by v62 and should not amplify writes")
     }
 
     @Test("UID-window stale slice seeks via the CAST expression index, not a folder scan")
     func uidWindowUsesExpressionIndex() throws {
-        // SyncEngineFullSync :737 — WHERE folderId=? AND CAST(messageId AS INTEGER) >= ?.
-        // v66 adds an expression index on (folderId, CAST(messageId AS INTEGER)). INDEXED BY
-        // forces it: SQLite errors ("no query solution") if it can't serve the query, so a
-        // USING-INDEX plan proves seekability independent of table size (a plain EXPLAIN
-        // would SCAN this tiny test table regardless).
+        // The predicates exactly mirror SyncEngineFullSync's production query.
+        // This unforced plan check proves SQLite itself selects the numeric-only
+        // partial expression index after migrations finish with ANALYZE.
         let db = try TestDatabase.make()
         let plan: String = try db.read { dbConn in
             try Row.fetchAll(dbConn, sql: """
                 EXPLAIN QUERY PLAN
-                SELECT * FROM messageHeader INDEXED BY messageHeader_folderId_uidInt
-                WHERE folderId = 'acc1:INBOX' AND CAST(messageId AS INTEGER) >= 100
+                SELECT * FROM messageHeader
+                WHERE folderId = 'acc1:INBOX'
+                  AND messageId GLOB '[0-9]*'
+                  AND messageId NOT GLOB '*[^0-9]*'
+                  AND CAST(messageId AS INTEGER) >= 100
                 """).map { $0["detail"] as String }.joined(separator: " | ")
         }
-        #expect(plan.contains("USING INDEX messageHeader_folderId_uidInt"),
+        #expect(plan.contains("USING INDEX messageHeader_folderId_numericUid"),
                 "the CAST-range stale slice must seek via the v66 expression index: \(plan)")
+    }
+
+    @Test("UID expression index contains only numeric identities")
+    func uidWindowIndexIsNumericOnly() throws {
+        let db = try TestDatabase.make()
+        let index = try db.read { dbConn in
+            try #require(try Row.fetchOne(dbConn, sql: """
+                SELECT il.partial, sm.sql
+                FROM pragma_index_list('messageHeader') AS il
+                JOIN sqlite_master AS sm ON sm.name = il.name
+                WHERE il.name = 'messageHeader_folderId_numericUid'
+                """))
+        }
+        #expect((index["partial"] as Int) == 1)
+        let sql = (index["sql"] as String).lowercased()
+        #expect(sql.contains("messageid glob '[0-9]*'"))
+        #expect(sql.contains("messageid not glob '*[^0-9]*'"))
+    }
+
+    @Test("UID stale slice returns decimal identities and excludes provider tokens")
+    func uidWindowFiltersNonNumericIdentities() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        for messageId in ["99", "100", "00101", "100x", "a100", "graph-token"] {
+            try TestDatabase.insertMessageHeader(db, messageId: messageId)
+        }
+
+        let ids = try db.read { dbConn in
+            try String.fetchAll(dbConn, sql: """
+                SELECT messageId FROM messageHeader
+                WHERE folderId = ?
+                  AND messageId GLOB '[0-9]*'
+                  AND messageId NOT GLOB '*[^0-9]*'
+                  AND CAST(messageId AS INTEGER) >= ?
+                ORDER BY CAST(messageId AS INTEGER)
+                """, arguments: ["acc1:INBOX", 100])
+        }
+        #expect(ids == ["100", "00101"])
+    }
+
+    @Test("Unread count and date-ordered list share the v62 composite")
+    func unreadQueriesUseOneComposite() throws {
+        let db = try TestDatabase.make()
+        let plans = try db.read { dbConn in
+            let count = try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT COUNT(*) FROM messageHeader
+                WHERE folderId = 'acc1:INBOX' AND isRead = 0
+                """).map { $0["detail"] as String }.joined(separator: " | ")
+            let list = try Row.fetchAll(dbConn, sql: """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM messageHeader
+                WHERE folderId = 'acc1:INBOX' AND isRead = 0
+                ORDER BY date DESC LIMIT 100
+                """).map { $0["detail"] as String }.joined(separator: " | ")
+            return (count, list)
+        }
+        #expect(plans.0.contains("messageHeader_folderId_isRead_date"))
+        #expect(plans.1.contains("messageHeader_folderId_isRead_date"))
+        #expect(!plans.1.contains("USE TEMP B-TREE"))
     }
 
     @Test("Canonicalize upsert lookup (messageId + folderId) uses an index, not a scan")
