@@ -1635,6 +1635,28 @@ final class InboxViewModel {
         return message.folderPath == trashPath
     }
 
+    /// Mark-as-read-on-archive/delete (Settings → User Interface, default
+    /// ON): composes an `.isRead(true)` record for the UNREAD members of
+    /// `messages` — called immediately alongside (before) the caller's own
+    /// `.move` record, both synchronous and back-to-back with no intervening
+    /// `await`, so they join the SAME open fold component
+    /// (`IntentionJournal.append`'s `needsFold` coverage check) and execute
+    /// together in ONE `executeFold` pass — the fold executor already unions
+    /// isRead + move intents sharing an id into one executor call
+    /// (ADR-IOS-058 "Behavior refinements"); this reuses that machinery
+    /// rather than inventing a second write path. Mirrors
+    /// `AccountManager.recordRoleMove`'s identical composition for the
+    /// tool/notification path (notification is exempt there; every gesture
+    /// entry point here is in scope).
+    private func recordMarkReadOnArchiveDeleteIfNeeded(_ messages: [MessageHeader]) {
+        guard AccountManager.markReadOnArchiveDeleteEnabled else { return }
+        let unread = messages.filter { !$0.isRead }
+        guard !unread.isEmpty else { return }
+        var displays: [String: AccountManager.PendingMutation] = [:]
+        for msg in unread { displays[msg.id] = .init(isRead: true) }
+        manager.record(ids: unread.map(\.id), kind: .isRead(true), displays: displays, origin: .gesture)
+    }
+
     /// Returns false when nothing was recorded (lookup miss, no archive
     /// folder for the account, or already-at-destination no-op) — callers
     /// (InboxView's single-message dismiss/swipe/move sites) MUST NOT hide
@@ -1664,6 +1686,7 @@ final class InboxViewModel {
                 forwardDestinationByAccount: [message.accountId: archivePath]
             )
         ))
+        recordMarkReadOnArchiveDeleteIfNeeded([message])
         // Archive's destination is never the inbox (guarded above), so
         // `message.isInInbox` alone determines "leaving the inbox" — clear
         // the tag in the overlay (F6) so the mid-drain window doesn't flash
@@ -1742,6 +1765,7 @@ final class InboxViewModel {
                 forwardDestinationByAccount: forwardDestinationByAccount
             )
         ))
+        recordMarkReadOnArchiveDeleteIfNeeded(actionable)
         // Archive's destination is never the inbox (guarded above), so each
         // member's own `isInInbox` determines "leaving the inbox" (F6) — a
         // thread can mix members already outside the inbox with ones still
@@ -1793,6 +1817,7 @@ final class InboxViewModel {
                 forwardDestinationByAccount: [message.accountId: trashPath]
             )
         ))
+        recordMarkReadOnArchiveDeleteIfNeeded([message])
         // Delete's destination is never the inbox (guarded above), so
         // `message.isInInbox` alone determines "leaving the inbox" (F6).
         // record() (ADR-IOS-058) replaces retain+registerMutation+enqueueWrite.
@@ -1872,6 +1897,7 @@ final class InboxViewModel {
                 forwardDestinationByAccount: forwardDestinationByAccount
             )
         ))
+        recordMarkReadOnArchiveDeleteIfNeeded(actionable)
         // Delete's destination is never the inbox (guarded above), so each
         // member's own `isInInbox` determines "leaving the inbox" (F6).
         // ONE record covers every actionable member.

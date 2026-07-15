@@ -1416,6 +1416,28 @@ final class MessageDetailViewModel {
         manager.registerGestureIntent(id: message.id, .isRead(target: newIsRead, baseline: wasRead))
     }
 
+    /// Mark-as-read-on-archive/delete (Settings → User Interface, default
+    /// ON): mirrors `InboxViewModel.recordMarkReadOnArchiveDeleteIfNeeded` —
+    /// composes an `.isRead(true)` record for an unread `msg` immediately
+    /// before the caller's own `.move` record so both join the SAME open
+    /// fold component and execute together (ADR-IOS-058). Also mirrors
+    /// `applyManualTag`'s dual optimistic-update shape (`message` when it's
+    /// the primary detail message, `threadMessages[idx]` when it's a visible
+    /// thread card) so the on-screen read state doesn't lag the DB write.
+    private func recordMarkReadOnArchiveDeleteIfNeeded(_ msg: MessageHeader) {
+        guard AccountManager.markReadOnArchiveDeleteEnabled, !msg.isRead else { return }
+        if msg.id == message?.id { message?.isRead = true }
+        if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
+            threadMessages[idx].isRead = true
+        }
+        manager.record(
+            ids: [msg.id],
+            kind: .isRead(true),
+            displays: [msg.id: .init(isRead: true)],
+            origin: .gesture
+        )
+    }
+
     /// Returns false when the archive was a no-op (no archive folder, or the
     /// message is already in it) — callers must not dismiss/flash in that case.
     @discardableResult
@@ -1443,6 +1465,7 @@ final class MessageDetailViewModel {
                 forwardDestinationByAccount: [msg.accountId: archiveFolder.path]
             )
         ))
+        recordMarkReadOnArchiveDeleteIfNeeded(msg)
         updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
         // Archive's destination is never the inbox (guarded above), so
         // `msg.isInInbox` alone determines "leaving the inbox" — hides the
@@ -1483,6 +1506,7 @@ final class MessageDetailViewModel {
                 forwardDestinationByAccount: [msg.accountId: trashFolder.path]
             )
         ))
+        recordMarkReadOnArchiveDeleteIfNeeded(msg)
         updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
         // Delete's destination is never the inbox (guarded above), so
         // `msg.isInInbox` alone determines "leaving the inbox" — hides the

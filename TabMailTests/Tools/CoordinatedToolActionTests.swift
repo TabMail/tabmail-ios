@@ -49,6 +49,14 @@ struct CoordinatedToolActionTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // Pre-existing `recordRoleMove` pins in this suite predate the "mark
+        // as read on archive & delete" feature and assert the pre-feature
+        // op/count shapes with default-unread fixtures — force the setting
+        // OFF so they keep exercising exactly that behavior. Tests covering
+        // the new feature explicitly flip it back on via the same
+        // UserDefaults key (`AccountManager.markReadOnArchiveDeleteKey`)
+        // after calling this helper.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -104,6 +112,7 @@ struct CoordinatedToolActionTests {
     /// AFTER the defers — leave the test DB alive when there's no previous one to
     /// restore, rather than let `AppDatabase.rawPool`'s force-unwrap crash the process.
     private func restoreTestDB(previous: AppDatabase?, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
@@ -293,6 +302,43 @@ struct CoordinatedToolActionTests {
 
         #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded after recordRoleMove completed")
         #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded after recordRoleMove completed")
+    }
+
+    // MARK: - (1b) Mark-as-read on archive & delete (owner feature, 2026-07-15) — tool path
+    //
+    // Settings → TabMail Settings → User Interface → "Mark as Read on Archive
+    // & Delete" (`AccountManager.markReadOnArchiveDeleteKey`, default ON).
+    // `makeTestDB` forces the setting OFF for this suite's OTHER tests (see
+    // its doc comment) so their pre-feature `ops.count == 1` pins stay valid
+    // — `origin: .tool` (agent tools) IS in scope for the feature, unlike
+    // `origin: .notification` (notification router, deliberately exempt and
+    // unconditional — see `AccountManager.markReadOnArchiveDeleteKey`'s doc
+    // comment and `NotificationActionRouterTests`, untouched by this feature).
+
+    @Test("mark-as-read-on-archive (default ON), tool path: recordRoleMove(origin: .tool) on an unread message composes the isRead intent with the role-move — DB ends read AND archived, exactly one .markRead op precedes the .move op, journal fully drained")
+    func recordRoleMoveToolOriginMarksUnreadMessageReadDefaultOn() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-tool-mark-read", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        let acted = await AccountManager.shared.recordRoleMove(ids: [id], role: .archive, origin: .tool)
+        #expect(acted == [id])
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true, "the tool path marks the unread message read")
+        #expect(final?.folderId == archive.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let opTypes = Set(ops.map(\.type))
+        #expect(opTypes == [.markRead, .move], "exactly one markRead op and one move op")
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
     }
 
     // MARK: - (2) Staleness pin (Trace-A regression)

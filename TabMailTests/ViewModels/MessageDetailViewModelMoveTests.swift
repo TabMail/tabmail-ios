@@ -698,6 +698,57 @@ struct MessageDetailViewModelMoveTests {
         #expect(ops.isEmpty, "no PendingOperation for a no-op")
     }
 
+    // MARK: - Mark-as-read on archive & delete (owner feature, 2026-07-15)
+    //
+    // Settings → TabMail Settings → User Interface → "Mark as Read on Archive
+    // & Delete" (`AccountManager.markReadOnArchiveDeleteKey`, default ON).
+    // This suite's other tests never override the key, so they run under the
+    // real process default (ON) — none of them archive/delete an UNREAD
+    // fixture while asserting an exact PendingOperation count (verified by
+    // direct read), so they are unaffected either way. This cell explicitly
+    // sets the key to prove the detail-view entry point itself.
+
+    @Test("mark-as-read-on-archive (default ON): archiveMessage on an unread detail-view message marks it read AND archives it — on-screen isRead flips optimistically, exactly one .markRead op precedes the .move op, and undo restores the LOCATION only (stays read)")
+    @MainActor
+    func archiveMessageMarksUnreadMessageReadDefaultOn() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            clearOverlay()
+            UndoService.shared.dismissAll()
+            UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = try insertHeader(pool, messageId: "detail-archive-mark-read", folderPath: Self.inboxPath, isInInbox: true, isRead: false)
+
+        let vm = MessageDetailViewModel(messageId: header.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(header)
+
+        #expect(vm.archiveMessage(header), "archive must record — returns true")
+        #expect(vm.message?.isRead == true, "optimistic in-memory flip alongside the archive")
+
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderPath == Self.archivePath)
+
+        let ops = try await pool.read { db in try PendingOperation.filter(Column("accountId") == "acc1").fetchAll(db) }
+        let opTypes = Set(ops.map(\.type))
+        #expect(opTypes == [.markRead, .move], "exactly one markRead op and one move op")
+
+        await UndoService.shared.undo()
+        await drainWriteQueue()
+
+        let afterUndo = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(afterUndo?.folderPath == Self.inboxPath, "undo restores the location")
+        #expect(afterUndo?.isRead == true, "undo does not restore read state — the message stays read")
+    }
+
     // MARK: - Undo preserves preceding user state
     //
     // These tests exercise public detail actions and Undo in serial order. A

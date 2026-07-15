@@ -649,6 +649,27 @@ extension AccountManager {
         }
     }
 
+    // MARK: - Mark-as-Read-on-Archive/Delete Setting (Settings → User Interface)
+
+    /// UserDefaults key for the "Mark as read on archive & delete" toggle.
+    /// Governs EVERY archive/delete-to-trash entry point (inbox swipe incl.
+    /// thread variants, detail-view, settings bulk archive, agent tools, AND
+    /// notification action buttons via `recordRoleMove`). The owner's request
+    /// (feature round 2026-07-15) was uniform mark-read on these actions;
+    /// audit showed no path did it before, so all origins now compose the
+    /// read intent when this is ON.
+    static let markReadOnArchiveDeleteKey = "markReadOnArchiveDelete"
+
+    /// Default true (missing key ⇒ ON) — `bool(forKey:)` returns `false` for a
+    /// never-set key, which would silently invert a default-ON setting; the
+    /// explicit `object(forKey:) == nil` check is the same pattern
+    /// `ProactiveNotifyService.isEnabled` uses for its own default-true toggle.
+    static var markReadOnArchiveDeleteEnabled: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: markReadOnArchiveDeleteKey) == nil { return true }
+        return defaults.bool(forKey: markReadOnArchiveDeleteKey)
+    }
+
     // MARK: - Coordinated Tool Actions (agent tools / notifications, ADR-IOS-058)
 
     /// Archive/delete for agent tools (`EmailArchiveTool`/`EmailDeleteTool`) and the
@@ -739,6 +760,25 @@ extension AccountManager {
                 // "leaving the inbox".
                 actionTag: msg.isInInbox ? .some(nil) : nil
             )
+        }
+
+        // Mark-as-read-on-archive/delete (Settings → User Interface, default
+        // ON): compose an `.isRead(true)` record for the UNREAD actionable
+        // members alongside the `.move` record below — both share these ids,
+        // so they join the SAME open fold component (`IntentionJournal
+        // .append`'s `needsFold` coverage check) and execute together in ONE
+        // `executeFold` pass, exactly like a gesture's toggleRead-then-archive
+        // (ADR-IOS-058 "Behavior refinements"). Applies to EVERY origin,
+        // including notification action buttons — the owner's request was
+        // that archive/delete mark read uniformly, and a tapped notification
+        // action is the clearest "I've dealt with this" signal of all.
+        if Self.markReadOnArchiveDeleteEnabled {
+            let unread = actionable.filter { !$0.isRead }
+            if !unread.isEmpty {
+                var readDisplays: [String: PendingMutation] = [:]
+                for msg in unread { readDisplays[msg.id] = PendingMutation(isRead: true) }
+                record(ids: unread.map(\.id), kind: .isRead(true), displays: readDisplays, origin: origin)
+            }
         }
 
         await recordAndWait(
@@ -838,6 +878,21 @@ extension AccountManager {
             for msg in messages {
                 displays[msg.id] = .init(folderId: destFolderId, actionTag: msg.isInInbox ? .some(nil) : nil)
             }
+
+            // Mark-as-read-on-archive/delete (Settings → User Interface,
+            // default ON) — see `recordRoleMove`'s identical composition for
+            // the full rationale. `record()` (not `recordAndWait`) is enough
+            // here: it joins the SAME fold component the `recordAndWait` move
+            // call below opens, so awaiting the move's receipt covers both.
+            if Self.markReadOnArchiveDeleteEnabled {
+                let unread = messages.filter { !$0.isRead }
+                if !unread.isEmpty {
+                    var readDisplays: [String: PendingMutation] = [:]
+                    for msg in unread { readDisplays[msg.id] = PendingMutation(isRead: true) }
+                    record(ids: unread.map(\.id), kind: .isRead(true), displays: readDisplays, origin: .settings)
+                }
+            }
+
             await AccountManager.shared.recordAndWait(
                 ids: messages.map(\.id),
                 kind: .move(.folder(folderId: destFolderId, folderPath: archivePath, isInbox: false)),

@@ -48,6 +48,13 @@ struct InboxGestureActionTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // Pre-existing archive/delete pins in this suite predate the "mark as
+        // read on archive & delete" feature and assert the pre-feature op/
+        // count shapes with default-unread fixtures — force the setting OFF so
+        // they keep exercising exactly that behavior. Tests that cover the new
+        // feature explicitly flip it back on via the same UserDefaults key
+        // (`AccountManager.markReadOnArchiveDeleteKey`) after calling this helper.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: provider)
             acc.id = "acc1"
@@ -273,6 +280,7 @@ struct InboxGestureActionTests {
     /// AppDatabase, leave the test one (and its files) alive. Mirrors
     /// `MessageDetailStagedFallbackTests.pinSurvivesWhileMoveQueued`.
     private func restoreTestDB(previous: AppDatabase?, dir _: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
         }
@@ -4773,6 +4781,279 @@ struct InboxGestureActionTests {
         #expect(ops.first?.destinationPath == trash.path)
 
         #expect(UndoService.shared.currentAction != nil, "an undo entry must have been pushed")
+    }
+
+    // MARK: - (x2) Mark-as-read on archive & delete (owner feature, 2026-07-15)
+    //
+    // Settings → TabMail Settings → User Interface → "Mark as Read on Archive
+    // & Delete" (`AccountManager.markReadOnArchiveDeleteKey`, default ON).
+    // `makeTestDB` forces the setting OFF for every OTHER test in this suite
+    // (see its doc comment) so their pre-feature op/count pins stay valid;
+    // these tests explicitly flip it back on (or re-assert off) to cover the
+    // feature itself. The composition reuses the EXISTING fold+executor
+    // machinery verbatim (`recordMarkReadOnArchiveDeleteIfNeeded` appends a
+    // plain `.isRead(true)` record alongside the `.move` record — no second
+    // write path) — see `coordinatedMoveOrdersAfterOpenIntentCycle` in
+    // CoordinatedToolActionTests.swift and the mixed-path regression tests
+    // above for generic proof the fold already unions isRead + move.
+
+    @Test("mark-as-read-on-archive (default ON): archive() on an unread message composes BOTH the isRead and move records into ONE optimistic write — overlay shows read+moved immediately, folder unread count decrements exactly once (not double-counted), and after drain the remote copy (stateful Gmail fixture) is BOTH read and archived")
+    func archiveUnreadMessageComposesReadAndMoveDefaultOn() async throws {
+        let rfcId = "mark-read-archive-\(UUID().uuidString.lowercased())@example.com"
+        let fixture = makeStatefulRESTFixture(kind: .gmail, rfc822MessageId: rfcId, initialRead: false)
+        defer { fixture.close() }
+        let (pool, inbox, archive, dir, previous) = try makeTestDB(
+            provider: fixture.accountProvider,
+            inboxPath: fixture.inboxPath,
+            archivePath: fixture.archivePath
+        )
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        // Explicit ON: makeTestDB's harness defaults this suite's OTHER tests
+        // to OFF — this test proves the feature itself, so it opts back in.
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: fixture.provider)
+
+        do {
+            let header = makeDurableHeader(
+                folder: inbox,
+                messageId: fixture.initialProviderMessageId,
+                isRead: false,
+                includeRFCIdentity: false
+            )
+            try await pool.writeWithoutTransaction { db in
+                try header.insert(db)
+                try db.execute(sql: "UPDATE folder SET unreadCount = 1 WHERE id = ?", arguments: [inbox.id])
+            }
+            let id = header.id
+            let vm = InboxViewModel(folders: [inbox])
+
+            #expect(vm.archive(id))
+
+            // "one optimistic write": record() is synchronous, so BOTH the
+            // isRead and move intents are already visible on the derived
+            // overlay the instant archive() returns — no intervening await.
+            let overlay = AccountManager.shared.snapshotOverlay()
+            #expect(overlay[id]?.isRead == true, "the composed isRead intent must be visible immediately")
+            #expect(overlay[id]?.folderId == archive.id, "the move intent must be visible immediately")
+
+            await drainWriteQueue()
+            try await drainProviderQueue(pool: pool)
+
+            let finalInbox = try await pool.read { db in try Folder.fetchOne(db, key: inbox.id) }
+            #expect(finalInbox?.unreadCount == 0, "unread count decremented exactly once — not double-counted by the move's own accounting")
+
+            let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+            #expect(final?.isRead == true)
+            #expect(final?.folderId == archive.id)
+
+            let remote = fixture.snapshots(rfcId)
+            #expect(remote.count == 1)
+            guard remote.count == 1 else {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+                return
+            }
+            #expect(remote[0].isRead, "remote copy must be read")
+            #expect(remote[0].folderPath == fixture.archivePath, "remote copy must be archived")
+
+            try await expectPipelineIdle(pool: pool)
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1")
+    }
+
+    @Test("mark-as-read-on-archive (default ON), delete-to-trash: delete(_:) on an unread message composes the isRead intent with the move-to-trash — DB ends read AND in Trash, unread count decremented once, exactly one .markRead op and one .move op, journal fully drained")
+    func deleteUnreadMessageComposesReadAndMoveDefaultOn() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in try trash.insert(db) }
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-mark-read-delete", isRead: false)
+        try await pool.writeWithoutTransaction { db in
+            try header.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 1 WHERE id = ?", arguments: [inbox.id])
+        }
+        let id = header.id
+        let vm = InboxViewModel(folders: [inbox])
+
+        let acted = await vm.delete(id)
+        #expect(acted)
+
+        await drainWriteQueue()
+
+        let finalInbox = try await pool.read { db in try Folder.fetchOne(db, key: inbox.id) }
+        #expect(finalInbox?.unreadCount == 0, "unread count decremented exactly once")
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderId == trash.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let opTypes = Set(ops.map(\.type))
+        #expect(opTypes == [.markRead, .move], "exactly one markRead op and one move op — no double writes")
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+    }
+
+    @Test("mark-as-read-on-archive (default ON), thread variant: archiveThread marks every UNREAD member read alongside the role-move — both members land read AND archived, exactly one batched .markRead op covers ONLY the unread member")
+    func archiveThreadComposesReadForEveryUnreadMember() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let unread1 = makeDurableHeader(folder: inbox, messageId: "m-thread-unread-1", isRead: false)
+        let alreadyRead = makeDurableHeader(folder: inbox, messageId: "m-thread-read", isRead: true)
+        try await pool.writeWithoutTransaction { db in
+            try unread1.insert(db)
+            try alreadyRead.insert(db)
+        }
+        let vm = InboxViewModel(folders: [inbox])
+
+        let skipped = vm.archiveThread([unread1.id, alreadyRead.id])
+        #expect(skipped.isEmpty)
+
+        await drainWriteQueue()
+
+        let final1 = try await pool.read { db in try MessageHeader.fetchOne(db, key: unread1.id) }
+        let final2 = try await pool.read { db in try MessageHeader.fetchOne(db, key: alreadyRead.id) }
+        #expect(final1?.isRead == true)
+        #expect(final1?.folderId == archive.id)
+        #expect(final2?.isRead == true)
+        #expect(final2?.folderId == archive.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let markReadOps = ops.filter { $0.type == .markRead }
+        #expect(markReadOps.count == 1, "one batched markRead op for the single unread member")
+        guard markReadOps.count == 1 else { return }
+        guard let unreadIdentity = MessageIdentity.durableActionRFC822MessageId(unread1.rfc822MessageId) else {
+            Issue.record("setup: unread1 must normalize to an RFC identity")
+            return
+        }
+        #expect(markReadOps[0].messageIds == [unreadIdentity], "only the unread member — the already-read member is untouched")
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+    }
+
+    @Test("setting OFF: archive() on an unread message does NOT mark it read — exact pre-feature behavior (message stays unread through archive, only the .move op is queued)")
+    func toggleOffPreservesPreFeatureArchiveBehavior() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        // makeTestDB's harness already forces this OFF; set it explicitly so
+        // this test's intent reads standalone regardless of harness changes.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-toggle-off-archive", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+        let vm = InboxViewModel(folders: [inbox])
+
+        #expect(vm.archive(id))
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == false, "OFF: the message must stay unread through archive")
+        #expect(final?.folderId == archive.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "OFF: only the .move op — no markRead op")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+    }
+
+    @Test("mark-as-read-on-archive (default ON): an ALREADY-READ message archives with no read intent recorded, no extra durable op, and unread count untouched")
+    func archiveAlreadyReadMessageRecordsNoExtraIntent() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-already-read-archive", isRead: true)
+        try await pool.writeWithoutTransaction { db in
+            try header.insert(db)
+            try db.execute(sql: "UPDATE folder SET unreadCount = 0 WHERE id = ?", arguments: [inbox.id])
+        }
+        let id = header.id
+        let vm = InboxViewModel(folders: [inbox])
+
+        #expect(vm.archive(id))
+
+        // record() is synchronous — the journal must show ONLY the move
+        // record, never a redundant isRead(true) record, for an already-read
+        // message.
+        #expect(AccountManager.shared.intentionJournal.recordsForTesting().filter { $0.ids.contains(id) }.count == 1, "no read intent recorded for an already-read message")
+
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.isRead == true)
+        #expect(final?.folderId == archive.id)
+
+        let finalInbox = try await pool.read { db in try Folder.fetchOne(db, key: inbox.id) }
+        #expect(finalInbox?.unreadCount == 0, "unread count untouched — was already 0")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "no extra durable op — only the .move")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
+    }
+
+    @Test("mark-as-read-on-archive (default ON): undo after drain restores LOCATION only — the message is back in the inbox but stays READ (serial replay's field-change rule; no read-restoration)")
+    func undoAfterArchiveRestoresLocationOnlyStaysRead() async throws {
+        let (pool, inbox, archive, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, dir: dir)
+            clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        }
+        clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-undo-stays-read", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+        let vm = InboxViewModel(folders: [inbox])
+
+        #expect(vm.archive(id))
+        await drainWriteQueue()
+
+        let afterArchive = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(afterArchive?.isRead == true, "setup: archive marked it read")
+        #expect(afterArchive?.folderId == archive.id, "setup: archived")
+
+        await UndoService.shared.undo()
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == inbox.id, "undo restores the LOCATION")
+        #expect(final?.isRead == true, "undo does NOT restore read state — the message stays read")
+
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "journal stranded")
     }
 
     // MARK: - (y) Move admission and happy paths

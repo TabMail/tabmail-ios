@@ -54,6 +54,11 @@ struct StatefulIMAPActionPipelineTests {
             current = appDatabase
             return prior
         }
+        // Pre-existing archive/action pins in this suite predate the "mark as
+        // read on archive & delete" feature and assert pre-feature op/count
+        // shapes with default-unread fixtures — force the setting OFF so they
+        // keep exercising exactly that behavior.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         let account: Account = {
             var value = Account(
                 emailAddress: "test@example.com",
@@ -147,6 +152,7 @@ struct StatefulIMAPActionPipelineTests {
     }
 
     private func restore(previous: AppDatabase?) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
         }

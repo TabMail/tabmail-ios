@@ -51,6 +51,11 @@ struct NotificationActionRouterTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // Pre-existing pins assert the single .move op; force mark-read-on-
+        // archive/delete OFF so they keep exercising exactly that behavior
+        // (mirrors CoordinatedToolActionTests). The dedicated ON test below
+        // flips it back via the same key.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -86,6 +91,7 @@ struct NotificationActionRouterTests {
     /// AFTER the defers — leave the test DB alive when there's no previous one to
     /// restore, rather than let `AppDatabase.rawPool`'s force-unwrap crash the process.
     private func restoreTestDB(previous: AppDatabase?, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
@@ -166,6 +172,37 @@ struct NotificationActionRouterTests {
         // The public router call waits for its AccountManager work to finish,
         // so it must not leave a staged intention behind.
         #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting(), "notification action must leave no stranded intention")
+    }
+
+    @Test("notification ARCHIVE with mark-read-on-archive ON composes read + move: header read and archived locally, both durable ops queued")
+    func notificationArchiveComposesReadWhenSettingOn() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir) }
+        // makeTestDB forces the setting OFF for the legacy pins — this test
+        // covers the owner-requested uniform behavior, so flip it ON.
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        var unread = makeDurableHeader(folder: inbox, messageId: "m-archive-markread")
+        unread.isRead = false
+        let header = unread
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        await NotificationActionRouter.execute(
+            actionId: "ARCHIVE", transportMessageId: "m-archive-markread",
+            rfc822MessageId: "m-archive-markread@example.com", accountId: "acc1"
+        )
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == archive.id)
+        #expect(final?.isRead == true, "a notification archive marks the message read when the setting is ON")
+
+        let ops = try await pool.read { db in
+            try PendingOperation.fetchAll(db).sorted { $0.type.rawValue < $1.type.rawValue }
+        }
+        let opTypes = Set(ops.map(\.type))
+        #expect(opTypes == [.move, .markRead], "read intent composes with the move through the same fold")
+        #expect(AccountManager.shared.intentionJournal.isFullyDrainedForTesting())
     }
 
     @Test("canonical RFC action lookup matches a whitespace-wrapped bracketed durable header")

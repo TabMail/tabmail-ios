@@ -30,6 +30,11 @@ struct ArchiveOldMessagesTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
+        // Pre-existing `archiveOldInboxMessages` pins in this suite predate
+        // the "mark as read on archive & delete" feature and assert the
+        // pre-feature op/count shapes with default-unread fixtures — force
+        // the setting OFF so they keep exercising exactly that behavior.
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -45,6 +50,7 @@ struct ArchiveOldMessagesTests {
     }
 
     private func restoreTestDB(previous: AppDatabase?, dir: URL) {
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
