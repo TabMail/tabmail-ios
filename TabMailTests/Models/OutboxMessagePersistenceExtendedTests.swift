@@ -80,7 +80,7 @@ struct OutboxMessagePersistenceExtendedTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        var msg = OutboxMessage(accountId: "acc1", draft: makeDraft())
+        let msg = OutboxMessage(accountId: "acc1", draft: makeDraft())
         try db.write { try msg.insert($0) }
         let msgId = msg.id
 
@@ -150,7 +150,7 @@ struct OutboxMessagePersistenceExtendedTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        var m1 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Queued"))
+        let m1 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Queued"))
         var m2 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Sending"))
         m2.status = OutboxStatus.sending.rawValue
         var m3 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Failed"))
@@ -174,7 +174,7 @@ struct OutboxMessagePersistenceExtendedTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        var m1 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Queued"))
+        let m1 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Queued"))
         var m2 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Sending"))
         m2.status = OutboxStatus.sending.rawValue
 
@@ -198,7 +198,7 @@ struct OutboxMessagePersistenceExtendedTests {
         var m1 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Failed"))
         m1.status = OutboxStatus.failed.rawValue
         m1.errorMessage = "SMTP error 550"
-        var m2 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Queued"))
+        let m2 = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Queued"))
 
         try db.write { db in
             try m1.insert(db)
@@ -455,7 +455,7 @@ struct OutboxMessagePersistenceExtendedTests {
         #expect(beforeCount == 2)
 
         // Delete the account — FK cascade should remove outbox messages
-        try db.write { try Account.deleteAll($0, keys: ["acc1"]) }
+        try db.write { _ = try Account.deleteAll($0, keys: ["acc1"]) }
 
         let afterCount = try db.read { try OutboxMessage.fetchCount($0) }
         #expect(afterCount == 0)

@@ -26,6 +26,20 @@ actor UnreadCountManager {
     private var isActive = false
 
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
+    /// The database the pending recount was requested against — see `requestRecount`.
+    private var pendingPool: PrioritizedDatabase?
+
+    #if DEBUG
+    /// Wait until the currently registered debounce cycle has finished all DB work.
+    /// Process-global tests use this before closing a temporarily installed pool;
+    /// fixed sleeps cannot prove that the leading recount or trailing cooldown drain
+    /// has released the connection.
+    func awaitIdleForTesting() async {
+        if let debounceTask {
+            await debounceTask.value
+        }
+    }
+    #endif
 
     /// Request a recount of unread messages for the given folder IDs.
     /// First request fires immediately. Subsequent requests within the
@@ -48,6 +62,28 @@ actor UnreadCountManager {
             // badge stays stale until the next foreground recount.
             Task { await updateBadgeProtected() }
         }
+        // Capture the database this recount is FOR. `performRecount` is debounced, so
+        // resolving `AppDatabase.dbPool` at execution time would let a recount requested
+        // against one database land on whichever database happens to be installed when
+        // the timer fires. In production that is a latent bug (any AppDatabase swap —
+        // account reset, re-onboarding); under test, where suites swap AppDatabase.shared
+        // and folder ids like "acc1:INBOX" collide across suites, it actively corrupts an
+        // unrelated suite's counts by recomputing them from the WRONG database's truth.
+        // Round-33: a recount belongs to the database it was computed for.
+        //
+        // And the pending ids must never OUTLIVE their database (round-34): they are
+        // unioned across requests while `pendingPool` remembers only the latest, so ids
+        // accumulated for a previous database would otherwise be written into this one —
+        // reintroducing the very corruption above. If the database changed underneath us,
+        // the old ids are for a DB we can no longer safely touch: drop them.
+        let current = dbPool
+        if let pending = pendingPool, pending.pool !== current.pool, !pendingFolderIds.isEmpty {
+            #if DEBUG
+            print("[UnreadCount] database changed with \(pendingFolderIds.count) folder id(s) still pending for the previous one — dropping them rather than recomputing them against the wrong DB")
+            #endif
+            pendingFolderIds.removeAll()
+        }
+        pendingPool = current
         pendingFolderIds.formUnion(folderIds)
         if !isActive {
             // Leading edge — fire immediately, then fixed cooldown.
@@ -80,7 +116,8 @@ actor UnreadCountManager {
         guard !folderIdArray.isEmpty else { return }
 
         do {
-            try await dbPool.write(label: "unreadRecount") { db in
+            let pool = pendingPool ?? dbPool
+            try await pool.write(label: "unreadRecount") { db in
                 // Single grouped query: count unread per folder
                 let placeholders = folderIdArray.map { _ in "?" }.joined(separator: ", ")
                 let sql = """

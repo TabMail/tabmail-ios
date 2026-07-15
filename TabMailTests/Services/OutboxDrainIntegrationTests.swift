@@ -742,6 +742,233 @@ struct OutboxDrainIntegrationTests {
     }
 }
 
+@Suite("Outbox durable RFC admission", .serialized, .processGlobalState)
+struct OutboxRFCAdmissionTests {
+    private struct Fixture {
+        let pool: DatabasePool
+        let folder: Folder
+        let directory: URL
+        let previous: AppDatabase?
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration
+        )
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        var account = Account(
+            emailAddress: "sender@example.com",
+            displayName: "Sender",
+            provider: .imap
+        )
+        account.id = "outbox-rfc-account"
+        let folder = Folder(
+            name: "INBOX",
+            path: "INBOX",
+            role: .inbox,
+            accountId: account.id
+        )
+        try pool.writeWithoutTransaction { db in
+            try account.insert(db)
+            try folder.insert(db)
+        }
+        return Fixture(
+            pool: pool,
+            folder: folder,
+            directory: directory,
+            previous: previous
+        )
+    }
+
+    private func restore(_ fixture: Fixture) {
+        // Finalization starts unstructured queue work. If the test host had no
+        // prior shared DB, retain this fixture as the valid process DB so that
+        // trailing work cannot dereference a nil/closed pool. Otherwise restore
+        // the prior DB, then close and remove this fixture completely.
+        guard fixture.previous != nil else { return }
+        AppDatabase.shared.withLock { $0 = fixture.previous }
+        try? fixture.pool.close()
+        try? FileManager.default.removeItem(at: fixture.directory)
+    }
+
+    private func makeHeader(folder: Folder, rfc822MessageId: String?) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: "provider-resource-id",
+            subject: "Subject",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "recipient@example.com",
+            date: Date(),
+            snippet: "Body",
+            folderId: folder.id,
+            accountId: folder.accountId,
+            folderPath: folder.path,
+            isInInbox: true
+        )
+        header.rfc822MessageId = rfc822MessageId
+        header.headerComplete = true
+        header.actionTag = .reply
+        header.tagSortOrder = ActionTag.reply.sortOrder
+        return header
+    }
+
+    private func makeOutbox(
+        header: MessageHeader,
+        isForward: Bool
+    ) -> OutboxMessage {
+        let draft = DraftMessage(
+            to: ["recipient@example.com"],
+            subject: "Subject",
+            body: "Body"
+        )
+        return OutboxMessage(
+            accountId: header.accountId,
+            draft: draft,
+            originalMessageHeaderId: header.id,
+            isForward: isForward
+        )
+    }
+
+    @Test("normal reply finalization queues normalized RFC identity and keeps action tags local")
+    func normalReplyUsesRFCIdentity() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let header = makeHeader(
+            folder: fixture.folder,
+            rfc822MessageId: " <Reply.Case@Example.COM> "
+        )
+        let outbox = makeOutbox(header: header, isForward: false)
+        try await fixture.pool.writeWithoutTransaction { db in
+            try header.insert(db)
+            try outbox.insert(db)
+        }
+
+        await AccountManager.shared.finalizeOutboxMessageForTesting(outbox)
+
+        let state = try await fixture.pool.read { db -> (MessageHeader?, OutboxMessage?, [PendingOperation]) in
+            (
+                try MessageHeader.fetchOne(db, key: header.id),
+                try OutboxMessage.fetchOne(db, key: outbox.id),
+                try PendingOperation.fetchAll(db)
+            )
+        }
+        #expect(state.0?.isReplied == true)
+        #expect(state.0?.actionTag == ActionTag.none)
+        #expect(state.1 == nil)
+        #expect(state.2.count == 1)
+        guard state.2.count == 1 else { return }
+        #expect(state.2[0].type == .markReplied)
+        #expect(state.2[0].messageIds == ["Reply.Case@Example.COM"])
+    }
+
+    @Test("normal forward with malformed RFC still finalizes locally but queues no auxiliary action")
+    func normalForwardInvalidRFCQueuesNothing() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let header = makeHeader(
+            folder: fixture.folder,
+            rfc822MessageId: "<missing-close@example.com"
+        )
+        let outbox = makeOutbox(header: header, isForward: true)
+        try await fixture.pool.writeWithoutTransaction { db in
+            try header.insert(db)
+            try outbox.insert(db)
+        }
+
+        await AccountManager.shared.finalizeOutboxMessageForTesting(outbox)
+
+        let state = try await fixture.pool.read { db -> (MessageHeader?, OutboxMessage?, [PendingOperation]) in
+            (
+                try MessageHeader.fetchOne(db, key: header.id),
+                try OutboxMessage.fetchOne(db, key: outbox.id),
+                try PendingOperation.fetchAll(db)
+            )
+        }
+        #expect(state.0?.isForwarded == true)
+        #expect(state.1 == nil)
+        #expect(state.2.isEmpty)
+    }
+
+    @Test("normal reply with a blank source finalizes locally but queues no auxiliary action")
+    func normalReplyBlankSourceQueuesNothing() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        var header = makeHeader(
+            folder: fixture.folder,
+            rfc822MessageId: "blank-source@example.com"
+        )
+        header.folderPath = "   "
+        let headerToInsert = header
+        let outbox = makeOutbox(header: headerToInsert, isForward: false)
+        try await fixture.pool.writeWithoutTransaction { db in
+            try headerToInsert.insert(db)
+            try outbox.insert(db)
+        }
+
+        await AccountManager.shared.finalizeOutboxMessageForTesting(outbox)
+
+        let state = try await fixture.pool.read { db -> (MessageHeader?, OutboxMessage?, [PendingOperation]) in
+            (
+                try MessageHeader.fetchOne(db, key: headerToInsert.id),
+                try OutboxMessage.fetchOne(db, key: outbox.id),
+                try PendingOperation.fetchAll(db)
+            )
+        }
+        #expect(state.0?.isReplied == true)
+        #expect(state.1 == nil)
+        #expect(state.2.isEmpty)
+    }
+
+    @Test("crash recovery queues the same normalized RFC identity as normal finalization")
+    func crashRecoveryUsesRFCIdentity() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        let header = makeHeader(
+            folder: fixture.folder,
+            rfc822MessageId: "<recovered@example.com>"
+        )
+        var recovering = makeOutbox(header: header, isForward: false)
+        recovering.status = OutboxStatus.sending.rawValue
+        recovering.sentAt = Date()
+        recovering.appendedToSent = true
+        let recoveringToInsert = recovering
+        try await fixture.pool.writeWithoutTransaction { db in
+            try header.insert(db)
+            try recoveringToInsert.insert(db)
+        }
+
+        await AccountManager.shared.reconcileOutbox()
+
+        let state = try await fixture.pool.read { db -> (MessageHeader?, OutboxMessage?, [PendingOperation]) in
+            (
+                try MessageHeader.fetchOne(db, key: header.id),
+                try OutboxMessage.fetchOne(db, key: recoveringToInsert.id),
+                try PendingOperation.fetchAll(db)
+            )
+        }
+        #expect(state.0?.isReplied == true)
+        #expect(state.1 == nil)
+        #expect(state.2.count == 1)
+        guard state.2.count == 1 else { return }
+        #expect(state.2[0].type == .markReplied)
+        #expect(state.2[0].messageIds == ["recovered@example.com"])
+    }
+}
+
 // MARK: - MockEmailProvider test helper extensions
 
 extension MockEmailProvider {

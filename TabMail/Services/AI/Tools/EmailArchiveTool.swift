@@ -32,6 +32,7 @@ struct EmailArchiveTool: AgentTool, Sendable {
         // Resolve numeric IDs to MessageHeaders
         let translator = ctx.translator
         var resolved: [MessageHeader] = []
+        var resolvedNumericIds: [Int] = []
         var emailDetails: [AgentToolRouter.ActionConfirmation.EmailDetail] = []
         var failedIds: [Int] = []
 
@@ -47,6 +48,7 @@ struct EmailArchiveTool: AgentTool, Sendable {
             // real email from demo (and vice versa) via stale translator IDs.
             if let header, DemoToolGuard.headerAccessible(header) {
                 resolved.append(header)
+                resolvedNumericIds.append(numericId)
                 emailDetails.append(.init(
                     numericId: numericId,
                     subject: header.subject.isEmpty ? "(No subject)" : header.subject,
@@ -77,26 +79,35 @@ struct EmailArchiveTool: AgentTool, Sendable {
             ] as [String: Any]))
         }
 
-        // Perform archive via the coordinated overlay + FIFO write-queue path
-        // (ADR-IOS-057 vicinity): re-resolves fresh headers INSIDE the queued
-        // closure so the write acts on row truth at execution time, not this
-        // `resolved` snapshot — which may have gone stale during the
-        // unbounded confirmation wait above. `resolved` is still used for the
-        // confirmation card display and the response payload below.
-        await AccountManager.shared.performCoordinatedRoleMove(ids: resolved.map(\.id), role: .archive)
+        // Perform archive via an intention record (ADR-IOS-058): the fold
+        // executor's `.role` branch re-resolves fresh headers at execution
+        // time so the write acts on row truth, not this `resolved` snapshot —
+        // which may have gone stale during the unbounded confirmation wait
+        // above. `resolved` is still used for the confirmation card display
+        // and the response payload below.
+        let actedHeaderIds = await AccountManager.shared.recordRoleMove(
+            ids: resolved.map(\.id),
+            role: .archive,
+            origin: .tool
+        )
+        let acted = zip(resolvedNumericIds, resolved).filter { actedHeaderIds.contains($0.1.id) }
+        let refusedResolvedIds = zip(resolvedNumericIds, resolved)
+            .filter { !actedHeaderIds.contains($0.1.id) }
+            .map(\.0)
+        failedIds.append(contentsOf: refusedResolvedIds)
 
-        let subjects = resolved.map { $0.subject.isEmpty ? "(No subject)" : $0.subject }
+        let subjects = acted.map { $0.1.subject.isEmpty ? "(No subject)" : $0.1.subject }
         var result: [String: Any] = [
-            "success": true,
-            "archived_count": resolved.count,
+            "success": !acted.isEmpty,
+            "archived_count": acted.count,
             "archived_subjects": subjects,
         ]
         if !failedIds.isEmpty {
             result["failed_ids"] = failedIds
-            result["warning"] = "\(failedIds.count) email(s) could not be found"
+            result["warning"] = "\(failedIds.count) email(s) could not be archived"
         }
 
-        print("[EmailArchiveTool] Archived \(resolved.count) emails, \(failedIds.count) failed")
+        print("[EmailArchiveTool] Archived \(acted.count) emails, \(failedIds.count) failed")
 
         return ToolJSON.string(from: result)
     }

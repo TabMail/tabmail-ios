@@ -108,11 +108,6 @@ final class RecentlyCompletedComposeCache {
         return true
     }
 
-    /// Test-only: clear all entries.
-    func clearForTesting() {
-        entries.removeAll()
-    }
-
     /// Test-only: current entry count.
     var countForTesting: Int { entries.count }
 }

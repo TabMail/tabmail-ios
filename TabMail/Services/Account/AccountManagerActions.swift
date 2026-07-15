@@ -7,6 +7,51 @@ import GRDB
 
 extension AccountManager {
 
+    private struct DurableMessageActionMember: Sendable {
+        let header: MessageHeader
+        let rfc822MessageId: String
+    }
+
+    private struct MarkReadWriteResult: Sendable {
+        var affectedFolderIds: Set<String> = []
+        var notificationKeys: [(accountId: String, messageId: String)] = []
+    }
+
+    /// Pairs the exact row eligible for optimistic mutation with the canonical
+    /// RFC identity written to the durable queue. Invalid identities disappear
+    /// here, before either side of that contract can occur.
+    private nonisolated static func durableMessageActionMembers(
+        _ messages: [MessageHeader]
+    ) -> [DurableMessageActionMember] {
+        messages.compactMap { header in
+            guard let address = MessageIdentity.durableActionAddress(
+                accountId: header.accountId,
+                folderPath: header.folderPath,
+                rfc822MessageId: header.rfc822MessageId
+            )
+            else { return nil }
+            return DurableMessageActionMember(
+                header: header,
+                rfc822MessageId: address.rfc822MessageId
+            )
+        }
+    }
+
+    /// Resolves current durable rows in caller order before admission. This
+    /// prevents a stale UI snapshot from supplying either an obsolete source
+    /// folder or an identity that is no longer attached to that row.
+    private nonisolated static func resolveDurableMessageActionMembers(
+        headerIds: [String],
+        db: Database
+    ) throws -> [DurableMessageActionMember] {
+        guard !headerIds.isEmpty else { return [] }
+        let rows = try MessageHeader
+            .filter(headerIds.contains(Column("id")))
+            .fetchAll(db)
+        let rowsById = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        return durableMessageActionMembers(headerIds.compactMap { rowsById[$0] })
+    }
+
     // MARK: - Actions (optimistic UI + persistent queue)
     //
     // All actions update GRDB state immediately (optimistic UI) then queue the
@@ -51,10 +96,20 @@ extension AccountManager {
     /// array being smaller than `ids` and must not strand any optimistic
     /// overlay entry registered for a dropped id.
     func resolveHeadersForAction(ids: [String]) async -> [MessageHeader] {
+        (try? await resolveHeadersForActionThrowing(ids: ids)) ?? []
+    }
+
+    /// Throwing variant of `resolveHeadersForAction` (ADR-IOS-058): lets the
+    /// fold executor distinguish a genuine DB READ ERROR (throw — keep the
+    /// intention records and retry) from a VANISHED row (clean read, id
+    /// absent from both durable and staged sources — drop the intent with a
+    /// log). The non-throwing wrapper preserves the pre-existing swallow-to-
+    /// empty behavior for every legacy caller.
+    func resolveHeadersForActionThrowing(ids: [String]) async throws -> [MessageHeader] {
         guard !ids.isEmpty else { return [] }
-        let durable = (try? await dbPool.read { db -> [MessageHeader] in
+        let durable = try await dbPool.read { db -> [MessageHeader] in
             try MessageHeader.filter(ids.contains(Column("id"))).fetchAll(db)
-        }) ?? []
+        }
         var byId = Dictionary(uniqueKeysWithValues: durable.map { ($0.id, $0) })
         let missingIds = ids.filter { byId[$0] == nil }
         if !missingIds.isEmpty {
@@ -76,35 +131,55 @@ extension AccountManager {
     func markRead(_ messages: [MessageHeader]) async {
         await ensureDurable(messages)
 
-        let affectedFolderIds: Set<String>
+        let writeResult: MarkReadWriteResult
         do {
-            affectedFolderIds = try await dbPool.write { db in
-                let expanded = try Self.expandWithSiblingsByRfc822(messages: messages, db: db)
-                let grouped = Dictionary(grouping: expanded) { "\($0.accountId)|\($0.folderPath)" }
+            writeResult = try await retryGatedQueueWrite(dbPool, label: "markRead", maxAttempts: 1) { db in
+                let resolved = try Self.resolveDurableMessageActionMembers(
+                    headerIds: messages.map(\.id),
+                    db: db
+                )
+                let notificationKeys = resolved.map {
+                    (accountId: $0.header.accountId, messageId: $0.header.messageId)
+                }
+                let resolvedHeaders = resolved.map(\.header)
+                let expanded = try Self.expandWithSiblingsByRfc822(messages: resolvedHeaders, db: db)
+                let actionable = Self.durableMessageActionMembers(expanded)
+                let grouped = Dictionary(grouping: actionable) {
+                    "\($0.header.accountId)|\($0.header.folderPath)"
+                }
                 var folderIds: Set<String> = []
-                for (_, msgs) in grouped {
-                    let accountId = msgs[0].accountId
-                    let folderPath = msgs[0].folderPath
-                    let stableIds = msgs.map(\.stableId)
-                    let msgIds = msgs.map(\.id)
-                    let folderId = msgs[0].folderId
+                for (_, members) in grouped {
+                    let accountId = members[0].header.accountId
+                    let folderPath = members[0].header.folderPath
+                    let durableIds = members.map(\.rfc822MessageId)
+                    let msgIds = members.map(\.header.id)
+                    guard let operation = PendingOperation.durableMessageAction(
+                        type: .markRead,
+                        messageIds: durableIds,
+                        accountId: accountId,
+                        folderPath: folderPath
+                    ) else { continue }
+                    let folderId = members[0].header.folderId
                     folderIds.insert(folderId)
                     let newlyRead = try Self.countCurrentlyUnread(msgIds: msgIds, db: db)
                     try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db, Column("isRead").set(to: true))
                     if newlyRead > 0 {
                         try db.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [newlyRead, folderId])
                     }
-                    try PendingOperation(type: .markRead, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(db)
+                    try operation.insert(db)
                 }
-                return folderIds
+                return MarkReadWriteResult(
+                    affectedFolderIds: folderIds,
+                    notificationKeys: notificationKeys
+                )
             }
         } catch {
             print("[Queue] ERROR: markRead write failed: \(error)")
-            affectedFolderIds = []
+            writeResult = MarkReadWriteResult()
         }
         // Clear delivered notifications for messages the user just read
-        for msg in messages {
-            NSEDataBridge.clearNotification(accountId: msg.accountId, messageId: msg.messageId)
+        for key in writeResult.notificationKeys {
+            NSEDataBridge.clearNotification(accountId: key.accountId, messageId: key.messageId)
         }
         // Post immediately from actor for responsive sidebar badges, then async recount for accuracy
         Task { @MainActor in
@@ -115,7 +190,7 @@ extension AccountManager {
         // folder.unreadCount, so the app-icon badge can update NOW (bg-task
         // protected) — without it, a read→immediate-background leaves the badge
         // stale until the next foreground recount.
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds, notifyImmediately: true) }
+        Task { await UnreadCountManager.shared.requestRecount(folderIds: writeResult.affectedFolderIds, notifyImmediately: true) }
         Task { await drainPendingQueue() }
     }
 
@@ -124,19 +199,32 @@ extension AccountManager {
 
         let affectedFolderIds: Set<String>
         do {
-            affectedFolderIds = try await dbPool.write { db in
+            affectedFolderIds = try await retryGatedQueueWrite(dbPool, label: "markUnread", maxAttempts: 1) { db in
                 // Mirror of markRead: expand to sibling rows in other folders so an
                 // unread mark on the inbox copy of a self-send also flips the Sent copy.
-                let expanded = try Self.expandWithSiblingsByRfc822(messages: messages, db: db)
-                let grouped = Dictionary(grouping: expanded) { "\($0.accountId)|\($0.folderPath)" }
+                let resolved = try Self.resolveDurableMessageActionMembers(
+                    headerIds: messages.map(\.id),
+                    db: db
+                ).map(\.header)
+                let expanded = try Self.expandWithSiblingsByRfc822(messages: resolved, db: db)
+                let actionable = Self.durableMessageActionMembers(expanded)
+                let grouped = Dictionary(grouping: actionable) {
+                    "\($0.header.accountId)|\($0.header.folderPath)"
+                }
                 var folderIds: Set<String> = []
-                for (_, msgs) in grouped {
-                    let accountId = msgs[0].accountId
-                    let folderPath = msgs[0].folderPath
-                    let stableIds = msgs.map(\.stableId)
-                    let msgIds = msgs.map(\.id)
+                for (_, members) in grouped {
+                    let accountId = members[0].header.accountId
+                    let folderPath = members[0].header.folderPath
+                    let durableIds = members.map(\.rfc822MessageId)
+                    let msgIds = members.map(\.header.id)
+                    guard let operation = PendingOperation.durableMessageAction(
+                        type: .markUnread,
+                        messageIds: durableIds,
+                        accountId: accountId,
+                        folderPath: folderPath
+                    ) else { continue }
                     // Count unread BEFORE marking unread — fresh DB read to compute delta
-                    let folderId = msgs[0].folderId
+                    let folderId = members[0].header.folderId
                     folderIds.insert(folderId)
                     let alreadyUnread = try Self.countCurrentlyUnread(msgIds: msgIds, db: db)
                     let newlyUnread = msgIds.count - alreadyUnread
@@ -144,7 +232,7 @@ extension AccountManager {
                     if newlyUnread > 0 {
                         try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [newlyUnread, folderId])
                     }
-                    try PendingOperation(type: .markUnread, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(db)
+                    try operation.insert(db)
                 }
                 return folderIds
             }
@@ -226,65 +314,131 @@ extension AccountManager {
 
     // MARK: - Optimistic Move (shared by archive, delete, move)
 
-    /// Core optimistic move: reassigns messages to the destination folder in GRDB,
-    /// queues tag removal if leaving inbox, and queues the PendingOperation.
+    private struct OptimisticMoveResult: Sendable {
+        var affectedFolderIds: Set<String> = []
+        var movedHeaderIds: Set<String> = []
+        var movedAccountIds: Set<String> = []
+    }
+
+    /// Bounded Undo-admission reconciliation (ADR-IOS-060 §8.3/§9.3), called
+    /// from inside the SAME gated transaction as the local optimistic
+    /// mutation, only when the caller is Undo. Loads every active
+    /// (queued/inFlight) row in durable order, NEVER touches the first
+    /// (protected) row, and scans the rest newest→oldest for the first row
+    /// related to `pendingOperation` (same account, member-set intersects).
+    /// That candidate is cancellable only if it is still `queued` and
+    /// flipping it EXACTLY equals `pendingOperation` (same op kind, complete
+    /// member set, complete source/destination/label) — in which case this
+    /// physically deletes the matched row (never `.cancelled`) and, for a
+    /// non-reversible-by-deletion setter, would append the inverse (moves
+    /// need no inverse row: the message never left). Any other outcome
+    /// (no related row, in-flight, partial overlap, mismatched payload)
+    /// falls through and the caller inserts `pendingOperation` unmodified —
+    /// this function never rewrites, splits, or partially deletes a batch.
+    /// Returns whether `pendingOperation`'s admission was fully handled.
+    @discardableResult
+    private nonisolated static func reconcileUndoAdmission(
+        _ pendingOperation: PendingOperation,
+        db: Database
+    ) throws -> Bool {
+        let activeRows = try PendingOperation.fetchAll(
+            db,
+            sql: "SELECT * FROM pendingOperation WHERE status != ? ORDER BY rowid ASC",
+            arguments: [PendingStatus.cancelled.rawValue]
+        )
+        guard activeRows.first != nil else { return false }
+        let ourMemberSet = Set(pendingOperation.messageIds)
+        // Scan strictly AFTER the protected first row, newest → oldest. The
+        // first row is excluded from consideration entirely, regardless of
+        // its account or status — it may already be crossing into execution.
+        for candidate in activeRows.dropFirst().reversed() {
+            guard candidate.accountId == pendingOperation.accountId else { continue }
+            let candidateMemberSet = Set(candidate.messageIds)
+            guard !candidateMemberSet.isDisjoint(with: ourMemberSet) else { continue }
+            // First related row scanning newest → oldest — stop here
+            // regardless of outcome; never consider an older row instead.
+            guard candidate.status == PendingStatus.queued.rawValue,
+                  candidateMemberSet == ourMemberSet,
+                  pendingOperation.matchesFlip(of: candidate)
+            else { return false }
+            _ = try PendingOperation.deleteOne(db, key: candidate.id)
+            if pendingOperation.type == .move {
+                // Location transition: deletion is sufficient — the message
+                // never left the pre-move location the matched row recorded.
+                return true
+            }
+            // Idempotent state/set operation: the inverse must still be the
+            // last durable command that executes.
+            try pendingOperation.insert(db)
+            return true
+        }
+        return false
+    }
+
+    /// Core optimistic move: reassigns messages to the destination folder in GRDB
+    /// and queues the PendingOperation. `actionTag`/`tagSortOrder` are NOT
+    /// touched (Round D-0) — the tag is retained across folders and is a
+    /// display-time concern only (gated on `isInInbox` at render time).
     /// Unread counts are adjusted inline (same transaction) for immediate UI feedback.
     /// UnreadCountManager async recount serves as safety net.
-    /// Post-drain sync reconciles UIDs via stale detection + UID remap.
+    /// Ordinary sync independently reconciles provider IDs through RFC identity.
     ///
-    /// Gmail-specific: archive destination is the synthetic "__GMAIL_ALL_MAIL__" folder;
-    /// the provider-level archive just removes the INBOX label. The optimistic folder
-    /// assignment works the same regardless.
-    /// Returns the set of affected folder IDs (source + destination) for unread recount.
+    /// `isUndo` routes durable admission through `reconcileUndoAdmission`
+    /// instead of an unconditional insert (ADR-IOS-060); every other caller
+    /// leaves it false and always inserts.
+    ///
+    /// Returns the affected folder IDs and moved row/account identities from the same
+    /// transaction. Provider-specific folder semantics stay behind `EmailProvider`.
     @discardableResult
     private nonisolated static func optimisticMoveToFolder(
-        msgs: [MessageHeader],
+        members: [DurableMessageActionMember],
         accountId: String,
         folderPath: String,
         destinationPath: String,
         opType: OperationType,
-        removeTagsIfLeavingInbox: Bool,
+        isUndo: Bool = false,
         db: Database
-    ) throws -> Set<String> {
+    ) throws -> OptimisticMoveResult {
         // Self-move is a no-op — don't create PendingOperation or touch local state.
         // Happens when archiving from All Mail on Gmail (source=dest=__GMAIL_ALL_MAIL__).
         guard folderPath != destinationPath else {
             print("[Queue] Skipping no-op move (source==dest): \(folderPath)")
-            return []
+            return OptimisticMoveResult()
         }
-        let stableIds = msgs.map(\.stableId)
-        let leavingInbox = msgs[0].isInInbox
+        let msgs = members.map(\.header)
+        let durableIds = members.map(\.rfc822MessageId)
+        guard let pendingOperation = PendingOperation.durableMessageAction(
+            type: opType,
+            messageIds: durableIds,
+            accountId: accountId,
+            folderPath: folderPath,
+            destinationPath: destinationPath
+        ) else { return OptimisticMoveResult() }
 
         // Optimistic local update — move to destination folder immediately.
-        // Message appears in destination right away; post-drain sync reconciles UIDs.
+        // Message appears in destination right away; ordinary sync reconciles provider IDs.
         let destFolderId = "\(accountId):\(destinationPath)"
         let destFolder = try Folder.fetchOne(db, key: destFolderId)
         let destIsInbox = destFolder?.role == .inbox
 
         let msgIds = msgs.map(\.id)
-        // Tags are local-only (ADR-IOS-036) — there is no server-side keyword
-        // to remove, so leaving the inbox clears `actionTag` in THIS write
-        // (same statement as the folder move) instead of queuing a
-        // PendingOperation. `tagSortOrder = 99` mirrors the "no tag" sentinel
-        // `sweepStaleActionTags` writes (SyncEngineMaintenance.swift) and the
-        // `MessageHeader.tagSortOrder` column default — same value, same
-        // meaning, so a message that leaves the inbox and one the periodic
-        // sweep later catches converge on identical local state.
-        if removeTagsIfLeavingInbox && leavingInbox {
-            try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
-                Column("folderId").set(to: destFolderId),
-                Column("folderPath").set(to: destinationPath),
-                Column("isInInbox").set(to: destIsInbox),
-                Column("actionTag").set(to: nil as String?),
-                Column("tagSortOrder").set(to: 99)
-            )
-        } else {
-            try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
-                Column("folderId").set(to: destFolderId),
-                Column("folderPath").set(to: destinationPath),
-                Column("isInInbox").set(to: destIsInbox)
-            )
-        }
+        // Action tags are RETAINED across a folder move (owner decision,
+        // 2026-07-14, Round D-0 — supersedes the 2026-07-10 F6 destructive
+        // clear). A tag is inbox-scoped PRESENTATION, not an inbox-scoped
+        // invariant: every tag renderer already gates display on
+        // `isInInbox`, so a message leaving the inbox simply stops showing
+        // its chip without losing the underlying value — no different from
+        // any other header field. `actionTag`/`tagSortOrder` are therefore
+        // left untouched here (they stay mutually consistent because this
+        // move doesn't write either column). `sweepStaleActionTags`
+        // (SyncEngineMaintenance.swift) remains the only place that reclaims
+        // a stale out-of-inbox tag, as periodic disk hygiene — never this
+        // move path.
+        try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
+            Column("folderId").set(to: destFolderId),
+            Column("folderPath").set(to: destinationPath),
+            Column("isInInbox").set(to: destIsInbox)
+        )
 
         // Inline unread count update — fresh DB read, not stale snapshot.
         // Re-read isRead from DB to avoid double-decrement when markRead + move race.
@@ -295,25 +449,43 @@ extension AccountManager {
             try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadMoving, destFolderId])
         }
 
-        try PendingOperation(type: opType, messageIds: stableIds, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath).insert(db)
-        print("[Queue] Queued \(opType.rawValue) for \(stableIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
-        return [msgs[0].folderId, destFolderId]
+        if isUndo {
+            let reconciled = try Self.reconcileUndoAdmission(pendingOperation, db: db)
+            if !reconciled {
+                try pendingOperation.insert(db)
+            }
+        } else {
+            try pendingOperation.insert(db)
+        }
+        print("[Queue] Queued \(opType.rawValue) for \(durableIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
+        return OptimisticMoveResult(
+            affectedFolderIds: [msgs[0].folderId, destFolderId],
+            movedHeaderIds: Set(msgs.map(\.id)),
+            movedAccountIds: [accountId]
+        )
     }
 
-    func move(_ messages: [MessageHeader], to destinationPath: String) async {
+    /// `isUndo` (ADR-IOS-060) routes this move's durable admission through
+    /// the bounded reconciliation formula instead of an unconditional insert.
+    /// Only `AccountManager.undoMove`'s own inverse-move dispatch ever passes
+    /// `true` — every gesture/tool/notification/settings caller leaves it
+    /// false.
+    func move(_ messages: [MessageHeader], to destinationPath: String, isUndo: Bool = false) async {
+        guard !destinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         // Re-resolve fresh headers by id — the single choke point for every
         // surface (swipe, detail view, agent tools, settings bulk-archive).
         // Gesture paths capture `lookupMessage` snapshots at tap time and pass
         // them into queued closures; a second destination-changing gesture on
         // the same message before the first closure commits would otherwise
-        // record a PendingOperation against the STALE source folderPath (on
-        // IMAP the drain then SEARCHes the wrong folder, uidResolutionFailed,
-        // and the destination-check wrongly confirms it stale and drops it).
+        // record a PendingOperation against the STALE source folderPath. The
+        // provider would correctly find no member there and no-op, silently
+        // losing the user's later move unless admission uses current row truth.
         // The write acts on row truth at execution time — same doctrine as
-        // `performCoordinatedRoleMove`'s in-closure re-resolve, which stays
-        // as-is (its double resolve is harmless). Ids that no longer resolve
-        // (vanished rows) are dropped from the batch — correct, per
-        // `resolveHeadersForAction`'s documented contract.
+        // the fold executor's own resolve (ADR-IOS-058 `executeFold`) and
+        // `recordRoleMove`'s pre-resolve upstream of it; the extra re-resolve
+        // here is harmless. Ids that no longer resolve (vanished rows) are
+        // dropped from the batch — correct, per `resolveHeadersForAction`'s
+        // documented contract.
         let fresh = await resolveHeadersForAction(ids: messages.map(\.id))
         // Observability (audit round 5): resolveHeadersForAction swallows read
         // errors (`try?` → []), so an empty result for a NON-empty input is
@@ -331,49 +503,73 @@ extension AccountManager {
         // PendingOperation whose server-side MOVE has provider-dependent
         // effects (e.g. archive-from-Archive).
         let movable = fresh.filter { $0.folderPath != destinationPath }
-        guard !movable.isEmpty else { return }
-        await ensureDurable(movable)
+        let candidates = Self.durableMessageActionMembers(movable)
+        guard !candidates.isEmpty else { return }
+        await ensureDurable(candidates.map(\.header))
 
-        let grouped = Dictionary(grouping: movable) { "\($0.accountId)|\($0.folderPath)" }
-        let affectedFolderIds: Set<String>
+        let moveResult: OptimisticMoveResult
         do {
-            affectedFolderIds = try await dbPool.write { db in
-                var folderIds: Set<String> = []
-                for (_, msgs) in grouped {
-                    let accountId = msgs[0].accountId
-                    let folderPath = msgs[0].folderPath
-                    let moved = try Self.optimisticMoveToFolder(msgs: msgs, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath, opType: .move, removeTagsIfLeavingInbox: true, db: db)
-                    folderIds.formUnion(moved)
+            moveResult = try await retryGatedQueueWrite(dbPool, label: "move", maxAttempts: 1) { db in
+                var result = OptimisticMoveResult()
+                let actionable = try Self.resolveDurableMessageActionMembers(
+                    headerIds: candidates.map(\.header.id),
+                    db: db
+                ).filter { $0.header.folderPath != destinationPath }
+                let grouped = Dictionary(grouping: actionable) {
+                    "\($0.header.accountId)|\($0.header.folderPath)"
                 }
-                return folderIds
+                for (_, members) in grouped {
+                    let accountId = members[0].header.accountId
+                    let folderPath = members[0].header.folderPath
+                    let moved = try Self.optimisticMoveToFolder(members: members, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath, opType: .move, isUndo: isUndo, db: db)
+                    result.affectedFolderIds.formUnion(moved.affectedFolderIds)
+                    result.movedHeaderIds.formUnion(moved.movedHeaderIds)
+                    result.movedAccountIds.formUnion(moved.movedAccountIds)
+                }
+                return result
             }
         } catch {
             print("[Queue] ERROR: move write failed: \(error)")
-            affectedFolderIds = []
+            moveResult = OptimisticMoveResult()
         }
         Task { @MainActor in
             NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         }
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds) }
+        Task {
+            await UnreadCountManager.shared.requestRecount(
+                folderIds: moveResult.affectedFolderIds
+            )
+        }
         Task { await drainPendingQueue() }
     }
 
     func markFlagged(_ messages: [MessageHeader], flagged: Bool) async {
         await ensureDurable(messages)
 
-        let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
         do {
-            try await dbPool.write { db in
-                for (_, msgs) in grouped {
-                    let accountId = msgs[0].accountId
-                    let folderPath = msgs[0].folderPath
-                    let stableIds = msgs.map(\.stableId)
-                    for msg in msgs {
+            try await retryGatedQueueWrite(dbPool, label: "markFlagged", maxAttempts: 1) { db in
+                let actionable = try Self.resolveDurableMessageActionMembers(
+                    headerIds: messages.map(\.id),
+                    db: db
+                )
+                let grouped = Dictionary(grouping: actionable) {
+                    "\($0.header.accountId)|\($0.header.folderPath)"
+                }
+                for (_, members) in grouped {
+                    let accountId = members[0].header.accountId
+                    let folderPath = members[0].header.folderPath
+                    let durableIds = members.map(\.rfc822MessageId)
+                    guard let operation = PendingOperation.durableMessageAction(
+                        type: flagged ? .markFlagged : .markUnflagged,
+                        messageIds: durableIds,
+                        accountId: accountId,
+                        folderPath: folderPath
+                    ) else { continue }
+                    for msg in members.map(\.header) {
                         try db.execute(sql: "UPDATE messageHeader SET isFlagged = ? WHERE id = ?", arguments: [flagged, msg.id])
                     }
-                    let opType: OperationType = flagged ? .markFlagged : .markUnflagged
-                    try PendingOperation(type: opType, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(db)
+                    try operation.insert(db)
                 }
             }
         } catch {
@@ -400,6 +596,8 @@ extension AccountManager {
         return messages.filter { !roleFolderIds.contains($0.folderId) }
     }
 
+    /// Undo never targets a role (its inverse is always an explicit folder —
+    /// see `UndoAccountCommand`), so this never needs an `isUndo` parameter.
     func archive(_ messages: [MessageHeader]) async {
         let movable = await messagesNotInRole(messages, role: .archive)
         await moveToRoleFolderPerAccount(movable, role: .archive)
@@ -439,55 +637,54 @@ extension AccountManager {
         }
     }
 
-    // MARK: - Coordinated Tool Actions (agent tools, ADR-IOS-057 vicinity)
+    // MARK: - Coordinated Tool Actions (agent tools / notifications, ADR-IOS-058)
 
-    /// Archive/delete via the same overlay + FIFO write-queue lifecycle as gesture
-    /// actions, for agent tools (`EmailArchiveTool`/`EmailDeleteTool`). Tools resolve
-    /// headers BEFORE an unbounded user-confirmation wait (for the confirmation card
-    /// display) — that snapshot can go stale while the user waits, so a later
-    /// user move/delete must not be silently reversed by an action that blindly
-    /// trusts it. This helper takes ids (never a pre-resolved header) and
-    /// re-resolves fresh headers INSIDE the queued closure, so the write acts on
-    /// row truth at EXECUTION time — and participates in the same optimistic
-    /// overlay + FIFO ordering as gesture-driven archive/delete. Awaits durable
-    /// completion (the local GRDB write + `PendingOperation` insert have landed)
-    /// before returning.
+    /// Archive/delete for agent tools (`EmailArchiveTool`/`EmailDeleteTool`) and the
+    /// notification action router — replaces `performCoordinatedRoleMove` (ADR-IOS-058,
+    /// plan §9d/§9l step 4). Appends ONE `.move(.role(role))` intention
+    /// record for the actionable ids and awaits its fold's durable completion via
+    /// `recordAndWait` — tools/notifications report success only after the local GRDB
+    /// write + `PendingOperation` insert have landed (same semantics
+    /// `performCoordinatedRoleMove`'s awaited continuation provided). No
+    /// `UndoService.push` — tools/notifications are deliberately undo-less (plan §9a,
+    /// `feedback_undo_stack_scope`). Since no `UndoableAction` ever references this
+    /// row, Undo's bounded reconciliation (which only ever runs for an Undo-origin
+    /// move) can never touch it either (ADR-IOS-060).
     ///
-    /// Retain/release audit: one `retainOverlayEntry` per actionable id below,
-    /// BEFORE its `registerMutation` call (ADR-IOS-057 ordering — the overlay
-    /// entry must not be removable by a sibling op's release before this id's
-    /// own retain lands). The queued closure releases every retained id on
-    /// every exit: ids dropped by the closure's own fresh re-resolve (vanished
-    /// row, or already moved into the role folder by an earlier queued op) are
-    /// released as soon as the drop is detected; the remaining (fresh) ids are
-    /// released once, after the `archive()`/`delete()` write completes (or is
-    /// skipped on the defensive unsupported-role branch, unreachable in
-    /// practice — the guard at the top of this function only lets `.archive`/
-    /// `.trash` reach the retain loop at all). There is exactly one path
-    /// through the closure body — no early returns — so the two release loops
-    /// together cover every id this call ever retained.
-    func performCoordinatedRoleMove(ids: [String], role: FolderRole) async {
-        guard !ids.isEmpty else { return }
+    /// Still pre-resolves headers for DISPLAY ONLY, mirroring `performCoordinatedRoleMove`'s
+    /// former pre-resolve: this is an async non-gesture path (tool/notification
+    /// dispatch, not a finger gesture), so a DB read here is fine — contrast the
+    /// zero-DB gesture-path contract. Staleness is now handled STRUCTURALLY rather
+    /// than by this function's own re-resolve: `executeFold`'s `.role` branch
+    /// (`archive()`/`delete()`) re-resolves FRESH headers and re-filters via
+    /// `messagesNotInRole` at fold time, so a message the user separately moved
+    /// during an unbounded confirmation wait still gets acted on with row truth at
+    /// execution, not this pre-resolve snapshot.
+    @discardableResult
+    func recordRoleMove(ids: [String], role: FolderRole, origin: IntentionOrigin) async -> Set<String> {
+        guard !ids.isEmpty else { return [] }
         guard role == .archive || role == .trash else {
-            BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unsupported role \(role.rawValue), no-op")
-            return
+            BackgroundSyncLogger.logInbox("[AccountManager] recordRoleMove — unsupported role \(role.rawValue), no-op")
+            return []
         }
 
         // Pre-resolve fresh headers to drop ids that no longer exist or are
         // already in the target role folder, and to look up each account's
-        // destination folder for the overlay's display-only folderId. This
-        // snapshot is intentionally re-taken again INSIDE the queued closure
-        // below — the actual write never trusts this one.
+        // destination folder for the overlay's display-only folderId. The
+        // fold's `.role` branch re-resolves again at execution time — this
+        // snapshot is display-only, never trusted for the write itself.
         let preResolved = await resolveHeadersForAction(ids: ids)
-        let movable = await messagesNotInRole(preResolved, role: role)
+        let roleEligible = await messagesNotInRole(preResolved, role: role)
+        let movable = Self.durableMessageActionMembers(roleEligible).map(\.header)
         guard !movable.isEmpty else {
-            // Observability (audit round 5): callers (agent tools, notification
-            // router) report success unconditionally after this await — a silent
-            // return here on a read failure (resolveHeadersForAction swallows
-            // errors to []) would leave no trace anywhere. Vanished/already-in-
-            // role ids are legit no-ops; the log is the only failure correlate.
-            print("[Queue] performCoordinatedRoleMove(\(role.rawValue)): 0 of \(ids.count) ids actionable after resolve/role filter — nothing to do")
-            return
+            // Observability (audit round 5, carried): callers (agent tools,
+            // notification router) report success unconditionally after this
+            // await — a silent return here on a read failure
+            // (resolveHeadersForAction swallows errors to []) would leave no
+            // trace anywhere. Vanished/already-in-role ids are legit no-ops;
+            // the log is the only failure correlate.
+            print("[Queue] recordRoleMove(\(role.rawValue)): 0 of \(ids.count) ids actionable after resolve/role filter — nothing to do")
+            return []
         }
 
         let accountIds = Set(movable.map(\.accountId))
@@ -496,7 +693,8 @@ extension AccountManager {
             for accountId in accountIds {
                 if let folder = try Folder
                     .filter(Column("accountId") == accountId && Column("role") == role.rawValue)
-                    .fetchOne(db) {
+                    .fetchOne(db),
+                   !folder.path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     result[accountId] = folder.id
                 }
             }
@@ -505,61 +703,39 @@ extension AccountManager {
 
         // Skip ids whose account has no folder for this role — mirrors
         // archive()/delete()'s own "no archive/trash folder for account" skip
-        // (including its ERROR log convention — audit round 5).
+        // (including its ERROR log convention — audit round 5). This filter
+        // runs BEFORE the record append below, so a skipped id never enters
+        // the journal — no overlay/journal entry to strand.
         let actionable = movable.filter { destFolderIdByAccount[$0.accountId] != nil }
         guard !actionable.isEmpty else {
-            print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) — no \(role.rawValue) folder resolved for account(s) \(accountIds.sorted().joined(separator: ",")); \(movable.count) message(s) skipped")
-            return
+            print("[Queue] ERROR: recordRoleMove(\(role.rawValue)) — no \(role.rawValue) folder resolved for account(s) \(accountIds.sorted().joined(separator: ",")); \(movable.count) message(s) skipped")
+            return []
         }
-        let actionableIds = Set(actionable.map(\.id))
 
+        var displays: [String: PendingMutation] = [:]
         for msg in actionable {
             guard let destFolderId = destFolderIdByAccount[msg.accountId] else { continue }
-            retainOverlayEntry(id: msg.id)
-            registerMutation(id: msg.id, mutation: PendingMutation(
+            displays[msg.id] = PendingMutation(
                 folderId: destFolderId,
-                // Tag clears locally the moment the message LEAVES the inbox —
-                // mirrors the DB-side clear semantics (F6): archive/trash
+                // Display-only hide, NOT a data clear (Round D-0 supersedes
+                // the old F6 destructive clear): the tag is retained on the
+                // header regardless of folder, but every renderer gates on
+                // `isInInbox`, so the pending-drain overlay shows no tag the
+                // moment the message LEAVES the inbox — archive/trash
                 // destinations are never the inbox, so for this helper's two
-                // supported roles "isInInbox on the pre-resolved snapshot"
-                // IS "leaving the inbox".
+                // supported roles "isInInbox on the pre-resolved snapshot" IS
+                // "leaving the inbox".
                 actionTag: msg.isInInbox ? .some(nil) : nil
-            ))
+            )
         }
 
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            enqueueWrite {
-                // Re-resolve INSIDE the queued closure: acts on row truth at
-                // EXECUTION time, not the confirmation-time snapshot above —
-                // the staleness bug this helper exists to close.
-                let fresh = await self.resolveHeadersForAction(ids: Array(actionableIds))
-                let freshMovable = await self.messagesNotInRole(fresh, role: role)
-                let freshIds = Set(freshMovable.map(\.id))
-
-                // Ids dropped by the fresh resolve (vanished row, or already
-                // in the role folder — e.g. an earlier queued op moved it
-                // there first) get no write; release their retain now.
-                for id in actionableIds.subtracting(freshIds) {
-                    self.releaseOverlayEntry(id: id)
-                }
-
-                switch role {
-                case .archive:
-                    await self.archive(freshMovable)
-                case .trash:
-                    await self.delete(freshMovable)
-                default:
-                    // Unreachable — the guard at the top of this function
-                    // only lets .archive/.trash reach the retain loop.
-                    BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unexpected role \(role.rawValue) reached queued closure")
-                }
-
-                for id in freshIds {
-                    self.releaseOverlayEntry(id: id)
-                }
-                cont.resume()
-            }
-        }
+        await recordAndWait(
+            ids: actionable.map(\.id),
+            kind: .move(.role(role)),
+            displays: displays,
+            origin: origin
+        )
+        return Set(actionable.map(\.id))
     }
 
     /// Diagnostic-only: log the trash-folder lookup result and the message(s) being deleted
@@ -582,6 +758,87 @@ extension AccountManager {
         }
     }
 
+    // MARK: - Bulk Archive (Settings)
+
+    /// Bulk-archive inbox messages older than `archiveCutoff`, one account
+    /// batch at a time. Extracted from `SettingsView.archiveOldMessages`
+    /// (test-review round-1, pure code move) — the View computes
+    /// `inboxFolderIds`/`archiveCutoff` from its own `navigationStore` state
+    /// and keeps its own guards/UI-state updates (`isLargeInbox`,
+    /// `oldMessageCount`); this owns the fetch + per-account loop and
+    /// returns the archived count.
+    ///
+    /// `await UndoService.shared.push(...)` below is the one adjustment the
+    /// move required: the original call ran on the View's MainActor context
+    /// (no hop needed); from inside the `AccountManager` actor, pushing to
+    /// the MainActor-isolated `UndoService` crosses an isolation boundary —
+    /// same call, same arguments, same order, just an explicit `await`.
+    @discardableResult
+    func archiveOldInboxMessages(inboxFolderIds: Set<String>, archiveCutoff: Date) async -> Int {
+        guard let oldMessages = try? await AppDatabase.dbPool.read({ db in
+            try MessageHeader
+                .filter(inboxFolderIds.contains(Column("folderId")))
+                .filter(Column("date") < archiveCutoff)
+                .order(Column("date").asc)
+                .fetchAll(db)
+        }), !oldMessages.isEmpty else { return 0 }
+
+        let admittedMessages = Self.durableMessageActionMembers(oldMessages).map(\.header)
+        guard !admittedMessages.isEmpty else { return 0 }
+        let byAccount = Dictionary(grouping: admittedMessages, by: \.accountId)
+        var totalArchived = 0
+
+        // Deterministic account order (test-review round 3): Dictionary
+        // iteration order is per-process-randomized, which made the
+        // per-account skip/abort distinction untestable deterministically —
+        // and nondeterministic undo-stack push order is user-visible.
+        for accountId in byAccount.keys.sorted() {
+            let messages = byAccount[accountId] ?? []
+            guard let archivePath = try? await AppDatabase.dbPool.read({ db in
+                try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.archive.rawValue).fetchOne(db)?.path
+            }), !archivePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                print("[ArchiveOld] No archive folder for account \(accountId)")
+                continue
+            }
+            let destFolderId = "\(accountId):\(archivePath)"
+            // Undo commands are built from the pre-move headers directly
+            // (ADR-IOS-060): no full-row snapshot, no overlay adjustment
+            // needed — `UndoMember` carries only rfc822 identity and the
+            // pre-move source path, neither of which the overlay affects.
+            await UndoService.shared.push(UndoableAction(
+                commands: UndoableAction.commands(
+                    for: messages,
+                    forwardDestinationByAccount: [accountId: archivePath]
+                )
+            ))
+            // ADR-IOS-058: record() replaces the bare `manager.move(...)` call
+            // this function used before. BEHAVIOR IMPROVEMENT (audit §9a): this
+            // bulk archive previously had NO overlay coverage and bypassed the
+            // FIFO write queue entirely (a bare actor call racing every other
+            // queued gesture); it now gets both, same as every other archive
+            // surface. ONE record covers this account's whole batch: members
+            // may span source folders — source grouping is `move()`'s job at
+            // execution time. recordAndWait (not fire-and-forget record())
+            // preserves this function's pre-existing await-until-committed
+            // contract: `totalArchived`/`oldMessageCount` below must reflect
+            // completed local writes, not merely enqueued intent.
+            var displays: [String: AccountManager.PendingMutation] = [:]
+            for msg in messages {
+                displays[msg.id] = .init(folderId: destFolderId, actionTag: msg.isInInbox ? .some(nil) : nil)
+            }
+            await AccountManager.shared.recordAndWait(
+                ids: messages.map(\.id),
+                kind: .move(.folder(folderId: destFolderId, folderPath: archivePath, isInbox: false)),
+                displays: displays,
+                origin: .settings
+            )
+            totalArchived += messages.count
+        }
+
+        print("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
+        return totalArchived
+    }
+
     // MARK: - Search
 
     func search(query: String, account: Account, folder: String, after: Date? = nil, before: Date? = nil, from: String? = nil, to: String? = nil) async throws -> [MessageHeaderInfo] {
@@ -591,124 +848,158 @@ extension AccountManager {
         }
     }
 
-    // MARK: - Undo Support
+    // MARK: - Undo Support (ADR-IOS-060)
 
-    /// Unified undo for archive, delete, and move. Cancels queued ops if still pending,
-    /// otherwise queues a move-back. Restores messages to original folder and adjusts
-    /// unread counts on both source (current) and destination (original) folders.
-    func undoDestructiveAction(
-        _ messages: [MessageHeader],
+    /// Resolve one Undo member's CURRENT row. Two tiers, tried in order:
+    ///
+    /// 1. By `originalHeaderId` — an ordinary optimistic move (`optimisticMoveToFolder`)
+    ///    UPDATEs folderId/folderPath on the EXISTING primary key; it never re-keys the
+    ///    row. So the id captured at forward-gesture time is still valid unless an
+    ///    INDEPENDENT sync re-key happened in between (Graph/IMAP provider-ID churn) —
+    ///    the only case tier 2 exists for. This tier is what makes an Undo dispatched
+    ///    while the forward move is STILL only in memory (never durably written) resolve
+    ///    to the right row: the id is unaffected by the move not having happened yet.
+    /// 2. By normalized RFC Message-ID scoped to `forwardDestinationPath` — the one place
+    ///    the forward move is known to have put this message. Used only when tier 1's id
+    ///    has vanished (an independent re-key). Zero or multiple matches there mean the
+    ///    Undo is stale for this member.
+    ///
+    /// Never fabricates a row. A member neither tier resolves is dropped — the same
+    /// stale-drop rule as any other locally vanished intention.
+    private nonisolated static func resolveUndoMember(
         accountId: String,
-        originalOpType: OperationType,
-        fromFolderPath: String,
-        toFolderPath: String,
-        toFolderId: String
-    ) async {
-        let ids = messages.map(\.messageId)
-        let idsSet = Set(ids)
-        let stableIdsSet = Set(messages.map(\.stableId))
-        let label = originalOpType.rawValue
-        print("[UndoStack] undo\(label) ENTER — msgIds=\(ids) from=\(fromFolderPath) restoreTo=\(toFolderPath) restoreFolderId=\(toFolderId)")
+        forwardDestinationPath: String,
+        member: UndoMember,
+        db: Database
+    ) throws -> MessageHeader? {
+        if let row = try MessageHeader.fetchOne(db, key: member.originalHeaderId),
+           row.accountId == accountId,
+           MessageIdentity.durableActionRFC822MessageId(row.rfc822MessageId) == member.rfc822MessageId,
+           // Serial-intent location guard (ADR-IOS-060 §8.2, plan §19): the row
+           // is undoable only where serial replay could have left it — at the
+           // forward destination (fold already executed) or still at this
+           // member's own source (fast tap: the forward fold is pending, the
+           // in-memory annihilation case). Anywhere else means an independent
+           // newer action (another client, a tool) moved it, and this Undo is
+           // stale: never drag a message back from an unrelated folder because
+           // undo "probably" owns it.
+           row.folderPath == forwardDestinationPath || row.folderPath == member.sourceFolderPath {
+            return row
+        }
+        let storedSpellings = [member.rfc822MessageId, "<\(member.rfc822MessageId)>"]
+        let candidates = try MessageHeader
+            .filter(
+                Column("accountId") == accountId
+                    && Column("folderPath") == forwardDestinationPath
+                    && storedSpellings.contains(Column("rfc822MessageId"))
+            )
+            .fetchAll(db)
+            .filter {
+                MessageIdentity.durableActionRFC822MessageId($0.rfc822MessageId) == member.rfc822MessageId
+            }
+        guard candidates.count == 1 else { return nil }
+        return candidates.first
+    }
+
+    /// Execute one account's Undo command: an ORDINARY inverse move through
+    /// the same journal/fold/gated-admission path every other move uses
+    /// (`origin: .undo`), source/destination swapped (ADR-IOS-060 §8.2). No
+    /// snapshot, no token, no receipt, no full-row restore — only the
+    /// location changes; any field change made between the forward move and
+    /// this Undo (a read toggle, a retag) is left exactly as it is, per
+    /// serial-replay semantics.
+    ///
+    /// A member whose row is not identifiable (`resolveUndoMember` above)
+    /// is dropped: no local mutation, no durable work. Returns the dropped
+    /// members' pre-move ids (for diagnostics/testing).
+    @discardableResult
+    func undoMove(
+        accountId: String,
+        forwardDestinationPath: String,
+        members: [UndoMember]
+    ) async -> Set<String> {
+        guard !members.isEmpty else { return [] }
+
+        let resolved: [(member: UndoMember, header: MessageHeader)]
         do {
-            try await dbPool.write { db in
-                let queuedOps = try PendingOperation
-                    .filter(Column("accountId") == accountId)
-                    .filter(Column("status") == PendingStatus.queued.rawValue)
-                    .fetchAll(db)
-                print("[UndoStack] undo\(label) — found \(queuedOps.count) queued ops for account")
-                for op in queuedOps {
-                    print("[UndoStack] undo\(label) — queued op: id=\(op.id.prefix(8)) type=\(op.type.rawValue) msgIds=\(op.messageIds) status=\(op.status)")
-                }
-
-                let inFlightOps = try PendingOperation
-                    .filter(Column("accountId") == accountId)
-                    .filter(Column("status") == PendingStatus.inFlight.rawValue)
-                    .fetchAll(db)
-                if !inFlightOps.isEmpty {
-                    print("[UndoStack] undo\(label) — WARNING: \(inFlightOps.count) inFlight ops:")
-                    for op in inFlightOps {
-                        print("[UndoStack]   inFlight: id=\(op.id.prefix(8)) type=\(op.type.rawValue) msgIds=\(op.messageIds)")
-                    }
-                }
-
-                var cancelledOriginal = false
-                for op in queuedOps {
-                    let opMsgIds = Set(op.messageIds)
-                    // Match by both numeric UIDs and stable IDs (rfc822MessageId)
-                    // since pending ops may contain either format.
-                    if (!opMsgIds.isDisjoint(with: idsSet) || !opMsgIds.isDisjoint(with: stableIdsSet)) &&
-                       (op.type == originalOpType || op.type == .removeTag) {
-                        var cancelled = op
-                        cancelled.status = PendingStatus.cancelled.rawValue
-                        try cancelled.save(db)
-                        print("[UndoStack] undo\(label) — CANCELLED op id=\(op.id.prefix(8)) type=\(op.type.rawValue)")
-                        if op.type == originalOpType { cancelledOriginal = true }
-                    }
-                }
-
-                // Restore messages — use save() (upsert) in case drain cleanup already deleted the row.
-                // The snapshot's folderPath/isInInbox are from the original source folder — save() restores all columns.
-                for msg in messages {
-                    let existing = try MessageHeader.fetchOne(db, key: msg.id)
-                    print("[UndoStack] undo\(label) — restore msg id=\(msg.id) existing=\(existing == nil ? "nil(deleted)" : "folderId=\(existing!.folderId)") → setting folderId=\(toFolderId)")
-                    var restored = msg
-                    restored.folderId = toFolderId
-                    try restored.save(db)
-                }
-
-                // Inline unread count update — fresh DB read after restore.
-                // Messages were just restored via save(db) above, so re-read their
-                // current isRead state from DB rather than trusting the caller snapshot.
-                let restoredMsgIds = messages.map(\.id)
-                let unreadRestored = try Self.countCurrentlyUnread(msgIds: restoredMsgIds, db: db)
-                if unreadRestored > 0 {
-                    let fromFolderId = "\(accountId):\(fromFolderPath)"
-                    if !fromFolderPath.isEmpty {
-                        try db.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [unreadRestored, fromFolderId])
-                    }
-                    try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadRestored, toFolderId])
-                }
-
-                if !cancelledOriginal {
-                    // IMAP MOVE changes UIDs — use rfc822MessageId for move-back so resolveUID
-                    // does a Message-ID header search in the destination folder (finds correct UID).
-                    // Gmail/Exchange use stable IDs that don't change on move.
-                    let account = try Account.fetchOne(db, key: accountId)
-                    let moveBackIds: [String]
-                    if account?.provider == .imap || account?.provider == .icloud {
-                        moveBackIds = messages.compactMap(\.rfc822MessageId)
-                        if moveBackIds.count != messages.count {
-                            print("[UndoStack] undo\(label) — WARNING: \(messages.count - moveBackIds.count) messages missing rfc822MessageId for move-back")
-                        }
-                    } else {
-                        moveBackIds = ids
-                    }
-                    if !moveBackIds.isEmpty {
-                        let moveBack = PendingOperation(type: .move, messageIds: moveBackIds, accountId: accountId, folderPath: fromFolderPath, destinationPath: toFolderPath)
-                        try moveBack.insert(db)
-                        print("[UndoStack] undo\(label) — original already executed/inFlight, queued MOVE-BACK id=\(moveBack.id.prefix(8)) from=\(fromFolderPath) to=\(toFolderPath) moveBackIds=\(moveBackIds)")
-                    } else {
-                        print("[UndoStack] undo\(label) — ERROR: no valid IDs for move-back (missing rfc822MessageId)")
-                    }
-                } else {
-                    print("[UndoStack] undo\(label) — CANCELLED original \(label) op, no move-back needed")
+            resolved = try await dbPool.read { db in
+                try members.compactMap { member -> (UndoMember, MessageHeader)? in
+                    guard let header = try Self.resolveUndoMember(
+                        accountId: accountId,
+                        forwardDestinationPath: forwardDestinationPath,
+                        member: member,
+                        db: db
+                    ) else { return nil }
+                    return (member, header)
                 }
             }
         } catch {
-            print("[UndoStack] ERROR: undo\(label) write failed: \(error)")
+            print("[UndoStack] ERROR: undoMove resolve failed for account \(accountId): \(error)")
+            resolved = []
         }
-        // Undo-restored messages are protected by their PendingOp(move-back) in the sync engine.
-        // No separate undoProtectedIds needed — the pending-op check handles it.
-        let fromFolderId = "\(accountId):\(fromFolderPath)"
-        var affectedFolderIds: Set<String> = [toFolderId]
-        if !fromFolderPath.isEmpty { affectedFolderIds.insert(fromFolderId) }
-        // Post immediately from actor for responsive sidebar badges, then async recount for accuracy
+
+        let resolvedOriginalIds = Set(resolved.map { $0.member.originalHeaderId })
+        let staleOriginalIds = Set(members.map(\.originalHeaderId)).subtracting(resolvedOriginalIds)
+        if !staleOriginalIds.isEmpty {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[UndoStack] undoMove — \(staleOriginalIds.count) member(s) stale (not identifiable, or no longer where the forward move put them): \(staleOriginalIds)")
+            }
+            // `UndoService.undo()` already posted `.messagesUndone` (PRE-move ids) and
+            // returned, so `InboxView.insertUndoneMessages` optimistically re-inserted
+            // every member. A member this resolve DROPPED would otherwise linger as a
+            // phantom row. Announce the refusals so the list re-reads the DB.
+            await MainActor.run {
+                NotificationCenter.default.post(name: .inboxDataDidChange, object: Array(staleOriginalIds))
+            }
+        }
+        guard !resolved.isEmpty else { return staleOriginalIds }
+
+        // A member whose row now lives under a DIFFERENT id than the View
+        // dismissed (an independent sync re-key between the forward gesture
+        // and this Undo — see `outlookArchiveUndoSurvivesGraphResourceIdRekey`)
+        // needs its own `.messagesUndone` announcement: `insertUndoneMessages`
+        // fetches by id, and the original id no longer exists.
+        let rekeyed = resolved.filter { $0.header.id != $0.member.originalHeaderId }.map { $0.header.id }
+        if !rekeyed.isEmpty {
+            await MainActor.run {
+                NotificationCenter.default.post(name: .messagesUndone, object: rekeyed)
+            }
+        }
+
+        // Group by restore destination — a batch can span source folders.
+        var touchedFolderIds: Set<String> = ["\(accountId):\(forwardDestinationPath)"]
+        let groups = Dictionary(grouping: resolved) { $0.member.sourceFolderPath }
+        for restorePath in groups.keys.sorted() {
+            let groupMembers = groups[restorePath] ?? []
+            let destFolderId = "\(accountId):\(restorePath)"
+            touchedFolderIds.insert(destFolderId)
+            let destIsInbox: Bool = (try? await dbPool.read { db in
+                try Folder.fetchOne(db, key: destFolderId)?.role == .inbox
+            }) ?? false
+            var displays: [String: PendingMutation] = [:]
+            for (_, header) in groupMembers {
+                displays[header.id] = .init(folderId: destFolderId)
+            }
+            // Fire-and-forget `record()`, not `recordAndWait` — every other
+            // gesture entry point (archive/delete/move) returns without
+            // waiting for its fold to execute, and Undo is an ordinary
+            // gesture (ADR-IOS-060). This also matters structurally: if the
+            // forward move this undoes is STILL only in memory (its own fold
+            // hasn't run yet), this record must be free to join the SAME
+            // connected component without this call blocking on that fold's
+            // completion — the in-memory annihilation case (§7.2).
+            record(
+                ids: groupMembers.map { $0.header.id },
+                kind: .move(.folder(folderId: destFolderId, folderPath: restorePath, isInbox: destIsInbox)),
+                displays: displays,
+                origin: .undo
+            )
+        }
+
         Task { @MainActor in NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil) }
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds) }
-        Task {
-            print("[UndoStack] undo\(label) — triggering drainPendingQueue (isDraining=\(isDraining))")
-            await drainPendingQueue()
-        }
+        Task { await UnreadCountManager.shared.requestRecount(folderIds: touchedFolderIds) }
+        Task { await drainPendingQueue() }
+        return staleOriginalIds
     }
 
     // MARK: - Draft Queue (persistent save/delete)
@@ -729,7 +1020,7 @@ extension AccountManager {
             let folderPath = try await draftsFolderPath(accountId: accountId)
 
             // Write transaction returns FTS data for post-transaction indexing.
-            let ftsInfo: (record: FTSHeaderRecord, bodyText: String)? = try await dbPool.write { db -> (FTSHeaderRecord, String)? in
+            let ftsInfo: (record: FTSHeaderRecord, bodyText: String)? = try await retryGatedQueueWrite(dbPool, label: "queueDraftSave", maxAttempts: 1) { db -> (FTSHeaderRecord, String)? in
                 // Optimistic MessageHeader — draft appears in Drafts folder immediately.
                 // Uses rfc822MessageId for dedup when sync brings in the real IMAP UID.
                 guard let draft = try Draft.fetchOne(db, key: draftId) else {
@@ -927,7 +1218,7 @@ extension AccountManager {
     func queueDraftDelete(serverDraftId: String, accountId: String, rfc822MessageId: String? = nil) async {
         do {
             let folderPath = try await draftsFolderPath(accountId: accountId)
-            try await dbPool.write { db in
+            try await retryGatedQueueWrite(dbPool, label: "queueDraftDelete", maxAttempts: 1) { db in
                 // Optimistic removal — draft disappears from UI immediately
                 let folderId = "\(accountId):\(folderPath)"
                 // Remove by server UID (synced header)

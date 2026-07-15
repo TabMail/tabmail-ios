@@ -1255,7 +1255,7 @@ struct OptimisticSentHeaderEdgeCaseTests {
             messageId: "real-uid-77",
             rfc822MessageId: "done@example.com"
         )
-        let result = try simulateSyncForSentFolder(db: db, folder: sentFolder, messages: [serverMsg])
+        _ = try simulateSyncForSentFolder(db: db, folder: sentFolder, messages: [serverMsg])
 
         // Optimistic header should have been replaced via rfc822 dedup (or UID remap)
         let headers = try db.read { dbConn in

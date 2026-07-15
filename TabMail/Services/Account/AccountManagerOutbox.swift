@@ -139,11 +139,11 @@ extension AccountManager {
                 } else {
                     try db.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [original.id])
                     // Clear "Reply" action tag — user already committed to replying.
-                    // PendingOperation(.setTag) for server sync stays in finalizeOutboxMessage.
+                    // Action tags are local-only (ADR-IOS-036).
                     if original.actionTag == .reply {
                         try db.execute(
-                            sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
-                            arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, original.id]
+                            sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ?, actionTagSetAt = ? WHERE id = ?",
+                            arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, Date(), original.id]
                         )
                     }
                 }
@@ -748,11 +748,12 @@ extension AccountManager {
         var replyDetectHeaderId: String?
         var deleted = false
         do {
-            replyDetectHeaderId = try await retryWrite(dbPool, label: "Outbox") { db -> String? in
+            replyDetectHeaderId = try await retryGatedQueueWrite(dbPool, label: "Outbox", maxAttempts: 3) { db -> String? in
                 try OutboxMessage.deleteOne(db, key: msg.id)
 
-                // Update isReplied/isForwarded on original message + queue server flag.
-                // Resolves the original message using the stableId pattern:
+                // Update isReplied/isForwarded on the original message and, when
+                // it has a valid RFC identity, queue the matching server flag.
+                // Resolves the original message using the existing lookup pattern:
                 // 1. PK lookup (originalMessageHeaderId) — works if message hasn't moved
                 // 2. rfc822MessageId lookup (inReplyTo) — survives IMAP folder moves
                 // This is the same resolution pattern used throughout the codebase
@@ -764,34 +765,38 @@ extension AccountManager {
                     if msg.isForward {
                         if let original {
                             try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
-                            try PendingOperation(
-                                type: .markForwarded,
-                                messageIds: [original.stableId],
+                            if let address = MessageIdentity.durableActionAddress(
                                 accountId: original.accountId,
-                                folderPath: original.folderPath
-                            ).insert(db)
+                                folderPath: original.folderPath,
+                                rfc822MessageId: original.rfc822MessageId
+                            ), let operation = PendingOperation.durableMessageAction(
+                                    type: .markForwarded,
+                                    messageIds: [address.rfc822MessageId],
+                                    accountId: address.accountId,
+                                    folderPath: address.folderPath
+                            ) {
+                                try operation.insert(db)
+                            }
                         }
                     } else {
                         if var original {
                             original.isReplied = true
-                            // Queue server-side \Answered flag
-                            try PendingOperation(
-                                type: .markReplied,
-                                messageIds: [original.stableId],
+                            // Queue server-side \Answered only through the
+                            // provider-neutral durable identity boundary.
+                            if let address = MessageIdentity.durableActionAddress(
                                 accountId: original.accountId,
-                                folderPath: original.folderPath
-                            ).insert(db)
+                                folderPath: original.folderPath,
+                                rfc822MessageId: original.rfc822MessageId
+                            ), let operation = PendingOperation.durableMessageAction(
+                                    type: .markReplied,
+                                    messageIds: [address.rfc822MessageId],
+                                    accountId: address.accountId,
+                                    folderPath: address.folderPath
+                            ) {
+                                try operation.insert(db)
+                            }
                             if original.actionTag == .reply {
-                                original.actionTag = ActionTag.none
-                                original.tagSortOrder = ActionTag.none.sortOrder
-                                let tagOp = PendingOperation(
-                                    type: .setTag,
-                                    messageIds: [original.stableId],
-                                    accountId: original.accountId,
-                                    folderPath: original.folderPath,
-                                    tagValue: ActionTag.none.rawValue
-                                )
-                                try tagOp.insert(db)
+                                original.setActionTag(ActionTag.none)
                                 print("[ReplyDetect] Outbox: reply→none for \(original.messageId) (just replied)")
                                 try original.update(db)
                                 return originalId
@@ -853,6 +858,12 @@ extension AccountManager {
         }
     }
 
+    #if DEBUG
+    func finalizeOutboxMessageForTesting(_ message: OutboxMessage) async {
+        await finalizeOutboxMessage(message)
+    }
+    #endif
+
     /// Resolve the original message for isReplied/isForwarded updates.
     /// Uses the stableId resolution pattern: PK lookup first, rfc822MessageId search if stale.
     /// This is the standard pattern used across the codebase for IMAP MOVE resilience.
@@ -901,7 +912,7 @@ extension AccountManager {
 
         var localDraftsToDelete: [String] = []
         do {
-            let result: (dirs: [String], drafts: [(String, String)], localDrafts: [String]) = try await retryWrite(dbPool, retryDelay: .milliseconds(200), label: "Outbox") { db in
+            let result: (dirs: [String], drafts: [(String, String)], localDrafts: [String]) = try await retryGatedQueueWrite(dbPool, label: "Outbox", maxAttempts: 3, retryDelay: .milliseconds(200)) { db in
                 let stale = try OutboxMessage
                     .filter(Column("status") == OutboxStatus.sending.rawValue)
                     .fetchAll(db)
@@ -931,15 +942,35 @@ extension AccountManager {
                                 if msg.isForward {
                                     if let original {
                                         try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
-                                        try PendingOperation(type: .markForwarded, messageIds: [original.stableId], accountId: original.accountId, folderPath: original.folderPath).insert(db)
+                                        if let address = MessageIdentity.durableActionAddress(
+                                            accountId: original.accountId,
+                                            folderPath: original.folderPath,
+                                            rfc822MessageId: original.rfc822MessageId
+                                        ), let operation = PendingOperation.durableMessageAction(
+                                            type: .markForwarded,
+                                            messageIds: [address.rfc822MessageId],
+                                            accountId: address.accountId,
+                                            folderPath: address.folderPath
+                                        ) {
+                                            try operation.insert(db)
+                                        }
                                     }
                                 } else if var original {
                                     original.isReplied = true
-                                    try PendingOperation(type: .markReplied, messageIds: [original.stableId], accountId: original.accountId, folderPath: original.folderPath).insert(db)
+                                    if let address = MessageIdentity.durableActionAddress(
+                                        accountId: original.accountId,
+                                        folderPath: original.folderPath,
+                                        rfc822MessageId: original.rfc822MessageId
+                                    ), let operation = PendingOperation.durableMessageAction(
+                                        type: .markReplied,
+                                        messageIds: [address.rfc822MessageId],
+                                        accountId: address.accountId,
+                                        folderPath: address.folderPath
+                                    ) {
+                                        try operation.insert(db)
+                                    }
                                     if original.actionTag == .reply {
-                                        original.actionTag = ActionTag.none
-                                        original.tagSortOrder = ActionTag.none.sortOrder
-                                        try PendingOperation(type: .setTag, messageIds: [original.stableId], accountId: original.accountId, folderPath: original.folderPath, tagValue: ActionTag.none.rawValue).insert(db)
+                                        original.setActionTag(ActionTag.none)
                                     }
                                     try original.update(db)
                                 }

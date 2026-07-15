@@ -12,7 +12,7 @@ import GRDB
 /// PendingOperation, and (at the view layer, via `archiveIsNoOp` /
 /// `deleteIsNoOp`) no row dismissal. Previously the swipe made the
 /// email/thread disappear from the folder list and queued a same-folder move.
-@Suite("Same-Folder Action No-Op", .serialized)
+@Suite("Same-Folder Action No-Op", .serialized, .processGlobalState)
 struct SameFolderNoOpTests {
 
     // MARK: - Helpers
@@ -80,6 +80,7 @@ struct SameFolderNoOpTests {
         )
         header.computedThreadId = computedThreadId
         header.headerComplete = true
+        header.rfc822MessageId = "<\(messageId)@same-folder.example.com>"
         try pool.writeWithoutTransaction { db in
             try header.insert(db)
         }
@@ -92,6 +93,35 @@ struct SameFolderNoOpTests {
     }
 
     private let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+    /// Escaped-write hygiene barrier (ADR-IOS-058, PROJECT_MEMORY "drain-before-
+    /// return" rule): enqueue a no-op onto `AccountManager.shared`'s FIFO write
+    /// queue and await it — since the queue is strictly FIFO, every fold
+    /// closure enqueued BEFORE this call is guaranteed to have executed by the
+    /// time this returns. MUST run before a test's own `resetForTesting()`
+    /// cleanup, or an escaped fold closure executes against the NEXT test's
+    /// freshly-installed DB (composite ids reuse the same values across
+    /// tests). Mirrors `InboxGestureActionTests.drainWriteQueue`.
+    /// Round-2 audit: a single FIFO enqueue+await only guarantees closures
+    /// already enqueued BEFORE this call have run — it does NOT guarantee the
+    /// journal is empty. Two independently-created Tasks (a gesture site's
+    /// `record()`, which spawns its own fold-executor Task, and this drain
+    /// call) can reach the shared FIFO in EITHER order, so a fold closure the
+    /// gesture just triggered may land AFTER this barrier's no-op closure and
+    /// still be pending when the barrier returns — closing this window is the
+    /// likely fix for the plan's known settle-flake. Loop the barrier until
+    /// the journal reports fully drained (no pending records, no in-flight
+    /// display holds/seqs); bounded so a genuine stuck-drain bug fails the
+    /// test instead of hanging it forever.
+    private func drainWriteQueue() async {
+        var iterations = 0
+        repeat {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
+            }
+            iterations += 1
+        } while !AccountManager.shared.intentionJournal.isFullyDrainedForTesting() && iterations < 200
+    }
 
     // MARK: - archiveIsNoOp / deleteIsNoOp predicates
 
@@ -127,6 +157,47 @@ struct SameFolderNoOpTests {
         #expect(vm.deleteIsNoOp(trashedId) == true)
         #expect(vm.deleteIsNoOp(inboxId) == false)
         #expect(vm.deleteIsNoOp("nonexistent") == false)
+    }
+
+    @Test("blank role-folder paths refuse archive and delete before Undo or optimistic mutation")
+    @MainActor func blankRoleFolderPathsAreSideEffectFree() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            try? FileManager.default.removeItem(at: dir)
+            AccountManager.shared.intentionJournal.resetForTesting()
+            UndoService.shared.dismissAll()
+        }
+        AccountManager.shared.intentionJournal.resetForTesting()
+        UndoService.shared.dismissAll()
+
+        let id = try insertMessage(pool, messageId: "blank-role-path", folder: inbox, date: baseDate)
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE folder SET path = '   ' WHERE accountId = ? AND role IN (?, ?)",
+                arguments: ["acc1", FolderRole.archive.rawValue, FolderRole.trash.rawValue]
+            )
+        }
+
+        let vm = InboxViewModel(folders: [inbox])
+        #expect(vm.archiveIsNoOp(id))
+        #expect(vm.deleteIsNoOp(id))
+        #expect(!vm.deleteActionIsAdmissible(id))
+        #expect(!vm.archive(id))
+        #expect(vm.archiveThread([id]) == [id])
+        let deleteResult = await vm.delete(id)
+        let deleteThreadResult = await vm.deleteThread([id])
+        #expect(!deleteResult)
+        #expect(deleteThreadResult == [id])
+
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay().isEmpty)
+        #expect(AccountManager.shared.intentionJournal.recordsForTesting().isEmpty)
+        let operations = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(operations.isEmpty)
+        let stored = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(stored?.folderId == inbox.id)
+        #expect(stored?.folderPath == inbox.path)
     }
 
     // MARK: - InboxViewModel.archive / archiveThread guards
@@ -204,8 +275,10 @@ struct SameFolderNoOpTests {
 
         #expect(UndoService.shared.undoStack.count == 1)
         #expect(AccountManager.shared.snapshotOverlay()[id]?.folderId == archive.id)
+        // Drain the FIFO before the cleanup below — see drainWriteQueue doc.
+        await drainWriteQueue()
         // Clean up the overlay entry so later tests in this process aren't affected.
-        AccountManager.shared.removeOverlayEntries(ids: [id])
+        AccountManager.shared.intentionJournal.resetForTesting()
     }
 
     // MARK: - InboxViewModel.delete / deleteThread guards
@@ -283,8 +356,10 @@ struct SameFolderNoOpTests {
 
         #expect(UndoService.shared.undoStack.count == 1)
         #expect(AccountManager.shared.snapshotOverlay()[id]?.folderId == trash.id)
+        // Drain the FIFO before the cleanup below — see drainWriteQueue doc.
+        await drainWriteQueue()
         // Clean up the overlay entry so later tests in this process aren't affected.
-        AccountManager.shared.removeOverlayEntries(ids: [id])
+        AccountManager.shared.intentionJournal.resetForTesting()
     }
 
     // MARK: - Duplicate-role folders (iCloud "Trash" + "Deleted Messages")
@@ -404,7 +479,7 @@ struct SameFolderNoOpTests {
         let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(ops.count == 1)
         guard ops.count == 1 else { return }
-        #expect(ops[0].messageIds == [inboxMsg.stableId])
+        #expect(ops[0].messageIds == ["i1@same-folder.example.com"])
 
         // The inbox message moved optimistically; the archived one is untouched.
         let movedInbox = try await pool.read { db in

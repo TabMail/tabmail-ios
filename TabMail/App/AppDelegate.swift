@@ -64,141 +64,307 @@ enum PendingConsentErrorStore {
 /// Extracted into a pure, testable, nonisolated helper — no raw SQL, no
 /// direct `pendingOperation` INSERTs.
 ///
-/// Lookup order mirrors `InboxViewModel.lookupMessage` / `AccountManager.
-/// resolveHeaderForAction` (ADR-IOS-049): durable GRDB row first — scoped to
-/// `isInInbox = 1`, because IMAP UIDs are folder-scoped (`MessageIdentity
-/// .headerId` embeds `folderPath` for exactly this reason). An unscoped
-/// lookup could match an unrelated message that happens to share the same
-/// UID in another folder; notification actions are inbox-arrival semantics
-/// (the push this notification came from landed FOR the inbox), so the
-/// durable lookup is restricted to the inbox row. Then the staged-row
-/// synthesis for a push that landed but hasn't merged yet. If BOTH miss (the
-/// NSE staged the row to the on-disk staging table but nothing has drained it
-/// into GRDB yet — a cold-launch gap, not the "message not local yet" cold
-/// fallback below), one `NSEMergeCoordinator.shared.merge()` pass — the same
-/// call `AccountManager.ensureDurable` uses — is run and the durable lookup
-/// is retried before giving up.
+/// The delivered payload carries two deliberately separate identities:
+/// `messageId` is the provider transport/deep-link ID, while
+/// `rfc822MessageId` is the provider-neutral action ID. New notifications
+/// always act by normalized RFC identity. A legacy notification without that
+/// field may use its provider ID only to recover exactly one inbox-scoped
+/// durable/staged header and extract that header's RFC identity; the provider
+/// ID itself is never appended to durable work.
 ///
 /// When a header resolves, MARK_READ dispatches via `AccountManager
-/// .markRead` (the batch API deliberately lives outside the ADR-IOS-057
-/// intent register — see that ADR). ARCHIVE/DELETE dispatch via
-/// `AccountManager.performCoordinatedRoleMove` — the same overlay + FIFO +
-/// fresh-re-resolve path agent tools use (`EmailArchiveTool`/
-/// `EmailDeleteTool`) — instead of calling `archive`/`delete` directly, so a
-/// notification tap gets the same role-folder resolution, optimistic local
-/// write, and F6 tag clear as gesture actions, plus the staleness guard of
-/// re-resolving the header inside the queued write.
+/// .markRead` (the batch API deliberately lives outside the ADR-IOS-058
+/// intention journal — see that ADR). ARCHIVE/DELETE dispatch via
+/// `AccountManager.recordRoleMove` — the same intention-record path agent
+/// tools use (`EmailArchiveTool`/`EmailDeleteTool`) — instead of calling
+/// `archive`/`delete` directly, so a notification tap gets the same
+/// role-folder resolution, optimistic local write, and F6 tag clear as
+/// gesture actions, plus the staleness guard of the fold executor
+/// re-resolving the header at execution time.
 ///
-/// Only when NO header is resolvable anywhere — even after the merge retry —
-/// does this fall back to directly queuing a `PendingOperation` — via the
-/// RECORD TYPE (never raw SQL) — so the drain reconciles once the message
-/// syncs. MARK_READ queues `.markRead` against the account's inbox-role
-/// folder; ARCHIVE/DELETE queue `.move` with `destinationPath` set to the
-/// account's archive-/trash-role folder (`.archive`/`.delete` are legacy
-/// no-op `OperationType`s in the drain — see `AccountManagerQueue
-/// .executeOperation` — so the cold path must never queue those). That
-/// queued `.move` carries a raw numeric UID and skips rfc822 verification
-/// (`resolveUID` short-circuits on a numeric id) — an accepted residual:
-/// (a) within a UIDVALIDITY generation UIDs are never reused, so a stale UID
-/// no-ops via the confirmed-stale path rather than hitting a wrong message;
-/// (b) the wrong-target window requires a UIDVALIDITY change between push
-/// and drain — rare, and that event triggers a full resync anyway; (c) the
-/// alternative (dropping the tap) violates never-drop-user-intention.
+/// If no local/staged header exists but the payload supplied a valid RFC
+/// identity, the cold path may queue that RFC identity against the inbox role
+/// so the provider resolves it later. A legacy payload that cannot recover an
+/// RFC identity is a safe no-op; there is no provider-ID fallback.
 enum NotificationActionRouter {
-    /// Durable lookup scoped to the account's inbox — see the enum doc for why.
-    private static func resolveDurableInboxHeader(messageId: String, accountId: String) async -> MessageHeader? {
+    #if DEBUG
+    /// Stateful merge double used only by the test host, where the App Group
+    /// staging database is unavailable. Production staged actions still rely
+    /// on `ensureDurable` in the normal AccountManager action path.
+    static let prepareStagedHeaderForActionForTesting = Mutex<
+        (@Sendable (MessageHeader) async throws -> Void)?
+    >(nil)
+    #endif
+
+    private enum HeaderResolution {
+        case missing
+        case durable(MessageHeader)
+        case staged(MessageHeader)
+        case ambiguous
+    }
+
+    private enum LookupIdentity {
+        case transportMessageId(String)
+        case rfc822MessageId(String)
+    }
+
+    private static func log(_ message: @autoclosure () -> String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        print(message())
+    }
+
+    /// Resolve at most one local inbox member. A second canonical match is
+    /// ambiguity and must no-op, never become `fetchOne`'s arbitrary winner.
+    private static func resolveDurableInboxHeader(identity: LookupIdentity, accountId: String) async -> HeaderResolution {
         do {
-            return try await AppDatabase.dbPool.read { db -> MessageHeader? in
-                try MessageHeader.fetchOne(db, sql: """
+            return try await AppDatabase.dbPool.read { db -> HeaderResolution in
+                let rows: [MessageHeader]
+                switch identity {
+                case .transportMessageId(let messageId):
+                    rows = try MessageHeader.fetchAll(db, sql: """
                     SELECT * FROM messageHeader
                     WHERE messageId = ? AND accountId = ? AND folderId != '' AND isInInbox = 1
-                    LIMIT 1
+                    LIMIT 2
                     """, arguments: [messageId, accountId])
+                case .rfc822MessageId(let rfc822MessageId):
+                    // Stored headers predate the durable-action boundary and
+                    // can still contain a balanced bracket pair or surrounding
+                    // whitespace. Narrow by substring, then apply the shared
+                    // canonical predicate in Swift so notification admission
+                    // uses exactly the same identity rule as every producer.
+                    let candidates = try MessageHeader.fetchAll(db, sql: """
+                    SELECT * FROM messageHeader
+                    WHERE accountId = ? AND folderId != '' AND isInInbox = 1
+                      AND rfc822MessageId IS NOT NULL
+                      AND instr(rfc822MessageId, ?) > 0
+                    """, arguments: [accountId, rfc822MessageId])
+                    rows = Array(candidates.lazy.filter {
+                        MessageIdentity.durableActionRFC822MessageId($0.rfc822MessageId) == rfc822MessageId
+                    }.prefix(2))
+                }
+                switch rows.count {
+                case 0: return .missing
+                case 1: return .durable(rows[0])
+                default: return .ambiguous
+                }
             }
         } catch {
-            print("[NotificationActionRouter] header lookup failed: \(error)")
-            return nil
+            log("[NotificationActionRouter] header lookup failed: \(error)")
+            return .ambiguous
         }
     }
 
-    static func execute(actionId: String, messageId: String, accountId: String) async {
-        let durableHeader = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
+    private static func resolveStagedInboxHeader(identity: LookupIdentity, accountId: String) -> HeaderResolution {
+        NSEDataBridge.latestStagedRows.withLock { rows in
+            var exact: MessageHeader?
+            for row in rows where row.accountId == accountId {
+                let matches: Bool
+                switch identity {
+                case .transportMessageId(let messageId):
+                    matches = row.messageId == messageId
+                case .rfc822MessageId(let rfc822MessageId):
+                    matches = EmailNotificationBuilder.normalizedActionMessageId(row.rfc822MessageId) == rfc822MessageId
+                }
+                guard matches else { continue }
+                guard exact == nil else { return .ambiguous }
+                exact = row.toMessageHeader()
+            }
+            return exact.map(HeaderResolution.staged) ?? .missing
+        }
+    }
 
-        let stagedHeader: MessageHeader? = durableHeader == nil
-            ? NSEDataBridge.latestStagedRows.withLock { rows in
-                rows.first(where: { $0.messageId == messageId && $0.accountId == accountId })
-            }?.toMessageHeader()
-            : nil
-        var header = durableHeader ?? stagedHeader
+    private static func resolveLocalInboxHeader(identity: LookupIdentity, accountId: String) async -> HeaderResolution {
+        let durable = await resolveDurableInboxHeader(identity: identity, accountId: accountId)
+        let staged = resolveStagedInboxHeader(identity: identity, accountId: accountId)
+        switch (durable, staged) {
+        case (.ambiguous, _), (_, .ambiguous):
+            return .ambiguous
+        case (.missing, .missing):
+            return .missing
+        case (.durable(let header), .missing):
+            return .durable(header)
+        case (.missing, .staged(let header)):
+            return .staged(header)
+        case (.durable(let durableHeader), .staged(let stagedHeader)):
+            // The staging cache may briefly retain the exact row already
+            // merged into GRDB. Deduplicate that representation; two distinct
+            // matching rows across tiers are ambiguous and must no-op.
+            return durableHeader.id == stagedHeader.id
+                ? .durable(durableHeader)
+                : .ambiguous
+        case (.staged, _), (_, .durable):
+            preconditionFailure("lookup tier returned an impossible resolution kind")
+        }
+    }
 
-        if header == nil {
-            // Cold-launch gap: the NSE already staged this row to the on-disk
-            // staging table (app-group), but nothing has drained it into GRDB
-            // yet — only the in-memory staged-row cache is empty. Run the
-            // SAME merge `ensureDurable` uses, then re-check durable. This is
-            // a normal-path recovery, distinct from the "message not local at
-            // all" cold fallback below.
-            await NSEMergeCoordinator.shared.merge()
-            header = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
+    private static func resolveAfterMerge(identity: LookupIdentity, accountId: String) async -> HeaderResolution {
+        let initial = await resolveLocalInboxHeader(identity: identity, accountId: accountId)
+        guard case .missing = initial else { return initial }
+        await NSEMergeCoordinator.shared.merge()
+        return await resolveLocalInboxHeader(identity: identity, accountId: accountId)
+    }
+
+    static func execute(
+        actionId: String,
+        transportMessageId: String,
+        rfc822MessageId: String?,
+        accountId: String
+    ) async {
+        let suppliedActionId = EmailNotificationBuilder.normalizedActionMessageId(rfc822MessageId)
+        let resolution: HeaderResolution
+
+        if rfc822MessageId != nil {
+            // A present but invalid action identity is not a legacy payload.
+            // Fail closed instead of recovering through the provider transport
+            // ID, which would turn malformed input into a provider-ID fallback.
+            guard let suppliedActionId else { return }
+            resolution = await resolveAfterMerge(
+                identity: .rfc822MessageId(suppliedActionId),
+                accountId: accountId
+            )
+        } else {
+            // Legacy delivered notification: provider ID is lookup-only. It
+            // must identify exactly one inbox header whose RFC identity then
+            // becomes the action identity.
+            resolution = await resolveAfterMerge(
+                identity: .transportMessageId(transportMessageId),
+                accountId: accountId
+            )
         }
 
-        if let header {
-            switch actionId {
-            case "MARK_READ":
-                await AccountManager.shared.markRead([header])
-                print("[NotificationActionRouter] markRead via manager for \(messageId)")
-            case "ARCHIVE":
-                await AccountManager.shared.performCoordinatedRoleMove(ids: [header.id], role: .archive)
-                print("[NotificationActionRouter] archive via performCoordinatedRoleMove for \(messageId)")
-            case "DELETE":
-                await AccountManager.shared.performCoordinatedRoleMove(ids: [header.id], role: .trash)
-                print("[NotificationActionRouter] delete via performCoordinatedRoleMove for \(messageId)")
-            default:
-                break
+        switch resolution {
+        case .durable(let header):
+            await dispatchResolvedAction(
+                actionId: actionId,
+                transportMessageId: transportMessageId,
+                header: header
+            )
+        case .staged(let header):
+            // A staged hit is local state, not a cold miss. Route through the
+            // exact same production action as a durable row: markRead and the
+            // role-move fold both reach `ensureDurable`, which merges the NSE
+            // row before committing optimistic state plus RFC-addressed work.
+            guard EmailNotificationBuilder.normalizedActionMessageId(header.rfc822MessageId) != nil else { return }
+            #if DEBUG
+            if let prepare = prepareStagedHeaderForActionForTesting.withLock({ $0 }) {
+                do {
+                    try await prepare(header)
+                } catch {
+                    log("[NotificationActionRouter] staged merge test double failed: \(error)")
+                    return
+                }
             }
+            #endif
+            await dispatchResolvedAction(
+                actionId: actionId,
+                transportMessageId: transportMessageId,
+                header: header
+            )
+        case .missing:
+            // Only an explicit RFC payload can survive a full local miss. A
+            // legacy provider ID is never converted into durable work.
+            guard let suppliedActionId else { return }
+            await queueColdPendingOperation(
+                actionId: actionId,
+                rfc822MessageId: suppliedActionId,
+                accountId: accountId
+            )
+        case .ambiguous:
             return
         }
+    }
 
-        // No header anywhere — even after the merge retry above (header not
-        // local yet — push arrived but sync hasn't landed). Queue a
-        // correctly-shaped PendingOperation so sync reconciles local state
-        // when the message arrives. See the enum doc for the raw-UID residual.
-        await queueColdPendingOperation(actionId: actionId, messageId: messageId, accountId: accountId)
+    private static func dispatchResolvedAction(
+        actionId: String,
+        transportMessageId: String,
+        header: MessageHeader
+    ) async {
+        guard EmailNotificationBuilder.normalizedActionMessageId(header.rfc822MessageId) != nil else { return }
+        switch actionId {
+        case "MARK_READ":
+            await AccountManager.shared.markRead([header])
+            log("[NotificationActionRouter] markRead via manager for \(transportMessageId)")
+        case "ARCHIVE":
+            await AccountManager.shared.recordRoleMove(
+                ids: [header.id],
+                role: .archive,
+                origin: .notification
+            )
+            log("[NotificationActionRouter] archive via recordRoleMove for \(transportMessageId)")
+        case "DELETE":
+            await AccountManager.shared.recordRoleMove(
+                ids: [header.id],
+                role: .trash,
+                origin: .notification
+            )
+            log("[NotificationActionRouter] delete via recordRoleMove for \(transportMessageId)")
+        default:
+            break
+        }
     }
 
     /// Cold fallback: no durable OR staged header exists for this message.
     /// Builds a `PendingOperation` via the record type against the account's
     /// role folders — never raw SQL.
-    private static func queueColdPendingOperation(actionId: String, messageId: String, accountId: String) async {
+    private static func queueColdPendingOperation(actionId: String, rfc822MessageId: String, accountId: String) async {
         do {
             let folders = try await AppDatabase.dbPool.read { db in
                 try Folder.filter(Column("accountId") == accountId).fetchAll(db)
             }
-            guard let inboxPath = folders.first(where: { $0.role == .inbox })?.path else {
-                print("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
+            guard let inboxPath = folders.first(where: { $0.role == .inbox })?.path,
+                  !accountId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !inboxPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                log("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(rfc822MessageId)")
                 return
             }
+            // Notification actions are deliberately undo-less
+            // (`feedback_undo_stack_scope`) — no `UndoableAction` will ever
+            // reference these rows, so ordinary durable admission (no undo
+            // reconciliation) is all this path needs (ADR-IOS-060).
+            let inserted: Bool
             switch actionId {
             case "MARK_READ":
-                try await AppDatabase.dbPool.write { db in
-                    try PendingOperation(type: .markRead, messageIds: [messageId], accountId: accountId, folderPath: inboxPath).insert(db)
+                inserted = try await AccountManager.shared.retryGatedQueueWrite(
+                    AppDatabase.dbPool, label: "queueColdPendingOperation", maxAttempts: 1
+                ) { db in
+                    guard let operation = PendingOperation.durableMessageAction(
+                        type: .markRead,
+                        messageIds: [rfc822MessageId],
+                        accountId: accountId,
+                        folderPath: inboxPath
+                    ) else { return false }
+                    try operation.insert(db)
+                    return true
                 }
-                print("[NotificationActionRouter] header not local — queued markRead PendingOperation for \(messageId)")
+                log("[NotificationActionRouter] header not local — queued markRead PendingOperation for \(rfc822MessageId)")
             case "ARCHIVE", "DELETE":
                 let role: FolderRole = actionId == "ARCHIVE" ? .archive : .trash
-                guard let destinationPath = folders.first(where: { $0.role == role })?.path else {
-                    print("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
+                guard let destinationPath = folders.first(where: { $0.role == role })?.path,
+                      !destinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    log("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(rfc822MessageId)")
                     return
                 }
-                try await AppDatabase.dbPool.write { db in
-                    try PendingOperation(type: .move, messageIds: [messageId], accountId: accountId, folderPath: inboxPath, destinationPath: destinationPath).insert(db)
+                inserted = try await AccountManager.shared.retryGatedQueueWrite(
+                    AppDatabase.dbPool, label: "queueColdPendingOperation", maxAttempts: 1
+                ) { db in
+                    guard let operation = PendingOperation.durableMessageAction(
+                        type: .move,
+                        messageIds: [rfc822MessageId],
+                        accountId: accountId,
+                        folderPath: inboxPath,
+                        destinationPath: destinationPath
+                    ) else { return false }
+                    try operation.insert(db)
+                    return true
                 }
-                print("[NotificationActionRouter] header not local — queued \(actionId) (.move) PendingOperation for \(messageId)")
+                log("[NotificationActionRouter] header not local — queued \(actionId) (.move) PendingOperation for \(rfc822MessageId)")
             default:
-                break
+                return
             }
+            guard inserted else { return }
+            await AccountManager.shared.drainPendingQueue()
         } catch {
-            print("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(messageId): \(error)")
+            log("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(rfc822MessageId): \(error)")
         }
     }
 }
@@ -298,6 +464,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 finish()
                 return
             }
+            let rfc822MessageId = userInfo[EmailNotificationBuilder.actionMessageIdUserInfoKey] as? String
             Task { @MainActor in
                 // Notification actions run the app in the BACKGROUND (no
                 // .foreground option) — databases may still be suspended from
@@ -308,7 +475,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // A notification action can fire during the one-time migration
                 // window; wait for the DB before touching it (AppStartup).
                 await AppStartup.shared.awaitLaunchReady(background: true)
-                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
+                await NotificationActionRouter.execute(
+                    actionId: actionId,
+                    transportMessageId: messageId,
+                    rfc822MessageId: rfc822MessageId,
+                    accountId: accountId
+                )
                 finish()
             }
             return
@@ -320,6 +492,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 finish()
                 return
             }
+            let rfc822MessageId = userInfo[EmailNotificationBuilder.actionMessageIdUserInfoKey] as? String
             Task { @MainActor in
                 // Background notification action — same resume rationale as
                 // MARK_READ above (ADR-IOS-041).
@@ -328,7 +501,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // Can fire during the one-time migration window — wait for
                 // the DB before touching it (AppStartup).
                 await AppStartup.shared.awaitLaunchReady(background: true)
-                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
+                await NotificationActionRouter.execute(
+                    actionId: actionId,
+                    transportMessageId: messageId,
+                    rfc822MessageId: rfc822MessageId,
+                    accountId: accountId
+                )
                 finish()
             }
             return

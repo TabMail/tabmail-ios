@@ -56,7 +56,7 @@ struct OutboxMessagePersistenceTests {
         try TestDatabase.insertAccount(db)
 
         let draft = DraftMessage(to: ["a@b.com"], subject: "Del", body: "Body")
-        var msg = OutboxMessage(accountId: "acc1", draft: draft)
+        let msg = OutboxMessage(accountId: "acc1", draft: draft)
         try db.write { try msg.insert($0) }
 
         _ = try db.write { try msg.delete($0) }
@@ -371,7 +371,7 @@ struct OutboxMessagePersistenceTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
 
-        var m1 = OutboxMessage(accountId: "acc1", draft: DraftMessage(to: ["a@b.com"], subject: "Q1", body: ""))
+        let m1 = OutboxMessage(accountId: "acc1", draft: DraftMessage(to: ["a@b.com"], subject: "Q1", body: ""))
         var m2 = OutboxMessage(accountId: "acc1", draft: DraftMessage(to: ["a@b.com"], subject: "S1", body: ""))
         m2.status = OutboxStatus.sending.rawValue
         var m3 = OutboxMessage(accountId: "acc1", draft: DraftMessage(to: ["a@b.com"], subject: "F1", body: ""))
