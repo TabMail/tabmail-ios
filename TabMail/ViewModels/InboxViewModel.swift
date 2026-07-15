@@ -1646,10 +1646,11 @@ final class InboxViewModel {
     /// (ADR-IOS-058 "Behavior refinements"); this reuses that machinery
     /// rather than inventing a second write path. Mirrors
     /// `AccountManager.recordRoleMove`'s identical composition for the
-    /// tool/notification path (notification is exempt there; every gesture
+    /// tool/notification path (recordRoleMove composes it for every origin,
+    /// including notifications on the WARM header-found path; every gesture
     /// entry point here is in scope).
     private func recordMarkReadOnArchiveDeleteIfNeeded(_ messages: [MessageHeader]) {
-        guard AccountManager.markReadOnArchiveDeleteEnabled else { return }
+        guard manager.markReadOnArchiveDeleteResolver() else { return }
         let unread = messages.filter { !$0.isRead }
         guard !unread.isEmpty else { return }
         var displays: [String: AccountManager.PendingMutation] = [:]

@@ -368,9 +368,32 @@ enum NotificationActionRouter {
                     log("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(memberIdentity)")
                     return
                 }
+                // Mark-as-read-on-archive/delete (Item 2 / R-audit,
+                // 2026-07-15): this COLD path has no local header to run
+                // through `recordRoleMove`'s composition, so it composes the
+                // read intent directly — a `.markRead` op for the SAME
+                // member, inserted immediately BEFORE the `.move` op inside
+                // the SAME transaction so its rowid precedes the move's (FIFO
+                // order); the shared member string means chain demotion
+                // drags both together. `markReadOnArchiveDeleteResolver` is
+                // nonisolated (AccountManager.swift), so this reads
+                // synchronously without an extra actor hop. If the markRead
+                // construction fails, the move still goes in — the move is
+                // the user's primary intent and must never be dropped for a
+                // secondary composition failure.
+                let markReadEnabled = AccountManager.shared.markReadOnArchiveDeleteResolver()
                 inserted = try await AccountManager.shared.retryGatedQueueWrite(
                     AppDatabase.dbPool, label: "queueColdPendingOperation", maxAttempts: 1
                 ) { db in
+                    if markReadEnabled,
+                       let readOperation = PendingOperation.durableMessageAction(
+                           type: .markRead,
+                           messageIds: [memberIdentity],
+                           accountId: accountId,
+                           folderPath: inboxPath
+                       ) {
+                        try readOperation.insert(db)
+                    }
                     guard let operation = PendingOperation.durableMessageAction(
                         type: .move,
                         messageIds: [memberIdentity],

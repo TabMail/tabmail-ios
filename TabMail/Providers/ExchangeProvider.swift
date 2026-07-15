@@ -650,6 +650,14 @@ actor ExchangeProvider: EmailProvider {
     /// Graph's default message resource ID changes on move. Durable actions use
     /// RFC Message-ID and resolve exactly one current resource inside the recorded
     /// source folder; zero/multiple are terminal no-ops and incomplete lookups throw.
+    /// The first-page `$filter` search is body-preserving so a structural 400
+    /// (e.g. a filter Graph itself rejects) classifies via
+    /// `classifyUnrecognizedActionBadRequest` into `.persistentActionFailure`
+    /// — the queue demotes the failing chain instead of arriving bodyless as
+    /// plain transient and retrying forever (ADR-IOS-060 decision 1
+    /// amendment, 2026-07-15). Pagination fetches (`requestAbsolute` against
+    /// Graph's own `nextLink`) are NOT reclassified — a 400 there is Graph
+    /// misbehaving on a URL it produced itself, and stays transient by design.
     private func resolveActionMessageId(_ rawRFC822MessageId: String, folder: String) async throws -> String? {
         guard let rfc822MessageId = MessageIdentity.durableActionRFC822MessageId(
             rawRFC822MessageId
@@ -694,11 +702,16 @@ actor ExchangeProvider: EmailProvider {
             let data: Data
             if firstPage {
                 do {
-                    data = try await request(path: firstPath)
-                } catch let error where isGraphNotFound(error) {
-                    // A folder-scoped collection 404/410 proves the recorded source
-                    // folder is gone; that is authoritative stale state.
-                    return nil
+                    data = try await requestPreservingBadRequestBody(path: firstPath, method: "GET", body: nil)
+                } catch {
+                    guard !isGraphNotFound(error) else {
+                        // A folder-scoped collection 404/410 proves the recorded source
+                        // folder is gone; that is authoritative stale state.
+                        return nil
+                    }
+                    // Any OTHER structural 400 is permanent-shaped but unproven:
+                    // persistent, so the queue demotes rather than wedges (or drops).
+                    throw classifyUnrecognizedActionBadRequest(error)
                 }
                 firstPage = false
             } else {

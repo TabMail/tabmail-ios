@@ -278,33 +278,30 @@ struct AccountManagerActionsTagClearTests {
 /// `CoordinatedToolActionTests`): default ON (a never-set key defaults to
 /// true — same missing-key handling as `ProactiveNotifyService.isEnabled`),
 /// and an explicit persisted change is honored on the next read of the
-/// SAME key (there is only one `UserDefaults.standard` per process, so
-/// "fresh store read" here means re-evaluating the computed property after
-/// the value changed underneath it, not a distinct store instance).
+/// SAME key.
 ///
-/// `.serialized`/`.processGlobalState`: mutates the process-wide
-/// `UserDefaults.standard` key every archive/delete entry point reads —
-/// mirrors the isolation every sibling suite in this feature applies.
-@Suite("AccountManager.markReadOnArchiveDeleteEnabled — setting contract", .serialized, .processGlobalState)
+/// Item 3 / R3 audit: runs against a throwaway `UserDefaults(suiteName:)`
+/// instance (via `markReadOnArchiveDeleteEnabled(defaults:)`) instead of the
+/// process-wide `.standard` store, so this suite carries no cross-suite
+/// isolation requirement of its own — production reads route through
+/// `AccountManager`'s instance-level `markReadOnArchiveDeleteResolver`
+/// seam, which every OTHER suite in this feature now controls directly.
 struct MarkReadOnArchiveDeleteSettingTests {
     @Test("key is the documented literal, default is ON when the key has never been set, and an explicit persisted change is honored on the next read")
-    func settingRoundTrip() {
+    func settingRoundTrip() throws {
         let key = AccountManager.markReadOnArchiveDeleteKey
         #expect(key == "markReadOnArchiveDelete")
 
-        let defaults = UserDefaults.standard
-        let previous = defaults.object(forKey: key)
-        defer {
-            if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) }
-        }
+        let suiteName = "markReadOnArchiveDeleteSettingTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        defaults.removeObject(forKey: key)
-        #expect(AccountManager.markReadOnArchiveDeleteEnabled == true, "a never-set key defaults to ON")
+        #expect(AccountManager.markReadOnArchiveDeleteEnabled(defaults: defaults) == true, "a never-set key defaults to ON")
 
         defaults.set(false, forKey: key)
-        #expect(AccountManager.markReadOnArchiveDeleteEnabled == false, "a persisted false is honored on the next read")
+        #expect(AccountManager.markReadOnArchiveDeleteEnabled(defaults: defaults) == false, "a persisted false is honored on the next read")
 
         defaults.set(true, forKey: key)
-        #expect(AccountManager.markReadOnArchiveDeleteEnabled == true, "a persisted true is honored on the next read")
+        #expect(AccountManager.markReadOnArchiveDeleteEnabled(defaults: defaults) == true, "a persisted true is honored on the next read")
     }
 }

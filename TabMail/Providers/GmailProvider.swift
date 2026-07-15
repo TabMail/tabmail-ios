@@ -586,13 +586,21 @@ actor GmailProvider: EmailProvider {
 
     /// Resolve one opaque token member — a Gmail message ID admitted when the
     /// message had no valid RFC identity (PLAN_IDENTITY_HYBRID §3). Exact
-    /// `GET /messages/{id}` with strict path-encoding, then verify the
-    /// current labels include the recorded SOURCE scope only (archive scope
-    /// per the Batch-A SENT fix). 404/410 is authoritative stale, as is a
-    /// token whose shape can never name a Gmail resource (whitespace/control
-    /// characters — the exact opaque string can only zero-match). Every other
-    /// request failure remains retryable uncertainty. Gmail IDs are stable
-    /// across label changes, so tail members have near-full fidelity.
+    /// `GET /messages/{id}` with strict path-encoding (body-preserving, so a
+    /// structural 400 can be classified rather than guessed from the status
+    /// code alone), then verify the current labels include the recorded
+    /// SOURCE scope only (archive scope per the Batch-A SENT fix). 404/410 is
+    /// authoritative stale, as is a token whose shape can never name a Gmail
+    /// resource (whitespace/control characters — the exact opaque string can
+    /// only zero-match), as is Gmail's own "Invalid id value" 400 (see
+    /// `isGmailInvalidIdError` — the Gmail mirror of Exchange's
+    /// `ErrorInvalidIdMalformed` handling in
+    /// `ExchangeProvider.resolveTokenMember`: a malformed id can never
+    /// resolve on retry). Any OTHER structural 400 is permanent-shaped but
+    /// unproven: persistent, so the queue demotes rather than wedges
+    /// (ADR-IOS-060 decision 1 amendment, 2026-07-15). Every other request
+    /// failure remains retryable uncertainty. Gmail IDs are stable across
+    /// label changes, so tail members have near-full fidelity.
     private func resolveTokenMember(_ token: String, folder: String) async throws -> String? {
         guard !token.isEmpty,
               token.rangeOfCharacter(
@@ -612,12 +620,22 @@ actor GmailProvider: EmailProvider {
 
         let metadata: Data
         do {
-            metadata = try await request(
+            metadata = try await requestPreservingBadRequestBody(
                 path: "/messages/\(encodedToken)\(GmailAPI.metadataQuery)"
             )
         } catch {
             guard !isHttpGoneStatus(error) else { return nil }
-            throw error
+            guard !isGmailInvalidIdError(error) else {
+                // Authoritative stale (Law 4): Gmail itself rejects this
+                // exact id as invalid — it can never resolve on retry.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] resolveTokenMember: invalid-id 400 for token confirmed stale — no-op")
+                }
+                return nil
+            }
+            // Any OTHER structural 400 is permanent-shaped but unproven:
+            // persistent, so the queue demotes rather than wedges (or drops).
+            throw classifyUnrecognizedActionBadRequest(error)
         }
 
         let message = try JSONDecoder().decode(GmailMessage.self, from: metadata)
@@ -1378,6 +1396,27 @@ actor GmailProvider: EmailProvider {
         let reason = detail?.reason ?? ""
         let message = detail?.message ?? decoded.error.message ?? ""
         return reason == "invalidArgument" && message.hasPrefix("Invalid label")
+    }
+
+    /// True only when Gmail's structured `400` error body PROVES the exact
+    /// id could never resolve — `reason == "invalidArgument"` AND Gmail's own
+    /// literal wording `"Invalid id value"` on `GET /messages/{id}` (a
+    /// malformed message id). This is the Gmail mirror of Exchange's
+    /// `ErrorInvalidIdMalformed` handling
+    /// (`ExchangeProvider.isGraphInvalidIdMalformed`): an id Gmail itself
+    /// rejects as invalid can never resolve on retry, so Law 4 treats it as
+    /// an authoritative stale no-op. Any other `400` shape is uncertainty and
+    /// must keep throwing.
+    private func isGmailInvalidIdError(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, let body) = underlying,
+              statusCode == 400,
+              let decoded = try? JSONDecoder().decode(GmailAPIErrorBody.self, from: body)
+        else { return false }
+        let detail = decoded.error.errors?.first
+        let reason = detail?.reason ?? ""
+        let message = detail?.message ?? decoded.error.message ?? ""
+        return reason == "invalidArgument" && message.hasPrefix("Invalid id value")
     }
 
     private func modifyMessage(id: String, addLabelIds: [String] = [], removeLabelIds: [String] = []) async throws {

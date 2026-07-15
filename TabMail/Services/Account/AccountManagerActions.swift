@@ -654,18 +654,34 @@ extension AccountManager {
     /// UserDefaults key for the "Mark as read on archive & delete" toggle.
     /// Governs EVERY archive/delete-to-trash entry point (inbox swipe incl.
     /// thread variants, detail-view, settings bulk archive, agent tools, AND
-    /// notification action buttons via `recordRoleMove`). The owner's request
-    /// (feature round 2026-07-15) was uniform mark-read on these actions;
-    /// audit showed no path did it before, so all origins now compose the
-    /// read intent when this is ON.
+    /// notification action buttons). The owner's request (feature round
+    /// 2026-07-15) was uniform mark-read on these actions; audit showed no
+    /// path did it before, so all origins now compose the read intent when
+    /// this is ON. Two DIFFERENT composition mechanisms reach that uniform
+    /// result: every WARM path (a durable or staged header was found) goes
+    /// through `recordRoleMove`, which composes an `.isRead(true)` record
+    /// alongside the `.move` record in the same fold. The COLD fallback path
+    /// (`AppDelegate.queueColdPendingOperation`, reached when a notification
+    /// action finds no local header) bypasses `recordRoleMove` entirely — it
+    /// composes the read intent directly by inserting a `.markRead`
+    /// `PendingOperation` immediately before the `.move` op inside the SAME
+    /// `retryGatedQueueWrite` transaction (Item 2 / R-audit, 2026-07-15).
     static let markReadOnArchiveDeleteKey = "markReadOnArchiveDelete"
 
     /// Default true (missing key ⇒ ON) — `bool(forKey:)` returns `false` for a
     /// never-set key, which would silently invert a default-ON setting; the
     /// explicit `object(forKey:) == nil` check is the same pattern
     /// `ProactiveNotifyService.isEnabled` uses for its own default-true toggle.
-    static var markReadOnArchiveDeleteEnabled: Bool {
-        let defaults = UserDefaults.standard
+    ///
+    /// `defaults:` (Item 3 / R3 audit) lets a test pin the missing-key-
+    /// defaults-ON contract against a throwaway `UserDefaults(suiteName:)`
+    /// instance instead of mutating the process-wide `.standard` store other
+    /// suites also read; production and the resolver default below omit it.
+    /// Production/test call sites that need the LIVE setting should read
+    /// `AccountManager`'s instance-level `markReadOnArchiveDeleteResolver`
+    /// (which defaults to this function) rather than calling this directly,
+    /// so tests can override it per-instance.
+    static func markReadOnArchiveDeleteEnabled(defaults: UserDefaults = .standard) -> Bool {
         if defaults.object(forKey: markReadOnArchiveDeleteKey) == nil { return true }
         return defaults.bool(forKey: markReadOnArchiveDeleteKey)
     }
@@ -772,7 +788,7 @@ extension AccountManager {
         // including notification action buttons — the owner's request was
         // that archive/delete mark read uniformly, and a tapped notification
         // action is the clearest "I've dealt with this" signal of all.
-        if Self.markReadOnArchiveDeleteEnabled {
+        if markReadOnArchiveDeleteResolver() {
             let unread = actionable.filter { !$0.isRead }
             if !unread.isEmpty {
                 var readDisplays: [String: PendingMutation] = [:]
@@ -884,7 +900,7 @@ extension AccountManager {
             // the full rationale. `record()` (not `recordAndWait`) is enough
             // here: it joins the SAME fold component the `recordAndWait` move
             // call below opens, so awaiting the move's receipt covers both.
-            if Self.markReadOnArchiveDeleteEnabled {
+            if markReadOnArchiveDeleteResolver() {
                 let unread = messages.filter { !$0.isRead }
                 if !unread.isEmpty {
                     var readDisplays: [String: PendingMutation] = [:]

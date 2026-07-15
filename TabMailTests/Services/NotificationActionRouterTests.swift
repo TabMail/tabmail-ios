@@ -53,9 +53,13 @@ struct NotificationActionRouterTests {
         }
         // Pre-existing pins assert the single .move op; force mark-read-on-
         // archive/delete OFF so they keep exercising exactly that behavior
-        // (mirrors CoordinatedToolActionTests). The dedicated ON test below
-        // flips it back via the same key.
-        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // (mirrors CoordinatedToolActionTests). The dedicated ON tests below
+        // flip it back via the same resolver seam. Item 3 / R3 audit:
+        // overrides `AccountManager.shared`'s instance resolver instead of
+        // `UserDefaults.standard` — the production `AccountManager.shared`
+        // singleton is what `NotificationActionRouter`'s production code
+        // paths (recordRoleMove, the cold fallback) actually read.
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { false }
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -91,7 +95,9 @@ struct NotificationActionRouterTests {
     /// AFTER the defers — leave the test DB alive when there's no previous one to
     /// restore, rather than let `AppDatabase.rawPool`'s force-unwrap crash the process.
     private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting {
+            AccountManager.markReadOnArchiveDeleteEnabled()
+        }
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
@@ -180,7 +186,7 @@ struct NotificationActionRouterTests {
         defer { restoreTestDB(previous: previous, dir: dir) }
         // makeTestDB forces the setting OFF for the legacy pins — this test
         // covers the owner-requested uniform behavior, so flip it ON.
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         var unread = makeDurableHeader(folder: inbox, messageId: "m-archive-markread")
         unread.isRead = false
@@ -266,6 +272,46 @@ struct NotificationActionRouterTests {
         #expect(ops[0].destinationPath == archive.path)
         #expect(ops[0].messageIds == ["m-cold-archive@example.com"])
         #expect(ops[0].accountId == "acc1")
+
+        let headerCount = try await pool.read { db in try MessageHeader.fetchCount(db) }
+        #expect(headerCount == 0, "no header was ever created — the cold path never synthesizes one")
+    }
+
+    /// Item 2 / R-audit (2026-07-15): the COLD fallback path
+    /// (`AppDelegate.queueColdPendingOperation`) has no local header to run
+    /// through `recordRoleMove`'s composition, so it must compose the
+    /// `.markRead` intent directly. Pins admission order (an acceptable
+    /// structural assertion for FIFO tests, per this suite's established
+    /// convention): the `.markRead` op's rowid must precede the `.move` op's
+    /// — same member string, so chain demotion drags both together.
+    @Test("no header anywhere (cold background launch) + ARCHIVE with mark-read-on-archive ON composes a .markRead op immediately before the .move op — same member, FIFO admission order")
+    func noHeaderArchiveComposesReadWhenSettingOn() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(previous: previous, dir: dir); resetStagedGlobal() }
+        resetStagedGlobal()
+        // makeTestDB forces the setting OFF for the legacy pins — this test
+        // covers the owner-requested uniform behavior on the COLD path, so
+        // flip it ON.
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
+
+        await NotificationActionRouter.execute(
+            actionId: "ARCHIVE", transportMessageId: "m-cold-archive-markread",
+            rfc822MessageId: "<m-cold-archive-markread@example.com>", accountId: "acc1"
+        )
+
+        let ops = try await pool.read { db in
+            try PendingOperation.fetchAll(db, sql: "SELECT * FROM pendingOperation ORDER BY rowid ASC")
+        }
+        #expect(ops.count == 2, "the cold path composes a .markRead op alongside the .move op")
+        guard ops.count == 2 else { return }
+        #expect(ops[0].type == .markRead, "the .markRead op is admitted FIRST (FIFO order)")
+        #expect(ops[1].type == .move)
+        #expect(ops[0].messageIds == ["m-cold-archive-markread@example.com"], "same member as the move op")
+        #expect(ops[1].messageIds == ["m-cold-archive-markread@example.com"])
+        #expect(ops[0].folderPath == inbox.path)
+        #expect(ops[0].destinationPath == nil)
+        #expect(ops[1].folderPath == inbox.path)
+        #expect(ops[1].destinationPath == archive.path)
 
         let headerCount = try await pool.read { db in try MessageHeader.fetchCount(db) }
         #expect(headerCount == 0, "no header was ever created — the cold path never synthesizes one")

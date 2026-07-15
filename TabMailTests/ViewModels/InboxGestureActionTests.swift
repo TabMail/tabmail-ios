@@ -52,9 +52,10 @@ struct InboxGestureActionTests {
         // read on archive & delete" feature and assert the pre-feature op/
         // count shapes with default-unread fixtures — force the setting OFF so
         // they keep exercising exactly that behavior. Tests that cover the new
-        // feature explicitly flip it back on via the same UserDefaults key
-        // (`AccountManager.markReadOnArchiveDeleteKey`) after calling this helper.
-        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // feature explicitly flip it back on via the same resolver seam
+        // (Item 3 / R3 audit: `AccountManager.shared`'s instance resolver,
+        // not `UserDefaults.standard`) after calling this helper.
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { false }
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: provider)
             acc.id = "acc1"
@@ -280,7 +281,9 @@ struct InboxGestureActionTests {
     /// AppDatabase, leave the test one (and its files) alive. Mirrors
     /// `MessageDetailStagedFallbackTests.pinSurvivesWhileMoveQueued`.
     private func restoreTestDB(previous: AppDatabase?, dir _: URL) {
-        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting {
+            AccountManager.markReadOnArchiveDeleteEnabled()
+        }
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
         }
@@ -4814,7 +4817,7 @@ struct InboxGestureActionTests {
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
         // Explicit ON: makeTestDB's harness defaults this suite's OTHER tests
         // to OFF — this test proves the feature itself, so it opts back in.
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
         await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: fixture.provider)
 
         do {
@@ -4875,7 +4878,7 @@ struct InboxGestureActionTests {
             clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
         }
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         let trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
         try await pool.writeWithoutTransaction { db in try trash.insert(db) }
@@ -4915,7 +4918,7 @@ struct InboxGestureActionTests {
             clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
         }
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         let unread1 = makeDurableHeader(folder: inbox, messageId: "m-thread-unread-1", isRead: false)
         let alreadyRead = makeDurableHeader(folder: inbox, messageId: "m-thread-read", isRead: true)
@@ -4960,7 +4963,7 @@ struct InboxGestureActionTests {
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
         // makeTestDB's harness already forces this OFF; set it explicitly so
         // this test's intent reads standalone regardless of harness changes.
-        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { false }
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-toggle-off-archive", isRead: false)
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
@@ -4990,7 +4993,7 @@ struct InboxGestureActionTests {
             clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
         }
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-already-read-archive", isRead: true)
         try await pool.writeWithoutTransaction { db in
@@ -5032,7 +5035,7 @@ struct InboxGestureActionTests {
             clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
         }
         clearOverlay(); resetStagedGlobal(); UndoService.shared.dismissAll()
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-undo-stays-read", isRead: false)
         try await pool.writeWithoutTransaction { db in try header.insert(db) }

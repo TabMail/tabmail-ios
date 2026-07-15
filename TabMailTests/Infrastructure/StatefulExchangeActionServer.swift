@@ -57,6 +57,14 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var lookupFailuresRemaining = 0
         var lookupFailuresConsumed = 0
         var mutationFailuresRemaining = 0
+        /// RFC Message-IDs whose source-folder `$filter` search
+        /// (`resolveActionMessageId`'s first-page fetch) returns a
+        /// structural `400` whose body matches NO known terminal shape (not
+        /// `ErrorInvalidIdMalformed`, not 404/410) — an UNCLASSIFIED
+        /// permanent-shaped failure. Drives the persistent-failure
+        /// chain-demotion path for RFC members.
+        var unclassified400RFCs: Set<String> = []
+        var unclassified400Served = 0
     }
 
     private final class StateBox: Sendable {
@@ -110,6 +118,22 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.mutationFailuresRemaining += 1 }
     }
 
+    /// Inject an UNCLASSIFIED structural 400 for the source-folder `$filter`
+    /// search naming `rfc822MessageId` — the body is Graph's structured error
+    /// shape but matches neither `ErrorInvalidIdMalformed` nor any other
+    /// terminal shape the adapter knows. Drives the persistent-failure
+    /// chain-demotion path for RFC members (`resolveActionMessageId`'s
+    /// first-page fetch).
+    func injectUnclassified400OnFilterSearch(rfc822MessageId: String) {
+        _ = state.value.withLock { $0.unclassified400RFCs.insert(rfc822MessageId) }
+    }
+
+    /// How many `$filter` search attempts were rejected with the injected
+    /// unclassified 400 — one per provider attempt on the failing op.
+    func unclassified400ServedCount() -> Int {
+        state.value.withLock { $0.unclassified400Served }
+    }
+
     func snapshots(rfc822MessageId: String) -> [Snapshot] {
         state.value.withLock { model in
             model.messagesByProviderId.values
@@ -135,6 +159,14 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let rfc822MessageId = Self.rfcIdentity(fromLookupURL: request.url)
             if filter != nil {
                 guard rfc822MessageId != nil else { return .status(400) }
+                if let rfc822MessageId,
+                   state.value.withLock({ model -> Bool in
+                       guard model.unclassified400RFCs.contains(rfc822MessageId) else { return false }
+                       model.unclassified400Served += 1
+                       return true
+                   }) {
+                    return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+                }
                 let lookupFailed = state.value.withLock { model -> Bool in
                     guard model.lookupFailuresRemaining > 0 else { return false }
                     model.lookupFailuresRemaining -= 1
@@ -234,6 +266,20 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let response = (try? JSONSerialization.data(withJSONObject: Self.graphRow(moved))) ?? Data()
             return .bytes(response, contentType: "application/json")
         }
+    }
+
+    /// Graph's structured `400` error body with a `code` that matches NO
+    /// terminal classification the adapter knows (not
+    /// `ErrorInvalidIdMalformed`, not 404/410) — the "unrecognized REST 400"
+    /// that used to wedge the queue before persistent-failure chain demotion.
+    private static func unclassifiedBadRequestBody() -> Data {
+        let object: [String: Any] = [
+            "error": [
+                "code": "ErrorInvalidRequest",
+                "message": "The request is malformed or incorrect.",
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
     private static func consumeMutationFailure(_ state: StateBox) -> Bool {

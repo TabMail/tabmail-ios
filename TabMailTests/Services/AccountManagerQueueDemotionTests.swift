@@ -591,6 +591,160 @@ struct AccountManagerQueueDemotionTests {
         try await assertQueueLivenessInvariants(pool: pool)
         AccountManager.shared.intentionJournal.resetForTesting()
     }
+
+    // MARK: - 6. R2 audit: persistent-400 classification gaps (2026-07-15)
+    //
+    // Two action-path request sites (`GmailProvider.resolveTokenMember` and
+    // `ExchangeProvider.resolveActionMessageId`'s first-page fetch) used the
+    // plain body-discarding `request` helper, so a structured 400 arrived as
+    // a bodyless `.networkError` — classified plain transient instead of
+    // `.persistentActionFailure`, wedging the FIFO forever instead of
+    // demoting. These three cells pin the fix.
+
+    @Test("a Gmail token member whose exact-ID GET returns an UNRECOGNIZED structural 400 demotes the op to the tail — unrelated later work completes")
+    func gmailTokenMemberUnclassifiedGet400DemotesChain() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-demote-token-get-\(suffix)"
+        // Provider-token shape (no "@") — MessageIdentity.durableMemberKind
+        // classifies this as `.providerToken`, exercising resolveTokenMember
+        // (exact-ID GET) rather than resolveActionMessageId's RFC search.
+        let tokenA = "gmail-token-a-\(suffix)"
+        let rfcB = "demote-token-b-\(suffix)@example.com"
+        let gmailB = "gmail-token-b-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: "unused-\(suffix)@example.com", providerMessageId: tokenA, labels: ["INBOX", "UNREAD"]),
+            .init(rfc822MessageId: rfcB, providerMessageId: gmailB, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+        server.injectUnclassified400OnGet(providerMessageId: tokenA)
+        let provider = server.provider()
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+
+        let opA = PendingOperation(type: .markRead, messageIds: [tokenA], accountId: accountId, folderPath: "INBOX")
+        let opB = PendingOperation(type: .markRead, messageIds: [rfcB], accountId: accountId, folderPath: "INBOX")
+        try insertOp(opA, pool: pool)
+        try insertOp(opB, pool: pool)
+        let opAStored = try #require(try fetchOp(opA.id, pool: pool))
+
+        try await withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await drainOnce()
+        }
+
+        // Unrelated work completed this SAME drain (RED today: B wedges
+        // behind A's plain-transient bodyless failure).
+        #expect(try fetchOp(opB.id, pool: pool) == nil, "B (unrelated member) must complete behind the demoted token-member op")
+        let bSnapshots = server.snapshots(rfc822MessageId: rfcB)
+        #expect(bSnapshots.first?.isRead == true, "B's markRead reached the provider")
+
+        // A sits at the tail, queued, payload intact — demoted, not dropped
+        // and not left wedging the frontier.
+        let remaining = try fetchOpsInRowidOrder(pool: pool)
+        #expect(remaining.map(\.id) == [opA.id], "exactly the failing op remains, demoted to the tail")
+        expectSameStoredOperation(remaining.first, asBefore: opAStored, "opA")
+
+        #expect(server.unclassified400OnGetServedCount() == 1, "exactly ONE provider attempt for A per drain (spin guard)")
+
+        try await assertQueueLivenessInvariants(pool: pool)
+    }
+
+    @Test("a Gmail token member whose exact-ID GET returns Gmail's 'Invalid id value' 400 resolves as an authoritative stale no-op — no server mutation, later ops run")
+    func gmailTokenMemberInvalidIdGet400IsAuthoritativeStaleNoOp() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-demote-token-invalid-\(suffix)"
+        let tokenA = "gmail-token-invalid-a-\(suffix)"
+        let untouchedRFC = "unused-\(suffix)@example.com"
+        let rfcB = "demote-token-invalid-b-\(suffix)@example.com"
+        let gmailB = "gmail-token-invalid-b-\(suffix)"
+
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: untouchedRFC, providerMessageId: tokenA, labels: ["INBOX", "UNREAD"]),
+            .init(rfc822MessageId: rfcB, providerMessageId: gmailB, labels: ["INBOX", "UNREAD"]),
+        ])
+        defer { server.close() }
+        server.injectInvalidIdOnGet(providerMessageId: tokenA)
+        let provider = server.provider()
+
+        try await insertAccount(id: accountId, provider: .gmail, pool: pool)
+
+        let opA = PendingOperation(type: .markRead, messageIds: [tokenA], accountId: accountId, folderPath: "INBOX")
+        let opB = PendingOperation(type: .markRead, messageIds: [rfcB], accountId: accountId, folderPath: "INBOX")
+        try insertOp(opA, pool: pool)
+        try insertOp(opB, pool: pool)
+
+        try await withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await drainOnce()
+        }
+
+        // A completed as an authoritative stale NO-OP (RED today: a bodyless
+        // 400 is plain transient, so A stays queued at the frontier and B
+        // never runs).
+        #expect(try fetchOp(opA.id, pool: pool) == nil, "A completed as a no-op — an id Gmail itself rejects can never resolve")
+        let aSnapshots = server.snapshots(rfc822MessageId: untouchedRFC)
+        #expect(aSnapshots.first.map { $0.labels.contains("UNREAD") } == true, "A's remote copy is untouched — no modify ever reached the provider")
+        #expect(!server.modifyLog().contains { $0.providerMessageId == tokenA }, "no modify attempt for A — it never got past resolution")
+
+        #expect(try fetchOp(opB.id, pool: pool) == nil, "B completed in the same drain")
+        let bSnapshots = server.snapshots(rfc822MessageId: rfcB)
+        #expect(bSnapshots.first?.isRead == true)
+
+        try await assertQueueLivenessInvariants(pool: pool)
+    }
+
+    @Test("an Exchange RFC member whose source-folder \\$filter search returns an UNRECOGNIZED structural 400 demotes the op to the tail — unrelated later work completes")
+    func exchangeRFCMemberUnclassifiedFilterSearch400DemotesChain() async throws {
+        let (pool, dir, previous) = try await makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-demote-exchange-filter-\(suffix)"
+        let rfcA = "demote-exchange-filter-a-\(suffix)@example.com"
+        let graphA = "graph-filter-a-\(suffix)"
+        let rfcB = "demote-exchange-filter-b-\(suffix)@example.com"
+        let graphB = "graph-filter-b-\(suffix)"
+        let inboxFolderId = "inbox-\(suffix)"
+
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfcA, providerMessageId: graphA, folderId: inboxFolderId),
+            .init(rfc822MessageId: rfcB, providerMessageId: graphB, folderId: inboxFolderId),
+        ])
+        defer { server.close() }
+        server.injectUnclassified400OnFilterSearch(rfc822MessageId: rfcA)
+        let provider = server.provider()
+
+        try await insertAccount(id: accountId, provider: .outlook, pool: pool)
+
+        let opA = PendingOperation(type: .markRead, messageIds: [rfcA], accountId: accountId, folderPath: inboxFolderId)
+        let opB = PendingOperation(type: .markRead, messageIds: [rfcB], accountId: accountId, folderPath: inboxFolderId)
+        try insertOp(opA, pool: pool)
+        try insertOp(opB, pool: pool)
+        let opAStored = try #require(try fetchOp(opA.id, pool: pool))
+
+        try await withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await drainOnce()
+        }
+
+        // Unrelated work completed this SAME drain (RED today: B wedges
+        // behind A's plain-transient bodyless failure).
+        #expect(try fetchOp(opB.id, pool: pool) == nil, "B (unrelated member) must complete behind the demoted chain")
+        let bSnapshots = server.snapshots(rfc822MessageId: rfcB)
+        #expect(bSnapshots.first?.isRead == true, "B's markRead reached the provider")
+
+        let remaining = try fetchOpsInRowidOrder(pool: pool)
+        #expect(remaining.map(\.id) == [opA.id], "exactly the failing op remains, demoted to the tail")
+        expectSameStoredOperation(remaining.first, asBefore: opAStored, "opA")
+
+        #expect(server.unclassified400ServedCount() == 1, "exactly ONE provider attempt for A per drain (spin guard)")
+
+        try await assertQueueLivenessInvariants(pool: pool)
+    }
 }
 
 /// Bounds-checked subscript used by the payload-equality loop — a failed

@@ -68,6 +68,19 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var unclassified400ProviderIds: Set<String> = []
         var unclassified400Served = 0
         var modifyLog: [ModifyCall] = []
+        /// Provider message ids whose exact-ID metadata `GET /messages/{id}`
+        /// (token-member resolution, `resolveTokenMember`) returns a
+        /// structural `400` whose body matches NO known terminal shape — the
+        /// GET-path counterpart of `unclassified400ProviderIds` (which only
+        /// covers the modify/POST path). Drives the persistent-failure
+        /// chain-demotion path for token members.
+        var unclassified400OnGetProviderIds: Set<String> = []
+        var unclassified400OnGetServed = 0
+        /// Provider message ids whose exact-ID metadata `GET /messages/{id}`
+        /// returns Gmail's real "Invalid id value" `400` — the Gmail mirror
+        /// of Graph's `ErrorInvalidIdMalformed`, an authoritative-stale
+        /// no-op per `isGmailInvalidIdError`.
+        var invalidIdOnGetProviderIds: Set<String> = []
         /// Provider ids that should ALSO match an `rfc822msgid:` search for a
         /// DIFFERENT (superstring) Message-ID — models a real observed Gmail
         /// search-index quirk where a message whose Message-ID is a
@@ -168,6 +181,30 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.modifyLog }
     }
 
+    /// Inject an UNCLASSIFIED structural 400 for the exact-ID metadata `GET
+    /// /messages/{id}` naming `providerMessageId` — the GET-path counterpart
+    /// of `injectUnclassified400` (which only covers the modify/POST path).
+    /// Drives the persistent-failure chain-demotion path for token-member
+    /// resolution (`GmailProvider.resolveTokenMember`).
+    func injectUnclassified400OnGet(providerMessageId: String) {
+        _ = state.value.withLock { $0.unclassified400OnGetProviderIds.insert(providerMessageId) }
+    }
+
+    /// How many exact-ID metadata GET attempts were rejected with the
+    /// injected unclassified 400 — one per provider attempt on the failing op.
+    func unclassified400OnGetServedCount() -> Int {
+        state.value.withLock { $0.unclassified400OnGetServed }
+    }
+
+    /// Inject Gmail's real "Invalid id value" `400` (structured,
+    /// `reason == "invalidArgument"`) for the exact-ID metadata `GET
+    /// /messages/{id}` naming `providerMessageId` — models Gmail rejecting a
+    /// malformed/never-valid message id, the Gmail mirror of Graph's
+    /// `ErrorInvalidIdMalformed`.
+    func injectInvalidIdOnGet(providerMessageId: String) {
+        _ = state.value.withLock { $0.invalidIdOnGetProviderIds.insert(providerMessageId) }
+    }
+
     /// SPEC-B1: simulate Gmail's real `rfc822msgid:` search occasionally
     /// surfacing a DECOY message alongside the true match for a DIFFERENT
     /// queried id — a superstring/substring search-index collision (e.g. a
@@ -212,6 +249,26 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// deleted/system label (e.g. googleapis/google-api-php-client#1254).
     private static func invalidLabelErrorBody(_ labelId: String) -> Data {
         let message = "Invalid label: \(labelId)"
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "invalidArgument",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    /// Gmail's real `400` error body for a malformed/never-valid message id
+    /// on exact-ID `GET /messages/{id}` — literal wording `"Invalid id value
+    /// <id>"` (matched by `GmailProvider.isGmailInvalidIdError`'s
+    /// `hasPrefix("Invalid id value")` check).
+    private static func invalidIdErrorBody(_ id: String) -> Data {
+        let message = "Invalid id value \(id)"
         let object: [String: Any] = [
             "error": [
                 "errors": [[
@@ -275,6 +332,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
         http.register(path: "/messages/", method: "GET") { [state] request in
             let providerId = request.url.pathComponents.last ?? ""
+            if state.value.withLock({ $0.invalidIdOnGetProviderIds.contains(providerId) }) {
+                return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)
+            }
+            let injectedUnclassified400 = state.value.withLock { model -> Bool in
+                guard model.unclassified400OnGetProviderIds.contains(providerId) else { return false }
+                model.unclassified400OnGetServed += 1
+                return true
+            }
+            if injectedUnclassified400 {
+                return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            }
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
             return Self.metadataResponse(message)

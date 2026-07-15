@@ -53,10 +53,10 @@ struct CoordinatedToolActionTests {
         // as read on archive & delete" feature and assert the pre-feature
         // op/count shapes with default-unread fixtures — force the setting
         // OFF so they keep exercising exactly that behavior. Tests covering
-        // the new feature explicitly flip it back on via the same
-        // UserDefaults key (`AccountManager.markReadOnArchiveDeleteKey`)
-        // after calling this helper.
-        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // the new feature explicitly flip it back on via the same resolver
+        // seam (Item 3 / R3 audit: `AccountManager.shared`'s instance
+        // resolver, not `UserDefaults.standard`) after calling this helper.
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { false }
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -112,7 +112,9 @@ struct CoordinatedToolActionTests {
     /// AFTER the defers — leave the test DB alive when there's no previous one to
     /// restore, rather than let `AppDatabase.rawPool`'s force-unwrap crash the process.
     private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting {
+            AccountManager.markReadOnArchiveDeleteEnabled()
+        }
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
@@ -310,17 +312,19 @@ struct CoordinatedToolActionTests {
     // & Delete" (`AccountManager.markReadOnArchiveDeleteKey`, default ON).
     // `makeTestDB` forces the setting OFF for this suite's OTHER tests (see
     // its doc comment) so their pre-feature `ops.count == 1` pins stay valid
-    // — `origin: .tool` (agent tools) IS in scope for the feature, unlike
-    // `origin: .notification` (notification router, deliberately exempt and
-    // unconditional — see `AccountManager.markReadOnArchiveDeleteKey`'s doc
-    // comment and `NotificationActionRouterTests`, untouched by this feature).
+    // — `origin: .tool` (agent tools) and `origin: .notification`
+    // (notification router's WARM header-found path) both compose the same
+    // way through `recordRoleMove`; `NotificationActionRouterTests` covers
+    // the notification origin directly (including its COLD fallback path,
+    // which composes the read intent without `recordRoleMove` — see
+    // `AccountManager.markReadOnArchiveDeleteKey`'s doc comment).
 
     @Test("mark-as-read-on-archive (default ON), tool path: recordRoleMove(origin: .tool) on an unread message composes the isRead intent with the role-move — DB ends read AND archived, exactly one .markRead op precedes the .move op, journal fully drained")
     func recordRoleMoveToolOriginMarksUnreadMessageReadDefaultOn() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-tool-mark-read", isRead: false)
         try await pool.writeWithoutTransaction { db in try header.insert(db) }

@@ -1425,7 +1425,7 @@ final class MessageDetailViewModel {
     /// the primary detail message, `threadMessages[idx]` when it's a visible
     /// thread card) so the on-screen read state doesn't lag the DB write.
     private func recordMarkReadOnArchiveDeleteIfNeeded(_ msg: MessageHeader) {
-        guard AccountManager.markReadOnArchiveDeleteEnabled, !msg.isRead else { return }
+        guard manager.markReadOnArchiveDeleteResolver(), !msg.isRead else { return }
         if msg.id == message?.id { message?.isRead = true }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = true

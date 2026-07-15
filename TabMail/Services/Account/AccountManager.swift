@@ -453,6 +453,39 @@ actor AccountManager {
         calendarProviders.removeValue(forKey: accountId)
     }
 
+    // MARK: - Mark-as-Read-on-Archive/Delete resolver (Item 3 / R3 audit)
+
+    /// Instance-level DI seam for "Mark as Read on Archive & Delete"
+    /// (`AccountManagerActions.markReadOnArchiveDeleteKey`). `nonisolated` +
+    /// `Mutex`-backed (Resilience Rule 5 — Mutex over `nonisolated(unsafe)`)
+    /// so callers that must stay synchronous — VM gesture handlers
+    /// (`InboxViewModel`/`MessageDetailViewModel`), and this actor's own
+    /// nonisolated `record()`-family call sites, and the notification
+    /// cold-path (`AppDelegate.queueColdPendingOperation`) — can read it
+    /// without `await`. Defaults to the production truth
+    /// (`markReadOnArchiveDeleteEnabled()`, which also backs the
+    /// `@AppStorage` Settings toggle via the same key — unchanged).
+    ///
+    /// Tests override the resolver on a SPECIFIC `AccountManager` instance
+    /// (almost always `.shared`, the only instance production code ever
+    /// touches) instead of racing other suites over the shared
+    /// `UserDefaults.standard` key — Swift Testing runs suites in parallel
+    /// and `.serialized` does not serialize ACROSS suites (R3 audit finding).
+    private nonisolated let markReadOnArchiveDeleteResolverBox = Mutex<@Sendable () -> Bool>(
+        { AccountManager.markReadOnArchiveDeleteEnabled() }
+    )
+
+    nonisolated var markReadOnArchiveDeleteResolver: @Sendable () -> Bool {
+        markReadOnArchiveDeleteResolverBox.withLock { $0 }
+    }
+
+    /// Test seam: override the resolver on this instance. Callers restore the
+    /// production default in `defer`, e.g.
+    /// `setMarkReadOnArchiveDeleteResolverForTesting { AccountManager.markReadOnArchiveDeleteEnabled() }`.
+    nonisolated func setMarkReadOnArchiveDeleteResolverForTesting(_ resolver: @escaping @Sendable () -> Bool) {
+        markReadOnArchiveDeleteResolverBox.withLock { $0 = resolver }
+    }
+
     /// Guard for pending queue drain (used by AccountManagerQueue).
     var isDraining = false
     /// Set when drainPendingQueue() is called while isDraining — triggers re-drain on completion.

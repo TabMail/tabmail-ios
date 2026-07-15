@@ -717,11 +717,17 @@ struct MessageDetailViewModelMoveTests {
             try? FileManager.default.removeItem(at: dir)
             clearOverlay()
             UndoService.shared.dismissAll()
-            UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+            AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting {
+                AccountManager.markReadOnArchiveDeleteEnabled()
+            }
         }
         clearOverlay()
         UndoService.shared.dismissAll()
-        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // Item 3 / R3 audit: this suite's other tests never override the
+        // resolver, so they run under the real production default (ON) —
+        // this cell sets it explicitly to prove the detail-view entry point
+        // itself, mirroring the doc comment above.
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { true }
 
         let header = try insertHeader(pool, messageId: "detail-archive-mark-read", folderPath: Self.inboxPath, isInInbox: true, isRead: false)
 

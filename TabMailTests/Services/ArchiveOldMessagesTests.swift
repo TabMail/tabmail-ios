@@ -34,7 +34,11 @@ struct ArchiveOldMessagesTests {
         // the "mark as read on archive & delete" feature and assert the
         // pre-feature op/count shapes with default-unread fixtures — force
         // the setting OFF so they keep exercising exactly that behavior.
-        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // Item 3 / R3 audit: overrides `AccountManager.shared`'s instance
+        // resolver instead of `UserDefaults.standard` — `archiveOldInboxMessages`
+        // reads the resolver on `AccountManager.shared`, the singleton this
+        // suite's tests call.
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting { false }
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
@@ -50,7 +54,9 @@ struct ArchiveOldMessagesTests {
     }
 
     private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+        AccountManager.shared.setMarkReadOnArchiveDeleteResolverForTesting {
+            AccountManager.markReadOnArchiveDeleteEnabled()
+        }
         if previous != nil {
             AppDatabase.shared.withLock { $0 = previous }
             try? FileManager.default.removeItem(at: dir)
