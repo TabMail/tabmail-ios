@@ -395,10 +395,32 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         folder: String,
         _ body: (IMAPServer) async throws -> T
     ) async throws -> T {
+        try await withActionConnectionSelection(folder: folder) { server, _ in
+            try await body(server)
+        }
+    }
+
+    /// T1.1 (E1): the Selection-passing core — the body receives the ACTION
+    /// connection's OWN `Mailbox.Selection`, i.e. the UIDVALIDITY reported by
+    /// the SELECT this very call just issued on this very connection. The
+    /// epoch has always been on the wire (`selectMailbox` returns it); the
+    /// action path simply discarded it with `_ =`, which is why nothing
+    /// downstream could verify it. A caller that needs the live epoch must
+    /// read it from its own uninterrupted selection rather than from any
+    /// shared mirror a concurrent SELECT on another connection can overwrite
+    /// mid-flow.
+    ///
+    /// This helper only *surrenders* the selection. It performs no epoch
+    /// comparison and drops nothing — the checkpoints that consume it land in
+    /// later items.
+    private func withActionConnectionSelection<T>(
+        folder: String,
+        _ body: (IMAPServer, Mailbox.Selection) async throws -> T
+    ) async throws -> T {
         let server = try await acquireActionConnection()
         do {
-            _ = try await server.selectMailbox(folder)
-            let result = try await body(server)
+            let selection = try await server.selectMailbox(folder)
+            let result = try await body(server, selection)
             releaseActionConnection(healthy: true)
             return result
         } catch {
@@ -411,6 +433,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             throw error
         }
     }
+
+    #if DEBUG
+    /// Test seam for T1.1 (lands with the production item it enables, per the
+    /// plan's §4 T0.10 rule). `withActionConnectionSelection` is `private`, and
+    /// at this item it deliberately has no production caller that reads the
+    /// selection — checkpoint B, the move path and the draft paths all land
+    /// later. Without a seam the property "an action body observes the live
+    /// UIDVALIDITY" is unobservable, so it could not be proven red-first.
+    ///
+    /// Runs a real action body on the real action connection and returns the
+    /// `uidValidity` that body was handed. Stripped from Release builds.
+    func actionConnectionSelectionUidValidityForTesting(folder: String) async throws -> UInt32 {
+        try await withActionConnectionSelection(folder: folder) { _, selection in
+            selection.uidValidity.value
+        }
+    }
+    #endif
 
     /// Execute on the action connection without folder SELECT (for LIST, STATUS, etc.).
     private func withActionConnectionNoSelect<T>(
