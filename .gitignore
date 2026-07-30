@@ -48,3 +48,6 @@ Secrets.xcconfig.bak
 # backend internals) and are not part of the public client. One slipped in
 # once (PLAN_NSE_ENHANCE.md); this rule prevents a recurrence.
 PLAN_*.md
+
+# v3 refactor recon + vet evidence — internal design notes, same class as PLAN_*.md above.
+analysis/v3-recon/
