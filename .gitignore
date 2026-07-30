@@ -51,3 +51,7 @@ PLAN_*.md
 
 # v3 refactor recon + vet evidence — internal design notes, same class as PLAN_*.md above.
 analysis/v3-recon/
+scratchpad/*
+
+# Local build/test scratch — logs, .xcresult bundles, .bak files. Never committed.
+scratchpad/
