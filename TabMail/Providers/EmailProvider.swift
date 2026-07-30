@@ -24,8 +24,18 @@ struct FolderInfo: Sendable {
     let totalCount: Int
     let uidNext: Int? // IMAP only — for delta sync change detection
     let highestModSeq: Int? // IMAP CONDSTORE only — full-sync fetch-skip (Fix B task 4). nil = no CONDSTORE
+    /// IMAP UIDVALIDITY — the folder's UID-numbering epoch (RFC 3501 §2.3.1.1).
+    /// Carried on the folder-list path so the full sync can make the epoch
+    /// DURABLE (`Folder.lastKnownUidValidity`); the delta path already gets it
+    /// from `IMAPFolderStatus`. nil when the server didn't report it (no
+    /// UIDPLUS) and for every non-IMAP provider — nil means UNKNOWN, never
+    /// "unchanged", so callers must not synthesise a value from it.
+    let uidValidity: Int?
 
-    init(name: String, path: String, role: FolderRole, unreadCount: Int, totalCount: Int, uidNext: Int? = nil, highestModSeq: Int? = nil) {
+    init(
+        name: String, path: String, role: FolderRole, unreadCount: Int, totalCount: Int,
+        uidNext: Int? = nil, highestModSeq: Int? = nil, uidValidity: Int? = nil
+    ) {
         self.name = name
         self.path = path
         self.role = role
@@ -33,6 +43,7 @@ struct FolderInfo: Sendable {
         self.totalCount = totalCount
         self.uidNext = uidNext
         self.highestModSeq = highestModSeq
+        self.uidValidity = uidValidity
     }
 }
 

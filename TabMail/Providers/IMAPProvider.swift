@@ -805,6 +805,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 var total = 0
                 var uidNextVal: Int?
                 var highestModSeqVal: Int?
+                var uidValidityVal: Int?
                 do {
                     let status = try await server.mailboxStatus(info.name)
                     unread = status.unseenCount ?? 0
@@ -813,6 +814,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // CONDSTORE HIGHESTMODSEQ (nil unless the server advertises it) — the
                     // full-sync fetch-skip signal (Fix B task 4).
                     highestModSeqVal = status.highestModSequence
+                    // UIDVALIDITY from the SAME STATUS response (nil unless the server
+                    // advertises UIDPLUS — SwiftMail only requests the attribute then).
+                    // This is what makes the epoch durable for a folder the deletion-
+                    // reconcile walk has never visited. Normalised at THIS boundary so
+                    // no `0` ("the server did not report a value" — the convention
+                    // `UIDExistenceResult.uidValidity` documents and
+                    // `SyncEngineDeletionReconcile.swift:144` enforces) can enter the
+                    // sync layer wearing the shape of a real epoch.
+                    uidValidityVal = SyncEngine.knownUidValidity(status.uidValidity.map { Int($0.value) })
                 } catch {
                     print("[IMAP] STATUS failed for \(info.name): \(error)")
                 }
@@ -824,7 +834,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         unreadCount: unread,
                         totalCount: total,
                         uidNext: uidNextVal,
-                        highestModSeq: highestModSeqVal
+                        highestModSeq: highestModSeqVal,
+                        uidValidity: uidValidityVal
                     ),
                     attributes: info.attributes
                 ))
@@ -1596,7 +1607,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // Non-nil only when the server advertised CONDSTORE / UIDPLUS
                 // (SwiftMail conditionally requests these STATUS attributes).
                 highestModSeq: status.highestModSequence,
-                uidValidity: status.uidValidity.map { Int($0.value) }
+                // Normalised at THIS boundary: `0` means "the server did not report
+                // a value" (see `UIDExistenceResult.uidValidity`), so it must reach
+                // the sync layer as nil/unknown, never as an epoch that would make
+                // every downstream comparison `0 == 0` and therefore vacuous.
+                uidValidity: SyncEngine.knownUidValidity(status.uidValidity.map { Int($0.value) })
             )
         }
     }

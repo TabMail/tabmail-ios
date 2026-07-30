@@ -422,9 +422,22 @@ extension SyncEngine {
     }
 
     /// Persist the bootstrap UIDVALIDITY observation (walk guard, ADR-IOS-051).
+    ///
+    /// BOOTSTRAP-ONLY, and the `lastKnownUidValidity IS NULL` predicate must live in
+    /// the STATEMENT — same rule as the sync writers (`SyncEngineDeltaSync
+    /// .bootstrapFolderUidValidity`). The walk decided to call this from a snapshot
+    /// taken at `:369`, then SUSPENDED on a network SEARCH before reaching here, so
+    /// "the column was nil" is stale by the time this runs: a delta/full sync pass
+    /// can have bootstrapped it in between. An unconditional UPDATE would then
+    /// overwrite a DIFFERING stored epoch with the walk's own — the exact overwrite
+    /// that disarms this walk's abort guard for every later pass. SQLite evaluates
+    /// the predicate inside the writer's serialized transaction, so the race cannot
+    /// be lost; losing the write is the correct outcome (the winner's value is by
+    /// construction the epoch the local UIDs were already being judged against).
     private func persistFolderUidValidity(folderId: String, uidValidity: UInt32) async throws {
         try await dbPool.write { db in
-            _ = try Folder.filter(Column("id") == folderId)
+            _ = try Folder
+                .filter(Column("id") == folderId && Column("lastKnownUidValidity") == nil)
                 .updateAll(db, Column("lastKnownUidValidity").set(to: Int(uidValidity)))
         }
     }

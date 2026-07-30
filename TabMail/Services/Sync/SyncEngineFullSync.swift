@@ -66,8 +66,16 @@ extension SyncEngine {
 
             for info in remoteFolders {
                 if var existing = localFolders.first(where: { $0.path == info.path }) {
+                    // Unconditional — it advances the per-folder deep-pass streak counter.
                     let deep = Self.fullSyncIsDeepPass(
                         folderId: existing.id, everyN: SyncConfig.fullSyncDeepEveryN)
+                    // NOTE (T1.2): an epoch-aware term was tried here and REMOVED. Making a
+                    // UIDVALIDITY turnover block this skip forces the folder down
+                    // `runSyncMessages`, whose windowed stale sweep has NO epoch guard — so
+                    // "more fetching" is NOT the conservative direction here: it converts a
+                    // skipped folder into a swept one and DELETES the old-epoch mail that
+                    // HEAD leaves alone. The sweep needs the guard first (see
+                    // `runSyncMessages`); until then this gate stays exactly as it was.
                     if Self.shouldSkipFolderFetch(
                         role: existing.role, freshModSeq: info.highestModSeq,
                         cachedModSeq: existing.lastKnownHighestModSeq, isDeepSync: deep) {
@@ -77,11 +85,27 @@ extension SyncEngine {
                     existing.totalCount = info.totalCount
                     if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
                     if let modseq = info.highestModSeq { existing.lastKnownHighestModSeq = modseq }
+                    // BOOTSTRAP the epoch for a folder the deletion-reconcile walk has
+                    // never visited (it was previously the only writer) — and ONLY
+                    // bootstrap. `uidValidityBootstrapWrite` writes nothing once the column
+                    // holds a value, so a nil/0 observation cannot erase it and a turnover
+                    // cannot overwrite it (which would disarm the walk's abort guard —
+                    // ADR-IOS-051; see the helper's doc comment). `localFolders` is read
+                    // inside THIS write transaction, so `existing` is not a stale snapshot.
+                    if let bootstrap = Self.uidValidityBootstrapWrite(
+                        observed: info.uidValidity, stored: existing.lastKnownUidValidity) {
+                        existing.lastKnownUidValidity = bootstrap
+                    }
                     try existing.update(db)
                 } else {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
                     folder.totalCount = info.totalCount
                     folder.lastKnownUidNext = info.uidNext
+                    // A brand-new row is by definition a first observation — the same
+                    // bootstrap rule, which here also filters the `0` = "not reported"
+                    // sentinel out of the column.
+                    folder.lastKnownUidValidity = Self.uidValidityBootstrapWrite(
+                        observed: info.uidValidity, stored: nil)
                     try folder.insert(db)
                 }
             }
@@ -89,7 +113,17 @@ extension SyncEngine {
             // Remove local folders that no longer exist remotely
             let remotePaths = Set(remoteFolders.map(\.path))
             for folder in localFolders where !remotePaths.contains(folder.path) {
-                // CASCADE handles messageHeader deletion automatically
+                // NOTE: this used to say "CASCADE handles messageHeader deletion
+                // automatically". That is FALSE — migration `v2_dropMessageHeaderFolderFK`
+                // made `messageHeader.folderId` a plain column with NO foreign key to
+                // `folder` (only `accountId` cascades). Deleting the folder row therefore
+                // leaves its headers ORPHANED: they survive, still pointing at a
+                // `folderId`/`folderPath` that now has no metadata. Because `Folder.id` is
+                // the deterministic `"\(accountId):\(path)"`, a later re-appearance of the
+                // same path re-adopts those orphans under a BRAND-NEW row whose
+                // `lastKnownUidValidity` is nil — old-epoch mail under an unknown epoch.
+                // See `Folder.lastKnownUidValidity`'s doc comment for why that is an open
+                // hazard rather than a benign one.
                 try folder.delete(db)
             }
 
@@ -127,6 +161,7 @@ extension SyncEngine {
         if !skippablePaths.isEmpty {
             BootProfiler.mark("fullSync[\(acctTag)]: skipped \(skippablePaths.count) MODSEQ-unchanged folder(s) — no re-fetch (reconcile still runs)")
         }
+
         print("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
 
         // Fetch fresh folder list after upsert
@@ -648,6 +683,18 @@ extension SyncEngine {
         // folder write here is the residual cap to chunk. Remove once confirmed bounded.
         let writeStart = CFAbsoluteTimeGetCurrent()
         let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]) = try await dbPool.write { db in
+            // ⚠ PRE-EXISTING HAZARD, deliberately NOT closed by T1.2 and tracked
+            // separately: this merge pass has NO UIDVALIDITY guard. `selectStaleHeaders`
+            // below classifies "the server did not return UID n" as stale, which on a
+            // re-created mailbox is true of EVERY local row (the new numbering restarts
+            // beneath them), and old-epoch headers also upsert cleanly into a folder whose
+            // numbering they no longer belong to. `v2final` closes this with its §5.5
+            // universal in-txn guard (`SyncEngineFullSync.swift:1045-1070` at tag
+            // `e28dd4edb`, ADR-IOS-061 Stage 1): re-read the folder row INSIDE this
+            // transaction and abandon the whole pass — before any deletion or upsert —
+            // when the epoch captured at fetch time disagrees with the stored one. That
+            // port is its own item; T1.2 must not widen the blast radius of a deleter it
+            // did not create, and must not narrow it either.
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
             // IMAP UIDs are per-folder — UID "500" in INBOX and UID "500" in Archive are different

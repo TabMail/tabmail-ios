@@ -744,6 +744,85 @@ extension SyncEngine {
         return server != cached
     }
 
+    /// A UIDVALIDITY the server ACTUALLY reported, or nil for "unknown" — the
+    /// shared choke point every epoch predicate and every epoch write below
+    /// normalises through.
+    ///
+    /// RFC 3501 §2.3.1.1 types UIDVALIDITY as `nz-number` (a NON-ZERO unsigned
+    /// 32-bit value), so `0` can only ever mean "not reported". The repo already
+    /// settled that convention: `UIDExistenceResult.uidValidity` is documented
+    /// *"0 = the server did not report a value (callers must treat as unknown and
+    /// abort any deletion decision — never delete on uncertainty)"* and enforced at
+    /// `SyncEngineDeletionReconcile.swift:144`. Normalising HERE — rather than at
+    /// each call site — is what stops a future SELECT-sourced caller from
+    /// introducing one: `Mailbox.Selection.uidValidity` is non-optional only
+    /// because SwiftMail DEFAULTS it to `UIDValidity(0)`
+    /// (`SwiftMail/IMAP/Models/Mailbox.swift:160`), which is not an RFC guarantee.
+    /// Persisting that 0 would make every downstream epoch comparison `0 == 0`,
+    /// i.e. vacuously true, silently disarming the guards built on it.
+    ///
+    /// REFERENCE (`v2final`): identical convention — `guard observed != 0 else
+    /// { return }` at the head of the single persist API
+    /// (`AccountManager.recordObservedUidValidity`), plus `known > 0` on every
+    /// read of `Folder.lastKnownUidValidity` into its epoch ledger.
+    nonisolated static func knownUidValidity(_ value: Int?) -> Int? {
+        guard let value, value > 0 else { return nil }
+        return value
+    }
+
+    /// The value a SYNC path may persist into `Folder.lastKnownUidValidity`, or nil
+    /// for "write nothing". **BOOTSTRAP-ONLY — this is a data-safety rule, not an
+    /// optimisation.**
+    ///
+    /// That column is not a general-purpose "last epoch the server reported" field:
+    /// it is the deletion-reconcile walk's ABORT GUARD (ADR-IOS-051, see
+    /// `Folder.swift`), and its safety depends on it meaning *the epoch the LOCAL
+    /// UIDs belong to*. The walk reads it from the DB
+    /// (`SyncEngineDeletionReconcile.swift:373`) and aborts when the live SELECT
+    /// disagrees (`:151-155`). Keeping the column synced to the live server epoch
+    /// would make that comparison always equal — so on a real UIDVALIDITY turnover
+    /// the walk would stop aborting and instead delete every local header as a
+    /// "ghost", up to `expectedGhosts + SyncConfig.deletionReconcileCapSlack`. Hence:
+    ///
+    /// - observation unknown (nil, or the `0` sentinel) ⇒ write nothing;
+    /// - column already holds a value ⇒ write nothing, whether it AGREES (no
+    ///   redundant write — WAL etiquette) or DIFFERS (a turnover; the UID-remap /
+    ///   resync machinery owns stamping a new epoch, only ever together with the
+    ///   purge of the rows that belonged to the old one);
+    /// - column empty + observation known ⇒ bootstrap it (the point of the item:
+    ///   a folder the walk has never visited still ends up with a usable epoch).
+    ///
+    /// REFERENCE (`v2final`): the identical three-branch contract, expressed as the
+    /// single persist API `AccountManager.recordObservedUidValidity`
+    /// (`AccountManager.swift:838`) — *"First observation … persist … Same value:
+    /// no write (WAL etiquette) … CHANGED value: does NOT overwrite the stored value
+    /// (a later stage's reaction owns stamping the new epoch, as part of the purge)
+    /// … `observed == 0`: unreported, never recorded, never compared."*
+    /// Pure + nonisolated for unit testing.
+    nonisolated static func uidValidityBootstrapWrite(observed: Int?, stored: Int?) -> Int? {
+        guard stored == nil else { return nil }
+        return knownUidValidity(observed)
+    }
+
+    /// Persist a bootstrap epoch as ONE conditional UPDATE.
+    ///
+    /// The `lastKnownUidValidity IS NULL` predicate belongs in the STATEMENT, not in
+    /// a Swift `if` over a `Folder` row read earlier: every sync caller reads its row
+    /// BEFORE a network round trip (STATUS/SELECT) and writes AFTER it, and the
+    /// deletion-reconcile walk writes this same column from its own task. Deciding on
+    /// the pre-suspension snapshot is a TOCTOU that would let a live epoch land on top
+    /// of the epoch the local UIDs belong to — the exact overwrite that disarms the
+    /// walk's abort guard (ADR-IOS-051). SQLite evaluates the predicate at write time,
+    /// inside the writer's serialized transaction, so the race cannot be lost.
+    func bootstrapFolderUidValidity(folderId: String, observed: Int?) async throws {
+        guard let epoch = Self.knownUidValidity(observed) else { return }
+        try await dbPool.write { db in
+            _ = try Folder
+                .filter(Column("id") == folderId && Column("lastKnownUidValidity") == nil)
+                .updateAll(db, Column("lastKnownUidValidity").set(to: epoch))
+        }
+    }
+
     /// IMAP delta sync using STATUS-based change detection.
     /// Calls STATUS on each folder to check uidNext/messageCount — skips unchanged folders.
     private func imapDeltaSync(account: Account, provider: IMAPProvider, inboxOnly: Bool = false) async throws -> (succeeded: Bool, hadChanges: Bool) {
@@ -790,6 +869,26 @@ extension SyncEngine {
 
             if !uidNextChanged && !countChanged && !modSeqChanged {
                 print("[Sync] IMAP delta: \(folder.name) unchanged (uidNext=\(status.uidNext), count=\(status.messageCount), modseq=\(status.highestModSeq.map(String.init) ?? "-"))")
+                // A QUIET folder is exactly the folder that would otherwise never get an
+                // epoch: the changed-branch persist below never runs for it, and the
+                // deletion-reconcile walk (the only other writer) only fires on a count
+                // mismatch. BOOTSTRAP the observed UIDVALIDITY before the early return —
+                // and only bootstrap: `uidValidityBootstrapWrite` returns nil the moment
+                // the column holds anything, so the steady state opens no write at all and
+                // a turnover can NEVER be stamped over the epoch the local UIDs belong to
+                // (that would disarm the reconcile walk's abort guard — ADR-IOS-051).
+                //
+                // The pre-read check is a cheap early-out only (WAL etiquette: the steady
+                // state opens no write transaction at all). The BINDING check is the
+                // `lastKnownUidValidity IS NULL` predicate inside the UPDATE itself —
+                // `folder` was read BEFORE the STATUS round trip suspended us, so its
+                // epoch is a stale snapshot and a reentrant path (the reconcile walk,
+                // another sync pass) can have bootstrapped the column in between.
+                if Self.uidValidityBootstrapWrite(
+                    observed: status.uidValidity, stored: folder.lastKnownUidValidity) != nil {
+                    try await bootstrapFolderUidValidity(
+                        folderId: folder.id, observed: status.uidValidity)
+                }
                 continue
             }
 
@@ -824,6 +923,18 @@ extension SyncEngine {
                     assignments.append(Column("lastKnownHighestModSeq").set(to: modseq))
                 }
                 _ = try Folder.filter(Column("id") == folder.id).updateAll(db, assignments)
+                // BOOTSTRAP the epoch in the SAME transaction but as its OWN conditional
+                // statement: the `lastKnownUidValidity IS NULL` predicate must be evaluated
+                // by SQLite at write time, never against `folder` — that snapshot predates
+                // the STATUS round trip, so it cannot decide whether the column is still
+                // empty. Never an overwrite (see `uidValidityBootstrapWrite`): stamping a
+                // live epoch over the one the local UIDs belong to disarms the
+                // deletion-reconcile walk's abort guard (ADR-IOS-051).
+                if let epoch = Self.knownUidValidity(status.uidValidity) {
+                    _ = try Folder
+                        .filter(Column("id") == folder.id && Column("lastKnownUidValidity") == nil)
+                        .updateAll(db, Column("lastKnownUidValidity").set(to: epoch))
+                }
             }
 
             // ADR-IOS-051 Phase 2 trigger: compare the LIVE local header count

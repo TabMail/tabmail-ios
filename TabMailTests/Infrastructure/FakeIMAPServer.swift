@@ -554,6 +554,18 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.deletedMailboxes[name] = includeNonexistentCode }
     }
 
+    /// Undo `markMailboxDeleted` — the name exists again. Models the second half
+    /// of the delete/re-create lifecycle: RFC 3501 §2.3.1.1 requires a re-created
+    /// mailbox to report a NEW UIDVALIDITY, which the caller sets with
+    /// `setUidValidity(_:for:)`.
+    func markMailboxRestored(_ name: String) {
+        // `state.…[name] = nil` (assignment ⇒ Void) rather than `removeValue(forKey:)`
+        // (⇒ `Bool?`): `withState` is generic in its closure's result and is NOT
+        // `@discardableResult` — several call sites genuinely consume the value — so a
+        // value-returning body here produced "result of call to 'withState' is unused".
+        withState { state in state.deletedMailboxes[name] = nil }
+    }
+
     /// Test seam (ADR-IOS-060 residual closure — UIDVALIDITY reset,
     /// 2026-07-16): set the UIDVALIDITY a mailbox's SELECT/EXAMINE reports
     /// going forward, simulating a server-side reset noticed live by a
@@ -1116,6 +1128,9 @@ final class FakeIMAPServer: @unchecked Sendable {
             \(tag) OK [READ-WRITE] SELECT completed\r
 
             """
+        case "STATUS":
+            guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
+            return handleStatus(tag: tag, args: args)
         case "UID":
             guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
             return handleUID(tag: tag, args: args, mailbox: selectedMailbox)
@@ -1177,6 +1192,55 @@ final class FakeIMAPServer: @unchecked Sendable {
         default:
             return "\(tag) BAD Unknown command \(command)\r\n"
         }
+    }
+
+    /// STATUS (RFC 3501 §6.3.10) — the command IMAP delta sync uses to decide
+    /// whether a folder changed WITHOUT selecting it. Answers only the
+    /// attributes the client actually requested, so a capability the fake does
+    /// not advertise stays genuinely absent from the reply (CONDSTORE's
+    /// `HIGHESTMODSEQ` is the case that matters: SwiftMail only asks for it
+    /// when the server advertises CONDSTORE, and inventing it here would let a
+    /// test pass against a server shape that cannot exist). Does NOT change the
+    /// connection's selected mailbox — that is the whole point of STATUS.
+    private func handleStatus(tag: String, args: String) -> String {
+        guard let openParen = args.firstIndex(of: "(") else {
+            return "\(tag) BAD STATUS requires an attribute list\r\n"
+        }
+        let mailbox = args[args.startIndex..<openParen]
+            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: .init(charactersIn: "\""))
+        if withState({ $0.deletedMailboxes[mailbox] }) != nil {
+            return "\(tag) NO Mailbox does not exist\r\n"
+        }
+        let closeParen = args.firstIndex(of: ")") ?? args.endIndex
+        let requested = args[args.index(after: openParen)..<closeParen]
+            .split(separator: " ")
+            .map { $0.uppercased() }
+
+        let (count, unseen, uidNext, uidValidity) = withState { state -> (Int, Int, Int, Int) in
+            let messages = state.messagesByMailbox[mailbox] ?? []
+            let flags = state.flagsByMailbox[mailbox] ?? [:]
+            let unseen = messages.filter { !(flags[$0.uid]?.contains("\\Seen") ?? false) }.count
+            return (
+                messages.count,
+                unseen,
+                (messages.map(\.uid).max() ?? 0) + 1,
+                state.uidValidityByMailbox[mailbox] ?? 1
+            )
+        }
+
+        var parts: [String] = []
+        for attribute in requested {
+            switch attribute {
+            case "MESSAGES": parts.append("MESSAGES \(count)")
+            case "RECENT": parts.append("RECENT 0")
+            case "UNSEEN": parts.append("UNSEEN \(unseen)")
+            case "UIDNEXT": parts.append("UIDNEXT \(uidNext)")
+            case "UIDVALIDITY": parts.append("UIDVALIDITY \(uidValidity)")
+            default: continue // an attribute this fake does not model — never invent one
+            }
+        }
+        return "* STATUS \"\(mailbox)\" (\(parts.joined(separator: " ")))\r\n\(tag) OK STATUS completed\r\n"
     }
 
     /// RFC 3501 §6.3.11 APPEND — `mailbox [(flags)] ["date-time"] {N}<literal>`.
