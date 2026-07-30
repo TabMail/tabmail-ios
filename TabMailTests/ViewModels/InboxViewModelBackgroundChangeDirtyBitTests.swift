@@ -99,7 +99,7 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 3, folderId: folder.id)
@@ -131,7 +131,7 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 3, folderId: folder.id)
@@ -161,7 +161,7 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 5, folderId: folder.id)
@@ -194,7 +194,7 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 3, folderId: folder.id)
@@ -223,7 +223,7 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 3, folderId: folder.id)
@@ -256,7 +256,7 @@ struct InboxViewModelBackgroundChangeDirtyBitTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 2, folderId: folder.id)

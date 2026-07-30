@@ -60,7 +60,7 @@ struct DurableIdentityLookupTests {
     @Test("primary (accountId, messageId) hit")
     func primaryHit() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let header = makeHeader(messageId: "111")
         try pool.write { db in try header.insert(db) }
 
@@ -79,7 +79,7 @@ struct DurableIdentityLookupTests {
     @Test("rfc822 fallback hit when primary lookup misses (simulated IMAP UID remap)")
     func rfc822FallbackHitOnUidRemap() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         // Durable row was written under the OLD UID (messageId "999") but carries
         // the stable rfc822MessageId. A later lookup arrives with a NEW UID
         // ("111", post-MOVE remap) and must find it via the rfc822 fallback.
@@ -100,7 +100,7 @@ struct DurableIdentityLookupTests {
     @Test("fallback is NOT taken when rfc822MessageId is nil")
     func fallbackNotTakenWhenRfc822Nil() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         // A durable row exists under a different messageId; without an rfc822 to
         // probe with, the lookup must NOT fall back to it.
         let header = makeHeader(messageId: "999", rfc822MessageId: "rfc-abc@example.com")
@@ -119,7 +119,7 @@ struct DurableIdentityLookupTests {
     @Test("fallback is NOT taken when rfc822MessageId is an empty string")
     func fallbackNotTakenWhenRfc822Empty() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let header = makeHeader(messageId: "999", rfc822MessageId: "rfc-abc@example.com")
         try pool.write { db in try header.insert(db) }
 
@@ -136,7 +136,7 @@ struct DurableIdentityLookupTests {
     @Test("absent identity returns nil")
     func absentIdentityReturnsNil() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         let ref = try pool.read { db in
             try DurableIdentityLookup.find(
@@ -151,7 +151,7 @@ struct DurableIdentityLookupTests {
     @Test("account scoping — same messageId on another account does not match")
     func accountScopingExcludesOtherAccounts() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let header = makeHeader(accountId: "acc2", messageId: "shared-id")
         try pool.write { db in try header.insert(db) }
 
@@ -168,7 +168,7 @@ struct DurableIdentityLookupTests {
     @Test("returned fields (folderId/folderPath/isInInbox/rfc822MessageId) are correct")
     func returnedFieldsCorrect() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let header = makeHeader(
             accountId: "acc1", folderPath: "Archive", messageId: "42",
             rfc822MessageId: "r@example.com", isInInbox: false
@@ -193,7 +193,7 @@ struct DurableIdentityLookupTests {
     @Test("exact-folder match takes precedence over a folder-blind hit — same (accountId, messageId) in two folders resolves to the QUERIED folder's row")
     func exactFolderPrecedence() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         // Same accountId + messageId ("42"), two different folders — a
         // legitimate per-folder IMAP UID collision (not a move).
         let inboxHeader = makeHeader(folderPath: "INBOX", messageId: "42")
@@ -225,7 +225,7 @@ struct DurableIdentityLookupTests {
     @Test("cross-folder UID collision with DIFFERING non-nil rfc822MessageId on both sides is rejected — falls through to the rfc822 step, which also misses, → nil")
     func crossFolderCollisionDifferingRfc822Rejected() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         // A DIFFERENT message living in Archive that happens to share the
         // UID ("88") the caller is probing for in INBOX.
         let archived = makeHeader(folderPath: "Archive", messageId: "88", rfc822MessageId: "rfc-real@example.com")
@@ -245,7 +245,7 @@ struct DurableIdentityLookupTests {
     @Test("cross-folder UID collision where the durable candidate's rfc822MessageId is nil → folder-blind match RETAINED (conservative: can't prove a difference)")
     func crossFolderCollisionCandidateRfc822NilRetainsMatch() throws {
         let (pool, dir) = try makeTestPool()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let archived = makeHeader(folderPath: "Archive", messageId: "77", rfc822MessageId: nil)
         try pool.write { db in try archived.insert(db) }
 

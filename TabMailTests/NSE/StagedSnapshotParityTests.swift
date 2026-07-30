@@ -110,14 +110,20 @@ struct StagedSnapshotParityTests {
 
     @Test("merge builds the staged row + body snapshot for a header+body row")
     func mergeParityHeaderAndBody() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let staging = try makeStagingFile(in: dir)
+        ownedQueues.append(staging.queue)
         try stageHeaderRow(staging.queue, subject: "Parity subject")
         try stageBodyRow(staging.queue, html: "<p>parity body</p>")
 
@@ -137,14 +143,20 @@ struct StagedSnapshotParityTests {
 
     @Test("merge excludes an unresolved-CID body from the body snapshot but keeps the header")
     func mergeParityExcludesCID() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let staging = try makeStagingFile(in: dir)
+        ownedQueues.append(staging.queue)
         try stageHeaderRow(staging.queue)
         try stageCIDBodyRow(staging.queue)
 

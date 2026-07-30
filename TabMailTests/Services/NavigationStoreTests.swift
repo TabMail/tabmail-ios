@@ -172,7 +172,7 @@ struct NavigationStoreRefreshTests {
         }
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         try await body(pool)
     }

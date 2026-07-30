@@ -82,11 +82,17 @@ struct NSEPaintGateTests {
     @Test("onSnapshotPublished fires with the snapshot in memory, BEFORE the durable header write")
     func callbackFiresBeforeDurableWrite() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
 
         let hid = headerId()
@@ -125,12 +131,18 @@ struct NSEPaintGateTests {
     @Test("onSnapshotPublished fires even when the .messagesStaged post is suppressed (unchanged KEPT set)")
     func callbackFiresWhenPostSuppressed() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         _ = pool
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
 
         let fires = Mutex<Int>(0)

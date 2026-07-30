@@ -56,7 +56,7 @@ struct NavigationStoreFavoritesAsyncTests {
     @Test("toggleFavorite flips isFavorite in the DB (off-main async write)")
     func toggleFavoriteFlipsDB() async throws {
         let (store, pool, dir, previous) = try makeStore()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         guard let folder = try await pool.read({ try Folder.fetchOne($0, key: "acc1:INBOX") }) else {
             Issue.record("seed folder missing"); return
@@ -75,7 +75,7 @@ struct NavigationStoreFavoritesAsyncTests {
     @Test("setFavorite writes the explicit value")
     func setFavoriteExplicit() async throws {
         let (store, pool, dir, previous) = try makeStore()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         guard let folder = try await pool.read({ try Folder.fetchOne($0, key: "acc1:INBOX") }) else {
             Issue.record("seed folder missing"); return
@@ -89,7 +89,7 @@ struct NavigationStoreFavoritesAsyncTests {
     @Test("setPrimaryAccount leaves EXACTLY ONE primary (atomic clear-then-set)")
     func setPrimaryAtomic() async throws {
         let (store, pool, dir, previous) = try makeStore()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         guard let acc2 = try await pool.read({ try Account.fetchOne($0, key: "acc2") }) else {
             Issue.record("seed account missing"); return

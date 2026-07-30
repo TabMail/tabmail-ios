@@ -20,10 +20,10 @@ struct DurabilityCheckpointTests {
         // the single source both makePool and this test use — no real-DB access).
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let pool = try DatabasePool(
             path: dir.appendingPathComponent("t.sqlite").path,
             configuration: AppDatabase.makeConfiguration())
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         let (sync, autockpt): (Int?, Int?) = try pool.read { db in
             (try Int.fetchOne(db, sql: "PRAGMA synchronous"),
@@ -47,7 +47,14 @@ struct DurabilityCheckpointTests {
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current; current = appDb; return prev
         }
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        var siblingPools: [DatabasePool] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(
+                pools: [pool] + siblingPools,
+                directory: dir
+            )
+        }
 
         // Commit user-intent-style rows under synchronous=NORMAL (no per-commit fsync).
         try await pool.write { db in
@@ -67,6 +74,7 @@ struct DurabilityCheckpointTests {
         let reopened = try DatabasePool(
             path: dir.appendingPathComponent("t.sqlite").path,
             configuration: AppDatabase.makeConfiguration())
+        siblingPools.append(reopened)
         let onDisk = try await reopened.read { try Account.fetchCount($0) }
         #expect(onDisk == 1, "checkpointed row must be visible to a fresh connection")
     }

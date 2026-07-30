@@ -122,7 +122,7 @@ struct NSEMergeMainActorBlockTests {
         let (dir, pool, previous) = try makeAppDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let stagedCount = 200   // realistic foreground catch-up volume (hundreds)
         let stagingPath = try makeStagingDB(in: dir, count: stagedCount)
@@ -234,7 +234,7 @@ struct NSEMergeMainActorBlockTests {
         let (dir, pool, previous) = try makeAppDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let stagingPath = dir.appendingPathComponent("nse_staging.sqlite").path
         AppDatabase.createNSEStagingDB(atPath: stagingPath)

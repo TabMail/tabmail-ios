@@ -162,7 +162,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Header lands with an EMPTY snippet (an IMAP push: the NSE stages
         // snippet=""); phase-2 later computes and writes the real snippet.
@@ -193,7 +193,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Row loads with a snippet (stands in for a SnippetLoader in-place fill —
         // in-memory state ahead of the DB), then the DB header's snippet is
@@ -225,7 +225,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 3, folderId: folder.id)
@@ -255,7 +255,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 5, folderId: folder.id)
@@ -297,7 +297,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 3, folderId: folder.id)
@@ -338,7 +338,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 2, folderId: folder.id)
@@ -375,7 +375,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         _ = try insertMessages(pool, count: 2, folderId: folder.id)
@@ -405,7 +405,7 @@ struct InboxViewModelAIBatchTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, count: 1, folderId: folder.id)

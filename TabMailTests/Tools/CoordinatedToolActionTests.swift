@@ -78,13 +78,15 @@ struct CoordinatedToolActionTests {
     /// Teardown shared by every test. Mirrors `InboxGestureActionTests.restoreTestDB`:
     /// production paths driven here (drainPendingQueue, unread recounts) fire
     /// unstructured background Tasks the drain barrier cannot join, so they can run
-    /// AFTER the defers — leave the test DB alive when there's no previous one to
-    /// restore, rather than let `AppDatabase.rawPool`'s force-unwrap crash the process.
-    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// AFTER the defers. Restore a real predecessor when present, but retain this
+    /// fixture until process exit in either case so escaped work never reaches a
+    /// closed pool.
+    private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     private func clearOverlay() {
@@ -107,7 +109,7 @@ struct CoordinatedToolActionTests {
     @Test("performCoordinatedRoleMove archives a message: row moves to Archive, ONE .move PendingOperation is queued, and the overlay refcount/entry fully drain")
     func basicArchiveMovesRowAndDrainsOverlay() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-basic-archive", actionTag: .reply)
@@ -141,7 +143,7 @@ struct CoordinatedToolActionTests {
     @Test("staleness regression: a message moved to Trash AFTER the tool captured its id (during the confirmation wait) — the coordinated archive re-resolves FRESH row truth, so its PendingOperation records the CURRENT (Trash) source path, not a stale Inbox path")
     func staleSnapshotDoesNotCorruptSourcePath() async throws {
         let (pool, inbox, archive, trash, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-stale-pin")
@@ -194,7 +196,7 @@ struct CoordinatedToolActionTests {
     @Test("FIFO/union: a coordinated archive queued behind an in-flight gesture intent cycle for the SAME id executes strictly after it — both complete, the row ends up read AND archived, and the overlay/refcount/intent-cycle registers all drain to empty")
     func coordinatedMoveOrdersAfterOpenIntentCycle() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-fifo-union", isRead: false)
@@ -254,7 +256,7 @@ struct CoordinatedToolActionTests {
     @Test("cross-account archive batch: each account's message lands in ITS OWN archive folder — the destination is resolved per account, never from the batch's first member")
     func crossAccountArchiveResolvesDestinationPerAccount() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         // Second account with a DIFFERENT archive path — the pre-fix code
@@ -304,7 +306,7 @@ struct CoordinatedToolActionTests {
     @Test("mixed multi-account batch: acc2 has NO archive folder at all — acc1's message archives normally (ONE .move op), acc2's message is skipped entirely (zero ops, untouched), and neither the acted-on nor the skipped id strands an overlay/refcount entry")
     func mixedBatchAccountMissingRoleFolderSkipsCleanly() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         // acc2 has ONLY an inbox — no archive folder anywhere for this account.

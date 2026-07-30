@@ -26,7 +26,7 @@ struct MemoryReadToolTests {
         return MemoryReadTool(context: ctx)
     }
 
-    private func installMemoryIndex() async throws -> URL {
+    private func installMemoryIndex() async throws -> (pool: DatabasePool, dir: URL) {
         await MemoryIndex.shared._testReset()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -40,12 +40,12 @@ struct MemoryReadToolTests {
         }
         let pool = try DatabasePool(path: path, configuration: config)
         try await MemoryIndex.shared._testInstallPool(pool)
-        return dir
+        return (pool, dir)
     }
 
-    private func cleanupMemoryIndex(_ dir: URL) async {
+    private func cleanupMemoryIndex(pool: DatabasePool, dir: URL) async {
         await MemoryIndex.shared._testReset()
-        try? FileManager.default.removeItem(at: dir)
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     // MARK: - Argument Validation
@@ -165,8 +165,8 @@ struct MemoryReadToolTests {
 
     @Test("Output tags each turn with role (USER / AGENT) and date header")
     func perTurnOutputIncludesRoleAndDate() async throws {
-        let memDir = try await installMemoryIndex()
-        defer { Task { await cleanupMemoryIndex(memDir) } }
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         let t0: Int64 = 1_710_000_000_000
         await MemoryIndex.shared.indexTurn(chatHistoryId: "u1", sessionId: "s", role: "user", dateMs: t0, text: "please add jane")
@@ -189,8 +189,8 @@ struct MemoryReadToolTests {
 
     @Test("Context window is session-bounded — does not leak adjacent sessions")
     func contextWindowBoundedToSession() async throws {
-        let memDir = try await installMemoryIndex()
-        defer { Task { await cleanupMemoryIndex(memDir) } }
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         let t0: Int64 = 1_710_000_000_000
         // Session A (target): 3 turns clustered around t0.

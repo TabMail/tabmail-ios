@@ -85,15 +85,17 @@ struct NSEStagingFolderPathTests {
         }
     }
 
-    private func tempDB() throws -> DatabaseQueue {
+    private func tempDB() throws -> (queue: DatabaseQueue, directory: URL) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return try DatabaseQueue(path: dir.appendingPathComponent("s.sqlite").path)
+        let queue = try DatabaseQueue(path: dir.appendingPathComponent("s.sqlite").path)
+        return (queue, dir)
     }
 
     @Test("v3 migration adds folderPath column on legacy v2 DB")
     func v3AddsColumn() throws {
-        let db = try tempDB()
+        let (db, directory) = try tempDB()
+        defer { TestDatabaseTeardown.retire(queue: db, directory: directory) }
         try runLegacyV2Schema(db)
 
         try runStagingSchemaWithV3(db)
@@ -107,7 +109,8 @@ struct NSEStagingFolderPathTests {
 
     @Test("v3 migration backfills legacy folderId values into folderPath")
     func v3Backfill() throws {
-        let db = try tempDB()
+        let (db, directory) = try tempDB()
+        defer { TestDatabaseTeardown.retire(queue: db, directory: directory) }
         try runLegacyV2Schema(db)
 
         try db.write { db in
@@ -128,7 +131,8 @@ struct NSEStagingFolderPathTests {
 
     @Test("v3 migration is idempotent — second run no-ops")
     func v3Idempotent() throws {
-        let db = try tempDB()
+        let (db, directory) = try tempDB()
+        defer { TestDatabaseTeardown.retire(queue: db, directory: directory) }
         try runLegacyV2Schema(db)
         try runStagingSchemaWithV3(db)
         try runStagingSchemaWithV3(db)  // must not throw
@@ -141,7 +145,8 @@ struct NSEStagingFolderPathTests {
 
     @Test("Fresh install (no legacy folderId column) tolerates backfill UPDATE")
     func v3OnFreshInstall() throws {
-        let db = try tempDB()
+        let (db, directory) = try tempDB()
+        defer { TestDatabaseTeardown.retire(queue: db, directory: directory) }
         // Fresh schema WITHOUT the legacy folderId column. Simulates an install
         // that went through the new code path only.
         try db.write { db in
@@ -161,7 +166,8 @@ struct NSEStagingFolderPathTests {
 
     @Test("Write with provider folderPath (Outlook) round-trips through the schema")
     func outlookFolderPathRoundTrip() throws {
-        let db = try tempDB()
+        let (db, directory) = try tempDB()
+        defer { TestDatabaseTeardown.retire(queue: db, directory: directory) }
         try runStagingSchemaWithV3(db)
 
         let graphFolder = "AQMkADAwATE2MTQwLTk2YTQtNjViMy0wMAItMDAKAC4AAAMD"

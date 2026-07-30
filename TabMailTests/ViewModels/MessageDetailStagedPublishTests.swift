@@ -72,11 +72,11 @@ struct MessageDetailStagedPublishTests {
     }
 
     @MainActor
-    private func cleanup(_ dir: URL, _ previous: AppDatabase?) {
+    private func cleanup(_ pool: DatabasePool, _ dir: URL, _ previous: AppDatabase?) {
         AppDatabase.shared.withLock { $0 = previous }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-        try? FileManager.default.removeItem(at: dir)
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     // MARK: - Seeding
@@ -85,7 +85,7 @@ struct MessageDetailStagedPublishTests {
     @Test("pending sentinel tap: publish seeds header, rewrites messageId, flips read")
     func pendingSentinelSeedsOnPublish() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         // Tap lands BEFORE any merge published the snapshot → pending sentinel.
@@ -110,7 +110,7 @@ struct MessageDetailStagedPublishTests {
     @Test("resolved composite but header-less (cancelled loadBody): publish seeds via stagedRowFallback")
     func resolvedCompositeSeedsOnPublish() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         // The resolve landed (composite id) but loadBody's durable header read
@@ -132,7 +132,7 @@ struct MessageDetailStagedPublishTests {
     @Test("publish never clobbers an already-set header (durable-first)")
     func publishDoesNotClobber() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
 
         let row = stagedRow(messageId: "tapseed-300", subject: "STALE staged")
         var durable = row.toMessageHeader()
@@ -154,7 +154,7 @@ struct MessageDetailStagedPublishTests {
     @Test("account-scoped: a same-UID row from ANOTHER account never seeds; the right one does")
     func publishIsAccountScoped() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         let vm = MessageDetailViewModel(
@@ -183,7 +183,7 @@ struct MessageDetailStagedPublishTests {
     @Test("composite branch is EXACT-match: same-UID staged INBOX push never seeds an Archive open")
     func compositeSeedRequiresExactHeaderId() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         // Normal (non-tap) open of an IMAP Archive message, still in its skeleton
@@ -212,7 +212,7 @@ struct MessageDetailStagedPublishTests {
     @Test("body catch-up: staged body published alongside the header is adopted for display")
     func publishAdoptsStagedBody() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         let row = stagedRow(messageId: "tapseed-500", subject: "With body")

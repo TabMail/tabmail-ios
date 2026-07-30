@@ -98,7 +98,7 @@ struct InboxViewModelInsertUndoneTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()
@@ -157,7 +157,7 @@ struct InboxViewModelInsertUndoneTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()
@@ -190,7 +190,7 @@ struct InboxViewModelInsertUndoneTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()

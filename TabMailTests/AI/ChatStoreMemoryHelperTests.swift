@@ -39,8 +39,7 @@ struct ChatStoreMemoryHelperTests {
     @MainActor
     private func tearDown(pool: DatabasePool, dir: URL, previous: AppDatabase?) {
         AppDatabase.shared.withLock { $0 = previous }
-        try? pool.close()
-        try? FileManager.default.removeItem(at: dir)
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     @MainActor
@@ -252,7 +251,7 @@ struct ChatStoreMemoryHelperTests {
 
     /// Install a fresh memory.db pool alongside the tabmail.sqlite pool, so that
     /// `ChatStore.appendTurn` exercises the memory.db side of the dual-write.
-    private func installMemoryPool() async throws -> URL {
+    private func installMemoryPool() async throws -> (pool: DatabasePool, dir: URL) {
         await MemoryIndex.shared._testReset()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -266,16 +265,23 @@ struct ChatStoreMemoryHelperTests {
         }
         let pool = try DatabasePool(path: path, configuration: config)
         try await MemoryIndex.shared._testInstallPool(pool)
-        return dir
+        return (pool, dir)
+    }
+
+    /// Close the memory.db pool before unlinking its directory — see
+    /// `TestDatabaseTeardown`.
+    private func tearDownMemoryPool(pool: DatabasePool, dir: URL) async {
+        await MemoryIndex.shared._testReset()
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     @Test("Integration: appendTurn(normal user) writes to memory.db with v3 fields")
     func appendTurn_dualWritesToMemoryDB() async throws {
         let (pool, dir, previous) = try await MainActor.run { try installTempDB() }
-        let memDir = try await installMemoryPool()
+        let (memPool, memDir) = try await installMemoryPool()
         defer {
             Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            Task { await tearDownMemoryPool(pool: memPool, dir: memDir) }
         }
 
         let userTurn = ChatTurn(
@@ -307,10 +313,10 @@ struct ChatStoreMemoryHelperTests {
     @Test("Integration: appendTurn(non-normal type) does NOT write to memory.db")
     func appendTurn_skipsMemoryDBForNonNormal() async throws {
         let (pool, dir, previous) = try await MainActor.run { try installTempDB() }
-        let memDir = try await installMemoryPool()
+        let (memPool, memDir) = try await installMemoryPool()
         defer {
             Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            Task { await tearDownMemoryPool(pool: memPool, dir: memDir) }
         }
 
         let greeting = ChatTurn(
@@ -343,10 +349,10 @@ struct ChatStoreMemoryHelperTests {
     @Test("Integration: deleteHistoryTurns cascades to memory.db")
     func deleteHistoryTurns_cascadesToMemoryDB() async throws {
         let (pool, dir, previous) = try await MainActor.run { try installTempDB() }
-        let memDir = try await installMemoryPool()
+        let (memPool, memDir) = try await installMemoryPool()
         defer {
             Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            Task { await tearDownMemoryPool(pool: memPool, dir: memDir) }
         }
 
         // Append two turns.
@@ -368,10 +374,10 @@ struct ChatStoreMemoryHelperTests {
     @Test("Integration: clearAll wipes both chatHistory and memory.db")
     func clearAll_cascadesToMemoryDB() async throws {
         let (pool, dir, previous) = try await MainActor.run { try installTempDB() }
-        let memDir = try await installMemoryPool()
+        let (memPool, memDir) = try await installMemoryPool()
         defer {
             Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            Task { await tearDownMemoryPool(pool: memPool, dir: memDir) }
         }
 
         let t = ChatTurn(

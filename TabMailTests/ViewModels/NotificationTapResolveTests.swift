@@ -59,11 +59,11 @@ struct NotificationTapResolveTests {
     @MainActor
     @Test("staged snapshot tier resolves the provider id instantly")
     func stagedTierResolves() async throws {
-        let (_, dir, previous) = try makePool()
+        let (pool, dir, previous) = try makePool()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let row = stagedRow(messageId: "m-prov-staged")
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
@@ -79,7 +79,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         let row = stagedRow(messageId: "m-prov-durable")
@@ -92,11 +92,11 @@ struct NotificationTapResolveTests {
     @MainActor
     @Test("exhausted ladder returns nil (message genuinely gone)")
     func exhaustedLadderReturnsNil() async throws {
-        let (_, dir, previous) = try makePool()
+        let (pool, dir, previous) = try makePool()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
@@ -116,7 +116,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let row = stagedRow(messageId: "m-tap-sentinel")
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
@@ -137,7 +137,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         let row = stagedRow(messageId: "m-tap-durable")
@@ -164,7 +164,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Empty staging snapshot AND empty DB — the message is genuinely
         // nowhere yet (NSE never staged it, sync hasn't landed it).
@@ -209,7 +209,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
@@ -256,7 +256,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
@@ -313,7 +313,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // First attempt: the message is genuinely nowhere yet (empty staging
         // snapshot AND empty DB) — the ladder exhausts → Not-Found.
@@ -358,7 +358,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // The message is genuinely nowhere — and STAYS nowhere across the retry.
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
@@ -409,7 +409,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
@@ -458,7 +458,7 @@ struct NotificationTapResolveTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Still absent across the whole test — every completed ladder exhausts.
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }

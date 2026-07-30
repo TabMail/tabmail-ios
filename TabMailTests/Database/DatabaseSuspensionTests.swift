@@ -56,7 +56,7 @@ struct DatabaseSuspensionTests {
         let (pool, dir) = try Self.makeSuspendablePool()
         defer {
             Self.postResume()
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         try pool.write { db in
@@ -94,7 +94,7 @@ struct DatabaseSuspensionTests {
         let (pool, dir) = try Self.makeSuspendablePool()
         defer {
             Self.postResume()
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         // Suspension arrives mid-transaction (the BGTask-expiration scenario:
@@ -123,9 +123,17 @@ struct DatabaseSuspensionTests {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("suspension-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var queueToRetire: DatabaseQueue?
         defer {
             Self.postResume()
-            try? FileManager.default.removeItem(at: dir)
+            if let queueToRetire {
+                TestDatabaseTeardown.closeThenUnlinkNow(
+                    queue: queueToRetire,
+                    directory: dir
+                )
+            } else {
+                try? FileManager.default.removeItem(at: dir)
+            }
         }
 
         // Mirror BodyAssetStore.manifestQueue(): rollback-journal DatabaseQueue
@@ -136,6 +144,7 @@ struct DatabaseSuspensionTests {
             path: dir.appendingPathComponent("manifest.sqlite").path,
             configuration: config
         )
+        queueToRetire = queue
         try queue.write { db in
             try db.execute(sql: "CREATE TABLE asset (id INTEGER PRIMARY KEY)")
         }
@@ -183,7 +192,7 @@ struct DatabaseSuspensionTests {
         let (pool, dir) = try Self.makeSuspendablePool()
         defer {
             Self.postResume()
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         // (1) A write aborted by suspension classifies as a suspension abort.
@@ -225,10 +234,18 @@ struct DatabaseSuspensionTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let suiteName = "nse-badge-susp-\(UUID().uuidString)"
         let suite = UserDefaults(suiteName: suiteName)!
+        var queueToRetire: DatabaseQueue?
         defer {
             Self.postResume()
             suite.removePersistentDomain(forName: suiteName)
-            try? FileManager.default.removeItem(at: dir)
+            if let queueToRetire {
+                TestDatabaseTeardown.closeThenUnlinkNow(
+                    queue: queueToRetire,
+                    directory: dir
+                )
+            } else {
+                try? FileManager.default.removeItem(at: dir)
+            }
         }
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -237,6 +254,7 @@ struct DatabaseSuspensionTests {
             path: dir.appendingPathComponent("staging.sqlite").path,
             configuration: config
         )
+        queueToRetire = db
         let id = NSEBadge.countedId(accountId: "acct", messageId: "uid-1", rfc822MessageId: "<m@x>")
 
         // While suspended: the markCounted write aborts internally — must be
@@ -289,7 +307,7 @@ struct DatabaseSuspensionTests {
         let (pool, dir) = try Self.makeSuspendablePool()
         defer {
             Self.postResume()
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         for i in 0..<5 {
@@ -344,9 +362,17 @@ struct DatabaseSuspensionTests {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("suspension-nonwal-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var queueToRetire: DatabaseQueue?
         defer {
             Self.postResume()
-            try? FileManager.default.removeItem(at: dir)
+            if let queueToRetire {
+                TestDatabaseTeardown.closeThenUnlinkNow(
+                    queue: queueToRetire,
+                    directory: dir
+                )
+            } else {
+                try? FileManager.default.removeItem(at: dir)
+            }
         }
 
         // Default Configuration() == rollback journal (NON-WAL), matching BodyAssetStore.
@@ -357,6 +383,7 @@ struct DatabaseSuspensionTests {
             path: dir.appendingPathComponent("manifest.sqlite").path,
             configuration: config
         )
+        queueToRetire = queue
         try queue.write { db in
             try db.execute(sql: "CREATE TABLE bodyAsset (id INTEGER PRIMARY KEY, sizeBytes INTEGER NOT NULL)")
             try db.execute(sql: "INSERT INTO bodyAsset (sizeBytes) VALUES (10), (20), (30)")
@@ -425,14 +452,14 @@ struct DatabaseSuspensionTests {
 
     /// See `CoordinatedToolActionTests.restoreTestDB`: production paths driven
     /// here (`AccountManager.move`'s unstructured recount/drain `Task`s) can
-    /// run AFTER this returns, so a test with no prior `AppDatabase` leaves the
-    /// test DB alive rather than let `AppDatabase.rawPool`'s force-unwrap crash
-    /// the process on a later unrelated access.
-    private func restoreAccountDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// run AFTER this returns. Restore a real predecessor when present, but
+    /// retain this installed fixture until process exit in either case.
+    private func restoreAccountDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     @Test("Live suspension through AccountManager.move(): a suspend posted BEFORE the call aborts the whole write (row move + PendingOperation insert, one transaction) atomically — no PendingOperation, folderId unchanged; after resume the SAME move() call succeeds")
@@ -443,7 +470,7 @@ struct DatabaseSuspensionTests {
         // safe even if the explicit mid-test postResume() below already ran.
         defer {
             Self.postResume()
-            restoreAccountDB(previous: previous, dir: dir)
+            restoreAccountDB(pool: pool, previous: previous, dir: dir)
         }
 
         var newHeader = MessageHeader(

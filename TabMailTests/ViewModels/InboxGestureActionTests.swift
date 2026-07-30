@@ -99,14 +99,16 @@ struct InboxGestureActionTests {
     /// (drainPendingQueue, unread recounts, queueTagWrite's drain hop,
     /// applyManualTag steps 3-4) — they can run AFTER the defers. Restoring a
     /// nil `previous` would make `AppDatabase.rawPool`'s force-unwrap
-    /// fatalError the whole test process, so when there is no previous
-    /// AppDatabase, leave the test one (and its files) alive. Mirrors
-    /// `MessageDetailStagedFallbackTests.pinSurvivesWhileMoveQueued`.
-    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// fatalError the whole test process. `InstalledTestDatabaseLifetime`
+    /// restores a real predecessor when present, leaves a nil-predecessor
+    /// fixture installed, and retains the complete fixture group until process
+    /// exit in both cases.
+    private func restoreTestDB(previous: AppDatabase?, pool: DatabasePool, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     private func clearOverlay() {
@@ -135,7 +137,7 @@ struct InboxGestureActionTests {
     func rapidDoubleToggleReadDerivesFromVisualizedState() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -184,7 +186,7 @@ struct InboxGestureActionTests {
     func toggleReadOnStagedOnlyRowFlipsInstantlyAndResolvesGracefully() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -231,7 +233,7 @@ struct InboxGestureActionTests {
     func markReadHandlesMixedOnAndOffScreenMembers() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -287,7 +289,7 @@ struct InboxGestureActionTests {
     func rapidDoubleToggleFlagDerivesFromVisualizedState() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -322,7 +324,7 @@ struct InboxGestureActionTests {
     func drainedDBStateMatchesLastToggleTarget() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -398,7 +400,7 @@ struct InboxGestureActionTests {
     func midDrainReloadShowsFinalIntentAcrossAlternatingToggles() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -458,7 +460,7 @@ struct InboxGestureActionTests {
     func refcountDrainsToEmptyAfterAlternatingToggles() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -502,7 +504,7 @@ struct InboxGestureActionTests {
     func mixedGesturesOnSameIdSurviveUntilBothComplete() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -556,7 +558,7 @@ struct InboxGestureActionTests {
     func vanishedRowPathReleasesOverlayRetain() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -594,7 +596,7 @@ struct InboxGestureActionTests {
     func alternatingTogglesCancelOutToZeroWrites() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -646,7 +648,7 @@ struct InboxGestureActionTests {
     func oddToggleCountProducesExactlyOneWrite() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -702,7 +704,7 @@ struct InboxGestureActionTests {
     func intentAfterCycleConsumedStartsNewCycle() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -747,7 +749,7 @@ struct InboxGestureActionTests {
     func tagRetagCoalescesToLatestTag() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -787,7 +789,7 @@ struct InboxGestureActionTests {
     func tagBackToBaselineIsNoOp() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -843,7 +845,7 @@ struct InboxGestureActionTests {
     func mixedToggleAndArchiveOnSameId() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -917,7 +919,7 @@ struct InboxGestureActionTests {
     func mixedArchiveAndToggleOnSameIdReverseOrder() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -987,7 +989,7 @@ struct InboxGestureActionTests {
     func undoHoldsRetainUntilRestoreExecutes() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
             UndoService.shared.dismissAll()
         }
@@ -1034,7 +1036,7 @@ struct InboxGestureActionTests {
     func undoRestoresActionTagIntoOverlayWhileArchiveClearStillHeld() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
             UndoService.shared.dismissAll()
         }
@@ -1083,7 +1085,7 @@ struct InboxGestureActionTests {
     func undoAfterArchiveRestoresStillQueuedTagGesture() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
             UndoService.shared.dismissAll()
         }
@@ -1149,7 +1151,7 @@ struct InboxGestureActionTests {
     func detailToggleReadCancelOutIsZeroWrites() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1196,7 +1198,7 @@ struct InboxGestureActionTests {
     func threeFieldsCoalesceInOneCycle() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1262,7 +1264,7 @@ struct InboxGestureActionTests {
     func sequentialCyclesEachExecuteIndependently() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1303,7 +1305,7 @@ struct InboxGestureActionTests {
     func threadBatchRetainsPerMemberAndReleasesPerMember() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1349,7 +1351,7 @@ struct InboxGestureActionTests {
     func undoMultiMessageReleasesAllRetains() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
             UndoService.shared.dismissAll()
         }
@@ -1408,7 +1410,7 @@ struct InboxGestureActionTests {
     func markAllAsReadBeforeToggleBurstDoesNotSwallowLatestIntent() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1466,9 +1468,9 @@ struct InboxGestureActionTests {
 
     @Test("applyManualTag on a staged-only row completes gracefully — optimistic tag survives on screen, zero strand (strand-hygiene pin: the test host's merge no-op means this CANNOT distinguish ensureDurable-present from absent; the silent-tag-loss fix is guarded by code review + ADR-IOS-057, not by this test)")
     func tagOnStagedOnlyRowRunsEnsureDurableAndReleasesGracefully() async throws {
-        let (_, inbox, _, dir, previous) = try makeTestDB()
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1522,7 +1524,7 @@ struct InboxGestureActionTests {
     func tagIntentSkipsReinstateWhenRowLeftInboxBeforeExecution() async throws {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()

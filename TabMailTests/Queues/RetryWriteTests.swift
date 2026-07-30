@@ -13,20 +13,23 @@ struct RetryWriteTests {
 
     /// Creates a file-based DatabasePool for retryWrite testing.
     /// DatabasePool requires WAL mode which doesn't work with :memory:.
-    private static func makePool() throws -> DatabasePool {
-        let dir = NSTemporaryDirectory() + "retrywrite_\(UUID().uuidString)"
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let path = dir + "/test.sqlite"
-        return try DatabasePool(path: path, configuration: {
+    private static func makePool() throws -> (pool: DatabasePool, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("retrywrite_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path, configuration: {
             var config = Configuration()
             config.foreignKeysEnabled = true
             return config
         }())
+        return (pool, directory)
     }
 
     @Test("Succeeds on first attempt")
     func successFirstAttempt() async throws {
-        let db = PrioritizedDatabase(pool: try Self.makePool())
+        let (pool, directory) = try Self.makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        let db = PrioritizedDatabase(pool: pool)
         let callCount = Mutex(0)
         let result = try await retryWrite(db, maxAttempts: 3, retryDelay: .milliseconds(10), label: "test") { db in
             callCount.withLock { $0 += 1 }
@@ -38,7 +41,9 @@ struct RetryWriteTests {
 
     @Test("Retries on transient failure then succeeds")
     func retryThenSucceed() async throws {
-        let db = PrioritizedDatabase(pool: try Self.makePool())
+        let (pool, directory) = try Self.makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        let db = PrioritizedDatabase(pool: pool)
         let callCount = Mutex(0)
         let result = try await retryWrite(db, maxAttempts: 3, retryDelay: .milliseconds(10), label: "test") { db in
             let count = callCount.withLock { $0 += 1; return $0 }
@@ -54,7 +59,9 @@ struct RetryWriteTests {
     @Test("Throws after exhausting all attempts")
     func exhaustRetries() async {
         do {
-            let db = PrioritizedDatabase(pool: try Self.makePool())
+            let (pool, directory) = try Self.makePool()
+            defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+            let db = PrioritizedDatabase(pool: pool)
             _ = try await retryWrite(db, maxAttempts: 2, retryDelay: .milliseconds(10), label: "test") { _ -> Int in
                 throw TestError.transient
             }
@@ -66,7 +73,9 @@ struct RetryWriteTests {
 
     @Test("Passes Database handle to operation")
     func passesDatabase() async throws {
-        let db = PrioritizedDatabase(pool: try Self.makePool())
+        let (pool, directory) = try Self.makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        let db = PrioritizedDatabase(pool: pool)
         try await retryWrite(db, maxAttempts: 1, retryDelay: .milliseconds(10), label: "test") { db in
             try db.execute(sql: "SELECT 1")
         }
@@ -75,7 +84,9 @@ struct RetryWriteTests {
     @Test("Respects maxAttempts = 1 (no retry)")
     func singleAttemptNoRetry() async {
         do {
-            let db = PrioritizedDatabase(pool: try Self.makePool())
+            let (pool, directory) = try Self.makePool()
+            defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+            let db = PrioritizedDatabase(pool: pool)
             _ = try await retryWrite(db, maxAttempts: 1, retryDelay: .milliseconds(10), label: "test") { _ -> Int in
                 throw TestError.transient
             }

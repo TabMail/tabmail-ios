@@ -126,7 +126,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -158,10 +158,10 @@ struct InboxListBehaviorPinningTests {
 
     @Test("a staged row with no durable GRDB write yet survives a reload (the reader includes S)")
     func stagedRowSurvivesReloadPreDurability() async throws {
-        let (_, inbox, _, dir, previous) = try makeTestDB()
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -187,10 +187,10 @@ struct InboxListBehaviorPinningTests {
 
     @Test("an isRead-only overlay mutation does not evict a staged row — it survives a reload (f843c02 class, now via the reader)")
     func stagedRowSurvivesReloadAfterNonRemovingOverlayMutation() async throws {
-        let (_, inbox, _, dir, previous) = try makeTestDB()
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -222,7 +222,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -290,7 +290,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -333,7 +333,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -392,7 +392,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -432,7 +432,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -468,7 +468,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -518,7 +518,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -567,7 +567,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -625,7 +625,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -673,10 +673,10 @@ struct InboxListBehaviorPinningTests {
     // `resetMessages()` call — just via the reader, not a second insert pass.
     @Test("resetMessages surfaces staged-but-not-yet-durable rows from NSEDataBridge.latestStagedRows via the reader")
     func resetMessagesReseedsFromLatestStagedRows() throws {
-        let (_, inbox, _, dir, previous) = try makeTestDB()
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -713,7 +713,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -767,7 +767,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -869,7 +869,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -934,10 +934,10 @@ struct InboxListBehaviorPinningTests {
 
     @Test("Pass-1 retains an existing non-empty snippet when a re-synthesized staged row's fresh snippet is empty (real SnippetLoader tier-1 FTS in-place fill, ahead of the staging snapshot)")
     func pass1RetainsSnippetOnEmptyFreshRow() async throws {
-        let (_, inbox, _, dir, previous) = try makeTestDB()
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -1018,7 +1018,7 @@ struct InboxListBehaviorPinningTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()

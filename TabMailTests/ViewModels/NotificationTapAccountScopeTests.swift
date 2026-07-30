@@ -91,7 +91,7 @@ struct NotificationTapAccountScopeTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         let r1 = stagedRow(accountId: "acc1", messageId: "100", subject: "A1")
@@ -109,11 +109,11 @@ struct NotificationTapAccountScopeTests {
     @MainActor
     @Test("staged resolve: same UID in two staged rows resolves the notified account")
     func stagedResolveAccountScoped() async throws {
-        let (_, dir, previous) = try makeTwoAccountPool()
+        let (pool, dir, previous) = try makeTwoAccountPool()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let r1 = stagedRow(accountId: "acc1", messageId: "100", subject: "A1")
         let r2 = stagedRow(accountId: "acc2", messageId: "100", subject: "A2")
@@ -128,11 +128,11 @@ struct NotificationTapAccountScopeTests {
     @MainActor
     @Test("legacy (nil accountId) resolve still matches on messageId alone")
     func legacyResolveMessageIdOnly() async throws {
-        let (_, dir, previous) = try makeTwoAccountPool()
+        let (pool, dir, previous) = try makeTwoAccountPool()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let r1 = stagedRow(accountId: "acc1", messageId: "777", subject: "Solo")
         NSEDataBridge.latestStagedRows.withLock { $0 = [r1] }
@@ -150,7 +150,7 @@ struct NotificationTapAccountScopeTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let r1 = stagedRow(accountId: "acc1", messageId: "100", subject: "A1 seed")
         let r2 = stagedRow(accountId: "acc2", messageId: "100", subject: "A2 seed")
@@ -171,7 +171,7 @@ struct NotificationTapAccountScopeTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Only acc1 is staged; a tap claiming acc2 must NOT seed acc1's row.
         let r1 = stagedRow(accountId: "acc1", messageId: "100", subject: "A1 only")

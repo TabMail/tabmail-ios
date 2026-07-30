@@ -120,7 +120,11 @@ struct InboxEndToEndInvariantTests {
 
     private func cleanup(_ fixture: DBFixture) {
         AppDatabase.shared.withLock { $0 = fixture.previous }
-        try? FileManager.default.removeItem(at: fixture.dir)
+        TestDatabaseTeardown.retire(
+            pools: [fixture.pool],
+            queues: [fixture.stagingQueue],
+            directory: fixture.dir
+        )
         resetGlobals()
     }
 

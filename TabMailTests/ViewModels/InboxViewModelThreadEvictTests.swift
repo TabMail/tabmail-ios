@@ -93,7 +93,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -144,7 +144,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -179,7 +179,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         _ = try insertMessages(pool, specs: [
@@ -209,7 +209,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -259,7 +259,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -289,7 +289,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         // Thread with head dated AFTER a standalone message
@@ -328,7 +328,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -368,7 +368,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -404,7 +404,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [
@@ -443,7 +443,7 @@ struct InboxViewModelThreadEvictTests {
         let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let ids = try insertMessages(pool, specs: [

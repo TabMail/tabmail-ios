@@ -1454,14 +1454,15 @@ struct AccountManagerActionsTagClearTests {
         return h
     }
 
-    /// Mirrors `CoordinatedToolActionTests.restoreTestDB` — leave the test DB
-    /// alive (rather than force-unwrap crash the process) when there's no
-    /// previous `AppDatabase` to restore.
-    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// Mirrors `CoordinatedToolActionTests.restoreTestDB`: restore a real
+    /// predecessor when present, but retain this installed fixture until
+    /// process exit in either case because action work can outlive the test.
+    private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     private func clearOverlay() {
@@ -1474,7 +1475,7 @@ struct AccountManagerActionsTagClearTests {
     @Test("archive() (real production path): actionTag clears to nil, tagSortOrder resets to the sweepStaleActionTags sentinel (99), and NO .removeTag PendingOperation is queued — only .move")
     func archiveClearsActionTagNoRemoveTagOp() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-archive-tag", actionTag: .reply)
@@ -1499,7 +1500,7 @@ struct AccountManagerActionsTagClearTests {
     @Test("move() between two non-inbox folders (Archive -> Trash, real production path): actionTag is NOT cleared — leavingInbox is false")
     func moveBetweenNonInboxFoldersDoesNotClearTag() async throws {
         let (pool, _, archive, trash, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: archive, messageId: "m-nonInbox-move", actionTag: .reply)
@@ -1519,7 +1520,7 @@ struct AccountManagerActionsTagClearTests {
     @Test("undo restores actionTag: archive() clears the tag locally; undoDestructiveAction's full-row save (the pre-archive snapshot) restores it")
     func undoRestoresActionTagAfterArchive() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-undo-tag", actionTag: .reply)
@@ -1560,7 +1561,7 @@ struct AccountManagerActionsTagClearTests {
     @Test("move() re-resolves fresh headers by id: a stale caller snapshot (still pointing at INBOX) is superseded by the row's CURRENT folder (Archive, landed by an earlier committed move) — the queued PendingOperation's source folderPath is the FRESH location, not the stale one")
     func moveReResolvesFreshHeaderOverStaleCallerSnapshot() async throws {
         let (pool, inbox, archive, trash, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-stale-move")
@@ -1599,7 +1600,7 @@ struct AccountManagerActionsTagClearTests {
     @Test("AccountManager.overlayAdjustedSnapshot: a still-queued gesture intent's overlay actionTag wins over the DB-fresh nil — undo snapshots must read visualized state, not stale DB truth")
     func overlayAdjustedSnapshotPicksUpQueuedTagIntent() async throws {
         let (pool, inbox, _, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); clearOverlay() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
         clearOverlay()
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-overlay-snapshot")

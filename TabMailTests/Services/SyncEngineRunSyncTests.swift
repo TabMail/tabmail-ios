@@ -980,8 +980,10 @@ struct RunSyncUIDRemapFtsRekeyTests {
     func remapEmitsFtsRekey() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        defer {
+            TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir)
+        }
         try AppDatabase.runMigrations(on: pool)
 
         let date = Date(timeIntervalSince1970: 1_700_000_000)
@@ -1167,8 +1169,10 @@ struct RunSyncLargeFolderStaleSafetyTests {
     func largeFolderPartialFetchNoMassStale() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        defer {
+            TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir)
+        }
         try AppDatabase.runMigrations(on: pool)
 
         let date = Date(timeIntervalSince1970: 1_700_000_000)
@@ -1220,8 +1224,10 @@ struct RunSyncLargeFolderStaleSafetyTests {
     func smallFolderCompleteKnowledgePreserved() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        defer {
+            TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir)
+        }
         try AppDatabase.runMigrations(on: pool)
 
         let date = Date(timeIntervalSince1970: 1_700_000_000)

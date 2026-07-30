@@ -69,8 +69,8 @@ struct InboxStagedInsertTests {
     @MainActor
     @Test("insertStagedRows adds a staged row to the inbox in-memory")
     func insertsNew() throws {
-        let (_, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let vm = InboxViewModel(folders: [folder])
         vm.loadInitialPage()
         #expect(vm.loadedMessages.isEmpty)
@@ -83,8 +83,8 @@ struct InboxStagedInsertTests {
     @MainActor
     @Test("insertStagedRows dedups against already-loaded ids (no double-insert)")
     func dedups() throws {
-        let (_, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let vm = InboxViewModel(folders: [folder])
         vm.loadInitialPage()
         let row = makeStagedRow(messageId: "m1")
@@ -96,8 +96,8 @@ struct InboxStagedInsertTests {
     @MainActor
     @Test("insertStagedRows skips a row for a non-displayed folder")
     func skipsOtherFolder() throws {
-        let (_, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let vm = InboxViewModel(folders: [folder])
         vm.loadInitialPage()
         // folderId = acc1:Archive — not one of the VM's displayed folders.
@@ -109,7 +109,7 @@ struct InboxStagedInsertTests {
     @Test("staged reply adopts the on-screen thread's computedThreadId (no singleton flash)")
     func adoptsThreadId() throws {
         let (pool, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         // A durable, on-screen message with a real thread id + rfc822 id.
         var parent = MessageHeader(
             messageId: "1000", subject: "Parent", from: "Sender", fromAddress: "s@example.com",
@@ -151,7 +151,7 @@ struct InboxStagedInsertTests {
     @Test("identity dedup: staged row with remapped UID but same rfc822MessageId is NOT double-inserted")
     func identityDedupRfc822() throws {
         let (pool, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         // Durable, on-screen copy under headerId acc1:INBOX:1000.
         var durable = MessageHeader(
             messageId: "1000", subject: "Dup", from: "Sender", fromAddress: "s@example.com",
@@ -176,7 +176,7 @@ struct InboxStagedInsertTests {
     @Test("identity dedup: staged row with same (accountId, messageId) in a sibling displayed folder is NOT double-inserted")
     func identityDedupMessageId() throws {
         let (pool, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
         try pool.writeWithoutTransaction { db in let f = updates; try f.insert(db) }
         var durable = MessageHeader(
@@ -200,7 +200,7 @@ struct InboxStagedInsertTests {
     @Test("G3: identity dedup rejects a UID collision with an on-screen row when both sides' rfc822 are known and DISAGREE — both rows render")
     func identityDedupRejectsCrossFolderUidCollisionWithDifferingRfc822() throws {
         let (pool, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
         try pool.writeWithoutTransaction { db in let f = updates; try f.insert(db) }
         var durable = MessageHeader(
@@ -229,7 +229,7 @@ struct InboxStagedInsertTests {
     @Test("identity dedup: collision with rfc822 known on only ONE side still dedups (conservative default, unchanged by G3)")
     func identityDedupStillMatchesWhenOnlyOneSideHasRfc822() throws {
         let (pool, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let updates = Folder(name: "Updates", path: "Updates", role: .inbox, accountId: "acc1")
         try pool.writeWithoutTransaction { db in let f = updates; try f.insert(db) }
         var durable = MessageHeader(
@@ -257,7 +257,7 @@ struct InboxStagedInsertTests {
     @Test("identity dedup is account-scoped: same messageId on ANOTHER account still inserts")
     func identityDedupAccountScoped() throws {
         let (pool, folder, dir, previous) = try makeTestDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         try pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "two@example.com", displayName: "Two", provider: .gmail)
             acc.id = "acc2"
@@ -284,10 +284,10 @@ struct InboxStagedInsertTests {
     @MainActor
     @Test("lookupMessage synthesizes from NSEDataBridge.latestStagedRows when GRDB has none")
     func lookupSynthesizes() throws {
-        let (_, folder, dir, previous) = try makeTestDB()
+        let (pool, folder, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         }
         let vm = InboxViewModel(folders: [folder])

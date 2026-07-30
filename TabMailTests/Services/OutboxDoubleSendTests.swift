@@ -83,7 +83,7 @@ struct OutboxDoubleSendTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let draft = makeDraft()
 
@@ -112,7 +112,7 @@ struct OutboxDoubleSendTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let draft = makeDraft()
 
@@ -143,7 +143,7 @@ struct OutboxDoubleSendTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Seed a .failed row for draft "draft-failed".
         try await pool.write { db in
@@ -178,7 +178,7 @@ struct OutboxDoubleSendTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Seed the original inbox message being replied to.
         let originalId = "acc1:INBOX:orig-1"
@@ -221,7 +221,7 @@ struct OutboxDoubleSendTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         try await pool.write { db in
             for (draftId, status) in [
@@ -320,7 +320,7 @@ struct OutboxSendMainActorBlockTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let hb = Heartbeat()
@@ -372,7 +372,7 @@ struct OutboxSendMainActorBlockTests {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let hb = Heartbeat()

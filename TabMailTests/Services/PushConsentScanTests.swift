@@ -76,11 +76,11 @@ struct PushConsentScanTests {
     ) async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
 
         var config = Configuration()
         config.foreignKeysEnabled = true
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let appDb = try AppDatabase(dbPool: pool)
 
         let previousDb = AppDatabase.shared.withLock { current -> AppDatabase? in

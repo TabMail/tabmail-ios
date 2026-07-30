@@ -78,7 +78,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let row = stagedRow(messageId: "m-tap")
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
@@ -103,7 +103,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let row = stagedRow(messageId: "m-dual")
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
@@ -132,7 +132,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [stagedRow(messageId: "m-other")] }
         let vm = MessageDetailViewModel(messageId: "acc1:INBOX:m-nope", dbPool: pool, fetchBodyOverride: { _ in })
@@ -164,7 +164,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Header durable (the common few-seconds-after-push case: phase 1
         // landed, phase 2's body write hasn't), body ONLY in the staged snapshot.
@@ -200,7 +200,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Focused message is staging-only, replying into a thread whose parent
         // will only become GRDB-queryable when the merge commits.
@@ -246,7 +246,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Notification-tap open: header synthesized from the staged snapshot (so
         // the detail view renders a card) but the BODY is neither durable yet NOR
@@ -287,7 +287,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Durable body present (or a concurrent merge just re-committed it), but
         // refetchBody() deleted the row + set messageBody=nil for its refresh
@@ -322,7 +322,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Header durable, body ONLY in the staged snapshot (no durable MessageBody).
         let row = stagedRow(messageId: "m-durable-only")
@@ -356,7 +356,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Header durable, body ONLY staged (phase-1 committed the header but the
         // phase-2 durable body write hasn't landed). The phase-1 .nseMergeDidCommit
@@ -402,7 +402,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             PreviewFreezeGate.shared.end()
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let parent = stagedRow(messageId: "m-parent-frozen")
         let focused = stagedRow(messageId: "m-reply-frozen", references: [parent.rfc822MessageId!])
@@ -444,7 +444,7 @@ struct MessageDetailStagedFallbackTests {
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let parent = stagedRow(messageId: "m-parent-gone")
         let focused = stagedRow(messageId: "m-reply-gone", references: [parent.rfc822MessageId!])
@@ -480,7 +480,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let focused = stagedRow(messageId: "m-reply-pending", references: [parent.rfc822MessageId!])
         NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
@@ -525,7 +525,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let focused = stagedRow(messageId: "m-reply-airev", references: [parent.rfc822MessageId!])
         NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
@@ -577,7 +577,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let focused = stagedRow(messageId: "m-reply-undo", references: [parent.rfc822MessageId!])
         NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
@@ -624,7 +624,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let focused = stagedRow(messageId: "m-reply-overlap", references: [parent.rfc822MessageId!])
         NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
@@ -677,14 +677,14 @@ struct MessageDetailStagedFallbackTests {
         defer {
             // manager.move fires UNSTRUCTURED tasks (drainPendingQueue, unread
             // recounts — AccountManagerActions) that the drain barrier below
-            // cannot join; they may run AFTER these defers. Restoring a nil
-            // `previous` would make AppDatabase.rawPool's force-unwrap
-            // fatalError the whole test process — so when there is no
-            // previous AppDatabase, leave the test one (and its files) alive.
-            if previous != nil {
-                AppDatabase.shared.withLock { $0 = previous }
-                try? FileManager.default.removeItem(at: dir)
-            }
+            // cannot join; they may run AFTER these defers. Restore a real
+            // predecessor when present, but retain the complete installed
+            // fixture until process exit in either case.
+            InstalledTestDatabaseLifetime.finish(
+                previous: previous,
+                pool: pool,
+                directory: dir
+            )
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
         }
@@ -754,7 +754,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let focused = stagedRow(messageId: "m-reply-sibling", references: [parent.rfc822MessageId!])
         NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
@@ -800,7 +800,7 @@ struct MessageDetailStagedFallbackTests {
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             AccountManager.shared.removeOverlayEntries(ids: [parent.headerId])
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // ThreadDetection excludes by folder ROLE — the Trash folder row must
         // exist for the exclusion to engage.

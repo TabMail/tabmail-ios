@@ -100,7 +100,7 @@ struct SameFolderNoOpTests {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let archivedId = try insertMessage(pool, messageId: "a1", folder: archive, date: baseDate)
@@ -117,7 +117,7 @@ struct SameFolderNoOpTests {
         let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let trashedId = try insertMessage(pool, messageId: "t1", folder: trash, date: baseDate)
@@ -136,7 +136,7 @@ struct SameFolderNoOpTests {
         let (pool, _, archive, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id = try insertMessage(pool, messageId: "a1", folder: archive, date: baseDate)
@@ -163,7 +163,7 @@ struct SameFolderNoOpTests {
         let (pool, _, archive, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id1 = try insertMessage(pool, messageId: "t1", folder: archive, date: baseDate, computedThreadId: "thread-1")
@@ -188,7 +188,7 @@ struct SameFolderNoOpTests {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
@@ -215,7 +215,7 @@ struct SameFolderNoOpTests {
         let (pool, _, _, trash, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id = try insertMessage(pool, messageId: "t1", folder: trash, date: baseDate)
@@ -242,7 +242,7 @@ struct SameFolderNoOpTests {
         let (pool, _, _, trash, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id1 = try insertMessage(pool, messageId: "t1", folder: trash, date: baseDate, computedThreadId: "thread-1")
@@ -267,7 +267,7 @@ struct SameFolderNoOpTests {
         let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
@@ -299,7 +299,7 @@ struct SameFolderNoOpTests {
         let (pool, _, _, trash, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         // Second trash-role folder, mirroring the known iCloud situation.
@@ -336,7 +336,7 @@ struct SameFolderNoOpTests {
         let (pool, _, _, trash, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let deletedMessages = Folder(name: "Deleted Messages", path: "Deleted Messages", role: .trash, accountId: "acc1")
@@ -371,7 +371,7 @@ struct SameFolderNoOpTests {
         let (pool, _, archive, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let id = try insertMessage(pool, messageId: "a1", folder: archive, date: baseDate)
@@ -390,7 +390,7 @@ struct SameFolderNoOpTests {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
 
         let archivedId = try insertMessage(pool, messageId: "a1", folder: archive, date: baseDate)

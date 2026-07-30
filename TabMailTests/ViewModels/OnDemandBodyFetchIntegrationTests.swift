@@ -19,6 +19,9 @@ private func makeTestPool() throws -> (pool: DatabasePool, dir: URL) {
     config.foreignKeysEnabled = true
     let pool = try DatabasePool(path: path, configuration: config)
     try AppDatabase.runMigrations(on: pool)
+    // Message-detail work can outlive the assertion that launched it. Keep the
+    // pool alive through the test-host boundary, then close before unlinking.
+    TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir)
     return (pool, dir)
 }
 

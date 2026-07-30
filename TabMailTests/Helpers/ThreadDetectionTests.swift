@@ -13,14 +13,16 @@ struct ThreadDetectionTests {
     // MARK: - Helpers
 
     /// Creates a file-based DatabasePool (ThreadDetection requires DatabasePool, not DatabaseQueue)
-    private func makePool() throws -> DatabasePool {
-        let tempDir = FileManager.default.temporaryDirectory
-        let dbPath = tempDir.appendingPathComponent("test_thread_\(UUID().uuidString).sqlite").path
+    private func makePool() throws -> (pool: DatabasePool, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_thread_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let dbPath = directory.appendingPathComponent("test.sqlite").path
         var config = Configuration()
         config.foreignKeysEnabled = true
         let pool = try DatabasePool(path: dbPath, configuration: config)
         try AppDatabase.runMigrations(on: pool)
-        return pool
+        return (pool, directory)
     }
 
     private func insertAccount(_ pool: DatabasePool, id: String = "acc1") throws {
@@ -77,7 +79,8 @@ struct ThreadDetectionTests {
 
     @Test("No related messages for standalone email")
     func standaloneEmail() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -89,7 +92,8 @@ struct ThreadDetectionTests {
 
     @Test("Finds parent via inReplyTo → rfc822MessageId")
     func findsParent() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -105,7 +109,8 @@ struct ThreadDetectionTests {
 
     @Test("Finds children via rfc822MessageId ← inReplyTo")
     func findsChildren() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -123,7 +128,8 @@ struct ThreadDetectionTests {
 
     @Test("Finds siblings (same inReplyTo)")
     func findsSiblings() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -141,7 +147,8 @@ struct ThreadDetectionTests {
 
     @Test("Native threadId finds related messages")
     func nativeThreadId() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -157,7 +164,8 @@ struct ThreadDetectionTests {
 
     @Test("Synthetic subj: threadId is ignored")
     func syntheticSubjThreadIdIgnored() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -172,7 +180,8 @@ struct ThreadDetectionTests {
 
     @Test("Results are sorted by date descending")
     func sortedByDateDescending() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -198,7 +207,8 @@ struct ThreadDetectionTests {
 
     @Test("Chain walking finds grandparent")
     func chainWalkingGrandparent() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -219,7 +229,8 @@ struct ThreadDetectionTests {
 
     @Test("Deep forward chain walking finds all descendants")
     func deepForwardChain() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -256,7 +267,8 @@ struct ThreadDetectionTests {
 
     @Test("Forward chain from first message finds all replies")
     func forwardChainFromFirst() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -288,7 +300,8 @@ struct ThreadDetectionTests {
 
     @Test("Empty inReplyTo and rfc822MessageId returns empty")
     func emptyFieldsReturnsEmpty() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -302,7 +315,8 @@ struct ThreadDetectionTests {
 
     @Test("Forward references: finds ancestor via References header when inReplyTo is missing from DB")
     func forwardReferencesFindsAncestor() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -324,7 +338,8 @@ struct ThreadDetectionTests {
 
     @Test("Reverse references: finds descendant that references me")
     func reverseReferencesFindsDescendant() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -346,7 +361,8 @@ struct ThreadDetectionTests {
 
     @Test("Transitive references: BFS expansion connects siblings through shared ancestor")
     func transitiveReferencesViaBFS() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -386,7 +402,8 @@ struct ThreadDetectionTests {
 
     @Test("Opening original message finds all descendants via reverse references")
     func originalFindsAllDescendantsViaReverseRefs() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -418,7 +435,8 @@ struct ThreadDetectionTests {
 
     @Test("Union approach: all signals combined — inReplyTo chain + references + threadId")
     func allSignalsCombined() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -462,7 +480,8 @@ struct ThreadDetectionTests {
 
     @Test("Reverse lookup uses messageReference table — single descendant")
     func junctionTableReverseBasic() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -483,7 +502,8 @@ struct ThreadDetectionTests {
 
     @Test("Reverse lookup uses messageReference table — multiple descendants")
     func junctionTableReverseMultiple() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -508,7 +528,8 @@ struct ThreadDetectionTests {
 
     @Test("BFS expansion finds transitive connections via junction table")
     func junctionTableBFSTransitive() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -536,7 +557,8 @@ struct ThreadDetectionTests {
 
     @Test("Junction table reverse lookup with no messageReference rows returns empty")
     func junctionTableNoRows() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -551,7 +573,8 @@ struct ThreadDetectionTests {
 
     @Test("Junction table reverse lookup does not return self")
     func junctionTableExcludesSelf() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -567,7 +590,8 @@ struct ThreadDetectionTests {
 
     @Test("Trashed replies are excluded from related messages")
     func trashedReplyExcluded() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -594,7 +618,8 @@ struct ThreadDetectionTests {
 
     @Test("Spam replies are excluded from related messages")
     func spamReplyExcluded() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Spam", path: "Spam", role: .spam)
@@ -619,7 +644,8 @@ struct ThreadDetectionTests {
 
     @Test("Trash exclusion applies to native threadId lookups")
     func trashExcludedFromThreadId() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -641,7 +667,8 @@ struct ThreadDetectionTests {
 
     @Test("Trash exclusion applies to reverse reference (junction table) lookups")
     func trashExcludedFromReverseReferences() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -661,7 +688,8 @@ struct ThreadDetectionTests {
 
     @Test("Mixed thread: live siblings still appear when some are trashed")
     func mixedThreadLiveSiblingsKept() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -696,7 +724,8 @@ struct ThreadDetectionTests {
 
     @Test("Trashed parent is excluded when walking inReplyTo upward")
     func trashedParentExcluded() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -718,7 +747,8 @@ struct ThreadDetectionTests {
 
     @Test("Forward references lookup excludes trashed ancestors")
     func forwardReferencesExcludesTrash() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -742,7 +772,8 @@ struct ThreadDetectionTests {
 
     @Test("Cross-account: trash in one account does not filter inbox in another")
     func crossAccountTrashIsolation() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool, id: "acc1")
         try insertAccount(pool, id: "acc2")
         try insertFolder(pool, accountId: "acc1") // INBOX
@@ -811,7 +842,8 @@ struct ThreadDetectionTests {
         // Same production scenario as `lateralSiblingsViaSharedExternalAncestor`,
         // but asserting the insert-time thread ADOPTION (inbox grouping path)
         // rather than the detail-view FIND path.
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -842,7 +874,8 @@ struct ThreadDetectionTests {
 
     @Test("assignComputedThreadId: Gmail/Exchange native threadId is authoritative")
     func assignComputedThreadIdNativeTakesPrecedence() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -856,7 +889,8 @@ struct ThreadDetectionTests {
 
     @Test("assignComputedThreadId: subj: native threadId is ignored (IMAP fallback path runs)")
     func assignComputedThreadIdSubjSkipped() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -879,7 +913,8 @@ struct ThreadDetectionTests {
         // still cite in their References headers are NOT in the local DB.
         // Neither message's inReplyTo points at the other. They can only be
         // linked via their shared References entry (the missing external ancestor).
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -915,7 +950,8 @@ struct ThreadDetectionTests {
         // Both messages reply to the same parent, but the parent row is absent.
         // Classic "sibling via inReplyTo" already worked under the old code, but
         // re-covering this path under the unified query protects against regression.
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool)
 
@@ -940,7 +976,8 @@ struct ThreadDetectionTests {
 
     @Test("Lateral linkage respects Trash/Spam exclusion")
     func lateralRespectsExcludedFolders() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)
@@ -968,7 +1005,8 @@ struct ThreadDetectionTests {
 
     @Test("Trash BFS: deleted intermediate must not leak its descendants into results")
     func trashBFSBlocksDescendants() throws {
-        let pool = try makePool()
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
         try insertAccount(pool)
         try insertFolder(pool) // INBOX
         try insertFolder(pool, name: "Trash", path: "Trash", role: .trash)

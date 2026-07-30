@@ -129,12 +129,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("Archived-then-restaged message: staging row deleted, snapshots scrubbed, stage-memo dropped, durable header stays in Archive")
     func archivedMessageRestagedIsInvalidatedNotResurrected() async throws {
         let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // ── Merge 1: ordinary push arrives, message lands in INBOX. ──
         try stageHeaderRow(q)
@@ -187,12 +193,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("IMAP UID-remap archive (durable header re-keyed, found via rfc822 fallback): invalidation is keyed by the STAGED headerId")
     func uidRemapArchiveInvalidatesByStagedHeaderId() async throws {
         let (dir, pool, _, archive, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // Merge 1: message lands durable in INBOX under the staged identity.
         try stageHeaderRow(q)
@@ -230,12 +242,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("A normal new message (no durable header yet) is NOT invalidated — merges normally")
     func newMessageWithoutDurableHeaderMergesNormally() async throws {
         let (dir, pool, inbox, _, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // Brand-new message, never seen before — no durable header exists.
         try stageHeaderRow(q, messageId: "msg-new")
@@ -269,12 +287,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("A staged row colliding on UID with an UNRELATED Archive message (differing rfc822) is NOT flagged stale-by-move — merges normally")
     func crossFolderUidCollisionIsNotFlaggedStaleByMove() async throws {
         let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // An UNRELATED message, already durable in Archive, sharing the SAME
         // raw UID ("msg-1") the staged row below will carry — but with a
@@ -333,12 +357,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("Scrub-only wake (only staged row is stale-by-move) posts exactly ONE immediate inboxDataDidChange")
     func scrubOnlyWakePostsExactlyOneImmediateReload() async throws {
         let (dir, pool, _, archive, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // ── Merge 1: ordinary push arrives, message lands in INBOX as a KEPT
         // gradual row (header-only, aiCompleted=0). ──
@@ -405,12 +435,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("Redelivery (two-wake): a stale-by-move row re-staged after the scrub-only wake evicted it once is scrubbed AGAIN with its own single immediate reload — no accumulation, no suppression on wake 2")
     func redeliveredStaleRowIsScrubbedAgainOnSecondWake() async throws {
         let (dir, pool, _, archive, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // ── Merge 1: ordinary push, kept gradual row. ──
         try stageHeaderRow(q)
@@ -490,12 +526,18 @@ struct NSEStaleStagedRowInvalidationTests {
     @Test("Mixed wake (stale-by-move row + genuinely new row): standard post pattern (≤2 total, no third post from the scrub branch); stale row scrubbed, new row merged durably")
     func mixedWakeStaleAndNewRowPostsStandardPattern() async throws {
         let (dir, pool, inbox, archive, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         resetGlobals()
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // ── Merge 1: ordinary push for "msg-1" arrives, kept gradual row
         // (header-only, aiCompleted=0). ──

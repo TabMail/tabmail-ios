@@ -122,10 +122,10 @@ struct InboxListReaderIntegrationTests {
 
     @Test("a staged-only row (no durable header anywhere) appears via fetch AND fetchSync")
     func stagedOnlyRowAppearsInBothVariants() async throws {
-        let (_, inbox, _, dir, previous) = try makeTestDB()
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -152,7 +152,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -187,7 +187,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -218,7 +218,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -253,7 +253,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -293,7 +293,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -347,7 +347,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -422,7 +422,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, archive, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
@@ -455,7 +455,7 @@ struct InboxListReaderIntegrationTests {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()

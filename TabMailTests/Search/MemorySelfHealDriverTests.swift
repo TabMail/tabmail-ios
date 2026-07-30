@@ -34,14 +34,15 @@ struct MemorySelfHealDriverTests {
         return (pool, dir, previous)
     }
 
-    @MainActor
     private func tearDownAppDB(pool: DatabasePool, dir: URL, previous: AppDatabase?) {
-        AppDatabase.shared.withLock { $0 = previous }
-        try? pool.close()
-        try? FileManager.default.removeItem(at: dir)
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
-    private func makeMemoryDB() async throws -> URL {
+    private func makeMemoryDB() async throws -> (pool: DatabasePool, directory: URL) {
         await MemoryIndex.shared._testReset()
         await BackfillMemoryEmbeddingQueue.shared._testReset()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -57,7 +58,7 @@ struct MemorySelfHealDriverTests {
         }
         let pool = try DatabasePool(path: path, configuration: config)
         try await MemoryIndex.shared._testInstallPool(pool)
-        return dir
+        return (pool, dir)
     }
 
     @MainActor
@@ -86,10 +87,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A indexes turns in chatHistory but not in memory_meta (older than idle cutoff)")
     func stageA_indexesMissingTurns() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -109,10 +110,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A respects idle cutoff — skips in-progress turns")
     func stageA_idleCutoffRespected() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -133,10 +134,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A indexes every scope (inbox + msg: + compose:)")
     func stageA_indexesEveryScope() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         let oldTs = Double(Int64(Date().timeIntervalSince1970 * 1000) - 10 * 60_000)
@@ -157,10 +158,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A filters non-normal / unknown-role turns")
     func stageA_filtersNonAllowlisted() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         let oldTs = Double(Int64(Date().timeIntervalSince1970 * 1000) - 10 * 60_000)
@@ -179,10 +180,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A is idempotent — double-run produces no re-index")
     func stageA_idempotent() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         let oldTs = Double(Int64(Date().timeIntervalSince1970 * 1000) - 10 * 60_000)
@@ -205,10 +206,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A deletes memory.db orphans whose chatHistoryId is not in chatHistory")
     func stageA_deletesOrphans() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         // Seed memory.db with two rows — one also in chatHistory, one orphan.
@@ -229,10 +230,10 @@ struct MemorySelfHealDriverTests {
     @Test("Stage A does NOT delete memory.db rows for still-active (within idle cutoff) chatHistory turns")
     func stageA_preservesActiveRowsInMemoryDB() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         // "active" chatHistory row (within idle cutoff) AND indexed in memory.db via appendTurn.
@@ -255,10 +256,10 @@ struct MemorySelfHealDriverTests {
     @Test("runStageAPlusB: turns FTS+meta indexed and enqueued for embedding")
     func stageAPlusB_endToEnd() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
-        let memDir = try await makeMemoryDB()
+        let (memPool, memDir) = try await makeMemoryDB()
         defer {
-            Task { @MainActor in tearDownAppDB(pool: pool, dir: appDir, previous: previous) }
-            Task { await MemoryIndex.shared._testReset(); try? FileManager.default.removeItem(at: memDir) }
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
         }
 
         let oldTs = Double(Int64(Date().timeIntervalSince1970 * 1000) - 10 * 60_000)

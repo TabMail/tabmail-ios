@@ -143,11 +143,17 @@ struct NSEMergeStageMemoTests {
     @Test("First merge writes durable header+body and records the memo; second merge with UNCHANGED staging skips (no reload signal, row still verified-skipped)")
     func unchangedGradualRowSkipsSecondMerge() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         NSEDataBridge.resetStageMemoForTesting()
 
         try stageHeaderRow(q)
@@ -197,11 +203,17 @@ struct NSEMergeStageMemoTests {
     @Test("Stage advance: a kept row's memo key updates as content grows, and a terminal advance writes the AI fields")
     func advancingContentIsRewrittenAndMemoTracksIt() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         NSEDataBridge.resetStageMemoForTesting()
         let stagingId = "acc1:msg-1"
 
@@ -253,11 +265,17 @@ struct NSEMergeStageMemoTests {
     @Test("Durability-verify fallback: a deleted durable header/body is NOT masked by a memo hit — re-merge recreates it")
     func deletedDurableRowIsRecreatedNotSkipped() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         NSEDataBridge.resetStageMemoForTesting()
         let stagingId = "acc1:msg-1"
 
@@ -301,12 +319,18 @@ struct NSEMergeStageMemoTests {
 
     @Test("Memo cleanup: once a terminal row drains, its stage-memo entry is removed")
     func memoEntryRemovedOnTerminalDrain() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         NSEDataBridge.resetStageMemoForTesting()
         let stagingId = "acc1:msg-1"
 
@@ -332,11 +356,17 @@ struct NSEMergeStageMemoTests {
     @Test("Skip-set cleanup: an abandoned, memo-matched row is drained from staging via the skip path (no GRDB re-write needed)")
     func abandonedSkipSetRowIsDrained() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         NSEDataBridge.resetStageMemoForTesting()
         let stagingId = "acc1:msg-1"
 

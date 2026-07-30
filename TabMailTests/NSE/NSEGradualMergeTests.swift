@@ -142,11 +142,17 @@ struct NSEGradualMergeTests {
     @Test("Header → body → AI: each stage merges incrementally; row kept until AI, then deleted")
     func gradualLifecycle() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // ── Stage 1: header only ──
         try stageHeaderRow(q)
@@ -194,11 +200,17 @@ struct NSEGradualMergeTests {
     @Test("Abandoned gradual row (aiCompleted=0, old) is merged then cleaned up")
     func abandonedRowCleanedUp() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // Header-only row whose NSE died long ago (well past the 60s stale window).
         try stageHeaderRow(q, processedAt: Date().timeIntervalSince1970 - 120)
@@ -214,11 +226,17 @@ struct NSEGradualMergeTests {
     @Test("Terminal full row merges and deletes in a single pass (regression)")
     func terminalRowInOnePass() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         try stageHeaderRow(q)
         try stageBodyRow(q)
@@ -236,11 +254,17 @@ struct NSEGradualMergeTests {
     @Test("Coordinator serializes concurrent merges — terminal row merged exactly once")
     func concurrentMergesSerialized() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // A complete, terminal staged message.
         try stageHeaderRow(q)
@@ -280,11 +304,17 @@ struct NSEGradualMergeTests {
     @Test("Header-only / body-less merge makes the message inbox-visible immediately (headerComplete=1, bodyComplete=0)")
     @MainActor func mergeFlipsHeaderCompleteSynchronously() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // Header only — no body text. Header visibility is DECOUPLED from body
         // indexing: the merge FTS-indexes the header and flips headerComplete=1
@@ -312,11 +342,17 @@ struct NSEGradualMergeTests {
     @Test("Unresolved-CID body: header becomes visible; no MessageBody cached, bodyComplete stays 0")
     @MainActor func unresolvedCIDMergeStillVisible() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
 
         // A pushed inline-image email whose CIDs the NSE could not resolve within
         // its memory budget — it has a body, but the body is neither MessageBody-
@@ -359,12 +395,18 @@ struct NSEGradualMergeTests {
 
     @Test("Two-phase merge emits TWO immediate inboxDataDidChange (header render, then body/AI)")
     @MainActor func mergePostsSingleImmediateSignal() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
         try stageBodyRow(q)
         try stageAIRow(q, action: "archive")
@@ -396,12 +438,18 @@ struct NSEGradualMergeTests {
 
     @Test("Merge posts .nseMergeDidCommit at phase-1 surface and end-of-merge; none on an empty re-merge")
     @MainActor func mergePostsMergeCommitSignal() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
         try stageBodyRow(q)
         try stageAIRow(q, action: "archive")
@@ -435,12 +483,18 @@ struct NSEGradualMergeTests {
 
     @Test("Re-merge with nothing new emits NO extra inboxDataDidChange (no redundant reload)")
     @MainActor func reMergeWithoutChangesEmitsNoSignal() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         // Header + body, NO AI → a KEPT gradual row (aiCompleted=0) that survives
         // the first merge in staging and is re-read on the next wake.
         try stageHeaderRow(q)
@@ -469,12 +523,18 @@ struct NSEGradualMergeTests {
 
     @Test("Re-merge of a summary-staged, action-pending row emits NO extra reload")
     @MainActor func reMergeWithSummaryButNoActionEmitsNoSignal() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
         try stageBodyRow(q)
         // Summary staged but NOT aiCompleted — the NSE stages the summary BEFORE the
@@ -510,12 +570,18 @@ struct NSEGradualMergeTests {
 
     @Test("Re-merge of a re-staged TERMINAL (aiCompleted) row emits NO extra reload")
     @MainActor func reMergeTerminalRowEmitsNoSignal() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
         try stageBodyRow(q)
         try stageAIRow(q, action: "archive")   // terminal: aiCompleted=1 + summary + action
@@ -553,11 +619,17 @@ struct NSEGradualMergeTests {
     @Test("Measurement: header-only merge surfaces the message fast (not blocked on AI)")
     func headerOnlyMergeIsFast() async throws {
         let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(
+                pools: [pool],
+                queues: ownedQueues,
+                directory: dir
+            )
         }
         let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
         try stageHeaderRow(q)
 
         let t0 = CFAbsoluteTimeGetCurrent()

@@ -59,14 +59,17 @@ struct DrainQueueIntegrationTests {
         return (pool, dir, previous)
     }
 
-    /// See `InboxGestureActionTests.restoreTestDB` — leaves the test DB alive (rather than
-    /// restoring a nil `previous`) when there was no prior `AppDatabase`, since
-    /// `AppDatabase.rawPool`'s force-unwrap would crash the whole test process later.
-    private func restoreRealDrainTestDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// See `InboxGestureActionTests.restoreTestDB`: the REAL `executeSingleOp`
+    /// driven here fires unstructured background Tasks that can outlive the test
+    /// body, so no earlier boundary can safely close the pool. Restore a real
+    /// predecessor when present, and retain this installed fixture until process
+    /// exit in either case.
+    private func restoreRealDrainTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     // MARK: - Helpers
@@ -468,7 +471,7 @@ struct DrainQueueIntegrationTests {
         // immediately, best-effort" — which a `.setTag` op reaches via the
         // SUCCESS path (executeOperation no-ops → op deletes normally).
         let (pool, dir, previous) = try makeRealDrainTestDB()
-        defer { restoreRealDrainTestDB(previous: previous, dir: dir) }
+        defer { restoreRealDrainTestDB(pool: pool, previous: previous, dir: dir) }
 
         let op = PendingOperation(
             type: .setTag,
@@ -497,7 +500,7 @@ struct DrainQueueIntegrationTests {
         // the destination-existence confirmation, so it falls through to retry —
         // matching production behavior for fresh ops (retryCount 0 < the cap).
         let (pool, dir, previous) = try makeRealDrainTestDB()
-        defer { restoreRealDrainTestDB(previous: previous, dir: dir) }
+        defer { restoreRealDrainTestDB(pool: pool, previous: previous, dir: dir) }
 
         await provider.setMoveThrows(ProviderError.uidResolutionFailed("msg-1"))
 

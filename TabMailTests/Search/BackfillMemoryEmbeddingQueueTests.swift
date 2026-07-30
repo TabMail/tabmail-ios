@@ -21,7 +21,7 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     // MARK: - Fixtures
 
-    private func makeMemoryIndex() async throws -> URL {
+    private func makeMemoryIndex() async throws -> (pool: DatabasePool, directory: URL) {
         await MemoryIndex.shared._testReset()
         await BackfillMemoryEmbeddingQueue.shared._testReset()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -37,13 +37,7 @@ struct BackfillMemoryEmbeddingQueueTests {
         }
         let pool = try DatabasePool(path: path, configuration: config)
         try await MemoryIndex.shared._testInstallPool(pool)
-        return dir
-    }
-
-    private func cleanup(_ dir: URL) async {
-        await BackfillMemoryEmbeddingQueue.shared._testReset()
-        await MemoryIndex.shared._testReset()
-        try? FileManager.default.removeItem(at: dir)
+        return (pool, dir)
     }
 
     /// Seed a user turn. Returns the chatHistoryId.
@@ -57,8 +51,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("repopulateFromDatabase enqueues only embeddingComplete=0 rows")
     func repopulate_enqueuesOnlyIncomplete() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await seedTurn("r1")
         await seedTurn("r2")
@@ -81,8 +75,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("repopulate short-circuits when EmbeddingService.shared is nil")
     func repopulate_gatesOnEmbeddingServiceNil() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await seedTurn("g1")
         guard EmbeddingService.shared == nil else { return }
@@ -95,8 +89,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("processBatch gracefully handles missing turn (mark done, shouldRetry=false)")
     func processBatch_handlesMissingTurn() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await BackfillMemoryEmbeddingQueue.shared.enqueue(chatHistoryId: "ghost")
         try await Task.sleep(for: .milliseconds(750))
@@ -107,8 +101,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("cancelAllInFlight resets counters")
     func cancelAllInFlight_resets() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await BackfillMemoryEmbeddingQueue.shared.enqueue(chatHistoryId: "c1")
         await BackfillMemoryEmbeddingQueue.shared.enqueue(chatHistoryId: "c2")
@@ -120,8 +114,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("Epoch mismatch returns skippedRace via direct storeEmbeddings call")
     func processBatch_skipsStoreOnEpochMismatch() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await seedTurn("x", content: "first")
         let map1 = await MemoryIndex.shared.ftsContentWithEpochs(chatHistoryIds: ["x"])
@@ -142,8 +136,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("Epoch stamp catches rowid-reuse (contiguous rowids, delete/insert reuses)")
     func processBatch_epochStampCatchesRowidReuse() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for i in 1...5 {
             await seedTurn("t\(i)", content: "content\(i)")
@@ -167,8 +161,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("awaitDrain returns quickly when queue is empty")
     func awaitDrain_returnsQuicklyWhenEmpty() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         let start = Date()
         await BackfillMemoryEmbeddingQueue.shared.awaitDrain()
         let elapsed = Date().timeIntervalSince(start)
@@ -179,8 +173,8 @@ struct BackfillMemoryEmbeddingQueueTests {
 
     @Test("pendingEmbeddingChatHistoryIds respects chunk (large seed)")
     func pending_respectsChunkLimit() async throws {
-        let dir = try await makeMemoryIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeMemoryIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for i in 0..<12 {
             await seedTurn("p\(i)")

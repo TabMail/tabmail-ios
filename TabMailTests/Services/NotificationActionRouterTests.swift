@@ -81,13 +81,15 @@ struct NotificationActionRouterTests {
     /// Teardown shared by every test. Mirrors `CoordinatedToolActionTests.restoreTestDB`:
     /// production paths driven here (drainPendingQueue, unread recounts) fire
     /// unstructured background Tasks the drain barrier cannot join, so they can run
-    /// AFTER the defers — leave the test DB alive when there's no previous one to
-    /// restore, rather than let `AppDatabase.rawPool`'s force-unwrap crash the process.
-    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// AFTER the defers. Restore a real predecessor when present, but retain this
+    /// fixture until process exit in either case so escaped work never reaches a
+    /// closed pool.
+    private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     /// Cold-path tests must not accidentally resolve via a staged row left
@@ -103,7 +105,7 @@ struct NotificationActionRouterTests {
     @Test("durable header + ARCHIVE routes through AccountManager.archive: row moves to Archive, ONE .move PendingOperation is queued with the original folder as source")
     func durableHeaderArchiveRoutesThroughManager() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-archive-durable")
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
@@ -134,7 +136,7 @@ struct NotificationActionRouterTests {
     @Test("no header anywhere (cold background launch) + ARCHIVE queues a .move PendingOperation directly: folderPath == inbox path, destinationPath == archive path, messageIds == [messageId]")
     func noHeaderArchiveQueuesColdMoveOp() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); resetStagedGlobal() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal() }
         resetStagedGlobal()
 
         // HONESTY NOTE: `NotificationActionRouter.execute` runs one
@@ -169,7 +171,7 @@ struct NotificationActionRouterTests {
     @Test("no header anywhere + MARK_READ queues a .markRead PendingOperation directly against the inbox path")
     func noHeaderMarkReadQueuesColdMarkReadOp() async throws {
         let (pool, inbox, _, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir); resetStagedGlobal() }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal() }
         resetStagedGlobal()
 
         // HONESTY NOTE (see the identical note on noHeaderArchiveQueuesColdMoveOp
@@ -194,7 +196,7 @@ struct NotificationActionRouterTests {
     @Test("durable header + DELETE routes through AccountManager.delete: row moves to Trash, ONE .move PendingOperation targets Trash")
     func durableHeaderDeleteRoutesThroughManager() async throws {
         let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-delete-durable")
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
@@ -224,7 +226,7 @@ struct NotificationActionRouterTests {
     @Test("same messageId (UID) exists in both the inbox and archive folders — IMAP UIDs are folder-scoped, so ARCHIVE must act on the INBOX row ONLY; the pre-existing archive-folder row with the same UID is untouched")
     func sameUidTwoFoldersArchiveActsOnInboxRowOnly() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         // Insert the ARCHIVE-folder row FIRST (lower rowid) — an unfiltered
         // `fetchOne` (no ORDER BY, no folder predicate) tends to return rows

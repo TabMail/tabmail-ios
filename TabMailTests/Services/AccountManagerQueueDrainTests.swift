@@ -46,15 +46,17 @@ struct AccountManagerQueueDrainTests {
         return (pool, dir, previous)
     }
 
-    /// See `InboxGestureActionTests.restoreTestDB` — leaves the test DB alive
-    /// (rather than restoring a nil `previous`) if there was no prior
-    /// `AppDatabase`, since `AppDatabase.rawPool`'s force-unwrap would crash
-    /// the whole test process on the next unrelated access.
-    private func restoreTestDB(previous: AppDatabase?, dir: URL) {
-        if previous != nil {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+    /// See `InboxGestureActionTests.restoreTestDB`: the drain paths driven here
+    /// fire unstructured background Tasks that can outlive the test body, so no
+    /// earlier boundary can safely close the pool. Restore a real predecessor
+    /// when present, and retain this installed fixture until process exit in
+    /// either case.
+    private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
     }
 
     private func insertOp(_ op: PendingOperation, pool: DatabasePool) throws {
@@ -70,7 +72,7 @@ struct AccountManagerQueueDrainTests {
     @Test(".markRead + uidResolutionFailed, uidResolutionRetryCount 0: op reset to queued, uidResolutionRetryCount bumped (retryCount untouched), outcome .haltLane")
     func markReadUidResolutionFailedFirstRetryHalts() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("msg-1"))
@@ -94,7 +96,7 @@ struct AccountManagerQueueDrainTests {
     @Test(".markRead + uidResolutionFailed at retry cap (on the DEDICATED uidResolutionRetryCount): op deleted (confirmed stale), outcome .proceed")
     func markReadUidResolutionFailedAtCapDrops() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("msg-1"))
@@ -115,7 +117,7 @@ struct AccountManagerQueueDrainTests {
     @Test("Contamination regression: retryCount at cap from prior generic-branch blips does NOT pre-exhaust uidResolutionRetryCount — op requeued, not dropped")
     func retryCountAtCapDoesNotContaminateUidResolutionCap() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("msg-1"))
@@ -147,7 +149,7 @@ struct AccountManagerQueueDrainTests {
     @Test(".setTag completes immediately (local-only, ADR-IOS-036): op deleted, outcome .proceed, provider never called")
     func setTagCompletesImmediatelyBestEffort() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         // NOTE: `executeOperation`'s `.setTag`/`.removeTag` case is a local-only
         // no-op (ADR-IOS-036) — it never calls the provider, so it can never
@@ -176,7 +178,7 @@ struct AccountManagerQueueDrainTests {
     @Test(".move + uidResolutionFailed with non-IMAP provider: reset to queued, failedAccounts NOT touched, outcome .haltLane")
     func moveUidResolutionFailedNonIMAPProviderHalts() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         // MockEmailProvider is NOT an IMAPProvider, so the destination-existence
         // check (`provider as? IMAPProvider`) can never run — this exercises the
@@ -204,7 +206,7 @@ struct AccountManagerQueueDrainTests {
     @Test("Lane halt integration: markFlagged never executes after markRead's uidResolutionFailed halts the lane")
     func laneHaltIntegrationBlocksLaterOpInSameLane() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("msg-1"))
@@ -267,7 +269,7 @@ struct AccountManagerQueueDrainTests {
     @Test("Batch messageNotFound split: each new single-message op inherits the parent's createdAt, not Date()")
     func messageNotFoundBatchSplitPreservesCreatedAt() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMoveThrows(ProviderError.messageNotFound)
@@ -303,7 +305,7 @@ struct AccountManagerQueueDrainTests {
     @Test("Batch uidResolutionFailed split: each new single-message op inherits the parent's createdAt, not Date()")
     func uidResolutionFailedBatchSplitPreservesCreatedAt() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("msg-1"))
@@ -347,7 +349,7 @@ struct AccountManagerQueueDrainTests {
     @Test("Lane halt integration: batch move split halts the lane — the chained move on a shared message id never executes in the same pass")
     func laneHaltsAfterBatchSplitBlocksChainedOp() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMoveThrows(ProviderError.uidResolutionFailed("msg-a"))
@@ -418,7 +420,7 @@ struct AccountManagerQueueDrainTests {
     @Test("reconcilePendingOperations (real function): inFlight→queued, cancelled deleted, queued untouched, count==2 — accountId has no registered provider so the triggered drain no-ops safely")
     func reconcilePendingOperationsResetsInFlightDeletesCancelledLeavesQueued() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         // No provider registered for "acc-gap1" — drainPendingQueue's claim
         // loop (`guard providers[op.accountId] != nil else { ...skip... }`,
@@ -463,7 +465,7 @@ struct AccountManagerQueueDrainTests {
     @Test("Batch move [A,B,C] fails on B via a generic connection error (ProviderError.notConnected): the WHOLE op resets to queued (not split), retryCount+1, failedAccounts marked, movedIds shows only the successful prefix [A] — a cleared retry then completes the op")
     func batchMoveGenericFailureHaltsWholeOpThenRetrySucceeds() async throws {
         let (pool, dir, previous) = try makeTestDB()
-        defer { restoreTestDB(previous: previous, dir: dir) }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         // The Archive folder must exist locally — otherwise executeSingleOp's
         // generic-error self-heal branch (`destMissing`, AccountManagerQueue.swift)
@@ -535,7 +537,7 @@ struct AccountManagerQueueDrainTests {
         let accountId = "acc-gap3-lanes"
         defer {
             Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(pool: pool, previous: previous, dir: dir)
         }
 
         let provider = MockEmailProvider()
@@ -580,7 +582,7 @@ struct AccountManagerQueueDrainTests {
         let accountId = "acc-gap3-failure"
         defer {
             Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(pool: pool, previous: previous, dir: dir)
         }
 
         let provider = MockEmailProvider()
@@ -614,7 +616,7 @@ struct AccountManagerQueueDrainTests {
         let accountId = "acc-gap3-reentrant"
         defer {
             Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
-            restoreTestDB(previous: previous, dir: dir)
+            restoreTestDB(pool: pool, previous: previous, dir: dir)
         }
 
         let provider = MockEmailProvider()

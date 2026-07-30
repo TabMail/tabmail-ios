@@ -19,7 +19,7 @@ struct MessageDetailViewModelErrorTests {
     @MainActor
     private func makeVM(
         fetchBodyOverride: @escaping (MessageHeader) async throws -> Void
-    ) throws -> (MessageDetailViewModel, URL) {
+    ) throws -> (MessageDetailViewModel, DatabasePool, URL) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("test.sqlite").path
@@ -63,11 +63,11 @@ struct MessageDetailViewModelErrorTests {
             dbPool: pool,
             fetchBodyOverride: fetchBodyOverride
         )
-        return (vm, dir)
+        return (vm, pool, dir)
     }
 
-    private func cleanup(_ dir: URL) {
-        try? FileManager.default.removeItem(at: dir)
+    private func cleanup(_ pool: DatabasePool, _ dir: URL) {
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     // MARK: - loadBody
@@ -75,10 +75,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody suppresses NIOConnectionError — error stays nil")
     @MainActor
     func loadBodySuppressesNIOConnectionError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw TestConnectionError(description: "NIOPosix.NIOConnectionError error 1")
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.loadBody()
 
@@ -88,10 +88,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody suppresses 'Connection reset' — error stays nil")
     @MainActor
     func loadBodySuppressesConnectionReset() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw TestConnectionError(description: "Connection reset by peer")
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.loadBody()
 
@@ -101,10 +101,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody suppresses 'broken pipe' — error stays nil")
     @MainActor
     func loadBodySuppressesBrokenPipe() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw TestConnectionError(description: "Write failed: broken pipe")
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.loadBody()
 
@@ -114,10 +114,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody shows non-connection error to user")
     @MainActor
     func loadBodyShowsNonConnectionError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw ProviderError.messageNotFound
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.loadBody()
 
@@ -127,10 +127,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody shows authentication error to user")
     @MainActor
     func loadBodyShowsAuthError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw ProviderError.authenticationFailed
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.loadBody()
 
@@ -142,10 +142,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("refetchBody suppresses NIOConnectionError — error stays nil")
     @MainActor
     func refetchBodySuppressesNIOConnectionError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw TestConnectionError(description: "NIOPosix.NIOConnectionError error 1")
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.refetchBody()
 
@@ -155,10 +155,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("refetchBody shows non-connection error to user")
     @MainActor
     func refetchBodyShowsNonConnectionError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw ProviderError.messageNotFound
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.refetchBody()
 
@@ -170,8 +170,8 @@ struct MessageDetailViewModelErrorTests {
     @Test("isLoading defaults to true — spinner shows from first frame")
     @MainActor
     func isLoadingDefaultsToTrue() throws {
-        let (vm, dir) = try makeVM { _ in }
-        defer { cleanup(dir) }
+        let (vm, pool, dir) = try makeVM { _ in }
+        defer { cleanup(pool, dir) }
 
         #expect(vm.isLoading == true, "isLoading must default to true so the spinner shows immediately")
     }
@@ -179,8 +179,8 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody clears isLoading when body found in DB")
     @MainActor
     func loadBodyClearsIsLoadingWhenBodyExists() async throws {
-        let (vm, dir) = try makeVM { _ in }
-        defer { cleanup(dir) }
+        let (vm, pool, dir) = try makeVM { _ in }
+        defer { cleanup(pool, dir) }
 
         // Insert body into DB before loadBody runs
         try await vm._dbPoolOverride!.write { db in
@@ -212,7 +212,7 @@ struct MessageDetailViewModelErrorTests {
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         #expect(vm.isLoading == true)
         await vm.loadBody()
@@ -223,10 +223,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody clears isLoading after connection error")
     @MainActor
     func loadBodyClearsIsLoadingAfterConnectionError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw TestConnectionError(description: "NIOPosix.NIOConnectionError error 1")
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         #expect(vm.isLoading == true)
         await vm.loadBody()
@@ -237,10 +237,10 @@ struct MessageDetailViewModelErrorTests {
     @Test("loadBody starts body poll when fetch fails with connection error")
     @MainActor
     func loadBodyStartsPollOnConnectionError() async throws {
-        let (vm, dir) = try makeVM { _ in
+        let (vm, pool, dir) = try makeVM { _ in
             throw TestConnectionError(description: "Connection reset by peer")
         }
-        defer { cleanup(dir) }
+        defer { cleanup(pool, dir) }
 
         await vm.loadBody()
 
@@ -252,11 +252,11 @@ struct MessageDetailViewModelErrorTests {
         #expect(vm.isLoading == false)
         // The poll task is private, but we can verify the VM isn't stuck by
         // inserting a body into DB and checking if the poll picks it up.
-        let pool = vm._dbPoolOverride!
-        let headerId = try await pool.read { db in
+        let vmPool = vm._dbPoolOverride!
+        let headerId = try await vmPool.read { db in
             try MessageHeader.fetchOne(db, sql: "SELECT * FROM messageHeader LIMIT 1")!.id
         }
-        try await pool.write { db in
+        try await vmPool.write { db in
             let body = MessageBody(headerId: headerId, htmlContent: "<p>Poll test</p>")
             try body.insert(db)
         }

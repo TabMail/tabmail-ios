@@ -68,6 +68,22 @@ struct ReadUnreadPersistenceTests {
         return (pool, folder, dir, previous)
     }
 
+    /// Teardown shared by every test. Ports `InboxGestureActionTests` /
+    /// `CoordinatedToolActionTests`' guarded restore: the REAL
+    /// `markRead`/`markUnread` paths driven here spawn unstructured
+    /// recount/drain Tasks (drainPendingQueue, `UnreadCountManager` recounts)
+    /// that outlive the test body — they can run AFTER the defers. Restore a
+    /// real predecessor when present, but retain this installed
+    /// fixture until process exit in either case so post-defer work never
+    /// reaches a closed pool.
+    private func restoreTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: previous,
+            pool: pool,
+            directory: dir
+        )
+    }
+
     @MainActor
     private func insertMessage(_ pool: DatabasePool, messageId: String, isRead: Bool) throws -> MessageHeader {
         var header = MessageHeader(
@@ -98,10 +114,7 @@ struct ReadUnreadPersistenceTests {
     @MainActor
     func markReadPersists() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
-        defer {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let header = try insertMessage(pool, messageId: "rru-1", isRead: false)
         #expect(header.isRead == false)
@@ -133,10 +146,7 @@ struct ReadUnreadPersistenceTests {
     @MainActor
     func markUnreadPersists() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
-        defer {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let header = try insertMessage(pool, messageId: "rru-2", isRead: true)
         #expect(header.isRead == true)
@@ -161,10 +171,7 @@ struct ReadUnreadPersistenceTests {
     @MainActor
     func roundTripPersistsBothOps() async throws {
         let (pool, _, dir, previous) = try makeTestDB()
-        defer {
-            AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
-        }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let header = try insertMessage(pool, messageId: "rru-3", isRead: false)
 

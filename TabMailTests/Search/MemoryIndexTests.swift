@@ -9,8 +9,12 @@ import GRDB
 
 /// Tests for `MemoryIndex` actor (v3 per-turn model).
 ///
-/// Each test creates a fresh temporary file-backed DatabasePool with sqlite-vec
-/// registered, installs it via `_testInstallPool`, runs assertions, and tears down.
+/// Database-backed tests create a fresh temporary file-backed DatabasePool with
+/// sqlite-vec registered and install it via `_testInstallPool`. `_testReset`
+/// drops the singleton actor's reference but does not close the pool, so those
+/// ordinary fixtures register their exact pool/directory for process-exit
+/// close-before-unlink. The explicit reinstall test separately proves and owns
+/// its two-pool handoff after awaiting each actor reset.
 /// `.serialized` because `MemoryIndex.shared` is a singleton.
 ///
 /// See ADR-IOS-034.
@@ -35,16 +39,11 @@ struct MemoryIndexTests {
         return (pool, dir)
     }
 
-    private func makeIndex() async throws -> URL {
+    private func makeIndex() async throws -> (pool: DatabasePool, directory: URL) {
         await MemoryIndex.shared._testReset()
         let (pool, dir) = try makePool()
         try await MemoryIndex.shared._testInstallPool(pool)
-        return dir
-    }
-
-    private func cleanup(_ dir: URL) async {
-        await MemoryIndex.shared._testReset()
-        try? FileManager.default.removeItem(at: dir)
+        return (pool, dir)
     }
 
     /// Build a ChatHistoryTurn for memoryText extractor tests.
@@ -117,8 +116,8 @@ struct MemoryIndexTests {
     /// filters both directions.
     @Test("searchVecCandidates: KNN subquery+JOIN executes; demo scope filters both ways")
     func vecCandidates_demoScope() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(
             chatHistoryId: "real1", sessionId: "real-session", role: "user",
@@ -151,8 +150,8 @@ struct MemoryIndexTests {
 
     @Test("indexTurn writes single row: meta + fts, epoch=1, embeddingComplete=0, no vec")
     func indexTurn_writesSingleRow() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(
             chatHistoryId: "t1",
@@ -180,8 +179,8 @@ struct MemoryIndexTests {
 
     @Test("indexTurn upsert: same chatHistoryId bumps epoch, clears vec, replaces fts")
     func indexTurn_upsertBumpsEpoch() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "first")
         let v1 = await MemoryIndex.shared._testMetaRow(chatHistoryId: "t1")
@@ -202,8 +201,8 @@ struct MemoryIndexTests {
 
     @Test("indexEpoch is per-turn, not shared across turns")
     func indexTurn_epochIsPerTurn() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for i in 1...3 {
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "v\(i)")
@@ -219,8 +218,8 @@ struct MemoryIndexTests {
 
     @Test("indexTurns bulk writes all turns in one transaction")
     func indexTurns_bulkWrites() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         let entries: [(chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64, text: String)] = [
             ("t1", "s", "user", 1000, "first"),
@@ -234,8 +233,8 @@ struct MemoryIndexTests {
 
     @Test("indexTurns empty input is a no-op")
     func indexTurns_emptyNoOp() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         await MemoryIndex.shared.indexTurns([])
         #expect(await MemoryIndex.shared._testMetaRowCount() == 0)
     }
@@ -244,8 +243,8 @@ struct MemoryIndexTests {
 
     @Test("deleteTurns evicts matching turns and their vec rows")
     func deleteTurns_evictsMatching() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for (i, id) in ["t1", "t2", "t3"].enumerated() {
             await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: Int64(1000 + i), text: "c\(i)")
@@ -261,8 +260,8 @@ struct MemoryIndexTests {
 
     @Test("deleteTurns([]) is a no-op")
     func deleteTurns_emptyNoOp() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "x")
         await MemoryIndex.shared.deleteTurns(chatHistoryIds: [])
         #expect(await MemoryIndex.shared._testMetaRowCount() == 1)
@@ -270,8 +269,8 @@ struct MemoryIndexTests {
 
     @Test("deleteAll wipes every row across all three tables")
     func deleteAll_wipesEverything() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for id in ["t1", "t2", "t3"] {
             await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 1000, text: "x")
@@ -291,8 +290,8 @@ struct MemoryIndexTests {
 
     @Test("pendingEmbeddingChatHistoryIds returns only embeddingComplete=0 rows")
     func pendingEmbeddingIds_returnsOnlyIncomplete() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for id in ["p1", "p2", "p3"] {
             await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 1000, text: "text")
@@ -305,8 +304,8 @@ struct MemoryIndexTests {
 
     @Test("pendingEmbeddingChatHistoryIds respects LIMIT")
     func pendingEmbeddingIds_respectsLimit() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for i in 0..<8 {
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: Int64(i * 1000), text: "x")
@@ -319,8 +318,8 @@ struct MemoryIndexTests {
 
     @Test("ftsContentWithEpochs returns content + rowid + epoch by chatHistoryId")
     func ftsContentWithEpochs_returns() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "x", sessionId: "s", role: "user", dateMs: 1000, text: "hello epoch")
         let map = await MemoryIndex.shared.ftsContentWithEpochs(chatHistoryIds: ["x", "nonexistent"])
@@ -331,8 +330,8 @@ struct MemoryIndexTests {
 
     @Test("storeEmbeddings with stale observedEpoch is skipped (race)")
     func storeEmbeddings_epochMismatchSkipped() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "first")
         // Bump epoch via re-index.
@@ -347,8 +346,8 @@ struct MemoryIndexTests {
 
     @Test("storeEmbeddings with current observedEpoch commits and flips flag")
     func storeEmbeddings_epochMatchCommits() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "x")
         let vec = Array(repeating: Float(0.0), count: SearchConfig.embeddingDims)
@@ -361,8 +360,8 @@ struct MemoryIndexTests {
 
     @Test("storeEmbeddings with missing turn is no-op")
     func storeEmbeddings_missingNoOp() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         let vec = Array(repeating: Float(0.0), count: SearchConfig.embeddingDims)
         let result = await MemoryIndex.shared.storeEmbeddings([(chatHistoryId: "ghost", observedEpoch: 1, embedding: vec)])
         #expect(result.committed.isEmpty)
@@ -373,8 +372,8 @@ struct MemoryIndexTests {
 
     @Test("listTurns returns reverse-chronological per-turn rows up to limit")
     func listTurns_reverseChrono() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         for i in 0..<5 {
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: i % 2 == 0 ? "user" : "assistant", dateMs: Int64(i * 1000), text: "m\(i)")
@@ -389,8 +388,8 @@ struct MemoryIndexTests {
 
     @Test("search returns per-turn hits — session with 2 matches yields 2 hits")
     func search_perTurnHits() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "the quarterly kyle update")
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t2", sessionId: "s", role: "assistant", dateMs: 1100, text: "Kyle's status looks good")
@@ -404,8 +403,8 @@ struct MemoryIndexTests {
 
     @Test("search returns empty on empty query or no match")
     func search_emptyQueryOrNoMatch() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         #expect(await MemoryIndex.shared.search(query: "", limit: 10).isEmpty)
         #expect(await MemoryIndex.shared.search(query: "   ", limit: 10).isEmpty)
         #expect(await MemoryIndex.shared.search(query: "nothing", limit: 10).isEmpty)
@@ -413,8 +412,8 @@ struct MemoryIndexTests {
 
     @Test("search respects date filter")
     func search_dateFilter() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         let baseMs: Int64 = 1_700_000_000_000
         await MemoryIndex.shared.indexTurn(chatHistoryId: "jan", sessionId: "s1", role: "user", dateMs: baseMs, text: "january keyword")
@@ -430,8 +429,8 @@ struct MemoryIndexTests {
 
     @Test("search prefix-matches short query tokens")
     func search_prefixMatchTokens() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "Melanie sent the report")
         // Short token "mel" should prefix-match "melanie" via our ftsQuery (mel*).
@@ -443,8 +442,8 @@ struct MemoryIndexTests {
 
     @Test("knownChatHistoryIds returns all indexed IDs")
     func knownChatHistoryIds_returnsAll() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         for id in ["a", "b", "c"] {
             await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 1000, text: "x")
         }
@@ -455,8 +454,8 @@ struct MemoryIndexTests {
 
     @Test("readByTimestamp centers window on matched turn within same session")
     func readByTimestamp_sessionBoundedWindow() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         let t0: Int64 = 1_700_000_000_000
         // 7 turns in session "s", spaced 10s apart.
@@ -483,8 +482,8 @@ struct MemoryIndexTests {
 
     @Test("readByTimestamp does not leak across sessions")
     func readByTimestamp_noCrossSessionLeak() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         let t0: Int64 = 1_700_000_000_000
         // Session A has 3 turns around t0.
@@ -520,8 +519,8 @@ struct MemoryIndexTests {
 
     @Test("readByTimestamp with NULL sessionId falls back to time-window walk")
     func readByTimestamp_nullSessionIdFallback() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         let t0: Int64 = 1_700_000_000_000
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: nil, role: "user", dateMs: t0, text: "one")
@@ -535,8 +534,8 @@ struct MemoryIndexTests {
 
     @Test("readByTimestamp empty window returns empty array")
     func readByTimestamp_emptyWindow() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         let hits = await MemoryIndex.shared.readByTimestamp(timestampMs: 0, toleranceMs: 0, maxTurns: 10)
         #expect(hits.isEmpty)
     }
@@ -565,15 +564,21 @@ struct MemoryIndexTests {
         try await MemoryIndex.shared._testInstallPool(reopened)
         #expect(await MemoryIndex.shared.knownChatHistoryIds().contains("persist"))
 
-        await cleanup(dir)
+        await MemoryIndex.shared._testReset()
+        // Two pools were opened on this one file. The superseded one is done
+        // with, so close it outright; the live one is retired (closed, then
+        // unlinked on a later retirement). Unlinking `dir` with either still
+        // open is the `vnode unlinked while in use` violation.
+        try pool.close()
+        TestDatabaseTeardown.retire(pool: reopened, directory: dir)
     }
 
     // MARK: - Schema version gate (v3 init)
 
     @Test("_testInstallPool stamps PRAGMA user_version to schemaVersion")
     func schemaVersion_stamped() async throws {
-        let dir = try await makeIndex()
-        defer { Task { await cleanup(dir) } }
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         #expect(await MemoryIndex.shared._testSchemaVersion() == 4)  // v4: tokenizer drops tokenchars
     }
 
@@ -581,10 +586,7 @@ struct MemoryIndexTests {
     func v2ToV3SchemaUpgrade_dropsAndRebuilds() async throws {
         await MemoryIndex.shared._testReset()
         let (pool, dir) = try makePool()
-        defer {
-            Task { await MemoryIndex.shared._testReset() }
-            try? FileManager.default.removeItem(at: dir)
-        }
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         // Seed v2-shaped memory.db: `memory_meta` with v2 `memId` column (not `chatHistoryId`),
         // no `role` column. Simulates what a dev-device v2 memory.db looks like.
@@ -639,10 +641,7 @@ struct MemoryIndexTests {
     func memoryFtsUsesSearchConfigTokenizer() async throws {
         await MemoryIndex.shared._testReset()
         let (pool, dir) = try makePool()
-        defer {
-            Task { await MemoryIndex.shared._testReset() }
-            try? FileManager.default.removeItem(at: dir)
-        }
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         try await MemoryIndex.shared._testInstallPoolWithGate(pool)
 
         let sql = try await pool.read { db in
@@ -661,10 +660,7 @@ struct MemoryIndexTests {
     func v3GateNoOpOnCurrentSchema() async throws {
         await MemoryIndex.shared._testReset()
         let (pool, dir) = try makePool()
-        defer {
-            Task { await MemoryIndex.shared._testReset() }
-            try? FileManager.default.removeItem(at: dir)
-        }
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
 
         // First install stamps the current schema version.
         try await MemoryIndex.shared._testInstallPoolWithGate(pool)

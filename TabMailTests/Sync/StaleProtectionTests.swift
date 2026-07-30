@@ -63,7 +63,7 @@ struct StaleProtectionTests {
     @Test("A recentlyCompleted-protected message the fetch missed is NOT marked stale")
     func protectedSurvives() async throws {
         let (pool, dir, previous) = try makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let (folder, headerId) = try seed(pool)
 
         // Exactly what the merge registers: provider messageId + normalized rfc822.
@@ -82,7 +82,7 @@ struct StaleProtectionTests {
     @Test("WITHOUT protection the same message IS marked stale (protection is load-bearing)")
     func unprotectedIsDeleted() async throws {
         let (pool, dir, previous) = try makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; try? FileManager.default.removeItem(at: dir) }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let (folder, headerId) = try seed(pool)
 
         let result = try await SyncEngine.runSyncMessages(

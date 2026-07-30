@@ -72,11 +72,11 @@ struct MessageDetailHeaderRecoveryTests {
     }
 
     @MainActor
-    private func cleanup(_ dir: URL, _ previous: AppDatabase?) {
+    private func cleanup(_ pool: DatabasePool, _ dir: URL, _ previous: AppDatabase?) {
         AppDatabase.shared.withLock { $0 = previous }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
         NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
-        try? FileManager.default.removeItem(at: dir)
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     // MARK: - Tests
@@ -85,7 +85,7 @@ struct MessageDetailHeaderRecoveryTests {
     @Test("chat-pill repro: durable header+body, not staged — poll recovers BOTH")
     func chatPillReproRecoversHeaderAndBody() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         let row = stagedRow(messageId: "hdrrec-100", subject: "Older durable email")
@@ -113,7 +113,7 @@ struct MessageDetailHeaderRecoveryTests {
     @Test("header-only durable (no body): poll recovers header, stays alive for body")
     func headerOnlyRecoversHeaderStaysAliveForBody() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         let row = stagedRow(messageId: "hdrrec-200", subject: "Header only durable email")
@@ -137,7 +137,7 @@ struct MessageDetailHeaderRecoveryTests {
     @Test("no-clobber: an already-set header is never overwritten by recovery")
     func recoveryDoesNotClobberExistingHeader() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         let row = stagedRow(messageId: "hdrrec-300", subject: "DURABLE subject (should not be adopted)")
@@ -160,7 +160,7 @@ struct MessageDetailHeaderRecoveryTests {
     @Test("pending-tap guard: recovery must not run while a notification-tap resolve is pending")
     func recoveryDoesNotRunDuringPendingTapResolve() async throws {
         let (pool, dir, previous) = try makePool()
-        defer { cleanup(dir, previous) }
+        defer { cleanup(pool, dir, previous) }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
         let tapId = MessageDetailViewModel.notificationTapIdPrefix + "acc1::hdrrec-404"

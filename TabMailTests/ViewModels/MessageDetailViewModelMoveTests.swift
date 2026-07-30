@@ -99,7 +99,7 @@ struct MessageDetailViewModelMoveTests {
         let (pool, dir, previous) = try makeEnv()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()
@@ -140,7 +140,7 @@ struct MessageDetailViewModelMoveTests {
         let (pool, dir, previous) = try makeEnv()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()
@@ -171,7 +171,7 @@ struct MessageDetailViewModelMoveTests {
         let (pool, dir, previous) = try makeEnv()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()
@@ -205,7 +205,7 @@ struct MessageDetailViewModelMoveTests {
         let (pool, dir, previous) = try makeEnv()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
-            try? FileManager.default.removeItem(at: dir)
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
             clearOverlay()
         }
         clearOverlay()

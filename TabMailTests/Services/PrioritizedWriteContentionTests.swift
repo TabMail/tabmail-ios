@@ -54,9 +54,9 @@ struct PrioritizedWriteContentionTests {
         return (dir, pool, previous)
     }
 
-    private func restore(_ previous: AppDatabase?, _ dir: URL) {
+    private func restore(_ pool: DatabasePool, _ previous: AppDatabase?, _ dir: URL) {
         AppDatabase.shared.withLock { $0 = previous }
-        try? FileManager.default.removeItem(at: dir)
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     // MARK: - Probes
@@ -108,8 +108,8 @@ struct PrioritizedWriteContentionTests {
 
     @Test("Priority-write latency tracks the IN-FLIGHT background batch size — chunking is the lever")
     func chunkingReducesPriorityLatency() async throws {
-        let (dir, _, previous) = try makeAppDatabase()
-        defer { restore(previous, dir) }
+        let (dir, pool, previous) = try makeAppDatabase()
+        defer { restore(pool, previous, dir) }
 
         let totalRows = 8000
         // BIG: a few huge batches (today's unchunked insertBackfillBatch shape).

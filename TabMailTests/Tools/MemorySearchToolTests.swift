@@ -14,12 +14,14 @@ struct MemorySearchToolTests {
     private func withTool(_ body: (MemorySearchTool) async throws -> Void) async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
 
         let path = dir.appendingPathComponent("test.sqlite").path
         var config = Configuration()
         config.foreignKeysEnabled = true
         let pool = try DatabasePool(path: path, configuration: config)
+        // Close before unlinking, and install the defer BEFORE the fallible
+        // `AppDatabase` init so a throw there still closes the pool.
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let appDb = try AppDatabase(dbPool: pool)
 
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
@@ -36,7 +38,7 @@ struct MemorySearchToolTests {
     }
 
     /// Creates a fresh MemoryIndex pool for per-turn format tests.
-    private func installMemoryIndex() async throws -> URL {
+    private func installMemoryIndex() async throws -> (pool: DatabasePool, dir: URL) {
         await MemoryIndex.shared._testReset()
         await MemorySearchCache.shared.reset()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -51,13 +53,13 @@ struct MemorySearchToolTests {
         }
         let pool = try DatabasePool(path: path, configuration: config)
         try await MemoryIndex.shared._testInstallPool(pool)
-        return dir
+        return (pool, dir)
     }
 
-    private func cleanupMemoryIndex(_ dir: URL) async {
+    private func cleanupMemoryIndex(pool: DatabasePool, dir: URL) async {
         await MemoryIndex.shared._testReset()
         await MemorySearchCache.shared.reset()
-        try? FileManager.default.removeItem(at: dir)
+        TestDatabaseTeardown.retire(pool: pool, directory: dir)
     }
 
     /// Backwards-compatible helper for tests that just need the tool.
@@ -195,8 +197,8 @@ struct MemorySearchToolTests {
 
     @Test("Per-turn output tags role as USER / AGENT")
     func perTurnOutputIncludesRoleTag() async throws {
-        let memDir = try await installMemoryIndex()
-        defer { Task { await cleanupMemoryIndex(memDir) } }
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "u1", sessionId: "s", role: "user", dateMs: 1000, text: "please add kylemcgregor to the contacts")
         await MemoryIndex.shared.indexTurn(chatHistoryId: "a1", sessionId: "s", role: "assistant", dateMs: 1100, text: "Added kylemcgregor successfully")
@@ -209,8 +211,8 @@ struct MemorySearchToolTests {
 
     @Test("Regression: output contains no raw SQL type descriptions (GRDB pitfall)")
     func noSQLTypeLeakInOutput() async throws {
-        let memDir = try await installMemoryIndex()
-        defer { Task { await cleanupMemoryIndex(memDir) } }
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "unique_leak_probe_token")
 
