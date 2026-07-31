@@ -1083,6 +1083,43 @@ struct IMAPProviderPoolInvariantTests {
     //        LOGOUT. (Reference: R6-1 Part 2. The folder-pool analogue IS
     //        satisfied and ships now as
     //        `concurrentSameFolderAcquiresOpenExactlyOneConnection`.)
+    //
+    //        🔴 RED EVIDENCE — PRODUCED BY THE D-19 SEAM PORT, NOT INFERRED.
+    //        D-02 was a reasoned-about defect until the plant-over trap landed.
+    //        With `assertPoolSlotWasNil(actionServer, "actionServer
+    //        (ensureServer create)")` armed at the plant (the reference's
+    //        `v2final:…:2387` call site), the T0.8 fuzzer
+    //        `ProviderIdQueueFuzzTests` trips it DETERMINISTICALLY — 3 isolated
+    //        runs out of 3, plus the first full-suite run — at seed
+    //        8131249127217430530. The `mutLog` tail dumped at the trap:
+    //
+    //          [12] releaseActionConnection(healthy:false) CLEARED actionServer=nil
+    //          [13] ensureServer create START                 actionServer=nil
+    //          [14] ensureServer create START                 actionServer=nil   ← TWO creators
+    //          [15] ensureServer createServer SUCCEEDED        actionServer=nil
+    //          [16] ensureServer PLANTED fresh                 actionServer=…ee40
+    //          [17] acquire-not-in-use SET actionInUse=true    actionServer=…ee40 actionInUse=true
+    //          [18] ensureServer createServer SUCCEEDED        actionServer=…ee40 actionInUse=true
+    //          → trap: planted a connection over a non-nil actionServer slot
+    //
+    //        Reading: an injected fault's unhealthy release nils the slot [12];
+    //        two acquires both observe nil and each start their own
+    //        `createServer()` [13][14]; creator A plants and its caller checks
+    //        the connection out [16][17]; creator B's RTT then returns [18] and
+    //        its next statement would overwrite a LIVE, CHECKED-OUT slot —
+    //        leaking A's logged-in session (never logged out, still counted
+    //        against the server's connection cap) and leaving A's holder using
+    //        a connection the pool no longer points at.
+    //
+    //        This satisfies Testing Rule 12's red-first requirement for D-02 in
+    //        advance: the invariant is pinned, the failure was observed on the
+    //        pre-fix code, and the fix (the reference's `actionServerCreating` +
+    //        `actionServerCreationWaiters` single-flight) must re-arm that ONE
+    //        assert line in the SAME commit. Until then the site is
+    //        deliberately unarmed — see the comment at the plant in
+    //        `TabMail/Providers/IMAPProvider.swift`. It is unarmed because the
+    //        assertion is RIGHT and the pool is WRONG; the predicate has not
+    //        been weakened anywhere.
     //  D-03  The post-liveness re-`ensureServer()` in `acquireActionConnection`
     //        adopts whatever instance it is handed instead of requiring the
     //        SAME instance it just NOOPed. (Reference: R6-1 Part 3.)
@@ -1172,9 +1209,45 @@ struct IMAPProviderPoolInvariantTests {
     //        action pool's liveness stamp as a side effect. (Reference: item D
     //        hygiene.) `evictionNeverTakesAConnectionOutFromUnderItsHolder`
     //        avoids the key rather than relying on it.
-    //  D-19  No plant site asserts its slot was nil beforehand. (Reference:
-    //        cross-field invariant #2 and its `assertPoolSlotWasNil` /
-    //        `assertActionServerSelfReplace` DEBUG assertions.)
+    //  D-19  ✅ CLOSED — THE SEAM HAS LANDED. It already paid for itself: it
+    //        turned D-02 from a reasoned-about defect into observed red
+    //        evidence on its first run (see D-02 above). Three plant sites stay
+    //        unarmed on purpose — D-02, D-20, D-23, each recorded with the
+    //        defect it belongs to.
+    //        Was: "No plant site asserts its slot was nil beforehand."
+    //        `TabMail/Providers/IMAPProvider.swift` now carries a verbatim port
+    //        of the reference's plant-over trap system — `assertPoolSlotWasNil`
+    //        (`v2final:…:494`), `assertActionServerSelfReplace` (`:524`) and the
+    //        `mutLog` / `logMut` / `mutLogForTesting` ring journal (`:629-636`),
+    //        which is the ONLY post-mortem channel a trap leaves behind (the
+    //        `assert` kills the process before any fuzzer's end-of-round dump
+    //        can run). All of it is inside `#if DEBUG`; Release is inert.
+    //        ARMED at three of the four plant sites that have a reference
+    //        counterpart: `createFolderConnection`'s primary and limit-retry
+    //        plants (reference `:1767` / `:1839`) and the dead-recreate
+    //        self-replace (`:2586`). The fourth — the nested `ensureServer()`
+    //        create (`:2387`) — is armed by ONE line that lands with D-02's
+    //        single-flight fix, because arming it today fires deterministically
+    //        on a defect this base still has; the red evidence it already
+    //        produced is recorded under D-02 above.
+    //        Three plant sites are deliberately NOT armed, each recorded where
+    //        the defect lives: D-02 (above), D-20 and D-23 (below). The pattern
+    //        is the same in all three and it is not a weakening of the
+    //        assertion: a trap belongs at a plant whose plant-over is already
+    //        structurally excluded, so it catches a FUTURE regression. Where the
+    //        exclusion is the very thing still missing, an armed trap is not a
+    //        regression detector — it is a guaranteed process kill on a defect
+    //        already on the books, and it takes ~7.8k unrelated test results
+    //        with it every run.
+    //        Why it lands NOW rather than with T3.7's fixes: a trap added AFTER
+    //        a pool fix cannot red-prove it, and BOTH of the reference pool
+    //        fuzzer's acceptance-gate findings were detected by this trap and
+    //        nothing else — so §6.3's Testing-Rule-11 gate ("rediscover a known
+    //        defect with its fix reverted") is unmeetable without it in place
+    //        first. Deliberately has no dedicated test of its own, for the
+    //        reason the reference states in the helper's own doc comment: a
+    //        firing `assert` traps the whole process, so a test that provoked it
+    //        would kill the run rather than fail one case.
     //
     // IDLE CONNECTION
     //  D-20  `launchIdleConnection` plants through `setIdleServer(_:)`, which
@@ -1183,6 +1256,14 @@ struct IMAPProviderPoolInvariantTests {
     //        the plant, so two overlapping launches clobber each other and the
     //        loser's session is leaked. (Reference: R7-F3's
     //        `claimIdleServerSlot`.)
+    //        D-19 NOTE — this is the one plant site the trap does NOT cover,
+    //        and the reference does not cover it either: `claimIdleServerSlot`
+    //        makes the plant-over structurally impossible (`guard idleServer ==
+    //        nil` in the SAME synchronous actor step as the assignment), so an
+    //        `assertPoolSlotWasNil` there would be dead code in the reference
+    //        and a certain trap here. The fix IS the structural guard, and it
+    //        leaves no trap gap behind it. Its detector is the leak oracle
+    //        (`FakeIMAPServer.abandonedSessionCount()`), not the assert.
     //  D-21  `onIdleStreamEnded(delay:)` takes no owner and clears `idleServer`
     //        unconditionally, so a stale listener's stream-end tears down a
     //        healthy successor. (Reference: R7-F3's `onIdleStreamEnded(owner:)`
@@ -1193,4 +1274,25 @@ struct IMAPProviderPoolInvariantTests {
     //        (declared in `IMAPConnection+Idle.swift`, default 15s) instead of
     //        completing promptly. `stopIdle()` in this base DOES send `done()`
     //        first; `markDirty()` does not.
+    //
+    // NEW, FILED BY THE D-19 SEAM PORT
+    //  D-23  `connect()` plants `actionServer = try await createServer()`
+    //        UNCONDITIONALLY, overwriting a live non-nil slot (leaking the old
+    //        logged-in connection) and racing any concurrent create.
+    //        `AccountManagerSync.ensureConnected` calls `connect()` on an
+    //        already-connected provider as a matter of course, so this is not a
+    //        rare interleaving — it is the normal second sync of a session.
+    //        (Reference: finding B-3. Its fix is to route `connect()` through
+    //        the single-flighted `ensureServer()` — `v2final:…:2876-2886` — with
+    //        staleness left to `markDirty()`, exactly as `ensureConnected`'s own
+    //        doc comment already describes.)
+    //        This is the ONE plant site D-19's trap deliberately leaves unarmed.
+    //        Arming `assertPoolSlotWasNil` here today would not catch a future
+    //        regression, it would guarantee a debug-build process kill on an
+    //        already-known defect — the reference closed the hole by changing
+    //        the code, which a purely-additive seam item may not do. Once the
+    //        B-3 fix lands, the plant lives inside `ensureServer()` and is
+    //        trapped there automatically, so no separate trap is ever needed.
+    //        The `logMut("connect() PLANTED (UNGUARDED — D-23)")` journal entry
+    //        is present so a post-mortem can still see this writer.
 }

@@ -149,6 +149,88 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return selection
     }
 
+    // MARK: - Pool Plant-Over Traps + Mutation Journal (D-19)
+    //
+    // PORTED from `v2final` (`TabMail/Providers/IMAPProvider.swift`):
+    // `assertPoolSlotWasNil` `:494`, `assertActionServerSelfReplace` `:524`, and
+    // the `mutLog` / `logMut` / `mutLogForTesting` ring journal `:629-636`.
+    //
+    // This base had ZERO `assert` / `assertionFailure` / `precondition` calls
+    // anywhere in the file, so the reference's cross-field invariant #2
+    // (`v2final:…:385-387` — *no path may plant a connection over a non-nil
+    // slot, except the action pool's documented
+    // self-replace-a-known-dead-connection case*) was enforced by nothing.
+    // Recorded as D-19 in
+    // `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift`.
+    //
+    // ONE deviation from the reference, the same one the T0.6(a) seam block
+    // below already documents: the reference leaves `mutLog` / `logMut` /
+    // `mutLogForTesting` UNGATED (only `logMut`'s BODY is `#if DEBUG`, relying
+    // on `@autoclosure` to keep release call sites free of the interpolation).
+    // Here the whole family — declarations AND every call site — sits inside
+    // `#if DEBUG`, so Release carries neither the storage nor one executable
+    // line of it. The reference's `@autoclosure` shape is kept verbatim anyway:
+    // it costs nothing and stays correct if a future call site is ever moved
+    // out of a `#if DEBUG` region.
+    #if DEBUG
+    /// R6 invariant helper (cross-field invariant #2): DEBUG-only cheap check
+    /// for "no path may plant a connection over a non-nil slot". Fires as a
+    /// Swift `assert` — a loud, immediate trap in debug/test builds (tests
+    /// always run DEBUG) and completely compiled out of release (zero runtime
+    /// cost there). Call BEFORE the write, passing whatever the slot held just
+    /// before it. Deliberately NOT exercised by a dedicated test: `assert`
+    /// traps the whole process on failure, which would kill the test run rather
+    /// than fail one test — its job is to turn a FUTURE regression into an
+    /// immediate, unambiguous crash inside whichever existing test first
+    /// exercises the broken path, not to be independently green today.
+    private func assertPoolSlotWasNil(_ previous: IMAPServer?, _ slot: String, file: StaticString = #file, line: UInt = #line) {
+        // Post-mortem channel: the assert traps the WHOLE process, so a
+        // fuzzer's normal end-of-round MUTLOG dump never runs — print the
+        // journal tail here first, or the trap's interleaving is unrecoverable
+        // (this is exactly how the reference root-caused its ensureServer
+        // creator plant-over-non-nil). DEBUG-only by the enclosing `#if`;
+        // prints only when about to trap.
+        if previous != nil {
+            print("[IMAPProvider] PLANT-OVER-NON-NIL POST-MORTEM (\(slot)) MUTLOG TAIL:")
+            for line in mutLog.suffix(50) { print("  \(line)") }
+        }
+        assert(previous == nil, "[IMAPProvider] R6 pool invariant violated: planted a connection over a non-nil \(slot) slot", file: file, line: line)
+    }
+
+    /// Cross-field invariant #2's ONE documented exception: the action pool's
+    /// dead-recreate self-replace may plant over a non-nil slot ONLY when that
+    /// slot still holds the EXACT dead instance this task just proved dead and
+    /// still holds exclusively (`actionInUse`).
+    ///
+    /// The nil case is admitted deliberately: in THIS base
+    /// `releaseActionConnection(healthy: false)` and keepalive's failure leg
+    /// nil the slot WITHOUT a generation bump, so a nil slot here can mean a
+    /// legitimate concurrent create is already in flight for it. The reference
+    /// additionally guards `actionServer === deadInstance` at the call site and
+    /// refuses the plant otherwise (its R8-F1 fix, deferred here as D-05), so
+    /// there the nil case is structurally excluded and this assert is pure
+    /// defense in depth. A THIRD instance means some other writer planted over
+    /// the slot without bumping generation, violating the "only self-replace
+    /// may skip the bump" premise this exception depends on.
+    private func assertActionServerSelfReplace(_ current: IMAPServer?, dead: IMAPServer, file: StaticString = #file, line: UInt = #line) {
+        assert(current == nil || current === dead, "[IMAPProvider] R8 pool invariant violated: dead-recreate self-replace found a THIRD instance in actionServer (neither nil nor the dead instance being replaced)", file: file, line: line)
+    }
+
+    /// Action-pool mutation journal. Every legal-mutator write appends one
+    /// line, and the assert helpers above dump the tail on a trap — this is the
+    /// ONLY post-mortem channel a plant-over trap leaves behind, because the
+    /// trap kills the process before any fuzzer's end-of-round dump can run.
+    private var mutLog: [String] = []
+    private func logMut(_ event: @autoclosure () -> String) {
+        mutLog.append("[\(mutLog.count)] \(event()) actionServer=\(actionServer.map { "\(ObjectIdentifier($0))" } ?? "nil") actionInUse=\(actionInUse) actionWaiters=\(actionWaiters.count) gen=\(generation)")
+        if mutLog.count > 5000 { mutLog.removeFirst(2000) }
+    }
+
+    /// Test-only accessor for the journal above — for a fuzzer/test that wants
+    /// the tail on a wedge or leak finding rather than on a trap.
+    func mutLogForTesting() -> [String] { mutLog }
+    #endif
+
     // MARK: - Folder-Pinned Connections
     // Each folder gets a dedicated connection, already SELECTed. LRU eviction at server limit.
     // Background ops (sync, backfill, batch fetch) go through these — zero checkout/SELECT overhead.
@@ -423,6 +505,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // observation it makes is currently indistinguishable from the body's.
             _ = try await selectMailboxTracked(server, folder: folder)
             folderCreating.remove(folder)
+            #if DEBUG
+            assertPoolSlotWasNil(folderServers[folder], "folderServers[\(folder)]")
+            #endif
             folderServers[folder] = server
             folderLastUsed[folder] = Date()
             folderInUse.insert(folder)
@@ -448,6 +533,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // T1.2b: the same open-the-folder SELECT as the primary create
                     // path above, on the connection-limit retry leg.
                     _ = try await selectMailboxTracked(server, folder: folder)
+                    #if DEBUG
+                    assertPoolSlotWasNil(folderServers[folder], "folderServers[\(folder)]")
+                    #endif
                     folderServers[folder] = server
                     folderLastUsed[folder] = Date()
                     folderInUse.insert(folder)
@@ -613,8 +701,31 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // actor reentrancy nilling actionServer between suspension points.
         func ensureServer() async throws -> IMAPServer {
             if let existing = actionServer { return existing }
+            #if DEBUG
+            logMut("ensureServer create START")
+            #endif
             let fresh = try await createServer()
+            #if DEBUG
+            // ⚠ DELIBERATELY NOT TRAPPED YET — see D-02 in
+            // `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift`,
+            // which now carries the RED EVIDENCE this port produced.
+            // The reference DOES trap here (`v2final:…:2387`) — but only
+            // because its `ensureServer()` is single-flighted (R6-1 Part 2), so
+            // the plant-over is structurally excluded there. THIS base is not
+            // single-flighted (D-02), and arming the trap makes the invariant
+            // fire DETERMINISTICALLY: `ProviderIdQueueFuzzTests`' T0.8 fuzzer
+            // reproduces it 3/3 at seed 8131249127217430530, killing the whole
+            // ~7.8k-test process. That is a TRUE positive, not a flake — the
+            // assertion is correct and the pool is wrong — so it must land in
+            // the SAME commit as D-02's single-flight fix, never before it.
+            // Arming it is one line: `assertPoolSlotWasNil(actionServer,
+            // "actionServer (ensureServer create)")` right here.
+            logMut("ensureServer createServer SUCCEEDED")
+            #endif
             actionServer = fresh
+            #if DEBUG
+            logMut("ensureServer PLANTED fresh")
+            #endif
             print("[IMAP] Created action connection")
             return fresh
         }
@@ -625,6 +736,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if !actionInUse {
             let idle = Date().timeIntervalSince(folderLastUsed["__action__"] ?? .distantPast)
             actionInUse = true
+            #if DEBUG
+            logMut("acquire-not-in-use SET actionInUse=true")
+            #endif
             folderLastUsed["__action__"] = Date()
 
             // Verify liveness if idle too long
@@ -634,11 +748,27 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     server = try await ensureServer()
                 } catch {
                     print("[IMAP] Action connection dead — recreating")
+                    #if DEBUG
+                    logMut("dead-recreate ENTER")
+                    #endif
                     do {
                         let fresh = try await createServer()
+                        #if DEBUG
+                        logMut("dead-recreate createServer SUCCEEDED")
+                        // `server` still holds the instance whose NOOP just
+                        // failed — it is reassigned to `fresh` two lines below,
+                        // so this read is the dead instance by construction.
+                        assertActionServerSelfReplace(actionServer, dead: server)
+                        #endif
                         actionServer = fresh
                         server = fresh
+                        #if DEBUG
+                        logMut("dead-recreate PLANTED fresh")
+                        #endif
                     } catch {
+                        #if DEBUG
+                        logMut("dead-recreate createServer FAILED: \(error)")
+                        #endif
                         releaseActionConnection(healthy: false)
                         throw error
                     }
@@ -654,6 +784,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // Resumed — connection may have been released unhealthy while waiting
         server = try await ensureServer()
         actionInUse = true
+        #if DEBUG
+        logMut("waiter-resume SET actionInUse=true (handoff)")
+        #endif
         folderLastUsed["__action__"] = Date()
         return server
     }
@@ -665,6 +798,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if !healthy {
             if let server = actionServer { Task { try? await server.logout() } }
             actionServer = nil
+            #if DEBUG
+            logMut("releaseActionConnection(healthy:false) CLEARED")
+            #endif
             // Fail all waiters
             let waiters = actionWaiters
             actionWaiters.removeAll()
@@ -674,9 +810,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             return
         }
 
+        #if DEBUG
+        if actionWaiters.isEmpty { logMut("release healthy, no waiter — actionInUse=false") }
+        #endif
         // Resume next waiter
         if !actionWaiters.isEmpty {
             let waiter = actionWaiters.removeFirst()
+            #if DEBUG
+            // Reference logs this as "(actionInUse stays true)" — its handoff
+            // reserves ownership for the waiter. THIS base cleared
+            // `actionInUse` at the top of the function instead (D-04/D-06), and
+            // the resumed waiter re-marks it; the journal records what this
+            // base actually does.
+            logMut("release healthy HANDOFF to waiter (actionInUse already false in this base)")
+            #endif
             waiter.resume()
         }
     }
@@ -721,6 +868,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             } catch {
                 print("[IMAP] Keepalive failed for action connection — removing")
                 actionServer = nil
+                #if DEBUG
+                // Journal entry with NO reference counterpart (`v2final:2865`
+                // does not log this leg). Added deliberately: this is an action
+                // slot mutation that does NOT bump `generation`, i.e. exactly
+                // the class of event the reference's own Round-9 wedge
+                // post-mortem says is otherwise invisible in the journal. It is
+                // a log line only — no assertion, no behaviour.
+                logMut("keepalive action FAILED — CLEARED")
+                #endif
             }
         }
     }
@@ -730,6 +886,22 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func connect() async throws {
         // Create the action connection eagerly
         actionServer = try await createServer()
+        #if DEBUG
+        // ⚠ DELIBERATELY NOT TRAPPED — see D-23 in
+        // `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift`.
+        // This plant is unconditional, and `AccountManagerSync.ensureConnected`
+        // calls `connect()` on an ALREADY-connected provider as a matter of
+        // course, so `assertPoolSlotWasNil` here would be a guaranteed
+        // debug-build process kill on an already-recorded defect rather than a
+        // future-regression trap. The reference closed this by routing
+        // `connect()` through the single-flighted `ensureServer()`
+        // (`v2final:…:2876-2886`, finding B-3) — a production behaviour change
+        // out of scope for this purely-additive item. When that fix lands the
+        // plant moves inside `ensureServer()` and is trapped there
+        // automatically. The journal still records the mutation so the
+        // post-mortem cannot silently miss where `actionServer` came from.
+        logMut("connect() PLANTED (UNGUARDED — D-23)")
+        #endif
         print("[IMAP] Action connection ready")
         startKeepAlive()
     }
@@ -758,6 +930,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let aw = actionWaiters
         actionWaiters.removeAll()
         for w in aw { w.resume(throwing: ProviderError.notConnected) }
+        #if DEBUG
+        // No `disconnect() BUMP` counterpart to the reference's `:2958`: this
+        // base's `disconnect()` does not advance `generation` at all (D-15).
+        logMut("disconnect() WIPED")
+        #endif
     }
 
     func markDirty() async {
@@ -769,6 +946,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // Advance generation — zombie tasks from previous generation will skip release
         // instead of accidentally removing newly created connections.
         generation += 1
+        #if DEBUG
+        logMut("markDirty() BUMP")
+        #endif
 
         // Nuke ALL folder connections (both idle and in-use)
         for (folder, server) in folderServers {
@@ -804,6 +984,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let aw = actionWaiters
         actionWaiters.removeAll()
         for w in aw { w.resume(throwing: ProviderError.notConnected) }
+        #if DEBUG
+        logMut("markDirty() WIPED")
+        #endif
     }
 
     /// Server-declared per-user connection limit (e.g., `max_userip_connections=15`).
