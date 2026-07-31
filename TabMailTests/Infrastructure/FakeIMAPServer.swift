@@ -108,14 +108,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
         /// Identity-resolution fault seam (Testing Rule 11) — bare (angle-
-        /// bracket-stripped) Message-ID → how many further `UID SEARCH …
-        /// HEADER "Message-ID"` commands naming it must answer SUCCESSFULLY
-        /// with zero UIDs. Unlike `injectedFailureCountdowns` above this is
-        /// consumed inside the SEARCH handler, not in the pre-dispatch failure
-        /// check, because the whole point is that the command SUCCEEDS. See
-        /// `returnEmptySearch(forMessageId:matchCount:)`.
-        var emptySearchCountdowns: [String: Int] = [:]
-        var consumedEmptySearchCount = 0
+        /// bracket-stripped) Message-ID → how many further whole RESOLUTIONS
+        /// of it must answer SUCCESSFULLY with zero UIDs. Unlike
+        /// `injectedFailureCountdowns` above this is consumed inside the SEARCH
+        /// handler, not in the pre-dispatch failure check, because the whole
+        /// point is that the command SUCCEEDS. The unit is a resolution and not
+        /// a command; see `returnEmptySearch(forMessageId:resolutionCount:)`
+        /// for why that distinction is load-bearing rather than cosmetic.
+        var emptySearchResolutionCountdowns: [String: Int] = [:]
+        /// Whole resolutions this fake has actually driven to empty — i.e. the
+        /// number of times it served the BARE half of a bracketed-then-bare
+        /// pair with zero UIDs, which is the exact wire event that makes
+        /// `IMAPProvider.resolveUID` throw `uidResolutionFailed`.
+        var consumedEmptySearchResolutionCount = 0
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
         /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
@@ -518,19 +523,27 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     /// Two-tier fuzzer (Testing Rule 11) seam — the IDENTITY-RESOLUTION fault,
     /// and the only one of this fake's three that a *successful* command
-    /// carries. The next `matchCount` `UID SEARCH … HEADER "Message-ID"`
-    /// commands naming `messageId` answer `* SEARCH` with an EMPTY UID list and
-    /// a tagged `OK`, while the message itself stays exactly where it is.
+    /// carries. The next `resolutionCount` whole RESOLUTIONS of `messageId`
+    /// answer `* SEARCH` with an EMPTY UID list and a tagged `OK`, while the
+    /// message itself stays exactly where it is.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED (RULE R0). `v2final`'s `FakeIMAPServer` has no
+    /// successful-but-empty SEARCH seam and no state field of this shape: the
+    /// reference's only injected faults are the tagged-`NO` and socket-kill
+    /// pair above, because it never fuzzed identity resolution at all (its
+    /// tier-2 adversarial dimension is the epoch reset, and a renumber
+    /// PRESERVES every Message-ID, so an RFC-keyed SEARCH still resolves).
+    /// There was therefore no reference seam to port and no reference
+    /// consumption-accounting shape to match.
     ///
     /// **Why neither existing fault can express this.** `failNextCommand` sends
     /// a tagged `NO`; `killConnectionOnNextCommand` closes the socket with no
     /// response at all. Both are consumed in the dispatch loop BEFORE
     /// `handleCommand` runs, so both surface at the client as a THROWN error.
     /// `IMAPProvider.resolveUID` throws `ProviderError.uidResolutionFailed`
-    /// only when a search that SUCCEEDED resolved to zero UIDs
-    /// (`IMAPProvider.swift:2337-2346`) — an outcome neither can produce.
-    /// Without this seam the drain's entire identity-resolution phase is
-    /// unreachable from any wire-level test.
+    /// only when a search that SUCCEEDED resolved to zero UIDs — an outcome
+    /// neither can produce. Without this seam the drain's entire
+    /// identity-resolution phase is unreachable from any wire-level test.
     ///
     /// **Fidelity.** The reply is byte-identical to the one a genuine miss
     /// produces — same `* SEARCH ` line, same tagged OK, emitted from the same
@@ -538,28 +551,57 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// an armed miss from a real one. That is what makes it a faithful model of
     /// the transient false negative `resolveUID`'s own contract names ("the
     /// message likely exists but SEARCH couldn't find it (server quirk, timing
-    /// issue)", `IMAPProvider.swift:2335-2336`).
+    /// issue)").
     ///
-    /// **`matchCount` counts COMMANDS, not resolutions.** One
-    /// `IMAPProvider.searchByMessageId` issues up to TWO searches — bracketed
-    /// first, then bare if the bracketed one came back empty
-    /// (`IMAPProvider.swift:2317-2329`) — so failing one whole resolution takes
-    /// `matchCount: 2`. Arming fewer merely under-injects (the bare retry finds
-    /// the message and resolution proceeds normally): a missed fault, never a
-    /// false one.
+    /// **The unit is a RESOLUTION, not a command — and that is the whole
+    /// point.** `IMAPProvider.searchByMessageId` issues up to TWO searches for
+    /// one resolution: the bracketed form first, then the bare form only when
+    /// the bracketed one came back empty. An earlier version of this seam
+    /// counted COMMANDS, and that made the fault splittable: the bracketed
+    /// half could consume one armed miss, a concurrent teardown could break the
+    /// connection before the bare half, and a LATER attempt could then spend
+    /// the leftover on ITS bracketed half and succeed on its bare one — two
+    /// armed misses served, ZERO resolutions failed, `uidResolutionFailed`
+    /// never thrown. A fuzzer's non-vacuity guard counting those commands would
+    /// green with the dimension it exists to exercise entirely unexercised.
+    ///
+    /// So the credit is consumed on the BARE half only. The bracketed half is
+    /// served empty while a credit is outstanding but spends nothing, which
+    /// makes the pair ATOMIC with respect to teardown: a connection that dies
+    /// mid-pair leaves the credit intact and the next attempt is dealt a whole
+    /// fresh pair. One credit therefore means exactly one
+    /// `ProviderError.uidResolutionFailed`, so both the injected-fault budget
+    /// and `consumedEmptySearchResolutionCount()` count the thing the caller
+    /// actually reasons about.
     ///
     /// `messageId` is matched with angle brackets stripped from both sides, so
     /// either form may be passed.
-    func returnEmptySearch(forMessageId messageId: String, matchCount: Int) {
+    ///
+    /// Symbol-level citations on purpose: `IMAPProvider.swift` is under active
+    /// growth on this branch, so a line range written here is a latent false
+    /// claim (this doc comment previously carried three of them). The symbols
+    /// are `IMAPProvider.searchByMessageId` (the bracketed-then-bare pair) and
+    /// `IMAPProvider.resolveUID` (the sole `uidResolutionFailed` throw site in
+    /// the whole app target).
+    func returnEmptySearch(forMessageId messageId: String, resolutionCount: Int) {
         let bare = messageId.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-        withState { $0.emptySearchCountdowns[bare, default: 0] += max(0, matchCount) }
+        withState { $0.emptySearchResolutionCountdowns[bare, default: 0] += max(0, resolutionCount) }
     }
 
-    /// How many armed empty-SEARCH answers this fake has actually served. A
-    /// fuzzer asserts this is non-zero so that an arming path which silently
-    /// stopped firing cannot leave the suite a green-always control.
-    func consumedEmptySearchCount() -> Int {
-        withState { $0.consumedEmptySearchCount }
+    /// How many whole armed resolutions this fake has actually driven to empty
+    /// — i.e. how many times it served the BARE half of a bracketed-then-bare
+    /// pair with zero UIDs, which is precisely the wire event that makes
+    /// `IMAPProvider.resolveUID` throw. A fuzzer asserts this is non-zero so
+    /// that an arming path which silently stopped firing cannot leave the suite
+    /// a green-always control.
+    ///
+    /// ⚠ This is a WIRE-side observation and proves only that the fake did its
+    /// job. It does NOT prove the drain's failure branch ran — that needs a
+    /// durable, production-written observation, which is why
+    /// `ProviderIdQueueFuzzTests` pairs this with the queue's own
+    /// `uidResolutionRetryCount` side effect rather than resting on it alone.
+    func consumedEmptySearchResolutionCount() -> Int {
+        withState { $0.consumedEmptySearchResolutionCount }
     }
 
     /// Owner-directed adversarial fuzzer addendum — see `State
@@ -1436,18 +1478,35 @@ final class FakeIMAPServer: @unchecked Sendable {
                 // from the raw header value and typically includes "<...>".
                 let bracketSet = CharacterSet(charactersIn: "<>")
                 let bareQuery = quoted.trimmingCharacters(in: bracketSet)
+                // `IMAPProvider.searchByMessageId` asks the bracketed form
+                // (`"<id>"`) first and the bare form (`"id"`) only when that
+                // came back empty, so the presence of the angle brackets IS
+                // which half of the resolution pair this command is.
+                let isBracketedHalf = quoted.hasPrefix("<")
                 // Identity-resolution fault seam — see
-                // `returnEmptySearch(forMessageId:matchCount:)`. Consumed HERE
-                // rather than in the pre-dispatch injected-failure check
+                // `returnEmptySearch(forMessageId:resolutionCount:)`. Consumed
+                // HERE rather than in the pre-dispatch injected-failure check
                 // because this fault's defining property is that the command
                 // SUCCEEDS: it takes the same `return` below as a genuine miss,
                 // so the two are indistinguishable on the wire.
+                //
+                // Both halves are answered empty while a credit is outstanding,
+                // but only the BARE half SPENDS it. That keeps the pair atomic
+                // against a teardown landing between the two commands: the
+                // credit survives, the next attempt is dealt a whole fresh
+                // pair, and one credit still means exactly one thrown
+                // `uidResolutionFailed`. Spending on the bracketed half instead
+                // would let a broken pair strand a half-credit that a later
+                // attempt consumes without ever failing a resolution — see the
+                // seam's doc comment.
                 let armedEmpty = withState { state -> Bool in
-                    guard let remaining = state.emptySearchCountdowns[bareQuery], remaining > 0 else {
+                    guard let remaining = state.emptySearchResolutionCountdowns[bareQuery], remaining > 0 else {
                         return false
                     }
-                    state.emptySearchCountdowns[bareQuery] = remaining - 1
-                    state.consumedEmptySearchCount += 1
+                    if !isBracketedHalf {
+                        state.emptySearchResolutionCountdowns[bareQuery] = remaining - 1
+                        state.consumedEmptySearchResolutionCount += 1
+                    }
                     return true
                 }
                 let matched: [String]

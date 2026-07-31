@@ -688,7 +688,7 @@ struct IMAPProviderPoolInvariantTests {
     ///
     /// **Red-first evidence (recorded 2026-07-30).** Dropping
     /// `|| folderCreating.contains(folder)` from `acquireFolderConnection`'s
-    /// branch-2 guard (`IMAPProvider.swift:363`) sends the second caller down
+    /// branch-2 guard (`IMAPProvider.acquireFolderConnection`) sends the second caller down
     /// the create path instead. The decisive failure is the abandoned-session
     /// oracle — `server.abandonedSessionCount()` reads 1 where 0 is required,
     /// because the loser's logged-in session is planted over with no LOGOUT —
@@ -734,7 +734,7 @@ struct IMAPProviderPoolInvariantTests {
         // `folderServers["INBOX"]`; the second acquire then arrives to an
         // already-existing connection and is served by an earlier branch of
         // `acquireFolderConnection`, never reaching the single-flight predicate
-        // at `IMAPProvider.swift:363` that this case exists to pin. With the
+        // in `IMAPProvider.acquireFolderConnection` that this case exists to pin. With the
         // canonical regression applied, such a run still observes one live
         // session and zero abandoned ones and reports GREEN with the bug
         // present. `secondSucceeded` below does not rescue it: succeeding
@@ -908,7 +908,8 @@ struct IMAPProviderPoolInvariantTests {
     /// comment at the assertion.
     ///
     /// **Red-first evidence (recorded 2026-07-30).** Changing
-    /// `releaseFolderConnection`'s healthy handoff (`IMAPProvider.swift:512-516`)
+    /// `IMAPProvider.releaseFolderConnection`'s healthy handoff (its
+    /// `folderWaiters[folder]` `removeFirst()` resume)
     /// from `removeFirst()` to draining and resuming the whole queue makes both
     /// waiters run at once. The extra entrant arrives asynchronously, so the
     /// assertion that catches it is the bounded NEGATIVE wait below: it
@@ -972,15 +973,15 @@ struct IMAPProviderPoolInvariantTests {
         //
         //  1. A self-disarming hook blinds `holdersEntered` to exactly the
         //     regression this case exists for. Under the red mutation — the
-        //     healthy handoff at `IMAPProvider.swift:512-516` draining and
+        //     healthy handoff in `IMAPProvider.releaseFolderConnection` draining and
         //     resuming the WHOLE queue instead of `removeFirst()` — the second
         //     entrant may read a nil hook, skip the body, and leave the count
         //     at 2, so the count would PASS while one socket was checked out
         //     twice. Counting EVERY entry is what turns `holdersEntered` into a
         //     property oracle: it reads 3 under that mutation.
         //  2. The disarm is racy, and the race TRAPS THE PROCESS.
-        //     `withFolderConnection` reads `folderConnectionTestHook` at
-        //     `IMAPProvider.swift:315` and then awaits it, while the body's own
+        //     `IMAPProvider.withFolderConnection` reads
+        //     `folderConnectionTestHook` and then awaits it, while the body's own
         //     `setFolderConnectionTestHookForTesting(nil)` needs a fresh hop
         //     back onto the actor — so a second entrant can read a still-armed
         //     hook in that gap. Both bodies then run, both store a
@@ -1209,36 +1210,69 @@ struct IMAPProviderPoolInvariantTests {
     //        action pool's liveness stamp as a side effect. (Reference: item D
     //        hygiene.) `evictionNeverTakesAConnectionOutFromUnderItsHolder`
     //        avoids the key rather than relying on it.
-    //  D-19  ✅ CLOSED — THE SEAM HAS LANDED. It already paid for itself: it
-    //        turned D-02 from a reasoned-about defect into observed red
-    //        evidence on its first run (see D-02 above). Three plant sites stay
-    //        unarmed on purpose — D-02, D-20, D-23, each recorded with the
-    //        defect it belongs to.
+    //  D-19  🟠 PARTIAL — the seam has landed, but it is PARTIAL DIAGNOSTICS:
+    //        3 of this base's 6 non-nil plant sites are armed, and the other 3
+    //        are each blocked on a named, still-open defect. Do NOT read this
+    //        entry as "the plant-over invariant is now enforced" — it is
+    //        enforced on half the surface.
     //        Was: "No plant site asserts its slot was nil beforehand."
-    //        `TabMail/Providers/IMAPProvider.swift` now carries a verbatim port
-    //        of the reference's plant-over trap system — `assertPoolSlotWasNil`
-    //        (`v2final:…:494`), `assertActionServerSelfReplace` (`:524`) and the
-    //        `mutLog` / `logMut` / `mutLogForTesting` ring journal (`:629-636`),
-    //        which is the ONLY post-mortem channel a trap leaves behind (the
-    //        `assert` kills the process before any fuzzer's end-of-round dump
-    //        can run). All of it is inside `#if DEBUG`; Release is inert.
-    //        ARMED at three of the four plant sites that have a reference
-    //        counterpart: `createFolderConnection`'s primary and limit-retry
-    //        plants (reference `:1767` / `:1839`) and the dead-recreate
-    //        self-replace (`:2586`). The fourth — the nested `ensureServer()`
-    //        create (`:2387`) — is armed by ONE line that lands with D-02's
-    //        single-flight fix, because arming it today fires deterministically
-    //        on a defect this base still has; the red evidence it already
-    //        produced is recorded under D-02 above.
-    //        Three plant sites are deliberately NOT armed, each recorded where
-    //        the defect lives: D-02 (above), D-20 and D-23 (below). The pattern
-    //        is the same in all three and it is not a weakening of the
-    //        assertion: a trap belongs at a plant whose plant-over is already
-    //        structurally excluded, so it catches a FUTURE regression. Where the
-    //        exclusion is the very thing still missing, an armed trap is not a
-    //        regression detector — it is a guaranteed process kill on a defect
-    //        already on the books, and it takes ~7.8k unrelated test results
-    //        with it every run.
+    //
+    //        THE SIX PLANT SITES, and their status. (Two of them hide behind a
+    //        dictionary subscript — `folderServers[folder] = …` — rather than a
+    //        scalar field name, so a grep for `actionServer =` alone misses
+    //        them.)
+    //          1. `createFolderConnection` primary plant .......... ARMED
+    //          2. `createFolderConnection` limit-retry plant ...... ARMED
+    //          3. action dead-recreate self-replace .............. ARMED
+    //                (via `assertActionServerSelfReplace`, the ONE documented
+    //                 exception to "never plant over non-nil")
+    //          4. nested `ensureServer()` create ............ UNARMED — D-02
+    //          5. `setIdleServer(_:)` ...................... UNARMED — D-20
+    //          6. `connect()`'s unconditional plant ........ UNARMED — D-23
+    //
+    //        It already paid for itself even at 3/6: it turned D-02 from a
+    //        reasoned-about defect into observed red evidence on its first run
+    //        (see D-02 above).
+    //
+    //        NEAR-VERBATIM, not verbatim. `TabMail/Providers/IMAPProvider.swift`
+    //        carries a NEAR-verbatim port of the reference's plant-over trap
+    //        system — `assertPoolSlotWasNil` (`v2final:…:494`),
+    //        `assertActionServerSelfReplace` (`:524`) and the `mutLog` /
+    //        `logMut` / `mutLogForTesting` ring journal (`:629-636`), which is
+    //        the ONLY post-mortem channel a trap leaves behind (the `assert`
+    //        kills the process before any fuzzer's end-of-round dump can run).
+    //        The two assert BODIES are byte-identical to the reference's. Four
+    //        things are not:
+    //          (a) COVERAGE. The reference arms FOUR call sites (`v2final:…`
+    //              `:1767`, `:1839`, `:2387`, `:2586`) and has only four plant
+    //              sites to arm, because it eliminated `connect()`'s plant (B-3)
+    //              and made the IDLE plant structurally impossible
+    //              (`claimIdleServerSlot`). This base has six and arms three.
+    //          (b) JOURNAL FIELDS. The reference's `logMut` line also carries
+    //              `actionServerCreating=`; this base has no such field to
+    //              print, because that field IS D-02's single-flight state.
+    //          (c) GATING. The reference leaves the journal family's
+    //              DECLARATIONS ungated and gates only `logMut`'s body; here
+    //              the whole family and every call site sit inside `#if DEBUG`.
+    //              (Already disclosed at the seam block itself.)
+    //          (d) CALL SITES. The self-replace call passes the local the
+    //              enclosing branch proved dead; the reference additionally
+    //              guards `actionServer === deadInstance` BEFORE the plant and
+    //              refuses otherwise (its R8-F1 fix), which is deferred here as
+    //              D-05 — so the same assert is defense-in-depth there and a
+    //              live check here.
+    //
+    //        WHY THREE SITES ARE UNARMED — and why that is not a weakening of
+    //        the assertion (R6). A trap belongs at a plant whose plant-over is
+    //        already structurally excluded, so that it catches a FUTURE
+    //        regression. Where the exclusion is the very thing still missing,
+    //        an armed trap is not a regression detector — it is a guaranteed
+    //        debug-build process kill on a defect already on the books, taking
+    //        ~7.8k unrelated test results with it every run. The predicate was
+    //        not softened anywhere; the arming line is simply absent at three
+    //        sites, each recorded with its blocking defect (D-02 above, D-20
+    //        and D-23 below).
+    //
     //        Why it lands NOW rather than with T3.7's fixes: a trap added AFTER
     //        a pool fix cannot red-prove it, and BOTH of the reference pool
     //        fuzzer's acceptance-gate findings were detected by this trap and
@@ -1249,6 +1283,47 @@ struct IMAPProviderPoolInvariantTests {
     //        firing `assert` traps the whole process, so a test that provoked it
     //        would kill the run rather than fail one case.
     //
+    //        ── IS THE D-02 RE-ARM COUPLING MACHINE-CHECKABLE? Considered, and
+    //        deliberately NOT built. Recording the reasoning, because the
+    //        question will be asked again.
+    //        The coupling at issue is: *D-02's single-flight fix must arm site 4
+    //        in the SAME commit, or the red evidence banked under D-02 is
+    //        orphaned.* Today that is enforced by prose here and by a comment
+    //        at the plant itself. Three candidate checks were weighed:
+    //          • PIN THE INVENTORY ("exactly 3 armed call sites in
+    //            `IMAPProvider.swift`"). REJECTED — it points the wrong way. It
+    //            goes RED on the SAFE transition (someone arms site 4, i.e.
+    //            does the right thing) and stays GREEN on the DANGEROUS one
+    //            (the single-flight fix lands with site 4 left unarmed — the
+    //            count is still 3). A tripwire that is green in exactly the
+    //            failure mode it advertises is worse than no tripwire: it is
+    //            false assurance, and it taxes the correct action.
+    //          • PIN THE FIX'S MECHANISM (`source contains
+    //            "actionServerCreating"` ⟺ `site 4 is armed`). Points the right
+    //            way, but pins the MECHANISM rather than the invariant — a
+    //            differently-shaped single-flight satisfies neither side and
+    //            the check stays green while the arming is missed. That is the
+    //            specific failure this project has already been burned by twice
+    //            (Testing Rule 12's "pin the INVARIANT, not the fix's
+    //            mechanism").
+    //          • PIN THAT THE THREE ARMED SITES STAY ARMED (a floor, not an
+    //            equality). Sound and correctly pointed, but it guards a
+    //            DIFFERENT risk (silent disarming) that already has behavioural
+    //            detectors — `concurrentSameFolderAcquiresOpenExactlyOneConnection`
+    //            and the `abandonedSessionCount()` leak oracle both go red if
+    //            those plants regress — so it would add call-site-text
+    //            fragility without adding a property.
+    //        The only correctly-pointed detector for the actual coupling is
+    //        BEHAVIOURAL: an action-pool analogue of
+    //        `concurrentSameFolderAcquiresOpenExactlyOneConnection`. It cannot
+    //        be written today without being a known-failing or `withKnownIssue`
+    //        test — which is what this whole DEFERRED block exists to avoid,
+    //        and is the prohibited "test that blesses the bug". It is already
+    //        mandated to land in D-02's fix commit, where it will be red-first
+    //        against the evidence banked above.
+    //        Conclusion: for THIS item, an accurate comment is the honest
+    //        ceiling. The overclaim was the defect; it is corrected above.
+    //
     // IDLE CONNECTION
     //  D-20  `launchIdleConnection` plants through `setIdleServer(_:)`, which
     //        assigns unconditionally. It does not re-check
@@ -1256,8 +1331,10 @@ struct IMAPProviderPoolInvariantTests {
     //        the plant, so two overlapping launches clobber each other and the
     //        loser's session is leaked. (Reference: R7-F3's
     //        `claimIdleServerSlot`.)
-    //        D-19 NOTE — this is the one plant site the trap does NOT cover,
-    //        and the reference does not cover it either: `claimIdleServerSlot`
+    //        D-19 NOTE — this is site 5 of D-19's six, one of the THREE the
+    //        trap does not cover (the others are D-02 and D-23). It is the only
+    //        one of the three the reference does not cover either:
+    //        `claimIdleServerSlot`
     //        makes the plant-over structurally impossible (`guard idleServer ==
     //        nil` in the SAME synchronous actor step as the assignment), so an
     //        `assertPoolSlotWasNil` there would be dead code in the reference
@@ -1286,7 +1363,8 @@ struct IMAPProviderPoolInvariantTests {
     //        the single-flighted `ensureServer()` — `v2final:…:2876-2886` — with
     //        staleness left to `markDirty()`, exactly as `ensureConnected`'s own
     //        doc comment already describes.)
-    //        This is the ONE plant site D-19's trap deliberately leaves unarmed.
+    //        This is site 6 of D-19's six — one of the THREE its trap
+    //        deliberately leaves unarmed (with D-02 and D-20).
     //        Arming `assertPoolSlotWasNil` here today would not catch a future
     //        regression, it would guarantee a debug-build process kill on an
     //        already-known defect — the reference closed the hole by changing

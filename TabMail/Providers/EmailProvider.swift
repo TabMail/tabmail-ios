@@ -181,7 +181,9 @@ protocol EmailProvider: Sendable {
     ///
     /// REFERENCE (`v2final`, tag `e28dd4edb`): the same member and the same
     /// `nil` default — `EmailProvider.swift:210` / `:352`, backed by
-    /// `IMAPProvider.lastObservedUidValidityBox` (`IMAPProvider.swift:84`). The
+    /// `IMAPProvider.lastObservedUidValidityBox` (symbol-cited on purpose: the
+    /// line-number convention into `IMAPProvider.swift` is abolished tree-wide,
+    /// because any edit to that file silently falsifies a number cited here). The
     /// no-stale-fallback rule above is an ADDITION to the reference, required
     /// because v3's consumer writes the value instead of comparing it — see
     /// `IMAPProvider.selectMailboxTracked`.

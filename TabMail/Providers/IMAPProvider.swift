@@ -73,7 +73,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `SyncEngineDeletionReconcile.swift` enforces).
     ///
     /// REFERENCE (`v2final`, tag `e28dd4edb`): `IMAPProvider
-    /// .lastObservedUidValidityBox` (`IMAPProvider.swift:84`), same shape and the
+    /// .lastObservedUidValidityBox` (`v2final:TabMail/Providers/IMAPProvider
+    /// .swift:84` — the `v2final:` prefix is load-bearing: this is a pointer at
+    /// the immutable TAG, not a self-reference into this file, where line 84
+    /// is something else entirely), same shape and the
     /// same `!= 0` guard — but the reference does NOT clear on a `0`, and this
     /// port deliberately does. See `selectMailboxTracked` for why that difference
     /// is required rather than cosmetic.
@@ -116,7 +119,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// no fallbacks), and the value it falls back to then gets PERSISTED.
     ///
     /// ⚠ THIS IS A DELIBERATE CORRECTION OF `v2final`, NOT A PORT OF IT. The
-    /// reference's chokepoint (`IMAPProvider.swift:1353`) has the identical
+    /// reference's chokepoint (`v2final:TabMail/Providers/IMAPProvider
+    /// .swift:1353` — tag-pinned, NOT a pointer into this file) has the identical
     /// `if observed != 0 { … }` and never clears — and that is SAFE there,
     /// because its consumer is a *comparison guard*: a stale mirror value
     /// disagrees with the live epoch, and disagreement ABORTS. Fail-safe. Here
@@ -163,7 +167,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     // Recorded as D-19 in
     // `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift`.
     //
-    // ONE deviation from the reference, the same one the T0.6(a) seam block
+    // NEAR-verbatim, not verbatim: the two assert BODIES are byte-identical to
+    // the reference's, but coverage (3 of 6 plant sites armed here vs 4 of 4
+    // there), the journal's field list (the reference also prints
+    // `actionServerCreating=`, which is D-02's single-flight state and does not
+    // exist here), one call site, and the gating below all differ. The full
+    // deviation list lives in the D-19 entry in
+    // `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift`; do not
+    // restate this port as verbatim.
+    //
+    // The GATING deviation, which is the one the T0.6(a) seam block
     // below already documents: the reference leaves `mutLog` / `logMut` /
     // `mutLogForTesting` UNGATED (only `logMut`'s BODY is `#if DEBUG`, relying
     // on `@autoclosure` to keep release call sites free of the interpolation).
@@ -869,12 +882,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 print("[IMAP] Keepalive failed for action connection — removing")
                 actionServer = nil
                 #if DEBUG
-                // Journal entry with NO reference counterpart (`v2final:2865`
-                // does not log this leg). Added deliberately: this is an action
-                // slot mutation that does NOT bump `generation`, i.e. exactly
-                // the class of event the reference's own Round-9 wedge
-                // post-mortem says is otherwise invisible in the journal. It is
-                // a log line only — no assertion, no behaviour.
+                // ⚑ NO REFERENCE — INVENTED (RULE R0). The reference's
+                // keepalive action-failure leg (`v2final:TabMail/Providers/
+                // IMAPProvider.swift:2861-2866`) nils `actionServer` with NO
+                // journal line at all, so this event has no counterpart to
+                // port. Added deliberately: this is an action slot mutation
+                // that does NOT bump `generation`, i.e. exactly the class of
+                // event the reference's own Round-9 wedge post-mortem says is
+                // otherwise invisible in the journal. It is a log line only —
+                // no assertion, no behaviour.
                 logMut("keepalive action FAILED — CLEARED")
                 #endif
             }

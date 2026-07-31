@@ -59,8 +59,10 @@ struct NSEMainAppIMAPParityTests {
     /// produce. Main-app `IMAPProvider.buildMessageHeaderInfo` is an actor
     /// method and needs a live IMAP connection to instantiate — we can't
     /// call it directly from a unit test. Instead we assert against the
-    /// exact expressions the production code uses (see `IMAPProvider.swift`
-    /// lines 1856, 1861, 1869-1876, 1886), so drift in IMAPProvider shows
+    /// exact expressions the production code uses (see
+    /// `IMAPProvider.mapMessageInfo`, symbol-cited: line numbers into
+    /// `IMAPProvider.swift` are abolished tree-wide because any edit to that
+    /// file silently falsifies them here), so drift in IMAPProvider shows
     /// up here as a failure.
     @Test("Shared helpers produce the per-field output both NSE + main-app use")
     func sharedHelpersByteIdentical() {
@@ -68,29 +70,29 @@ struct NSEMainAppIMAPParityTests {
 
         // messageId — prefer UID.
         #expect(IMAPFetchMapping.messageIdString(from: info) == "42")
-        // Matches IMAPProvider.swift:1861 expression for the same inputs.
+        // Matches IMAPProvider.mapMessageInfo's messageId expression for the same inputs.
 
         // rfc822MessageId — bare.
         #expect(IMAPFetchMapping.rfc822MessageId(from: info) == "id@example.com")
-        // Matches IMAPProvider.swift:1856.
+        // Matches IMAPProvider.mapMessageInfo's rfc822MessageId.
 
         // inReplyTo — bare, normalized.
         #expect(IMAPFetchMapping.inReplyTo(from: info) == "parent@example.com")
-        // Matches IMAPProvider.swift:1857 expression (pre-helper inline form).
+        // Matches IMAPProvider.mapMessageInfo's inReplyTo expression (pre-helper inline form).
 
         // references — bare entries.
         #expect(IMAPFetchMapping.references(from: info) == ["root@example.com", "parent@example.com"])
-        // Matches IMAPProvider.swift:1858 expression.
+        // Matches IMAPProvider.mapMessageInfo's references expression.
 
-        // hasAttachments — predicate parity with IMAPProvider.swift:1877-1884.
+        // hasAttachments — predicate parity with IMAPProvider.mapMessageInfo.
         #expect(IMAPFetchMapping.hasAttachments(from: info))
 
-        // Recipient joining parity with IMAPProvider.swift:1869-1871.
+        // Recipient joining parity with IMAPProvider.mapMessageInfo.
         #expect(info.to.joined(separator: ", ") == "a@x.com, b@x.com")
         #expect(info.cc.joined(separator: ", ") == "c@x.com")
         #expect(info.bcc.joined(separator: ", ") == "d@x.com")
 
-        // Flags — mirrors IMAPProvider.swift:1875-1876.
+        // Flags — mirrors IMAPProvider.mapMessageInfo.
         #expect(info.flags.contains(.seen))
         #expect(!info.flags.contains(.flagged))
 
@@ -103,7 +105,7 @@ struct NSEMainAppIMAPParityTests {
     func uidlessFallback() {
         let info = makeInfo(uid: nil, messageID: "<only@id.com>")
         // Fallback: bare local@domain (no angle brackets), per
-        // IMAPProvider.swift:1861 and IMAPFetchMapping.messageIdString.
+        // IMAPProvider.mapMessageInfo and IMAPFetchMapping.messageIdString.
         #expect(IMAPFetchMapping.messageIdString(from: info) == "only@id.com")
     }
 

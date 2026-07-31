@@ -54,7 +54,8 @@ import GRDB
 /// the deletion-reconcile walk's abort guard (ADR-IOS-051).
 ///
 /// REFERENCE (`v2final`, tag `e28dd4edb`): the same capture, from the same
-/// place. `IMAPProvider.selectMailboxTracked` (`IMAPProvider.swift:1353`) wraps
+/// place. `IMAPProvider.selectMailboxTracked` (symbol-cited — the reference's
+/// line numbers for this file are no longer quoted, see below) wraps
 /// `server.selectMailbox`, guards `if observed != 0`, and records into
 /// `lastObservedUidValidityBox`; `EmailProvider.lastObservedUidValidity(
 /// folderPath:)` (`EmailProvider.swift:210`, default `nil` at `:352`) is how a
@@ -330,7 +331,7 @@ struct SelectSourcedFolderEpochTests {
     ///
     /// The fixture mailbox is EMPTY on purpose. `IMAPProvider.fetchMessages`
     /// SELECTs before its `selection.messageCount > 0` early return
-    /// (`IMAPProvider.swift:969-970`), so the epoch observation this test is
+    /// (symbol-cited, no line number), so the epoch observation this test is
     /// about happens either way — while an empty result keeps
     /// `SyncMessagesResult.newHeaders` empty, so the wrapper's post-merge
     /// side-effect branches (`indexHeadersForFTS`, `ActiveBodyQueue.shared`,

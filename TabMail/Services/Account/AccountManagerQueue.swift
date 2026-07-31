@@ -327,7 +327,8 @@ extension AccountManager {
     // This is a verbatim port of the reference accessor
     // (`v2final:TabMail/Services/Account/AccountManagerQueue.swift:3172-3174`) —
     // same name, same predicate — with the one deviation this file's sibling
-    // seams already established (`IMAPProvider.swift:830-855`, T0.6(a)): the
+    // seams already established (`IMAPProvider.mutLogForTesting` and the
+    // T0.6(a) pool-invariant seams; symbol-cited, no line numbers): the
     // reference leaves its `…ForTesting` surface UNGATED, here it is `#if DEBUG`
     // so Release builds carry neither the member nor any call site. Purely
     // additive: nothing above changed, and no production code reads it.

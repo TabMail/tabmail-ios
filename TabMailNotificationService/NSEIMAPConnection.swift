@@ -256,13 +256,14 @@ enum NSEIMAPConnection {
             isRead: info.flags.contains(.seen),
             isFlagged: info.flags.contains(.flagged),
             hasAttachments: IMAPFetchMapping.hasAttachments(from: info),
-            // Parity with IMAPProvider.buildMessageHeaderInfo:1886-1887.
+            // Parity with IMAPProvider.mapMessageInfo (symbol-cited, no line number).
             isReplied: info.flags.contains(.answered),
             isForwarded: info.flags.contains(.custom("$Forwarded")),
             // Raw custom keywords — merge filters tm_* + excluded in the
             // main-app target where `UserLabelStore.isExcludedKeyword` is
             // available. This mirrors how main-app `IMAPProvider` already
-            // handles it (line 1840-1848 of IMAPProvider.swift).
+            // handles it (`IMAPProvider.mapMessageInfo`'s `userLabelKeywords`
+            // extraction; symbol-cited, no line number).
             providerLabels: IMAPFetchMapping.customKeywords(from: info),
             folderPath: folderPath
         )

@@ -20,8 +20,10 @@ actor MockEmailProvider: EmailProvider {
     // MARK: - UIDVALIDITY observation (the epoch test seam)
 
     /// Per-folder mocked `lastObservedUidValidity`. `Mutex`-backed nonisolated
-    /// seam (mirrors `IMAPProvider.lastObservedUidValidityBox`,
-    /// `IMAPProvider.swift:80`) — the protocol requirement is synchronous
+    /// seam (mirrors `IMAPProvider.lastObservedUidValidityBox` — cited by
+    /// SYMBOL, not line: `IMAPProvider.swift` grows on this branch and even a
+    /// comment-only edit there shifts every line citation into it) — the
+    /// protocol requirement is synchronous
     /// (`EmailProvider.swift:188`; callers include a GRDB write closure, which
     /// cannot `await`), so an actor-isolated `var` cannot satisfy it.
     ///

@@ -76,7 +76,9 @@ import Synchronization
 ///     and never registered via `expectMutations` — any mutating command that
 ///     lands on one is a violation by construction. (The oracle's allowlist is
 ///     round-wide, not per-intention — a known limitation recorded in the
-///     plan's T0.7 callout, `FakeIMAPServer.swift:646-675`. Invariant (b)'s
+///     plan's T0.7 callout; the allowlist is registered by
+///     `FakeIMAPServer.expectMutations` and read by its `recordOracleCheck`.
+///     Invariant (b)'s
 ///     per-intention SERVER-side end state is what covers the residual: if
 ///     gesture X's mutation landed on gesture Y's message, X's own end state
 ///     is false and X settles `.unaccounted`.)
@@ -106,9 +108,10 @@ import Synchronization
 ///     microsecond lottery. Three faults are injected:
 ///     1. `killConnectionOnNextCommand` — a real dead transport.
 ///     2. An injected LOGIN connection-limit `NO`.
-///     3. `returnEmptySearch(forMessageId:matchCount:)` — a `UID SEARCH` that
-///        SUCCEEDS and resolves to zero UIDs, the sole producer of
-///        `ProviderError.uidResolutionFailed` (`IMAPProvider.swift:2337-2346`).
+///     3. `returnEmptySearch(forMessageId:resolutionCount:)` — a `UID SEARCH`
+///        that SUCCEEDS and resolves to zero UIDs, the sole producer of
+///        `ProviderError.uidResolutionFailed` (thrown in
+///        `IMAPProvider.resolveUID` — the one throw site in the app target).
 ///        This is the queue's IDENTITY-RESOLUTION phase, and it is fuzzed here
 ///        because that error carries a DEDICATED retry budget
 ///        (`PendingOperation.uidResolutionRetryCount`, capped at
@@ -118,6 +121,10 @@ import Synchronization
 ///        the intention settles `EXECUTED` against the fake server's real end
 ///        state. See `Step.injectEmptySearchResolution` for the accounting and
 ///        for the ONE gesture that is excluded from it.
+///
+///        The fault's unit is a whole RESOLUTION, not a `UID SEARCH` command —
+///        see the seam's own doc comment for why that distinction decides
+///        whether this suite's non-vacuity guard means anything.
 ///
 ///     ⚠️ CORRECTION (this file's own prior claims, both FALSE, were the T0.8
 ///     blocker). The superseded text asserted (i) that faults on `UID SEARCH`
@@ -236,12 +243,17 @@ struct ProviderIdQueueFuzzTests {
         /// (a). They exist purely so the oracle has something to catch.
         static let bystanderCount = 3
 
-        /// `UID SEARCH` commands ONE armed resolution failure costs.
-        /// `IMAPProvider.searchByMessageId` tries the bracketed form first and
-        /// falls back to the bare form only when that came back empty
-        /// (`IMAPProvider.swift:2317-2329`), so both must be armed for a single
-        /// `resolveUID` call to actually fail.
-        static let emptySearchCommandsPerResolution = 2
+        /// Whole resolution failures ONE `.injectEmptySearchResolution` arm
+        /// buys. The seam's unit is a RESOLUTION, not a `UID SEARCH` command:
+        /// `IMAPProvider.searchByMessageId` issues the bracketed form and then
+        /// the bare form, and `FakeIMAPServer` spends the credit only on the
+        /// bare half — so one credit is exactly one thrown
+        /// `ProviderError.uidResolutionFailed`, indivisible by a teardown
+        /// landing between the two commands. That indivisibility is what lets
+        /// the non-vacuity assertion below be sound rather than probabilistic;
+        /// the previous command-counting shape could spend two commands across
+        /// two different attempts and fail no resolution at all.
+        static let emptySearchResolutionsPerArm = 1
 
         /// Resolution failures a single message may be dealt in one round.
         ///
@@ -255,6 +267,12 @@ struct ProviderIdQueueFuzzTests {
         /// not hopeful: ONLY the resolution leg touches this counter
         /// (`:603`), while ordinary connection blips bump the separate
         /// `retryCount` (`:661`), so an unrelated fault cannot consume it.
+        ///
+        /// Since the seam became resolution-granular, one admitted arm is
+        /// exactly one increment of `uidResolutionRetryCount` — so this cap is
+        /// not merely an upper bound on the injected pressure, it is the exact
+        /// value the counter can reach, and the post-round audit below asserts
+        /// that equality holds rather than trusting this comment.
         static var maxEmptySearchResolutionsPerMessage: Int {
             max(1, SyncConfig.maxUidResolutionRetries - 1)
         }
@@ -433,10 +451,10 @@ struct ProviderIdQueueFuzzTests {
     /// this list already covers four times over. It could not produce the
     /// empty RESULT that makes the resolution phase interesting, because
     /// `ProviderError.uidResolutionFailed` is thrown only when a search
-    /// SUCCEEDS and resolves to zero UIDs (`IMAPProvider.swift:2337-2346`).
+    /// SUCCEEDS and resolves to zero UIDs (`IMAPProvider.resolveUID`).
     /// That outcome needs a different seam and now has one —
     /// `Step.injectEmptySearchResolution`, via `FakeIMAPServer
-    /// .returnEmptySearch(forMessageId:matchCount:)`.
+    /// .returnEmptySearch(forMessageId:resolutionCount:)`.
     private static let killFragments = ["LOGIN", "SELECT", "UID STORE", "UID MOVE"]
 
     // MARK: - Round identities
@@ -477,7 +495,7 @@ struct ProviderIdQueueFuzzTests {
     /// `PendingOperation.messageIds` **today**: every one of them is
     /// `msgs.map(\.stableId)` (`AccountManagerActions.swift:88`, `:97`, `:255`,
     /// `:298`, `:371`, `:376`). The ledger takes whatever string it is handed
-    /// verbatim and never classifies its shape (`IntentionLedger.swift:29-32`,
+    /// verbatim and never classifies its shape (`IntentionLedger.swift:24-28`,
     /// `:186-192`), so the suite's invariant set is keying-AGNOSTIC — this one
     /// function is the entire surface that knows what the key is.
     ///
@@ -541,8 +559,106 @@ struct ProviderIdQueueFuzzTests {
         guard budget.admit(messageId) else { return }
         server.returnEmptySearch(
             forMessageId: messageId,
-            matchCount: FuzzConfig.emptySearchCommandsPerResolution
+            resolutionCount: FuzzConfig.emptySearchResolutionsPerArm
         )
+    }
+
+    // MARK: - Identity-resolution failure audit (the non-vacuity proof)
+
+    /// Test-only audit of the ONE durable side effect the drain's non-move
+    /// `uidResolutionFailed` branch leaves behind: `updated
+    /// .uidResolutionRetryCount += 1` followed by `save`
+    /// (`AccountManagerQueue.swift:600-605`).
+    ///
+    /// That statement is the only writer of that column in the app target, and
+    /// it is reachable only from a thrown `ProviderError.uidResolutionFailed`
+    /// on a single-message NON-move op. The `.move` leg drops or falls through
+    /// without touching it (`:546-576`, `:610-615`), and every ordinary
+    /// transient bumps the separate `retryCount` (`:661`). So a recorded
+    /// increment proves two things at once: a resolution genuinely failed, AND
+    /// the failure reached the queue's failure path and was committed.
+    ///
+    /// ## Why a trigger, and not a query after the round
+    ///
+    /// The round drives itself to an EMPTY queue on purpose (invariant (c)), so
+    /// by the time any post-round `SELECT` could run, every row carrying the
+    /// evidence has been deleted by its own eventual success. Sampling during
+    /// the round would be a race, and widening a sampling window to close that
+    /// race is exactly the bound-widening R6 forbids. A SQLite `AFTER UPDATE`
+    /// trigger fires INSIDE the drain's own write transaction and writes to a
+    /// separate table, so the evidence is captured at the instant it exists and
+    /// outlives the row. It is also indifferent to which connection or pool
+    /// object performed the write, because it lives in the schema rather than
+    /// in the test's own read path.
+    ///
+    /// Nothing production-side changes for this. The table and trigger are
+    /// created by the test, on the test's own temporary database, after the
+    /// migrator has already run — the alternative considered and rejected was a
+    /// `#if DEBUG` counter inside `AccountManagerQueue`, which would have been
+    /// a production edit to observe a production write that SQLite can already
+    /// observe for free.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED (RULE R0) — the MECHANISM only; the PROOF
+    /// TECHNIQUE is the reference's and is followed deliberately. `v2final`
+    /// proves non-vacuity two-sidedly at
+    /// `v2final:TabMailTests/ViewModels/StatefulIMAPActionPipelineTests
+    /// .swift:2193-2194`: a WIRE-side consumption counter
+    /// (`server.consumedInjectedFailureCount() > 0` — *"sanity (SF2): the
+    /// injected failure was actually consumed by the attempt"*) paired with a
+    /// DURABLE per-op counter read back out of the database (`claimSeq > 0` —
+    /// *"the op must have actually been attempted before this point, otherwise
+    /// this assertion proves nothing about retention"*). That shape transfers
+    /// directly and is what the block after the drain barrier implements. What
+    /// does NOT transfer is the reference's way of READING the durable side: it
+    /// asserts RETENTION, so its row is still there when it looks. This suite
+    /// asserts CONVERGENCE, so the row is gone — hence the trigger. The
+    /// reference never fuzzed identity resolution at all, so it has no seam of
+    /// this kind to port and no counter of its own to reuse.
+    private static let resolutionFailureAuditTable = "queueFuzzUidResolutionFailureAudit"
+
+    private func installResolutionFailureAudit(pool: DatabasePool) throws {
+        let table = Self.resolutionFailureAuditTable
+        try pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                CREATE TABLE \(table) (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    opId TEXT NOT NULL,
+                    messageIdsJSON TEXT NOT NULL,
+                    newCount INTEGER NOT NULL
+                )
+                """)
+            // Deliberately NO `OF uidResolutionRetryCount` column list: GRDB's
+            // `save` writes every column, so an `UPDATE OF` trigger would also
+            // fire on writes that leave the counter alone. The `WHEN` clause is
+            // the precise predicate — it fires only on an actual increase, so
+            // the requeue-without-bump legs cannot forge evidence.
+            try db.execute(sql: """
+                CREATE TRIGGER \(table)_onIncrement
+                AFTER UPDATE ON \(PendingOperation.databaseTableName)
+                WHEN NEW.uidResolutionRetryCount > OLD.uidResolutionRetryCount
+                BEGIN
+                    INSERT INTO \(table) (opId, messageIdsJSON, newCount)
+                    VALUES (NEW.id, NEW.messageIdsJSON, NEW.uidResolutionRetryCount);
+                END
+                """)
+        }
+    }
+
+    /// Every recorded increment, oldest first, as (durable identity of the op's
+    /// single message, the counter value the increment produced).
+    private func recordedResolutionFailures(
+        pool: DatabasePool
+    ) async throws -> [(durableId: String, newCount: Int)] {
+        let table = Self.resolutionFailureAuditTable
+        return try await pool.read { db in
+            try Row.fetchAll(db, sql: "SELECT messageIdsJSON, newCount FROM \(table) ORDER BY seq")
+                .map { row in
+                    let json: String = row["messageIdsJSON"]
+                    let newCount: Int = row["newCount"]
+                    let ids = (try? JSONDecoder().decode([String].self, from: Data(json.utf8))) ?? []
+                    return (durableId: ids.first ?? "<unparsable: \(json)>", newCount: newCount)
+                }
+        }
     }
 
     // MARK: - Harness
@@ -582,6 +698,9 @@ struct ProviderIdQueueFuzzTests {
             try inbox.insert(db)
             try archive.insert(db)
         }
+        // After the migrator, before any op can be enqueued — see
+        // `installResolutionFailureAudit`.
+        try installResolutionFailureAudit(pool: pool)
         return Fixture(pool: pool, directory: directory, previous: previous, inbox: inbox, archive: archive)
     }
 
@@ -855,8 +974,11 @@ struct ProviderIdQueueFuzzTests {
             // GUARANTEED rather than schedule-dependent: the targeted gesture
             // always fires (single-shot), its op cannot resolve before the
             // round starts, and the drain barrier below does not return until
-            // the queue is empty — so the armed pair is necessarily served, and
-            // the non-vacuity assertion after the barrier is sound rather than
+            // the queue is empty — so the armed resolution is necessarily
+            // served. Its credit is indivisible (the fake spends it on the bare
+            // half of the pair, so a teardown landing mid-pair leaves it intact
+            // rather than stranding a half), which is what makes the
+            // non-vacuity assertions after the barrier sound rather than
             // flaky. The freely-scheduled second arm lives in `planSteps`.
             let emptySearchBudget = EmptySearchArmBudget()
             let emptySearchTargets = ids.emptySearchFaultTargetRfcs
@@ -952,16 +1074,73 @@ struct ProviderIdQueueFuzzTests {
                 "\(seedHex) round \(round): setup sanity — every single-shot gesture must have fired exactly once (got \(outcomes.count))"
             )
 
-            // ---- Setup sanity: the identity-resolution fault actually FIRED.
-            // Without this a broken arming path would silently turn the whole
-            // resolution dimension back off and leave a green-always control.
-            // The bound is the guaranteed setup arm's own cost (bracketed +
-            // bare, `FuzzConfig.emptySearchCommandsPerResolution`) — a floor
-            // the round cannot miss, not a tuned threshold.
-            let servedEmptySearches = server.consumedEmptySearchCount()
+            // ---- Non-vacuity: the identity-resolution FAILURE PATH really ran.
+            //
+            // Two-sided, and both sides are load-bearing — the reference's SF2
+            // shape, quoted in `installResolutionFailureAudit`. Neither half is
+            // a proof on its own:
+            //
+            //  * The WIRE side proves the fake served a whole empty resolution.
+            //    It cannot prove the drain reacted to it.
+            //  * The DURABLE side proves the drain's non-move
+            //    `uidResolutionFailed` branch executed and COMMITTED its
+            //    counter bump. Nothing else in the app target writes that
+            //    column, and the round's other two faults (a killed socket, an
+            //    injected LOGIN `NO`) are transport errors that take the
+            //    generic branch and bump the SEPARATE `retryCount`, so they
+            //    cannot forge it.
+            //
+            // ⚠ This replaced a guard that counted `UID SEARCH` COMMANDS and
+            // claimed the count proved a resolution had failed. It did not: a
+            // resolution is a bracketed-then-bare PAIR, so two consumed
+            // commands are one failed resolution only if they belonged to the
+            // same attempt. A teardown landing between them split the pair, a
+            // later attempt spent the leftover on its own bracketed half and
+            // then succeeded on its bare half, and the guard greened with ZERO
+            // resolutions failed and `uidResolutionFailed` never thrown — the
+            // exact vacuous-assertion trap this suite exists to avoid. The
+            // seam is now resolution-granular (the credit is spent on the bare
+            // half only), which removes that schedule; the assertion below no
+            // longer depends on it having been removed.
+            //
+            // Soundness of the floor, not a tuned threshold: the guaranteed
+            // setup arm is placed before any step spawns, its target gesture is
+            // single-shot and always fires, the op cannot resolve before the
+            // round starts, one credit is indivisible, and the barrier does not
+            // return until the queue is empty. So at least one whole armed
+            // resolution is necessarily served AND necessarily observed by the
+            // drain.
+            let servedEmptyResolutions = server.consumedEmptySearchResolutionCount()
             #expect(
-                servedEmptySearches >= FuzzConfig.emptySearchCommandsPerResolution,
-                "\(seedHex) round \(round): the empty-SEARCH resolution fault never fired (served \(servedEmptySearches)) — the identity-resolution dimension was not exercised"
+                servedEmptyResolutions >= FuzzConfig.emptySearchResolutionsPerArm,
+                "\(seedHex) round \(round): no whole empty-SEARCH resolution was ever served on the wire (served \(servedEmptyResolutions)) — the identity-resolution dimension was not exercised"
+            )
+
+            let resolutionFailures = try await recordedResolutionFailures(pool: fixture.pool)
+            #expect(
+                !resolutionFailures.isEmpty,
+                "\(seedHex) round \(round): NO durable identity-resolution failure was recorded — \(servedEmptyResolutions) empty resolution(s) were served on the wire, but the drain's uidResolutionFailed branch never bumped uidResolutionRetryCount, so nothing in this round proves the production failure path executed"
+            )
+
+            // Attribution + headroom. Every recorded failure must belong to a
+            // gesture the fault was allowed to target, and must have stayed
+            // inside the arm budget. The second half is the machine check for
+            // the headroom `FuzzConfig.maxEmptySearchResolutionsPerMessage`
+            // states in prose: a counter above it means a gesture was walking
+            // toward the drop leg at `SyncConfig.maxUidResolutionRetries` that
+            // this suite deliberately excludes from its ledger.
+            let armableIdentities = Set(
+                [headers.markRead, headers.markUnread, headers.markFlagged].map(Self.durableIdentity)
+            )
+            let misattributed = resolutionFailures.filter { !armableIdentities.contains($0.durableId) }
+            #expect(
+                misattributed.isEmpty,
+                "\(seedHex) round \(round): identity-resolution failure(s) recorded against message(s) the fault never targeted: \(misattributed.map(\.durableId))"
+            )
+            let overBudget = resolutionFailures.filter { $0.newCount > FuzzConfig.maxEmptySearchResolutionsPerMessage }
+            #expect(
+                overBudget.isEmpty,
+                "\(seedHex) round \(round): uidResolutionRetryCount reached \(overBudget.map(\.newCount)) — above the per-message arm budget \(FuzzConfig.maxEmptySearchResolutionsPerMessage), i.e. a gesture was pushed toward the drop leg at SyncConfig.maxUidResolutionRetries=\(SyncConfig.maxUidResolutionRetries)"
             )
 
             // ---- Invariant (a): the wire oracle is clean. The ONE hard

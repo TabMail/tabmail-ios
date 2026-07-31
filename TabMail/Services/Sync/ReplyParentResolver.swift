@@ -41,7 +41,7 @@ enum ReplyParentResolver {
         guard !inReplyTos.isEmpty else { return [] }
 
         // Normalize defensively. IMAPProvider normalizes at the boundary
-        // (IMAPProvider.swift:1922) but Gmail/Exchange providers pass raw
+        // (`IMAPProvider.mapMessageInfo`) but Gmail/Exchange providers pass raw
         // metadata through — `normalizeMessageId` is idempotent so this costs
         // nothing when the value was already normalized.
         let normalized: Set<String> = Set(

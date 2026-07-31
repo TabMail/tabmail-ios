@@ -19,7 +19,10 @@ import Synchronization
 /// (`TabMail/Providers/EmailProvider.swift:188`) carries a `nil` protocol
 /// default (`:258`), because UIDVALIDITY is an IMAP concept and every other
 /// provider honestly reports "unknown". `IMAPProvider` overrides it from its
-/// `Mutex`-backed SELECT mirror (`IMAPProvider.swift:80-88`). `MockEmailProvider`
+/// `Mutex`-backed SELECT mirror (`IMAPProvider.lastObservedUidValidityBox`, read
+/// by its `lastObservedUidValidity` override — cited by SYMBOL, not line, because
+/// any edit to `IMAPProvider.swift` shifts a line citation into it).
+/// `MockEmailProvider`
 /// did **not** — so it silently inherited `nil`.
 ///
 /// A mock that always answers `nil` does not merely fail to model the epoch; it
@@ -55,6 +58,19 @@ import Synchronization
 /// no such guard yet, so the tests below pin the seam's contract at the one
 /// production consumer v3 does have.
 ///
+/// ⚑ NO REFERENCE — INVENTED (RULE R0) — **THIS SUITE**, as distinct from the
+/// seam it exercises. The seam is a verbatim port (above); the suite is not.
+/// `v2final` has no `MockProviderEpochSeamTests.swift` and no equivalent
+/// anywhere: there, the mock's epoch override is exercised only INCIDENTALLY,
+/// as fixture setup for the merge-guard tests named above, so the reference
+/// never needed a suite whose subject is the seam's own liveness. v3 does,
+/// because v3 acquires the seam BEFORE it acquires the guard that consumes it
+/// (T1.3/T2.5/T2.6/T2.7 all depend on it), and a seam with no consumer yet is
+/// exactly the shape that passes vacuously — which is the defect this file
+/// was written to make impossible. Nothing about the three tests below is
+/// adapted from a reference test; they are authored against v3's one existing
+/// production consumer, `SyncEngineFullSync.runSyncMessages`.
+///
 /// ## Red-first evidence — MEASURED 2026-07-30, quoted verbatim
 ///
 /// The inversion is the MINIMAL one that reproduces the defect exactly: the
@@ -63,7 +79,11 @@ import Synchronization
 /// `EmailProvider`'s `{ nil }` default — i.e. precisely the 220-line shape at
 /// `b3fb8563f`. Everything else (both `Mutex` boxes, both setters, this file)
 /// was left untouched, so the boxes stay populated and the failures can only be
-/// the missing override. Verbatim console output:
+/// the missing override. Verbatim console output — the `.swift:NNN` line
+/// numbers below are as-recorded and are NOT live pointers; this doc comment has
+/// grown since, so they no longer index the same assertions. The quoted test name
+/// + expectation is the identifying part. (Same convention as the sibling
+/// transcript in `SelectSourcedFolderEpochTests`.)
 ///
 /// ```
 /// ✘ Test "A mock-observed epoch reaches the folder's stored epoch" recorded an issue at MockProviderEpochSeamTests.swift:157:9: Expectation failed: (mock.lastObservedUidValidity(folderPath: "INBOX") → nil) == (observedEpoch → 838601)
