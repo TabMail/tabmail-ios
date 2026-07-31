@@ -520,4 +520,73 @@ struct FakeIMAPServerOracleTests {
         #expect(violations[0].actualRfc == occupantId)
         #expect(server.flags(in: "INBOX", uid: occupantUID).contains("\\Seen"))
     }
+
+    // MARK: - Deliverable 3: the sequence-set parser cannot narrow a mutation
+
+    /// The oracle above resolves each UID that `parseUIDSet` hands the mutating
+    /// handlers, so the SET those handlers receive is the oracle's substrate: a
+    /// parser that returns fewer UIDs than the client addressed makes the fake
+    /// mutate fewer messages than a real server would, and every
+    /// `wrongMessageViolations().isEmpty` assertion downstream then certifies a
+    /// narrower mutation than the one actually issued.
+    ///
+    /// THE INVARIANT: a `seq-range` denotes the same inclusive set regardless
+    /// of endpoint order. RFC 3501 §9 states it verbatim — *"two seq-number
+    /// values and all values between these two regardless of order. Example:
+    /// 2:4 and 4:2 are equivalent and indicate values 2, 3, and 4."* — so a
+    /// descending range is ordinary, protocol-legal input, NOT a malformed set
+    /// to be rejected or truncated.
+    ///
+    /// Asserted at the parser rather than over the wire because the client
+    /// cannot express the input. `MessageIdentifierSet` (SwiftMail's `UIDSet`)
+    /// stores its members in a `private var indexSet: Foundation.IndexSet`, and
+    /// EVERY initialiser — including the range ones and `init?(string:)` —
+    /// writes through that one property. `IndexSet` keeps sorted, coalesced
+    /// ranges, and the set renders via `indexSet.rangeView`, which yields those
+    /// ranges in ascending order. So the emitted `sequence-set` is ascending no
+    /// matter how the value was built; endpoint order is normalised away before
+    /// anything reaches the wire.
+    ///
+    /// Its five range-taking initialisers reinforce this rather than carry it:
+    /// three are closed (`ClosedRange<Int>`, the variadic `ranges:
+    /// ClosedRange<Int>...`, and `ClosedRange<Identifier>`) and a `ClosedRange`
+    /// traps on `5...2` rather than representing it, so a descending closed
+    /// range cannot be formed at all; the other two (`PartialRangeFrom<Int>`,
+    /// `PartialRangeFrom<Identifier>`) have no upper bound to invert and are
+    /// normalised to `lowerBound...UInt32.max`. `init?(string:)` splits on `-`,
+    /// not `:`, so it cannot even be handed `"5:2"`.
+    ///
+    /// SwiftMail therefore cannot emit a descending range, and the tree carries
+    /// no raw-socket IMAP client to hand-write one with. Descending sets come
+    /// from OTHER clients and from fuzzed command streams, which is exactly the
+    /// input class the fake must survive. The property is the parser's
+    /// contract, so this is where it lives.
+    @Test("a descending UID range expands to the same inclusive set as its ascending twin")
+    func descendingUIDRangeExpandsInclusivelyInBothDirections() {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+
+        let ascending = server.parseUIDSet("2:5")
+        let descending = server.parseUIDSet("5:2")
+
+        #expect(
+            ascending == [2, 3, 4, 5],
+            "an ascending range must expand inclusively: got \(ascending)"
+        )
+        #expect(
+            descending == [2, 3, 4, 5],
+            "RFC 3501 §9: 5:2 and 2:5 are the SAME four UIDs — a narrower result means the fake mutates fewer messages than the client addressed: got \(descending)"
+        )
+        #expect(
+            ascending == descending,
+            "endpoint order changed the addressed set — 5:2 resolved to \(descending) against 2:5's \(ascending)"
+        )
+
+        // Composition: a comma-joined set mixes directions and single UIDs, and
+        // every member still expands inclusively.
+        #expect(server.parseUIDSet("9:7,1,4:5") == [7, 8, 9, 1, 4, 5])
+
+        // A single UID and a degenerate range are unchanged by the ordering.
+        #expect(server.parseUIDSet("3") == [3])
+        #expect(server.parseUIDSet("3:3") == [3])
+    }
 }

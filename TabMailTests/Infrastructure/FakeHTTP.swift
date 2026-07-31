@@ -235,6 +235,25 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
             box.recordedCalls()
         }
 
+        /// `"<METHOD> <path>"` for every request this scenario served, in
+        /// order — a whole-sequence oracle for tests that must prove WHICH
+        /// requests reached the fake, not merely that some did.
+        ///
+        /// `recordedCalls().contains { … }` cannot do that job: a request that
+        /// escaped to the live endpoint leaves no record, and if any sibling
+        /// leg re-issues the same method and path the `contains` still matches
+        /// and the escape passes unnoticed. Comparing the full sequence makes
+        /// an extra, missing, or reordered request a failure.
+        ///
+        /// The query string is dropped deliberately — these assertions are
+        /// about which SESSION carried the request, and paths are the stable
+        /// part of that.
+        func servedCallSequence() -> [String] {
+            recordedCalls().map { call in
+                "\(call.method) \(URL(string: call.url)?.path ?? call.url)"
+            }
+        }
+
         func reset() {
             box.reset()
         }
@@ -260,6 +279,40 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         deinit {
             close()
         }
+    }
+
+    /// A deterministic canned-response SEQUENCE for one route: each call pops
+    /// the next status code, and `served` records what actually left the fake.
+    ///
+    /// Exists so a test can drive a specific control-flow LEG of a provider
+    /// method — a 401 retry, a 404 fallback — instead of only its happy path,
+    /// and can then assert on the responses that genuinely arrived rather than
+    /// on the ones it hoped would. That second half is what makes such a test
+    /// falsifiable: if the request under test bypassed the injected session,
+    /// its scripted response is still sitting unserved.
+    ///
+    /// Once the script is exhausted every further call gets `599`, so an
+    /// unexpected extra request is loud rather than silently absorbed by a
+    /// repeated last entry.
+    final class ResponseScript: Sendable {
+        private let remaining: Mutex<[Int]>
+        private let servedBox = Mutex<[Int]>([])
+
+        init(_ statuses: [Int]) {
+            remaining = Mutex(statuses)
+        }
+
+        /// Pop the next scripted status and record it as served.
+        func next() -> Int {
+            let status = remaining.withLock { queue -> Int in
+                queue.isEmpty ? 599 : queue.removeFirst()
+            }
+            servedBox.withLock { $0.append(status) }
+            return status
+        }
+
+        /// The statuses this route actually returned, in order.
+        var served: [Int] { servedBox.withLock { $0 } }
     }
 
     /// Transitional namespace for the still-serialized Exchange mock suite.

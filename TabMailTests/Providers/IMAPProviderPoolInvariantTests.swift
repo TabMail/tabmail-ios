@@ -796,22 +796,37 @@ struct IMAPProviderPoolInvariantTests {
 
         // THE INVARIANT: one folder, one session. No `connect()` was called, so
         // there is no action connection and every live session is a folder one.
+        // The SESSION half of that is `liveSessionCount()`, asserted at the end
+        // of this function; the LOGIN counter below states something narrower,
+        // and the difference is worth being exact about.
         //
-        // The LOGIN counter is the decisive oracle, and it is ported from
-        // `v2final:TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift:590`
+        // The LOGIN oracle is ported from
+        // `v2final:TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift:615`
         // (`ensureServerSingleFlightsConcurrentCreation`, R6-1 Part 2), which
-        // stated the same property as `loginCount() == 1` on
-        // `recordedCommands()`. RULE R0: the reference's shape is preferred here
-        // over inventing a companion self-test, and the reason is structural.
+        // stated the property as `loginCount() == 1` on `recordedCommands()`.
+        // RULE R0: the reference's shape is preferred here over inventing a
+        // companion counter, and its WORDING is adopted verbatim because that
+        // wording is careful in a way a paraphrase is not.
         //
-        // `recordedCommands()` is MONOTONIC — `commandLog` is appended to at
-        // command dispatch and nothing ever removes from it — and the assertion
-        // is an EQUALITY, so it is two-sided and self-controlling:
+        // **LOGIN counts successful AUTHENTICATIONS, not connections.** A
+        // connection opened and then abandoned before it authenticated is
+        // invisible to this counter. So the reference does not say "exactly one
+        // connection was opened"; it says a SECOND LOGIN MEANS two racing
+        // `createServer()` calls. That implication is what holds, and it is all
+        // that is claimed here. The connection census is `liveSessionCount()`'s
+        // job, and the never-logged-out leak detector is
+        // `abandonedSessionCount()`'s — both asserted immediately below.
+        //
+        // Within that narrower scope the assertion is still two-sided, because
+        // `recordedCommands()` is MONOTONIC (`commandLog` is appended to at
+        // command dispatch and nothing ever removes from it) and the comparison
+        // is an EQUALITY:
         //
         //   * 2+ ⇒ a second `createServer()` raced the single-flight (the bug).
-        //   * 0  ⇒ the oracle itself is dead (route renamed, log no longer
-        //          written, fixture not actually spoken to). It FAILS rather
-        //          than certifying the assertions beneath it.
+        //   * 0  ⇒ no LOGIN was recorded at all, though both acquires were just
+        //          asserted to have succeeded — so the command log itself has
+        //          stopped being written. It FAILS rather than certifying the
+        //          assertions beneath it.
         //
         // That second property is exactly what `abandonedSessionCount() == 0`
         // lacks on its own. `liveSessionCount()`'s own doc comment records that
@@ -828,7 +843,7 @@ struct IMAPProviderPoolInvariantTests {
         let loginCount = server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") }.count
         #expect(
             loginCount == 1,
-            "both concurrent same-folder acquires must share ONE created connection — \(loginCount) LOGIN(s) on the wire (2+ ⇒ two racing createServer() calls and a silently overwritten, leaked session; 0 ⇒ the wire oracle itself stopped working, so nothing below can be trusted)"
+            "both concurrent acquires must share ONE created connection — a second LOGIN means two racing createServer() calls (the overwrite/leak bug)"
         )
         let sessions = server.liveSessionCount()
         #expect(sessions == 1, "two same-folder acquires opened \(sessions) sessions — a second creation raced the single-flight and the loser was leaked")

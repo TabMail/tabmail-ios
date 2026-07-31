@@ -120,18 +120,25 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.lookupFailuresConsumed }
     }
 
-    /// The EXACT request shape `v2final`'s `resolveActionMessageId` sent, and
-    /// the only shape `failNextLookup()` can consume: a source-folder listing
-    /// whose `$filter` names an RFC identity in angle brackets.
+    /// The minimal request shape `failNextLookup()` can consume: a
+    /// source-folder listing whose `$filter` names an RFC identity in angle
+    /// brackets. The `$filter` is the only part the hook keys on, because the
+    /// `/mailFolders/` route extracts the bracketed identity via
+    /// `rfcIdentity(fromLookupURL:)` and rejects a `$filter` carrying none.
     ///
-    /// Exposed so a POSITIVE CONTROL can drive the lookup-failure oracle
-    /// directly through this scenario's own `http.session`. `v3` has no
-    /// production path that sends this shape (the RFC-resolution layer is
-    /// exactly what D4 removed), so without such a control every
-    /// `consumedLookupFailureCount() == 0` assertion in the suite would be
-    /// STRUCTURALLY zero — unfalsifiable, and therefore no evidence at all.
-    /// The reference got its `== 1` half for free because an action really did
-    /// send this request; here the control has to send it.
+    /// ⚑ NO REFERENCE — INVENTED. This is NOT the reference's request shape:
+    /// `v2final:TabMail/Providers/ExchangeProvider.swift`'s
+    /// `resolveActionMessageId` sent `$select=id,parentFolderId,internetMessageId`
+    /// and `$top=2` alongside the `$filter`, where this sends `$select=id` and
+    /// no `$top`. `v3` has no production path that sends any such request — the
+    /// RFC-resolution layer is exactly what D4 removed, and
+    /// `ExchangeProvider.search` routes a caller's query into `$search`, never
+    /// into an `internetMessageId` `$filter` — so this URL exists only so a
+    /// FIXTURE SELF-CHECK can prove the hook, route and counter are alive.
+    /// Without one, every `consumedLookupFailureCount() == 0` assertion in the
+    /// suite would be STRUCTURALLY zero: unfalsifiable, and therefore no
+    /// evidence at all. It does not stand in for the reference's adapter-level
+    /// `== 1`, which nothing on `v3` can produce.
     ///
     /// Built here rather than in the test so the URL grammar lives next to
     /// `rfcIdentity(fromLookupURL:)`/`folderId(fromLookupURL:)`, which parse it.

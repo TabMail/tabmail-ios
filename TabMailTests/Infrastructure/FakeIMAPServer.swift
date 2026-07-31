@@ -1678,17 +1678,41 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
-    private func parseUIDSet(_ value: String) -> [Int] {
+    /// Expand an IMAP `sequence-set` into its UIDs.
+    ///
+    /// **A range is inclusive of both endpoints AND order-independent.** RFC
+    /// 3501 §9 annotates the `seq-range` production verbatim: *"two seq-number
+    /// values and all values between these two regardless of order. Example:
+    /// 2:4 and 4:2 are equivalent and indicate values 2, 3, and 4."* So `5:2`
+    /// is not malformed and is not a narrower set than `2:5` — it is the SAME
+    /// set, and a server that treats it otherwise is the one violating the
+    /// protocol.
+    ///
+    /// Expanding `min...max` is therefore both the RFC-correct reading and the
+    /// only formulation that cannot trap. The naive `Array(bounds[0]...bounds[1])`
+    /// is a `fatalError` — not a thrown error — whenever the lower bound
+    /// exceeds the upper, which would kill the ENTIRE test process and take
+    /// every unrelated result with it rather than failing one case. Ordering
+    /// the bounds removes that hazard completely, so no guard is needed.
+    ///
+    /// **Do NOT "fix" the trap by guarding the descending case away instead.**
+    /// A `bounds[0] <= bounds[1]` guard falls through to the `bounds.first`
+    /// line below, which silently NARROWS `5:2` to `[5]` — one UID where the
+    /// real server touches four. This parser feeds `recordOracleCheck` for
+    /// every mutating command (`UID STORE`/`MOVE`/`COPY`/`EXPUNGE`), so it is
+    /// the wrong-message oracle's own substrate: a fake that quietly shrinks a
+    /// mutation set certifies wrong-message behaviour as correct.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeIMAPServer.swift:1389`
+    /// has the identical function with NO ordering treatment at all
+    /// (`if bounds.count == 2 { return Array(bounds[0]...bounds[1]) }`), so the
+    /// reference would trap on the same input; it simply never exercised a
+    /// descending set. The order-independent expansion has no counterpart there.
+    func parseUIDSet(_ value: String) -> [Int] {
         value.split(separator: ",").flatMap { component -> [Int] in
             let bounds = component.split(separator: ":").compactMap { Int($0) }
-            // `bounds[0] <= bounds[1]` is NOT redundant with the count check.
-            // `Array(5...2)` is a `fatalError`, not a thrown error, so a
-            // descending range — syntactically valid IMAP, and reachable from
-            // any randomized/fuzzed command stream — would kill the ENTIRE test
-            // process and take every unrelated result with it, rather than
-            // failing one case. A malformed set resolves to no UIDs instead.
-            if bounds.count == 2, bounds[0] <= bounds[1] {
-                return Array(bounds[0]...bounds[1])
+            if bounds.count == 2 {
+                return Array(min(bounds[0], bounds[1])...max(bounds[0], bounds[1]))
             }
             return bounds.first.map { [$0] } ?? []
         }
