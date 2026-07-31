@@ -164,6 +164,29 @@ protocol EmailProvider: Sendable {
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
     var staleWindowMode: StaleWindowMode { get }
 
+    /// T1.2b: the UIDVALIDITY the MOST RECENT SELECT of `folderPath` reported, or
+    /// `nil` when that SELECT reported none, when this provider has never SELECTed
+    /// the folder, or when the folder concept doesn't apply (every non-IMAP
+    /// provider).
+    ///
+    /// Two things it is NOT, both load-bearing for the caller that persists it:
+    /// it never returns `0` (that is "the server did not report a value", never an
+    /// epoch), and it never falls back to an epoch an EARLIER SELECT reported once
+    /// the current one has stopped reporting one — "unknown now" must read as
+    /// unknown, not as "known before" (project rule 4, no fallbacks).
+    ///
+    /// Deliberately synchronous/non-`async` (`nonisolated` on the IMAP
+    /// override) so a sync pass can read "the epoch my fetch was served under"
+    /// from inside a GRDB write closure, which cannot `await`.
+    ///
+    /// REFERENCE (`v2final`, tag `e28dd4edb`): the same member and the same
+    /// `nil` default — `EmailProvider.swift:210` / `:352`, backed by
+    /// `IMAPProvider.lastObservedUidValidityBox` (`IMAPProvider.swift:84`). The
+    /// no-stale-fallback rule above is an ADDITION to the reference, required
+    /// because v3's consumer writes the value instead of comparing it — see
+    /// `IMAPProvider.selectMailboxTracked`.
+    func lastObservedUidValidity(folderPath: String) -> UInt32?
+
     /// Mark the provider's connections as potentially stale. Called on session start
     /// (foreground return, BGAppRefresh, push wakeup). IMAP providers drain and reseed
     /// their connection pool on the next checkout. HTTP providers are a no-op (ephemeral sessions).
@@ -226,6 +249,14 @@ protocol EmailProvider: Sendable {
 }
 
 extension EmailProvider {
+    /// Default `nil` — UIDVALIDITY is an IMAP concept, so every other provider
+    /// (and every generic test double) reports "unknown". `nil` is the FAIL-SAFE
+    /// answer here: the only consumer is a bootstrap-only persist that writes
+    /// nothing when the observation is unknown, so a provider that loses this
+    /// override can never erase or invent an epoch (it just stops contributing
+    /// one). REFERENCE (`v2final`): identical default at `EmailProvider.swift:352`.
+    func lastObservedUidValidity(folderPath: String) -> UInt32? { nil }
+
     /// Default no-op for HTTP-based providers (Gmail, Exchange) — ephemeral sessions have no stale connections.
     func markDirty() async {}
 
@@ -375,8 +406,9 @@ enum ProviderError: LocalizedError {
 }
 
 /// True when `id` matches a TabMail-internal optimistic-placeholder shape.
-/// `sent-<UUID>` (AccountManagerOutbox.insertOptimisticSentHeader) and
-/// `draft-<UUID>` (AccountManagerActions.queueDraftSave) are written into
+/// `sent-<UUID>` (`AccountManager.insertOptimisticSentHeader`, in
+/// `AccountManagerOutbox.swift`) and `draft-<UUID>`
+/// (`AccountManager.queueDraftSave`, in `AccountManagerActions.swift`) are written into
 /// `messageHeader.messageId` so the row exists in the user's Sent/Drafts view
 /// before the server has assigned a real id. They MUST NOT be forwarded to
 /// any provider's HTTP/IMAP fetch — the server has no record of them. Used

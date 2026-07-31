@@ -122,6 +122,13 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// mailbox recreation (message list churn is separately simulated via
         /// `setMessages`).
         var uidValidityByMailbox: [String: Int] = [:]
+        /// Mailboxes whose SELECT/EXAMINE response OMITS the
+        /// `* OK [UIDVALIDITY n]` line entirely (T1.2b, `suppressSelectUidValidity`).
+        /// RFC 3501 §6.3.1 says a server SHOULD send it, not MUST, and SwiftMail
+        /// therefore defaults `Mailbox.Selection.uidValidity` to `UIDValidity(0)` —
+        /// so this models the one wire shape that can hand the app a `0` and let
+        /// it be mistaken for a real epoch. Empty for every pre-existing test.
+        var selectUidValiditySuppressed: Set<String> = []
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -575,6 +582,20 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// mailbox's lifetime, so callers should only ever raise it.
     func setUidValidity(_ value: Int, for mailbox: String) {
         withState { $0.uidValidityByMailbox[mailbox] = value }
+    }
+
+    /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
+    /// `* OK [UIDVALIDITY n]` untagged response entirely. RFC 3501 §6.3.1 lists
+    /// it as SHOULD, not MUST, which is exactly why SwiftMail's
+    /// `Mailbox.Selection.uidValidity` is non-optional with a `UIDValidity(0)`
+    /// default — a client that trusts that default persists `0` as though it
+    /// were an epoch, and every later epoch comparison becomes `0 == 0`.
+    /// This is the only seam that produces the OMITTED-line wire shape;
+    /// `setUidValidity(0, for:)` would instead send a literal `UIDVALIDITY 0`,
+    /// which is not a shape any RFC-conformant server can produce (§2.3.1.1
+    /// types UIDVALIDITY as `nz-number`).
+    func suppressSelectUidValidity(for mailbox: String) {
+        withState { state in _ = state.selectUidValiditySuppressed.insert(mailbox) }
     }
 
     /// Test seam: replace a mailbox's entire message list. Used to simulate
@@ -1113,16 +1134,26 @@ final class FakeIMAPServer: @unchecked Sendable {
                     : "\(tag) NO Mailbox does not exist\r\n"
             }
             selectedMailbox = mailbox
-            let (messages, uidValidity) = withState { state in
-                (state.messagesByMailbox[mailbox] ?? [], state.uidValidityByMailbox[mailbox] ?? 1)
+            let (messages, uidValidity, suppressUidValidity) = withState { state in
+                (
+                    state.messagesByMailbox[mailbox] ?? [],
+                    state.uidValidityByMailbox[mailbox] ?? 1,
+                    state.selectUidValiditySuppressed.contains(mailbox)
+                )
             }
             let count = messages.count
             let uidnext = (messages.map(\.uid).max() ?? 0) + 1
+            // `suppressSelectUidValidity` drops the line entirely rather than
+            // sending `UIDVALIDITY 0` — a real server never sends 0 (it is an
+            // `nz-number`), so omission is the only faithful way to reach the
+            // client-side default of `UIDValidity(0)`.
+            let uidValidityLine = suppressUidValidity
+                ? ""
+                : "* OK [UIDVALIDITY \(uidValidity)] UIDs valid\r\n"
             return """
             * \(count) EXISTS\r
             * 0 RECENT\r
-            * OK [UIDVALIDITY \(uidValidity)] UIDs valid\r
-            * OK [UIDNEXT \(uidnext)] Predicted next UID\r
+            \(uidValidityLine)* OK [UIDNEXT \(uidnext)] Predicted next UID\r
             * FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
             * OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)] Flags permitted\r
             \(tag) OK [READ-WRITE] SELECT completed\r

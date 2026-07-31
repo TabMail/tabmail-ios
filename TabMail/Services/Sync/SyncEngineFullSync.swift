@@ -667,6 +667,30 @@ extension SyncEngine {
         recentlyCompleted: [String: Date] = [:]
     ) async throws -> SyncMessagesResult {
         let messages = try await provider.fetchMessages(folder: folder.path, limit: limit, offset: 0)
+        // T1.2b — SELECT-sourced epoch capture. `fetchMessages` SELECTs the folder
+        // (`IMAPProvider.selectMailboxTracked`), and `OK [UIDVALIDITY n]` is core
+        // IMAP4rev1, NOT a UIDPLUS extension — so on a non-UIDPLUS server, where
+        // the STATUS-sourced writes T1.2 added see nil forever, this is the epoch
+        // source that still answers. (The deletion-reconcile walk's own SELECT is
+        // the other one, but it only runs on a count mismatch, so it is not a
+        // backstop.) Captured ONCE here, into a local, immediately after this
+        // pass's OWN fetch; the write below must never re-read the shared mirror
+        // from inside the transaction, where a later SELECT could have replaced
+        // it. nil for every non-IMAP provider (protocol default), and nil — never
+        // a previous SELECT's value — when the SELECT that served this fetch
+        // reported no UIDVALIDITY.
+        //
+        // REFERENCE (`v2final`, tag `e28dd4edb`): the same capture, at the same
+        // point of the same function — `SyncEngineFullSync.swift:1019`,
+        // `let observedEpochAtFetch = provider.lastObservedUidValidity(folderPath:)`.
+        // Residual, documented there and unchanged here: this local is read from
+        // a cross-connection mirror, so a concurrent SELECT of the SAME folder
+        // path on another connection could in principle land between the fetch
+        // and this line. Under the bootstrap-only write rule the consequence is
+        // bounded to the nil-ambiguity residual T1.2 already carries as a known
+        // issue (a nil-epoch folder has its first observation asserted as its
+        // mail's epoch); it can never overwrite an epoch already stored.
+        let observedEpochAtFetch = provider.lastObservedUidValidity(folderPath: folder.path)
         let folderPath = folder.path
         let folderId = folder.id
         let accountId = folder.accountId
@@ -695,6 +719,21 @@ extension SyncEngine {
             // when the epoch captured at fetch time disagrees with the stored one. That
             // port is its own item; T1.2 must not widen the blast radius of a deleter it
             // did not create, and must not narrow it either.
+            //
+            // T1.2b: bootstrap this folder's epoch from the SELECT that served the
+            // fetch above, as its own conditional statement inside this SAME
+            // transaction (`lastKnownUidValidity IS NULL` evaluated by SQLite at
+            // write time — see `SyncEngine.bootstrapFolderUidValidity`, whose doc
+            // comment enumerates all three writers of this column). On a
+            // non-UIDPLUS server this is the write that reaches a folder the
+            // deletion-reconcile walk has never visited — the walk's own bootstrap
+            // is the only other one that can, and it needs a count mismatch to run.
+            // It is BOOTSTRAP-ONLY and it is not part of the merge: it can only
+            // fill a nil column, never overwrite the epoch the local UIDs belong
+            // to, so it adds no deletion path — the walk's abort guard is armed by
+            // a populated column, never disarmed by one.
+            try Self.bootstrapFolderUidValidity(
+                db, folderId: folderId, observed: observedEpochAtFetch.map { Int($0) })
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
             // IMAP UIDs are per-folder — UID "500" in INBOX and UID "500" in Archive are different

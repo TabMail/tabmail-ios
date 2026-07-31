@@ -63,8 +63,15 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// **Write rule — BOOTSTRAP-ONLY.** Written only while it is nil, by whichever
     /// path first observes a non-zero UIDVALIDITY: the folder-list pass and delta
     /// sync's STATUS (`SyncEngine.uidValidityBootstrapWrite` /
-    /// `bootstrapFolderUidValidity`), or the walk's own first SELECT
-    /// (`SyncEngineDeletionReconcile.swift:428`). NEVER overwritten afterwards — an
+    /// `bootstrapFolderUidValidity`), the message-sync pass's own SELECT
+    /// (`SyncEngine.runSyncMessages`, via `IMAPProvider.selectMailboxTracked` and
+    /// `EmailProvider.lastObservedUidValidity(folderPath:)` — T1.2b), or the walk's
+    /// own first SELECT (`persistFolderUidValidity` in
+    /// `SyncEngineDeletionReconcile.swift`). The SELECT source is not redundant
+    /// with STATUS: SwiftMail asks for the `UIDVALIDITY` STATUS attribute only on a
+    /// UIDPLUS server, whereas `OK [UIDVALIDITY n]` on SELECT is core IMAP4rev1 —
+    /// so without it a non-UIDPLUS account would leave every folder here nil
+    /// forever. NEVER overwritten afterwards — an
     /// observation that DIFFERS is a turnover, and advancing this column without
     /// first purging the rows that belong to the old epoch silently disarms the
     /// guard above and turns the walk into a mass-deleter. `0` is "the server did

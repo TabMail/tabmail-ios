@@ -4,6 +4,7 @@
 
 import Foundation
 import SwiftMail
+import Synchronization
 
 /// Quick folder status snapshot for IMAP delta sync change detection.
 struct IMAPFolderStatus: Sendable {
@@ -48,6 +49,105 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the port (993 → implicit TLS, 143 → plain). Tests set `false` to point
     /// IMAPProvider at an in-process plain-TCP fake on an ephemeral port.
     private let useTLS: Bool?
+
+    // MARK: - UIDVALIDITY epoch observation (T1.2b)
+
+    /// Last SELECT-observed UIDVALIDITY per folder path, written by
+    /// `selectMailboxTracked`. `Mutex`-backed nonisolated seam (Resilience Rule
+    /// 5) so `lastObservedUidValidity(folderPath:)` is readable synchronously
+    /// from a GRDB write closure, which cannot `await` into this actor.
+    ///
+    /// **Observation only** — this type never compares the value against a
+    /// stored epoch and never refuses or drops an operation because of it (those
+    /// are later items). It answers exactly one question: *what did the most
+    /// recent tracked SELECT of this folder report?*
+    ///
+    /// An entry exists only while the LAST tracked SELECT of that path reported a
+    /// non-zero UIDVALIDITY. `0` never enters the map, and — the part that is
+    /// easy to get wrong — a `0` also REMOVES any earlier entry, so the map can
+    /// never answer with a previous SELECT's epoch. RFC 3501 §2.3.1.1 types
+    /// UIDVALIDITY as `nz-number`, and SwiftMail's `Mailbox.Selection.uidValidity`
+    /// is non-optional only because it DEFAULTS to `UIDValidity(0)`, so `0` here
+    /// can only mean "the server did not report a value" (the convention
+    /// `UIDExistenceResult.uidValidity` documents and
+    /// `SyncEngineDeletionReconcile.swift` enforces).
+    ///
+    /// REFERENCE (`v2final`, tag `e28dd4edb`): `IMAPProvider
+    /// .lastObservedUidValidityBox` (`IMAPProvider.swift:84`), same shape and the
+    /// same `!= 0` guard — but the reference does NOT clear on a `0`, and this
+    /// port deliberately does. See `selectMailboxTracked` for why that difference
+    /// is required rather than cosmetic.
+    private nonisolated let lastObservedUidValidityBox = Mutex<[String: UInt32]>([:])
+
+    /// Protocol conformance (`EmailProvider.lastObservedUidValidity`) — see
+    /// `lastObservedUidValidityBox`. `nil` = the most recent tracked SELECT of
+    /// `folderPath` reported no UIDVALIDITY, or there has been no tracked SELECT
+    /// of it at all. It never returns `0`, and it never returns a value an
+    /// earlier SELECT reported once the current one has stopped reporting it.
+    nonisolated func lastObservedUidValidity(folderPath: String) -> UInt32? {
+        lastObservedUidValidityBox.withLock { $0[folderPath] }
+    }
+
+    /// SELECT `folder` and RECORD the epoch that SELECT reported, then hand the
+    /// caller the very same `Mailbox.Selection` a bare `server.selectMailbox`
+    /// would have returned.
+    ///
+    /// Observation only: it performs no comparison against any stored epoch and
+    /// drops no message and no operation. The one test it does make is the
+    /// unreported-sentinel classification below, which decides what this SELECT
+    /// is recorded AS — never whether the caller's work proceeds.
+    ///
+    /// Why SELECT and not STATUS: `OK [UIDVALIDITY n]` is core IMAP4rev1
+    /// (RFC 3501 §6.3.1), whereas SwiftMail asks for the `UIDVALIDITY` STATUS
+    /// attribute only when the server advertises UIDPLUS
+    /// (`IMAPServer+Mailbox.swift`'s `mailboxStatus`: `if capabilities
+    /// .contains(.uidPlus) { attributes.append(.uidValidity) }`). So on a
+    /// non-UIDPLUS server the STATUS-sourced writes added by T1.2 observe nil
+    /// forever, and this is the path that still yields an epoch.
+    ///
+    /// **The `0` branch CLEARS; it must not merely skip the write.**
+    /// `Mailbox.Selection.uidValidity` is non-optional only because SwiftMail
+    /// defaults it to `UIDValidity(0)`, which is not an RFC guarantee. Recording
+    /// that `0` would let it be persisted as an epoch and make every later epoch
+    /// comparison `0 == 0`, i.e. vacuously true. But *leaving a previous entry
+    /// standing* is just as wrong here, and less obvious: the next reader would
+    /// be handed an epoch an EARLIER SELECT reported and treat it as this fetch's
+    /// — "unknown now" silently falling back to "known before" (project rule 4,
+    /// no fallbacks), and the value it falls back to then gets PERSISTED.
+    ///
+    /// ⚠ THIS IS A DELIBERATE CORRECTION OF `v2final`, NOT A PORT OF IT. The
+    /// reference's chokepoint (`IMAPProvider.swift:1353`) has the identical
+    /// `if observed != 0 { … }` and never clears — and that is SAFE there,
+    /// because its consumer is a *comparison guard*: a stale mirror value
+    /// disagrees with the live epoch, and disagreement ABORTS. Fail-safe. Here
+    /// the consumer is a *write* (`SyncEngine.runSyncMessages` bootstraps the
+    /// column from it), so the same staleness is fail-dangerous: it plants a
+    /// wrong epoch that the later checkpoints will compare against. The mechanism
+    /// is only safe in the direction its consumer runs; copying it verbatim
+    /// across that inversion is the bug.
+    ///
+    /// The map write is synchronous with the SELECT — no `await` between the two
+    /// — so no other operation on this actor can interleave between this SELECT
+    /// and the record of its result.
+    ///
+    /// ⚠ SECOND DEVIATION FROM `v2final` (deliberate, scoped): the reference makes
+    /// this the chokepoint that EVERY `selectMailbox` call site routes through,
+    /// because there it also carries the ADR-IOS-061 Stage-2 *refusal* — a throw
+    /// that must fire on every SELECT to be a contract. T1.2b adds no refusal
+    /// (that is a later item), so only the sync/open SELECTs — the folder-pinned
+    /// connection's own SELECT and `fetchMessages`' — are routed through it here.
+    /// Narrower is also SAFER for the one consumer that exists: a mirror written
+    /// by every action SELECT too has more ways to be overwritten between a sync
+    /// pass's fetch and its read of this value. Widening it belongs with the
+    /// refusal.
+    private func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
+        let selection = try await server.selectMailbox(folder)
+        let observed = selection.uidValidity.value
+        // Assignment, not an `if` — a `0` (unreported) must ERASE any earlier
+        // entry, never leave it behind as an answer for this SELECT.
+        lastObservedUidValidityBox.withLock { $0[folder] = observed != 0 ? observed : nil }
+        return selection
+    }
 
     // MARK: - Folder-Pinned Connections
     // Each folder gets a dedicated connection, already SELECTed. LRU eviction at server limit.
@@ -294,7 +394,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
             let server = try await createServer()
-            _ = try await server.selectMailbox(folder)
+            // T1.2b: the OPEN-the-folder SELECT — the one a folder-pinned
+            // connection performs once, before any caller has asked for anything.
+            // It is routed through the tracked helper so the mirror describes the
+            // pinned connection's actual selected mailbox from the moment the
+            // connection exists. No test isolates this site: every
+            // `withFolderConnection` caller in this file today re-SELECTs the same
+            // folder before issuing commands (`fetchMessages` directly, the
+            // backfill SEARCHes via `searchDateRange`/`searchBeforeOnly`), so the
+            // observation it makes is currently indistinguishable from the body's.
+            _ = try await selectMailboxTracked(server, folder: folder)
             folderCreating.remove(folder)
             folderServers[folder] = server
             folderLastUsed[folder] = Date()
@@ -318,7 +427,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 print("[IMAP] Connection limit hit for \(folder) — evicted LRU, retrying")
                 do {
                     let server = try await createServer()
-                    _ = try await server.selectMailbox(folder)
+                    // T1.2b: the same open-the-folder SELECT as the primary create
+                    // path above, on the connection-limit retry leg.
+                    _ = try await selectMailboxTracked(server, folder: folder)
                     folderServers[folder] = server
                     folderLastUsed[folder] = Date()
                     folderInUse.insert(folder)
@@ -846,7 +957,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] {
         try await withFolderConnection(folder: folder) { server in
-            let selection = try await server.selectMailbox(folder)
+            // T1.2b: the SYNC path's own SELECT. `SyncEngine.runSyncMessages`
+            // reaches the server through here (`provider.fetchMessages`), and that
+            // is the shared core of both the full-sync per-folder pass and the
+            // on-navigate `syncFolderMessages`. Recording the epoch here is what
+            // makes it readable for a folder the deletion-reconcile walk has never
+            // visited, and on a non-UIDPLUS server, where the STATUS-sourced writes
+            // see nothing. Not universal: a folder whose CONDSTORE HIGHESTMODSEQ is
+            // unchanged is skipped before `runSyncMessages` (`shouldSkipFolderFetch`)
+            // and observes nothing from this path on that cycle.
+            let selection = try await selectMailboxTracked(server, folder: folder)
             guard selection.messageCount > 0 else { return [] }
 
             guard let range = selection.latest(limit) else { return [] }
