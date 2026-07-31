@@ -85,6 +85,69 @@ extension SyncEngine {
     private static func consumeEpochBootstrapWriteFailureForTesting(folderId: String) -> Bool {
         epochBootstrapWriteFailureIdsForTesting.withLock { $0.remove(folderId) != nil }
     }
+
+    /// Test seam: the FRESH branch's bookkeeping transaction throws for every
+    /// folder id in here, and — unlike `epochBootstrapWriteFailureIdsForTesting`
+    /// above — the id is **NOT consumed**.
+    ///
+    /// That difference is the whole point. The one-shot seam models a TRANSIENT
+    /// write failure; the defect this one models is a PERSISTENT one (GRDB
+    /// suspension, ADR-IOS-046 / `0xdead10cc`; `SQLITE_FULL`; corruption), where
+    /// the folder is handed straight back by the loop's fresh re-read and the
+    /// identical failing write is retried at network rate. A one-shot seam
+    /// cannot express "every attempt fails", so it cannot exercise the bound.
+    static let freshCursorWriteFailureIdsForTesting = Mutex<Set<String>>([])
+
+    /// Marker error for the seam above. DEBUG-only; never reachable in Release.
+    struct FreshCursorWriteFailureForTesting: Error {}
+
+    private static func freshCursorWriteShouldFailForTesting(folderId: String) -> Bool {
+        freshCursorWriteFailureIdsForTesting.withLock { $0.contains(folderId) }
+    }
+
+    /// Named suspension points inside `runBackfill`, so a test can interleave a
+    /// SECOND `runBackfill` (or a direct DB write) at the exact instant a race
+    /// requires. One-shot and folder-scoped: the hook is removed BEFORE it is
+    /// awaited, so a second walk reaching the same checkpoint runs straight
+    /// through and cannot consume it twice.
+    ///
+    /// REFERENCE (`v2final`): PORTED shape —
+    /// `BackfillWalkCheckpointForTesting` / `backfillWalkCheckpointHooksForTesting`
+    /// in the same function's file at the tag, same one-shot/remove-before-await
+    /// discipline, same `Mutex`-boxed dictionary. What differs: the reference has
+    /// ONE checkpoint (`afterWorkersJoinedBeforeFinalBookkeeping`) and its hook
+    /// is `throws` so an injected failure surfaces; these three are
+    /// non-throwing, because every one of them exists to let another task RUN,
+    /// not to inject a failure — the failures in this file have their own two
+    /// seams above.
+    enum BackfillWalkCheckpointForTesting: Hashable, Sendable {
+        /// After the walk-start SELECT resolved this pass's epoch and UIDNEXT,
+        /// BEFORE the `case .fresh` branch's bookkeeping transaction (both the
+        /// `initialCursor < 1` completion write and the initial-cursor planting
+        /// write are downstream of it).
+        case beforeFreshBookkeepingWrite(folderId: String)
+        /// After the walk-start gate decided `.refuseEpochMismatch`, BEFORE
+        /// `resetEmptyFolderCrawlEpoch` runs — the window in which the decision
+        /// this reset acts on can go stale.
+        case beforeEmptyFolderCrawlEpochReset(folderId: String)
+        /// Inside a worker, after a chunk's headers are fetched and the
+        /// post-FETCH epoch check passed, BEFORE `insertBackfillBatch` — the
+        /// "already-fetched batch outside SQLite" window.
+        case beforeInsertingFetchedChunk(folderId: String)
+    }
+
+    static let backfillWalkCheckpointHooksForTesting = Mutex<[
+        BackfillWalkCheckpointForTesting: @Sendable () async -> Void
+    ]>([:])
+
+    private static func runBackfillWalkCheckpointForTesting(
+        _ checkpoint: BackfillWalkCheckpointForTesting
+    ) async {
+        let hook = backfillWalkCheckpointHooksForTesting.withLock {
+            $0.removeValue(forKey: checkpoint)
+        }
+        if let hook { await hook() }
+    }
     #endif
 
     // MARK: - T1.3 anti-brick: the crawl's epoch bootstrap, BOUND to its UIDs
@@ -236,58 +299,134 @@ extension SyncEngine {
     /// `AccountManager.newGestureRefusedForUnknownEpoch` — a gesture resolves an
     /// E1 UID against E2 and mutates the wrong message (C3).
     ///
-    /// The two causes ARE distinguishable, and this is the distinguishing fact: a
-    /// folder with a non-nil `stored` proves the server reports UIDVALIDITY.
-    /// Refusing on `walk == nil && stored != nil` therefore closes the transient
-    /// cause without touching the epochless-server account round 8 protected — on
-    /// such an account `stored` is nil forever, so the gate still says
-    /// `.proceed`, and nothing is stamped there either way.
+    /// ⚠ **RETRACTION (round 12) — the argument this gate USED to rest on was
+    /// false, and it was the justification for the safety decision.** Round 11
+    /// wrote: *"a folder with a non-nil `stored` proves the server reports
+    /// UIDVALIDITY"*, and inferred from that that refusing on
+    /// `walk == nil && stored != nil` only ever catches a transient failure. The
+    /// inference does not hold, because **the two epochs come from independent
+    /// channels**: `IMAPProvider.fetchFolders` sources `FolderInfo.uidValidity`
+    /// from `IMAPServer.mailboxStatus` — an IMAP **STATUS** command — and
+    /// `SyncEngine.fullSync`'s folder-list upsert feeds THAT into
+    /// `Folder.lastKnownUidValidity`, while `walk` comes from **SELECT**
+    /// (`IMAPProvider.getUidNextWithEpoch` → `selectMailboxTracked`). A stamp
+    /// therefore proves the server reports UIDVALIDITY *somewhere*, not that
+    /// SELECT does. Nor is `walk == nil` only "the call threw": a SELECT that
+    /// SUCCEEDS and reports `UIDVALIDITY 0` normalises to nil at
+    /// `IMAPProvider.selectMailboxTracked`'s `observed != 0 ? observed : nil`.
     ///
-    /// The refusal is TRANSIENT in the cause that motivates it (the next
-    /// `runBackfill` re-observes; cost is one SELECT per cycle). It is INDEFINITE
-    /// only for a server that reported an epoch for this folder once and then
-    /// permanently stops reporting it — accepted, fail-closed (C3 outranks C6's
-    /// tolerance for a stalled crawl), and stated here rather than left silent.
+    /// **The refusal is still correct — on a different and much stronger
+    /// argument.** RFC 3501 §6.3.1 (SELECT) lists UIDVALIDITY among the
+    /// *REQUIRED OK untagged responses* — UNSEEN, PERMANENTFLAGS, UIDNEXT,
+    /// UIDVALIDITY — and states that if it is missing, the server does not
+    /// support unique identifiers. RFC 9051 §6.3.2 carries the same requirement.
+    /// So a SELECT that omits UIDVALIDITY is a server declaring it does not
+    /// support UIDs at all, which is an account this app cannot serve: every
+    /// durable action it takes is UID-addressed. Refusing to crawl such a folder
+    /// is not a heuristic about transience — it is refusing to guess a UID space
+    /// on a server that just said it has none.
     ///
-    /// REFERENCE (`v2final`): PORTED — same refusal, same reasoning, expressed as
-    /// the `guard observedEpoch != nil` before its bookkeeping writes. What does
-    /// not transfer is the SHAPE: the reference refuses at the END of the walk
-    /// (its per-chunk `insertBackfillBatch` guard already covers the inserts, so
-    /// only its own bookkeeping needs protecting), whereas v3's per-chunk check is
-    /// driven by `expectedEpoch` itself and so must refuse BEFORE the walk runs.
+    /// The epochless-server account round 8 protected is untouched: there
+    /// `stored` is nil forever (no STATUS epoch either), the gate still says
+    /// `.proceed`, and nothing is stamped — `IOS-EPOCH-001`'s accepted window.
+    ///
+    /// **DISCLOSURE — this refusal is PERMANENT, not self-healing, if the
+    /// server never reports again.** `.refuseUnobservedEpoch` mutates nothing,
+    /// so the state `stored = E, walk = nil` is re-created on every later call: a
+    /// per-call decline container with a DURABLE re-entry condition, which is the
+    /// same "transient container + durable re-entry ⇒ permanent refusal" shape
+    /// `resetEmptyFolderCrawlEpoch` exists to break. Round 11 disclosed it as
+    /// "INDEFINITE … one SELECT that reports again clears it"; that is only true
+    /// while the server DOES report again. Stated plainly: while the server keeps
+    /// omitting UIDVALIDITY from SELECT for this folder, the crawl re-declines
+    /// every cycle forever (cost: one SELECT per cycle) and that folder's
+    /// un-crawled mail stays un-indexed. This is fail-closed and C6-legal, and it
+    /// is deliberately NOT given a bounded recovery: the only server that reaches
+    /// it is nonconforming in a way that makes every UID-addressed action unsafe.
+    ///
+    /// REFERENCE (`v2final`): PORTED — same refusal, same fail-closed direction,
+    /// expressed as the `guard observedEpoch != nil` before its bookkeeping
+    /// writes. What does not transfer is the SHAPE: the reference refuses at the
+    /// END of the walk (its per-chunk `insertBackfillBatch` guard already covers
+    /// the inserts, so only its own bookkeeping needs protecting), whereas v3's
+    /// per-chunk check is driven by `expectedEpoch` itself and so must refuse
+    /// BEFORE the walk runs.
     nonisolated static func crawlEpochGate(stored: UInt32?, walk: UInt32?) -> CrawlEpochGate {
         guard let walk else {
             return stored == nil ? .proceed : .refuseUnobservedEpoch
         }
-        guard let stored else { return .proceed }
-        return stored == walk ? .proceed : .refuseEpochMismatch
+        return crawlEpochAgrees(stored: stored, walk: walk) ? .proceed : .refuseEpochMismatch
     }
 
-    /// May a bookkeeping write from a pass walking under `walkEpoch` land on this
-    /// folder, judged against the folder row as it stands INSIDE the caller's own
-    /// write transaction?
+    /// A crawl pass's premise about a folder's `lastKnownUidValidity`, wrapped so
+    /// that "this caller holds NO premise, do not guard" (a nil
+    /// `CrawlEpochPremise?`) stays distinguishable from "the premise is that the
+    /// folder is UNSTAMPED" (`CrawlEpochPremise(nil)`).
+    ///
+    /// The distinction is load-bearing, not decorative: the unstamped folder is
+    /// precisely the one the guard matters most for. A folder holding rows of
+    /// unproven epoch is refused by `bootstrapCrawledFolderUidValidity`, so its
+    /// premise IS nil for the whole pass, and a sibling stamping it mid-walk is
+    /// the C3 hazard `insertBackfillBatch`'s guard exists to catch. Passing a
+    /// bare `UInt32?` and reading nil as "no guard" would drop the guard on
+    /// exactly that folder.
+    struct CrawlEpochPremise: Sendable, Equatable {
+        let epoch: UInt32?
+        init(_ epoch: UInt32?) { self.epoch = epoch }
+    }
+
+    /// May a bookkeeping write from this pass land on this folder, judged against
+    /// the folder row as it stands INSIDE the caller's own write transaction?
     ///
     /// NB4: `runBackfill` reads the folder row ONCE per iteration, BEFORE the
     /// walk-start SELECT round trip, and every bookkeeping write it then makes
     /// happens after it — some of them minutes later, from a parallel worker.
     /// Deciding those writes on that pre-network snapshot is the codebase's own
-    /// pending-ops-inside-txn rule violated. The column is monotone (bootstrap-only
-    /// for values), so the reachable skew is "snapshot nil, DB now stamped E" — and
-    /// `crawlEpochAgrees(stored: nil, walk:)` ADMITS, i.e. the skew fails OPEN,
-    /// which is the wrong direction for a guard. Re-reading here closes it.
+    /// pending-ops-inside-txn rule violated. Re-reading here closes it.
+    ///
+    /// **This is a COMPARE-AND-SET on the folder's stamp, not a comparison
+    /// against the walk's epoch — and round 12 changed it to that.**
+    /// `premiseEpoch` is the value of `Folder.lastKnownUidValidity` this pass's
+    /// bookkeeping is accounted under: the row's value at walk start, advanced to
+    /// the walk's own epoch if and only if THIS pass's own
+    /// `bootstrapCrawledFolderUidValidity` stamped it (see `runBackfill`). The
+    /// write is authorised only while the row still holds exactly that value.
+    ///
+    /// ⚠ **RETRACTION (round 12, NB3) — the premise this function used to state
+    /// is stale.** It said: *"The column is monotone (bootstrap-only for values),
+    /// so the reachable skew is 'snapshot nil, DB now stamped E'."* That stopped
+    /// being true when `resetEmptyFolderCrawlEpoch` landed: it CLEARS the column,
+    /// so **value → nil is reachable too**, and the old body
+    /// (`crawlEpochAgrees(stored: nil, walk: E)`) ADMITS a nil — the fail-OPEN
+    /// direction, on a folder whose identity another pass has just torn down.
+    /// The complete writer set is enumerated on
+    /// `SyncEngine.bootstrapFolderUidValidity`: three bootstrap-only VALUE
+    /// writers (nil → E) plus that one CLEARER (E → nil). A CAS refuses in both
+    /// directions and needs no case analysis at all, which is why it replaced the
+    /// comparison rather than being added beside it.
+    ///
+    /// Both refusals are TRANSIENT: a skew means some other pass re-derived this
+    /// folder's identity while this one was on the network, so this pass's
+    /// cursor/completeness describe a premise that no longer holds, and the NEXT
+    /// call reads the new premise and proceeds under it. The value writers are
+    /// bootstrap-only, so nil → E can happen at most once per folder.
     ///
     /// REFERENCE (`v2final`): PORTED from `uidValidityWalkWriteAllowed(db:folderId:
     /// observedEpoch:)` in the same function's file at the tag — same in-txn
-    /// `Folder.fetchOne`, same comparison, same use on every cursor/completeness
-    /// write the walk makes (including the two THROTTLED in-worker writes, which
-    /// this port had left unguarded). What does not transfer is its
-    /// `uidValidityResetPendingAt` quarantine term: v3 has no such column (T4.S6).
+    /// `Folder.fetchOne`, same use on every cursor/completeness write the walk
+    /// makes. TWO deviations, both deliberate: (1) its `uidValidityResetPendingAt`
+    /// quarantine term does not transfer — v3 has no such column (T4.S6); (2) the
+    /// reference COMPARES (`observedEpoch` vs `storedEpoch`) where this CASes,
+    /// because the reference has no clearer — its `lastKnownUidValidity` is
+    /// advanced by the reset reaction's purge-then-stamp, so "the row's stamp
+    /// changed under me" is a state its quarantine flag already refuses. v3 has
+    /// the clearer and not the flag, so the CAS is the ⚑ INVENTED half.
     nonisolated static func crawlWalkWriteAllowed(
-        _ db: Database, folderId: String, walkEpoch: UInt32?
+        _ db: Database, folderId: String, premiseEpoch: UInt32?
     ) throws -> Bool {
         let stored = knownUidValidity(try Folder.fetchOne(db, key: folderId)?.lastKnownUidValidity)
             .flatMap { UInt32(exactly: $0) }
-        return crawlEpochAgrees(stored: stored, walk: walkEpoch)
+        return stored == premiseEpoch
     }
 
     /// Drop the crawl state of a folder that holds ZERO local headers, so the next
@@ -337,11 +476,55 @@ extension SyncEngine {
     /// empty-folder case is not distinguished and cannot brick. v3 has no
     /// reaction, so the empty case is the one the crawl can still discharge on its
     /// own, and it is discharged here. The non-empty case stays refused (T4.S6).
+    ///
+    /// 🚨 **`expectedStoredEpoch` IS THE CAS, AND IT IS LOAD-BEARING** (round 12,
+    /// blocker B). The decision to reset is made at the walk-start gate, which is
+    /// itself decided from a folder-row snapshot taken BEFORE a network round
+    /// trip. Two `runBackfill` calls for the same account overlap for real — the
+    /// persistent worker `SyncEngine.startBackfill` launches (reaching
+    /// `runBackfill` in `SyncEngineBackfill.swift`) and the BGProcessing pass
+    /// `SyncScheduler` drives through `AccountManager.runBackfill` →
+    /// `SyncEngine.performBackfill` — and `SyncEngine` is an actor, so both
+    /// suspend and interleave at every `await`. Without this predicate the helper
+    /// checked only `headerCount == 0` and then updated BY FOLDER ID, so a walk
+    /// acting on an ALREADY-STALE mismatch could clear a stamp and cursor that a
+    /// sibling walk had, in the meantime, legitimately re-derived from the live
+    /// mailbox. The sibling's already-fetched batch — held outside SQLite, so
+    /// invisible to the header count — then landed under a nil stamp, and its
+    /// final bookkeeping read that nil as agreement and marked the now-populated
+    /// folder COMPLETE. Durable end state: rows present, `lastKnownUidValidity`
+    /// nil, `backfillComplete` true. Completion excludes it from every later
+    /// crawl cycle, and Smart Reindex (`SyncEngine.resetCrawlState`) reopens the
+    /// crawl but cannot re-stamp, because the header-count gate below now
+    /// refuses. Only an on-open sync could heal it; the crawl never could.
+    ///
+    /// The predicate re-validates, inside the write transaction, the state the
+    /// reset decision was premised on: the folder is still the crawl's
+    /// responsibility (`backfillComplete == false`) and still carries the stamp
+    /// the gate saw disagree. `walkEpoch` needs no re-validation — it is a
+    /// constant of the calling pass — so "the stamp is unchanged" is exactly
+    /// "the mismatch that motivated this reset still holds". A refusal is
+    /// TRANSIENT: it means a sibling already did the re-derivation this call
+    /// wanted, and the next call reads the result.
+    ///
+    /// ⚑ R0 — **NO REFERENCE for the predicate**, because there is no reference
+    /// for the function (see above). The SHAPE is the reference's own, though:
+    /// re-read the row inside the writer's transaction and judge against it, as
+    /// `v2final`'s `uidValidityWalkWriteAllowed` does for every bookkeeping write
+    /// the walk makes. Serialising the two walks per account was considered and
+    /// rejected: `v2final` does not serialise them either (its folder loop is
+    /// identical and it carries no per-account walk lock), and a lock would
+    /// convert a one-cycle skew into a stalled BGProcessing budget.
     nonisolated static func resetEmptyFolderCrawlEpoch(
-        _ db: Database, folderId: String
+        _ db: Database, folderId: String, expectedStoredEpoch: UInt32
     ) throws -> Bool {
         let localHeaders = try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
         guard localHeaders == 0 else { return false }
+        guard let current = try Folder.fetchOne(db, key: folderId),
+              current.backfillComplete == false,
+              knownUidValidity(current.lastKnownUidValidity).flatMap({ UInt32(exactly: $0) })
+                  == expectedStoredEpoch
+        else { return false }
         let changed = try Folder
             .filter(Column("id") == folderId)
             .updateAll(db,
@@ -609,10 +792,20 @@ extension SyncEngine {
                         // the reset and the next iteration's SELECT would otherwise
                         // spin this loop at network rate (the NB3 shape).
                         var readopted = false
-                        if !epochReadoptedFolderIds.contains(folder.id) {
+                        if !epochReadoptedFolderIds.contains(folder.id), let expectedStored = storedEpoch {
                             let folderId = folder.id
+                            #if DEBUG
+                            await Self.runBackfillWalkCheckpointForTesting(
+                                .beforeEmptyFolderCrawlEpochReset(folderId: folderId))
+                            #endif
+                            // The CAS lives INSIDE the write txn — see
+                            // `resetEmptyFolderCrawlEpoch`. `expectedStored` is the
+                            // stamp this gate saw disagree; a sibling walk that has
+                            // since re-derived the folder's identity moves it, and
+                            // this stale decision must then NOT fire.
                             readopted = ((try? await AppDatabase.backgroundPool.write { db in
-                                try Self.resetEmptyFolderCrawlEpoch(db, folderId: folderId)
+                                try Self.resetEmptyFolderCrawlEpoch(
+                                    db, folderId: folderId, expectedStoredEpoch: expectedStored)
                             }) ?? false)
                         }
                         if readopted {
@@ -628,6 +821,17 @@ extension SyncEngine {
                         }
                         continue
                     }
+
+                    // THE PREMISE every bookkeeping write this pass makes is
+                    // accounted under: the value of `Folder.lastKnownUidValidity`
+                    // this pass's cursor/completeness describe. It starts as the
+                    // walk-start snapshot and advances to `walkEpoch` if and only
+                    // if THIS pass's own bootstrap stamped the folder — at which
+                    // point the row legitimately holds `walkEpoch` and every later
+                    // write of this pass must be judged against THAT.
+                    // `crawlWalkWriteAllowed` CASes the row against it inside each
+                    // write's own transaction (NB3/NB4).
+                    var premiseEpoch = storedEpoch
 
                     // Initialize cursor (from DB or UIDNEXT)
                     let cursorValue: Int
@@ -647,8 +851,14 @@ extension SyncEngine {
                                     return try Self.bootstrapCrawledFolderUidValidity(
                                         db, folderId: folderId, observed: observed)
                                 }
-                                if stamped, DebugModeManager.isLoggingEnabled() {
-                                    print("[Backfill] \(folder.name) epoch bootstrapped from resumed walk")
+                                if stamped {
+                                    // This pass just moved the row nil → walkEpoch,
+                                    // so that is the premise its later writes are
+                                    // accounted under, not the nil snapshot.
+                                    premiseEpoch = walkEpoch
+                                    if DebugModeManager.isLoggingEnabled() {
+                                        print("[Backfill] \(folder.name) epoch bootstrapped from resumed walk")
+                                    }
                                 }
                             } catch {
                                 // 🚨 A THROW AND A `false` MEAN DIFFERENT THINGS,
@@ -680,6 +890,14 @@ extension SyncEngine {
                     case .fresh(let uidNext):
                         let folderId = folder.id
                         let initialCursor = uidNext - 1
+                        // The premise the two writes below are judged against.
+                        // Captured here rather than read inside the closures so it
+                        // is unambiguously the value the gate above proceeded on.
+                        let writePremise = premiseEpoch
+                        #if DEBUG
+                        await Self.runBackfillWalkCheckpointForTesting(
+                            .beforeFreshBookkeepingWrite(folderId: folderId))
+                        #endif
                         if initialCursor < 1 {
                             // NB3 (round 8): this early-out used to skip the epoch
                             // bootstrap entirely. It must not: the walk-start
@@ -693,8 +911,35 @@ extension SyncEngine {
                             // later pass. Same transaction as the completion write,
                             // so a failure of either leaves the folder incomplete
                             // and it is retried.
+                            //
+                            // 🚨 ROUND 12, BLOCKER A — THIS WRITE WAS UNGUARDED,
+                            // and `9e0c4797e`'s message and `crawlWalkWriteAllowed`'s
+                            // own doc both claimed every bookkeeping transaction
+                            // re-read the folder row. They were wrong about this one
+                            // and about its sibling below. REFERENCE (`v2final`):
+                            // PORTED — the reference guards its counterpart with
+                            // `uidValidityWalkWriteAllowed` and logs *"skipping
+                            // fully-crawled write — UIDVALIDITY quarantine"*. The
+                            // failure it closes: this pass observes E1 on an
+                            // unstamped folder, a sibling stamps E2 and merges its
+                            // recent window while this pass is between the SELECT
+                            // and the write, and the stale E1 pass then writes
+                            // `backfillComplete = true` — the bootstrap beside it
+                            // returns `false` (headers now exist) and that return
+                            // is discarded. Completion excludes the folder from
+                            // every later crawl, so the E2 mail outside the recent
+                            // window is permanently outside automatic backfill.
+                            var written = false
                             do {
-                                try await AppDatabase.backgroundPool.write { db in
+                                written = try await AppDatabase.backgroundPool.write { db -> Bool in
+                                    #if DEBUG
+                                    if Self.freshCursorWriteShouldFailForTesting(folderId: folderId) {
+                                        throw FreshCursorWriteFailureForTesting()
+                                    }
+                                    #endif
+                                    guard try Self.crawlWalkWriteAllowed(
+                                        db, folderId: folderId, premiseEpoch: writePremise
+                                    ) else { return false }
                                     _ = try Folder.filter(Column("id") == folderId)
                                         .updateAll(db,
                                             Column("backfillComplete").set(to: true),
@@ -702,8 +947,8 @@ extension SyncEngine {
                                         )
                                     _ = try Self.bootstrapCrawledFolderUidValidity(
                                         db, folderId: folderId, observed: walkEpoch)
+                                    return true
                                 }
-                                print("[Backfill] \(folder.name) fully crawled (UIDNEXT=1, no messages)")
                             } catch {
                                 // The folder is still incomplete, so the loop's
                                 // fresh re-read would hand it straight back and
@@ -716,6 +961,17 @@ extension SyncEngine {
                                     print("[Backfill] \(folder.name) fully-crawled write failed: \(error) — declining for this call, retry next cycle")
                                 }
                             }
+                            if written {
+                                print("[Backfill] \(folder.name) fully crawled (UIDNEXT=1, no messages)")
+                            } else if !epochDeclinedFolderIds.contains(folder.id) {
+                                // Refused, not thrown: another pass moved the stamp
+                                // out from under this one. Same spin argument as the
+                                // throw — decline for the rest of the call.
+                                epochDeclinedFolderIds.insert(folder.id)
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Backfill] \(folder.name): skipping fully-crawled write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
+                                }
+                            }
                             didWork = true
                             await updateBackfillProgressForAccount(account)
                             continue
@@ -726,19 +982,92 @@ extension SyncEngine {
                         // inside `bootstrapCrawledFolderUidValidity` is evaluated
                         // in THIS transaction. Sharing the transaction with the
                         // initial-cursor write is deliberate — the two land
-                        // together or not at all, and a throw propagates to the
-                        // folder loop's `catch`, which retries next cycle.
-                        try await AppDatabase.backgroundPool.write { db in
-                            _ = try Folder.filter(Column("id") == folderId)
-                                .updateAll(db,
-                                    Column("backfillUidCursor").set(to: initialCursor),
-                                    Column("lastKnownUidNext").set(to: uidNext)
-                                )
-                            _ = try Self.bootstrapCrawledFolderUidValidity(
-                                db, folderId: folderId, observed: walkEpoch)
+                        // together or not at all.
+                        //
+                        // 🚨 ROUND 12, BLOCKER A — THIS WRITE WAS UNGUARDED TOO.
+                        // REFERENCE (`v2final`): PORTED — the reference guards its
+                        // counterpart with `uidValidityWalkWriteAllowed` and logs
+                        // *"skipping initial cursor write — UIDVALIDITY
+                        // quarantine"*. The failure it closes is the C3 one: a
+                        // sibling stamps E1 while this pass is between its SELECT
+                        // (which observed E2) and this write; the write plants a
+                        // cursor and `lastKnownUidNext` in E2 numbering onto an
+                        // E1-stamped folder, the walk then runs with
+                        // `expectedEpoch = E2` and the per-chunk check compares the
+                        // MIRROR against `expectedEpoch` — never against the STORED
+                        // stamp — so it agrees and inserts E2 rows into an
+                        // E1-stamped folder. The stamp is non-nil, so
+                        // `AccountManager.newGestureRefusedForUnknownEpoch` (which
+                        // tests only `== nil`) admits gestures on those bare-UID
+                        // rows and a numeric id resolves as a literal UID in the
+                        // live mailbox. Refusing here is what keeps a folder's rows
+                        // and its stamp in ONE epoch.
+                        //
+                        // 🚨 ROUND 12, BLOCKER C — AND IT WAS A BARE `try await`.
+                        // A throw went to the folder loop's outer `catch`, which
+                        // for a non-connection, non-auth error only logs; the
+                        // folder was still incomplete, still cursor-less and never
+                        // declined, so the loop's fresh re-read handed back the
+                        // SAME folder, issued another `getUidNextWithEpoch` SELECT
+                        // and retried the identical failing write — and
+                        // `previousFolderId` was already this folder, so
+                        // `interFolderDelay` was skipped too. Under a persistent
+                        // write failure (GRDB suspension, ADR-IOS-046 /
+                        // `0xdead10cc` — which `freshCursorWriteFailureIdsForTesting`
+                        // models — or `SQLITE_FULL`, or corruption) that is an
+                        // unbounded SELECT-per-iteration loop against the server
+                        // with zero backoff for the whole call. The
+                        // `initialCursor < 1` early-out fifteen lines above got
+                        // exactly this `catch` in `9e0c4797e` and its argument
+                        // applies word-for-word here; it simply was not applied.
+                        // ⚑ R0 — DIVERGENCE FROM THE REFERENCE, DELIBERATE:
+                        // `v2final`'s counterpart write is ALSO a bare `try await`
+                        // with no decline, so this is not a port regression. It is
+                        // fixed anyway, because the reference shares the defect.
+                        let planted: (landed: Bool, stamped: Bool)
+                        do {
+                            planted = try await AppDatabase.backgroundPool.write { db -> (landed: Bool, stamped: Bool) in
+                                #if DEBUG
+                                if Self.freshCursorWriteShouldFailForTesting(folderId: folderId) {
+                                    throw FreshCursorWriteFailureForTesting()
+                                }
+                                #endif
+                                guard try Self.crawlWalkWriteAllowed(
+                                    db, folderId: folderId, premiseEpoch: writePremise
+                                ) else { return (landed: false, stamped: false) }
+                                _ = try Folder.filter(Column("id") == folderId)
+                                    .updateAll(db,
+                                        Column("backfillUidCursor").set(to: initialCursor),
+                                        Column("lastKnownUidNext").set(to: uidNext)
+                                    )
+                                let stamped = try Self.bootstrapCrawledFolderUidValidity(
+                                    db, folderId: folderId, observed: walkEpoch)
+                                return (landed: true, stamped: stamped)
+                            }
+                        } catch {
+                            epochDeclinedFolderIds.insert(folder.id)
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Backfill] \(folder.name) initial cursor write failed: \(error) — declining for this call, retry next cycle")
+                            }
+                            continue
                         }
+                        guard planted.landed else {
+                            epochDeclinedFolderIds.insert(folder.id)
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Backfill] \(folder.name): skipping initial cursor write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
+                            }
+                            continue
+                        }
+                        if planted.stamped { premiseEpoch = walkEpoch }
                         cursorValue = initialCursor
                     }
+
+                    // Frozen for the rest of the pass: the premise every write from
+                    // here on (both throttled in-worker cursor writes, both final
+                    // writes) is CASed against. Nothing after this point may change
+                    // the folder's stamp on this pass's behalf, so a `let` is the
+                    // honest shape.
+                    let walkWritePremise = premiseEpoch
 
                     let cursor = UIDWalkCursor(startCursor: cursorValue, chunkSize: limit)
                     let poolMax = await imapProvider.poolMaxConnections()
@@ -848,14 +1177,17 @@ extension SyncEngine {
                                                 // `storedEpoch` snapshot this pass
                                                 // gated on was taken before the
                                                 // walk-start round trip and can be
-                                                // minutes stale by now, and its only
-                                                // reachable skew (nil → stamped)
-                                                // fails OPEN.
+                                                // minutes stale by now. Round 12
+                                                // (NB3): the skews are nil → stamped
+                                                // AND stamped → nil (the clearer
+                                                // `resetEmptyFolderCrawlEpoch`), and
+                                                // BOTH fail open under an
+                                                // epoch comparison — hence the CAS.
                                                 guard try Self.crawlWalkWriteAllowed(
-                                                    db, folderId: folderCaptured.id, walkEpoch: expectedEpoch
+                                                    db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise
                                                 ) else {
                                                     if DebugModeManager.isLoggingEnabled() {
-                                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder is stamped with a different epoch")
+                                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised")
                                                     }
                                                     return
                                                 }
@@ -935,10 +1267,33 @@ extension SyncEngine {
 
                                     // Successfully fetched — insert to DB then confirm
                                     if !fetchedHeaders.isEmpty {
-                                        let (inserted, ftsRecords, ccBccUpdates) = await self.insertBackfillBatch(
+                                        #if DEBUG
+                                        await Self.runBackfillWalkCheckpointForTesting(
+                                            .beforeInsertingFetchedChunk(folderId: folderCaptured.id))
+                                        #endif
+                                        let (inserted, ftsRecords, ccBccUpdates, refused) = await self.insertBackfillBatch(
                                             fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
-                                            folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox
+                                            folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
+                                            epochPremise: .init(walkWritePremise)
                                         )
+                                        // A refused chunk means the folder's STAMP moved
+                                        // under this walk — something `epochStillAgrees()`
+                                        // above structurally cannot see, since no term in
+                                        // it reads the folder row. The range is FAILED,
+                                        // never confirmed, and this worker stops: failed
+                                        // ranges are served FIRST by `nextRange`, so
+                                        // continuing would re-fetch the same range forever
+                                        // (the stamp cannot move back mid-pass). Same stop
+                                        // rationale, and the same rule, as `v2final`'s
+                                        // `chunkRefused` leg.
+                                        if refused {
+                                            await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.epochDisagreed = true
+                                            if DebugModeManager.isLoggingEnabled() {
+                                                print("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY this pass premised, \(fetchedHeaders.count) headers discarded")
+                                            }
+                                            break
+                                        }
                                         if !ftsRecords.isEmpty { await self.indexHeadersForFTS(ftsRecords) }
                                         if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
                                         if inserted > 0 {
@@ -958,10 +1313,10 @@ extension SyncEngine {
                                         try? await AppDatabase.backgroundPool.write { db in
                                             // NB2/NB4 — see the empty-range twin above.
                                             guard try Self.crawlWalkWriteAllowed(
-                                                db, folderId: folderCaptured.id, walkEpoch: expectedEpoch
+                                                db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise
                                             ) else {
                                                 if DebugModeManager.isLoggingEnabled() {
-                                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder is stamped with a different epoch")
+                                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised")
                                                 }
                                                 return
                                             }
@@ -1013,7 +1368,12 @@ extension SyncEngine {
                     // post-insert legs) already persisted intermediate cursors about
                     // once a second while the walk ran, and `v2final` guards BOTH of
                     // them where this port had left them bare. They are guarded now
-                    // (`crawlWalkWriteAllowed`), and what they persisted is sound on
+                    // (`crawlWalkWriteAllowed`) — as, since round 12, are the two
+                    // `case .fresh` writes `9e0c4797e` left bare while claiming
+                    // otherwise; the disproving search is
+                    // `rg -n 'Column\("backfillUidCursor"\)\.set|Column\("backfillComplete"\)\.set|Column\("lastKnownUidNext"\)\.set|crawlWalkWriteAllowed'`
+                    // over this file, and every IMAP-branch bookkeeping write it
+                    // returns now sits under a guard. What they persisted is sound on
                     // its own terms: a cursor can only advance past a range that a
                     // worker confirmed, and a worker only confirms a range whose own
                     // SEARCH and FETCH agreed with `expectedEpoch` — so every
@@ -1053,7 +1413,7 @@ extension SyncEngine {
                     if isComplete {
                         let written = ((try? await AppDatabase.backgroundPool.write { db -> Bool in
                             guard try Self.crawlWalkWriteAllowed(
-                                db, folderId: folderId, walkEpoch: walkEpoch) else { return false }
+                                db, folderId: folderId, premiseEpoch: walkWritePremise) else { return false }
                             _ = try Folder.filter(Column("id") == folderId)
                                 .updateAll(db,
                                     Column("backfillComplete").set(to: true),
@@ -1073,7 +1433,7 @@ extension SyncEngine {
                     } else {
                         let written = ((try? await AppDatabase.backgroundPool.write { db -> Bool in
                             guard try Self.crawlWalkWriteAllowed(
-                                db, folderId: folderId, walkEpoch: walkEpoch) else { return false }
+                                db, folderId: folderId, premiseEpoch: walkWritePremise) else { return false }
                             _ = try Folder.filter(Column("id") == folderId)
                                 .updateAll(db, Column("backfillUidCursor").set(to: finalCursor))
                             return true
@@ -1228,7 +1588,11 @@ extension SyncEngine {
 
                     if !headers.isEmpty {
                         // Step 1: Insert headers to GRDB (batch dedup)
-                        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
+                        // `epochPremise` deliberately omitted (nil ⇒ no guard):
+                        // this is the Gmail/Exchange page walk, and neither
+                        // provider has a UIDVALIDITY concept at all, so there is
+                        // no premise to hold and nothing a guard could compare.
+                        let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
                             headers, folderId: folder.id, accountId: folder.accountId,
                             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                         )
@@ -1351,6 +1715,22 @@ extension SyncEngine {
                     try? await Task.sleep(for: .seconds(connectionBackoffSeconds))
                     connectionBackoffSeconds = min(60, connectionBackoffSeconds * 2)
                 }
+                // ROUND 12 — the mirror-image hunt looked hard at the `else` of
+                // this `if` (an unclassified error gets NO backoff at all) and
+                // deliberately left it alone. It is NOT a sibling of the
+                // blocker-C spin family, because reaching here does not imply
+                // "no progress was made": every error thrown AFTER the walk's
+                // final cursor write leaves the cursor advanced, so the next
+                // iteration walks the NEXT range rather than re-walking this
+                // one. The pre-progress throws all funnel through
+                // `selectMailboxTracked` (`getUidNextWithEpoch`), whose failures
+                // `isSelectFailedError` classifies, so they DO back off. The one
+                // residual — an unclassified, non-connection throw out of
+                // `getUidNextWithEpoch` — is reported in the round-12 findings
+                // rather than fixed here: a blanket decline in this `catch`
+                // would drop a whole folder for the rest of a BGProcessing
+                // budget on one transient blip, and `v2final`'s `catch` is
+                // byte-identical to this one, so there is no reference to port.
             }
 
             // Only delay between different folders — same folder continues immediately

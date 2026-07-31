@@ -146,7 +146,7 @@ extension SyncEngine {
         guard !headers.isEmpty else { return 0 }
 
         // Step 4: Insert into GRDB (reuse backfill insert which handles dedup)
-        let (inserted, ftsRecords, _) = await insertBackfillBatch(
+        let (inserted, ftsRecords, _, _) = await insertBackfillBatch(
             headers,
             folderId: folderId,
             accountId: account.id,

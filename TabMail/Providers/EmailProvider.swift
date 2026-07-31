@@ -294,22 +294,41 @@ extension EmailProvider {
     /// write nothing for a nil observation. Losing this override therefore stops
     /// a provider contributing an epoch; it can never make one up.
     ///
-    /// SEARCH THAT BOUNDS THE CLAIM (do not restate it without re-running these):
-    /// `rg -n "(final class|class|struct|actor|extension) +\w+ *:.*EmailProvider"`
-    /// over `TabMail/`, `TabMailTests/`, `TabMailNotificationService/` enumerates
-    /// every conformer — production: `IMAPProvider`, `GmailProvider`,
-    /// `ExchangeProvider`, `DemoProvider`; test doubles: `MockEmailProvider`,
-    /// `PerIDFetchMock`, `WorkQueueMockProvider`, and the `NonProbeProvider` /
-    /// `ProbingProvider` pairs in `HandleMissedItemsTests` and
-    /// `ConfirmGoneAtThresholdTests`. `rg -n "func lastObservedUidValidity"` over
-    /// the same roots returns exactly two overrides, `IMAPProvider`'s and
-    /// `MockEmailProvider`'s. So on TODAY'S tree every conformer inheriting this
-    /// default also answers `nil` from the mirror and the two forms coincide —
-    /// which is precisely why the delegating form would have been invisible, and
-    /// why the explicit form is written instead. It is a bounded claim about this
-    /// tree, not a law: a future non-IMAP conformer that starts populating a
-    /// mirror gets `nil` here rather than an unbound value, and must override
-    /// this method with a genuinely bound one if it wants to contribute an epoch.
+    /// ⚠ **RETRACTION (round 12, NB1) — the census this comment used to give was
+    /// already false when it was written, and the SAME COMMIT falsified it.** It
+    /// listed eleven conformers, asserted "exactly two overrides" of
+    /// `lastObservedUidValidity`, and concluded that *every* conformer inheriting
+    /// this default also answers `nil` from the mirror. `9e0c4797e` added
+    /// `MirrorOnlyProvider` (in `SelectSourcedFolderEpochTests.swift`) — a
+    /// twelfth conformer, a THIRD override, and the explicit counterexample to
+    /// the "every inheritor has a nil mirror" clause, since it inherits this
+    /// default while answering a populated mirror. That clause was the
+    /// justification for calling the delegating form "invisible"; it is now
+    /// simply wrong, and the searches are given below in place of the absolute.
+    ///
+    /// THE SEARCHES, run 2026-07-31 (re-run them; do not restate their output as
+    /// a law):
+    /// - `rg -n "(final class|class|struct|actor|extension) +\w+ *:.*EmailProvider"`
+    ///   over `TabMail/`, `TabMailTests/`, `TabMailNotificationService/` returned
+    ///   TWELVE — production: `IMAPProvider`, `GmailProvider`, `ExchangeProvider`,
+    ///   `DemoProvider`; test doubles: `MockEmailProvider`, `PerIDFetchMock`,
+    ///   `WorkQueueMockProvider`, `MirrorOnlyProvider`, and the
+    ///   `NonProbeProvider` / `ProbingProvider` pairs in `HandleMissedItemsTests`
+    ///   and `ConfirmGoneAtThresholdTests`. The search matches the DECLARATION
+    ///   line only, so a conformance added in a separate `extension` would not
+    ///   appear — it bounds from below, not exactly.
+    /// - `rg -n "func lastObservedUidValidity"` over the same roots returned
+    ///   THREE overrides: `IMAPProvider`'s, `MockEmailProvider`'s and
+    ///   `MirrorOnlyProvider`'s (plus the protocol requirement and the default in
+    ///   this file).
+    ///
+    /// What is true, and all that is needed: this default is BOUND BY
+    /// CONSTRUCTION regardless of the census. A conformer that populates a
+    /// mirror and does not override gets `nil` here rather than an unbound value
+    /// — `MirrorOnlyProvider` is that case made real, and
+    /// `SelectSourcedFolderEpochTests.aConformerThatDoesNotOverrideReportsNoEpoch`
+    /// asserts it. A future conformer wanting to contribute an epoch must
+    /// override this method with a genuinely bound one.
     ///
     /// `IMAPProvider` overrides with the BOUND form — the epoch taken from the
     /// very `Mailbox.Selection` that served the fetch. `MockEmailProvider`

@@ -92,7 +92,7 @@ extension SyncEngine {
                         }
                     }
                 }
-                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -149,7 +149,7 @@ extension SyncEngine {
                         ids: chunk, batchSize: gmailBatchSize, interBatchDelay: gmailDelay
                     )
                 }
-                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -205,7 +205,7 @@ extension SyncEngine {
                         ids: chunk, batchSize: batchSize, interBatchDelay: batchDelay
                     )
                 }
-                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -240,22 +240,56 @@ extension SyncEngine {
     }
 
     /// Insert headers into a folder. Returns (insertedCount, ftsRecords) so the caller
-    /// can coalesce FTS indexing across multiple batches within a window.
+    /// can coalesce FTS indexing across multiple batches within a window, plus
+    /// whether any chunk was REFUSED on epoch grounds (see `epochPremise`).
+    ///
+    /// 🚨 `epochPremise` — **the C3 guard, and it must be judged against the
+    /// STORED stamp, not against the caller's own walk epoch** (round 12). The
+    /// backfill walk's per-chunk `epochStillAgrees()` check compares the
+    /// provider's epoch MIRROR against the epoch the WALK started in; it is
+    /// structurally blind to the folder's stamp changing after the walk began,
+    /// because no term in it reads the folder row at all. So a sibling pass
+    /// stamping the folder mid-walk (full sync's STATUS-sourced folder-list
+    /// upsert, `runSyncMessages`' SELECT-sourced bootstrap, deletion-reconcile's)
+    /// lets this walk's rows land under a stamp describing a DIFFERENT numbering
+    /// — and since `AccountManager.newGestureRefusedForUnknownEpoch` tests only
+    /// `== nil`, a non-nil wrong stamp ADMITS every bare-UID gesture on them.
+    /// Re-reading the row inside THIS transaction is the only place the two can
+    /// be compared without a TOCTOU.
+    ///
+    /// `nil` means "this caller holds no premise; do not guard" — the
+    /// Gmail/Exchange page walk (no UIDVALIDITY exists for those providers), deep
+    /// backfill and self-heal. `.init(nil)` means "the premise is that the folder
+    /// is UNSTAMPED", which is a real and common crawl state (a folder holding
+    /// rows of unproven epoch, which `bootstrapCrawledFolderUidValidity` refuses
+    /// to stamp) and MUST still be guarded.
+    ///
+    /// ⚑ R0 — PORTED from `v2final`'s `insertBackfillBatch(… observedEpoch:)` +
+    /// `refused` return, which carries the same in-txn guard through
+    /// `uidValidityWriteAllowed(resetPending:observedEpoch:storedEpoch:)` and the
+    /// same "a refused range is FAILED, never confirmed" contract on the caller.
+    /// TWO deviations: (1) the reference's `uidValidityResetPendingAt` term does
+    /// not transfer (v3 has no such column — T4.S6); (2) the reference passes a
+    /// bare `UInt32?` and lets `nil` mean "no guard", which it can afford BECAUSE
+    /// of that flag — v3 cannot, since the unstamped folder is exactly the one
+    /// whose premise is nil, hence the wrapper type.
     func insertBackfillBatch(
         _ headers: [MessageHeaderInfo],
         folderId: String,
         accountId: String,
         folderPath: String,
         folderRole: FolderRole,
-        isInInbox: Bool
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]) {
-        guard !headers.isEmpty else { return (0, [], []) }
+        isInInbox: Bool,
+        epochPremise: SyncEngine.CrawlEpochPremise? = nil
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)], refused: Bool) {
+        guard !headers.isEmpty else { return (0, [], [], false) }
 
         var ftsRecords: [FTSHeaderRecord] = []
         var count = 0
         var unreadInserted = 0
         var discoveredParents: [String] = []
         var ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)] = []
+        var anyChunkRefused = false
 
         // CHUNKED async insert: split the batch into transactions of
         // SyncConfig.backfillInsertChunkSize rows so each holds the single GRDB
@@ -270,8 +304,22 @@ extension SyncEngine {
             let end = min(start + chunkSize, headers.count)
             let chunk = Array(headers[start..<end])
             do {
-                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], ccBcc: [(headerId: String, cc: String, bcc: String)], parents: [String]) =
+                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], ccBcc: [(headerId: String, cc: String, bcc: String)], parents: [String], refused: Bool) =
                     try await AppDatabase.backgroundPool.write { db in
+                        // THE C3 GUARD — re-read the folder row INSIDE this txn and
+                        // compare it against the caller's premise. A chunk refused
+                        // here is simply re-fetched by a later pass; a chunk
+                        // inserted under a stamp it does not belong to is silent
+                        // data corruption that only surfaces as a gesture landing
+                        // on the wrong message. See `epochPremise` above.
+                        if let epochPremise,
+                           try !SyncEngine.crawlWalkWriteAllowed(
+                               db, folderId: folderId, premiseEpoch: epochPremise.epoch) {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Backfill] \(folderId): skipping insert chunk — the folder no longer holds the UIDVALIDITY this pass premised")
+                            }
+                            return (inserted: 0, unread: 0, fts: [], ccBcc: [], parents: [], refused: true)
+                        }
                         // Load pending destructive IDs to skip messages with optimistic moves.
                         // Scoped to (accountId, folderPath) to prevent IMAP cross-folder UID collisions.
                         let scopedOps = try PendingOperation
@@ -394,8 +442,9 @@ extension SyncEngine {
                             accountId: accountId,
                             db: db
                         )
-                        return (inserted, unread, fts, ccBcc, parents)
+                        return (inserted, unread, fts, ccBcc, parents, false)
                     }
+                if result.refused { anyChunkRefused = true }
                 count += result.inserted
                 unreadInserted += result.unread
                 ftsRecords.append(contentsOf: result.fts)
@@ -418,7 +467,7 @@ extension SyncEngine {
             }
         }
         ReplyParentResolver.postParentNotifications(discoveredParents)
-        return (count, ftsRecords, ccBccFtsUpdates)
+        return (count, ftsRecords, ccBccFtsUpdates, anyChunkRefused)
     }
 
     // MARK: - Deep Backfill (Past Age Limit)

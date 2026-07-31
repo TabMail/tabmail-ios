@@ -737,17 +737,43 @@ final class FakeIMAPServer: @unchecked Sendable {
     }
 
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
-    /// `* OK [UIDVALIDITY n]` untagged response entirely. RFC 3501 §6.3.1 lists
-    /// it as SHOULD, not MUST, which is exactly why SwiftMail's
-    /// `Mailbox.Selection.uidValidity` is non-optional with a `UIDValidity(0)`
-    /// default — a client that trusts that default persists `0` as though it
-    /// were an epoch, and every later epoch comparison becomes `0 == 0`.
+    /// `* OK [UIDVALIDITY n]` untagged response entirely.
+    ///
+    /// ⚠ **RETRACTED (round 12) — this doc used to say "RFC 3501 §6.3.1 lists
+    /// it as SHOULD, not MUST". That is FALSE.** §6.3.1 (SELECT) lists
+    /// UIDVALIDITY among the *REQUIRED OK untagged responses* — UNSEEN,
+    /// PERMANENTFLAGS, UIDNEXT, UIDVALIDITY — and adds that if it is missing,
+    /// the server does not support unique identifiers. RFC 9051 §6.3.2 carries
+    /// the same requirement. **This seam therefore models a NONCONFORMING
+    /// server**, and that is exactly what makes it useful: it is the only
+    /// deterministic way to produce the `walkEpoch == nil` wire shape the
+    /// crawl's `SyncEngine.crawlEpochGate` has to decide about. Do not use it as
+    /// evidence that omitting UIDVALIDITY is a legal server behaviour the app
+    /// must accommodate.
+    ///
+    /// What IS true, and is the reason the app cannot just trust the parse:
+    /// SwiftMail's `Mailbox.Selection.uidValidity` is non-optional with a
+    /// `UIDValidity(0)` default, so a client that trusts it persists `0` as
+    /// though it were an epoch and every later comparison becomes `0 == 0`.
     /// This is the only seam that produces the OMITTED-line wire shape;
     /// `setUidValidity(0, for:)` would instead send a literal `UIDVALIDITY 0`,
     /// which is not a shape any RFC-conformant server can produce (§2.3.1.1
     /// types UIDVALIDITY as `nz-number`).
     func suppressSelectUidValidity(for mailbox: String) {
         withState { state in _ = state.selectUidValiditySuppressed.insert(mailbox) }
+    }
+
+    /// Undo `suppressSelectUidValidity(for:)` — this mailbox's SELECT/EXAMINE
+    /// reports `* OK [UIDVALIDITY n]` again from the next SELECT on.
+    ///
+    /// Added for round 12's NB4(b): a refusal that keys off "this pass observed
+    /// no epoch" has to be shown BOTH ways — that it recurs for as long as the
+    /// server keeps omitting the line (the permanent bound `crawlEpochGate` now
+    /// discloses), and that one conformant SELECT clears it. Without an un-
+    /// suppress, only the first half is testable and the disclosure stays
+    /// one-sided.
+    func restoreSelectUidValidity(for mailbox: String) {
+        withState { state in _ = state.selectUidValiditySuppressed.remove(mailbox) }
     }
 
     /// Test seam: replace a mailbox's entire message list. Used to simulate
