@@ -808,8 +808,8 @@ struct IMAPProviderPoolInvariantTests {
         // companion counter, and its WORDING is adopted verbatim because that
         // wording is careful in a way a paraphrase is not.
         //
-        // **LOGIN counts successful AUTHENTICATIONS, not connections.** A
-        // connection opened and then abandoned before it authenticated is
+        // **LOGIN counts authentication ATTEMPTS, not connections.** A
+        // connection opened and then abandoned before it sent LOGIN is
         // invisible to this counter. So the reference does not say "exactly one
         // connection was opened"; it says a SECOND LOGIN MEANS two racing
         // `createServer()` calls. That implication is what holds, and it is all
@@ -817,10 +817,22 @@ struct IMAPProviderPoolInvariantTests {
         // job, and the never-logged-out leak detector is
         // `abandonedSessionCount()`'s — both asserted immediately below.
         //
+        // ATTEMPTS, not AUTHENTICATIONS, and the distinction is the fake's, not
+        // a hedge: its client loop appends to `commandLog` at LINE-PARSE time,
+        // in the same `withState` block that then evaluates the injected-failure
+        // countdown — and the append comes FIRST. A matched failure either
+        // answers `NO` and `continue`s or `break`s the client loop, so it never
+        // reaches `handleCommand`'s `case "LOGIN": authenticated = true`. An
+        // injected LOGIN failure and a killed connection are therefore both
+        // COUNTED here while being no authentication at all. This test injects
+        // neither, so the count is exact for it; the wording matters because a
+        // future variant that does inject one would silently change what this
+        // number means.
+        //
         // Within that narrower scope the assertion is still two-sided, because
         // `recordedCommands()` is MONOTONIC (`commandLog` is appended to at
-        // command dispatch and nothing ever removes from it) and the comparison
-        // is an EQUALITY:
+        // line-parse time, as above, and nothing ever removes from it) and the
+        // comparison is an EQUALITY:
         //
         //   * 2+ ⇒ a second `createServer()` raced the single-flight (the bug).
         //   * 0  ⇒ no LOGIN was recorded at all, though both acquires were just
@@ -843,7 +855,11 @@ struct IMAPProviderPoolInvariantTests {
         let loginCount = server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") }.count
         #expect(
             loginCount == 1,
-            "both concurrent acquires must share ONE created connection — a second LOGIN means two racing createServer() calls (the overwrite/leak bug)"
+            // R0: the reference's sentence is kept byte-identical; the observed
+            // count is APPENDED. `v2final`'s message carries no number, so a
+            // failure reported none — strictly-additive diagnostic, not a
+            // weakened assertion (the predicate above is untouched).
+            "both concurrent acquires must share ONE created connection — a second LOGIN means two racing createServer() calls (the overwrite/leak bug); observed \(loginCount) LOGIN(s) on the wire"
         )
         let sessions = server.liveSessionCount()
         #expect(sessions == 1, "two same-folder acquires opened \(sessions) sessions — a second creation raced the single-flight and the loser was leaked")

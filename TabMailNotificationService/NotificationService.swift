@@ -419,8 +419,10 @@ final class NotificationService: UNNotificationServiceExtension {
                     accountId: accountId
                 )
                 // Zombie guard — same rationale as the step-4/5/6/7 checks: a
-                // history.list fetch can outlive the watchdog (HTTPClient allows
-                // up to 300s + retries), and everything below is a write —
+                // history.list fetch can outlive the watchdog
+                // (`HTTPConfig.sharedResourceTimeoutSeconds` = 300, applied to
+                // `timeoutIntervalForResource`, plus retries), and everything
+                // below is a write —
                 // setLastHistoryId, persistInboxRemovals, and ESPECIALLY the
                 // badge adjustment, which is raw UserDefaults arithmetic (unlike
                 // the per-message-deduped badgeForDelivery): a zombie re-running

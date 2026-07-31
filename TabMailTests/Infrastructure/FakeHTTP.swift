@@ -235,9 +235,17 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
             box.recordedCalls()
         }
 
-        /// `"<METHOD> <path>"` for every request this scenario served, in
+        /// `"<METHOD> <path>"` for every request this scenario RECEIVED, in
         /// order — a whole-sequence oracle for tests that must prove WHICH
         /// requests reached the fake, not merely that some did.
+        ///
+        /// RECEIVED, not "served": `StateBox.take` appends to `calls` BEFORE it
+        /// looks for a matcher, so a request with no registered route appears
+        /// here too even though the fake answered it `599` rather than serving
+        /// it. That is what these tests want — an unexpected request must show
+        /// up in the sequence and fail the comparison, not vanish because
+        /// nothing was registered for it — but it is not what the word "served"
+        /// says, so this comment says the other one.
         ///
         /// `recordedCalls().contains { … }` cannot do that job: a request that
         /// escaped to the live endpoint leaves no record, and if any sibling
@@ -248,6 +256,11 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
         /// The query string is dropped deliberately — these assertions are
         /// about which SESSION carried the request, and paths are the stable
         /// part of that.
+        ///
+        /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeHTTP.swift`
+        /// has no `servedCallSequence` (verified: the identifier does not occur
+        /// in that file at the tag). Its tests assert over `recordedCalls()`
+        /// directly, which is the shape this method exists to replace.
         func servedCallSequence() -> [String] {
             recordedCalls().map { call in
                 "\(call.method) \(URL(string: call.url)?.path ?? call.url)"
@@ -294,6 +307,13 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
     /// Once the script is exhausted every further call gets `599`, so an
     /// unexpected extra request is loud rather than silently absorbed by a
     /// repeated last entry.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeHTTP.swift`
+    /// has no `ResponseScript` (verified: the identifier does not occur in that
+    /// file at the tag) and no per-leg response sequencing of any kind — the
+    /// reference's registrations are all single fixed responses, which is why
+    /// it could never pin a 401-retry or 404-fallback leg separately from the
+    /// happy path.
     final class ResponseScript: Sendable {
         private let remaining: Mutex<[Int]>
         private let servedBox = Mutex<[Int]>([])

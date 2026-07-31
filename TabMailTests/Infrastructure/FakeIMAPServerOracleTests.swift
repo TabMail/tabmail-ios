@@ -6,6 +6,9 @@ import Testing
 import Foundation
 import SwiftMail
 @testable import TabMail
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// T0.2 — the red-first proof for the two `FakeIMAPServer` mechanisms the v3
 /// safety work is built on. Both mechanisms landed with T0.1 (they are woven
@@ -537,8 +540,21 @@ struct FakeIMAPServerOracleTests {
     /// descending range is ordinary, protocol-legal input, NOT a malformed set
     /// to be rejected or truncated.
     ///
-    /// Asserted at the parser rather than over the wire because the client
-    /// cannot express the input. `MessageIdentifierSet` (SwiftMail's `UIDSet`)
+    /// THE OTHER TWO INVARIANTS, same substrate, same consequence: `*` is a
+    /// BOUND (RFC 3501 §9 — "the largest number in use"), so discarding it
+    /// narrows exactly as a descending-range guard would; and a MALFORMED
+    /// component must address NOTHING, because dropping its unparseable token
+    /// and re-reading the survivors turns narrowing into WIDENING — the fake
+    /// then mutates a message the client never named, which is strictly worse.
+    /// A syntactically valid full-UID-space range must also resolve without
+    /// being materialised.
+    ///
+    /// Asserted at the parser HERE, and over the wire in
+    /// `wireLevelUIDSetsMutateExactlyTheAddressedMessages` below — the latter
+    /// is the one that pins the property that matters (what the fake actually
+    /// mutates); this one enumerates the input space cheaply. Neither can be
+    /// driven through SwiftMail, because the client cannot express any of these
+    /// inputs. `MessageIdentifierSet` (SwiftMail's `UIDSet`)
     /// stores its members in a `private var indexSet: Foundation.IndexSet`, and
     /// EVERY initialiser — including the range ones and `init?(string:)` —
     /// writes through that one property. `IndexSet` keeps sorted, coalesced
@@ -556,17 +572,21 @@ struct FakeIMAPServerOracleTests {
     /// normalised to `lowerBound...UInt32.max`. `init?(string:)` splits on `-`,
     /// not `:`, so it cannot even be handed `"5:2"`.
     ///
-    /// SwiftMail therefore cannot emit a descending range, and the tree carries
-    /// no raw-socket IMAP client to hand-write one with. Descending sets come
-    /// from OTHER clients and from fuzzed command streams, which is exactly the
-    /// input class the fake must survive. The property is the parser's
-    /// contract, so this is where it lives.
+    /// SwiftMail therefore cannot emit a descending range — nor a `*` on any
+    /// mutating path, nor a malformed set at all. Those sets come from OTHER
+    /// clients and from fuzzed command streams, which is exactly the input
+    /// class the fake must survive, so the sibling wire test hand-writes them
+    /// through a purpose-built raw-socket client rather than a library.
     @Test("a descending UID range expands to the same inclusive set as its ascending twin")
     func descendingUIDRangeExpandsInclusivelyInBothDirections() {
-        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        // UID 6 is deliberately ABSENT. Every expectation below is therefore
+        // also an assertion that the parser INTERSECTS the mailbox rather than
+        // enumerating a range: an implementation that materialised `min...max`
+        // would invent a UID 6 that no message holds.
+        let roster = [1, 2, 3, 4, 5, 7, 8, 9]
 
-        let ascending = server.parseUIDSet("2:5")
-        let descending = server.parseUIDSet("5:2")
+        let ascending = FakeIMAPServer.resolveUIDSet("2:5", againstMailboxUIDs: roster)
+        let descending = FakeIMAPServer.resolveUIDSet("5:2", againstMailboxUIDs: roster)
 
         #expect(
             ascending == [2, 3, 4, 5],
@@ -582,11 +602,241 @@ struct FakeIMAPServerOracleTests {
         )
 
         // Composition: a comma-joined set mixes directions and single UIDs, and
-        // every member still expands inclusively.
-        #expect(server.parseUIDSet("9:7,1,4:5") == [7, 8, 9, 1, 4, 5])
+        // every member still resolves inclusively.
+        #expect(FakeIMAPServer.resolveUIDSet("9:7,1,4:5", againstMailboxUIDs: roster) == [7, 8, 9, 1, 4, 5])
 
         // A single UID and a degenerate range are unchanged by the ordering.
-        #expect(server.parseUIDSet("3") == [3])
-        #expect(server.parseUIDSet("3:3") == [3])
+        #expect(FakeIMAPServer.resolveUIDSet("3", againstMailboxUIDs: roster) == [3])
+        #expect(FakeIMAPServer.resolveUIDSet("3:3", againstMailboxUIDs: roster) == [3])
+
+        // A UID the mailbox does not hold is IGNORED (RFC 3501 §6.4.8), not
+        // invented — the gap in the roster is the proof.
+        #expect(FakeIMAPServer.resolveUIDSet("6", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("5:7", againstMailboxUIDs: roster) == [5, 7])
+
+        // `*` IS A BOUND, NOT A TOKEN TO DROP. `*` is the mailbox's largest UID
+        // (RFC 3501 §9), so an open-ended range reaches the end of the mailbox
+        // in either direction, and a bare `*` names exactly the last message.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("1:*", againstMailboxUIDs: roster) == roster,
+            "1:* must address the whole mailbox — dropping `*` collapses it to the single UID 1"
+        )
+        #expect(
+            FakeIMAPServer.resolveUIDSet("*:1", againstMailboxUIDs: roster) == roster,
+            "*:1 is 1:* — order-independence applies to a resolved wildcard exactly as it does to a literal"
+        )
+        #expect(FakeIMAPServer.resolveUIDSet("*", againstMailboxUIDs: roster) == [9])
+        #expect(FakeIMAPServer.resolveUIDSet("7:*", againstMailboxUIDs: roster) == [7, 8, 9])
+
+        // A MALFORMED COMPONENT CONTRIBUTES NOTHING. The failure mode this
+        // guards is not narrowing but WIDENING: dropping the unparseable token
+        // from `1:x:3` leaves `1` and `3`, which read as a well-formed range
+        // and expand to include UID 2 — a message the client never addressed.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("1:x:3", againstMailboxUIDs: roster) == [],
+            "a malformed component must address NOTHING — resolving it to a range mutates messages the client never named"
+        )
+        #expect(
+            FakeIMAPServer.resolveUIDSet("1:2:3", againstMailboxUIDs: roster) == [],
+            "three bounds is not a seq-range; keeping the first two silently rewrites the client's set"
+        )
+        #expect(FakeIMAPServer.resolveUIDSet(":", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("1:", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet(":5", againstMailboxUIDs: roster) == [])
+        // …and it poisons only its own component, not its well-formed siblings.
+        #expect(FakeIMAPServer.resolveUIDSet("1:x:3,4", againstMailboxUIDs: roster) == [4])
+
+        // A SYNTACTICALLY VALID HUGE RANGE MUST NOT BE MATERIALISED. `1:2^32-1`
+        // is legal input; `Array(1...4294967295)` is ~4 billion `Int`s. That the
+        // call returns at all is the assertion — intersection is bounded by the
+        // mailbox, not by the range's width.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("1:4294967295", againstMailboxUIDs: roster) == roster,
+            "a full-UID-space range must resolve to the mailbox's own UIDs, without enumerating the range"
+        )
+
+        // An empty mailbox addresses nothing, whatever the set says.
+        #expect(FakeIMAPServer.resolveUIDSet("1:*", againstMailboxUIDs: []) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("2:5", againstMailboxUIDs: []) == [])
+    }
+
+    /// The same property at the SYSTEM level: what a real `UID STORE` /
+    /// `UID COPY` on the wire actually mutates. The test above pins the helper's
+    /// return value; this one pins the thing that matters — *the fake mutates
+    /// exactly the messages the client addressed, no more and no fewer* — by
+    /// speaking the two commands and then reading the resulting server state.
+    ///
+    /// Driven over a raw socket because **no client in this tree can express
+    /// these inputs.** SwiftMail's `MessageIdentifierSet` normalises endpoint
+    /// order away through a `Foundation.IndexSet`, has no way to spell a
+    /// malformed set, and only reaches an unbounded `*` through the
+    /// `PartialRangeFrom` initialisers its FETCH APIs use — none of which
+    /// touches `UID STORE`/`UID COPY`. Since the input class the parser exists
+    /// to survive is precisely "OTHER clients and fuzzed command streams", the
+    /// test has to be one of those other clients.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final` has no `FakeIMAPServerOracleTests`
+    /// at all and no raw-socket IMAP client anywhere in `TabMailTests/`
+    /// (verified: `TabMailTests/Infrastructure/FakeIMAPServer.swift` is the only
+    /// file in the tree that opens a socket, and it is the SERVER side). Both
+    /// the client below and this case are new.
+    @Test("a wildcard and a malformed UID set mutate exactly the addressed messages on the wire")
+    func wireLevelUIDSetsMutateExactlyTheAddressedMessages() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                Self.message(uid: 11, id: "wire-set-first@example.com"),
+                Self.message(uid: 12, id: "wire-set-second@example.com"),
+                Self.message(uid: 13, id: "wire-set-third@example.com"),
+            ],
+            "Archive": [],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "a1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "a2", "SELECT INBOX")
+
+        // 1. WILDCARD — `11:*` addresses every message from 11 to the end of the
+        //    mailbox. Dropping `*` leaves the single bound 11, so only the first
+        //    message would be flagged and the other two would silently escape a
+        //    mutation the client did issue.
+        _ = try client.command(tag: "a3", "UID STORE 11:* +FLAGS (\\Seen)")
+        #expect(
+            server.flags(in: "INBOX", uid: 11).contains("\\Seen"),
+            "UID 11 was named by the range's lower bound and must be flagged"
+        )
+        #expect(
+            server.flags(in: "INBOX", uid: 12).contains("\\Seen"),
+            "UID 12 lies inside 11:* — an unresolved `*` narrowed the STORE to UID 11 alone"
+        )
+        #expect(
+            server.flags(in: "INBOX", uid: 13).contains("\\Seen"),
+            "UID 13 is the mailbox's `*` — an unresolved `*` narrowed the STORE to UID 11 alone"
+        )
+
+        // 2. MALFORMED — `11:x:13` is not a sequence-set. It must mutate
+        //    NOTHING. Dropping the unparseable token leaves 11 and 13, which
+        //    read as a range and would flag UID 12: a message the client never
+        //    addressed, in a command it never validly issued.
+        _ = try client.command(tag: "a4", "UID STORE 11:x:13 +FLAGS (\\Flagged)")
+        for uid in [11, 12, 13] {
+            #expect(
+                !server.flags(in: "INBOX", uid: uid).contains("\\Flagged"),
+                "a malformed UID set mutated UID \(uid) — the fake touched a message no valid command addressed"
+            )
+        }
+
+        // 3. The same two properties on the COPY path, where a widened set
+        //    duplicates real mail rather than merely restamping a flag.
+        _ = try client.command(tag: "a5", "UID COPY 12:* \"Archive\"")
+        #expect(
+            Set(server.messageIDs(in: "Archive")) == [
+                "<wire-set-second@example.com>", "<wire-set-third@example.com>",
+            ],
+            "UID COPY 12:* must copy exactly UIDs 12 and 13: got \(server.messageIDs(in: "Archive"))"
+        )
+
+        _ = try client.command(tag: "a6", "UID COPY 11:x:13 \"Archive\"")
+        #expect(
+            server.messageIDs(in: "Archive").count == 2,
+            "a malformed UID COPY set copied messages — Archive holds \(server.messageIDs(in: "Archive"))"
+        )
+
+        // The source mailbox is untouched by COPY (RFC 3501 §6.4.7), so a
+        // widened set cannot hide as a moved-away message either.
+        #expect(server.messageIDs(in: "INBOX").count == 3)
+
+        _ = try client.command(tag: "a7", "LOGOUT")
+    }
+}
+
+/// A minimal raw-socket IMAP client: enough to log in, select, and issue a
+/// hand-written command line whose exact bytes the test controls. It exists so
+/// a test can send a `sequence-set` no real client library in this tree can
+/// construct (see `wireLevelUIDSetsMutateExactlyTheAddressedMessages`).
+///
+/// Blocking POSIX I/O against `127.0.0.1` with a receive timeout, so a fake
+/// that stops answering fails the test with a thrown error instead of hanging
+/// the suite.
+///
+/// ⚑ NO REFERENCE — INVENTED. `v2final` contains no raw-socket IMAP client;
+/// its FakeIMAPServer tests all drive `SwiftMail.IMAPServer`.
+private final class RawIMAPClient {
+    enum Failure: Error {
+        case socket(String)
+        case io(String)
+    }
+
+    private let fd: Int32
+
+    init(port: Int, timeoutSeconds: Int = 10) throws {
+        fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw Failure.socket("socket() failed: \(errno)") }
+
+        var timeout = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else {
+            Darwin.close(fd)
+            throw Failure.socket("connect() failed: \(errno)")
+        }
+    }
+
+    /// Consume the server's `* OK …` connection greeting.
+    func readGreeting() throws {
+        _ = try readUntil { $0.hasPrefix("* OK") }
+    }
+
+    /// Send `tag SPACE line CRLF` and read through the matching tagged response.
+    @discardableResult
+    func command(tag: String, _ line: String) throws -> String {
+        try write("\(tag) \(line)\r\n")
+        return try readUntil { $0.contains("\r\n\(tag) ") || $0.hasPrefix("\(tag) ") }
+    }
+
+    func close() {
+        Darwin.close(fd)
+    }
+
+    private func write(_ text: String) throws {
+        let bytes = Array(text.utf8)
+        var sent = 0
+        while sent < bytes.count {
+            let written = bytes.withUnsafeBytes { buffer -> Int in
+                Darwin.write(fd, buffer.baseAddress!.advanced(by: sent), bytes.count - sent)
+            }
+            guard written > 0 else { throw Failure.io("write() failed: \(errno)") }
+            sent += written
+        }
+    }
+
+    private func readUntil(_ isComplete: (String) -> Bool) throws -> String {
+        var accumulated = ""
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while !isComplete(accumulated) {
+            let received = chunk.withUnsafeMutableBytes { buffer -> Int in
+                Darwin.read(fd, buffer.baseAddress, 4096)
+            }
+            guard received > 0 else {
+                throw Failure.io("read() returned \(received) (errno \(errno)) after: \(accumulated)")
+            }
+            accumulated += String(decoding: chunk[0..<received], as: UTF8.self)
+        }
+        return accumulated
     }
 }

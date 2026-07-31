@@ -27,12 +27,16 @@ import Testing
 /// `failNextLookup()` arms a failure that ONLY an `rfc822msgid:` search can
 /// consume, so `consumedLookupFailureCount() == 0` after a full action
 /// sequence is a wire-level proof that **no `GmailProvider` ACTION method**
-/// (`markRead`/`markFlagged`/`move`/`delete`, plus the folder listings the
-/// action paths depend on) resolves its target by RFC. The word ACTION is
-/// load-bearing and not a hedge: `GmailProvider.search` DOES emit an
-/// `rfc822msgid:` query when a caller hands it one — that is exactly what
-/// drives the positive control below — but `search` resolves no action, it
-/// returns results to a caller, so it is not a counter-example to the claim.
+/// resolves its target by RFC. That is all FOUR of them, counted:
+/// `markRead`, `markUnread`, `markFlagged`, `move` — plus `deleteDraft` (a
+/// draft operation, not an action) and the folder listings the action paths
+/// depend on. (An earlier revision listed a `delete` method here.
+/// `GmailProvider` has none; its only delete-shaped method is `deleteDraft`.)
+/// The word ACTION is load-bearing and not a hedge: `GmailProvider.search`
+/// DOES emit an `rfc822msgid:` query when a caller hands it one — that is
+/// exactly what drives the positive control below — but `search` resolves no
+/// action, it returns results to a caller, so it is not a counter-example to
+/// the claim.
 ///
 /// FOUR assertion sites in this file read `consumedLookupFailureCount() == 0`.
 /// Three of them — in `duplicateRfcMutatesOnlyTheAddressedResource`,
@@ -442,9 +446,17 @@ struct StatefulGmailActionServerTests {
     /// counter, not about the adapter.
     ///
     /// **The property this pins.** `GmailProvider.search(query:folder:…)`
-    /// forwards its caller's query verbatim into the Gmail `q=` parameter, and
-    /// it is reached in production from `AccountManagerActions.search` and
-    /// `SearchView`. So `search(query: "rfc822msgid:…")` is a genuine
+    /// preserves its caller's query as the BASE of the Gmail `q=` parameter —
+    /// not verbatim: it APPENDS `from:`/`to:`/`after:`/`before:` terms for any
+    /// non-nil argument and, off the archive path, `allMailExclusionQuery`,
+    /// then percent-encodes the whole thing. What matters for this control is
+    /// that the caller's own terms survive into `q`, which they do; the fixture
+    /// keys only on an `rfc822msgid:` term being present. The method is reached
+    /// in production from `AccountManager.search(query:account:folder:after:before:from:to:)`
+    /// (declared in the file `AccountManagerActions.swift`, which is an
+    /// `extension AccountManager` — there is no `AccountManagerActions` type,
+    /// and an earlier revision cited one) and from `SearchView`. So
+    /// `search(query: "rfc822msgid:…")` is a genuine
     /// production driver for this route — the earlier claim that "v3 has no
     /// production path that can produce this control" was wrong. It rested on
     /// `git grep rfc822msgid` finding no LITERAL under `TabMail/`, which proves
@@ -485,8 +497,13 @@ struct StatefulGmailActionServerTests {
         // retryable set (`HTTPRetryPolicy.gmail` retries 429/403 only), so it is
         // not silently retried into a success: `AuthedHTTP` throws
         // `HTTPError.networkError(503)` and `GmailProvider.request` rewraps it.
-        // The throw is therefore itself evidence that the request matched the
-        // `rfc822msgid:` route rather than being served normally.
+        // The throw shows only that the request was NOT served 2xx — it does
+        // NOT show the armed route was hit, because an UNMATCHED request throws
+        // identically (FakeHTTP answers 599 → `HTTPError.networkError` → the
+        // same rewrap). The load-bearing evidence is the assertion immediately
+        // below: `consumedLookupFailureCount()` can only be incremented inside
+        // the armed branch, so `== 1` is what distinguishes "matched the
+        // `rfc822msgid:` route" from "was not served".
         await #expect(throws: ProviderError.self) {
             _ = try await provider.search(
                 query: "rfc822msgid:\(rfc822MessageId)", folder: "INBOX"
@@ -513,11 +530,29 @@ struct StatefulGmailActionServerTests {
 
     // MARK: - Injected-session escape detectors
 
+    // ⚑ NO REFERENCE — INVENTED. Scope marker for the whole section below: the
+    // THREE tests that follow (`deleteDraftAndFetchHistoryUseTheInjectedSession`,
+    // `deleteDraftRetriesTheDraftDeleteOnTheInjectedSessionAfter401`,
+    // `deleteDraftTrashFallbackAndItsRetryUseTheInjectedSession`) have NO
+    // counterpart in `v2final`. Verified: the reference's
+    // `StatefulGmailActionServerTests` declares exactly seven tests
+    // (`userLabelCatalogAuthority`, `createdUserLabelIsImmediatelyKnown`,
+    // `overlappingUserLabelCatalogsKeepNewestKnowledge`, `actionFinalState`,
+    // `undoArchiveResolvesSentLabeledSelfSentMessage`, `staleAmbiguousAndTransient`,
+    // `ordinaryFolderListings`) and none of them is a session-escape detector.
+    // The reference had no need for one — it never dropped `session:` in the
+    // first place; these exist because `v3` did, and they are what keeps the
+    // regression from returning silently. The `FakeHTTP.ResponseScript` they
+    // are built on is likewise invented (see its own marker).
+
     /// **`GmailProvider` must not escape its injected `URLSession`.**
     ///
-    /// `HTTPClient` resolves `session ?? sharedEphemeralSession`, so a missing
-    /// `session:` is not an error — it silently sends the request to the LIVE
-    /// internet. `v3` had dropped `session: testSession` from `deleteDraft` and
+    /// `performHTTPRequest` resolves `session ?? sharedEphemeralSession`, so a
+    /// missing `session:` is not an error — it silently sends the request to
+    /// the LIVE internet. (The owner is the free function, not a type: nothing
+    /// named `HTTPClient` is declared anywhere in the tree —
+    /// `Shared/HTTP/HTTPClient.swift` is a FILE that declares `HTTPConfig`,
+    /// `HTTPRequestResult` and `HTTPError` plus three free functions.) `v3` had dropped `session: testSession` from `deleteDraft` and
     /// `fetchHistory`, so both issued real HTTPS requests to
     /// `gmail.googleapis.com` from the unit suite: nondeterministic, slow, and
     /// a data leak from a public repo's test run. The sibling

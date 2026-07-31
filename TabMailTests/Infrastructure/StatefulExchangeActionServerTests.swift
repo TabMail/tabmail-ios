@@ -44,11 +44,15 @@ import Testing
 /// `consumedLookupFailureCount() == 0` cannot fail no matter what the adapter
 /// does, which is precisely the vacuity trap this suite exists to avoid. The
 /// converse is NOT claimed: tests that assert nothing about the counter do not
-/// arm the hook, and three below (`opaqueDraftIdStaysOnePathSegment`,
+/// arm the hook, and FOUR of the seven tests in this file do exactly that —
+/// `opaqueDraftIdStaysOnePathSegment`,
 /// `moveReallocatesGraphIdWhilePreservingFields`,
-/// `transientMutationFailureLeavesStateUnchanged`) drive full action sequences
-/// with neither an arm nor an assertion. That is a different subject, not a
-/// silent gap.
+/// `transientMutationFailureLeavesStateUnchanged` and
+/// `deleteDraftRetriesOnTheInjectedSessionAfter401` drive full action sequences
+/// with neither an arm nor a counter assertion. That is a different subject,
+/// not a silent gap. (The count was "three" until
+/// `deleteDraftRetriesOnTheInjectedSessionAfter401` was added to this same file
+/// without updating it — recount this list whenever a test is added.)
 /// `armedLookupFailureIsConsumedByAnRfcFilterSearch` is the matching POSITIVE
 /// CONTROL: it proves the oracle fires when the RFC filter really is sent, so
 /// the zeros are falsifiable rather than structural.
@@ -404,11 +408,28 @@ struct StatefulExchangeActionServerTests {
     /// emit `$filter` elsewhere, from `ExchangeProvider.listBackfillMessageIds`
     /// and `fetchOlderMessages`, but those carry `receivedDateTime` windows and
     /// never reach this hook. `failNextMutation()` gates exactly three fixture
-    /// handlers — `/messages/` PATCH, DELETE, and POST — and those three verbs
-    /// cover all four `ExchangeProvider` action methods: `markRead` and
-    /// `markFlagged` reach `updateMessage` (PATCH), `move` reaches
-    /// `moveMessage` (POST `/messages/{id}/move`), and `deleteDraft` issues
-    /// DELETE. This test drives `markRead`, i.e. the PATCH gate.
+    /// handlers — `/messages/` PATCH, DELETE, and POST — and between them those
+    /// three verbs cover every mutating method `ExchangeProvider` has. Counted
+    /// exactly: FOUR action methods — `markRead`, `markUnread`, `markFlagged`,
+    /// `move` — plus `deleteDraft`, which is a draft operation rather than an
+    /// action and is counted separately here. Routing:
+    /// `markRead`/`markUnread`/`markFlagged`, and ONLY those three, reach the
+    /// private `patchMessage(id:body:)` (PATCH); `move` does NOT — it reaches
+    /// `moveMessage(id:destinationId:)` (POST `/messages/{id}/move`); and
+    /// `deleteDraft` issues DELETE. This test drives `markRead`, i.e. the PATCH
+    /// gate.
+    ///
+    /// (Two corrections to an earlier revision of this paragraph, recorded
+    /// because both were review-invisible. It claimed "all four … action
+    /// methods" while enumerating only three of the four plus `deleteDraft`,
+    /// silently dropping `markUnread` — a live production action:
+    /// `AccountManager.markUnread(_:)` queues a `.markUnread`
+    /// `PendingOperation`, and the drain in `AccountManagerQueue.swift` — a
+    /// FILE, `extension AccountManager`, not a type — calls
+    /// `provider.markUnread`, through this same PATCH. It also named
+    /// `updateMessage`, which is declared nowhere in the tree; the method is
+    /// `patchMessage(id:body:)`. The coverage conclusion survives both; the
+    /// count and the symbol did not.)
     /// A 503 is outside Graph's retryable set
     /// (`HTTPRetryPolicy.graph` retries 429 only), so it surfaces to the caller
     /// and the model must be unchanged.
@@ -449,8 +470,18 @@ struct StatefulExchangeActionServerTests {
     /// the Gmail counterpart
     /// (`ordinaryFolderListingsDecodeMembershipFieldsAndLimits`) does exactly
     /// this. Leg 2 is the half that does not transfer: no `v3` adapter method
-    /// issues the RFC-identity `$filter`, so the `== 1` obligation is
-    /// discharged by `armedLookupFailureIsConsumedByAnRfcFilterSearch` instead.
+    /// issues the RFC-identity `$filter`, so there is nothing for a ported leg
+    /// 2 to drive.
+    ///
+    /// **That obligation is NOT discharged** (an earlier revision of this line
+    /// claimed it was, contradicting the block above
+    /// `armedLookupFailureIsConsumedByAnRfcFilterSearch`, which is the correct
+    /// one). What that test supplies is a FIXTURE SELF-CHECK: it proves the
+    /// hook, route and counter are alive, so the `== 0` assertions in this file
+    /// are not measuring a counter nothing can ever increment. It drives a
+    /// synthetic URL, not `ExchangeProvider`, and therefore says nothing about
+    /// the adapter. The reference's adapter/system-level `== 1` remains
+    /// OUTSTANDING, and no test in this file supplies it.
     @Test("ordinary Graph folder listings decode identity, fields, order, and paging")
     func ordinaryFolderListingsDecodeIdentityFieldsOrderAndPaging() async throws {
         let newest = Date()
@@ -518,14 +549,30 @@ struct StatefulExchangeActionServerTests {
 
     // MARK: - Injected-session escape detector
 
+    // ⚑ NO REFERENCE — INVENTED. Scope marker for the section below: the test
+    // that follows (`deleteDraftRetriesOnTheInjectedSessionAfter401`) has NO
+    // counterpart in `v2final`. Verified: the reference's
+    // `StatefulExchangeActionServerTests` declares exactly four tests
+    // (`opaqueDraftResourceLifecycle`, `actionFinalState`,
+    // `staleAmbiguousAndTransient`, `ordinaryFolderListings`) and none of them
+    // is a session-escape detector. The reference had no need for one — it
+    // passed `session: testSession` at both `deleteDraft` call sites already;
+    // this exists because `v3` had dropped them. The
+    // `FakeHTTP.ResponseScript` and `servedCallSequence()` it is built on are
+    // likewise invented (see their own markers).
+
     /// **`ExchangeProvider.deleteDraft` must not escape its injected
     /// `URLSession` — on EITHER of its two request lines.**
     ///
     /// `deleteDraft` is the one method that bypasses the file's private
     /// `request()` helper, calling the free `performHTTPRequestWithRetry` /
-    /// `performHTTPRequest` directly. `HTTPClient` resolves
+    /// `performHTTPRequest` directly, and `performHTTPRequest` itself resolves
     /// `session ?? sharedEphemeralSession`, so a missing `session:` is not an
     /// error — it silently sends the request to `https://graph.microsoft.com`.
+    /// (The owner is that free function, not a type: nothing named
+    /// `HTTPClient` is declared anywhere in the tree —
+    /// `Shared/HTTP/HTTPClient.swift` is a FILE that declares `HTTPConfig`,
+    /// `HTTPRequestResult` and `HTTPError` plus three free functions.)
     /// That is not hypothetical: it is what this suite did before the
     /// restoration, and it failed with a real `Error Domain=Exchange Code=401`
     /// from Microsoft.

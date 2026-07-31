@@ -1592,7 +1592,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "STORE":
             let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
             guard components.count == 2 else { return "\(tag) BAD Invalid UID STORE\r\n" }
-            let uids = parseUIDSet(components[0])
+            let uids = parseUIDSet(components[0], in: mailbox)
             let operation = components[1].uppercased()
             let flags = Self.parenthesizedTokens(components[1])
             withState { state in
@@ -1615,7 +1615,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "MOVE":
             let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
             guard components.count == 2 else { return "\(tag) BAD Invalid UID MOVE\r\n" }
-            let uids = Set(parseUIDSet(components[0]))
+            let uids = Set(parseUIDSet(components[0], in: mailbox))
             let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
             withState { state in
                 recordOracleCheck(command: "UID MOVE", mailbox: mailbox, uids: uids, state: &state)
@@ -1638,7 +1638,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
             return "\(tag) OK UID MOVE completed\r\n"
         case "EXPUNGE":
-            let uids = Set(parseUIDSet(subargs))
+            let uids = Set(parseUIDSet(subargs, in: mailbox))
             withState { state in
                 recordOracleCheck(command: "UID EXPUNGE", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
@@ -1654,7 +1654,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             // fallback (COPY + STORE \Deleted + EXPUNGE, SPEC-B4).
             let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
             guard components.count == 2 else { return "\(tag) BAD Invalid UID COPY\r\n" }
-            let uids = Set(parseUIDSet(components[0]))
+            let uids = Set(parseUIDSet(components[0], in: mailbox))
             let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
             withState { state in
                 recordOracleCheck(command: "UID COPY", mailbox: mailbox, uids: uids, state: &state)
@@ -1678,9 +1678,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
-    /// Expand an IMAP `sequence-set` into its UIDs.
+    /// Resolve an IMAP `sequence-set` into the UIDs it addresses IN `mailbox`.
     ///
-    /// **A range is inclusive of both endpoints AND order-independent.** RFC
+    /// This parser feeds `recordOracleCheck` for every mutating command
+    /// (`UID STORE`/`MOVE`/`COPY`/`EXPUNGE`), so it is the wrong-message
+    /// oracle's own substrate. A set the parser resolves wrongly is a set the
+    /// fake mutates wrongly, and every `wrongMessageViolations().isEmpty`
+    /// downstream then certifies that wrongness as correct. THREE distinct ways
+    /// to get it wrong are closed here — narrowing, widening, and exhausting
+    /// memory — and the middle one is the dangerous one: a fake that mutates
+    /// messages the client never addressed is strictly worse than one that
+    /// mutates too few.
+    ///
+    /// **1. A range is inclusive of both endpoints AND order-independent.** RFC
     /// 3501 §9 annotates the `seq-range` production verbatim: *"two seq-number
     /// values and all values between these two regardless of order. Example:
     /// 2:4 and 4:2 are equivalent and indicate values 2, 3, and 4."* So `5:2`
@@ -1688,34 +1698,99 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// set, and a server that treats it otherwise is the one violating the
     /// protocol.
     ///
-    /// Expanding `min...max` is therefore both the RFC-correct reading and the
+    /// Ordering the bounds is therefore both the RFC-correct reading and the
     /// only formulation that cannot trap. The naive `Array(bounds[0]...bounds[1])`
     /// is a `fatalError` — not a thrown error — whenever the lower bound
     /// exceeds the upper, which would kill the ENTIRE test process and take
-    /// every unrelated result with it rather than failing one case. Ordering
-    /// the bounds removes that hazard completely, so no guard is needed.
+    /// every unrelated result with it rather than failing one case.
+    /// **Do NOT "fix" that trap by guarding the descending case away instead.**
+    /// A `bounds[0] <= bounds[1]` guard falls through to a `bounds.first`
+    /// fallback that silently NARROWS `5:2` to `[5]` — one UID where a real
+    /// server touches four.
     ///
-    /// **Do NOT "fix" the trap by guarding the descending case away instead.**
-    /// A `bounds[0] <= bounds[1]` guard falls through to the `bounds.first`
-    /// line below, which silently NARROWS `5:2` to `[5]` — one UID where the
-    /// real server touches four. This parser feeds `recordOracleCheck` for
-    /// every mutating command (`UID STORE`/`MOVE`/`COPY`/`EXPUNGE`), so it is
-    /// the wrong-message oracle's own substrate: a fake that quietly shrinks a
-    /// mutation set certifies wrong-message behaviour as correct.
+    /// **2. `*` is a BOUND to resolve, not a token to discard.** RFC 3501 §9
+    /// defines it as "the largest number in use" — for a UID set, the mailbox's
+    /// highest UID. A `compactMap { Int($0) }` over the bounds DROPS it, so
+    /// `1:*` collapses to one surviving bound and narrows to `[1]`, `*:1`
+    /// likewise to `[1]`, and a bare `*` to nothing at all. That is defect 1's
+    /// silent narrowing wearing a different hat, which is why `*` is resolved
+    /// against the mailbox rather than filtered out.
+    ///
+    /// **3. A malformed component contributes NOTHING — not a subset, and above
+    /// all not a superset.** Dropping unparseable tokens and then branching on
+    /// how many survived is how narrowing becomes WIDENING: `1:x:3` drops to
+    /// `["1","3"]`, reads as a well-formed two-bound range, and expands to
+    /// `[1, 2, 3]` — the fake mutates UID 2, which the client never addressed.
+    /// Hence the `bounds.count == parts.count` check below: that comparison is
+    /// load-bearing, because it is the only thing separating "every token
+    /// parsed" from "some tokens vanished".
+    ///
+    /// **Intersection, not enumeration.** The set is resolved by FILTERING the
+    /// mailbox's actual UIDs — exactly what the sibling `parseSequenceSet`
+    /// already does — never by materialising the range. `Array(1...4294967295)`
+    /// on a syntactically valid `1:4294967295` would attempt ~4 billion `Int`s;
+    /// the filter is bounded by the mailbox's message count. It also makes the
+    /// result RFC-correct for free — §6.4.8 says a UID that does not exist is
+    /// simply ignored — and changes no existing UID's treatment, because
+    /// `recordOracleCheck` downstream already skips absent UIDs
+    /// (`guard let msg = byUid[uid] else { continue }`).
+    ///
+    /// `*` resolves via `max()` rather than `parseSequenceSet`'s
+    /// `messages.last?.uid`. The two agree while the mailbox is held in
+    /// ascending-UID order (which this fake maintains — appends allocate
+    /// `max + 1`), and `max()` is what the RFC actually specifies.
+    ///
+    /// This hardening is deliberately REACHABILITY-INDEPENDENT. SwiftMail
+    /// cannot emit `*` on the `UID STORE`/`MOVE`/`COPY`/`EXPUNGE` paths that
+    /// reach here (`MessageIdentifierSet`'s `PartialRangeFrom` initialisers are
+    /// wired only to its FETCH APIs, and `UID FETCH` routes to
+    /// `parseSequenceSet`, which resolves `*` correctly), and it cannot emit a
+    /// descending or malformed set at all. The fake's stated job is surviving
+    /// OTHER clients and fuzzed command streams, and the fuzzers are the point
+    /// — so this is held to the protocol, not to what the single client in this
+    /// tree happens to send today.
     ///
     /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeIMAPServer.swift:1389`
-    /// has the identical function with NO ordering treatment at all
-    /// (`if bounds.count == 2 { return Array(bounds[0]...bounds[1]) }`), so the
-    /// reference would trap on the same input; it simply never exercised a
-    /// descending set. The order-independent expansion has no counterpart there.
-    func parseUIDSet(_ value: String) -> [Int] {
-        value.split(separator: ",").flatMap { component -> [Int] in
-            let bounds = component.split(separator: ":").compactMap { Int($0) }
-            if bounds.count == 2 {
-                return Array(min(bounds[0], bounds[1])...max(bounds[0], bounds[1]))
-            }
-            return bounds.first.map { [$0] } ?? []
+    /// declares `private func parseUIDSet(_ value: String) -> [Int]` with none
+    /// of this: no mailbox parameter, no `*` handling, no malformed handling,
+    /// and a bare `Array(bounds[0]...bounds[1])` — so the reference traps on a
+    /// descending set and widens on `1:x:3`. It simply never exercised any of
+    /// these inputs. There is nothing here to port.
+    func parseUIDSet(_ value: String, in mailbox: String) -> [Int] {
+        withState { state in
+            Self.resolveUIDSet(
+                value, againstMailboxUIDs: (state.messagesByMailbox[mailbox] ?? []).map(\.uid))
         }
+    }
+
+    /// The pure core of `parseUIDSet` — split out so the parser's contract can
+    /// be exercised directly against a known UID roster. See that method's doc
+    /// comment for the defects this shape closes.
+    static func resolveUIDSet(_ value: String, againstMailboxUIDs mailboxUIDs: [Int]) -> [Int] {
+        // An empty mailbox addresses nothing, and `*` has no value to resolve
+        // against — both answers are the same empty set.
+        guard let maxUID = mailboxUIDs.max() else { return [] }
+        let ascending = mailboxUIDs.sorted()
+        var resolved: [Int] = []
+        // `omittingEmptySubsequences: false` so `""` and `":"` survive as empty
+        // tokens and get REJECTED below, instead of collapsing into a
+        // zero-token component that a `.first` fallback would treat as valid.
+        for component in value.split(separator: ",", omittingEmptySubsequences: false) {
+            let parts = component.split(separator: ":", omittingEmptySubsequences: false)
+            // A `seq-range` has exactly two bounds, a `seq-number` exactly one.
+            // Anything else (`1:2:3`, `1:x:3`) is malformed.
+            guard parts.count == 1 || parts.count == 2 else { continue }
+            let bounds = parts.compactMap { part -> Int? in part == "*" ? maxUID : Int(part) }
+            // THE load-bearing line: if any token failed to parse, the whole
+            // component is malformed and contributes nothing. Without it the
+            // surviving tokens get re-read as a shorter — or differently
+            // shaped, hence WIDER — set than the client wrote.
+            guard bounds.count == parts.count else { continue }
+            let lo = min(bounds[0], bounds[bounds.count - 1])
+            let hi = max(bounds[0], bounds[bounds.count - 1])
+            resolved.append(contentsOf: ascending.filter { $0 >= lo && $0 <= hi })
+        }
+        return resolved
     }
 
     private static func parenthesizedTokens(_ value: String) -> Set<String> {
