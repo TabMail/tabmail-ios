@@ -24,7 +24,7 @@ import Synchronization
 /// ahead of it in GRDB's writer FIFO.
 ///
 /// Prints timings so we have a concrete before/after artifact.
-@Suite("Prioritized write contention", .serialized)
+@Suite("Prioritized write contention", .serialized, .processGlobalState)
 @MainActor
 struct PrioritizedWriteContentionTests {
 

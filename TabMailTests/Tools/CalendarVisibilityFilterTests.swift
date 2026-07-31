@@ -6,7 +6,7 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("CalendarToolHelpers visibility filter")
+@Suite("CalendarToolHelpers visibility filter", .serialized, .processGlobalState)
 struct CalendarVisibilityFilterTests {
 
     private func makeCal(_ id: String, primary: Bool = false) -> GCalCalendar {

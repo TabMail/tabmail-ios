@@ -154,7 +154,7 @@ struct NavigationStoreTests {
 /// methods (not just their query patterns) against a real `AppDatabase` so the
 /// sync→async conversion (Half A / PLAN_HANG_FIX) can be verified before/after.
 /// `.serialized` because it swaps the `AppDatabase.shared` singleton.
-@Suite("NavigationStore refresh behavior", .serialized)
+@Suite("NavigationStore refresh behavior", .serialized, .processGlobalState)
 struct NavigationStoreRefreshTests {
 
     @MainActor

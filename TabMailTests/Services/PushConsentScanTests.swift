@@ -25,7 +25,7 @@ import Synchronization
 /// `PushConsentChecking` on the shared `PushNotificationService` actor, then
 /// drive the scan and observe `.pushConsentErrorsDetected`. The suite
 /// is `.serialized` because it mutates process-global singletons.
-@Suite("PushConsentScan", .serialized)
+@Suite("PushConsentScan", .serialized, .processGlobalState)
 struct PushConsentScanTests {
 
     // MARK: - Mock

@@ -16,7 +16,7 @@ import GRDB
 /// We mutate existing loaded messages (actionTag / isRead) because `reloadMessages`
 /// is a diff-reload of the currently-loaded date range. That path is the one the
 /// `.inboxDataDidChange` handler invokes, so it's the right surface to assert on.
-@Suite("InboxViewModel Background Change Dirty Bit", .serialized)
+@Suite("InboxViewModel Background Change Dirty Bit", .serialized, .processGlobalState)
 struct InboxViewModelBackgroundChangeDirtyBitTests {
 
     @MainActor

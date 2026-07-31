@@ -14,7 +14,7 @@ import GRDB
 ///
 /// InboxViewModel is @MainActor and uses AppDatabase.dbPool directly.
 /// Tests install a temporary file-backed AppDatabase.shared, then restore it.
-@Suite("InboxViewModel AI Batch Throttle", .serialized)
+@Suite("InboxViewModel AI Batch Throttle", .serialized, .processGlobalState)
 struct InboxViewModelAIBatchTests {
 
     /// Creates a temp file-backed DatabasePool, installs it as AppDatabase.shared,

@@ -17,7 +17,7 @@ import Foundation
 /// different TTLs: the default `SyncConfig.recentlyCompletedTTLSeconds` (30s, action
 /// completion) and the longer `SyncConfig.pushMergeStaleProtectionTTLSeconds` (120s,
 /// push-merge arrival — see NSEDataBridge's registration call).
-@Suite("AccountManager.recentlyCompleted per-entry TTL")
+@Suite("AccountManager.recentlyCompleted per-entry TTL", .processGlobalState)
 struct RecentlyCompletedTTLTests {
 
     /// Unique key per test — `AccountManager.shared` is a live singleton shared

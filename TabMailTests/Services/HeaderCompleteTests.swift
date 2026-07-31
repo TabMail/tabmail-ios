@@ -69,7 +69,7 @@ struct HeaderCompleteModelTests {
 
 // MARK: - Suite 2: FTS Indexing Sets headerComplete=1
 
-@Suite("HeaderComplete - FTS Indexing Lifecycle", .serialized)
+@Suite("HeaderComplete - FTS Indexing Lifecycle", .serialized, .processGlobalState)
 struct HeaderCompleteFTSIndexingTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -226,7 +226,7 @@ struct HeaderCompleteRepopulateTests {
 
 // MARK: - Suite 4: recoverIncompleteHeaders
 
-@Suite("HeaderComplete - Recovery of Incomplete Headers", .serialized)
+@Suite("HeaderComplete - Recovery of Incomplete Headers", .serialized, .processGlobalState)
 struct HeaderCompleteRecoveryTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -467,7 +467,7 @@ struct HeaderCompleteRecoveryTests {
 
 // MARK: - Suite 5: Full Pipeline
 
-@Suite("HeaderComplete - Full Pipeline End-to-End", .serialized)
+@Suite("HeaderComplete - Full Pipeline End-to-End", .serialized, .processGlobalState)
 struct HeaderCompleteFullPipelineTests {
 
     private var index: SearchIndex { SearchIndex.shared }

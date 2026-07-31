@@ -15,7 +15,7 @@ import Synchronization
 ///
 /// Drives the REAL `NSEDataBridge.mergeNSEStagingData` via the
 /// `stagingPathOverride` test seam (same harness as `NSEGradualMergeTests`).
-@Suite("NSE boot paint gate", .serialized)
+@Suite("NSE boot paint gate", .serialized, .processGlobalState)
 @MainActor
 struct NSEPaintGateTests {
 

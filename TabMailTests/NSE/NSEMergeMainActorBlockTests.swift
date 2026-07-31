@@ -33,7 +33,7 @@ import GRDB
 /// progress while a background writer held the single writer connection:
 ///   • BEFORE the fix (synchronous write): ~0 heartbeats → main actor frozen.
 ///   • AFTER the fix (async write): heartbeat keeps ticking → main actor live.
-@Suite("NSE merge must not block the main actor", .serialized)
+@Suite("NSE merge must not block the main actor", .serialized, .processGlobalState)
 @MainActor
 struct NSEMergeMainActorBlockTests {
 

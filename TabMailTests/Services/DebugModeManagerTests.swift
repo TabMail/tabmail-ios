@@ -6,7 +6,7 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("DebugModeManager")
+@Suite("DebugModeManager", .serialized, .processGlobalState)
 @MainActor
 struct DebugModeManagerTests {
 
@@ -182,7 +182,7 @@ struct DebugModeManagerTests {
 /// synchronous Keychain XPC on every log call). Serialized because the
 /// memoized flag, the shared `tabmail_session` keychain item, and the
 /// `debug_mode_unlocked` default are all process-wide global state.
-@Suite("DebugModeManager.isLoggingEnabled", .serialized)
+@Suite("DebugModeManager.isLoggingEnabled", .serialized, .processGlobalState)
 @MainActor
 struct DebugModeLoggingGateTests {
 

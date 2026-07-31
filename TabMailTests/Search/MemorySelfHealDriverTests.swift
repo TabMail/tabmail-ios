@@ -12,7 +12,7 @@ import GRDB
 /// Stage B (embedding queue repopulate) is covered by `BackfillMemoryEmbeddingQueueTests`.
 ///
 /// See ADR-IOS-034.
-@Suite("MemorySelfHealDriver", .serialized)
+@Suite("MemorySelfHealDriver", .serialized, .processGlobalState)
 struct MemorySelfHealDriverTests {
 
     // MARK: - Fixtures

@@ -27,7 +27,22 @@ import Testing
 /// `.serialized`: tests touch `AccountManager.shared`'s process-wide optimistic
 /// overlay + FIFO write queue and `NSEDataBridge.latestStagedRows` — mirrors
 /// `InboxListBehaviorPinningTests` / `MessageDetailStagedFallbackTests`.
-@Suite("Inbox gesture actions — zero-DB, act-on-visualized-state (dead-toggle fix)", .serialized)
+///
+/// BOTH traits are load-bearing, and they do different jobs. `.serialized`
+/// orders tests INSIDE this suite. `.processGlobalState` is what excludes
+/// OTHER suites: this one swaps `AppDatabase.shared` (`makeTestDB`) and wipes
+/// `AccountManager.shared`'s process-wide overlay (`clearOverlay` →
+/// `snapshotOverlay` + `removeOverlayEntries`), and `.serialized` does nothing
+/// to stop a different suite doing the same thing concurrently
+/// (`ProcessGlobalTestState.swift:8-14`). Without it the protection was
+/// ONE-SIDED — `ProviderIdQueueFuzzTests` (T0.8) took the shared lock, this
+/// suite never asked for it and barged in, and the fuzz suite's whole-overlay
+/// wipe deleted this suite's in-flight entries. Reproduced 2026-07-30:
+/// running only these two suites together went red 2 times in 9 runs on
+/// `sequentialCyclesEachExecuteIndependently`. Do NOT "fix" a recurrence by
+/// relaxing an assertion, adding a wait, or widening a bound — the trait is
+/// the fix. Matches `v2final:…/InboxGestureActionTests.swift:31` verbatim.
+@Suite("Inbox gesture actions — zero-DB, act-on-visualized-state (dead-toggle fix)", .serialized, .processGlobalState)
 @MainActor
 struct InboxGestureActionTests {
 

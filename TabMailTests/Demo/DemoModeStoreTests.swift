@@ -7,7 +7,7 @@ import Foundation
 @testable import TabMail
 
 @MainActor
-@Suite("DemoModeStore — counter + refund matrix")
+@Suite("DemoModeStore — counter + refund matrix", .serialized, .processGlobalState)
 struct DemoModeStoreTests {
 
     init() {

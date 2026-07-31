@@ -1403,7 +1403,7 @@ struct AccountManagerActionsTests {
 /// `.serialized`: tests swap the process-wide `AppDatabase.shared` singleton
 /// and touch `AccountManager.shared`'s optimistic overlay — mirrors
 /// `InboxGestureActionTests` / `CoordinatedToolActionTests`.
-@Suite("AccountManagerActions — actionTag clears on inbox exit (F6)", .serialized)
+@Suite("AccountManagerActions — actionTag clears on inbox exit (F6)", .serialized, .processGlobalState)
 struct AccountManagerActionsTagClearTests {
 
     // MARK: - Harness (mirrors CoordinatedToolActionTests.swift)

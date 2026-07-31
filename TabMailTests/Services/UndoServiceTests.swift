@@ -401,7 +401,7 @@ struct UndoableActionGmailPathsTests {
 
 // MARK: - UndoService State Tests
 
-@Suite("UndoService State Management")
+@Suite("UndoService State Management", .processGlobalState)
 struct UndoServiceStateTests {
 
     @MainActor
@@ -484,7 +484,7 @@ struct UndoServiceStateTests {
 
 // MARK: - UndoService Undo on Empty Stack
 
-@Suite("UndoService Empty Stack Behavior")
+@Suite("UndoService Empty Stack Behavior", .processGlobalState)
 struct UndoServiceEmptyStackTests {
 
     @MainActor

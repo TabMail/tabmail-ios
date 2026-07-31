@@ -236,7 +236,7 @@ struct HeaderCanonicalizeTests {
 /// The FTS-side primitive used by sync re-keys (UID remap, remnant
 /// canonicalization): moves an entry to a new header id IN PLACE, keeping the
 /// rowid — and with it the indexed body text and the embedding.
-@Suite("SearchIndex rekeyHeaders", .serialized)
+@Suite("SearchIndex rekeyHeaders", .serialized, .processGlobalState)
 struct SearchIndexRekeyTests {
 
     private var index: SearchIndex { SearchIndex.shared }

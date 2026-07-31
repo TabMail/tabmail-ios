@@ -10,7 +10,7 @@ import GRDB
 /// Tests for diff-based reloadMessages() and rebuildDisplayGroups().
 /// Verifies that background reloads preserve existing message/group identity
 /// (scroll position stability) while correctly reflecting data changes.
-@Suite("InboxViewModel Diff-Based Updates", .serialized)
+@Suite("InboxViewModel Diff-Based Updates", .serialized, .processGlobalState)
 struct InboxViewModelDiffTests {
 
     // MARK: - Helpers

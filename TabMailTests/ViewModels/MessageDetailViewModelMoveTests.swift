@@ -20,7 +20,7 @@ import GRDB
 ///
 /// `move(toFolderPath:)` now simply delegates to `moveMessage(message, …)`, so the
 /// focused path still targets the focused message.
-@Suite("MessageDetailViewModel move targets the swiped message", .serialized)
+@Suite("MessageDetailViewModel move targets the swiped message", .serialized, .processGlobalState)
 struct MessageDetailViewModelMoveTests {
 
     // Folder paths that exist in the test DB (must match for the role lookup).

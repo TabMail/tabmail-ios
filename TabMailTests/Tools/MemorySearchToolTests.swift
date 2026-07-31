@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-@Suite("MemorySearchTool", .serialized)
+@Suite("MemorySearchTool", .serialized, .processGlobalState)
 struct MemorySearchToolTests {
 
     /// Creates a MemorySearchTool with a file-backed DB, runs the body, then restores AppDatabase.shared.

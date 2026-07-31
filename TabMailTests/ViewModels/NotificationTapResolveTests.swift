@@ -13,7 +13,7 @@ import Testing
 /// detail view at once, with the sentinel-prefixed PROVIDER id when the staged
 /// snapshot misses, and `MessageDetailViewModel` resolves it asynchronously
 /// under the loading skeleton (`resolveProviderTap`).
-@Suite("Notification-tap provider-id resolve (immediate push)")
+@Suite("Notification-tap provider-id resolve (immediate push)", .processGlobalState)
 struct NotificationTapResolveTests {
 
     private func makePool() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {

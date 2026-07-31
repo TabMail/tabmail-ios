@@ -18,7 +18,7 @@ import GRDB
 /// Drives the REAL merge + REAL staging file via the `stagingPathOverride` seam
 /// (unit-test host has no App Group entitlement), same harness as
 /// `NSEGradualMergeTests`.
-@Suite("Merge staged-snapshot parity", .serialized)
+@Suite("Merge staged-snapshot parity", .serialized, .processGlobalState)
 @MainActor
 struct StagedSnapshotParityTests {
 

@@ -35,7 +35,7 @@ import Testing
 ///
 /// `.serialized`: tests swap `AppDatabase.shared` and drive `AccountManager
 /// .shared`'s write paths — mirrors `CoordinatedToolActionTests`.
-@Suite("NotificationActionRouter — notification-action dispatch fix", .serialized)
+@Suite("NotificationActionRouter — notification-action dispatch fix", .serialized, .processGlobalState)
 struct NotificationActionRouterTests {
 
     // MARK: - Harness (mirrors CoordinatedToolActionTests.swift)

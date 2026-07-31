@@ -14,7 +14,7 @@ import GRDB
 ///   - `loadHistoryTurns(forSessionId:)` (kept from v2)
 ///
 /// Uses `.serialized` because we rebind `AppDatabase.shared`.
-@Suite("ChatStore Memory Helpers", .serialized)
+@Suite("ChatStore Memory Helpers", .serialized, .processGlobalState)
 struct ChatStoreMemoryHelperTests {
 
     // MARK: - Fixtures

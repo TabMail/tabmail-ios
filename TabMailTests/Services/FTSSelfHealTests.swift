@@ -13,7 +13,7 @@ import GRDB
 /// branch, v31 snapshot migration) and left messages stuck in an AI-dropping
 /// loop. The fix is `SyncEngine.selfHealFTSBodyMembership`, which uses
 /// `SearchIndex.headerIdsMissingFromFTS` + re-index + reset bodyComplete=0.
-@Suite("FTS Self-Heal - Missing Body Membership", .serialized)
+@Suite("FTS Self-Heal - Missing Body Membership", .serialized, .processGlobalState)
 struct FTSSelfHealTests {
 
     private var index: SearchIndex { SearchIndex.shared }

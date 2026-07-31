@@ -23,7 +23,7 @@ import Synchronization
 /// Drives the REAL `NSEDataBridge.mergeNSEStagingData` against a real pool-backed
 /// `AppDatabase` + a real staging DB built at a temp path via the
 /// `stagingPathOverride` test seam (the unit-test host has no App Group entitlement).
-@Suite("NSE gradual staging merge", .serialized)
+@Suite("NSE gradual staging merge", .serialized, .processGlobalState)
 @MainActor
 struct NSEGradualMergeTests {
 

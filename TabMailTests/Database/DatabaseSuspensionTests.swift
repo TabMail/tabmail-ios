@@ -16,7 +16,7 @@ import GRDB
 /// observes them. The suite is `.serialized` and every test resumes in a
 /// `defer` so a failure can never leave the process suspended for other
 /// suites.
-@Suite("Database Suspension (0xdead10cc defense)", .serialized)
+@Suite("Database Suspension (0xdead10cc defense)", .serialized, .processGlobalState)
 struct DatabaseSuspensionTests {
 
     private static func postSuspend() {

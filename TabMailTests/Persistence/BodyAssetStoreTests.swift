@@ -12,7 +12,7 @@ import GRDB
 /// All tests run against an in-memory manifest queue + a per-test temporary
 /// container directory injected via `BodyAssetStore._setTestEnvironment(...)`.
 /// No App Group entitlement required.
-@Suite("BodyAssetStore")
+@Suite("BodyAssetStore", .serialized, .processGlobalState)
 struct BodyAssetStoreTests {
 
     private static func setupTest() throws -> URL {

@@ -293,7 +293,7 @@ struct OnDemandBodyFetchErrorTests {
 
 // MARK: - Suite 4: Mark-read-on-open (independent of loadBody)
 
-@Suite("Mark-Read on Open — Independent of loadBody")
+@Suite("Mark-Read on Open — Independent of loadBody", .processGlobalState)
 struct MarkReadOnOpenTests {
 
     @Test("markReadOnOpenIfNeeded flips unread message's optimistic isRead flag")
@@ -397,7 +397,7 @@ struct MarkReadOnOpenTests {
 // optimistic move's overlay points at the destination before the
 // message has physically been moved there.
 
-@Suite("MessageDetailViewModel — Overlay survives DB re-reads")
+@Suite("MessageDetailViewModel — Overlay survives DB re-reads", .serialized, .processGlobalState)
 struct MessageDetailOverlayTests {
 
     /// AccountManager.shared is a singleton — clear any stragglers between tests.

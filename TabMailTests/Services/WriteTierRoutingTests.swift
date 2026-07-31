@@ -20,7 +20,7 @@ import Synchronization
 /// AFTER it is cleared, so the explicit (non-`defer`) `clearObserver()` call always
 /// runs — no unstructured `Task` is needed (and none is used) around it, which would
 /// otherwise risk racing the NEXT test's `installObserver()`.
-@Suite("BodyFetchProcessor / ActiveAIQueue write tier (ADR-IOS-056)", .serialized)
+@Suite("BodyFetchProcessor / ActiveAIQueue write tier (ADR-IOS-056)", .serialized, .processGlobalState)
 struct WriteTierRoutingTests {
 
     // MARK: - Helpers

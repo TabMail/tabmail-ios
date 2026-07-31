@@ -14,7 +14,7 @@ import Testing
 /// `.serialized`: `mergeCommitBuffersDuringPreviewFreeze` flips the process-
 /// GLOBAL `PreviewFreezeGate.shared` — a sibling test's `.nseMergeDidCommit`
 /// handler observing the frozen gate would buffer its refresh and flake.
-@Suite("MessageDetail staged-row fallback (ADR-IOS-049)", .serialized)
+@Suite("MessageDetail staged-row fallback (ADR-IOS-049)", .serialized, .processGlobalState)
 struct MessageDetailStagedFallbackTests {
 
     /// Sentinel `object` for test posts of `.nseMergeDidCommit`. Production

@@ -26,7 +26,7 @@ import GRDB
 ///
 /// `.serialized`: swaps the process-wide `AppDatabase.shared` singleton —
 /// mirrors `InboxGestureActionTests` / `MessageDetailStagedFallbackTests`.
-@Suite("AccountManagerQueue drain — executeSingleOp + lane halt (F2)", .serialized)
+@Suite("AccountManagerQueue drain — executeSingleOp + lane halt (F2)", .serialized, .processGlobalState)
 struct AccountManagerQueueDrainTests {
 
     // MARK: - Harness (mirrors InboxGestureActionTests.makeTestDB/restoreTestDB)

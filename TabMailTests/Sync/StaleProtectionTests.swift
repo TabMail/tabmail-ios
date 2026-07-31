@@ -13,7 +13,7 @@ import GRDB
 /// REAL `SyncEngine.runSyncMessages` against an AppDatabase-backed pool + a MockEmailProvider
 /// whose fetch returns nothing (the propagation-lag race). `.serialized` because it swaps
 /// the `AppDatabase.shared` singleton.
-@Suite("Stale-detection drop-race protection", .serialized)
+@Suite("Stale-detection drop-race protection", .serialized, .processGlobalState)
 struct StaleProtectionTests {
 
     /// Real DatabasePool-backed AppDatabase (runs all migrations) swapped into the shared

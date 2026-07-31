@@ -65,7 +65,7 @@ private func makeDraft(subject: String = "Hello", body: String = "Body") -> Draf
 
 // MARK: - Double-send firewall
 
-@Suite("Outbox double-send firewall", .serialized)
+@Suite("Outbox double-send firewall", .serialized, .processGlobalState)
 @MainActor
 struct OutboxDoubleSendTests {
 
@@ -258,7 +258,7 @@ struct OutboxDoubleSendTests {
 ///     path) STARVES the heartbeat → frozen UI (the 2–3 s lag).
 ///   • `await persistQueuedSend` (the NEW path) suspends the main actor instead →
 ///     the heartbeat keeps ticking → responsive UI.
-@Suite("Compose-dismiss send persistence must not block the main actor", .serialized)
+@Suite("Compose-dismiss send persistence must not block the main actor", .serialized, .processGlobalState)
 @MainActor
 struct OutboxSendMainActorBlockTests {
 

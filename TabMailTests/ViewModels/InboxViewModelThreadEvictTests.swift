@@ -10,7 +10,7 @@ import GRDB
 /// Tests for InboxViewModel.evictAndRebuild() — when archiving/deleting the thread
 /// head while expanded, children must be promoted to their own group(s) immediately.
 /// Also tests that expanded-thread swipe/tag actions scope to the individual message.
-@Suite("InboxViewModel Thread Evict & Rebuild", .serialized)
+@Suite("InboxViewModel Thread Evict & Rebuild", .serialized, .processGlobalState)
 struct InboxViewModelThreadEvictTests {
 
     // MARK: - Helpers

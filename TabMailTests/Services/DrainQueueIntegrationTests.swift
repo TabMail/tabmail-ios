@@ -22,7 +22,17 @@ import GRDB
 /// call the REAL `AccountManager.shared.executeSingleOp`, which reads/writes via
 /// `AppDatabase.shared` — they swap the process-wide singleton (mirrors
 /// `InboxGestureActionTests` / `AccountManagerQueueDrainTests`).
-@Suite("Drain Queue Integration Tests", .serialized)
+///
+/// ⚑ NO REFERENCE — INVENTED (RULE R0). This file does not exist at `v2final`,
+/// so unlike the other 40 files in the 2026-07-30 `.processGlobalState` port
+/// there is no reference line to match. The trait is added on the same
+/// evidence the doc comment above already states: the suite swaps
+/// `AppDatabase.shared` (line 54), and the two suites it names as its own
+/// mirrors — `InboxGestureActionTests`, `AccountManagerQueueDrainTests` —
+/// both carry the trait at `v2final`. `.serialized` orders tests only inside
+/// one suite; only `.processGlobalState` excludes the other suites that swap
+/// the same singleton (`ProcessGlobalTestState.swift:8-14`).
+@Suite("Drain Queue Integration Tests", .serialized, .processGlobalState)
 struct DrainQueueIntegrationTests {
 
     let db: DatabaseQueue

@@ -11,7 +11,7 @@ import GRDB
 /// NORMAL (fast commits — the merge-stall fix), and `checkpointForDurability()` (the valve
 /// that hardens user intent before suspend / after a send) fsyncs the WAL without losing or
 /// corrupting committed data. `.serialized` because the checkpoint test swaps `AppDatabase.shared`.
-@Suite("WAL synchronous=NORMAL durability", .serialized)
+@Suite("WAL synchronous=NORMAL durability", .serialized, .processGlobalState)
 struct DurabilityCheckpointTests {
 
     @Test("production config sets synchronous=NORMAL and wal_autocheckpoint=0")

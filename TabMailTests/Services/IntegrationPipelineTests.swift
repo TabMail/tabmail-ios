@@ -9,7 +9,7 @@ import GRDB
 
 // MARK: - Suite 1: Real indexHeadersForFTS Sets headerComplete
 
-@Suite("Integration Pipeline - FTS Header Indexing", .serialized)
+@Suite("Integration Pipeline - FTS Header Indexing", .serialized, .processGlobalState)
 struct FTSHeaderIndexingIntegrationTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -79,7 +79,7 @@ struct FTSHeaderIndexingIntegrationTests {
 
 // MARK: - Suite 2: Real recoverIncompleteHeaders
 
-@Suite("Integration Pipeline - Recover Incomplete Headers", .serialized)
+@Suite("Integration Pipeline - Recover Incomplete Headers", .serialized, .processGlobalState)
 struct RecoverIncompleteHeadersIntegrationTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -162,7 +162,7 @@ struct RecoverIncompleteHeadersIntegrationTests {
 
 // MARK: - Suite 3: flushBatch with Mixed FTS State
 
-@Suite("Integration Pipeline - FlushBatch Mixed FTS", .serialized)
+@Suite("Integration Pipeline - FlushBatch Mixed FTS", .serialized, .processGlobalState)
 struct FlushBatchMixedFTSTests {
 
     private var index: SearchIndex { SearchIndex.shared }
@@ -250,7 +250,7 @@ struct FlushBatchMixedFTSTests {
 
 // MARK: - Suite 4: End-to-End Pipeline
 
-@Suite("Integration Pipeline - End-to-End", .serialized)
+@Suite("Integration Pipeline - End-to-End", .serialized, .processGlobalState)
 struct EndToEndPipelineTests {
 
     private var index: SearchIndex { SearchIndex.shared }

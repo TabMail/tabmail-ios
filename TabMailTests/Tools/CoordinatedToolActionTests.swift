@@ -24,7 +24,7 @@ import Testing
 ///
 /// `.serialized`: tests touch `AccountManager.shared`'s process-wide optimistic
 /// overlay + FIFO write queue — mirrors `InboxGestureActionTests`.
-@Suite("performCoordinatedRoleMove — agent-tool overlay + fresh-resolve (F4)", .serialized)
+@Suite("performCoordinatedRoleMove — agent-tool overlay + fresh-resolve (F4)", .serialized, .processGlobalState)
 struct CoordinatedToolActionTests {
 
     // MARK: - Harness (mirrors InboxGestureActionTests.swift)

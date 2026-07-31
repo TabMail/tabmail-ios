@@ -22,7 +22,7 @@ import Testing
 /// `AccountManager.shared.writeQueue` used by other suites (mirrors
 /// `InboxGestureActionTests`'s rationale) — serializing our own `@Test`
 /// functions avoids two of THIS suite's tests racing each other's order logs.
-@Suite("AccountManager write-queue background flush (F3)", .serialized)
+@Suite("AccountManager write-queue background flush (F3)", .serialized, .processGlobalState)
 struct WriteQueueFlushTests {
 
     // MARK: - 1. FIFO barrier ordering

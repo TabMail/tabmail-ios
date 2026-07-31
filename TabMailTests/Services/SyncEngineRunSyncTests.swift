@@ -973,7 +973,7 @@ struct RunSyncPendingOpProtectionTests {
 /// a re-keyed row must ride `ftsRekeys` (its FTS entry MOVES in place,
 /// preserving indexed body + embedding) and must NOT ride `staleIds` (which
 /// would delete that entry) nor `newHeaders` (header-only re-index).
-@Suite("runSyncMessages — UID remap ftsRekeys emission", .serialized)
+@Suite("runSyncMessages — UID remap ftsRekeys emission", .serialized, .processGlobalState)
 struct RunSyncUIDRemapFtsRekeyTests {
 
     @Test("Remap emits ftsRekeys with new messageId; old id avoids staleIds/newHeaders")
@@ -1162,7 +1162,7 @@ struct RunSyncNewRemoteIdsTests {
 /// when the local side is <= `SyncConfig.staleDetectionMaxFullScan`. A LARGE folder
 /// that returns < limit is a truncated/partial fetch — treating it as complete would
 /// mass-stale-delete the rows it never returned (the ADR-IOS-042 data-loss class).
-@Suite("runSyncMessages — large-folder stale safety (FIX C)", .serialized)
+@Suite("runSyncMessages — large-folder stale safety (FIX C)", .serialized, .processGlobalState)
 struct RunSyncLargeFolderStaleSafetyTests {
 
     @Test("Large folder + partial (< limit) fetch does NOT mass-stale-delete unreturned rows")

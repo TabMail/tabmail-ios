@@ -17,7 +17,7 @@ import Testing
 /// `.serialized`: tests swap `AppDatabase.shared` and touch the
 /// `AccountManager.shared` overlay + `NSEDataBridge.latestStagedRows`
 /// process-wide globals (mirrors `InboxListBehaviorPinningTests`).
-@Suite("InboxListReader integration (PLAN_INBOX_UNIFIED_READ §5A.3)", .serialized)
+@Suite("InboxListReader integration (PLAN_INBOX_UNIFIED_READ §5A.3)", .serialized, .processGlobalState)
 @MainActor
 struct InboxListReaderIntegrationTests {
 

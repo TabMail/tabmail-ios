@@ -31,7 +31,7 @@ import Testing
 /// overlay and `NSEDataBridge.latestStagedRows` — both process-wide globals —
 /// so tests must not interleave (mirrors `InboxStagedRowGuardTests` /
 /// `NSEStaleStagedRowInvalidationTests`).
-@Suite("Inbox list behavior pinning (PLAN_INBOX_UNIFIED_READ Phase 1)", .serialized)
+@Suite("Inbox list behavior pinning (PLAN_INBOX_UNIFIED_READ Phase 1)", .serialized, .processGlobalState)
 @MainActor
 struct InboxListBehaviorPinningTests {
 

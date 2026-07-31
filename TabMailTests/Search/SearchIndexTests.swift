@@ -99,7 +99,7 @@ struct FTSSearchResultFieldTests {
 
 // MARK: - SearchIndex Actor Tests (uses SearchIndex.shared — already initialized by app startup)
 
-@Suite("SearchIndex CRUD Operations", .serialized)
+@Suite("SearchIndex CRUD Operations", .serialized, .processGlobalState)
 struct SearchIndexCRUDTests {
 
     /// Use the shared singleton which is initialized during app startup in the test host.

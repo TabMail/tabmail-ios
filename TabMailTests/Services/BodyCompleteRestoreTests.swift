@@ -21,7 +21,7 @@ import GRDB
 /// Tests run against the production `AppDatabase.dbPool` / `SearchIndex.shared`
 /// (what the engine reads), with unique account-id prefixes for isolation and
 /// row cleanup at the end — same pattern as `ConfirmGoneAtThresholdTests`.
-@Suite("bodyComplete restore + eviction decoupling", .serialized)
+@Suite("bodyComplete restore + eviction decoupling", .serialized, .processGlobalState)
 struct BodyCompleteRestoreTests {
 
     private var index: SearchIndex { SearchIndex.shared }

@@ -24,7 +24,7 @@ import Testing
 /// Ids use a distinctive `hdrrec-` prefix: suites run concurrently and other
 /// suites post real notifications — matching is id-scoped so cross-suite
 /// activity can't interfere (and vice versa).
-@Suite("MessageDetail header recovery via poll")
+@Suite("MessageDetail header recovery via poll", .processGlobalState)
 struct MessageDetailHeaderRecoveryTests {
 
     private func makePool() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {

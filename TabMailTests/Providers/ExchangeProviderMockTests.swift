@@ -29,7 +29,7 @@ import Foundation
 /// resource, itemAttachment resource, attachment-get, attachment-list).
 /// `.serialized` — `FakeHTTP` state is process-global. Running tests in this
 /// suite in parallel would race on matcher registration.
-@Suite("ExchangeProvider — HTTP-level integration", .serialized)
+@Suite("ExchangeProvider — HTTP-level integration", .serialized, .processGlobalState)
 struct ExchangeProviderMockTests {
 
     // MARK: - Test 1: itemAttachment expand + nested-list fallback + marker

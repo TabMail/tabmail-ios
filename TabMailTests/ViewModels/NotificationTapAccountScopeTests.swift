@@ -13,7 +13,7 @@ import Testing
 /// account B's message. The push payload carries `accountId`; the deep-link
 /// sentinel now encodes it (`notifTap::<accountId>::<providerId>`) and every tap
 /// match predicate applies it.
-@Suite("Notification-tap account disambiguation")
+@Suite("Notification-tap account disambiguation", .processGlobalState)
 struct NotificationTapAccountScopeTests {
 
     // MARK: - Sentinel decode (pure)

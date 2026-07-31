@@ -29,7 +29,7 @@ import Synchronization
 /// `NSEGradualMergeTests`. `stageMemo` is a process-global static — reset it
 /// at the start of every test (`resetStageMemoForTesting`) and keep the suite
 /// serialized, same as `NSEGradualMergeTests`.
-@Suite("NSE merge — stage-memo skip", .serialized)
+@Suite("NSE merge — stage-memo skip", .serialized, .processGlobalState)
 @MainActor
 struct NSEMergeStageMemoTests {
 

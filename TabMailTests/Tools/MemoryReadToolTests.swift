@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-@Suite("MemoryReadTool", .serialized)
+@Suite("MemoryReadTool", .serialized, .processGlobalState)
 struct MemoryReadToolTests {
 
     /// Creates a MemoryReadTool and installs a file-backed AppDatabase.shared.

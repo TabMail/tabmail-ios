@@ -12,7 +12,7 @@ import GRDB
 /// PendingOperation, and (at the view layer, via `archiveIsNoOp` /
 /// `deleteIsNoOp`) no row dismissal. Previously the swipe made the
 /// email/thread disappear from the folder list and queued a same-folder move.
-@Suite("Same-Folder Action No-Op", .serialized)
+@Suite("Same-Folder Action No-Op", .serialized, .processGlobalState)
 struct SameFolderNoOpTests {
 
     // MARK: - Helpers

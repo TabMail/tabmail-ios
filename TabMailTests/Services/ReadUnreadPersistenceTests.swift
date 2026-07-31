@@ -19,7 +19,7 @@ import GRDB
 ///   2. `markRead` / `markUnread` still flip `MessageHeader.isRead` in GRDB and
 ///      insert a `PendingOperation`, so sync happens asynchronously and the
 ///      user's intent survives crash/kill/disconnection.
-@Suite("Read/unread persistence after undo-stack removal", .serialized)
+@Suite("Read/unread persistence after undo-stack removal", .serialized, .processGlobalState)
 struct ReadUnreadPersistenceTests {
 
     // MARK: - Compile-time invariant: .toggleRead does not exist

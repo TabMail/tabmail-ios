@@ -16,7 +16,7 @@ import Foundation
 ///
 /// IMPORTANT: .serialized prevents interleaving with other SearchIndex tests that depend on
 /// the shared singleton being initialized.
-@Suite("SearchIndex Lazy Initialization", .serialized)
+@Suite("SearchIndex Lazy Initialization", .serialized, .processGlobalState)
 struct SearchIndexLazyInitTests {
 
     private var index: SearchIndex { SearchIndex.shared }
