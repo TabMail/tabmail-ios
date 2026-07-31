@@ -73,6 +73,79 @@ extension AccountManager {
         await resolveHeadersForAction(ids: [id]).first
     }
 
+    // MARK: - T1.3 — an unknown folder epoch fails CLOSED for new gestures
+
+    /// Whether a NEW user gesture against `folderPath` must be REFUSED because that
+    /// folder's UIDVALIDITY epoch is not yet known. Callers must treat `true` as a
+    /// **silent no-op** (owner decision §9 D6(a)): no op row, no local mutation, no
+    /// error surfaced to the user.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED.
+    /// The `v2final` reference deliberately does the OPPOSITE. Its
+    /// `observedUidValidityStampForTokenAdmission`
+    /// (`v2final:TabMail/Services/Account/AccountManagerQueue.swift:837`) returns a
+    /// nil stamp on an unobserved epoch, which then skips the claim-time check, the
+    /// in-flight slot publish and the ledger compare — it fails **OPEN**, and records
+    /// that as an accepted residual: *"virgin-folder fail-open is bounded by
+    /// seed-write latency"* (`v2final:Companion/Decisions/Active/adr-ios-061.md:38`).
+    /// That was only tenable because v2 carried an epoch ledger plus a purge-and-
+    /// resync reaction. v3 has neither, so v3 is deliberately stronger and refuses.
+    ///
+    /// **This deliberately drops one user intention, which this repo's core
+    /// philosophy otherwise forbids. Do NOT "fix" it back to fail-open.** The owner
+    /// authorised the trade (§9 D6, 2026-07-30): failing closed is always acceptable,
+    /// and constraint C3 — *never mutate the wrong message* — is the one hard
+    /// invariant. `MessageHeader.stableId` falls back to the bare numeric UID for any
+    /// header with no `rfc822MessageId`, and `IMAPProvider.resolveUID` treats a
+    /// numeric id as a literal UID. Admitting against a folder whose epoch is unknown
+    /// can therefore resolve that UID under a DIFFERENT epoch and STORE/COPY over an
+    /// unrelated message — exactly C3.
+    ///
+    /// What makes the trade acceptable is that the window is **BOUNDED to the first
+    /// sync of a folder**. T1.2b (`7c71f6c7b`) persists the epoch from the
+    /// `Mailbox.Selection` of SELECTs the sync and folder-open paths already perform,
+    /// and `OK [UIDVALIDITY n]` is core IMAP4rev1 — NOT a UIDPLUS extension — so even
+    /// a server that never answers a UIDVALIDITY STATUS still reports one on SELECT.
+    /// So nil means "the first sync has not finished yet", never "this server does not
+    /// do UIDVALIDITY". Recorded for users as `IOS-EPOCH-001` in `KNOWN_ISSUES.md`.
+    /// ⛔ A synthesized/fake epoch was PROPOSED AND REJECTED by the owner (2026-07-30):
+    /// it would disable the check globally to paper over a case SELECT already covers.
+    ///
+    /// 🚨 **PROVIDER-SCOPED ON PURPOSE — never widen this to "the column is nil".**
+    /// `Folder.lastKnownUidValidity` is nil FOREVER on Gmail and Exchange: UIDVALIDITY
+    /// is an IMAP concept, and neither the Gmail nor the Graph provider ever populates
+    /// `FolderInfo.uidValidity`, so nothing ever writes that column for their folders.
+    /// Keying the refusal off the column alone would silently no-op every action on
+    /// every Gmail and Exchange account permanently — a bricked app, not a bounded
+    /// window. The partition below mirrors `EmailProvider.staleWindowMode` (`.uid` for
+    /// IMAP, `.date` for Gmail/Exchange), expressed against the `Account` row because
+    /// admission runs inside a write transaction with no provider instance in hand.
+    /// `.icloud` IS an IMAP account and MUST stay in the set — several sync sites test
+    /// `.imap` alone and wrongly exclude it; do not copy those.
+    ///
+    /// Every unknown fails **OPEN** (returns `false` = admit, i.e. exactly today's
+    /// behaviour): a missing account row, a non-IMAP provider, or a missing `Folder`
+    /// row. A missing folder row is deliberately NOT a refusal — it is not a bounded
+    /// first-sync state, because the draft and user-label paths synthesize `"Drafts"`
+    /// / `"INBOX"` paths that may match no row at all, so refusing there would be
+    /// permanent rather than transient: the same brick shape this guard exists to
+    /// avoid.
+    nonisolated static func newGestureRefusedForUnknownEpoch(
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> Bool {
+        guard let account = try Account.fetchOne(db, key: accountId) else { return false }
+        // Account-side mirror of `staleWindowMode == .uid`. `.icloud` is IMAP.
+        guard account.provider == .imap || account.provider == .icloud else { return false }
+        guard let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)") else { return false }
+        guard folder.lastKnownUidValidity == nil else { return false }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Queue] T1.3 refusing new gesture — folder '\(folderPath)' has no known UIDVALIDITY epoch yet (account \(accountId.prefix(8)))")
+        }
+        return true
+    }
+
     func markRead(_ messages: [MessageHeader]) async {
         await ensureDurable(messages)
 
@@ -85,6 +158,9 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
+                    // T1.3 — refuse before ANY mutation so the local flip and the op
+                    // row are precluded together, atomically.
+                    if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) { continue }
                     let stableIds = msgs.map(\.stableId)
                     let msgIds = msgs.map(\.id)
                     let folderId = msgs[0].folderId
@@ -133,6 +209,8 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
+                    // T1.3 — refuse before ANY mutation (see markRead).
+                    if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) { continue }
                     let stableIds = msgs.map(\.stableId)
                     let msgIds = msgs.map(\.id)
                     // Count unread BEFORE marking unread — fresh DB read to compute delta
@@ -252,6 +330,14 @@ extension AccountManager {
             print("[Queue] Skipping no-op move (source==dest): \(folderPath)")
             return []
         }
+        // T1.3 — refuse before ANY mutation. This is the single chokepoint for
+        // archive/delete/move from every surface, so the guard covers them all.
+        // Scoped to the SOURCE folder: UID resolution for a move happens in the
+        // source mailbox (`withActionConnection(folder: source)`), so an unknown
+        // DESTINATION epoch is irrelevant and must not refuse the gesture.
+        if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
+            return []
+        }
         let stableIds = msgs.map(\.stableId)
         let leavingInbox = msgs[0].isInInbox
 
@@ -368,6 +454,8 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
+                    // T1.3 — refuse before ANY mutation (see markRead).
+                    if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) { continue }
                     let stableIds = msgs.map(\.stableId)
                     for msg in msgs {
                         try db.execute(sql: "UPDATE messageHeader SET isFlagged = ? WHERE id = ?", arguments: [flagged, msg.id])

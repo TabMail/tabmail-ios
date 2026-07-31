@@ -742,8 +742,23 @@ struct ProviderIdQueueFuzzTests {
         }
         var account = Account(emailAddress: "\(accountId)@example.com", displayName: "Test", provider: .imap)
         account.id = accountId
-        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
-        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId)
+        // T1.3 — this fuzzer explores the STEADY STATE of an IMAP account: a folder
+        // that has already completed its first sync and is now taking gestures. A
+        // folder acquires `lastKnownUidValidity` from the first SELECT any sync or
+        // folder-open performs (T1.2b, `7c71f6c7b`), but this fixture seeds the DB
+        // directly and never syncs, so without an explicit epoch these folders would
+        // sit permanently in the pre-first-sync state where T1.3 refuses every
+        // durable gesture. That would make the whole fuzz run VACUOUS — no ops
+        // admitted, hence no wire traffic, no faults consumed, and no interleavings
+        // explored — which is exactly what the non-vacuity assertions below
+        // (`servedEmptyResolutions`, `resolutionFailures`, the consumed-identity
+        // intersection) exist to catch, and they did. Stamping the epoch here
+        // restores the state the fuzzer intends to model; it does NOT weaken any
+        // assertion.
+        var inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+        inbox.lastKnownUidValidity = 4_294_000_001
+        var archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId)
+        archive.lastKnownUidValidity = 4_294_000_002
         try pool.writeWithoutTransaction { db in
             try account.insert(db)
             try inbox.insert(db)

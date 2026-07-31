@@ -156,6 +156,10 @@ struct UserLabelMenuView: View {
         let folderPath = resolvedFolderPath()
         do {
             try await AppDatabase.dbPool.write { db in
+                // T1.3 — see InboxViewModel.removeUserLabel. Refuse before the local
+                // insert so neither half lands.
+                guard try !AccountManager.newGestureRefusedForUnknownEpoch(
+                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return }
                 try MessageUserLabel(messageId: messageSnapshot.id, userLabelId: label.id)
                     .insert(db, onConflict: .ignore)
                 let op = PendingOperation(
@@ -178,6 +182,10 @@ struct UserLabelMenuView: View {
         let folderPath = resolvedFolderPath()
         do {
             try await AppDatabase.dbPool.write { db in
+                // T1.3 — see InboxViewModel.removeUserLabel. Refuse before the local
+                // delete so neither half lands.
+                guard try !AccountManager.newGestureRefusedForUnknownEpoch(
+                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return }
                 try MessageUserLabel
                     .filter(Column("messageId") == messageSnapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)

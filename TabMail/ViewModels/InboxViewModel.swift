@@ -1910,6 +1910,11 @@ final class InboxViewModel {
         // Persist + queue
         do {
             try await AppDatabase.dbPool.write { db in
+                // T1.3 — on IMAP a user label is a keyword STORE resolved by UID, so
+                // an unknown folder epoch fails closed. Refuse before the local
+                // delete so neither half lands.
+                guard try !AccountManager.newGestureRefusedForUnknownEpoch(
+                    accountId: message.accountId, folderPath: message.folderPath, db: db) else { return }
                 try MessageUserLabel
                     .filter(Column("messageId") == snapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
