@@ -314,6 +314,37 @@ extension AccountManager {
         }
     }
 
+    // MARK: - Drain-barrier Test Seam (T0.8)
+    //
+    // `ProviderIdQueueFuzzTests` needs a drain barrier, and per the plan's T0.5
+    // callout a barrier is only correct if it samples its predicate BEFORE
+    // requesting a drain — otherwise every poll lands on `drainPendingQueue()`'s
+    // is-draining guard above, sets `needsRedrain` itself, and the barrier keeps
+    // its own re-arm alive forever. That corrected shape needs to be able to
+    // observe "no drain in flight", which `isDraining`/`needsRedrain`
+    // (`AccountManager.swift:274`, `:276`) do not expose to a test on their own.
+    //
+    // This is a verbatim port of the reference accessor
+    // (`v2final:TabMail/Services/Account/AccountManagerQueue.swift:3172-3174`) —
+    // same name, same predicate — with the one deviation this file's sibling
+    // seams already established (`IMAPProvider.swift:830-855`, T0.6(a)): the
+    // reference leaves its `…ForTesting` surface UNGATED, here it is `#if DEBUG`
+    // so Release builds carry neither the member nor any call site. Purely
+    // additive: nothing above changed, and no production code reads it.
+    #if DEBUG
+
+    /// Narrow test seam for proving that awaiting a drain also joins any
+    /// requested re-drain instead of leaving unstructured queue work behind.
+    ///
+    /// The barrier that consumes it MUST read this FIRST and only then ask for a
+    /// drain (see `ProviderIdQueueFuzzTests.drainProviderQueue`) — the inverse
+    /// ordering is the self-re-arm bug the reference fixed in `f214c704a`.
+    func pendingQueueIsQuiescentForTesting() -> Bool {
+        !isDraining && !needsRedrain
+    }
+
+    #endif
+
     /// Execute a single claimed op against its provider. Updates shared DrainContext
     /// with results (executedAny, failedAccounts, foldersToSync, recentActions).
     /// Returns the outcome (`.proceed`/`.haltLane`) so the per-lane drain loop knows
