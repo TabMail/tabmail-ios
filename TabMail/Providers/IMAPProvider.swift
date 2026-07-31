@@ -137,13 +137,34 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// ⚠ SECOND DEVIATION FROM `v2final` (deliberate, scoped): the reference makes
     /// this the chokepoint that EVERY `selectMailbox` call site routes through,
     /// because there it also carries the ADR-IOS-061 Stage-2 *refusal* — a throw
-    /// that must fire on every SELECT to be a contract. T1.2b adds no refusal
-    /// (that is a later item), so only the sync/open SELECTs — the folder-pinned
-    /// connection's own SELECT and `fetchMessages`' — are routed through it here.
-    /// Narrower is also SAFER for the one consumer that exists: a mirror written
-    /// by every action SELECT too has more ways to be overwritten between a sync
-    /// pass's fetch and its read of this value. Widening it belongs with the
-    /// refusal.
+    /// that must fire on every SELECT to be a contract. This port adds no refusal
+    /// (that is a later item), so only the SYNC and OPEN SELECTs are routed
+    /// through it. That set is exactly five today:
+    ///  1. `createFolderConnection`'s open-the-folder SELECT (both legs);
+    ///  2. `fetchMessages`' SELECT (T1.2b — `SyncEngine.runSyncMessages`);
+    ///  3. `getUidNext`'s (T1.3 round 8 — the backfill walk's walk-start epoch);
+    ///  4. `searchExistingUIDs(folder:from:to:)`' (T1.3 round 8 — per-chunk);
+    ///  5. `fetchMessageHeaders(folder:uids:batchSize:interBatchDelay:)`' (ditto).
+    ///
+    /// 3–5 were RAW until audit round 8. That was the round-7 blocker: with them
+    /// raw, the mirror held the epoch the pinned connection observed when it was
+    /// CREATED and tracked no turnover during the crawl, so the epoch the walk
+    /// read back at the end was not bound to the UID population the walk had just
+    /// inserted. All three are backfill-only call sites (`SyncEngine.runBackfill`
+    /// is their sole caller), so this widening reaches no ACTION SELECT — the
+    /// distinction the paragraph below is about. `v2final` routes all three
+    /// through the tracked helper too.
+    ///
+    /// Action SELECTs stay OUT, and narrower stays SAFER for them: a mirror
+    /// written by every action SELECT too has more ways to be overwritten between
+    /// a sync pass's fetch and its read of this value. Widening THERE belongs with
+    /// the refusal. The residual this widening does add is bounded and already
+    /// documented at `SyncEngine.runSyncMessages`' capture: a concurrent backfill
+    /// SELECT of the same path can now land between that fetch and its read of
+    /// this mirror. Under the bootstrap-only write rule it can only ever plant a
+    /// first epoch, never overwrite one, and the value it would plant is the same
+    /// epoch unless a real turnover happened — in which case no reading of this
+    /// mirror was going to be right.
     private func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
         let selection = try await server.selectMailbox(folder)
         let observed = selection.uidValidity.value
@@ -2271,7 +2292,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Returns 0 if server doesn't provide UIDNEXT (shouldn't happen per RFC 3501).
     func getUidNext(folder: String) async throws -> Int {
         try await withFolderConnection(folder: folder) { server in
-            let selection = try await server.selectMailbox(folder)
+            // T1.3 (round 8): TRACKED. This is the crawl's walk-start SELECT —
+            // the one `SyncEngine.runBackfill` reads back as the walk's own
+            // epoch. A raw `selectMailbox` here left the mirror holding
+            // whatever the pinned connection's CREATION SELECT observed, which
+            // on a resumed crawl can be an epoch from a different pass
+            // entirely. See `selectMailboxTracked`'s scope note.
+            let selection = try await selectMailboxTracked(server, folder: folder)
             return Int(selection.uidNext.value)
         }
     }
@@ -2285,7 +2312,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try Task.checkCancellation()
 
         return try await withFolderConnection(folder: folder) { server in
-            let _ = try await server.selectMailbox(folder)
+            // T1.3 (round 8): TRACKED — this SELECT is the one that decides
+            // which UID space this chunk's SEARCH result belongs to, and the
+            // walk compares the epoch it records against the walk's own before
+            // it trusts (or inserts) anything from this range.
+            let _ = try await selectMailboxTracked(server, folder: folder)
             var searchSet = MessageIdentifierSet<UID>()
             searchSet.insert(range: Int(from)...Int(to))
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
@@ -2448,7 +2479,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
 
             let infos: [SwiftMail.MessageInfo] = try await withFolderConnection(folder: folder) { server in
-                _ = try await server.selectMailbox(folder)
+                // T1.3 (round 8): TRACKED — the crawl's per-batch SELECT. The
+                // headers this batch returns belong to the epoch THIS SELECT
+                // reported, and the walk refuses to insert them when that
+                // disagrees with the epoch it captured at walk start.
+                _ = try await selectMailboxTracked(server, folder: folder)
                 return try await server.fetchMessageInfosBulk(using: uidSet)
             }
 

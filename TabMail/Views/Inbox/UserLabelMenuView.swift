@@ -99,6 +99,13 @@ final class UserLabelMenuModel {
     /// A failed READ leaves `appliedIds` alone rather than guessing. That is the
     /// only honest answer — this function's whole contract is "show what the
     /// database says", and it has not been told.
+    ///
+    /// The `dbPool.read` is SYNCHRONOUS on the MainActor on purpose — see the same
+    /// note on `InboxViewModel.reconcileUserLabels`. An await between the read and
+    /// the assignment would let two overlapping reconciles read in one order and
+    /// write in the other, destroying the "last completion is authoritative"
+    /// property this whole design rests on. The query is one leading-column-indexed
+    /// lookup on `messageUserLabel`'s composite primary key.
     func reconcileAppliedIdsFromDatabase() {
         do {
             let applied = try AppDatabase.dbPool.read { db in

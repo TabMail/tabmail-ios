@@ -66,11 +66,23 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// `bootstrapFolderUidValidity`), the message-sync pass's own SELECT
     /// (`SyncEngine.runSyncMessages`, via `IMAPProvider.selectMailboxTracked` and
     /// `EmailProvider.lastObservedUidValidity(folderPath:)` — T1.2b), the backfill
-    /// crawl's own pinned-connection SELECT (`SyncEngine.runBackfill`, same mirror —
-    /// the T1.3 anti-brick, and the ONLY one of these that reaches a custom
-    /// NON-FAVOURITE folder, which `syncableFolders` excludes from every sync pass),
-    /// or the walk's own first SELECT (`persistFolderUidValidity` in
-    /// `SyncEngineDeletionReconcile.swift`). The SELECT source is not redundant
+    /// crawl's own walk-start SELECT (`SyncEngine.bootstrapCrawledFolderUidValidity`,
+    /// called from `SyncEngine.runBackfill` — the T1.3 anti-brick), or the walk's
+    /// own first SELECT (`persistFolderUidValidity` in
+    /// `SyncEngineDeletionReconcile.swift`).
+    ///
+    /// ⚠ Round 7 claimed the backfill crawl was the ONLY one of these that can
+    /// reach a custom NON-FAVOURITE folder. That is FALSE and is retracted (round
+    /// 8): `syncableFolders` does exclude such a folder from full sync, delta sync
+    /// and self-heal, but ON-DEMAND NAVIGATION reaches any folder through
+    /// `AccountManager.syncFolders(_:)`, which filters on `!folder.path.isEmpty`
+    /// alone, and lands in `runSyncMessages` with its T1.2b bootstrap. Without the
+    /// crawl's bootstrap the epoch stayed nil INDEFINITELY — until the user opened
+    /// that folder — not forever; the crawl's bootstrap matters because backfill
+    /// makes the folder's mail account-wide searchable long before that. See
+    /// `SyncEngine.bootstrapCrawledFolderUidValidity` for the full retraction.
+    ///
+    /// The SELECT source is not redundant
     /// with STATUS: SwiftMail asks for the `UIDVALIDITY` STATUS attribute only on a
     /// UIDPLUS server, whereas `OK [UIDVALIDITY n]` on SELECT is core IMAP4rev1 —
     /// so without it a non-UIDPLUS account would leave every folder here nil

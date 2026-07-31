@@ -807,19 +807,31 @@ extension SyncEngine {
     /// The bootstrap epoch write itself, as ONE conditional UPDATE, inside a
     /// transaction the caller already owns. Used by delta sync's unchanged and
     /// changed branches (STATUS-sourced), by `runSyncMessages` (SELECT-sourced,
-    /// T1.2b) and by `SyncEngine.runBackfill`'s IMAP branch (SELECT-sourced, the
-    /// T1.3 anti-brick — the ONLY writer that reaches a custom non-favourite
-    /// folder, which no `syncableFolders` pass ever visits).
+    /// T1.2b) and by `SyncEngine.runBackfill`'s IMAP branch, through the gated
+    /// wrapper `SyncEngine.bootstrapCrawledFolderUidValidity` (SELECT-sourced, the
+    /// T1.3 anti-brick).
+    ///
+    /// ⚠ Round 7 described that backfill caller as "the ONLY writer that reaches a
+    /// custom non-favourite folder, which no `syncableFolders` pass ever visits".
+    /// RETRACTED (round 8): on-demand navigation reaches ANY folder via
+    /// `AccountManager.syncFolders(_:)` → `SyncEngine.syncFolderMessages` →
+    /// `runSyncMessages`, whose filter is `!folder.path.isEmpty` and nothing else.
+    /// The crawl's bootstrap is still needed — backfill makes a folder's mail
+    /// account-wide searchable long before the user ever opens it — but the window
+    /// it closes is INDEFINITE, not permanent.
     ///
     /// ⚠ It is NOT the only writer of `Folder.lastKnownUidValidity`, and treating
     /// it as one would be dangerous — this column's safety property depends on
     /// knowing every writer (see the column's own doc comment on `Folder`). The
     /// complete set is THREE:
-    ///  1. this function — `runSyncMessages`, delta sync's changed branch and
-    ///     `runBackfill`'s IMAP branch (in the FILE `SyncEngineBackfillWalk.swift`,
-    ///     which is an `extension SyncEngine`; there is no `SyncEngineBackfillWalk`
-    ///     type to cite) call it directly, delta sync's unchanged branch through
-    ///     the async wrapper of the same name below;
+    ///  1. this function — `runSyncMessages` and delta sync's changed branch call it
+    ///     directly, delta sync's unchanged branch through the async wrapper of the
+    ///     same name below, and `runBackfill`'s IMAP branch (in the FILE
+    ///     `SyncEngineBackfillWalk.swift`, which is an `extension SyncEngine`; there
+    ///     is no `SyncEngineBackfillWalk` type to cite) through
+    ///     `bootstrapCrawledFolderUidValidity`, which adds a "the folder holds no
+    ///     local UID yet" precondition on top of this one and must be the crawl's
+    ///     only door to this function;
     ///  2. the folder-list upsert in `SyncEngine.fullSync` (`SyncEngineFullSync.swift`), which sets the
     ///     field on the `Folder` record it is already updating/inserting rather
     ///     than issuing a separate statement — it is safe without the in-statement

@@ -1967,6 +1967,23 @@ final class InboxViewModel {
     ///
     /// Re-finds by id rather than reusing a captured index: the array can be
     /// rebuilt across an await.
+    ///
+    /// **The `dbPool.read` here is SYNCHRONOUS on the MainActor, deliberately**
+    /// (audit round 8 raised it against Resilience Rule 1). Making it `async`
+    /// would put a suspension point between the read and the assignment, and the
+    /// whole value of this function is that those two are ATOMIC: nothing can
+    /// interleave, so whichever overlapping gesture completes LAST leaves
+    /// `loadedMessages` equal to the durable truth. With an await in the middle,
+    /// two reconciles can read in one order and write in the other, and the older
+    /// read can land last — which is exactly the compose-wrongly failure the
+    /// snapshot restore this replaced had, in a new costume. The read itself is
+    /// one lookup on `messageUserLabel`'s composite primary key
+    /// `(messageId, userLabelId)` — leading-column indexed, a handful of rows —
+    /// on a path that has just awaited `drainPendingQueue`. Same reasoning and
+    /// same shape as `UserLabelMenuModel.reconcileAppliedIdsFromDatabase`,
+    /// `loadLabels` and `resolvedFolderPath`. If this ever has to go async, the
+    /// atomicity has to be restored some other way (a generation token on the
+    /// row, or reconciling under a serialising actor) — not dropped.
     private func reconcileUserLabels(forMessageId id: String) {
         guard let idx = loadedMessages.firstIndex(where: { $0.id == id }) else { return }
         do {

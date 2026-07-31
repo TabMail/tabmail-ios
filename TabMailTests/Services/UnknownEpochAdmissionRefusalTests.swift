@@ -856,4 +856,140 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(model.appliedIds == durable,
                 "shown \(model.appliedIds.sorted()) vs stored \(durable.sorted())")
     }
+
+    // MARK: - 11b. The DISTINGUISHING case: the last completion is ADMITTED
+
+    /// 🚨 THE TEST THAT SEPARATES "reconcile on EVERY completion" FROM
+    /// "reconcile only on refusal". Neither of the two tests above does:
+    /// `twoAdmittedTogglesAgreeWithTheDatabase` SERIALIZES its toggles (it
+    /// awaits the first before creating the second), so the optimistic
+    /// composition and the durable composition apply the same flips in the same
+    /// order and agree by construction; `twoRefusedTogglesReconcileFromTheDatabase`
+    /// is all-refused, so a refusal-only reconcile runs on every completion
+    /// anyway. Both stay GREEN on a design the commit records as REJECTED, which
+    /// means the strengthening was pinned by nothing.
+    ///
+    /// THE INVARIANT (unchanged, and the only thing asserted): after any
+    /// sequence of toggles the displayed checkmarks equal the durable join rows.
+    ///
+    /// What makes this case distinguishing is a durable change the toggles did
+    /// not make. `appliedIds` is computed once by `loadLabels()`; a label
+    /// applied to the same message afterwards — by a sync pass, by a drain, by
+    /// another device — is in the database and NOT in the display. Two
+    /// overlapping toggles then run and BOTH are admitted, so under a
+    /// refusal-only design nothing ever re-reads and that label stays invisible
+    /// until the sheet is reopened. Reconciling on every completion makes the
+    /// LAST completion authoritative, so it appears. No interleaving is relied
+    /// on: the divergence exists before either toggle starts and neither toggle
+    /// can remove it.
+    @Test("Two OVERLAPPING toggles whose LAST completion is ADMITTED still match the database")
+    @MainActor
+    func overlappingTogglesEndingAdmittedMatchTheDatabase() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "903")
+        let toggled = UserLabel(id: "lbl-toggled", accountId: "acc1", name: "Toggled", isSystem: false)
+        let arrivedLater = UserLabel(id: "lbl-arrived", accountId: "acc1", name: "Arrived", isSystem: false)
+        try await pool.writeWithoutTransaction { db in
+            try toggled.insert(db)
+            try arrivedLater.insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: toggled.id).insert(db)
+        }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+        #expect(model.appliedIds == [toggled.id],
+                "fixture precondition: the menu was loaded before the second label arrived")
+
+        // A durable change the menu has not seen — a sync pass, a drain, or
+        // another device applying a label to the same message.
+        try await pool.writeWithoutTransaction { db in
+            try MessageUserLabel(messageId: msg.id, userLabelId: arrivedLater.id).insert(db)
+        }
+
+        // Two taps inside one write window. Both are ADMITTED (the epoch is
+        // known), so the LAST completion is an admitted one.
+        let first = model.toggleLabel(toggled)
+        let second = model.toggleLabel(toggled)
+        await first.value
+        await second.value
+
+        let rows = try await ops(pool)
+        #expect(rows.count == 2, "precondition: both toggles were admitted")
+        let durable = try await pool.read { db in
+            Set(try MessageUserLabel
+                .filter(Column("messageId") == msg.id)
+                .fetchAll(db)
+                .map(\.userLabelId))
+        }
+        #expect(durable.contains(arrivedLater.id),
+                "precondition: the externally-applied label is still in the database")
+        #expect(model.appliedIds == durable,
+                """
+                the checkmarks disagree with the database after two overlapping toggles whose \
+                last completion was ADMITTED (shown \(model.appliedIds.sorted()) vs stored \
+                \(durable.sorted())) — reconciling only on refusal never re-reads here, so the \
+                display keeps whatever the optimistic flips left behind
+                """)
+    }
+
+    /// The same invariant for the OTHER consumer of the same reconcile.
+    /// `InboxViewModel.reconcileUserLabels` received the identical
+    /// "on every completion, not only on refusal" change and had no test at all.
+    ///
+    /// The row's `userLabels` is a snapshot taken when the list was built; a
+    /// label applied afterwards is durable and undisplayed. An ADMITTED
+    /// `removeUserLabel` must leave the row equal to the join rows — which under
+    /// a refusal-only reconcile it does not, because the admitted path never
+    /// re-reads.
+    @Test("An ADMITTED removeUserLabel leaves the row's labels equal to the database")
+    @MainActor
+    func admittedRemoveUserLabelReconcilesTheRow() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "904")
+        let removed = UserLabel(id: "lbl-removed", accountId: "acc1", name: "Removed", isSystem: false)
+        let arrivedLater = UserLabel(id: "lbl-row-arrived", accountId: "acc1", name: "RowArrived", isSystem: false)
+        try await pool.writeWithoutTransaction { db in
+            try removed.insert(db)
+            try arrivedLater.insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: removed.id).insert(db)
+        }
+
+        let inbox = try #require(try await pool.read { db in
+            try Folder.fetchOne(db, key: "acc1:INBOX")
+        })
+        // The VM loads its rows (and their labels) in `init` — this is the
+        // snapshot the user is looking at.
+        let viewModel = InboxViewModel(folders: [inbox])
+        let snapshot = try #require(viewModel.loadedMessages.first { $0.id == msg.id })
+        #expect(snapshot.userLabels.map(\.id) == [removed.id],
+                "fixture precondition: the row was built before the second label arrived")
+
+        // Durable, and not in the row's snapshot.
+        try await pool.writeWithoutTransaction { db in
+            try MessageUserLabel(messageId: msg.id, userLabelId: arrivedLater.id).insert(db)
+        }
+
+        await viewModel.removeUserLabel(removed, from: snapshot)
+
+        let rows = try await ops(pool)
+        #expect(rows.count == 1, "precondition: the removal was admitted")
+        let durable = try await pool.read { db in
+            Set(try MessageUserLabel
+                .filter(Column("messageId") == msg.id)
+                .fetchAll(db)
+                .map(\.userLabelId))
+        }
+        #expect(durable == [arrivedLater.id], "precondition: only the removed label left the database")
+        let shown = Set(viewModel.loadedMessages.first { $0.id == msg.id }?.userLabels.map(\.id) ?? [])
+        #expect(shown == durable,
+                """
+                the row's labels disagree with the database after an ADMITTED removal \
+                (shown \(shown.sorted()) vs stored \(durable.sorted())) — the admitted path \
+                must reconcile too, or a label applied since the row was built stays invisible
+                """)
+    }
 }
