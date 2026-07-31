@@ -1903,18 +1903,20 @@ final class InboxViewModel {
     func removeUserLabel(_ label: UserLabel, from snapshot: MessageSnapshot) async {
         // Look up full MessageHeader from DB for correct folderPath
         guard let message = lookupMessage(snapshot.id) else { return }
-        // Optimistic UI: remove label from snapshot
+        // Optimistic UI: remove label from snapshot. Captured so a REFUSED write can
+        // put it back — see the revert below.
+        let previousLabels = loadedMessages.first(where: { $0.id == snapshot.id })?.userLabels
         if let idx = loadedMessages.firstIndex(where: { $0.id == snapshot.id }) {
             loadedMessages[idx].userLabels.removeAll { $0.id == label.id }
         }
         // Persist + queue
         do {
-            try await AppDatabase.dbPool.write { db in
+            let admitted = try await AppDatabase.dbPool.write { db -> Bool in
                 // T1.3 — on IMAP a user label is a keyword STORE resolved by UID, so
                 // an unknown folder epoch fails closed. Refuse before the local
                 // delete so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                    accountId: message.accountId, folderPath: message.folderPath, db: db) else { return }
+                    accountId: message.accountId, folderPath: message.folderPath, db: db) else { return false }
                 try MessageUserLabel
                     .filter(Column("messageId") == snapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
@@ -1926,12 +1928,29 @@ final class InboxViewModel {
                     userLabelId: label.id
                 )
                 try op.insert(db)
+                return true
+            }
+            // A refusal queued nothing and changed no row. Leaving the optimistic
+            // removal in place would show the label as gone forever while it is still
+            // applied in the database — a phantom success. Re-find by id rather than
+            // reusing the index: the array can be rebuilt across the await above.
+            guard admitted else {
+                restoreUserLabels(previousLabels, forMessageId: snapshot.id)
+                return
             }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             await AccountManager.shared.drainPendingQueue()
         } catch {
+            restoreUserLabels(previousLabels, forMessageId: snapshot.id)
             print("[InboxViewModel] removeUserLabel failed: \(error)")
         }
+    }
+
+    /// Put a message's optimistically-mutated label set back after a write that was
+    /// refused or failed. No-op when the row has since left the list.
+    private func restoreUserLabels(_ labels: [UserLabel]?, forMessageId id: String) {
+        guard let labels, let idx = loadedMessages.firstIndex(where: { $0.id == id }) else { return }
+        loadedMessages[idx].userLabels = labels
     }
 
     func move(_ messageId: String, toFolderPath: String) {

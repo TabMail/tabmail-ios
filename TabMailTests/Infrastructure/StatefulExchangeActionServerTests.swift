@@ -408,16 +408,46 @@ struct StatefulExchangeActionServerTests {
     /// emit `$filter` elsewhere, from `ExchangeProvider.listBackfillMessageIds`
     /// and `fetchOlderMessages`, but those carry `receivedDateTime` windows and
     /// never reach this hook. `failNextMutation()` gates exactly three fixture
-    /// handlers — `/messages/` PATCH, DELETE, and POST — and between them those
-    /// three verbs cover every mutating method `ExchangeProvider` has. Counted
-    /// exactly: FOUR action methods — `markRead`, `markUnread`, `markFlagged`,
-    /// `move` — plus `deleteDraft`, which is a draft operation rather than an
-    /// action and is counted separately here. Routing:
-    /// `markRead`/`markUnread`/`markFlagged`, and ONLY those three, reach the
-    /// private `patchMessage(id:body:)` (PATCH); `move` does NOT — it reaches
-    /// `moveMessage(id:destinationId:)` (POST `/messages/{id}/move`); and
-    /// `deleteDraft` issues DELETE. This test drives `markRead`, i.e. the PATCH
-    /// gate.
+    /// handlers — `/messages/` PATCH, DELETE, and POST.
+    ///
+    /// ⚠ CORRECTED 2026-07-31. The previous revision of this paragraph made two
+    /// counted claims, both false, both re-verified against `ExchangeProvider`
+    /// before replacement.
+    ///
+    /// (1) It said those three gates "cover every mutating method
+    /// `ExchangeProvider` has". They do not. `send(draft:)` POSTs `/sendMail`, and
+    /// `saveDraft`'s create branch POSTs `/mailFolders/drafts/messages` — neither
+    /// URL contains the `/messages/` substring the fixture matches on, so neither is
+    /// gated at all. (`appendToSentFolder` and `setActionTag` issue no HTTP, so they
+    /// are vacuously outside it.)
+    ///
+    /// (2) It said `markRead`/`markUnread`/`markFlagged` "and ONLY those three"
+    /// reach the private `patchMessage(id:body:)`, and that `move` does NOT. Both
+    /// halves are wrong. `move(ids:from:to:)` calls `stripLegacyCategories(id:)` on
+    /// its `source == inboxFolderId` branch — the MAINLINE inbox-triage path
+    /// (archive, delete, move out of INBOX) — and `stripLegacyCategories` ends in
+    /// `patchMessage(id:body:)`. `saveDraft`'s update branch PATCHes
+    /// `/messages/{id}` as well. Accurately: PATCH is reached by `markRead`,
+    /// `markUnread`, `markFlagged`, `saveDraft`'s update branch, and `move` via the
+    /// category strip; POST `/messages/{id}/move` by `move`; DELETE by
+    /// `deleteDraft`.
+    ///
+    /// Why (2) matters beyond the wording: a move-from-INBOX issues its strip PATCH
+    /// BEFORE its move POST, so an injected failure could be consumed by the PATCH
+    /// rather than by the verb a test names. Checked — this leg still pins what it
+    /// intends, for three independent reasons. This test drives `markRead`, not
+    /// `move`; `failNextMutation()` has no other call site in the tree; and in this
+    /// fixture the strip cannot PATCH at all, because `inboxFolderId` is populated
+    /// only inside `fetchFolders()`, which these tests never call, so
+    /// `source == inboxFolderId` is false — and even with it populated, `graphRow`
+    /// seeds `"categories": []`, so `stripLegacyCategories` returns at its `guard`
+    /// before reaching `patchMessage`. Its unconditional
+    /// `GET /messages/{id}?$select=categories` would not consume the credit either:
+    /// the fixture's `/messages/` GET handler does not check the flag. 🚨 **Anyone
+    /// adding a `move`-based transient-failure test MUST re-derive this** — it holds
+    /// because of this fixture's state, not because of the routing.
+    ///
+    /// This test drives `markRead`, i.e. the PATCH gate.
     ///
     /// (Two corrections to an earlier revision of this paragraph, recorded
     /// because both were review-invisible. It claimed "all four … action
@@ -572,7 +602,13 @@ struct StatefulExchangeActionServerTests {
     /// (The owner is that free function, not a type: nothing named
     /// `HTTPClient` is declared anywhere in the tree —
     /// `Shared/HTTP/HTTPClient.swift` is a FILE that declares `HTTPConfig`,
-    /// `HTTPRequestResult` and `HTTPError` plus three free functions.)
+    /// `HTTPRequestResult` and `HTTPError`, the global `let sharedEphemeralSession`,
+    /// and TWO free functions: `performHTTPRequest` and
+    /// `performHTTPRequestWithRetry`. ⚠ CORRECTED 2026-07-31 from "plus three free
+    /// functions" — six top-level declarations, but only two of them are functions.
+    /// The miscounted third was `sharedEphemeralSession`, a global CONSTANT bound to
+    /// an immediately-invoked closure, and it is precisely the symbol the sentence
+    /// above depends on.)
     /// That is not hypothetical: it is what this suite did before the
     /// restoration, and it failed with a real `Error Domain=Exchange Code=401`
     /// from Microsoft.

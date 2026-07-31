@@ -180,28 +180,33 @@ enum NotificationActionRouter {
             }
             switch actionId {
             case "MARK_READ":
-                try await AppDatabase.dbPool.write { db in
+                // Report the ADMISSION RESULT, not the mere absence of a throw — a
+                // refusal queues nothing, and logging "queued" for it sends anyone
+                // debugging a vanished action looking in the drain instead of here.
+                let admitted = try await AppDatabase.dbPool.write { db -> Bool in
                     // T1.3 — a notification-action tap is a new user gesture. No local
                     // header exists on this cold path, so `messageIds` is a bare UID:
                     // exactly the shape an unknown epoch can misresolve.
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                        accountId: accountId, folderPath: inboxPath, db: db) else { return }
+                        accountId: accountId, folderPath: inboxPath, db: db) else { return false }
                     try PendingOperation(type: .markRead, messageIds: [messageId], accountId: accountId, folderPath: inboxPath).insert(db)
+                    return true
                 }
-                print("[NotificationActionRouter] header not local — queued markRead PendingOperation for \(messageId)")
+                print("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") markRead PendingOperation for \(messageId)")
             case "ARCHIVE", "DELETE":
                 let role: FolderRole = actionId == "ARCHIVE" ? .archive : .trash
                 guard let destinationPath = folders.first(where: { $0.role == role })?.path else {
                     print("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
                     return
                 }
-                try await AppDatabase.dbPool.write { db in
+                let admitted = try await AppDatabase.dbPool.write { db -> Bool in
                     // T1.3 — see the MARK_READ arm above. Source-scoped.
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                        accountId: accountId, folderPath: inboxPath, db: db) else { return }
+                        accountId: accountId, folderPath: inboxPath, db: db) else { return false }
                     try PendingOperation(type: .move, messageIds: [messageId], accountId: accountId, folderPath: inboxPath, destinationPath: destinationPath).insert(db)
+                    return true
                 }
-                print("[NotificationActionRouter] header not local — queued \(actionId) (.move) PendingOperation for \(messageId)")
+                print("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") \(actionId) (.move) PendingOperation for \(messageId)")
             default:
                 break
             }

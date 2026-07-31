@@ -448,8 +448,16 @@ struct StatefulGmailActionServerTests {
     /// **The property this pins.** `GmailProvider.search(query:folder:…)`
     /// preserves its caller's query as the BASE of the Gmail `q=` parameter —
     /// not verbatim: it APPENDS `from:`/`to:`/`after:`/`before:` terms for any
-    /// non-nil argument and, off the archive path, `allMailExclusionQuery`,
-    /// then percent-encodes the whole thing. What matters for this control is
+    /// non-nil argument and, ON the archive path (i.e. when
+    /// `folder == GmailProvider.archivePath`), `allMailExclusionQuery`,
+    /// then percent-encodes the whole thing.
+    /// (⚠ CORRECTED 2026-07-31: this read "off the archive path", the exact
+    /// opposite of `if folder == GmailProvider.archivePath { q += " " + GmailProvider.allMailExclusionQuery }`.
+    /// The synthetic All Mail path is not a real Gmail label ID, so it is expressed
+    /// as query exclusions INSTEAD OF `labelIds` — which is why the two clauses have
+    /// OPPOSITE polarity and why the identical phrase appearing twice in this file
+    /// was so easy to get backwards. Both occurrences are now spelled out rather
+    /// than sharing the ambiguous phrase.) What matters for this control is
     /// that the caller's own terms survive into `q`, which they do; the fixture
     /// keys only on an `rfc822msgid:` term being present. The method is reached
     /// in production from `AccountManager.search(query:account:folder:after:before:from:to:)`
@@ -472,9 +480,13 @@ struct StatefulGmailActionServerTests {
     /// Note the request shapes differ and neither is "the reference's exact
     /// shape". `v2final:TabMail/Providers/GmailProvider.swift`'s
     /// `resolveActionMessageId` sent `q` + `maxResults=2` +
-    /// `includeSpamTrash=true` (+ `labelIds=<folder>` off the archive path);
-    /// v3's `search` sends `q` + `maxResults=20` (+ `labelIds=<folder>` off the
-    /// archive path). What the fixture's hook keys on — and all it keys on — is
+    /// `includeSpamTrash=true` (+ `labelIds=<folder>` when the folder is NOT the
+    /// archive path); v3's `search` sends `q` + `maxResults=20` (+
+    /// `labelIds=<folder>` when the folder is neither empty nor the archive path —
+    /// the guard is `(folder.isEmpty || folder == GmailProvider.archivePath) ? "" : …`,
+    /// so an empty folder suppresses it too). Note this is the OPPOSITE polarity to
+    /// the `allMailExclusionQuery` clause above, which is appended ON the archive
+    /// path — see the correction there. What the fixture's hook keys on — and all it keys on — is
     /// an `rfc822msgid:` term inside `q`, which both shapes carry.
     @Test("the armed lookup failure IS consumed by an rfc822msgid: search — the oracle fires")
     func armedLookupFailureIsConsumedByAnRfcSearch() async throws {
@@ -552,7 +564,13 @@ struct StatefulGmailActionServerTests {
     /// the LIVE internet. (The owner is the free function, not a type: nothing
     /// named `HTTPClient` is declared anywhere in the tree —
     /// `Shared/HTTP/HTTPClient.swift` is a FILE that declares `HTTPConfig`,
-    /// `HTTPRequestResult` and `HTTPError` plus three free functions.) `v3` had dropped `session: testSession` from `deleteDraft` and
+    /// `HTTPRequestResult` and `HTTPError`, the global `let sharedEphemeralSession`,
+    /// and TWO free functions: `performHTTPRequest` and
+    /// `performHTTPRequestWithRetry`. ⚠ CORRECTED 2026-07-31 from "plus three free
+    /// functions" — six top-level declarations, but only two of them are functions.
+    /// The miscounted third was `sharedEphemeralSession`, a global CONSTANT bound to
+    /// an immediately-invoked closure, and it is precisely the symbol the sentence
+    /// above depends on.) `v3` had dropped `session: testSession` from `deleteDraft` and
     /// `fetchHistory`, so both issued real HTTPS requests to
     /// `gmail.googleapis.com` from the unit suite: nondeterministic, slow, and
     /// a data leak from a public repo's test run. The sibling

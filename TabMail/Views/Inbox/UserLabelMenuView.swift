@@ -137,29 +137,45 @@ struct UserLabelMenuView: View {
         }
         // DB write + queue drain in background
         Task {
-            if wasApplied {
-                await removeLabel(label)
-            } else {
-                await applyLabel(label)
+            let admitted = wasApplied ? await removeLabel(label) : await applyLabel(label)
+            // T1.3 — the write can REFUSE admission (unknown folder epoch), in which
+            // case no op row was queued and no local row changed. Without this revert
+            // the checkmark above stays flipped and the user is shown a label state
+            // that was never persisted and never will be: a phantom success. The
+            // presentation state has to track admission, not merely the absence of a
+            // thrown error.
+            if !admitted {
+                if wasApplied {
+                    appliedIds.insert(label.id)
+                } else {
+                    appliedIds.remove(label.id)
+                }
             }
         }
     }
 
-    /// Look up the real folder path from DB (MessageSnapshot doesn't carry folderPath).
-    private func resolvedFolderPath() -> String {
+    /// The message's REAL folder path, or nil when its header row is gone.
+    ///
+    /// This used to fall back to `?? "INBOX"`. It must not: that guess is what made
+    /// the admission guard's missing-`Folder`-row case unsafe to fail closed, and a
+    /// guessed path is wrong in exactly the situation it fires — the header has
+    /// vanished, so there is no message here to label. Callers abort on nil.
+    private func resolvedFolderPath() -> String? {
         (try? AppDatabase.dbPool.read { db in
             try MessageHeader.fetchOne(db, key: messageSnapshot.id)?.folderPath
-        }) ?? "INBOX"
+        }) ?? nil
     }
 
-    private func applyLabel(_ label: UserLabel) async {
-        let folderPath = resolvedFolderPath()
+    /// Returns whether the write was ADMITTED. `false` means nothing was queued and
+    /// nothing changed locally, so the caller must revert its optimistic UI.
+    private func applyLabel(_ label: UserLabel) async -> Bool {
+        guard let folderPath = resolvedFolderPath() else { return false }
         do {
-            try await AppDatabase.dbPool.write { db in
+            let admitted = try await AppDatabase.dbPool.write { db -> Bool in
                 // T1.3 — see InboxViewModel.removeUserLabel. Refuse before the local
                 // insert so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return }
+                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return false }
                 try MessageUserLabel(messageId: messageSnapshot.id, userLabelId: label.id)
                     .insert(db, onConflict: .ignore)
                 let op = PendingOperation(
@@ -170,22 +186,27 @@ struct UserLabelMenuView: View {
                     userLabelId: label.id
                 )
                 try op.insert(db)
+                return true
             }
+            guard admitted else { return false }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             await AccountManager.shared.drainPendingQueue()
+            return true
         } catch {
             print("[UserLabelMenu] Apply label failed: \(error)")
+            return false
         }
     }
 
-    private func removeLabel(_ label: UserLabel) async {
-        let folderPath = resolvedFolderPath()
+    /// Returns whether the write was ADMITTED — see `applyLabel`.
+    private func removeLabel(_ label: UserLabel) async -> Bool {
+        guard let folderPath = resolvedFolderPath() else { return false }
         do {
-            try await AppDatabase.dbPool.write { db in
+            let admitted = try await AppDatabase.dbPool.write { db -> Bool in
                 // T1.3 — see InboxViewModel.removeUserLabel. Refuse before the local
                 // delete so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return }
+                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return false }
                 try MessageUserLabel
                     .filter(Column("messageId") == messageSnapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
@@ -197,11 +218,15 @@ struct UserLabelMenuView: View {
                     userLabelId: label.id
                 )
                 try op.insert(db)
+                return true
             }
+            guard admitted else { return false }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             await AccountManager.shared.drainPendingQueue()
+            return true
         } catch {
             print("[UserLabelMenu] Remove label failed: \(error)")
+            return false
         }
     }
 
@@ -255,10 +280,13 @@ struct UserLabelMenuView: View {
 
             // Apply to message
             let newLabel = UserLabel(id: labelId, accountId: accountId, name: name, isSystem: false)
-            await applyLabel(newLabel)
-            // Add to list + mark applied (no full re-sort)
+            let admitted = await applyLabel(newLabel)
+            // Add to list — the label row itself was created above regardless, so it
+            // belongs in the menu either way. Mark it APPLIED only if the write was
+            // admitted: a refusal queued nothing and inserted no join row, and a
+            // checkmark here would be the same phantom success `toggleLabel` reverts.
             sortedLabels.insert(newLabel, at: 0)
-            appliedIds.insert(labelId)
+            if admitted { appliedIds.insert(labelId) }
             searchText = ""
         } catch {
             print("[UserLabelMenu] Create label failed: \(error)")

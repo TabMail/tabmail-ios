@@ -752,6 +752,198 @@ struct FakeIMAPServerOracleTests {
 
         _ = try client.command(tag: "a7", "LOGOUT")
     }
+
+    // MARK: - Deliverable 4: a bound that is not an `nz-number` addresses NOTHING
+
+    /// `Int(_:)` is not a parser for RFC 3501's `nz-number`. It accepts a strictly
+    /// larger language, and every extra form it admits WIDENS the resolved set —
+    /// the same widening class the previous round claimed to close, surviving
+    /// inside that round's own fix. Measured against the pre-fix parser:
+    /// `Int("0") == 0`, `Int("-1") == -1`, `Int("+1") == 1`, `Int("007") == 7`,
+    /// `Int("4294967296") == 4294967296`. So `0:2` and `-1:2` resolved to ranges
+    /// whose floor sits BELOW the mailbox's first UID and swept in messages the
+    /// client never named, and `1:4294967296` reached past the top of the 32-bit
+    /// UID space.
+    ///
+    /// Why this is worse than ordinary widening: on every one of these inputs a
+    /// CORRECT parser contributes nothing at all, so each UID the old parser
+    /// resolved was a mutation with no legitimate counterpart — pure invention by
+    /// the substrate the wrong-message oracle runs on.
+    ///
+    /// The grammar (RFC 3501 §9): `nz-number = digit-nz *DIGIT` — ASCII digits, no
+    /// sign, no leading zero, non-zero — and §2.3.1.1 makes a UID 32-bit, so the
+    /// accepted range is exactly `1 ... 4294967295`.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeIMAPServer.swift`'s
+    /// `parseUIDSet(_ value: String) -> [Int]` uses a bare `Int(...)` on its bounds
+    /// with no grammar check whatever, so the reference admits every form below.
+    /// It simply never exercised them. There is nothing here to port.
+    @Test("a bound that is not an nz-number addresses nothing — no sign, no zero, no leading zero, no overflow")
+    func nonNZNumberBoundsAddressNothing() {
+        // UID 6 absent, exactly as in the sibling test — a materialised range would
+        // invent it.
+        let roster = [1, 2, 3, 4, 5, 7, 8, 9]
+
+        // ZERO is not an nz-number. `0:2` must not resolve; the old parser read it
+        // as the range 0…2 and mutated UIDs 1 and 2.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("0:2", againstMailboxUIDs: roster) == [],
+            "0 is not an nz-number — 0:2 must address nothing, not the range 0…2"
+        )
+        #expect(FakeIMAPServer.resolveUIDSet("0", againstMailboxUIDs: roster) == [])
+
+        // A SIGN is not part of the grammar. Both directions matter: `-1:2` widened
+        // downward, `+1` was silently accepted as 1.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("-1:2", againstMailboxUIDs: roster) == [],
+            "-1 is not an nz-number — a negative floor sweeps in every UID below the range the client wrote"
+        )
+        #expect(FakeIMAPServer.resolveUIDSet("+1:2", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("-1", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("+3", againstMailboxUIDs: roster) == [])
+
+        // A LEADING ZERO is not `digit-nz`. `007` must not silently become 7.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("007", againstMailboxUIDs: roster) == [],
+            "007 is not an nz-number — accepting it makes the parser answer a set the client could not have written"
+        )
+        #expect(FakeIMAPServer.resolveUIDSet("01:3", againstMailboxUIDs: roster) == [])
+
+        // BEYOND 32 BITS. 4294967295 is the largest UID; 4294967296 is not one.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("1:4294967296", againstMailboxUIDs: roster) == [],
+            "a bound past the 32-bit UID space is not a UID — the component must contribute nothing"
+        )
+        #expect(FakeIMAPServer.resolveUIDSet("4294967296", againstMailboxUIDs: roster) == [])
+        // ...while the largest LEGAL bound still resolves, so the cap is not off by one.
+        #expect(
+            FakeIMAPServer.resolveUIDSet("1:4294967295", againstMailboxUIDs: roster) == roster,
+            "4294967295 IS a valid UID — rejecting it would narrow instead"
+        )
+
+        // WHITESPACE is not a digit. This is what the EXPUNGE call site used to hand
+        // the parser when a client wrote two spaces after the verb.
+        #expect(FakeIMAPServer.resolveUIDSet(" 1:3", againstMailboxUIDs: roster) == [])
+        #expect(FakeIMAPServer.resolveUIDSet("1 : 3", againstMailboxUIDs: roster) == [])
+
+        // A malformed bound poisons ONLY its own component, exactly as `1:x:3` does.
+        #expect(FakeIMAPServer.resolveUIDSet("0:2,4", againstMailboxUIDs: roster) == [4])
+        #expect(FakeIMAPServer.resolveUIDSet("4,-1:2", againstMailboxUIDs: roster) == [4])
+
+        // And the well-formed cases are untouched by the new check.
+        #expect(FakeIMAPServer.resolveUIDSet("2:5", againstMailboxUIDs: roster) == [2, 3, 4, 5])
+        #expect(FakeIMAPServer.resolveUIDSet("1:*", againstMailboxUIDs: roster) == roster)
+        #expect(FakeIMAPServer.resolveUIDSet("*", againstMailboxUIDs: roster) == [9])
+    }
+
+    /// The same property over the wire, on the two verbs that had NO wire-level pin
+    /// at all — `UID MOVE` and `UID EXPUNGE`, which are precisely where a widened
+    /// set LOSES mail rather than restamping a flag. The existing wire test drives
+    /// only STORE and COPY.
+    ///
+    /// Driven raw for the same reason as its sibling: SwiftMail's
+    /// `MessageIdentifierSet` cannot spell `0:2`, `-1:2` or `1:4294967296` at all,
+    /// and the input class this parser exists to survive is other clients and
+    /// fuzzed command streams.
+    @Test("a non-nz-number UID set moves and expunges nothing on the wire")
+    func wireLevelNonNZNumberSetsMoveAndExpungeNothing() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                Self.message(uid: 1, id: "wire-nz-first@example.com"),
+                Self.message(uid: 2, id: "wire-nz-second@example.com"),
+                Self.message(uid: 3, id: "wire-nz-third@example.com"),
+            ],
+            "Archive": [],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "b1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "b2", "SELECT INBOX")
+
+        // 1. UID MOVE with a zero floor. The old parser read `0:2` as the range 0…2
+        //    and would have MOVED UIDs 1 and 2 out of the mailbox — mail the client
+        //    never addressed, gone from INBOX.
+        _ = try client.command(tag: "b3", "UID MOVE 0:2 \"Archive\"")
+        #expect(
+            server.messageIDs(in: "Archive").isEmpty,
+            "a zero-floored UID MOVE relocated mail: Archive holds \(server.messageIDs(in: "Archive"))"
+        )
+        #expect(
+            server.messageIDs(in: "INBOX").count == 3,
+            "INBOX lost messages to a set no valid command addressed: \(server.messageIDs(in: "INBOX"))"
+        )
+
+        // 2. UID MOVE with a negative floor — same shape, the other malformed sign.
+        _ = try client.command(tag: "b4", "UID MOVE -1:2 \"Archive\"")
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.messageIDs(in: "INBOX").count == 3)
+
+        // 3. UID EXPUNGE with an out-of-range bound. This is the destructive verb:
+        //    a widened set here DELETES mail outright, with nothing to recover from.
+        _ = try client.command(tag: "b5", "UID EXPUNGE 1:4294967296")
+        #expect(
+            server.messageIDs(in: "INBOX").count == 3,
+            "an out-of-range UID EXPUNGE destroyed mail: INBOX holds \(server.messageIDs(in: "INBOX"))"
+        )
+
+        // 4. UID EXPUNGE with a leading-zero bound.
+        _ = try client.command(tag: "b6", "UID EXPUNGE 001:2")
+        #expect(server.messageIDs(in: "INBOX").count == 3)
+
+        // 5. The verbs DO still work on a well-formed set — otherwise every
+        //    expectation above would pass vacuously on a parser that rejects
+        //    everything. `2:3` is legal and must move exactly those two.
+        _ = try client.command(tag: "b7", "UID MOVE 2:3 \"Archive\"")
+        #expect(
+            Set(server.messageIDs(in: "Archive")) == [
+                "<wire-nz-second@example.com>", "<wire-nz-third@example.com>",
+            ],
+            "a well-formed UID MOVE must still move exactly its set: got \(server.messageIDs(in: "Archive"))"
+        )
+        #expect(server.messageIDs(in: "INBOX") == ["<wire-nz-first@example.com>"])
+
+        _ = try client.command(tag: "b8", "LOGOUT")
+    }
+
+    /// The EXPUNGE call site passes its arguments RAW — it is the one UID
+    /// subcommand with no `split(maxSplits: 1)` to strip the separator, because it
+    /// takes a sequence-set and nothing else. `resolveUIDSet` never splits on
+    /// space, so an extra space used to reach the parser as part of the bound,
+    /// which then failed the grammar and made the whole command a silent no-op
+    /// answered `OK`. Narrowing rather than widening — but a command that reports
+    /// success while doing nothing is exactly how a fake certifies a broken client
+    /// as correct.
+    @Test("UID EXPUNGE with extra whitespace still expunges the set it names")
+    func wireLevelUIDExpungeToleratesExtraWhitespace() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                Self.message(uid: 1, id: "wire-ws-first@example.com"),
+                Self.message(uid: 2, id: "wire-ws-second@example.com"),
+                Self.message(uid: 3, id: "wire-ws-third@example.com"),
+            ],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "c1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "c2", "SELECT INBOX")
+
+        // Two spaces after the verb. Pre-trim this resolved to [] and answered OK.
+        _ = try client.command(tag: "c3", "UID EXPUNGE  1:2")
+        #expect(
+            server.messageIDs(in: "INBOX") == ["<wire-ws-third@example.com>"],
+            "UID EXPUNGE silently expunged nothing while answering OK: INBOX holds \(server.messageIDs(in: "INBOX"))"
+        )
+
+        _ = try client.command(tag: "c4", "LOGOUT")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a

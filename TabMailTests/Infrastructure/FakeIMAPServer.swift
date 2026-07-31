@@ -1638,7 +1638,17 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
             return "\(tag) OK UID MOVE completed\r\n"
         case "EXPUNGE":
-            let uids = Set(parseUIDSet(subargs, in: mailbox))
+            // TRIMMED, unlike the raw `subargs` this used to pass. `UID EXPUNGE`
+            // takes a sequence-set and nothing else, so it is the one UID subcommand
+            // with no `split(maxSplits: 1)` to strip the separator for it — and
+            // `resolveUIDSet` splits only on `,` and `:`, never on space. A client
+            // writing `UID EXPUNGE  1:3` (two spaces) therefore handed the parser
+            // " 1:3", whose lower bound `" 1"` is not an nz-number, so the whole
+            // component was rejected and the command deleted NOTHING while still
+            // being answered `OK`. Narrowing, not widening — but a silent no-op
+            // answered as success is exactly what makes a fake certify a broken
+            // client as correct.
+            let uids = Set(parseUIDSet(subargs.trimmingCharacters(in: .whitespaces), in: mailbox))
             withState { state in
                 recordOracleCheck(command: "UID EXPUNGE", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
@@ -1735,10 +1745,28 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// `recordOracleCheck` downstream already skips absent UIDs
     /// (`guard let msg = byUid[uid] else { continue }`).
     ///
+    /// **4. A BOUND MUST BE A REAL `nz-number`.** `Int(part)` is not a parser for
+    /// the grammar: it accepts `0`, `-1`, `+1`, `007` and `4294967296`, none of
+    /// which is an `nz-number` (RFC 3501 §9: `nz-number = digit-nz *DIGIT`, and
+    /// §2.3.1.1 bounds a UID to 32 bits). Every one of those WIDENS — `0:2` and
+    /// `-1:2` resolve to a range whose floor is below the mailbox's first UID and
+    /// so sweep in messages the client never named, and `1:4294967296` reaches past
+    /// the top of the UID space. Widening is the dangerous direction (see 3), and
+    /// it is worse here than in a real server: a correct parser contributes
+    /// NOTHING on these inputs, so every UID such a component resolves is a
+    /// mutation with no legitimate counterpart at all. `parseNZNumber` below is
+    /// therefore the only numeric conversion in this path — do not reintroduce a
+    /// bare `Int(...)`.
+    ///
     /// `*` resolves via `max()` rather than `parseSequenceSet`'s
-    /// `messages.last?.uid`. The two agree while the mailbox is held in
-    /// ascending-UID order (which this fake maintains — appends allocate
-    /// `max + 1`), and `max()` is what the RFC actually specifies.
+    /// `messages.last?.uid`, and `max()` is what the RFC actually specifies.
+    /// ⚠ An earlier revision of this sentence justified the two being
+    /// interchangeable by claiming the fake maintains the mailbox in ascending-UID
+    /// order because appends allocate `max + 1`. That is FALSE and was removed:
+    /// `setMessages` installs a caller-supplied array VERBATIM, so a test may hold
+    /// any order it likes and `messages.last?.uid` is then not the maximum. The
+    /// sibling narrows on such a roster; this function does not, which is a reason
+    /// to prefer `max()` rather than a reason the two agree.
     ///
     /// This hardening is deliberately REACHABILITY-INDEPENDENT. SwiftMail
     /// cannot emit `*` on the `UID STORE`/`MOVE`/`COPY`/`EXPUNGE` paths that
@@ -1756,11 +1784,43 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// and a bare `Array(bounds[0]...bounds[1])` — so the reference traps on a
     /// descending set and widens on `1:x:3`. It simply never exercised any of
     /// these inputs. There is nothing here to port.
+    ///
+    /// 🚨 **THIS METHOD TAKES `stateLock`, AND `stateLock` IS A NON-RECURSIVE
+    /// `NSLock`.** It must only ever be called from OUTSIDE a `withState` closure.
+    /// All four current callers (`UID STORE`/`MOVE`/`COPY`/`EXPUNGE`) resolve their
+    /// set first and enter `withState` afterwards, sequentially — never nested. The
+    /// natural-looking alternative deadlocks the whole fake: `recordOracleCheck`'s
+    /// doc invites future mutating handlers to hook in, and such a handler would be
+    /// written inside `withState` (that is where the mutation lives), where calling
+    /// this self-relocks. Use the pure `resolveUIDSet(_:againstMailboxUIDs:)` from
+    /// inside a held lock instead — it takes no lock and is what this wraps.
     func parseUIDSet(_ value: String, in mailbox: String) -> [Int] {
         withState { state in
             Self.resolveUIDSet(
                 value, againstMailboxUIDs: (state.messagesByMailbox[mailbox] ?? []).map(\.uid))
         }
+    }
+
+    /// An IMAP `nz-number` bound, or nil for anything that is not one.
+    ///
+    /// RFC 3501 §9 defines `nz-number = digit-nz *DIGIT` — ASCII digits, no sign,
+    /// no leading zero, non-zero — and §2.3.1.1 makes a UID a 32-bit value, so the
+    /// accepted range is exactly `1 ... 4294967295`. This exists because `Int(_:)`
+    /// accepts a strictly larger language than the grammar does, and every extra
+    /// form it admits widens the resolved set. See `parseUIDSet`'s point 4.
+    static func parseNZNumber(_ token: Substring) -> Int? {
+        // 4294967295 is ten digits; anything longer cannot be in range, and the
+        // length cap keeps a pathological token from reaching the conversion.
+        guard !token.isEmpty, token.count <= 10 else { return nil }
+        // Rejects `+`/`-` signs, underscores, whitespace and non-ASCII digit forms
+        // (`Character.isNumber` alone is true for e.g. Arabic-Indic digits, which
+        // `Int(_:)` does accept).
+        guard token.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        // `digit-nz` — a leading zero is not an nz-number, so `007` is malformed
+        // rather than 7, and `0` is rejected outright.
+        guard token.first != "0" else { return nil }
+        guard let value = Int(token), value >= 1, value <= Int(UInt32.max) else { return nil }
+        return value
     }
 
     /// The pure core of `parseUIDSet` — split out so the parser's contract can
@@ -1780,7 +1840,9 @@ final class FakeIMAPServer: @unchecked Sendable {
             // A `seq-range` has exactly two bounds, a `seq-number` exactly one.
             // Anything else (`1:2:3`, `1:x:3`) is malformed.
             guard parts.count == 1 || parts.count == 2 else { continue }
-            let bounds = parts.compactMap { part -> Int? in part == "*" ? maxUID : Int(part) }
+            let bounds = parts.compactMap { part -> Int? in
+                part == "*" ? maxUID : Self.parseNZNumber(part)
+            }
             // THE load-bearing line: if any token failed to parse, the whole
             // component is malformed and contributes nothing. Without it the
             // surviving tokens get re-read as a shorter — or differently

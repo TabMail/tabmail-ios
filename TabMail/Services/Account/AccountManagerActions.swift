@@ -123,13 +123,59 @@ extension AccountManager {
     /// `.icloud` IS an IMAP account and MUST stay in the set — several sync sites test
     /// `.imap` alone and wrongly exclude it; do not copy those.
     ///
-    /// Every unknown fails **OPEN** (returns `false` = admit, i.e. exactly today's
-    /// behaviour): a missing account row, a non-IMAP provider, or a missing `Folder`
-    /// row. A missing folder row is deliberately NOT a refusal — it is not a bounded
-    /// first-sync state, because the draft and user-label paths synthesize `"Drafts"`
-    /// / `"INBOX"` paths that may match no row at all, so refusing there would be
-    /// permanent rather than transient: the same brick shape this guard exists to
-    /// avoid.
+    /// 🚨 **THE PROVIDER COLUMN IS A PROXY FOR "IS THIS ACCOUNT IMAP-BACKED", AND THE
+    /// DEMO ACCOUNT BREAKS IT.** `DemoSeed.seedAccount` stores `provider: .imap`, but
+    /// the account is served by `DemoProvider` — pure GRDB, no network, no SELECT, so
+    /// nothing can EVER stamp `lastKnownUidValidity` on a demo folder. Without the
+    /// exclusion below, every guarded gesture in Demo Mode is refused forever: archive,
+    /// delete, move, mark read/unread, flag and all three label paths become silent
+    /// no-ops. That is a permanent brick, not a bounded first-sync window — the exact
+    /// shape the Gmail/Exchange scoping above exists to prevent, reached through a
+    /// different door. The exclusion is placed HERE rather than papered over by seeding
+    /// a synthetic epoch in `DemoSeed`: this predicate's one idea is *"does this
+    /// account address messages by epoch-scoped UID?"*, and `DemoProvider` does not, so
+    /// excluding it CORRECTS the proxy instead of feeding it a value that would make
+    /// `Folder.lastKnownUidValidity` (documented as "the UIDVALIDITY the server last
+    /// reported") lie for an account that has no server. A seeded epoch would also
+    /// silently re-brick the moment demo seeding changed. Comparing against
+    /// `DemoSeed.demoAccountId` is this repo's established idiom for the demo carve-out
+    /// — `AccountManager.setupOAuthAccount`, `AccountManager.addIMAPAccount` and
+    /// `AccountManager.addICloudAccount` each guard on `acct.id != DemoSeed.demoAccountId`,
+    /// and so do all three in `v2final`. (Those three live in the FILE
+    /// `AccountManagerSetup.swift`, which is an `extension AccountManager`; there is
+    /// no `AccountManagerSetup` type to cite.)
+    ///
+    /// The COMPLETE class this exclusion closes — every `Account` construction site was
+    /// enumerated, not sampled. Only two of the five providers are in the predicate at
+    /// all (`.imap`, `.icloud`), so the class is "stored as IMAP-family but not backed
+    /// by a live `IMAPProvider`": `setupOAuthAccount` (`.gmail`/`.outlook` — excluded by
+    /// provider), `addIMAPAccount` (`.imap`, real IMAP — the intended bounded window),
+    /// `addICloudAccount` (`.icloud`, real IMAP — same), `addCalDAVAccount` (`.caldav`,
+    /// `calendarOnly` — NOT in the predicate, and it owns no mail folders, so it is
+    /// doubly exempt), the two `CalendarSetupView` sites (`.gmail`/`.outlook`,
+    /// `calendarOnly` — excluded by provider), `PreviewMocks` (`.imap`, but SwiftUI
+    /// previews only; never inserted into the shared database) and `DemoSeed`
+    /// (`.imap`, `DemoProvider` — the one real member, closed below).
+    ///
+    /// A MISSING `Folder` ROW FAILS **CLOSED** for the IMAP family. It is not a benign
+    /// unknown: `SyncEngine.fullSync` deletes a vanished folder's row while RETAINING
+    /// its headers (there is no foreign key — see the NOTE above its `folder.delete(db)`
+    /// in the FILE `SyncEngineFullSync.swift`, which is an `extension SyncEngine`; there
+    /// is no `SyncEngineFullSync` type to cite),
+    /// so an orphaned header keeps a `folderId`/`folderPath` with no metadata, and a
+    /// later re-appearance of the same path re-adopts it under a brand-new row whose
+    /// epoch is nil. Admitting a gesture on such a header writes a bare UID from the OLD
+    /// epoch into a durable op — precisely C3. Orphans are reachable by real gestures
+    /// (the notification path queries `messageHeader` without joining `folder`).
+    /// This does NOT brick the two callers that used to justify the fail-open, because
+    /// neither reaches this function with a guessed path any more:
+    /// `UserLabelMenuView.resolvedFolderPath()` now returns `nil` instead of guessing
+    /// `"INBOX"` and its callers abort, and the draft sites only consult this guard when
+    /// the op will actually resolve an existing UID (see `queueDraftSave`), which cannot
+    /// be true on an account that has no drafts-role row to have synced through.
+    ///
+    /// Every remaining unknown still fails **OPEN** (returns `false` = admit): a missing
+    /// account row and a non-IMAP-family provider.
     nonisolated static func newGestureRefusedForUnknownEpoch(
         accountId: String,
         folderPath: String,
@@ -138,7 +184,14 @@ extension AccountManager {
         guard let account = try Account.fetchOne(db, key: accountId) else { return false }
         // Account-side mirror of `staleWindowMode == .uid`. `.icloud` is IMAP.
         guard account.provider == .imap || account.provider == .icloud else { return false }
-        guard let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)") else { return false }
+        // Stored as `.imap`, served by `DemoProvider` — no server, no epoch, ever.
+        guard accountId != DemoSeed.demoAccountId else { return false }
+        guard let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)") else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] T1.3 refusing new gesture — no folder row for '\(folderPath)' (orphaned header? account \(accountId.prefix(8)))")
+            }
+            return true
+        }
         guard folder.lastKnownUidValidity == nil else { return false }
         if DebugModeManager.isLoggingEnabled() {
             print("[Queue] T1.3 refusing new gesture — folder '\(folderPath)' has no known UIDVALIDITY epoch yet (account \(accountId.prefix(8)))")
@@ -825,6 +878,34 @@ extension AccountManager {
                     return nil
                 }
 
+                // T1.3 — a draft save IS epoch-sensitive whenever it will resolve an
+                // EXISTING UID. The original census exempted this site wholesale as
+                // "APPEND-shaped, resolves no existing UID"; that is wrong for the
+                // normal case. `IMAPProvider.saveDraft` runs a delete-then-APPEND, and
+                // its `existingDraftId` branch does `store(flags: [.deleted])` +
+                // `expunge()` on `MessageIdentifierSet<UID>(UID(uid))` — a LITERAL UID,
+                // both calls `try?`-swallowed, so a wrong-message expunge is silent.
+                // `saveDraft` itself returns `DraftSaveResult(serverId: String(uid))`,
+                // so `Draft.serverDraftId` IS the IMAP UID and the numeric branch is the
+                // normal path for every save after the first. Byte-for-byte the same
+                // shape already acknowledged as a C3 vector for `queueDraftDelete`.
+                //
+                // Classified by what the provider DOES with the id, not by the op's
+                // name — the three cases are distinct and only one is a hazard:
+                //   • `serverDraftId == nil`  → pure APPEND, no id to resolve → admit.
+                //     (This is the ONLY case the old census description actually fit.)
+                //   • non-numeric             → Message-ID SEARCH, epoch-IMMUNE → admit.
+                //   • numeric                 → literal UID STORE+EXPUNGE → GUARD.
+                // Scoping to the numeric case is also what makes the missing-`Folder`-row
+                // refusal safe here: `draftsFolderPath` falls back to a guessed "Drafts"
+                // only when the account has no drafts-role row, and such an account can
+                // never have produced a numeric `serverDraftId` in the first place — so
+                // the guessed path never reaches the guard, and draft saving cannot brick.
+                if let existingId = draft.serverDraftId, UInt32(existingId) != nil,
+                   try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
+                    return nil
+                }
+
                 let folderId = "\(accountId):\(folderPath)"
                 var rfc822 = draft.rfc822MessageId
 
@@ -1016,6 +1097,18 @@ extension AccountManager {
         do {
             let folderPath = try await draftsFolderPath(accountId: accountId)
             try await dbPool.write { db in
+                // T1.3 — same classification as `queueDraftSave`, by what the provider
+                // DOES with the id rather than by the op's name. `.deleteDraft` drains to
+                // `IMAPProvider.deleteDraft`, which calls `resolveUID(draftId)`: a numeric
+                // id short-circuits straight to `UIDSet(UID(uidValue))` with no SEARCH, so
+                // the following `store(flags: [.deleted])` + `expunge()` is addressed by a
+                // LITERAL UID and mutates whatever occupies it in the CURRENT epoch. A
+                // non-numeric id goes to `searchByMessageId` and is epoch-immune.
+                // This was already acknowledged as a residual C3 vector; it is now guarded.
+                if UInt32(serverDraftId) != nil,
+                   try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
+                    return
+                }
                 // Optimistic removal — draft disappears from UI immediately
                 let folderId = "\(accountId):\(folderPath)"
                 // Remove by server UID (synced header)
