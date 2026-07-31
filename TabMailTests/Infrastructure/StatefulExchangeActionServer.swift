@@ -120,6 +120,30 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.lookupFailuresConsumed }
     }
 
+    /// The EXACT request shape `v2final`'s `resolveActionMessageId` sent, and
+    /// the only shape `failNextLookup()` can consume: a source-folder listing
+    /// whose `$filter` names an RFC identity in angle brackets.
+    ///
+    /// Exposed so a POSITIVE CONTROL can drive the lookup-failure oracle
+    /// directly through this scenario's own `http.session`. `v3` has no
+    /// production path that sends this shape (the RFC-resolution layer is
+    /// exactly what D4 removed), so without such a control every
+    /// `consumedLookupFailureCount() == 0` assertion in the suite would be
+    /// STRUCTURALLY zero — unfalsifiable, and therefore no evidence at all.
+    /// The reference got its `== 1` half for free because an action really did
+    /// send this request; here the control has to send it.
+    ///
+    /// Built here rather than in the test so the URL grammar lives next to
+    /// `rfcIdentity(fromLookupURL:)`/`folderId(fromLookupURL:)`, which parse it.
+    static func rfcFilterLookupURL(folderId: String, rfc822MessageId: String) -> URL {
+        var components = URLComponents(string: "https://graph.microsoft.com/v1.0/me/mailFolders/\(folderId)/messages")!
+        components.queryItems = [
+            URLQueryItem(name: "$select", value: "id"),
+            URLQueryItem(name: "$filter", value: "internetMessageId eq '<\(rfc822MessageId)>'"),
+        ]
+        return components.url!
+    }
+
     func failNextMutation() {
         state.value.withLock { $0.mutationFailuresRemaining += 1 }
     }

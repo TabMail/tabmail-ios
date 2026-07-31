@@ -151,6 +151,29 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.lookupFailuresConsumed }
     }
 
+    /// The EXACT request shape `v2final`'s `resolveActionMessageId` sent, and
+    /// the only shape `failNextLookup()` can consume: a `/messages` list whose
+    /// `q` carries an `rfc822msgid:` term.
+    ///
+    /// Exposed so a POSITIVE CONTROL can drive the lookup-failure oracle
+    /// directly through this scenario's own `http.session`. `v3` has no
+    /// production path that sends this shape — `git grep rfc822msgid` matches
+    /// nothing under `TabMail/` — so without such a control every
+    /// `consumedLookupFailureCount() == 0` assertion in the suite would be
+    /// STRUCTURALLY zero: unfalsifiable, and therefore no evidence at all. The
+    /// reference got its `== 1` half for free because an action really did send
+    /// this request; here the control has to send it.
+    ///
+    /// Built here rather than in the test so the URL grammar lives next to
+    /// `rfcIdentity(fromSearchQuery:)`, which parses it.
+    static func rfcSearchLookupURL(rfc822MessageId: String) -> URL {
+        var components = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        components.queryItems = [
+            URLQueryItem(name: "q", value: "rfc822msgid:\(rfc822MessageId)"),
+        ]
+        return components.url!
+    }
+
     /// Simulate `labelId` deleted remotely between enqueue and drain: any
     /// `/messages/{id}/modify` add/remove naming it, and any source-scoped
     /// `/messages` list query naming it, now returns Gmail's real structural

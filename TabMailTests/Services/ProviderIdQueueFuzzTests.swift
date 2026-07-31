@@ -117,7 +117,8 @@ import Synchronization
 ///        (`PendingOperation.uidResolutionRetryCount`, capped at
 ///        `SyncConfig.maxUidResolutionRetries`) which makes a bounded run of
 ///        misses RECOVERABLE, hence accountable: the op is requeued
-///        (`AccountManagerQueue.swift:591-606`), a later drain resolves it, and
+///        (`AccountManager.executeSingleOp`'s non-move `uidResolutionFailed`
+///        leg), a later drain resolves it, and
 ///        the intention settles `EXECUTED` against the fake server's real end
 ///        state. See `Step.injectEmptySearchResolution` for the accounting and
 ///        for the ONE gesture that is excluded from it.
@@ -243,16 +244,26 @@ struct ProviderIdQueueFuzzTests {
         /// (a). They exist purely so the oracle has something to catch.
         static let bystanderCount = 3
 
-        /// Whole resolution failures ONE `.injectEmptySearchResolution` arm
-        /// buys. The seam's unit is a RESOLUTION, not a `UID SEARCH` command:
+        /// Whole EMPTY RESOLUTIONS one `.injectEmptySearchResolution` arm buys.
+        /// The seam's unit is a RESOLUTION, not a `UID SEARCH` command:
         /// `IMAPProvider.searchByMessageId` issues the bracketed form and then
         /// the bare form, and `FakeIMAPServer` spends the credit only on the
-        /// bare half — so one credit is exactly one thrown
-        /// `ProviderError.uidResolutionFailed`, indivisible by a teardown
-        /// landing between the two commands. That indivisibility is what lets
-        /// the non-vacuity assertion below be sound rather than probabilistic;
-        /// the previous command-counting shape could spend two commands across
-        /// two different attempts and fail no resolution at all.
+        /// bare half — so one credit is exactly one whole empty resolution,
+        /// indivisible by a teardown landing between the two commands. That
+        /// indivisibility is what lets the non-vacuity assertion below be sound
+        /// rather than probabilistic; the previous command-counting shape could
+        /// spend two commands across two different attempts and fail no
+        /// resolution at all.
+        ///
+        /// ⚠ One credit is NOT "exactly one thrown
+        /// `ProviderError.uidResolutionFailed`", as this comment previously
+        /// claimed. `resolveUID` is the only throw site but not
+        /// `searchByMessageId`'s only caller — `move`'s destination probe,
+        /// `currentUIDs`, `appendToSentFolder` and the draft-save legs all read
+        /// empty as an ordinary answer. Consumption therefore BOUNDS the throws
+        /// from above, which is why the post-round audit joins the wire and
+        /// durable sides by identity and asserts an inequality per message
+        /// rather than an equality.
         static let emptySearchResolutionsPerArm = 1
 
         /// Resolution failures a single message may be dealt in one round.
@@ -260,19 +271,34 @@ struct ProviderIdQueueFuzzTests {
         /// DERIVED from the production budget rather than written as a literal,
         /// so the two can never drift: the drain drops the op on the failure
         /// that finds `uidResolutionRetryCount >= SyncConfig
-        /// .maxUidResolutionRetries` (`AccountManagerQueue.swift:591`) — i.e.
-        /// the (budget + 1)-th. Staying one below the budget leaves a whole
-        /// failure of headroom, so no legal schedule can tip a gesture into the
-        /// drop leg this suite deliberately excludes. The headroom is exact,
-        /// not hopeful: ONLY the resolution leg touches this counter
-        /// (`:603`), while ordinary connection blips bump the separate
-        /// `retryCount` (`:661`), so an unrelated fault cannot consume it.
+        /// .maxUidResolutionRetries` (the drop guard in
+        /// `AccountManager.executeSingleOp`'s non-move `uidResolutionFailed`
+        /// leg) — i.e. the (budget + 1)-th. Staying one below the budget leaves
+        /// a whole failure of headroom, so no legal schedule can tip a gesture
+        /// into the drop leg this suite deliberately excludes. The headroom is
+        /// exact, not hopeful: ONLY that leg touches this counter (its
+        /// `uidResolutionRetryCount += 1`), while ordinary connection blips bump
+        /// the separate `retryCount` in the same function's generic transient
+        /// branch, so an unrelated fault cannot consume it.
         ///
-        /// Since the seam became resolution-granular, one admitted arm is
-        /// exactly one increment of `uidResolutionRetryCount` — so this cap is
-        /// not merely an upper bound on the injected pressure, it is the exact
-        /// value the counter can reach, and the post-round audit below asserts
-        /// that equality holds rather than trusting this comment.
+        /// Cited by SYMBOL: the three line numbers this paragraph used to carry
+        /// (`:591`, `:603`, `:661`) were each off by one against
+        /// `AccountManagerQueue.swift` at the time they were written.
+        ///
+        /// **This is an UPPER BOUND on the injected pressure, not an equality**
+        /// — the previous wording claimed the opposite ("the exact value the
+        /// counter can reach … the post-round audit asserts that equality
+        /// holds") and the audit never asserted any equality: it rejects
+        /// `newCount > cap` and nothing else. Two legal schedules keep an
+        /// admitted arm from ever becoming an increment: the freely-scheduled
+        /// second arm can land AFTER its single-shot gesture has already
+        /// settled, and a consumed credit can be spent by a `searchByMessageId`
+        /// caller that is not `resolveUID` and therefore never throws. So
+        /// admitted ≥ consumed ≥ incremented, and only the last two are joined
+        /// tightly enough to compare. The audit below asserts the per-message
+        /// bound that IS provable — increments ≤ credits actually consumed on
+        /// the wire for that same message — plus this cap as the headroom check
+        /// it always was.
         static var maxEmptySearchResolutionsPerMessage: Int {
             max(1, SyncConfig.maxUidResolutionRetries - 1)
         }
@@ -368,7 +394,8 @@ struct ProviderIdQueueFuzzTests {
         /// entirely unfuzzed before this step existed.
         ///
         /// **Why the flag gestures are accountable.** A `resolveUID` miss on a
-        /// non-move op takes `AccountManagerQueue.swift:577-606`: while
+        /// non-move op takes `AccountManager.executeSingleOp`'s non-move
+        /// `ProviderError.uidResolutionFailed` leg: while
         /// `uidResolutionRetryCount < SyncConfig.maxUidResolutionRetries` the
         /// op is written back `.queued` with the counter bumped and the lane
         /// halted — the account is explicitly NOT marked failed, so the very
@@ -380,10 +407,11 @@ struct ProviderIdQueueFuzzTests {
         ///
         /// **Why `.archive` is excluded — the ACTUAL reason.** A `.move` op has
         /// no retry budget at all. Its resolution miss takes the destination
-        /// probe at `:546-576`, and when the message is not in the destination
-        /// either — which is exactly the state an armed false negative
-        /// manufactures, since the message is still sitting in INBOX — the leg
-        /// is "Confirmed stale … dropping" (`:556`) on the FIRST miss. The op
+        /// probe in the same function's `type == .move` branch, and when the
+        /// message is not in the destination either — which is exactly the state
+        /// an armed false negative manufactures, since the message is still
+        /// sitting in INBOX — the leg is "Confirmed stale … dropping" on the
+        /// FIRST miss. The op
         /// row is deleted with the move never performed, so the intention has
         /// neither an achieved end state nor (until `T4.V8` builds the refusal
         /// channel) any way to be REPORTED. The ledger has no accepted
@@ -539,6 +567,22 @@ struct ProviderIdQueueFuzzTests {
                 return true
             }
         }
+
+        /// Identity → arms this round actually ADMITTED for it.
+        ///
+        /// The post-round audit needs this because "the identities the fault was
+        /// allowed to target" and "the identities the fault was actually armed
+        /// against" are different sets, and attributing a durable failure to the
+        /// former proves nothing: a round may admit arms for one message and
+        /// none for another, and a failure recorded against the un-armed one
+        /// would still be inside the permitted set. Admitted is still only an
+        /// upper bound on consumed — an arm placed after its single-shot gesture
+        /// settled is never spent — so the audit compares durable increments
+        /// against the WIRE's consumption, and uses this only to state which
+        /// identities the round could possibly have pressured.
+        func admittedTargets() -> [String: Int] {
+            dealt.withLock { $0 }
+        }
     }
 
     /// Arm ONE successful-but-empty resolution against `messageId`, subject to
@@ -567,16 +611,23 @@ struct ProviderIdQueueFuzzTests {
 
     /// Test-only audit of the ONE durable side effect the drain's non-move
     /// `uidResolutionFailed` branch leaves behind: `updated
-    /// .uidResolutionRetryCount += 1` followed by `save`
-    /// (`AccountManagerQueue.swift:600-605`).
+    /// .uidResolutionRetryCount += 1` followed by `save`, in
+    /// `AccountManager.executeSingleOp`'s non-move `uidResolutionFailed` leg.
     ///
     /// That statement is the only writer of that column in the app target, and
     /// it is reachable only from a thrown `ProviderError.uidResolutionFailed`
     /// on a single-message NON-move op. The `.move` leg drops or falls through
-    /// without touching it (`:546-576`, `:610-615`), and every ordinary
-    /// transient bumps the separate `retryCount` (`:661`). So a recorded
-    /// increment proves two things at once: a resolution genuinely failed, AND
-    /// the failure reached the queue's failure path and was committed.
+    /// without touching it (the `type == .move` destination-probe branch, and
+    /// the fall-through re-queue after the non-move branch), and every ordinary
+    /// transient bumps the separate `retryCount` in the same function's generic
+    /// connection/transient-error branch. So a recorded increment proves two
+    /// things at once: a resolution genuinely failed, AND the failure reached
+    /// the queue's failure path and was committed.
+    ///
+    /// Cited by SYMBOL. The `` `:661` `` this block carried named a COMMENT
+    /// line, not the `retryCount += 1` statement it claimed — a citation this
+    /// same commit had just written while rewriting others for exactly that
+    /// hazard.
     ///
     /// ## Why a trigger, and not a query after the round
     ///
@@ -1076,9 +1127,11 @@ struct ProviderIdQueueFuzzTests {
 
             // ---- Non-vacuity: the identity-resolution FAILURE PATH really ran.
             //
-            // Two-sided, and both sides are load-bearing — the reference's SF2
-            // shape, quoted in `installResolutionFailureAudit`. Neither half is
-            // a proof on its own:
+            // Two-sided, both sides load-bearing, and — the part an earlier
+            // revision left out — JOINED BY IDENTITY. The reference's SF2 shape,
+            // quoted in `installResolutionFailureAudit`. Neither half is a proof
+            // on its own, and the pair is not a proof either unless both halves
+            // name the same message:
             //
             //  * The WIRE side proves the fake served a whole empty resolution.
             //    It cannot prove the drain reacted to it.
@@ -1089,6 +1142,14 @@ struct ProviderIdQueueFuzzTests {
             //    injected LOGIN `NO`) are transport errors that take the
             //    generic branch and bump the SEPARATE `retryCount`, so they
             //    cannot forge it.
+            //  * The JOIN is what turns "both numbers are non-zero" into "the
+            //    durable failure belongs to the message whose empty resolution
+            //    was armed". Previously the wire figure was a single aggregate
+            //    carrying no identity at all, and the durable rows — which DO
+            //    carry identity — were checked against the three ARMABLE
+            //    identities rather than the ones actually armed and consumed.
+            //    Neither comparison could distinguish the intended case from a
+            //    round that pressured one message and failed a different one.
             //
             // ⚠ This replaced a guard that counted `UID SEARCH` COMMANDS and
             // claimed the count proved a resolution had failed. It did not: a
@@ -1110,10 +1171,28 @@ struct ProviderIdQueueFuzzTests {
             // return until the queue is empty. So at least one whole armed
             // resolution is necessarily served AND necessarily observed by the
             // drain.
-            let servedEmptyResolutions = server.consumedEmptySearchResolutionCount()
+            // ⚠ THE HALVES MUST BE JOINED BY IDENTITY. An aggregate wire count
+            // paired with a durable failure recorded against *some* message
+            // establishes only that each number is non-zero. It does NOT
+            // establish "the durable failure belongs to the message whose empty
+            // resolution was armed" — the sentence this block exists to prove.
+            // A round that armed message A, served A's resolution, and recorded
+            // a failure against B for an unrelated reason would satisfy both
+            // one-sided halves and satisfy an attribution check written against
+            // the three ARMABLE identities (B is armable; it was simply never
+            // armed). Both sides are therefore read PER MESSAGE-ID and the
+            // comparison is made on the same key.
+            let consumedByIdentity = server.consumedEmptySearchResolutions()
+            let servedEmptyResolutions = consumedByIdentity.values.reduce(0, +)
             #expect(
                 servedEmptyResolutions >= FuzzConfig.emptySearchResolutionsPerArm,
                 "\(seedHex) round \(round): no whole empty-SEARCH resolution was ever served on the wire (served \(servedEmptyResolutions)) — the identity-resolution dimension was not exercised"
+            )
+            // The keyed map and the aggregate counter are written in the same
+            // locked mutation, so a divergence means the seam itself is broken.
+            #expect(
+                servedEmptyResolutions == server.consumedEmptySearchResolutionCount(),
+                "\(seedHex) round \(round): the fake's keyed and aggregate empty-resolution counters disagree (\(servedEmptyResolutions) vs \(server.consumedEmptySearchResolutionCount())) — the wire seam is miscounting"
             )
 
             let resolutionFailures = try await recordedResolutionFailures(pool: fixture.pool)
@@ -1122,21 +1201,59 @@ struct ProviderIdQueueFuzzTests {
                 "\(seedHex) round \(round): NO durable identity-resolution failure was recorded — \(servedEmptyResolutions) empty resolution(s) were served on the wire, but the drain's uidResolutionFailed branch never bumped uidResolutionRetryCount, so nothing in this round proves the production failure path executed"
             )
 
-            // Attribution + headroom. Every recorded failure must belong to a
-            // gesture the fault was allowed to target, and must have stayed
-            // inside the arm budget. The second half is the machine check for
-            // the headroom `FuzzConfig.maxEmptySearchResolutionsPerMessage`
-            // states in prose: a counter above it means a gesture was walking
-            // toward the drop leg at `SyncConfig.maxUidResolutionRetries` that
-            // this suite deliberately excludes from its ledger.
-            let armableIdentities = Set(
-                [headers.markRead, headers.markUnread, headers.markFlagged].map(Self.durableIdentity)
-            )
-            let misattributed = resolutionFailures.filter { !armableIdentities.contains($0.durableId) }
+            // (1) ATTRIBUTION, against what was actually CONSUMED — not against
+            // what was merely armable. Every durable increment must name a
+            // message this round genuinely drove to an empty resolution on the
+            // wire. `admittedTargets()` is reported in the failure message for
+            // diagnosis but is deliberately NOT the comparison set: an arm can
+            // be admitted and never spent (it may land after its single-shot
+            // gesture has already settled), so admitted ⊋ consumed.
+            let admitted = emptySearchBudget.admittedTargets()
+            let consumedIdentities = Set(consumedByIdentity.keys)
+            let misattributed = resolutionFailures.filter { !consumedIdentities.contains($0.durableId) }
             #expect(
                 misattributed.isEmpty,
-                "\(seedHex) round \(round): identity-resolution failure(s) recorded against message(s) the fault never targeted: \(misattributed.map(\.durableId))"
+                "\(seedHex) round \(round): identity-resolution failure(s) recorded against message(s) whose resolution was never driven empty on the wire: \(misattributed.map(\.durableId)) — consumed=\(consumedByIdentity), admitted=\(admitted)"
             )
+
+            // (2) THE JOIN ITSELF. At least one identity must appear on BOTH
+            // sides. Without this the two `!isEmpty`/`>= 1` checks above can be
+            // satisfied by disjoint messages, which is exactly the gap that made
+            // the previous "two-sided" guard one-sided twice over.
+            let failedIdentities = Set(resolutionFailures.map(\.durableId))
+            #expect(
+                !failedIdentities.intersection(consumedIdentities).isEmpty,
+                "\(seedHex) round \(round): the wire and durable halves never named the same message — consumed \(consumedIdentities), failed \(failedIdentities). Both halves are non-empty, so each one-sided check passes, yet nothing links the drain's failure to the resolution this round actually armed"
+            )
+
+            // (3) PER-MESSAGE COUNT BOUND, replacing the bound against a
+            // constant. Each durable increment for a message needs its own
+            // consumed credit for that SAME message, so the highest
+            // `uidResolutionRetryCount` a message reached can never exceed the
+            // credits the wire spent on it. This is the tightest relation that
+            // is actually provable: it is `<=` rather than `==` because a
+            // consumed credit can be spent by a `searchByMessageId` caller that
+            // is not `resolveUID` (`move`'s destination probe, `currentUIDs`,
+            // `appendToSentFolder`, the draft-save legs) and therefore never
+            // throws — see `FakeIMAPServer.consumedEmptySearchResolutionCount()`
+            // caveat 2. Asserting equality here would pin a claim the system
+            // does not make.
+            var increments: [String: Int] = [:]
+            for failure in resolutionFailures {
+                increments[failure.durableId] = max(increments[failure.durableId] ?? 0, failure.newCount)
+            }
+            let unbacked = increments.filter { $0.value > (consumedByIdentity[$0.key] ?? 0) }
+            #expect(
+                unbacked.isEmpty,
+                "\(seedHex) round \(round): uidResolutionRetryCount rose higher than the empty resolutions the wire actually served for that message: \(unbacked) vs consumed=\(consumedByIdentity) — an increment with no armed resolution behind it means something other than the injected fault is driving the failure path"
+            )
+
+            // (4) HEADROOM. Unchanged in force, corrected in description: this
+            // is the arm budget's UPPER BOUND, never an equality (see
+            // `FuzzConfig.maxEmptySearchResolutionsPerMessage`). A counter above
+            // it means a gesture was walking toward the drop leg at
+            // `SyncConfig.maxUidResolutionRetries` that this suite deliberately
+            // excludes from its ledger.
             let overBudget = resolutionFailures.filter { $0.newCount > FuzzConfig.maxEmptySearchResolutionsPerMessage }
             #expect(
                 overBudget.isEmpty,

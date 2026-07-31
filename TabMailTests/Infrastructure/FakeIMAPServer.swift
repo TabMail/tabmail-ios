@@ -118,9 +118,24 @@ final class FakeIMAPServer: @unchecked Sendable {
         var emptySearchResolutionCountdowns: [String: Int] = [:]
         /// Whole resolutions this fake has actually driven to empty — i.e. the
         /// number of times it served the BARE half of a bracketed-then-bare
-        /// pair with zero UIDs, which is the exact wire event that makes
-        /// `IMAPProvider.resolveUID` throw `uidResolutionFailed`.
+        /// pair with zero UIDs.
+        ///
+        /// ⚠ That is a statement about the WIRE, not about
+        /// `uidResolutionFailed`. `IMAPProvider.searchByMessageId` has several
+        /// direct callers besides `IMAPProvider.resolveUID` — `move`'s
+        /// destination probe, `currentUIDs`, `appendToSentFolder`'s dedup
+        /// check, and the draft-save/stale-draft legs — and NONE of those
+        /// throws `uidResolutionFailed` on an empty result. Only `resolveUID`
+        /// does. So a served empty resolution is a NECESSARY, not a sufficient,
+        /// condition for the throw, and the count is an upper bound on the
+        /// throws it can have caused.
         var consumedEmptySearchResolutionCount = 0
+        /// The same events keyed by bare Message-ID. The aggregate above is
+        /// unjoinable: it cannot say WHICH message was driven empty, so pairing
+        /// it with a durable side effect recorded against some message proves
+        /// only that both numbers are non-zero, never that they describe the
+        /// same message. Every consumer that needs a two-sided proof reads this.
+        var consumedEmptySearchResolutionsByMessageId: [String: Int] = [:]
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
         /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
@@ -569,10 +584,23 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// served empty while a credit is outstanding but spends nothing, which
     /// makes the pair ATOMIC with respect to teardown: a connection that dies
     /// mid-pair leaves the credit intact and the next attempt is dealt a whole
-    /// fresh pair. One credit therefore means exactly one
-    /// `ProviderError.uidResolutionFailed`, so both the injected-fault budget
-    /// and `consumedEmptySearchResolutionCount()` count the thing the caller
-    /// actually reasons about.
+    /// fresh pair. One credit therefore buys exactly one whole EMPTY RESOLUTION
+    /// — one indivisible wire event — which is what both the injected-fault
+    /// budget and `consumedEmptySearchResolutions()` count.
+    ///
+    /// **⚠ A whole empty resolution is not the same thing as a thrown
+    /// `ProviderError.uidResolutionFailed`, and this comment used to say it
+    /// was.** `IMAPProvider.resolveUID` is the only site in the app target that
+    /// throws it, but it is NOT `IMAPProvider.searchByMessageId`'s only caller:
+    /// `move`'s destination probe (which wraps the call in `try?` and reads
+    /// empty as "not yet copied"), `currentUIDs`, `appendToSentFolder`'s dedup
+    /// check and the draft-save/stale-draft legs all call it directly, and every
+    /// one of them treats an empty result as an ordinary answer rather than a
+    /// failure. A credit is therefore consumed by whichever caller reaches the
+    /// bare half first, and only the `resolveUID` ones become
+    /// `uidResolutionFailed`. Consumption BOUNDS the throws from above; it does
+    /// not equal them. A test that needs the throw itself must observe the
+    /// throw's own durable side effect and join it to this seam BY IDENTITY.
     ///
     /// `messageId` is matched with angle brackets stripped from both sides, so
     /// either form may be passed.
@@ -590,18 +618,45 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     /// How many whole armed resolutions this fake has actually driven to empty
     /// — i.e. how many times it served the BARE half of a bracketed-then-bare
-    /// pair with zero UIDs, which is precisely the wire event that makes
-    /// `IMAPProvider.resolveUID` throw. A fuzzer asserts this is non-zero so
-    /// that an arming path which silently stopped firing cannot leave the suite
-    /// a green-always control.
+    /// pair with zero UIDs. A fuzzer asserts this is non-zero so that an arming
+    /// path which silently stopped firing cannot leave the suite a green-always
+    /// control.
     ///
-    /// ⚠ This is a WIRE-side observation and proves only that the fake did its
-    /// job. It does NOT prove the drain's failure branch ran — that needs a
-    /// durable, production-written observation, which is why
-    /// `ProviderIdQueueFuzzTests` pairs this with the queue's own
-    /// `uidResolutionRetryCount` side effect rather than resting on it alone.
+    /// ⚠ Two things this does NOT say.
+    ///
+    /// 1. It is a WIRE-side observation and proves only that the fake did its
+    ///    job — never that the drain's failure branch ran. That needs a durable,
+    ///    production-written observation, which is why `ProviderIdQueueFuzzTests`
+    ///    pairs it with the queue's own `uidResolutionRetryCount` side effect
+    ///    rather than resting on it alone.
+    /// 2. A served empty bare search is NOT equivalent to a thrown
+    ///    `ProviderError.uidResolutionFailed`. `IMAPProvider.resolveUID` is the
+    ///    only throw site, but it is not `IMAPProvider.searchByMessageId`'s only
+    ///    caller — `move`'s destination probe, `currentUIDs`,
+    ///    `appendToSentFolder` and the draft-save legs all call it directly and
+    ///    all treat empty as an ordinary answer. So this counts the wire event
+    ///    that ENABLES the throw, and bounds the throws from above; it does not
+    ///    count throws.
+    ///
+    /// Use `consumedEmptySearchResolutions()` when the two sides have to be
+    /// joined by identity rather than merely both being non-zero.
     func consumedEmptySearchResolutionCount() -> Int {
         withState { $0.consumedEmptySearchResolutionCount }
+    }
+
+    /// The same consumption, keyed by bare Message-ID: identity → how many whole
+    /// armed resolutions of THAT message this fake drove empty.
+    ///
+    /// This is what makes a two-sided non-vacuity proof actually two-sided. An
+    /// aggregate wire count paired with a durable failure recorded against some
+    /// message establishes only that each side is non-zero — the durable failure
+    /// may belong to a message whose resolution was never armed, and the served
+    /// resolution may belong to a message that never failed durably. Comparing
+    /// per identity closes that gap, and gives a per-message upper bound
+    /// (see this type's `consumedEmptySearchResolutionCount()` caveat 2 for why
+    /// it is a bound and not an equality).
+    func consumedEmptySearchResolutions() -> [String: Int] {
+        withState { $0.consumedEmptySearchResolutionsByMessageId }
     }
 
     /// Owner-directed adversarial fuzzer addendum — see `State
@@ -1506,6 +1561,15 @@ final class FakeIMAPServer: @unchecked Sendable {
                     if !isBracketedHalf {
                         state.emptySearchResolutionCountdowns[bareQuery] = remaining - 1
                         state.consumedEmptySearchResolutionCount += 1
+                        // Same event, recorded WITH its identity. The aggregate
+                        // counter above cannot be joined to anything: a durable
+                        // side effect attributed to message A is not evidence
+                        // that A's resolution was the one driven empty when the
+                        // only wire figure available is a total across all
+                        // messages. Keyed, the two halves of a non-vacuity proof
+                        // can be compared per identity instead of merely both
+                        // being non-zero.
+                        state.consumedEmptySearchResolutionsByMessageId[bareQuery, default: 0] += 1
                     }
                     return true
                 }
@@ -1617,7 +1681,13 @@ final class FakeIMAPServer: @unchecked Sendable {
     private func parseUIDSet(_ value: String) -> [Int] {
         value.split(separator: ",").flatMap { component -> [Int] in
             let bounds = component.split(separator: ":").compactMap { Int($0) }
-            if bounds.count == 2 {
+            // `bounds[0] <= bounds[1]` is NOT redundant with the count check.
+            // `Array(5...2)` is a `fatalError`, not a thrown error, so a
+            // descending range — syntactically valid IMAP, and reachable from
+            // any randomized/fuzzed command stream — would kill the ENTIRE test
+            // process and take every unrelated result with it, rather than
+            // failing one case. A malformed set resolves to no UIDs instead.
+            if bounds.count == 2, bounds[0] <= bounds[1] {
                 return Array(bounds[0]...bounds[1])
             }
             return bounds.first.map { [$0] } ?? []

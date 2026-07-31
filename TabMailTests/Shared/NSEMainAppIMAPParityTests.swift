@@ -60,9 +60,11 @@ struct NSEMainAppIMAPParityTests {
     /// method and needs a live IMAP connection to instantiate — we can't
     /// call it directly from a unit test. Instead we assert against the
     /// exact expressions the production code uses (see
-    /// `IMAPProvider.mapMessageInfo`, symbol-cited: line numbers into
-    /// `IMAPProvider.swift` are abolished tree-wide because any edit to that
-    /// file silently falsifies them here), so drift in IMAPProvider shows
+    /// `IMAPProvider.mapMessageInfo`, symbol-cited: line citations into
+    /// `IMAPProvider.swift` are abolished in SWIFT SOURCES because any edit to
+    /// that file silently falsifies them here — ~180 stale ones do still survive
+    /// in `PLAN_*.md` and `analysis/v3-recon/*.md`, which this convention does
+    /// not reach), so drift in IMAPProvider shows
     /// up here as a failure.
     @Test("Shared helpers produce the per-field output both NSE + main-app use")
     func sharedHelpersByteIdentical() {

@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import Foundation
 import Testing
 @testable import TabMail
 
@@ -25,7 +26,25 @@ import Testing
 /// share one RFC, and addressing one by provider id must move only that one.
 /// `failNextLookup()` arms a failure that ONLY an `rfc822msgid:` search can
 /// consume, so `consumedLookupFailureCount() == 0` after a full action
-/// sequence is a wire-level proof that no v3 path resolves an action by RFC.
+/// sequence is a wire-level proof that **no `GmailProvider` method** resolves
+/// an action by RFC. Every such assertion is ARMED first — an unarmed
+/// `== 0` cannot fail and proves nothing — and
+/// `armedLookupFailureIsConsumedByAnRfcSearch` is the matching POSITIVE
+/// CONTROL that the oracle actually fires.
+///
+/// **⚠ ADAPTER BOUNDARY, NOT SYSTEM BOUNDARY.** The scope of that proof is
+/// `GmailProvider`, the layer at which `ids` are already Gmail resource ids. It
+/// is NOT a system property. `AccountManager.markRead`/`markUnread` call
+/// `expandWithSiblingsByRfc822` BEFORE anything is queued, and that helper
+/// selects every `messageHeader` row sharing the RFC 822 Message-ID for the
+/// account — no folder filter, no provider-id qualification — then queues each
+/// sibling's native id. So at the SYSTEM boundary a duplicate-RFC gesture still
+/// fans out to both copies, and this suite says nothing about that. Tracked as
+/// **D-26** in `PLAN_IOS_REFACTOR_V3.md`; the system-boundary proof is still
+/// OWED and must be written red-first against `AccountManager`, never lowered
+/// to this boundary to make it pass. `v2final` has the identical helper with
+/// identical SQL, so narrowing it is a production behaviour change that needs
+/// its own tier — it must not be smuggled into a test fix.
 ///
 /// **No `.processGlobalState`.** `v2final` leaves both Stateful*ActionServer
 /// suites unannotated, and neither swaps `AppDatabase.shared` nor mutates
@@ -243,7 +262,23 @@ struct StatefulGmailActionServerTests {
             labels: ["INBOX", "UNREAD"]
         ))
 
-        #expect(server.modifyLog().allSatisfy { $0.providerMessageId == gone })
+        // `allSatisfy` over an EMPTY collection is vacuously TRUE, so the
+        // non-emptiness assertion below is load-bearing rather than decorative:
+        // an adapter that issued no modify at all — or one that threw before
+        // reaching the wire — would satisfy the `allSatisfy` while proving
+        // nothing about which resource a stale provider id addresses. The
+        // fixture appends to `modifyLog` on ENTRY to the `/messages/{id}/modify`
+        // route, before the 404 is decided, so the attempt on a gone id is
+        // genuinely recorded and the non-emptiness assertion is satisfiable.
+        let modifyAttempts = server.modifyLog()
+        #expect(
+            !modifyAttempts.isEmpty,
+            "the adapter issued no modify at all — this leg constrains nothing about where a stale provider id lands"
+        )
+        #expect(
+            modifyAttempts.allSatisfy { $0.providerMessageId == gone },
+            "a modify named a resource other than the stale id: \(modifyAttempts.map(\.providerMessageId))"
+        )
         #expect(
             server.consumedLookupFailureCount() == 0,
             "a stale provider id must not trigger an rfc822msgid: fallback search"
@@ -252,11 +287,13 @@ struct StatefulGmailActionServerTests {
 
     /// Port of the reference's `ordinaryFolderListings`.
     ///
-    /// Dropped: the two `failNextLookup()` / `consumedLookupFailureCount() == 1`
-    /// legs, which asserted that a listing does NOT consume the action-lookup
-    /// budget while a subsequent action DOES. The second half is unreachable on
-    /// `v3` — no code path issues an `rfc822msgid:` search — so it is asserted
-    /// in its inverted, v3-meaningful form in `duplicateRfc…` above instead.
+    /// The reference armed `failNextLookup()`, asserted a listing did NOT
+    /// consume it (`== 0`), then ran an RFC-addressed ACTION and asserted it DID
+    /// (`== 1`). The first half ports verbatim and is restored below. The second
+    /// half is unreachable from any adapter method on `v3` — no code path issues
+    /// an `rfc822msgid:` search — so the oracle's `== 1` obligation is
+    /// discharged by `armedLookupFailureIsConsumedByAnRfcSearch`, which drives
+    /// the same route directly. Both halves exist; only the driver changed.
     @Test("ordinary Gmail folder listings decode membership, fields, and limits")
     func ordinaryFolderListingsDecodeMembershipFieldsAndLimits() async throws {
         let inboxRFC = "gmail-list-inbox@example.com"
@@ -270,7 +307,15 @@ struct StatefulGmailActionServerTests {
         defer { server.close() }
         let provider = server.provider()
 
+        // Reference leg 1: an ordinary listing must not spend the action-lookup
+        // budget. Armed, so the `== 0` below can actually fail.
+        server.failNextLookup()
+
         let inbox = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        #expect(
+            server.consumedLookupFailureCount() == 0,
+            "an ordinary folder listing must not consume the action-lookup budget — it issues no rfc822msgid: search"
+        )
         #expect(inbox.count == 1)
         guard inbox.count == 1 else { return }
         #expect(inbox[0].messageId == "gmail-list-1")
@@ -360,5 +405,112 @@ struct StatefulGmailActionServerTests {
         guard log.count == 1 else { return }
         #expect(log[0].providerMessageId == providerMessageId)
         #expect(Set(log[0].removeLabelIds) == ["INBOX", legacyLabelId])
+    }
+
+    /// **The positive control for `consumedLookupFailureCount()`** — `v2final`'s
+    /// `== 1` half, restored (RULE R0).
+    ///
+    /// Three assertions in this file read `consumedLookupFailureCount() == 0`.
+    /// All three are armed, but arming alone is not enough: if the fixture's
+    /// `/messages` route stopped matching, or `rfcIdentity(fromSearchQuery:)`
+    /// stopped parsing `rfc822msgid:`, or the counter stopped being written,
+    /// every one of those zeros would stay green while proving nothing at all.
+    /// A `== 0` oracle with no `== 1` anywhere in the suite is a claim about a
+    /// counter, not about the adapter.
+    ///
+    /// The reference produced its `== 1` from a real action, because `v2final`'s
+    /// `GmailProvider` resolved RFC identities through an `rfc822msgid:` search.
+    /// `v3` deleted that layer — `git grep rfc822msgid` matches nothing under
+    /// `TabMail/` — so the reference's DRIVER cannot transfer (R0 outcome 2)
+    /// even though the obligation does. Driving the request straight over the
+    /// scenario's own session exercises the identical route, extraction and
+    /// counter, so a dead hook fails here rather than silently certifying the
+    /// rest of the file.
+    @Test("the armed lookup failure IS consumed by an rfc822msgid: search — the oracle fires")
+    func armedLookupFailureIsConsumedByAnRfcSearch() async throws {
+        let rfc822MessageId = "gmail-positive-control@example.com"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: rfc822MessageId,
+            providerMessageId: "gmail-positive-control-1",
+            labels: ["INBOX", "UNREAD"]
+        )])
+        defer { server.close() }
+
+        // Baseline: nothing about fixture construction pre-loads the counter.
+        #expect(server.consumedLookupFailureCount() == 0)
+
+        server.failNextLookup()
+
+        let url = StatefulGmailActionServer.rfcSearchLookupURL(rfc822MessageId: rfc822MessageId)
+        let (_, response) = try await server.http.session.data(from: url)
+        #expect(
+            (response as? HTTPURLResponse)?.statusCode == 503,
+            "the armed lookup failure must surface as the fixture's 503, proving the request matched the rfc822msgid: route"
+        )
+        #expect(
+            server.consumedLookupFailureCount() == 1,
+            "an rfc822msgid: search MUST consume the armed lookup failure — if it does not, every `== 0` assertion in this suite is vacuous"
+        )
+
+        // Single-shot: the credit measures armed consumption, not traffic.
+        let (_, secondResponse) = try await server.http.session.data(from: url)
+        #expect((secondResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(server.consumedLookupFailureCount() == 1)
+    }
+
+    /// **`GmailProvider` must not escape its injected `URLSession`.**
+    ///
+    /// `v2final` passed `session: testSession` at four sites in this file; `v3`
+    /// had dropped it to one (`authedHTTP`), leaving `deleteDraft` and
+    /// `fetchHistory` — the delta-sync path — building their requests with no
+    /// session at all. Both then fell back to `sharedEphemeralSession` and
+    /// issued LIVE HTTPS requests to `gmail.googleapis.com` from the unit suite:
+    /// nondeterministic, slow, and a data leak from a public repo's test run.
+    /// The sibling `ExchangeProvider.deleteDraft` regression is what made this
+    /// visible (a real `Code=401` from Microsoft during the port).
+    ///
+    /// This case pins the restoration at the only boundary that can distinguish
+    /// the two worlds: whether the request reached THIS scenario's fake. Both
+    /// routes are registered on the scenario rather than baked into
+    /// `StatefulGmailActionServer`, because neither belongs to the action
+    /// surface the fixture models — they exist here purely as escape detectors.
+    /// Drop `session: testSession` again and the fake records nothing, the
+    /// canned bodies never arrive, and every assertion below goes red.
+    @Test("GmailProvider.deleteDraft and .fetchHistory route through the injected session, never the shared one")
+    func deleteDraftAndFetchHistoryUseTheInjectedSession() async throws {
+        let providerMessageId = "gmail-session-escape-1"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "gmail-session-escape@example.com",
+            providerMessageId: providerMessageId,
+            labels: ["DRAFT"]
+        )])
+        defer { server.close() }
+        let provider = server.provider()
+
+        server.http.register(path: "/drafts/", method: "DELETE", response: .status(204))
+        server.http.register(
+            path: "/history",
+            method: "GET",
+            response: .json(raw: #"{"historyId":"424242","history":[{"messagesAdded":[{"message":{"id":"gmail-history-added-1","labelIds":["INBOX"]}}]}]}"#)
+        )
+
+        try await provider.deleteDraft(draftId: providerMessageId, draftsFolderPath: "Drafts")
+
+        let history = try await provider.fetchHistory(since: "424241")
+        #expect(history != nil, "fetchHistory returned nil — the canned delta never arrived, so the request did not reach the fake")
+        guard let history else { return }
+        #expect(history.newHistoryId == "424242")
+        #expect(history.messagesAdded.count == 1)
+        #expect(history.messagesAdded.first?.messageId == "gmail-history-added-1")
+
+        let calls = server.http.recordedCalls()
+        #expect(
+            calls.contains { $0.method == "DELETE" && $0.url.contains("/drafts/\(providerMessageId)") },
+            "the fake recorded no DELETE /drafts/… — deleteDraft escaped to the live Gmail endpoint"
+        )
+        #expect(
+            calls.contains { $0.method == "GET" && $0.url.contains("/history") },
+            "the fake recorded no GET /history — fetchHistory escaped to the live Gmail endpoint"
+        )
     }
 }

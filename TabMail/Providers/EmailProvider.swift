@@ -180,10 +180,12 @@ protocol EmailProvider: Sendable {
     /// from inside a GRDB write closure, which cannot `await`.
     ///
     /// REFERENCE (`v2final`, tag `e28dd4edb`): the same member and the same
-    /// `nil` default — `EmailProvider.swift:210` / `:352`, backed by
-    /// `IMAPProvider.lastObservedUidValidityBox` (symbol-cited on purpose: the
-    /// line-number convention into `IMAPProvider.swift` is abolished tree-wide,
-    /// because any edit to that file silently falsifies a number cited here). The
+    /// `nil` default — `v2final:TabMail/Providers/EmailProvider.swift:210` /
+    /// `:352`, backed by `IMAPProvider.lastObservedUidValidityBox` (symbol-cited
+    /// on purpose: line citations into `IMAPProvider.swift` are abolished in
+    /// SWIFT SOURCES, because any edit to that file silently falsifies a number
+    /// cited here — ~180 stale ones do still survive in `PLAN_*.md` and
+    /// `analysis/v3-recon/*.md`, which this convention does not reach). The
     /// no-stale-fallback rule above is an ADDITION to the reference, required
     /// because v3's consumer writes the value instead of comparing it — see
     /// `IMAPProvider.selectMailboxTracked`.

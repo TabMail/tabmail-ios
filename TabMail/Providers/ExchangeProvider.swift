@@ -595,7 +595,7 @@ actor ExchangeProvider: EmailProvider {
         let token = try await accessToken(false)
         let result = try await performHTTPRequestWithRetry(
             url: baseURL + "/messages/\(draftId)", method: "DELETE", body: nil, token: token,
-            retryableStatusCodes: [429], logLabel: "Exchange"
+            retryableStatusCodes: [429], session: testSession, logLabel: "Exchange"
         )
         if result.statusCode == 404 {
             print("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success")
@@ -604,7 +604,7 @@ actor ExchangeProvider: EmailProvider {
         if result.data != nil { return }
         if result.statusCode == 401 {
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(draftId)", method: "DELETE", body: nil, token: freshToken)
+            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(draftId)", method: "DELETE", body: nil, token: freshToken, session: testSession)
             if retry.statusCode == 404 || retry.data != nil { return }
             throw ProviderError.networkError(underlying: NSError(domain: "Exchange", code: retry.statusCode))
         }

@@ -24,11 +24,13 @@ actor MockEmailProvider: EmailProvider {
     /// SYMBOL, not line: `IMAPProvider.swift` grows on this branch and even a
     /// comment-only edit there shifts every line citation into it) — the
     /// protocol requirement is synchronous
-    /// (`EmailProvider.swift:188`; callers include a GRDB write closure, which
-    /// cannot `await`), so an actor-isolated `var` cannot satisfy it.
+    /// (`EmailProvider.lastObservedUidValidity(folderPath:)`; callers include a
+    /// GRDB write closure, which cannot `await`), so an actor-isolated `var`
+    /// cannot satisfy it.
     ///
     /// **Without this override the mock inherits the protocol's `nil` default
-    /// (`EmailProvider.swift:258`), and every mock-driven test of "capture the
+    /// (the `extension EmailProvider` implementation of the same requirement),
+    /// and every mock-driven test of "capture the
     /// folder epoch" observes `nil` on BOTH sides of whatever it is comparing —
     /// passing without ever executing the branch it was written for.** That is
     /// the vacuous-assertion shape the plan's structural finding (c) names.

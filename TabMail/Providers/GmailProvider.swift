@@ -545,12 +545,12 @@ actor GmailProvider: EmailProvider {
         // No logLabel — 404 is expected (draftId may be a message ID, not a draft resource ID)
         let result = try await performHTTPRequestWithRetry(
             url: baseURL + "/drafts/\(draftId)", method: "DELETE", body: nil, token: token,
-            retryableStatusCodes: [429, 403]
+            retryableStatusCodes: [429, 403], session: testSession
         )
         if result.data != nil { return }
         if result.statusCode == 401 {
             token = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + "/drafts/\(draftId)", method: "DELETE", body: nil, token: token)
+            let retry = try await performHTTPRequest(url: baseURL + "/drafts/\(draftId)", method: "DELETE", body: nil, token: token, session: testSession)
             if retry.data != nil { return }
             if retry.statusCode != 404 {
                 throw ProviderError.networkError(underlying: NSError(domain: "Gmail", code: retry.statusCode))
@@ -562,7 +562,7 @@ actor GmailProvider: EmailProvider {
             // No logLabel — 404 here means already deleted, also handled gracefully
             let trashResult = try await performHTTPRequestWithRetry(
                 url: baseURL + "/messages/\(draftId)/trash", method: "POST", body: nil, token: token,
-                retryableStatusCodes: [429, 403]
+                retryableStatusCodes: [429, 403], session: testSession
             )
             if trashResult.data != nil { return }
             if trashResult.statusCode == 404 {
@@ -571,7 +571,7 @@ actor GmailProvider: EmailProvider {
             }
             if trashResult.statusCode == 401 {
                 let freshToken = try await accessToken(true)
-                let retry = try await performHTTPRequest(url: baseURL + "/messages/\(draftId)/trash", method: "POST", body: nil, token: freshToken)
+                let retry = try await performHTTPRequest(url: baseURL + "/messages/\(draftId)/trash", method: "POST", body: nil, token: freshToken, session: testSession)
                 if retry.statusCode == 404 || retry.data != nil { return }
                 throw ProviderError.networkError(underlying: NSError(domain: "Gmail", code: retry.statusCode))
             }
@@ -813,7 +813,7 @@ actor GmailProvider: EmailProvider {
         // to full sync, matching legacy behavior.
         let http = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
-            retry: .gmail, logLabel: "Gmail"
+            retry: .gmail, logLabel: "Gmail", session: testSession
         )
 
         let delta: HistoryDelta?

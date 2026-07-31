@@ -19,12 +19,40 @@ import Testing
 /// `snapshot(providerMessageId:)`, the v3-only accessor that had zero callers
 /// before this suite.
 ///
-/// **`failNextLookup()` is unreachable on `v3`.** The fixture only consumes it
-/// on a request carrying `$filter`, and no `v3` code path sends one —
-/// `fetchMessages` uses `$select`/`$top`/`$skip`/`$orderby` only. The
-/// reference's lookup-failure legs are therefore replaced by
-/// `failNextMutation()` coverage, which IS reachable (it gates PATCH/POST/
-/// DELETE), plus the duplicate-RFC proof below.
+/// **The lookup-failure claim, at its true width.** An earlier revision of this
+/// header asserted that "no `v3` code path sends a `$filter`". That is FALSE:
+/// `ExchangeProvider.listBackfillMessageIds` and
+/// `ExchangeProvider.fetchOlderMessages` both emit one (`receivedDateTime`
+/// windows). The claim these tests actually make — and the only one they
+/// support — is narrower: **no `v3` ACTION / RFC-resolution path sends the
+/// RFC-IDENTITY `$filter`** the reference's `resolveActionMessageId` used
+/// (`internetMessageId eq '<…>'`). That is the sole shape the fixture's
+/// `failNextLookup()` hook consumes: `StatefulExchangeActionServer`'s
+/// `/mailFolders/` route extracts the bracketed identity via
+/// `rfcIdentity(fromLookupURL:)` and rejects a `$filter` carrying none, so a
+/// `receivedDateTime` window never reaches the counter.
+///
+/// The hook is therefore ARMED before every action sequence below and asserted
+/// UNCONSUMED. Arming is what makes the zero mean anything — an unarmed
+/// `consumedLookupFailureCount() == 0` cannot fail no matter what the adapter
+/// does, which is precisely the vacuity trap this suite exists to avoid.
+/// `armedLookupFailureIsConsumedByAnRfcFilterSearch` is the matching POSITIVE
+/// CONTROL (`v2final`'s `== 1` half): it proves the oracle fires when the RFC
+/// filter really is sent, so the zeros are falsifiable rather than structural.
+///
+/// **⚠ ADAPTER BOUNDARY, NOT SYSTEM BOUNDARY.** Everything this suite proves
+/// about duplicate RFC identities is a property of `ExchangeProvider` — the
+/// layer where `ids` are already Graph resource ids. It is NOT a property of
+/// the system. `AccountManager.markRead`/`markUnread` call
+/// `expandWithSiblingsByRfc822` BEFORE anything is queued, and that helper
+/// selects every `messageHeader` row sharing the RFC 822 Message-ID for the
+/// account — no folder filter, no provider-id qualification — then queues each
+/// sibling's native id. So at the SYSTEM boundary a duplicate-RFC gesture still
+/// fans out. Tracked as **D-26** in `PLAN_IOS_REFACTOR_V3.md`; the
+/// system-boundary proof is still OWED and must be written as a red-first test
+/// against `AccountManager`, not lowered to this boundary. `v2final` has the
+/// identical helper with identical SQL, so narrowing it is a production
+/// behaviour change needing its own tier — do not smuggle it into a test fix.
 ///
 /// **No `.processGlobalState`.** `v2final` leaves both Stateful*ActionServer
 /// suites unannotated, and neither swaps `AppDatabase.shared` nor mutates
@@ -45,15 +73,22 @@ struct StatefulExchangeActionServerTests {
     /// test therefore seeds only the reserved characters `v3` does transmit
     /// intact (`+`, `=`).
     ///
-    /// **Gap 2 — `deleteDraft` escapes the injected session.** Every other
-    /// Exchange path goes through `authedHTTP`, which is built with
-    /// `session: testSession`. `v3`'s `deleteDraft` instead calls the free
-    /// `performHTTPRequestWithRetry` / `performHTTPRequest` WITHOUT
-    /// `session: testSession`, so it falls back to `sharedEphemeralSession` and
-    /// issues a LIVE request to `https://graph.microsoft.com`. `v2final` passes
-    /// `session: testSession` at both call sites. The DELETE leg is therefore
-    /// omitted — including it made this test fail with a real
-    /// `Error Domain=Exchange Code=401` from Microsoft.
+    /// **Gap 2 — CLOSED.** `ExchangeProvider.deleteDraft` used to escape the
+    /// injected session: it is the one method that bypasses the file's private
+    /// `request()` helper, calling the free `performHTTPRequestWithRetry` /
+    /// `performHTTPRequest` with no `session:`, so both fell back to
+    /// `sharedEphemeralSession` and issued LIVE requests to
+    /// `https://graph.microsoft.com` — omitting this leg was the only way to
+    /// keep the suite off the public internet, and including it failed with a
+    /// real `Error Domain=Exchange Code=401` from Microsoft. `v2final` passed
+    /// `session: testSession` at both call sites; `v3` had dropped it. Both are
+    /// restored, so the DELETE leg is now exercised below.
+    ///
+    /// That leg is also this file's live proof of the restoration: it can only
+    /// pass if the DELETE reached THIS scenario's fake. A regression that drops
+    /// `session:` again sends the request to Microsoft, which answers 401 for a
+    /// fabricated token, and the fixture's model still holds the draft — both
+    /// assertions go red rather than the escape going unnoticed.
     ///
     /// Signature adaptation: `v3`'s `saveDraft` has no
     /// `previousRfc822MessageId:` parameter (`v2final`-only).
@@ -94,6 +129,19 @@ struct StatefulExchangeActionServerTests {
         })
         // Updating an existing draft must PATCH, never create a second resource.
         #expect(!calls.contains { $0.method == "POST" })
+
+        // Gap 2's restored leg. `deleteDraft` addresses the same opaque id, and
+        // both of its request paths now carry `session: testSession`.
+        try await provider.deleteDraft(draftId: opaqueId, draftsFolderPath: "Drafts")
+        #expect(
+            server.snapshot(providerMessageId: opaqueId) == nil,
+            "deleteDraft must remove the addressed resource from THIS fixture — a surviving snapshot means the DELETE never reached the injected session"
+        )
+        let afterDelete = server.http.recordedCalls()
+        #expect(
+            afterDelete.contains { $0.method == "DELETE" && $0.url.contains("/messages/\(opaqueId)") },
+            "the fake recorded no DELETE for the draft — the request escaped to the live Graph endpoint instead of the injected session"
+        )
     }
 
     /// Port of the reference's `actionFinalState`, converted to the v3 keying —
@@ -208,6 +256,16 @@ struct StatefulExchangeActionServerTests {
         guard before.count == 2 else { return }
         #expect(before.allSatisfy { !$0.isRead && !$0.isFlagged })
 
+        // ARM the lookup-failure hook BEFORE the action sequence. Without this
+        // the `== 0` assertion at the end of the test is unfalsifiable — the
+        // counter starts at zero and nothing the adapter could do would move
+        // it, so the assertion would pass on an adapter that resolved every
+        // action by RFC. Armed, an RFC-identity `$filter` from any action path
+        // consumes the credit and the assertion goes red.
+        // (`armedLookupFailureIsConsumedByAnRfcFilterSearch` is the positive
+        // control proving the hook fires when that request really is sent.)
+        server.failNextLookup()
+
         try await provider.markRead(ids: [addressed], folder: "source-folder")
         try await provider.markFlagged(
             ids: [addressed], flagged: true, folder: "source-folder"
@@ -244,11 +302,71 @@ struct StatefulExchangeActionServerTests {
         #expect(stillTwo.filter { $0.folderId == "destination-folder" }.count == 1)
         #expect(stillTwo.filter { $0.folderId == "source-folder" }.count == 1)
 
-        // Never consumed: no v3 Graph path issues a `$filter` RFC search.
+        // Armed above and still unconsumed: no v3 Graph ACTION path resolves a
+        // target via an RFC-identity `$filter` search.
         #expect(
             server.consumedLookupFailureCount() == 0,
             "no v3 Graph action path may resolve a target via an RFC $filter search"
         )
+    }
+
+    /// **The positive control for `consumedLookupFailureCount()`** — `v2final`'s
+    /// `== 1` half, restored (RULE R0).
+    ///
+    /// The reference armed `failNextLookup()`, ran a listing (asserting `== 0`),
+    /// then ran an ACTION addressed by RFC and asserted `== 1`, because on
+    /// `v2final` an action really did issue `resolveActionMessageId`'s RFC
+    /// `$filter` search. `v3` deleted that layer, so no production path can
+    /// produce the `== 1` half any more — outcome (2) under R0: the reference's
+    /// *mechanism* does not transfer, but the *obligation* does.
+    ///
+    /// Without any `== 1` anywhere in the suite, `consumedLookupFailureCount()
+    /// == 0` is testing a counter nothing ever increments: a mis-registered
+    /// route, a renamed query parameter, or an `rfcIdentity(fromLookupURL:)`
+    /// that silently stopped parsing would all leave every zero-assertion in
+    /// this file green while proving nothing whatsoever. This control drives the
+    /// oracle end to end over the scenario's own session — the same route, the
+    /// same extraction, the same counter — so a dead hook fails HERE instead of
+    /// quietly certifying the rest of the suite.
+    ///
+    /// Deliberately NOT routed through `ExchangeProvider`: the whole point is
+    /// that no adapter method can emit this request. Driving it from the
+    /// transport is what makes the control possible at all.
+    @Test("the armed lookup failure IS consumed by an RFC $filter search — the oracle fires")
+    func armedLookupFailureIsConsumedByAnRfcFilterSearch() async throws {
+        let rfc822MessageId = "exchange-positive-control@example.com"
+        let server = StatefulExchangeActionServer(messages: [.init(
+            rfc822MessageId: rfc822MessageId,
+            providerMessageId: "graph-positive-control-1",
+            folderId: "source-folder"
+        )])
+        defer { server.close() }
+
+        // Baseline: the counter is zero before anything is armed, so the
+        // increment below cannot be a leftover from fixture construction.
+        #expect(server.consumedLookupFailureCount() == 0)
+
+        server.failNextLookup()
+
+        let url = StatefulExchangeActionServer.rfcFilterLookupURL(
+            folderId: "source-folder",
+            rfc822MessageId: rfc822MessageId
+        )
+        let (_, response) = try await server.http.session.data(from: url)
+        #expect(
+            (response as? HTTPURLResponse)?.statusCode == 503,
+            "the armed lookup failure must surface as the fixture's 503, proving the request matched the RFC-filter route"
+        )
+        #expect(
+            server.consumedLookupFailureCount() == 1,
+            "an RFC-identity $filter search MUST consume the armed lookup failure — if it does not, every `== 0` assertion in this suite is vacuous"
+        )
+
+        // And the credit is single-shot: a second identical search is served
+        // normally, so the counter measures armed consumption, not traffic.
+        let (_, secondResponse) = try await server.http.session.data(from: url)
+        #expect((secondResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(server.consumedLookupFailureCount() == 1)
     }
 
     /// Port of the reference's transient-failure leg, keeping only the half

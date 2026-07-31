@@ -367,7 +367,15 @@ struct IMAPProviderPoolInvariantTests {
         await provider.markDirty()
         let epochAfter = await epoch(of: provider)
         #expect(epochBefore != nil && epochAfter != nil, "the pool snapshot stopped reporting a `generation=` field")
-        #expect(epochAfter == epochBefore.map { $0 + 1 }, "markDirty() must advance the pool epoch — every guard below keys off that move")
+        // `guard let`, not `.map`: `#expect` is non-fatal, so on a snapshot that
+        // stopped emitting `generation=` BOTH optionals are nil and
+        // `epochAfter == epochBefore.map { $0 + 1 }` compares `nil == nil` —
+        // which is TRUE. The epoch assertion would then pass precisely when the
+        // thing it measures had disappeared, and every guard below keys off that
+        // move. Unwrapping first makes the comparison reachable only when there
+        // is something to compare.
+        guard let epochBefore, let epochAfter else { return }
+        #expect(epochAfter == epochBefore + 1, "markDirty() must advance the pool epoch — every guard below keys off that move")
 
         // markDirty() logs the held connection out on a detached Task. Waiting
         // for the wire to confirm makes the zombie's body GUARANTEED to fail on
@@ -652,9 +660,21 @@ struct IMAPProviderPoolInvariantTests {
             #expect(Bool(false), "the action waiter must FAIL once the pool is disconnected, not succeed")
         }
 
+        let snapshot = await provider.poolStateSnapshotForTesting()
+
+        // Residual waiter queues, the same pair the markDirty() sibling asserts.
+        // This case's doc comment claims the SAME invariant ("no waiter survives
+        // a shutdown") but was only checking that the two waiters it happens to
+        // hold references to came back — it never looked at the queues
+        // themselves. A sweep that resumes a waiter and forgets to DEQUEUE it
+        // leaves a dangling continuation whose eventual double-resume surfaces
+        // as a process-killing `SWIFT TASK CONTINUATION MISUSE`, taking every
+        // unrelated result with it, rather than as a clean failure here.
+        #expect(await provider.folderWaiterCountForTesting(folder: "INBOX") == 0, "disconnect() left a folder waiter behind — \(snapshot)")
+        #expect(await provider.actionWaiterCountForTesting() == 0, "disconnect() left an action waiter behind — \(snapshot)")
+
         // Marks ⇔ holders, same invariant as the markDirty() case — a separate
         // writer, so a regression in one is invisible to the other's test.
-        let snapshot = await provider.poolStateSnapshotForTesting()
         #expect(await provider.folderInUseForTesting(folder: "INBOX") == false, "disconnect() left INBOX marked checked-out with no holder — the folder lane is wedged — \(snapshot)")
         #expect(await provider.actionInUseForTesting() == false, "disconnect() left the action connection marked checked-out with no holder — the action lane is wedged — \(snapshot)")
 
@@ -677,14 +697,19 @@ struct IMAPProviderPoolInvariantTests {
     /// whichever plants second silently overwrites — and thereby LEAKS, with no
     /// logout — the other's logged-in session.
     ///
-    /// The VERDICT is decided by the session oracles alone — exactly one live
-    /// session for the folder, and no logged-in session abandoned without a
-    /// LOGOUT. The waiter queue is single-flight's mechanism, not its property,
-    /// so nothing below asserts a queue *shape*. The one thing this case does
-    /// assert about the queue is a setup PRECONDITION ("the second acquire
-    /// reached the pool while the creation was in flight"); the comment at that
-    /// line explains why that is not a mechanism check and why it carries no
-    /// `guard`.
+    /// The VERDICT is decided by wire-level oracles alone — exactly one LOGIN,
+    /// exactly one live session for the folder, and no logged-in session
+    /// abandoned without a LOGOUT. The waiter queue is single-flight's
+    /// mechanism, not its property, so nothing below asserts a queue *shape*.
+    /// The one thing this case does assert about the queue is a setup
+    /// PRECONDITION ("the second acquire reached the pool while the creation was
+    /// in flight"); the comment at that line explains why that is not a
+    /// mechanism check and why it carries no `guard`.
+    ///
+    /// The LOGIN count is `v2final`'s oracle for this exact property and is the
+    /// only one of the three that is self-controlling — see the block at the
+    /// assertion for why a `== 0` leak oracle with no positive control anywhere
+    /// in the tree proves nothing about itself.
     ///
     /// **Red-first evidence (recorded 2026-07-30).** Dropping
     /// `|| folderCreating.contains(folder)` from `acquireFolderConnection`'s
@@ -771,6 +796,40 @@ struct IMAPProviderPoolInvariantTests {
 
         // THE INVARIANT: one folder, one session. No `connect()` was called, so
         // there is no action connection and every live session is a folder one.
+        //
+        // The LOGIN counter is the decisive oracle, and it is ported from
+        // `v2final:TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift:590`
+        // (`ensureServerSingleFlightsConcurrentCreation`, R6-1 Part 2), which
+        // stated the same property as `loginCount() == 1` on
+        // `recordedCommands()`. RULE R0: the reference's shape is preferred here
+        // over inventing a companion self-test, and the reason is structural.
+        //
+        // `recordedCommands()` is MONOTONIC — `commandLog` is appended to at
+        // command dispatch and nothing ever removes from it — and the assertion
+        // is an EQUALITY, so it is two-sided and self-controlling:
+        //
+        //   * 2+ ⇒ a second `createServer()` raced the single-flight (the bug).
+        //   * 0  ⇒ the oracle itself is dead (route renamed, log no longer
+        //          written, fixture not actually spoken to). It FAILS rather
+        //          than certifying the assertions beneath it.
+        //
+        // That second property is exactly what `abandonedSessionCount() == 0`
+        // lacks on its own. `liveSessionCount()`'s own doc comment records that
+        // it reads 0 the instant `closeClientFd` runs for ANY reason, so for an
+        // already-closed planted-over leak `abandonedSessionCount()` is the only
+        // detector — and it has exactly one call site in the tree, asserting
+        // ZERO. If `sessionsEndedWithoutLogout` ever stopped being populated,
+        // that assertion would green forever with a real leak present, and
+        // nothing anywhere would notice. The sibling wrong-message oracle in
+        // `FakeIMAPServerOracleTests` carries three self-tests including an
+        // explicit "it fires" case; the session oracles carry none. The LOGIN
+        // count supplies the missing falsifiability without needing one, because
+        // its own zero is a failure.
+        let loginCount = server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") }.count
+        #expect(
+            loginCount == 1,
+            "both concurrent same-folder acquires must share ONE created connection — \(loginCount) LOGIN(s) on the wire (2+ ⇒ two racing createServer() calls and a silently overwritten, leaked session; 0 ⇒ the wire oracle itself stopped working, so nothing below can be trusted)"
+        )
         let sessions = server.liveSessionCount()
         #expect(sessions == 1, "two same-folder acquires opened \(sessions) sessions — a second creation raced the single-flight and the loser was leaked")
         #expect(server.abandonedSessionCount() == 0, "a logged-in session was abandoned without a LOGOUT — the classic planted-over leak")

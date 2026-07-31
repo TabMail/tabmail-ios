@@ -16,8 +16,9 @@ import Synchronization
 /// ## Why this suite exists — a missing override makes future tests LIE
 ///
 /// `EmailProvider.lastObservedUidValidity(folderPath:)`
-/// (`TabMail/Providers/EmailProvider.swift:188`) carries a `nil` protocol
-/// default (`:258`), because UIDVALIDITY is an IMAP concept and every other
+/// (declared in `TabMail/Providers/EmailProvider.swift`) carries a `nil`
+/// protocol default (the `extension EmailProvider` implementation of the same
+/// requirement), because UIDVALIDITY is an IMAP concept and every other
 /// provider honestly reports "unknown". `IMAPProvider` overrides it from its
 /// `Mutex`-backed SELECT mirror (`IMAPProvider.lastObservedUidValidityBox`, read
 /// by its `lastObservedUidValidity` override — cited by SYMBOL, not line, because
