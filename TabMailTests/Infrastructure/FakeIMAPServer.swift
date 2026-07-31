@@ -107,6 +107,15 @@ final class FakeIMAPServer: @unchecked Sendable {
         var commandLog: [String] = []
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
+        /// Identity-resolution fault seam (Testing Rule 11) — bare (angle-
+        /// bracket-stripped) Message-ID → how many further `UID SEARCH …
+        /// HEADER "Message-ID"` commands naming it must answer SUCCESSFULLY
+        /// with zero UIDs. Unlike `injectedFailureCountdowns` above this is
+        /// consumed inside the SEARCH handler, not in the pre-dispatch failure
+        /// check, because the whole point is that the command SUCCEEDS. See
+        /// `returnEmptySearch(forMessageId:matchCount:)`.
+        var emptySearchCountdowns: [String: Int] = [:]
+        var consumedEmptySearchCount = 0
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
         /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
@@ -505,6 +514,52 @@ final class FakeIMAPServer: @unchecked Sendable {
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
                 .append(InjectedFailure(skip: 0, message: "", killConnection: true))
         }
+    }
+
+    /// Two-tier fuzzer (Testing Rule 11) seam — the IDENTITY-RESOLUTION fault,
+    /// and the only one of this fake's three that a *successful* command
+    /// carries. The next `matchCount` `UID SEARCH … HEADER "Message-ID"`
+    /// commands naming `messageId` answer `* SEARCH` with an EMPTY UID list and
+    /// a tagged `OK`, while the message itself stays exactly where it is.
+    ///
+    /// **Why neither existing fault can express this.** `failNextCommand` sends
+    /// a tagged `NO`; `killConnectionOnNextCommand` closes the socket with no
+    /// response at all. Both are consumed in the dispatch loop BEFORE
+    /// `handleCommand` runs, so both surface at the client as a THROWN error.
+    /// `IMAPProvider.resolveUID` throws `ProviderError.uidResolutionFailed`
+    /// only when a search that SUCCEEDED resolved to zero UIDs
+    /// (`IMAPProvider.swift:2337-2346`) — an outcome neither can produce.
+    /// Without this seam the drain's entire identity-resolution phase is
+    /// unreachable from any wire-level test.
+    ///
+    /// **Fidelity.** The reply is byte-identical to the one a genuine miss
+    /// produces — same `* SEARCH ` line, same tagged OK, emitted from the same
+    /// `return` as the ordinary no-match case — so nothing downstream can tell
+    /// an armed miss from a real one. That is what makes it a faithful model of
+    /// the transient false negative `resolveUID`'s own contract names ("the
+    /// message likely exists but SEARCH couldn't find it (server quirk, timing
+    /// issue)", `IMAPProvider.swift:2335-2336`).
+    ///
+    /// **`matchCount` counts COMMANDS, not resolutions.** One
+    /// `IMAPProvider.searchByMessageId` issues up to TWO searches — bracketed
+    /// first, then bare if the bracketed one came back empty
+    /// (`IMAPProvider.swift:2317-2329`) — so failing one whole resolution takes
+    /// `matchCount: 2`. Arming fewer merely under-injects (the bare retry finds
+    /// the message and resolution proceeds normally): a missed fault, never a
+    /// false one.
+    ///
+    /// `messageId` is matched with angle brackets stripped from both sides, so
+    /// either form may be passed.
+    func returnEmptySearch(forMessageId messageId: String, matchCount: Int) {
+        let bare = messageId.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+        withState { $0.emptySearchCountdowns[bare, default: 0] += max(0, matchCount) }
+    }
+
+    /// How many armed empty-SEARCH answers this fake has actually served. A
+    /// fuzzer asserts this is non-zero so that an arming path which silently
+    /// stopped firing cannot leave the suite a green-always control.
+    func consumedEmptySearchCount() -> Int {
+        withState { $0.consumedEmptySearchCount }
     }
 
     /// Owner-directed adversarial fuzzer addendum — see `State
@@ -1381,11 +1436,30 @@ final class FakeIMAPServer: @unchecked Sendable {
                 // from the raw header value and typically includes "<...>".
                 let bracketSet = CharacterSet(charactersIn: "<>")
                 let bareQuery = quoted.trimmingCharacters(in: bracketSet)
-                let matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
-                    .filter {
-                        $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
+                // Identity-resolution fault seam — see
+                // `returnEmptySearch(forMessageId:matchCount:)`. Consumed HERE
+                // rather than in the pre-dispatch injected-failure check
+                // because this fault's defining property is that the command
+                // SUCCEEDS: it takes the same `return` below as a genuine miss,
+                // so the two are indistinguishable on the wire.
+                let armedEmpty = withState { state -> Bool in
+                    guard let remaining = state.emptySearchCountdowns[bareQuery], remaining > 0 else {
+                        return false
                     }
-                    .map { String($0.uid) }
+                    state.emptySearchCountdowns[bareQuery] = remaining - 1
+                    state.consumedEmptySearchCount += 1
+                    return true
+                }
+                let matched: [String]
+                if armedEmpty {
+                    matched = []
+                } else {
+                    matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
+                        .filter {
+                            $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
+                        }
+                        .map { String($0.uid) }
+                }
                 return "* SEARCH \(matched.joined(separator: " "))\r\n\(tag) OK UID SEARCH completed\r\n"
             }
             let uids = withState { $0.messagesByMailbox[mailbox] ?? [] }
