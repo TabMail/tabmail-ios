@@ -305,6 +305,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ) async throws -> T {
         let acquiredGeneration = generation
         let server = try await acquireFolderConnection(folder: folder)
+        #if DEBUG
+        // T0.6(a) test seam — fires once per checkout, after this folder's pinned
+        // connection is checked out and BEFORE `body` runs, i.e. while this
+        // task is a legitimate HOLDER. Lets a test park a holder
+        // deterministically so a second caller can queue as a real waiter, or
+        // so a concurrent `markDirty()`/`disconnect()` can land inside a live
+        // checkout. Compiled out of Release; `nil` in every non-test context.
+        if let hook = folderConnectionTestHook { await hook(folder) }
+        #endif
         do {
             let result = try await body(server)
             // If markDirty() ran while body was executing, this connection is stale.
@@ -390,6 +399,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // Mark as creating — prevents duplicate creation from actor reentrancy
         // (another caller hitting acquireFolderConnection during our awaits below)
         folderCreating.insert(folder)
+        #if DEBUG
+        // T0.6(a) test seam — fires after `folder` is marked `folderCreating`
+        // but BEFORE `createServer()` establishes anything. This is the window
+        // the folder pool's single-flight exists to cover: a test parks here
+        // and checks that a concurrent same-folder acquire QUEUES on
+        // `folderWaiters[folder]` instead of racing a second creation.
+        // Compiled out of Release; `nil` in every non-test context.
+        if let hook = createFolderConnectionCreationTestHook { await hook() }
+        #endif
 
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
@@ -531,6 +549,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let server = try await acquireActionConnection()
         do {
             let selection = try await server.selectMailbox(folder)
+            #if DEBUG
+            // T0.6(a) test seam — action-pool sibling of
+            // `folderConnectionTestHook`. Fires once per checkout, after the
+            // action connection is acquired AND SELECTed but BEFORE `body`
+            // runs, i.e. while this task holds `actionInUse`. Compiled out of
+            // Release; `nil` in every non-test context.
+            if let hook = actionConnectionTestHook { await hook() }
+            #endif
             let result = try await body(server, selection)
             releaseActionConnection(healthy: true)
             return result
@@ -790,6 +816,143 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func poolMaxConnections() -> Int {
         maxFolderConnections
     }
+
+    // MARK: - Pool Invariant Test Seams (T0.6(a))
+    //
+    // The suite `IMAPProviderPoolInvariantTests` needs to assert the connection
+    // pool's INVARIANTS on the real actor rather than on a hand-copied replica.
+    // (The suites in the FILES `IMAPPrimaryConnectionTests.swift` and
+    // `IMAPActionConnectionTests.swift` all drive private test doubles —
+    // `TestPrimaryProvider` / `TestActionProvider`, private actors declared in
+    // those two files — so nothing they assert is binding on the code below.
+    // Those two names are FILENAMES; no type of either name exists.)
+    //
+    // Two deliberate deviations from the reference implementation (`v2final`,
+    // `TabMail/Providers/IMAPProvider.swift`), each noted where it matters.
+    // Nothing here is invented: all 17 members below have a `v2final` counterpart.
+    //
+    //  1. The reference leaves its `…ForTesting` surface UNGATED. Here it is
+    //     `#if DEBUG`, matching the convention this file already set with
+    //     `actionConnectionSelectionUidValidityForTesting` (T1.1) — Release
+    //     builds carry neither the storage nor the three call sites.
+    //  2. Only the seams the SHIPPING assertions use are ported. The reference
+    //     declares 74 members matching
+    //     `^\s*(private |nonisolated |static )*(func|var|let) \w+(ForTesting|TestHook)`;
+    //     17 are ported here. The rest exist to reproduce races whose fixes are
+    //     not in this base, and adding them now would be unreachable code. The
+    //     `DEFERRED TO T3.7` block at the end of
+    //     `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift` names
+    //     the ones each deferred assertion will need.
+    //
+    // NOT a deviation, recorded because an earlier draft got it wrong: there is
+    // no `generationForTesting()` here. The epoch is already observable —
+    // `poolStateSnapshotForTesting()` below emits it as its leading
+    // `generation=` field, exactly as the reference's does
+    // (`v2final:TabMail/Providers/IMAPProvider.swift:843-844`), and the
+    // reference additionally passes it to `beforeLogoutTestHook` and the
+    // holder-enter/exit hooks. A dedicated getter would have been an invented
+    // seam duplicating observability the reference already provides, so the
+    // test reads the snapshot instead.
+    #if DEBUG
+
+    /// Test seam: install `folderConnectionTestHook` — see its call site in
+    /// `withFolderConnection`.
+    var folderConnectionTestHook: (@Sendable (String) async -> Void)?
+    func setFolderConnectionTestHookForTesting(_ hook: (@Sendable (String) async -> Void)?) {
+        folderConnectionTestHook = hook
+    }
+
+    /// Test seam: install `actionConnectionTestHook` — see its call site in
+    /// `withActionConnectionSelection`.
+    var actionConnectionTestHook: (@Sendable () async -> Void)?
+    func setActionConnectionTestHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        actionConnectionTestHook = hook
+    }
+
+    /// Test seam: install `createFolderConnectionCreationTestHook` — see its
+    /// call site in `createFolderConnection`.
+    var createFolderConnectionCreationTestHook: (@Sendable () async -> Void)?
+    func setCreateFolderConnectionCreationTestHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        createFolderConnectionCreationTestHook = hook
+    }
+
+    /// Test-only observability: number of tasks parked in `actionWaiters`.
+    func actionWaiterCountForTesting() -> Int { actionWaiters.count }
+
+    /// Test-only observability: whether the action connection is checked out.
+    func actionInUseForTesting() -> Bool { actionInUse }
+
+    /// Test-only observability: number of tasks parked in
+    /// `folderWaiters[folder]`. In this base that queue holds BOTH the
+    /// same-folder handoff waiters (`acquireFolderConnection` branch 2) and the
+    /// capacity waiters `createFolderConnection` parks when the pool is full —
+    /// the reference splits the latter into a separate `folderCapacityWaiters`
+    /// queue, which this base does not have.
+    func folderWaiterCountForTesting(folder: String) -> Int {
+        folderWaiters[folder]?.count ?? 0
+    }
+
+    /// Test-only observability: whether `folder` is currently checked out.
+    func folderInUseForTesting(folder: String) -> Bool {
+        folderInUse.contains(folder)
+    }
+
+    /// Test seam: flip `folderInUse` membership without a real acquire — the
+    /// deterministic stand-in for "a concurrent task holds this folder" in the
+    /// keepalive and eviction tests, neither of which can otherwise pin a
+    /// checkout across a synchronous call. Production code never does this.
+    func setFolderInUseForTesting(folder: String, inUse: Bool) {
+        if inUse { folderInUse.insert(folder) } else { folderInUse.remove(folder) }
+    }
+
+    /// Test-only observability: whether `folder` still has a tracked pinned
+    /// connection.
+    func hasFolderConnectionForTesting(folder: String) -> Bool {
+        folderServers[folder] != nil
+    }
+
+    /// Test-only observability: the exact `IMAPServer` instance currently
+    /// pinned to `folder`, or nil. Identity — not mere presence — is what
+    /// distinguishes "the holder's connection survived" from "some connection
+    /// is there now".
+    func currentFolderServerForTesting(folder: String) -> IMAPServer? {
+        folderServers[folder]
+    }
+
+    /// Test seam: backdate a pinned connection's last-used stamp so LRU
+    /// ordering is decided by the test instead of by wall-clock creation
+    /// order, which is too coarse to be reliable at test speed.
+    func setFolderLastUsedForTesting(_ date: Date, folder: String) {
+        folderLastUsed[folder] = date
+    }
+
+    /// Test seam: direct pass-through to the private `evictLRUFolder()`, so a
+    /// test can exercise eviction without first driving the pool to capacity.
+    @discardableResult
+    func evictLRUFolderForTesting() -> Bool { evictLRUFolder() }
+
+    /// Test seam: direct pass-through to the private
+    /// `keepAlivePinnedConnections()`, so a test can run exactly one keepalive
+    /// pass instead of waiting out `SyncConfig.imapPoolLivenessCheckSeconds`.
+    func keepAlivePinnedConnectionsForTesting() async {
+        await keepAlivePinnedConnections()
+    }
+
+    /// Test-only diagnostic dump of every pool-state field, for `#expect`
+    /// failure messages. Never called outside a caller that asks for it.
+    func poolStateSnapshotForTesting() -> String {
+        "generation=\(generation) " +
+        "actionServer=\(actionServer.map { "\(ObjectIdentifier($0))" } ?? "nil") " +
+        "actionInUse=\(actionInUse) " +
+        "actionWaiters=\(actionWaiters.count) " +
+        "folderServers=\(folderServers.map { "\($0.key)=\(ObjectIdentifier($0.value))" }.sorted()) " +
+        "folderInUse=\(folderInUse.sorted()) " +
+        "folderCreating=\(folderCreating.sorted()) " +
+        "folderWaiters=\(folderWaiters.mapValues { $0.count }.sorted { $0.key < $1.key }) " +
+        "idleServer=\(idleServer != nil) idleEnabled=\(idleEnabled)"
+    }
+
+    #endif
 
     // MARK: - IDLE (Dedicated Connection)
 
