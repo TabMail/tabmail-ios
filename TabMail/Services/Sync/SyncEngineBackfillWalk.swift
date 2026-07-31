@@ -411,6 +411,54 @@ extension SyncEngine {
     /// call reads the new premise and proceeds under it. The value writers are
     /// bootstrap-only, so nil → E can happen at most once per folder.
     ///
+    /// 🚨 **ROUND 13, BLOCKER 1 — A MISSING ROW IS NOT AN UNSTAMPED ROW.** The
+    /// body used to be one optional chain,
+    /// `knownUidValidity(try Folder.fetchOne(db, key: folderId)?.lastKnownUidValidity)`,
+    /// which collapses TWO states into one `stored == nil`: *the folder row is
+    /// GONE* (the account was removed, the folder was deleted, a folder-list
+    /// rebuild is mid-flight) and *the row exists and is genuinely UNSTAMPED*. A
+    /// caller holding the legitimate unstamped premise passes `premiseEpoch ==
+    /// nil`, so `nil == nil` ADMITTED every write onto a folder that no longer
+    /// exists — the fail-OPEN direction, decided from the absence of the very row
+    /// the CAS exists to compare against. The `guard let` below splits them: a
+    /// missing row REFUSES, an unstamped row still ADMITS a nil premise. That
+    /// second half is load-bearing and must not be regressed — the unstamped
+    /// folder is exactly the one `CrawlEpochPremise` was introduced to keep
+    /// guarded (see its doc), so refusing it would silently un-crawl every folder
+    /// holding rows of unproven epoch.
+    ///
+    /// The in-repo model is this function's own sibling:
+    /// `resetEmptyFolderCrawlEpoch` already writes
+    /// `guard let current = try Folder.fetchOne(db, key: folderId), …`.
+    ///
+    /// ⚠ **NOTHING ELSE CATCHES THIS — the database does not.** An earlier draft
+    /// of this note claimed SQLite would abort the header insert anyway, because
+    /// `v1_createTables` declares `messageHeader.folderId` with
+    /// `.references("folder", onDelete: .cascade)`. That is FALSE for any live
+    /// database: migration **`v2_dropMessageHeaderFolderFK`** rebuilds the table
+    /// with `folderId` as a plain column and no foreign key at all (its own
+    /// comment says so). Measured, not reasoned: with the guard inverted, the
+    /// premised insert returned `.landed(inserted: 1, …)` and a real
+    /// `messageHeader` row was written naming a folder id with no row behind it.
+    /// So pre-fix this wrote an ORPHAN header AND told the walk the range had
+    /// landed, which the walk reads as licence to `confirmRange` — the crawl
+    /// advances past mail on the strength of a row nothing owns.
+    ///
+    /// What the new refusal costs, stated as the mirror-image check demands: for
+    /// a folder whose row is genuinely gone the refusal is PERMANENT, and that is
+    /// the correct end state — there is no folder left to describe the rows. For
+    /// a folder that is deleted and re-created (`Folder.id` is `accountId:path`,
+    /// so a rebuild reuses the id) the refusal is TRANSIENT: the next pass reads
+    /// the new row and proceeds under it.
+    ///
+    /// ⚑ R0 — **DELIBERATE CORRECTION OF THE REFERENCE, NOT A PORT.**
+    /// `v2final`'s `uidValidityWalkWriteAllowed` has the identical collapse
+    /// (`let folder = try Folder.fetchOne(db, key: folderId)`, then
+    /// `folder?.lastKnownUidValidity.flatMap { … }`), so a missing row there
+    /// yields `resetPending == false` and `storedEpoch == nil`, and
+    /// `uidValidityWriteAllowed` — whose epoch term fails OPEN on either side nil
+    /// — admits. The reference shares the defect; it is fixed here anyway.
+    ///
     /// REFERENCE (`v2final`): PORTED from `uidValidityWalkWriteAllowed(db:folderId:
     /// observedEpoch:)` in the same function's file at the tag — same in-txn
     /// `Folder.fetchOne`, same use on every cursor/completeness write the walk
@@ -424,7 +472,11 @@ extension SyncEngine {
     nonisolated static func crawlWalkWriteAllowed(
         _ db: Database, folderId: String, premiseEpoch: UInt32?
     ) throws -> Bool {
-        let stored = knownUidValidity(try Folder.fetchOne(db, key: folderId)?.lastKnownUidValidity)
+        // No row ⇒ nothing to compare the premise against ⇒ refuse. This is NOT
+        // the same as an unstamped row, which is compared below and legitimately
+        // matches a nil premise (round 13 blocker 1 — see above).
+        guard let folder = try Folder.fetchOne(db, key: folderId) else { return false }
+        let stored = knownUidValidity(folder.lastKnownUidValidity)
             .flatMap { UInt32(exactly: $0) }
         return stored == premiseEpoch
     }
@@ -1271,22 +1323,28 @@ extension SyncEngine {
                                         await Self.runBackfillWalkCheckpointForTesting(
                                             .beforeInsertingFetchedChunk(folderId: folderCaptured.id))
                                         #endif
-                                        let (inserted, ftsRecords, ccBccUpdates, refused) = await self.insertBackfillBatch(
-                                            fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
-                                            folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
-                                            epochPremise: .init(walkWritePremise)
-                                        )
                                         // A refused chunk means the folder's STAMP moved
-                                        // under this walk — something `epochStillAgrees()`
-                                        // above structurally cannot see, since no term in
-                                        // it reads the folder row. The range is FAILED,
+                                        // under this walk (or its row went away entirely)
+                                        // — something `epochStillAgrees()` above
+                                        // structurally cannot see, since no term in it
+                                        // reads the folder row. The range is FAILED,
                                         // never confirmed, and this worker stops: failed
                                         // ranges are served FIRST by `nextRange`, so
                                         // continuing would re-fetch the same range forever
                                         // (the stamp cannot move back mid-pass). Same stop
                                         // rationale, and the same rule, as `v2final`'s
-                                        // `chunkRefused` leg.
-                                        if refused {
+                                        // `chunkRefused` leg. Round 13: the refusal now
+                                        // arrives as a CASE rather than a discardable
+                                        // tuple member, so this leg cannot be skipped by
+                                        // omission — `break` inside `guard else` targets
+                                        // the `while` (a `switch` would have swallowed it).
+                                        guard case .landed(let inserted, let ftsRecords, let ccBccUpdates) =
+                                            await self.insertBackfillBatch(
+                                                fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
+                                                folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
+                                                epochPremise: .init(walkWritePremise)
+                                            )
+                                        else {
                                             await cursor.failRange(from: range.from, to: range.to)
                                             outcome.epochDisagreed = true
                                             if DebugModeManager.isLoggingEnabled() {
@@ -1587,12 +1645,14 @@ extension SyncEngine {
                     }
 
                     if !headers.isEmpty {
-                        // Step 1: Insert headers to GRDB (batch dedup)
-                        // `epochPremise` deliberately omitted (nil ⇒ no guard):
-                        // this is the Gmail/Exchange page walk, and neither
-                        // provider has a UIDVALIDITY concept at all, so there is
-                        // no premise to hold and nothing a guard could compare.
-                        let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
+                        // Step 1: Insert headers to GRDB (batch dedup).
+                        // The premise-LESS overload, deliberately: this is the
+                        // Gmail/Exchange page walk, and neither provider has a
+                        // UIDVALIDITY concept at all, so there is no premise to
+                        // hold and nothing a guard could compare. That overload
+                        // has no refusal channel to discard (round 13 blocker 3),
+                        // so this call site cannot silently swallow one.
+                        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                             headers, folderId: folder.id, accountId: folder.accountId,
                             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                         )

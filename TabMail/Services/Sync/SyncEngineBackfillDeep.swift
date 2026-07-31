@@ -92,7 +92,7 @@ extension SyncEngine {
                         }
                     }
                 }
-                let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -149,7 +149,7 @@ extension SyncEngine {
                         ids: chunk, batchSize: gmailBatchSize, interBatchDelay: gmailDelay
                     )
                 }
-                let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -205,7 +205,7 @@ extension SyncEngine {
                         ids: chunk, batchSize: batchSize, interBatchDelay: batchDelay
                     )
                 }
-                let (inserted, ftsRecords, ccBccUpdates, _) = await insertBackfillBatch(
+                let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
                     folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
                 )
@@ -239,6 +239,49 @@ extension SyncEngine {
         return (inserted: totalInserted, found: totalFound)
     }
 
+    /// What a PREMISED `insertBackfillBatch` did, as a value the caller cannot
+    /// half-consume.
+    ///
+    /// 🚨 **ROUND 13, BLOCKER 3 — THIS TYPE IS THE FIX, AND IT REPLACES A
+    /// COMMENT.** The premised insert used to return a 4-tuple whose last member
+    /// was a `refused` flag, and of its SIX call sites exactly ONE consumed it
+    /// (`git grep -n insertBackfillBatch <pre-fix HEAD> -- '*.swift'`: three in
+    /// this file, two in `SyncEngineBackfillWalk`, one in `SyncEngineSelfHeal`;
+    /// no test target called it). The other five discarded it with `_`. That was
+    /// safe only by accident —
+    /// those five pass no premise, so their guard never runs and they can never be
+    /// refused — which makes it fail-DANGEROUS coupling: the first person to arm
+    /// a premise at one of them without also consuming `refused` silently DROPS
+    /// the batch, with no failed range and no retry, violating both *never drop
+    /// user intention* and *never mark unfetched content as fetched*. The two
+    /// concerns are now welded together by the type system instead: a premise can
+    /// only be supplied through the overload that returns THIS enum, and there is
+    /// no way to reach `inserted` / `ftsRecords` without having named `.landed`.
+    /// The premise-less overload returns a plain 3-tuple — it has no refusal
+    /// channel to ignore because it can have no refusal.
+    ///
+    /// ⚑ R0 — **NO REFERENCE in `v2final`**: there `insertBackfillBatch` is a
+    /// single function whose `refused` member is documented as ignorable
+    /// ("callers with no per-range completeness concept … can ignore this
+    /// field"). The RULE ported from the reference is the caller-side one — *a
+    /// refused range is FAILED, never confirmed* — and this type is the v3
+    /// mechanism for making that rule unforgettable.
+    enum BackfillBatchOutcome: Sendable {
+        /// The batch was admitted. `inserted == 0` is ordinary dedup, NOT a
+        /// refusal — that distinction is the whole point of the other case.
+        case landed(
+            inserted: Int,
+            ftsRecords: [FTSHeaderRecord],
+            ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]
+        )
+        /// At least one chunk's in-transaction CAS refused: the folder no longer
+        /// holds the `lastKnownUidValidity` the caller premised. NOTHING was
+        /// written for that chunk, so the caller must treat its work as
+        /// OUTSTANDING (fail the range, do not confirm it, do not advance any
+        /// completeness accounting) and let a later pass re-derive it.
+        case refused
+    }
+
     /// Insert headers into a folder. Returns (insertedCount, ftsRecords) so the caller
     /// can coalesce FTS indexing across multiple batches within a window, plus
     /// whether any chunk was REFUSED on epoch grounds (see `epochPremise`).
@@ -257,12 +300,20 @@ extension SyncEngine {
     /// Re-reading the row inside THIS transaction is the only place the two can
     /// be compared without a TOCTOU.
     ///
-    /// `nil` means "this caller holds no premise; do not guard" — the
-    /// Gmail/Exchange page walk (no UIDVALIDITY exists for those providers), deep
-    /// backfill and self-heal. `.init(nil)` means "the premise is that the folder
-    /// is UNSTAMPED", which is a real and common crawl state (a folder holding
-    /// rows of unproven epoch, which `bootstrapCrawledFolderUidValidity` refuses
-    /// to stamp) and MUST still be guarded.
+    /// Omitting the argument entirely (the premise-LESS overload) means "this
+    /// caller holds no premise; do not guard" — the Gmail/Exchange page walk (no
+    /// UIDVALIDITY exists for those providers) and deep backfill's windows.
+    /// `.init(nil)` means "the premise is that the folder is UNSTAMPED", which is
+    /// a real and common crawl state (a folder holding rows of unproven epoch,
+    /// which `bootstrapCrawledFolderUidValidity` refuses to stamp) and MUST still
+    /// be guarded. Round 13 removed self-heal from the unguarded list — see
+    /// `SyncEngine.selfHealFolder`.
+    ///
+    /// ⚠ **A nil premise is NOT a missing folder row**, and
+    /// `crawlWalkWriteAllowed` no longer treats them alike: a row that is gone
+    /// refuses (round 13 blocker 1). So `.init(nil)` guards the unstamped folder
+    /// exactly as before, while a caller whose folder has been deleted out from
+    /// under it is refused rather than admitted.
     ///
     /// ⚑ R0 — PORTED from `v2final`'s `insertBackfillBatch(… observedEpoch:)` +
     /// `refused` return, which carries the same in-txn guard through
@@ -273,6 +324,10 @@ extension SyncEngine {
     /// bare `UInt32?` and lets `nil` mean "no guard", which it can afford BECAUSE
     /// of that flag — v3 cannot, since the unstamped folder is exactly the one
     /// whose premise is nil, hence the wrapper type.
+    ///
+    /// The premised entry point. A caller that holds a premise MUST reach the
+    /// insert through here, and the `BackfillBatchOutcome` it gets back cannot be
+    /// used without naming the refusal case (round 13 blocker 3).
     func insertBackfillBatch(
         _ headers: [MessageHeaderInfo],
         folderId: String,
@@ -280,7 +335,52 @@ extension SyncEngine {
         folderPath: String,
         folderRole: FolderRole,
         isInInbox: Bool,
-        epochPremise: SyncEngine.CrawlEpochPremise? = nil
+        epochPremise: SyncEngine.CrawlEpochPremise
+    ) async -> SyncEngine.BackfillBatchOutcome {
+        let result = await insertBackfillBatchGuardable(
+            headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
+            folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise
+        )
+        guard !result.refused else { return .refused }
+        return .landed(
+            inserted: result.inserted,
+            ftsRecords: result.ftsRecords,
+            ccBccFtsUpdates: result.ccBccFtsUpdates
+        )
+    }
+
+    /// The premise-LESS entry point: the Gmail/Exchange page walk (neither
+    /// provider has a UIDVALIDITY concept, so there is no premise to hold and
+    /// nothing a guard could compare) and deep backfill's windows.
+    ///
+    /// It returns no refusal channel because it can produce no refusal: with no
+    /// premise the in-transaction CAS below never runs. If a future caller of
+    /// THIS overload ever needs guarding, it must move to the premised one above
+    /// — which is exactly the coupling blocker 3 asked for, expressed as a
+    /// signature rather than as a warning nobody reads.
+    func insertBackfillBatch(
+        _ headers: [MessageHeaderInfo],
+        folderId: String,
+        accountId: String,
+        folderPath: String,
+        folderRole: FolderRole,
+        isInInbox: Bool
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]) {
+        let result = await insertBackfillBatchGuardable(
+            headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
+            folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil
+        )
+        return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates)
+    }
+
+    private func insertBackfillBatchGuardable(
+        _ headers: [MessageHeaderInfo],
+        folderId: String,
+        accountId: String,
+        folderPath: String,
+        folderRole: FolderRole,
+        isInInbox: Bool,
+        epochPremise: SyncEngine.CrawlEpochPremise?
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)], refused: Bool) {
         guard !headers.isEmpty else { return (0, [], [], false) }
 

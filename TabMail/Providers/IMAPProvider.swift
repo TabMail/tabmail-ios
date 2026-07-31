@@ -146,7 +146,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///     `SyncEngine.runSyncMessages` through `fetchMessages`);
     ///  3. `getUidNextWithEpoch`'s (T1.3 — the backfill walk's walk-start epoch);
     ///  4. `searchExistingUIDs(folder:from:to:)`' (T1.3 — per-chunk);
-    ///  5. `fetchMessageHeaders(folder:uids:batchSize:interBatchDelay:)`' (ditto).
+    ///  5. `fetchMessageHeadersWithObservedEpoch(folder:uids:batchSize:
+    ///     interBatchDelay:)`' (ditto — round 13 moved the SELECT there from
+    ///     `fetchMessageHeaders(folder:uids:batchSize:interBatchDelay:)`, which
+    ///     is now a thin delegating wrapper).
     ///
     /// 3–5 were RAW until audit round 8. That was the round-7 blocker: with them
     /// raw, the mirror held the epoch the pinned connection observed when it was
@@ -164,6 +167,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// files, none of them a type you can cite. Neither self-heal nor deep
     /// backfill is epoch-guarded, so both now write this mirror. Do not restate
     /// any "sole caller" claim here without re-running that search.
+    ///
+    /// ⚠ **UPDATE (round 13, blocker 2): self-heal IS epoch-guarded now**
+    /// (`SyncEngine.selfHealFolder`) — and it is guarded WITHOUT reading this
+    /// mirror, by the epoch `fetchMessageHeadersWithObservedEpoch` returns from
+    /// the SELECTs that served its headers. It still WRITES the mirror, because
+    /// its fetch still routes through this helper. Deep backfill remains
+    /// unguarded and remains a writer.
     ///
     /// That retraction is why the two consumers whose direction is a WRITE no
     /// longer read this mirror at all. They take the epoch bound to their own
@@ -2527,10 +2537,78 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         batchSize: Int,
         interBatchDelay: TimeInterval = 0.5
     ) async throws -> [MessageHeaderInfo] {
-        guard !uids.isEmpty else { return [] }
+        try await fetchMessageHeadersWithObservedEpoch(
+            folder: folder, uids: uids, batchSize: batchSize, interBatchDelay: interBatchDelay
+        ).messages
+    }
+
+    /// The same fetch as above, plus the UIDVALIDITY **the SELECTs that actually
+    /// SERVED it reported** — taken from each batch's returned
+    /// `Mailbox.Selection`, never from `lastObservedUidValidityBox`.
+    ///
+    /// 🚨 **WHY THIS EXISTS RATHER THAN A MIRROR READ** (round 13, blocker 2).
+    /// `lastObservedUidValidity(folderPath:)` answers *what did the most recent
+    /// tracked SELECT of this path report* — and this fetch is one of SEVERAL
+    /// concurrent writers of that box (the crawl's per-chunk SELECTs, deep
+    /// backfill's, self-heal's; see `selectMailboxTracked`'s round-10
+    /// retraction). Reading it back therefore yields an epoch that may belong to
+    /// a DIFFERENT SELECT than the one that produced these headers. That is
+    /// tolerable where the consumer is a comparison that fails CLOSED on
+    /// disagreement — the crawl's per-chunk `epochStillAgrees()` — and it is not
+    /// tolerable where the consumer decides whether a batch may be written under
+    /// a folder's stamp, which is a fail-DANGEROUS direction. `v2final` can pass
+    /// a mirror read into `insertBackfillBatch` because its own
+    /// `selectMailboxTracked` carries the ADR-IOS-061 Stage-2 refusal
+    /// (`throw ProviderError.uidValidityChanged(…)` on a stored/observed
+    /// disagreement), so a SELECT under a changed epoch never reaches an insert
+    /// at all. **v3 has no such error and no such refusal**: `rg -n
+    /// 'uidValidityChanged' TabMail/` finds no declaration and no throw site —
+    /// every hit is prose (this note, `SyncEngine.selfHealFolder`'s, and
+    /// `SyncEngineFullSync`'s note recording that the term was deliberately
+    /// dropped). So the reference's mirror read is load-bearing on a term v3
+    /// deleted, and does not transfer.
+    ///
+    /// For a non-empty `uids`, `observedEpoch` is nil when — and only when — the
+    /// batches were NOT all served under one reported epoch: any batch whose
+    /// SELECT reported none (`0` is SwiftMail's default for "not reported", never
+    /// a real epoch — RFC 3501 §2.3.1.1 types UIDVALIDITY as `nz-number`), or two
+    /// batches reporting DIFFERENT epochs because the mailbox was re-created
+    /// mid-fetch. (An EMPTY `uids` also returns nil, having performed no SELECT at
+    /// all — with no headers to place there is nothing for a caller to decide.)
+    /// Collapsing those to nil is deliberate and fail-closed: a caller comparing
+    /// this against its own gated epoch then refuses, because a non-nil gated
+    /// epoch can never equal nil.
+    ///
+    /// A caller whose gated epoch is ITSELF nil admits. That is sound because the
+    /// gate that produced the nil (`SyncEngine.crawlEpochGate`) only yields
+    /// `.proceed` on a nil observation when the FOLDER's own
+    /// `lastKnownUidValidity` is nil too — and an unstamped folder is exactly what
+    /// `AccountManager.newGestureRefusedForUnknownEpoch` refuses every gesture on,
+    /// so no bare UID from such a folder is ever resolved against a live mailbox
+    /// (the `IOS-EPOCH-001` accepted window). Note this is a per-FOLDER property,
+    /// not a per-account one: `Folder.lastKnownUidValidity` can also be stamped
+    /// from IMAP **STATUS** via `fetchFolders`, an independent channel from
+    /// SELECT (see `selectMailboxTracked`'s round-12 retraction), so a server that
+    /// omits UIDVALIDITY on SELECT but reports it in STATUS yields a STAMPED
+    /// folder plus a nil observation — which the gate refuses rather than admits.
+    ///
+    /// ⚑ R0 — **NO REFERENCE in `v2final`**: there this overload returns bare
+    /// `[MessageHeaderInfo]` and every caller that needs an epoch samples the
+    /// mirror. The SHAPE is the reference's own, though, and this file's:
+    /// `fetchMessagesWithObservedEpoch` and `getUidNextWithEpoch` already return
+    /// the epoch of the SELECT they performed, for exactly this reason.
+    func fetchMessageHeadersWithObservedEpoch(
+        folder: String,
+        uids: [UInt32],
+        batchSize: Int,
+        interBatchDelay: TimeInterval = 0.5
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+        guard !uids.isEmpty else { return ([], nil) }
 
         var allHeaders: [MessageHeaderInfo] = []
         var offset = 0
+        var batchEpochs = Set<UInt32>()
+        var anyBatchUnreported = false
         while offset < uids.count {
             try Task.checkCancellation()
 
@@ -2541,14 +2619,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 uidSet.insert(UID(uid))
             }
 
-            let infos: [SwiftMail.MessageInfo] = try await withFolderConnection(folder: folder) { server in
-                // T1.3 (round 8): TRACKED — the crawl's per-batch SELECT. The
-                // headers this batch returns belong to the epoch THIS SELECT
-                // reported, and the walk refuses to insert them when that
-                // disagrees with the epoch it captured at walk start.
-                _ = try await selectMailboxTracked(server, folder: folder)
-                return try await server.fetchMessageInfosBulk(using: uidSet)
-            }
+            let fetched: (infos: [SwiftMail.MessageInfo], observed: UInt32?) =
+                try await withFolderConnection(folder: folder) { server in
+                    // T1.3 (round 8): TRACKED — the crawl's per-batch SELECT. The
+                    // headers this batch returns belong to the epoch THIS SELECT
+                    // reported, and the walk refuses to insert them when that
+                    // disagrees with the epoch it captured at walk start.
+                    let selection = try await selectMailboxTracked(server, folder: folder)
+                    let observed = selection.uidValidity.value
+                    return (
+                        try await server.fetchMessageInfosBulk(using: uidSet),
+                        observed != 0 ? observed : nil
+                    )
+                }
+            let infos = fetched.infos
+            if let observed = fetched.observed { batchEpochs.insert(observed) } else { anyBatchUnreported = true }
 
             let returnedCount = infos.count
             let requestedCount = batch.count
@@ -2567,7 +2652,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
 
-        return allHeaders
+        let observedEpoch: UInt32? =
+            (!anyBatchUnreported && batchEpochs.count == 1) ? batchEpochs.first : nil
+        return (allHeaders, observedEpoch)
     }
 
     /// Fetch older messages before a given date for infinite scroll.
