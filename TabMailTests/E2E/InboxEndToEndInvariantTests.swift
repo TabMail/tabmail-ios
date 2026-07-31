@@ -48,7 +48,21 @@ import Testing
 // xcodebuild's static test enumeration did not), matching every other test
 // file's convention in this repo. Non-`@Test` helpers live in `private`
 // members below.
-@Suite("Inbox end-to-end invariant layer (PLAN_INBOX_UNIFIED_READ §5B Phase 7)", .serialized)
+// `.processGlobalState` is REQUIRED here, not decorative: this suite swaps
+// `AppDatabase.shared` (`makeFixture` below at line 83; restored in `cleanup`
+// at line 134) and mutates `AccountManager.shared`'s overlay in `cleanup`.
+// `.serialized` only orders tests INSIDE one
+// suite — it does nothing to stop a *different* suite replacing those same
+// singletons concurrently (see `ProcessGlobalTestState.swift:8-14`). Without
+// this trait the suite ran outside the shared critical section, and the I8
+// signal-liveness check below failed intermittently with `captured=[]` once a
+// fifth long-running annotated suite (T0.7's UIDVALIDITY fuzzer) widened the
+// overlap window. Diagnosed 2026-07-30 — do NOT "fix" a recurrence by relaxing
+// the I8 assertion or adding a wait; the trait is the fix.
+@Suite(
+    "Inbox end-to-end invariant layer (PLAN_INBOX_UNIFIED_READ §5B Phase 7)",
+    .serialized, .processGlobalState
+)
 @MainActor
 struct InboxEndToEndInvariantTests {
 
