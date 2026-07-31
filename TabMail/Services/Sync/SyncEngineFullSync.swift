@@ -473,20 +473,90 @@ extension SyncEngine {
     /// (no OR-merge from losers — that would claim an FTS body the survivor's
     /// row doesn't have, the PLAN_FTS_BODY_LOSS class). A survivor with
     /// `bodyComplete = 0` re-enters the standard body pipeline naturally.
+    ///
+    /// `incomingNormalizedRfc822` (ADR-IOS-061 R15-F1): the incoming server
+    /// message's NORMALIZED rfc822MessageId (nil when the server carries
+    /// none). **Required — never defaulted**: a dropped injection here is
+    /// silent and fail-DANGEROUS, and the compiler is the only thing that can
+    /// catch a new call site that forgets it.
+    ///
+    /// `(folderId, messageId)` equality is an ADDRESS match, not an identity
+    /// proof: `optimisticMoveToFolder` writes folderId/folderPath/isInInbox
+    /// but leaves BOTH the PK and the `messageId` column holding the SOURCE
+    /// folder's UID, so a message archived out of INBOX parks a
+    /// foreign-UID-space `messageId` under the destination `folderId`. IMAP UID
+    /// spaces are PER FOLDER, so INBOX UID 500 and Archive UID 500 routinely
+    /// coexist as DIFFERENT messages — **no UIDVALIDITY reset is needed for
+    /// this to collide.** Without the gate, the destination folder's next sync
+    /// matches the moved-in remnant, elects the folder-native canonical-PK row
+    /// as survivor, and DELETES the user's just-moved message as a duplicate,
+    /// OR-merging its read/AI state onto an unrelated message and cascading its
+    /// body away — while the move op is still pending (this function never
+    /// consults `pendingAllIds`; that set only guards the stale sweep).
+    ///
+    /// Rows whose stored identity PROVABLY differs (both sides non-nil,
+    /// unequal) are excluded from canonicalization entirely — never merged,
+    /// never deleted, never adopted as survivor; they heal through their own
+    /// folder's rfc-verified UID remap in `runSyncMessages`. When the incoming
+    /// identity is nil AND the matching rows themselves carry conflicting
+    /// non-nil identities, there is no discriminating signal at all: refuse to
+    /// touch anything (loud error), returning the canonical-PK row if one
+    /// exists so the caller's upsert still proceeds — the next pass that
+    /// carries an identity discriminates. Nil-identity rows remain mergeable
+    /// with anything (the documented nil-blindness residual — indistinguishable
+    /// from enrichment).
+    ///
+    /// REFERENCE (`v2final`, tag `7904961ded`):
+    /// `v2final:TabMail/Services/Sync/SyncEngineFullSync.swift:636-706`. The
+    /// reference's second extra parameter, `fieldAuthority:
+    /// LocalIdentityFieldAuthority`, does NOT transfer — that type is
+    /// ADR-IOS-060 durable-intention machinery that does not exist anywhere in
+    /// v3, and it is orthogonal to this identity gate.
     nonisolated static func canonicalizeLocalRows(
         accountId: String,
         folderPath: String,
         folderId: String,
         messageId: String,
         isInInbox: Bool,
+        incomingNormalizedRfc822: String?,
         db: Database
     ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
-        let rows = try MessageHeader
+        let allRows = try MessageHeader
             .filter(Column("messageId") == messageId && Column("folderId") == folderId)
             .fetchAll(db)
-        guard !rows.isEmpty else { return (nil, [], nil) }
+        guard !allRows.isEmpty else { return (nil, [], nil) }
 
         let canonicalId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
+
+        // R15-F1 identity gate — see `incomingNormalizedRfc822`'s doc above.
+        let rows: [MessageHeader]
+        if let incoming = incomingNormalizedRfc822 {
+            // The row already holding the CANONICAL PK is folder-native (it was
+            // inserted under this folder's own address, not moved in) — it stays
+            // visible even on an identity conflict, so the caller's `existing`
+            // branch can apply the §5 classification to it. The gate excludes
+            // only NON-canonical-PK rows: those are moved-in remnants, and a
+            // conflicting identity there means a foreign message at a
+            // coinciding address.
+            rows = allRows.filter { row in
+                let stored = normalizedRfc822Identity(row.rfc822MessageId)
+                return row.id == canonicalId || stored == nil || stored == incoming
+            }
+            if rows.count != allRows.count {
+                // Ungated per CLAUDE.md rule 12 exception (b): a foreign-identity
+                // row at this address is exactly the R15-F1 wrong-merge input —
+                // production observability needs it.
+                BackgroundSyncLogger.log("[Sync] ERROR: canonicalize identity gate at (folderId=\(folderId), msgId=\(messageId)) excluded \(allRows.count - rows.count) row(s) whose stored rfc822MessageId differs from the incoming identity — address match is not an identity proof (R15-F1)")
+            }
+            guard !rows.isEmpty else { return (nil, [], nil) }
+        } else {
+            let distinctNonNil = Set(allRows.compactMap { normalizedRfc822Identity($0.rfc822MessageId) })
+            if distinctNonNil.count > 1 {
+                BackgroundSyncLogger.log("[Sync] ERROR: canonicalize identity conflict at (folderId=\(folderId), msgId=\(messageId)) with a NIL incoming identity — \(distinctNonNil.count) distinct stored identities among \(allRows.count) rows; refusing to merge/re-key anything (R15-F1)")
+                return (allRows.first(where: { $0.id == canonicalId }), [], nil)
+            }
+            rows = allRows
+        }
         // Fast path — a single row already under the canonical PK is the
         // overwhelmingly common case. Return before ANY extra query so the
         // per-message cost of the upsert loop is identical to the plain
@@ -612,6 +682,56 @@ extension SyncEngine {
             guard let floorDate = fetched.map(\.date).min() else { return [] }
             return candidates.filter { $0.date >= floorDate && !remoteIds.contains($0.messageId) }
         }
+    }
+
+    /// The identity an rfc822 Message-ID column carries, or nil when it carries
+    /// NONE. Normalized (angle brackets/whitespace stripped) so a stored
+    /// `<a@example.com>` and an incoming `a@example.com` are the same identity,
+    /// and empty-after-normalization collapses to nil — an empty string is the
+    /// absence of an identity, not a distinct one.
+    ///
+    /// One helper rather than the reference's four inlined copies of
+    /// `.map(EmailFilter.normalizeMessageId).flatMap { $0.isEmpty ? nil : $0 }`
+    /// (`v2final:669-673, 685-690, 1946-1951, 2350-2355`): every §5 site must
+    /// agree on what "same identity" means, and four copies are four chances
+    /// for one to drift.
+    nonisolated static func normalizedRfc822Identity(_ raw: String?) -> String? {
+        raw.map(EmailFilter.normalizeMessageId).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// §5 merge-collision classification: is a same-(folder, UID) row's
+    /// normalized rfc822MessageId changing to a DIFFERENT non-nil value (a
+    /// genuine identity collision), or is this ordinary enrichment/no-op?
+    /// nil→non-nil (first-time identity fill) and non-nil→nil (incoming
+    /// carries no signal) are both `.notACollision` — the stored identity is
+    /// authoritative either way once assigned.
+    ///
+    /// **This deliberately does NOT encode the assign/keep rule.**
+    /// `.notACollision` covers THREE shapes — nil→non-nil enrichment,
+    /// non-nil→nil, and equal values — and only the first and last may assign.
+    /// A non-nil→nil incoming carries no signal and must never NULL a stored
+    /// identity (that flips `MessageHeader.stableId` from the durable RFC id to
+    /// the bare UID, re-admitting bare-UID gestures). Each call site owns that
+    /// decision because each has a different row to write it to.
+    ///
+    /// Pure — no DB/IO, unit-testable like `selectStaleHeaders` above.
+    ///
+    /// REFERENCE (`v2final`, tag `7904961ded`): ported verbatim from
+    /// `v2final:TabMail/Services/Sync/SyncEngineFullSync.swift:880-893`
+    /// (ADR-IOS-061 §5, origin commit `4d34ee864`).
+    enum RFC822MergeOutcome: Equatable {
+        case notACollision
+        case collision
+    }
+
+    nonisolated static func classifyRFC822Merge(
+        storedNormalized: String?,
+        incomingNormalized: String?
+    ) -> RFC822MergeOutcome {
+        guard let storedNormalized, let incomingNormalized, storedNormalized != incomingNormalized else {
+            return .notACollision
+        }
+        return .collision
     }
 
     /// Which of `remoteIds` are NEW (not already present locally in `folderId`) —
@@ -1022,6 +1142,12 @@ extension SyncEngine {
                 // Drafts/Sent are exempt: DraftStore's push migration manages
                 // their row identity.
                 let reconT0 = CFAbsoluteTimeGetCurrent()
+                // The §5 identity of the message the server is offering at this
+                // address. Computed once per iteration and reused by the
+                // canonicalizer's R15-F1 gate and the merge/reclaim
+                // classifications below, so every §5 decision in this pass is
+                // made against ONE value.
+                let normalizedIncomingRfc822 = Self.normalizedRfc822Identity(info.rfc822MessageId)
                 let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?)
                 if folder.role == .drafts || folder.role == .sent {
                     recon = (try MessageHeader
@@ -1031,7 +1157,8 @@ extension SyncEngine {
                     recon = try Self.canonicalizeLocalRows(
                         accountId: accountId, folderPath: folderPath,
                         folderId: folderId, messageId: info.messageId,
-                        isInInbox: isInInbox, db: db
+                        isInInbox: isInInbox,
+                        incomingNormalizedRfc822: normalizedIncomingRfc822, db: db
                     )
                 }
                 upsReconSeconds += CFAbsoluteTimeGetCurrent() - reconT0
@@ -1107,8 +1234,64 @@ extension SyncEngine {
                     // Only upgrade from false→true, never downgrade.
                     existing.isReplied = existing.isReplied || info.isReplied
                     existing.isForwarded = existing.isForwarded || info.isForwarded
-                    existing.rfc822MessageId = info.rfc822MessageId
-                    existing.referencesJSON = MessageHeader.encodeReferences(info.references)
+                    // §5 merge-collision invariant (ADR-IOS-061; supersedes the
+                    // old unconditional `existing.rfc822MessageId =
+                    // info.rfc822MessageId` + `existing.referencesJSON = …`).
+                    //
+                    // Same (folder, UID) but a DIFFERENT normalized identity means
+                    // the address was reassigned (a UIDVALIDITY reset reusing the
+                    // UID) or the staged row is corrupt. Either way the stored
+                    // identity is not this message's to rewrite: overwriting it
+                    // hands the row's PK-keyed body/labels/references to a
+                    // different message.
+                    //
+                    // nil→non-nil / non-nil→nil are NOT collisions — but
+                    // "not a collision" covers THREE shapes and only
+                    // nil→non-nil and equal may assign. `IMAPFetchMapping
+                    // .rfc822MessageId(from:)` is `info.messageId.map { … }`, i.e.
+                    // nil whenever the ENVELOPE carries no Message-ID, so an
+                    // unconditional assign NULLs a durable identity — which flips
+                    // `MessageHeader.stableId` from the RFC id to the bare UID and
+                    // re-admits bare-UID gestures through
+                    // `AccountManager.newGestureRefusedForUnknownEpoch` (that guard
+                    // is `folder.lastKnownUidValidity == nil`, and
+                    // `bootstrapFolderUidValidity` makes the stamp non-nil inside
+                    // THIS transaction). `referencesJSON` is derived from the same
+                    // fetch and rides the same decision.
+                    //
+                    // REFERENCE (`v2final`, tag `7904961ded`):
+                    // `v2final:…/SyncEngineFullSync.swift:1935-1996`. Its collision
+                    // arm branches on the epoch: mismatch → fire the
+                    // purge-and-resync reaction and abort the folder pass; same (or
+                    // unknown) epoch → refuse and log. v3 has no reaction to fire
+                    // (`uidValidityResetPendingAt`, `ProviderError.uidValidityChanged`
+                    // and the reaction itself are deliberately absent; that is plan
+                    // item T4.S6), so under constraint C6 — no backward compatibility
+                    // required, failing closed is always acceptable — BOTH arms
+                    // collapse into the refusal. Refusing is the strictly safer half:
+                    // the row keeps its old identity, so a gesture on it resolves by
+                    // an RFC id the server no longer has and fails closed, instead of
+                    // resolving onto the new occupant. Non-identity fields still
+                    // merge, exactly as in the reference's same-epoch arm.
+                    let normalizedStoredRfc822 = Self.normalizedRfc822Identity(existing.rfc822MessageId)
+                    switch Self.classifyRFC822Merge(
+                        storedNormalized: normalizedStoredRfc822,
+                        incomingNormalized: normalizedIncomingRfc822
+                    ) {
+                    case .notACollision:
+                        if normalizedIncomingRfc822 != nil {
+                            existing.rfc822MessageId = info.rfc822MessageId
+                            existing.referencesJSON = MessageHeader.encodeReferences(info.references)
+                        }
+                        // else: incoming carries no identity signal — keep the
+                        // stored rfc822MessageId/referencesJSON untouched.
+                    case .collision:
+                        // Ungated per CLAUDE.md rule 12 exception (b): production
+                        // observability needs this.
+                        BackgroundSyncLogger.log("[Sync] ERROR: rfc822MessageId collision at \(existing.id) (folder=\(folderPath)) — stored=\(normalizedStoredRfc822 ?? "nil") incoming=\(normalizedIncomingRfc822 ?? "nil") — refusing identity overwrite")
+                        // Identity fields (rfc822MessageId, referencesJSON) keep
+                        // their stored values; non-identity fields still merge.
+                    }
                     // ReplyDetect: if message is replied (server or local) and has reply tag, override to none
                     // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
                     if existing.isReplied && existing.actionTag == .reply {
@@ -1271,12 +1454,47 @@ extension SyncEngine {
                     // inbox rows for the same (accountId, messageId), we want
                     // to clean up BOTH — using fetchOne would migrate one and
                     // leave the other orphaned, compounding the drift.
-                    let preSyncRows = try MessageHeader
+                    let preSyncRowsAll = try MessageHeader
                         .filter(Column("accountId") == accountId)
                         .filter(Column("messageId") == info.messageId)
                         .filter(Column("isInInbox") == true)
                         .filter(Column("id") != header.id)
                         .fetchAll(db)
+                    // R15-F1 identity gate — sibling of the one in
+                    // `canonicalizeLocalRows` (see its parameter doc). This
+                    // reclaim exists for folderPath-drift duplicates of the SAME
+                    // message (NSE writer drift); its bare
+                    // (accountId, messageId, isInInbox) match also catches a
+                    // DIFFERENT message optimistically moved INTO the inbox whose
+                    // source-folder UID coincides — the first such row is DELETED
+                    // below (`try preSync.delete(db)`) and any tail rows are
+                    // deleted outright, so an ungated match drops the user's moved
+                    // message and grafts its AI state onto the incoming one.
+                    // Exclude rows whose stored identity provably differs; with a
+                    // nil incoming identity and conflicting stored identities,
+                    // refuse the whole reclaim (no discriminating signal — the next
+                    // identity-carrying pass discriminates). An empty result is not
+                    // a dead end: control falls through to the orphan/insert path,
+                    // which stores the incoming message normally.
+                    let preSyncRows: [MessageHeader]
+                    if let incoming = normalizedIncomingRfc822 {
+                        preSyncRows = preSyncRowsAll.filter { row in
+                            let stored = Self.normalizedRfc822Identity(row.rfc822MessageId)
+                            return stored == nil || stored == incoming
+                        }
+                        if preSyncRows.count != preSyncRowsAll.count {
+                            // Ungated per CLAUDE.md rule 12 exception (b).
+                            BackgroundSyncLogger.log("[Sync] ERROR: pre-sync inbox reclaim identity gate at (accountId=\(accountId), msgId=\(info.messageId)) excluded \(preSyncRowsAll.count - preSyncRows.count) row(s) whose stored rfc822MessageId differs from the incoming identity (R15-F1)")
+                        }
+                    } else {
+                        let distinctNonNil = Set(preSyncRowsAll.compactMap { Self.normalizedRfc822Identity($0.rfc822MessageId) })
+                        if distinctNonNil.count > 1 {
+                            BackgroundSyncLogger.log("[Sync] ERROR: pre-sync inbox reclaim at (accountId=\(accountId), msgId=\(info.messageId)) found \(distinctNonNil.count) distinct stored identities with a NIL incoming identity — refusing the reclaim (R15-F1)")
+                            preSyncRows = []
+                        } else {
+                            preSyncRows = preSyncRowsAll
+                        }
+                    }
                     if preSyncRows.count > 1 {
                         print("[Sync] Pre-sync reclaim: \(preSyncRows.count) matching inbox rows for \(info.messageId) — merging all")
                     }
@@ -1379,6 +1597,61 @@ extension SyncEngine {
                         print("[MoveTrace] fullSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
                         continue
                     }
+                    // §5 merge-collision invariant, orphan-reclaim leg
+                    // (ADR-IOS-061 R14-F1, origin commit `711dc68cb`). This branch
+                    // re-identifies a row that currently belongs to ANOTHER folder
+                    // — an optimistic move's survivor whose PK still carries this
+                    // folder's address (the move keeps the PK; the new UID is
+                    // unknown until the destination folder's sync re-keys it).
+                    // The pending-op check above is NOT the whole guard: it only
+                    // covers moves whose op is still ACTIVE. Once the drain
+                    // completes and the op row is deleted, the survivor is
+                    // invisible to `pendingDestructiveIds` while still parked
+                    // under this folder's PK.
+                    //
+                    // Within one epoch a PK match proves same-message (IMAP never
+                    // reuses UIDs in an epoch; Gmail/Graph ids are never reused),
+                    // so the reclaim is safe. Across an epoch swap the SAME address
+                    // names a DIFFERENT message — reclaiming would in-place-rewrite
+                    // the survivor's identity and hijack its PK-keyed
+                    // body/labels/references/search index for the new-epoch
+                    // occupant, while yanking the user's moved message out of its
+                    // destination folder. `orphaned.id` never changes here and no
+                    // ftsRekey is emitted, so the mis-attachment is PERMANENT
+                    // (`bodyComplete` is untouched ⇒ nothing ever re-fetches).
+                    // Classify BEFORE any mutation, mirroring the `existing`
+                    // branch.
+                    //
+                    // `MessageAICache` is NOT PK-keyed
+                    // (`MessageIdentity.aiCacheKey` is
+                    // accountId:folderPath:rfc822), so it is merely orphaned by a
+                    // reclaim, not mis-attached.
+                    //
+                    // The refusal is TRANSIENT, not a durable re-entry condition:
+                    // the survivor lives in its destination folder, where its
+                    // messageId is a foreign-UID-space value that folder's remote
+                    // set does not contain, so it is stale there and the
+                    // rfc822-keyed UID-remap above re-keys it to its real UID —
+                    // vacating this PK, after which the next pass reclaims/inserts
+                    // normally.
+                    //
+                    // REFERENCE (`v2final`, tag `7904961ded`):
+                    // `v2final:…/SyncEngineFullSync.swift:2332-2393` + `2431-2433`.
+                    // Its epoch-mismatch arm fires the purge-and-resync reaction and
+                    // aborts the folder pass; v3 has no reaction (plan item T4.S6),
+                    // so under C6 that arm collapses into the plain refusal below.
+                    let normalizedSurvivorRfc822 = Self.normalizedRfc822Identity(orphaned.rfc822MessageId)
+                    if Self.classifyRFC822Merge(
+                        storedNormalized: normalizedSurvivorRfc822,
+                        incomingNormalized: normalizedIncomingRfc822
+                    ) == .collision {
+                        // The survivor belongs to a different message: touching ANY
+                        // of its fields is wrong, and the incoming occupant cannot
+                        // be stored while the survivor occupies its PK — skip it
+                        // this pass. Ungated per CLAUDE.md rule 12 exception (b).
+                        BackgroundSyncLogger.log("[Sync] ERROR: orphan-reclaim rfc822MessageId collision at \(orphaned.id) (folder=\(folderPath), survivor folderId=\(orphaned.folderId)) — stored=\(normalizedSurvivorRfc822 ?? "nil") incoming=\(normalizedIncomingRfc822 ?? "nil") — refusing the reclaim")
+                        continue
+                    }
                     print("[Sync] Reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folderId)")
                     orphaned.folderId = folderId
                     orphaned.folderPath = folderPath
@@ -1393,7 +1666,12 @@ extension SyncEngine {
                     orphaned.cc = header.cc
                     orphaned.bcc = header.bcc
                     orphaned.replyTo = header.replyTo
-                    orphaned.rfc822MessageId = header.rfc822MessageId
+                    // R14-F1 assign/keep rule (mirrors the `existing` branch): a
+                    // nil/empty incoming identity carries no signal and must never
+                    // NULL the stored one — that flips `stableId` to the bare UID.
+                    if normalizedIncomingRfc822 != nil {
+                        orphaned.rfc822MessageId = header.rfc822MessageId
+                    }
                     orphaned.isReplied = orphaned.isReplied || header.isReplied
                     orphaned.isForwarded = orphaned.isForwarded || header.isForwarded
                     orphaned.subject = header.subject

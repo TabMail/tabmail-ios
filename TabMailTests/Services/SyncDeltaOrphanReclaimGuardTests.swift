@@ -73,8 +73,28 @@ struct SyncDeltaOrphanReclaimGuardTests {
         #expect(after?.folderId == "acc1:Archive")
     }
 
-    @Test("No pending op: orphan reclaim proceeds as before")
-    func noPendingOp_reclaimProceeds() throws {
+    /// ⚠ **This test formerly asserted that "no pending op → the reclaim
+    /// proceeds", i.e. that the pending-op check IS the whole guard. That was a
+    /// bug-blessing test**: it encoded the pre-fix spec, and it would have
+    /// stayed green over the ADR-IOS-061 R14-F1 fix (origin commit `711dc68cb`)
+    /// while the system it described mutated the wrong message. It is rewritten,
+    /// not supplemented — leaving a blessing test and adding a sibling has
+    /// produced two regressions in this project.
+    ///
+    /// The pending-op check is only the FIRST leg. Admission requires BOTH:
+    /// no pending destructive op AND no identity collision between the parked
+    /// survivor and the incoming occupant. The completed-drain case (op row
+    /// deleted, survivor still parked under this folder's PK) is precisely
+    /// where the pending check answers "not pending" and the identity check is
+    /// the only thing standing between a reused address and a wrong-message
+    /// rewrite.
+    ///
+    /// The durable end-state proofs — A's body never served as B's, and the
+    /// refusal healing once the destination sync vacates the PK — live in
+    /// `RFC822IdentityMergeGuardTests`, driven through the real
+    /// `SyncEngine.runSyncMessages`.
+    @Test("No pending op is NOT sufficient: admission also requires a non-colliding identity")
+    func noPendingOp_stillRequiresIdentityAgreement() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1", provider: .imap)
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
@@ -92,11 +112,34 @@ struct SyncDeltaOrphanReclaimGuardTests {
         try db.write { dbConn in
             let snapshot = try PendingOperationSnapshot.load(accountId: "acc1", db: dbConn)
             let orphaned = try MessageHeader.fetchOne(dbConn, key: pk)
+            #expect(orphaned != nil)
+            guard let orphaned else { return }
             let orphanIsPending = snapshot.destructive.containsAnyKey(
-                messageId: orphaned!.messageId,
-                rfc822MessageId: orphaned!.rfc822MessageId
+                messageId: orphaned.messageId,
+                rfc822MessageId: orphaned.rfc822MessageId
             )
-            #expect(!orphanIsPending, "No pending op → guard does not fire")
+            #expect(!orphanIsPending, "precondition: the drain completed, so the pending leg does not fire")
+
+            let stored = SyncEngine.normalizedRfc822Identity(orphaned.rfc822MessageId)
+            // A DIFFERENT message now occupies this address — reclaiming would
+            // rewrite the survivor's identity in place while its PK-keyed body,
+            // labels, references and search index stay attached to the old one.
+            #expect(
+                SyncEngine.classifyRFC822Merge(
+                    storedNormalized: stored,
+                    incomingNormalized: SyncEngine.normalizedRfc822Identity("occupant@example.com")
+                ) == .collision,
+                "not-pending must NOT be enough to admit a reclaim onto a different message"
+            )
+            // The same message really is still admitted — the guard refuses
+            // collisions, not orphan reclaims in general.
+            #expect(
+                SyncEngine.classifyRFC822Merge(
+                    storedNormalized: stored,
+                    incomingNormalized: SyncEngine.normalizedRfc822Identity("<orphan@example.com>")
+                ) == .notACollision,
+                "a same-identity orphan (bracket forms included) is still reclaimed"
+            )
         }
     }
 

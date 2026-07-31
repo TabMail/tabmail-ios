@@ -57,8 +57,18 @@ private func makeHeaderInfo(
 }
 
 /// Simulates the core of `SyncEngine.runSyncMessages()` against a DatabaseQueue.
-/// This replicates the exact logic from SyncEngineFullSync.swift but accepts DatabaseWriter
+/// This replicates the logic from SyncEngineFullSync.swift but accepts DatabaseWriter
 /// so it works with the in-memory DatabaseQueue used by tests.
+///
+/// ⚠ **DELIBERATELY OMITTED: the §5 RFC822 identity guards** (ADR-IOS-061 —
+/// `SyncEngine.classifyRFC822Merge` and the assign/keep rule in the `existing`
+/// merge branch and the orphan-reclaim branch). This simulation keeps the
+/// pre-guard unconditional `rfc822MessageId` assignment because the cases below
+/// are about stale detection, insert, UID remap and pending-op protection —
+/// every fixture uses one identity per address, where guarded and unguarded
+/// behaviour are identical. A simulation is structurally blind to the code it
+/// re-implements, so the guards are pinned against the REAL entry point in
+/// `RFC822IdentityMergeGuardTests` instead. Do NOT add an identity case here.
 ///
 /// Returns the same tuple shape as SyncMessagesResult.
 private func simulateRunSyncMessages(

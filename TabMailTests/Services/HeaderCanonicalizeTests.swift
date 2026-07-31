@@ -63,12 +63,24 @@ struct HeaderCanonicalizeTests {
         return db
     }
 
-    private func canonicalize(_ db: DatabaseQueue, messageId: String) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
+    /// `incomingRfc822` defaults to nil because every fixture in this suite
+    /// predates the R15-F1 identity gate and stores no `rfc822MessageId` — with
+    /// a nil incoming identity and at most one distinct stored identity the gate
+    /// is a pass-through, so these cases still exercise exactly the merge/re-key
+    /// behaviour they were written for. The gate itself is pinned separately in
+    /// `RFC822IdentityMergeGuardTests`.
+    private func canonicalize(
+        _ db: DatabaseQueue,
+        messageId: String,
+        incomingRfc822: String? = nil
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
         try db.write { dbConn in
             try SyncEngine.canonicalizeLocalRows(
                 accountId: "acc1", folderPath: trashPath,
                 folderId: trashFolderId, messageId: messageId,
-                isInInbox: false, db: dbConn
+                isInInbox: false,
+                incomingNormalizedRfc822: SyncEngine.normalizedRfc822Identity(incomingRfc822),
+                db: dbConn
             )
         }
     }
