@@ -92,6 +92,17 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// guard above and turns the walk into a mass-deleter. `0` is "the server did
     /// not report a value" and is never stored (`SyncEngine.knownUidValidity`).
     ///
+    /// **One path CLEARS it back to nil, and only for a folder holding ZERO
+    /// headers:** `SyncEngine.resetEmptyFolderCrawlEpoch` (in the FILE
+    /// `SyncEngineBackfillWalk.swift`). "Never overwritten" is a rule about rows —
+    /// with no rows there is nothing the stamp can be wrong about, nothing to
+    /// purge, and no guard to disarm (the deletion-reconcile walk needs
+    /// `localHeaderCount > messageCount` to fire at all, which zero can never
+    /// satisfy). Without that clearer a stale stamp on an empty folder refuses its
+    /// crawl on EVERY later cycle, permanently. The count is taken inside the same
+    /// write transaction as the clear; the re-stamp is an ordinary bootstrap
+    /// afterwards.
+    ///
     /// **nil means UNKNOWN — it is NOT proof of an empty/fresh folder.** A folder
     /// populated before this column existed, or one whose row was deleted and
     /// re-created for the same path (folder rows are deleted on a remote

@@ -247,7 +247,7 @@ struct BackfillOnlyFolderEpochTests {
                 "the admitted gesture mutated a message it never targeted: \(server.wrongMessageViolations())")
     }
 
-    @Test("The crawl's epoch write is BOOTSTRAP-ONLY — it never overwrites a stored epoch")
+    @Test("The crawl never re-stamps a folder that HOLDS ROWS of the stored epoch")
     @MainActor
     func backfillEpochWriteNeverOverwritesAStoredEpoch() async throws {
         // The safety property the ADR-IOS-051 deletion-reconcile walk depends on: a
@@ -255,6 +255,16 @@ struct BackfillOnlyFolderEpochTests {
         // stamped over the one the local UIDs belong to DISARMS it, turning the walk
         // into a mass-deleter. A new writer that fixed the brick by writing
         // unconditionally would trade a silent no-op for silent data loss.
+        //
+        // ⚠ ROUND 10 — this test used to run with an EMPTY folder, which made it
+        // pin the MECHANISM ("the epoch column is never re-written") instead of the
+        // invariant ("no row is ever left under a stamp it does not belong to").
+        // Those are not the same claim, and the difference is a permanent brick:
+        // an empty folder holds no row for the stamp to be wrong about, so its
+        // stale stamp can and must be dropped (see
+        // `anEmptyFolderIsNeverPermanentlyRefusedAfterATurnover`). The folder here
+        // therefore HOLDS a row from the stored epoch — the state the mechanism
+        // actually exists to protect.
         let storedEpoch = 913_201
         let liveEpoch = 913_202
         let server = FakeIMAPServer(
@@ -271,6 +281,10 @@ struct BackfillOnlyFolderEpochTests {
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try Self.insertBackfillOnlyFolder(
             accountId: accountId, path: "Receipts", pool: pool, cursor: 5, epoch: storedEpoch)
+        // A row written under `storedEpoch`. Its bare UID is what the stamp is a
+        // claim ABOUT, and re-stamping would make that claim false.
+        try Self.insertHeader(
+            accountId: accountId, path: "Receipts", uid: "3", pool: pool, rfc822MessageId: nil)
 
         let imap = Self.provider(for: server)
         try await imap.connect()
@@ -285,6 +299,8 @@ struct BackfillOnlyFolderEpochTests {
                 (\(String(describing: after?.lastKnownUidValidity)) vs stored \(storedEpoch)) — \
                 that disarms the deletion-reconcile walk's abort guard
                 """)
+        #expect(try Self.headers(pool, folderId: "\(accountId):Receipts").count == 1,
+                "a folder the crawl declined must not have gained rows from the declining pass")
     }
 
     // MARK: - Property 2 — the epoch must belong to the UIDs it unlocks
@@ -457,5 +473,309 @@ struct BackfillOnlyFolderEpochTests {
             accountId: accountId, path: "Receipts", pool: pool)
         #expect(folderAfter?.backfillComplete == false,
                 "a pass whose UID space was invalidated must not stamp the crawl complete")
+
+        // ── ROUND 10, BLOCKER 1: THE SECOND CALL ──────────────────────────
+        //
+        // The state the first call leaves behind is the brick, and stopping the
+        // test here is what hid it for two rounds: the folder is EMPTY, still
+        // incomplete, carries the cursor its fresh-cursor transaction planted, and
+        // is durably stamped with the epoch that transaction observed — while the
+        // server is now on a different one. Every later `runBackfill` re-reads
+        // that mismatch and declines the folder again, and no epoch writer can
+        // move a stamp once set, so the refusal never lifts. (The per-call decline
+        // SET really is transient — function-local, gone when the call returns.
+        // The durable stamp is what re-inserts the folder into it on every call.
+        // A transient container plus a durable re-entry condition is a PERMANENT
+        // refusal.)
+        //
+        // THE INVARIANT: **a folder holding zero headers is never permanently
+        // refused by the crawl.** It is asserted on mail arriving and on that mail
+        // being actionable — never on the decline set being empty, which is the
+        // mechanism and which stays "correct" on a bricked system.
+        #expect(try Self.headers(pool, folderId: "\(accountId):Receipts").isEmpty,
+                "precondition for the brick: the interrupted pass inserted nothing")
+        #expect(folderAfter?.backfillUidCursor != nil,
+                "precondition for the brick: the pass left a cursor behind")
+        #expect(folderAfter?.lastKnownUidValidity == oldEpoch,
+                "precondition for the brick: the folder is durably stamped with the pre-turnover epoch")
+
+        _ = await engine.runBackfill(account: account)
+
+        let recovered = try Self.headers(pool, folderId: "\(accountId):Receipts")
+        let recoveredRfcs = Set(recovered.compactMap(\.rfc822MessageId))
+        #expect(recoveredRfcs.contains(replacementRfc),
+                """
+                a SECOND crawl of an EMPTY folder whose stamp predates a turnover fetched \
+                nothing — the folder is permanently refused: its stored epoch can never agree \
+                with the live one again, and no writer may advance it. Rows: \
+                \(recovered.map { "\($0.messageId)=\($0.rfc822MessageId ?? "-")" })
+                """)
+        #expect(!recoveredRfcs.contains(originalRfc),
+                "the recovered crawl must not resurrect a pre-turnover message")
+
+        let folderRecovered = try FolderEpochTestFixture.readFolder(
+            accountId: accountId, path: "Receipts", pool: pool)
+        #expect(folderRecovered?.lastKnownUidValidity == newEpoch,
+                """
+                the recovered folder is stamped \(String(describing: folderRecovered?.lastKnownUidValidity)), \
+                not the epoch its rows were fetched under — every row in a folder and the \
+                folder's stamp must come from ONE epoch
+                """)
+
+        // …and the mail is actionable, which is the whole point of the stamp.
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: imap)
+        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) } }
+        guard let crawled = recovered.first else { return }
+        server.expectMutation(rfc822MessageId: replacementRfc)
+        await AccountManager.shared.markRead([crawled])
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(try Self.headers(pool, folderId: "\(accountId):Receipts").first?.isRead == true,
+                "a gesture on the recovered folder's mail is still refused — the folder is unusable")
+        #expect(server.wrongMessageViolations().isEmpty,
+                "the recovered folder's gesture mutated a message it never targeted: \(server.wrongMessageViolations())")
+    }
+
+    // MARK: - Round 10, blocker 2 — an unobservable epoch disables every check
+
+    /// 🚨 A pass that could not observe the epoch of a folder that HAS one must
+    /// not walk it.
+    ///
+    /// `crawlEpochAgrees` admitted any nil, so a nil `walkEpoch` reached
+    /// `expectedEpoch` and made BOTH per-chunk checks return true
+    /// unconditionally — the walk then inserted whatever the server served into a
+    /// folder stamped with an epoch nothing in the pass had confirmed. Those rows
+    /// carry bare UIDs of a numbering the stamp does not describe, and because the
+    /// stamp is non-nil `AccountManager.newGestureRefusedForUnknownEpoch` keeps
+    /// admitting gestures on them: an old UID resolves against whatever now
+    /// occupies that number (C3).
+    ///
+    /// THE INVARIANT: **no row enters a folder under a stamp the inserting pass
+    /// could not verify.** Asserted on the folder's durable population, not on
+    /// which branch the code took.
+    ///
+    /// The fixture drives the "server reports no UIDVALIDITY on SELECT" cause,
+    /// because it is the one a fake server can produce deterministically
+    /// (`suppressSelectUidValidity`); the transient-failure cause the blocker is
+    /// really about arrives at the same `walkEpoch == nil` through
+    /// `getUidNextWithEpoch` throwing under `try?`, and both are refused by the
+    /// same gate. A folder with a stored epoch proves the server DOES report one,
+    /// which is exactly what makes refusing here safe for the epochless-server
+    /// account the old comment protected — that account's folders have a nil
+    /// stored epoch and are untouched (`anEpochlessServerIsStillCrawled`).
+    @Test("A folder with a stored epoch is never walked under an epoch this pass could not observe")
+    @MainActor
+    func aFolderWithAStoredEpochIsNeverWalkedUnderAnUnobservedOne() async throws {
+        let storedEpoch = 913_501
+        let serverRfc = "unobserved-epoch@example.com"
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: [
+                "INBOX": [],
+                "Receipts": [Self.message(uid: 7, id: serverRfc, subject: "server side")],
+            ])
+        // The SELECT omits `* OK [UIDVALIDITY n]` entirely — RFC 3501 §6.3.1
+        // makes it a SHOULD — so every observation this pass can make is nil.
+        server.suppressSelectUidValidity(for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t13-unobserved-epoch"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        // Stamped and resuming — the folder's rows belong to `storedEpoch`, so the
+        // server demonstrably does report UIDVALIDITY for this account.
+        try Self.insertBackfillOnlyFolder(
+            accountId: accountId, path: "Receipts", pool: pool, cursor: 60, epoch: storedEpoch)
+        try Self.insertHeader(
+            accountId: accountId, path: "Receipts", uid: "4", pool: pool, rfc822MessageId: nil)
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+        _ = await engine.runBackfill(account: account)
+
+        #expect(imap.lastObservedUidValidity(folderPath: "Receipts") == nil,
+                "precondition: this pass could observe no epoch at all")
+
+        let rows = try Self.headers(pool, folderId: "\(accountId):Receipts")
+        #expect(rows.count == 1 && !rows.contains { $0.rfc822MessageId == serverRfc },
+                """
+                the crawl inserted rows into a folder stamped UIDVALIDITY \(storedEpoch) without \
+                confirming that epoch even once this pass — every per-chunk check was a no-op, so \
+                nothing binds these UIDs to the stamp that keeps their gestures admitted. \
+                Rows: \(rows.map { "\($0.messageId)=\($0.rfc822MessageId ?? "-")" })
+                """)
+
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(after?.backfillComplete == false,
+                "a pass that could not verify the folder's epoch must not stamp the crawl complete")
+    }
+
+    /// The negative case for the refusal above: the account the round-8 comment
+    /// protected is one whose server never reports UIDVALIDITY at all, so its
+    /// folders have a NIL stored epoch — and those must still be crawled, or the
+    /// fix trades one brick for a bigger one.
+    @Test("A server that never reports UIDVALIDITY is still crawled")
+    @MainActor
+    func anEpochlessServerIsStillCrawled() async throws {
+        let serverRfc = "epochless-server@example.com"
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: [
+                "INBOX": [],
+                "Receipts": [Self.message(uid: 4, id: serverRfc, subject: "epochless")],
+            ])
+        server.suppressSelectUidValidity(for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t13-epochless"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try Self.insertBackfillOnlyFolder(accountId: accountId, path: "Receipts", pool: pool, cursor: nil)
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+        _ = await engine.runBackfill(account: account)
+
+        let rows = try Self.headers(pool, folderId: "\(accountId):Receipts")
+        #expect(rows.contains { $0.rfc822MessageId == serverRfc },
+                """
+                the crawl refused an account whose server reports no UIDVALIDITY at all — the \
+                refusal must key off "the folder HAS a stored epoch this pass could not confirm", \
+                never off "no epoch was observed"
+                """)
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(after?.lastKnownUidValidity == nil,
+                "nothing can be stamped from an epochless server — IOS-EPOCH-001 still applies")
+    }
+
+    // MARK: - Round 10, blocker 4 — a transient bootstrap write failure
+
+    /// 🚨 A transient failure of the crawl's epoch-bootstrap WRITE must not
+    /// durably prevent the folder from ever being stamped.
+    ///
+    /// Round 8 caught the throw, set a flag, and CONTINUED the walk — inserting
+    /// headers — then withheld `backfillComplete` "so this pass is retried". The
+    /// retry could not work, because the pass it had already run made its own
+    /// precondition false: with headers now present,
+    /// `bootstrapCrawledFolderUidValidity` returns FALSE rather than throwing, a
+    /// `false` was read as success, and the folder was marked complete with a NIL
+    /// stamp. Completion excludes it from every later crawl and Smart Reindex
+    /// keeps the headers, so the count gate refuses forever after.
+    ///
+    /// THE INVARIANT: **a folder whose epoch bootstrap failed once is stamped by a
+    /// later pass.** It is asserted on the durable stamp and on the mail being
+    /// actionable, not on which flag the failing pass set — a mechanism-pinning
+    /// assertion ("`epochBootstrapWriteFailed` was true") stays green on exactly
+    /// the broken system this test exists to reject.
+    @Test("A transient epoch-bootstrap write failure never leaves the folder unstampable")
+    @MainActor
+    func aTransientBootstrapWriteFailureIsRecoveredByTheNextPass() async throws {
+        let liveEpoch = 913_601
+        let crawledRfc = "bootstrap-retry@example.com"
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: [
+                "INBOX": [],
+                "Receipts": [Self.message(uid: 6, id: crawledRfc, subject: "retryable")],
+            ])
+        server.setUidValidity(liveEpoch, for: "Receipts")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t13-bootstrap-retry"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        // A RESUMED cursor with a nil stamp: legitimate — an earlier pass planted
+        // the cursor while the server reported UIDVALIDITY 0, so nothing was
+        // stamped. The folder holds no headers yet, so the bootstrap CAN succeed.
+        try Self.insertBackfillOnlyFolder(
+            accountId: accountId, path: "Receipts", pool: pool, cursor: 20, epoch: nil)
+
+        let folderId = "\(accountId):Receipts"
+        SyncEngine.epochBootstrapWriteFailureIdsForTesting.withLock { _ = $0.insert(folderId) }
+        defer { SyncEngine.epochBootstrapWriteFailureIdsForTesting.withLock { _ = $0.remove(folderId) } }
+
+        let imap = Self.provider(for: server)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
+
+        // Pass 1 — the bootstrap write throws once.
+        _ = await engine.runBackfill(account: account)
+        // Pass 2 — the seam is consumed; an ordinary pass.
+        _ = await engine.runBackfill(account: account)
+
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
+        #expect(after?.lastKnownUidValidity == liveEpoch,
+                """
+                the folder is stamped \(String(describing: after?.lastKnownUidValidity)) after a \
+                transient bootstrap write failure — a ONE-OFF write error left it durably \
+                unstampable, so every gesture on its mail is a silent no-op with no way back
+                """)
+
+        let rows = try Self.headers(pool, folderId: folderId)
+        #expect(rows.contains { $0.rfc822MessageId == crawledRfc },
+                "the recovered pass must also have crawled the folder's mail")
+    }
+
+    // MARK: - Round 10, NB4 — the walk's writes are judged at write time
+
+    /// The walk reads the folder row ONCE per iteration, BEFORE its walk-start
+    /// network round trip, and every bookkeeping write it makes lands after that —
+    /// some from a parallel worker minutes later. NB4: judging those writes on the
+    /// pre-network snapshot is fail-OPEN, because the one reachable skew is
+    /// "snapshot said nil, the row is stamped by now" and a nil stored epoch
+    /// ADMITS. `crawlWalkWriteAllowed` re-reads inside the write's own transaction.
+    @Test("A walk bookkeeping write is judged against the folder row at WRITE time")
+    func crawlWalkWriteAllowedReReadsInsideTheTransaction() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t13-inTxnGuard"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try Self.insertBackfillOnlyFolder(
+            accountId: accountId, path: "Receipts", pool: pool, cursor: 10, epoch: nil)
+        let folderId = "\(accountId):Receipts"
+
+        // The pre-network snapshot every caller took: nil.
+        let snapshotEpoch = try #require(try await pool.read { db in
+            try Folder.fetchOne(db, key: folderId)
+        }).lastKnownUidValidity
+        #expect(snapshotEpoch == nil)
+
+        // Another writer stamps the folder while the walk is out on the network.
+        try await pool.write { db in
+            try SyncEngine.bootstrapFolderUidValidity(db, folderId: folderId, observed: 913_701)
+        }
+
+        // A write from a pass walking under a DIFFERENT epoch must now be refused,
+        // even though the snapshot it gated on said "unstamped, anything goes".
+        let allowedForOtherEpoch = try await pool.read { db in
+            try SyncEngine.crawlWalkWriteAllowed(db, folderId: folderId, walkEpoch: 913_702)
+        }
+        #expect(!allowedForOtherEpoch,
+                """
+                the walk's bookkeeping write was authorised against a stale pre-network snapshot: \
+                the folder has since been stamped 913701 and this pass is walking 913702, so its \
+                cursor/completeness describe a UID space the folder's rows do not belong to
+                """)
+
+        // …and the ordinary case still passes, or the guard would stall every crawl.
+        let allowedForSameEpoch = try await pool.read { db in
+            try SyncEngine.crawlWalkWriteAllowed(db, folderId: folderId, walkEpoch: 913_701)
+        }
+        #expect(allowedForSameEpoch, "a pass walking the folder's own epoch must still write")
     }
 }

@@ -844,6 +844,18 @@ extension SyncEngine {
     /// Every one of the three is bootstrap-only and 0-filtered. A fourth writer
     /// must be too, and must be added to this list.
     ///
+    /// ⚠ One path CLEARS the column and writes no value:
+    /// `SyncEngine.resetEmptyFolderCrawlEpoch` (in the FILE
+    /// `SyncEngineBackfillWalk.swift`) sets it — and `backfillUidCursor` — back to
+    /// NULL for a folder whose `MessageHeader` count is zero IN THE SAME
+    /// TRANSACTION, so the stamp it drops describes an empty set and asserts
+    /// nothing. It exists because bootstrap-only monotonicity, on its own, makes a
+    /// stale stamp on an EMPTY folder a permanent crawl refusal (round-9 blocker
+    /// 1). It never writes a value: the re-stamp is this function's, on the crawl's
+    /// next iteration, under the same gate as any other first bootstrap. Keep it
+    /// that way — a clearer that also stamped would be the fourth value-writer and
+    /// would have to carry every rule above.
+    ///
     /// The `lastKnownUidValidity IS NULL` predicate belongs in the STATEMENT, not in
     /// a Swift `if` over a `Folder` row read earlier: every sync caller reads its row
     /// BEFORE a network round trip (STATUS/SELECT) and writes AFTER it, and the

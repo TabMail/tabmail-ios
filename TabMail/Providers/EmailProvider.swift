@@ -198,6 +198,23 @@ protocol EmailProvider: Sendable {
 
     func fetchFolders() async throws -> [FolderInfo]
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo]
+
+    /// `fetchMessages`, plus the UIDVALIDITY the SELECT that served it reported —
+    /// BOUND together, so a consumer that WRITES the epoch can never pick up one
+    /// some other SELECT of the same path recorded in between.
+    ///
+    /// `SyncEngine.runSyncMessages` is the caller, and its consumer direction is a
+    /// bootstrap WRITE of `Folder.lastKnownUidValidity`. Reading the shared
+    /// `lastObservedUidValidity(folderPath:)` mirror there was fail-DANGEROUS: the
+    /// backfill walk, self-heal and deep backfill all record into that mirror
+    /// (see `IMAPProvider.selectMailboxTracked`), so one of them landing between
+    /// the fetch and the read makes the pass stamp the live server's epoch over a
+    /// batch that belongs to the previous one. See
+    /// `IMAPProvider.fetchMessagesWithObservedEpoch` for the full rationale.
+    func fetchMessagesWithObservedEpoch(
+        folder: String, limit: Int, offset: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
+
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo
     func search(query: String, folder: String, after: Date?, before: Date?, from: String?, to: String?) async throws -> [MessageHeaderInfo]
 
@@ -260,6 +277,53 @@ extension EmailProvider {
     /// override can never erase or invent an epoch (it just stops contributing
     /// one). REFERENCE (`v2final`): identical default at `EmailProvider.swift:352`.
     func lastObservedUidValidity(folderPath: String) -> UInt32? { nil }
+
+    /// Default: the plain fetch, paired with an EXPLICIT `nil` — never a read of
+    /// the `lastObservedUidValidity` mirror.
+    ///
+    /// 🚨 **The direction of this default is the whole point.** Delegating to the
+    /// mirror was the first shape written here, and it reproduces exactly the
+    /// unbound read this method exists to remove: any conformer that does not
+    /// override would silently get the defective path, and silently is the worst
+    /// way for a safety seam to fail (the same shape as the nil-defaulted test
+    /// seam whose dropped injection put the unit suite on the live internet). A
+    /// literal `nil` is BOUND BY CONSTRUCTION — it cannot drift, cannot be
+    /// replaced between the fetch and the return, and cannot stamp anything: the
+    /// sole consumer, `SyncEngine.runSyncMessages`, persists through
+    /// `bootstrapCrawledFolderUidValidity`/`bootstrapFolderUidValidity`, which
+    /// write nothing for a nil observation. Losing this override therefore stops
+    /// a provider contributing an epoch; it can never make one up.
+    ///
+    /// SEARCH THAT BOUNDS THE CLAIM (do not restate it without re-running these):
+    /// `rg -n "(final class|class|struct|actor|extension) +\w+ *:.*EmailProvider"`
+    /// over `TabMail/`, `TabMailTests/`, `TabMailNotificationService/` enumerates
+    /// every conformer — production: `IMAPProvider`, `GmailProvider`,
+    /// `ExchangeProvider`, `DemoProvider`; test doubles: `MockEmailProvider`,
+    /// `PerIDFetchMock`, `WorkQueueMockProvider`, and the `NonProbeProvider` /
+    /// `ProbingProvider` pairs in `HandleMissedItemsTests` and
+    /// `ConfirmGoneAtThresholdTests`. `rg -n "func lastObservedUidValidity"` over
+    /// the same roots returns exactly two overrides, `IMAPProvider`'s and
+    /// `MockEmailProvider`'s. So on TODAY'S tree every conformer inheriting this
+    /// default also answers `nil` from the mirror and the two forms coincide —
+    /// which is precisely why the delegating form would have been invisible, and
+    /// why the explicit form is written instead. It is a bounded claim about this
+    /// tree, not a law: a future non-IMAP conformer that starts populating a
+    /// mirror gets `nil` here rather than an unbound value, and must override
+    /// this method with a genuinely bound one if it wants to contribute an epoch.
+    ///
+    /// `IMAPProvider` overrides with the BOUND form — the epoch taken from the
+    /// very `Mailbox.Selection` that served the fetch. `MockEmailProvider`
+    /// overrides too, because it is the double that MODELS an IMAP-like bound
+    /// provider for the epoch suites; `DemoProvider` deliberately does not, and
+    /// `SelectSourcedFolderEpochTests.aConformerThatDoesNotOverrideReportsNoEpoch`
+    /// pins what that inheritance actually produces so this default can never be
+    /// re-pointed at the mirror unnoticed.
+    func fetchMessagesWithObservedEpoch(
+        folder: String, limit: Int, offset: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+        let messages = try await fetchMessages(folder: folder, limit: limit, offset: offset)
+        return (messages, nil)
+    }
 
     /// Default no-op for HTTP-based providers (Gmail, Exchange) — ephemeral sessions have no stale connections.
     func markDirty() async {}

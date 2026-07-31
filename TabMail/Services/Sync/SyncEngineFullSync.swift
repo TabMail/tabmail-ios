@@ -666,31 +666,45 @@ extension SyncEngine {
         dbPool: PrioritizedDatabase,
         recentlyCompleted: [String: Date] = [:]
     ) async throws -> SyncMessagesResult {
-        let messages = try await provider.fetchMessages(folder: folder.path, limit: limit, offset: 0)
-        // T1.2b — SELECT-sourced epoch capture. `fetchMessages` SELECTs the folder
-        // (`IMAPProvider.selectMailboxTracked`), and `OK [UIDVALIDITY n]` is core
-        // IMAP4rev1, NOT a UIDPLUS extension — so on a non-UIDPLUS server, where
-        // the STATUS-sourced writes T1.2 added see nil forever, this is the epoch
-        // source that still answers. (The deletion-reconcile walk's own SELECT is
-        // the other one, but it only runs on a count mismatch, so it is not a
-        // backstop.) Captured ONCE here, into a local, immediately after this
-        // pass's OWN fetch; the write below must never re-read the shared mirror
-        // from inside the transaction, where a later SELECT could have replaced
-        // it. nil for every non-IMAP provider (protocol default), and nil — never
-        // a previous SELECT's value — when the SELECT that served this fetch
-        // reported no UIDVALIDITY.
+        // T1.2b — SELECT-sourced epoch capture, BOUND to this pass's own fetch.
+        // `fetchMessagesWithObservedEpoch` SELECTs the folder
+        // (`IMAPProvider.selectMailboxTracked`) and hands back the UIDVALIDITY
+        // that same `Mailbox.Selection` reported, so nothing can get between the
+        // two. `OK [UIDVALIDITY n]` is core IMAP4rev1, NOT a UIDPLUS extension —
+        // so on a non-UIDPLUS server, where the STATUS-sourced writes T1.2 added
+        // see nil forever, this is the epoch source that still answers. (The
+        // deletion-reconcile walk's own SELECT is the other one, but it only runs
+        // on a count mismatch, so it is not a backstop.) nil for every non-IMAP
+        // provider (protocol default), and nil — never a previous SELECT's
+        // value — when the SELECT that served this fetch reported no UIDVALIDITY.
         //
-        // REFERENCE (`v2final`, tag `e28dd4edb`): the same capture, at the same
-        // point of the same function — `SyncEngineFullSync.swift:1019`,
-        // `let observedEpochAtFetch = provider.lastObservedUidValidity(folderPath:)`.
-        // Residual, documented there and unchanged here: this local is read from
-        // a cross-connection mirror, so a concurrent SELECT of the SAME folder
-        // path on another connection could in principle land between the fetch
-        // and this line. Under the bootstrap-only write rule the consequence is
-        // bounded to the nil-ambiguity residual T1.2 already carries as a known
-        // issue (a nil-epoch folder has its first observation asserted as its
-        // mail's epoch); it can never overwrite an epoch already stored.
-        let observedEpochAtFetch = provider.lastObservedUidValidity(folderPath: folder.path)
+        // 🚨 ROUND 10 — this used to read the shared
+        // `provider.lastObservedUidValidity(folderPath:)` mirror right after the
+        // fetch, and that was a REGRESSION the moment round 8 routed the backfill
+        // walk's three SELECTs through the tracked chokepoint: the walk's
+        // `getUidNext`/`searchExistingUIDs`/`fetchMessageHeaders` — and, through
+        // that last one, self-heal and deep backfill, neither of them
+        // epoch-guarded — all replace the mirror for this same folder path. One
+        // of them landing between the fetch and the read let this pass bootstrap
+        // the LIVE epoch while merging the PREVIOUS one's headers, which is the
+        // stamp-agrees-with-live-server-over-old-rows state that disarms the
+        // ADR-IOS-051 deletion-reconcile abort guard — the mass-deletion failure
+        // this whole train exists to prevent, relocated into another consumer.
+        //
+        // REFERENCE (`v2final`, tag `e28dd4edb`): the same capture at the same
+        // point of the same function reads the MIRROR
+        // (`let observedEpochAtFetch = provider.lastObservedUidValidity(folderPath:)`),
+        // and it is sound there: its consumer is the §5.5 in-transaction
+        // COMPARISON that abandons the entire merge pass on disagreement, so a
+        // race can only force a false MISMATCH (abort), never a false match — the
+        // reference's own comment argues exactly that. v3 has not ported §5.5
+        // (T4.S6), so here the value feeds a bootstrap WRITE, where the identical
+        // race is fail-dangerous. The mechanism does NOT transfer across that
+        // inversion of consumer direction; the binding below replaces it.
+        let fetched = try await provider.fetchMessagesWithObservedEpoch(
+            folder: folder.path, limit: limit, offset: 0)
+        let messages = fetched.messages
+        let observedEpochAtFetch = fetched.observedEpoch
         let folderPath = folder.path
         let folderId = folder.id
         let accountId = folder.accountId

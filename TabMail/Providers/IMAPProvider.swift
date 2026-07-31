@@ -139,32 +139,46 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// because there it also carries the ADR-IOS-061 Stage-2 *refusal* — a throw
     /// that must fire on every SELECT to be a contract. This port adds no refusal
     /// (that is a later item), so only the SYNC and OPEN SELECTs are routed
-    /// through it. That set is exactly five today:
+    /// through it. The tracked set, by `rg -n "selectMailboxTracked" TabMail/`
+    /// (five sites in this file today; attack the claim by re-running it):
     ///  1. `createFolderConnection`'s open-the-folder SELECT (both legs);
-    ///  2. `fetchMessages`' SELECT (T1.2b — `SyncEngine.runSyncMessages`);
-    ///  3. `getUidNext`'s (T1.3 round 8 — the backfill walk's walk-start epoch);
-    ///  4. `searchExistingUIDs(folder:from:to:)`' (T1.3 round 8 — per-chunk);
+    ///  2. `fetchMessagesWithObservedEpoch`' SELECT (T1.2b — reached from
+    ///     `SyncEngine.runSyncMessages` through `fetchMessages`);
+    ///  3. `getUidNextWithEpoch`'s (T1.3 — the backfill walk's walk-start epoch);
+    ///  4. `searchExistingUIDs(folder:from:to:)`' (T1.3 — per-chunk);
     ///  5. `fetchMessageHeaders(folder:uids:batchSize:interBatchDelay:)`' (ditto).
     ///
     /// 3–5 were RAW until audit round 8. That was the round-7 blocker: with them
     /// raw, the mirror held the epoch the pinned connection observed when it was
     /// CREATED and tracked no turnover during the crawl, so the epoch the walk
     /// read back at the end was not bound to the UID population the walk had just
-    /// inserted. All three are backfill-only call sites (`SyncEngine.runBackfill`
-    /// is their sole caller), so this widening reaches no ACTION SELECT — the
-    /// distinction the paragraph below is about. `v2final` routes all three
-    /// through the tracked helper too.
+    /// inserted. `v2final` routes all three through the tracked helper too.
+    ///
+    /// ⚠ **RETRACTION (round 10) — round 8 claimed all three are "backfill-only
+    /// call sites (`SyncEngine.runBackfill` is their sole caller)". That is FALSE
+    /// for #5 and two reviewers accepted it.** `rg -n "fetchMessageHeaders\("
+    /// TabMail/` finds the `folder:uids:batchSize:` overload called from SIX
+    /// sites in THREE files: the walk (`SyncEngineBackfillWalk.swift`), self-heal
+    /// (`SyncEngineSelfHeal.swift`) and deep backfill
+    /// (`SyncEngineBackfillDeep.swift`, four sites) — all `extension SyncEngine`
+    /// files, none of them a type you can cite. Neither self-heal nor deep
+    /// backfill is epoch-guarded, so both now write this mirror. Do not restate
+    /// any "sole caller" claim here without re-running that search.
+    ///
+    /// That retraction is why the two consumers whose direction is a WRITE no
+    /// longer read this mirror at all. They take the epoch bound to their own
+    /// SELECT, returned by the call that performed it —
+    /// `fetchMessagesWithObservedEpoch` (consumed by `runSyncMessages`' bootstrap)
+    /// and `getUidNextWithEpoch` (consumed by the walk's stamp). A mirror read is
+    /// only sound where the consumer is a COMPARISON that fails closed on
+    /// disagreement, which is what the walk's per-chunk check is: an interloping
+    /// SELECT of the same path can only report the epoch the server is live on,
+    /// so it can force a false MISMATCH (refuse — safe) and never a false MATCH.
     ///
     /// Action SELECTs stay OUT, and narrower stays SAFER for them: a mirror
     /// written by every action SELECT too has more ways to be overwritten between
-    /// a sync pass's fetch and its read of this value. Widening THERE belongs with
-    /// the refusal. The residual this widening does add is bounded and already
-    /// documented at `SyncEngine.runSyncMessages`' capture: a concurrent backfill
-    /// SELECT of the same path can now land between that fetch and its read of
-    /// this mirror. Under the bootstrap-only write rule it can only ever plant a
-    /// first epoch, never overwrite one, and the value it would plant is the same
-    /// epoch unless a real turnover happened — in which case no reading of this
-    /// mirror was going to be right.
+    /// a pass's fetch and its read of this value. Widening THERE belongs with
+    /// the refusal.
     private func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
         let selection = try await server.selectMailbox(folder)
         let observed = selection.uidValidity.value
@@ -1339,6 +1353,39 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] {
+        try await fetchMessagesWithObservedEpoch(folder: folder, limit: limit, offset: offset).messages
+    }
+
+    /// `fetchMessages`, plus the UIDVALIDITY reported by the SELECT that served
+    /// it — returned TOGETHER, from the same `Mailbox.Selection`.
+    ///
+    /// 🚨 The pairing is the point. `SyncEngine.runSyncMessages` BOOTSTRAPS
+    /// `Folder.lastKnownUidValidity` from this value, and a write consumer cannot
+    /// safely read the shared `lastObservedUidValidityBox`: any SELECT of the same
+    /// path on any other connection replaces it, and after round 8 that includes
+    /// the walk's, self-heal's and deep backfill's (see `selectMailboxTracked`'s
+    /// retraction). One of those landing between the fetch and the read makes the
+    /// pass stamp an epoch that describes the live server rather than the batch it
+    /// is merging — the stamp then agrees with the live epoch while old-epoch rows
+    /// sit under it, which is precisely how the deletion-reconcile abort guard
+    /// (ADR-IOS-051) gets disarmed. Returning the epoch with the messages removes
+    /// the window rather than narrowing it.
+    ///
+    /// ⚑ R0 — **NO REFERENCE in `v2final`**: there `runSyncMessages` reads the
+    /// mirror, and it is sound because its consumer is the §5.5 in-transaction
+    /// COMPARISON that aborts the whole merge pass on disagreement (a race can
+    /// only manufacture a false mismatch, never a false match — its own comment
+    /// says so). v3 has not ported that guard (T4.S6), so the same value here
+    /// feeds a WRITE, where the identical race is fail-DANGEROUS. Same mechanism,
+    /// inverted consumer direction; copying it verbatim across that inversion is
+    /// what made this a defect.
+    ///
+    /// `observedEpoch` is nil when the SELECT reported no UIDVALIDITY — `0` is
+    /// SwiftMail's default for "not reported", never a real epoch (RFC 3501
+    /// §2.3.1.1 types it `nz-number`).
+    func fetchMessagesWithObservedEpoch(
+        folder: String, limit: Int, offset: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
         try await withFolderConnection(folder: folder) { server in
             // T1.2b: the SYNC path's own SELECT. `SyncEngine.runSyncMessages`
             // reaches the server through here (`provider.fetchMessages`), and that
@@ -1350,9 +1397,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // unchanged is skipped before `runSyncMessages` (`shouldSkipFolderFetch`)
             // and observes nothing from this path on that cycle.
             let selection = try await selectMailboxTracked(server, folder: folder)
-            guard selection.messageCount > 0 else { return [] }
+            let observed = selection.uidValidity.value
+            let observedEpoch: UInt32? = observed != 0 ? observed : nil
+            guard selection.messageCount > 0 else { return ([], observedEpoch) }
 
-            guard let range = selection.latest(limit) else { return [] }
+            guard let range = selection.latest(limit) else { return ([], observedEpoch) }
 
             do {
                 let infos = try await server.fetchMessageInfosBulk(using: range)
@@ -1360,12 +1409,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     print("[IMAP-FETCH-GAP] \(folder): fetchMessages requested \(limit) (msgCount=\(selection.messageCount)), got \(infos.count)")
                 }
                 // compactMap: mapMessageInfo returns nil for unparseable messages (treated as fetch failure)
-                return infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }
+                return (infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }, observedEpoch)
             } catch {
                 let msg = "\(error)"
                 if msg.contains("Invalid messageset") || msg.contains("invalid messageset") {
                     print("[IMAP] Invalid messageset for \(folder) (messageCount=\(selection.messageCount)) — skipping")
-                    return []
+                    return ([], observedEpoch)
                 }
                 throw error
             }
@@ -2288,18 +2337,32 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - UID Range Backfill
 
-    /// Get UIDNEXT for a folder via SELECT. Returns the next UID the server will assign.
-    /// Returns 0 if server doesn't provide UIDNEXT (shouldn't happen per RFC 3501).
-    func getUidNext(folder: String) async throws -> Int {
+    /// Get UIDNEXT for a folder via SELECT, together with the UIDVALIDITY that
+    /// same SELECT reported. Returns `uidNext == 0` if the server doesn't provide
+    /// UIDNEXT (shouldn't happen per RFC 3501), and `observedEpoch == nil` if it
+    /// reported no UIDVALIDITY.
+    ///
+    /// 🚨 The two travel together because `SyncEngine.runBackfill` STAMPS
+    /// `observedEpoch` onto the folder (through
+    /// `bootstrapCrawledFolderUidValidity`) and hands it to every worker as the
+    /// epoch the walk is accounted in. Reading it back out of
+    /// `lastObservedUidValidityBox` instead — which round 8 did — leaves a window
+    /// in which any other SELECT of the same path replaces it first, and after
+    /// round 8's widening that includes self-heal's and deep backfill's
+    /// `fetchMessageHeaders` (see `selectMailboxTracked`'s round-10 retraction).
+    /// The mirror is sound only for the walk's per-chunk COMPARISON, which fails
+    /// closed on disagreement; it is not sound for the value the walk writes.
+    func getUidNextWithEpoch(folder: String) async throws -> (uidNext: Int, observedEpoch: UInt32?) {
         try await withFolderConnection(folder: folder) { server in
             // T1.3 (round 8): TRACKED. This is the crawl's walk-start SELECT —
-            // the one `SyncEngine.runBackfill` reads back as the walk's own
-            // epoch. A raw `selectMailbox` here left the mirror holding
-            // whatever the pinned connection's CREATION SELECT observed, which
-            // on a resumed crawl can be an epoch from a different pass
-            // entirely. See `selectMailboxTracked`'s scope note.
+            // the one the walk's per-chunk checks compare against. A raw
+            // `selectMailbox` here left the mirror holding whatever the pinned
+            // connection's CREATION SELECT observed, which on a resumed crawl can
+            // be an epoch from a different pass entirely. See
+            // `selectMailboxTracked`'s scope note.
             let selection = try await selectMailboxTracked(server, folder: folder)
-            return Int(selection.uidNext.value)
+            let observed = selection.uidValidity.value
+            return (Int(selection.uidNext.value), observed != 0 ? observed : nil)
         }
     }
 

@@ -77,6 +77,45 @@ actor MockEmailProvider: EmailProvider {
         mockedUidValiditySequenceBox.withLock { $0[folderPath] = values }
     }
 
+    /// The epoch `fetchMessagesWithObservedEpoch` reports as BOUND to its own
+    /// fetch, independently of what the `lastObservedUidValidity` mirror answers.
+    ///
+    /// The two are separable in production — the mirror is written by every
+    /// tracked SELECT of the path (the backfill walk's, and through
+    /// `fetchMessageHeaders` also self-heal's and deep backfill's), so a
+    /// concurrent SELECT can make it disagree with the SELECT that served THIS
+    /// fetch — and a test that cannot separate them cannot tell which one a sync
+    /// pass stamped.
+    ///
+    /// ⚠ When this box is UNSET the override below falls back to the mirror, and
+    /// that fallback is the MOCK'S OWN choice, not the protocol's: the
+    /// `extension EmailProvider` default pairs the fetch with an explicit `nil`
+    /// and never touches the mirror (deliberately — see its comment). This mock
+    /// overrides precisely because it is the double that MODELS an IMAP-like
+    /// provider, and without the fallback every existing mock-driven epoch test —
+    /// `MockProviderEpochSeamTests` above all, whose whole subject is that a
+    /// mock-observed epoch reaches `Folder.lastKnownUidValidity` — would go
+    /// vacuously green against a `nil` on both sides. Do not "simplify" this to
+    /// match the protocol default; what a NON-overriding conformer produces is
+    /// pinned separately by
+    /// `SelectSourcedFolderEpochTests.aConformerThatDoesNotOverrideReportsNoEpoch`,
+    /// against `DemoProvider`, so the two contracts are tested apart.
+    private nonisolated let mockedBoundFetchEpochBox = Mutex<[String: UInt32?]>([:])
+
+    func setMockedBoundFetchEpoch(_ value: UInt32?, folderPath: String) {
+        mockedBoundFetchEpochBox.withLock { $0[folderPath] = value }
+    }
+
+    func fetchMessagesWithObservedEpoch(
+        folder: String, limit: Int, offset: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+        let messages = try await fetchMessages(folder: folder, limit: limit, offset: offset)
+        if let bound = mockedBoundFetchEpochBox.withLock({ $0[folder] }) {
+            return (messages, bound)
+        }
+        return (messages, lastObservedUidValidity(folderPath: folder))
+    }
+
     // MARK: - Call Recording
 
     var callLog: [String] = []

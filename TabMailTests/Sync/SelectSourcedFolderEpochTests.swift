@@ -559,4 +559,175 @@ struct SelectSourcedFolderEpochTests {
                 and delete every local header as a ghost (ADR-IOS-051)
                 """)
     }
+
+    // MARK: - Round 10, blocker 3 — the stamp must describe the MERGED batch
+
+    /// 🚨 The epoch a sync pass stamps must be the one that served ITS OWN fetch,
+    /// never whatever a concurrent SELECT last recorded in the shared mirror.
+    ///
+    /// Round 8 routed the backfill walk's three SELECTs through
+    /// `IMAPProvider.selectMailboxTracked`, and through
+    /// `fetchMessageHeaders(folder:uids:batchSize:interBatchDelay:)` that reroute
+    /// also reaches self-heal and deep backfill — neither of them epoch-guarded,
+    /// and `rg -n "fetchMessageHeaders\("` finds six call sites across three
+    /// files, not the one the commit claimed. Any of them SELECTing this folder
+    /// path between `runSyncMessages`' fetch and its read of the mirror made the
+    /// pass bootstrap the LIVE epoch while merging the PREVIOUS one's headers.
+    ///
+    /// THE INVARIANT: **`Folder.lastKnownUidValidity` names the epoch the folder's
+    /// rows belong to.** A stamp taken from the live mirror instead describes the
+    /// server, and once it agrees with the live epoch the deletion-reconcile
+    /// walk's abort guard compares equal-to-equal and proceeds to delete
+    /// old-epoch UIDs as ghosts (ADR-IOS-051) — the mass deletion this whole
+    /// train exists to prevent, relocated into another consumer.
+    ///
+    /// The mock reports the two SEPARATELY (`setMockedBoundFetchEpoch` is the
+    /// fetch's own SELECT; `setMockedUidValidity` is the shared mirror an
+    /// interloping SELECT has since advanced), because a double that cannot tell
+    /// them apart cannot tell which one the pass stamped.
+    @Test("The epoch stamped by a sync pass is the one that served its own fetch")
+    func syncStampsTheEpochBoundToItsOwnFetch() async throws {
+        let fetchEpoch: UInt32 = 838_601   // the SELECT that returned these headers
+        let mirrorEpoch: UInt32 = 838_602  // a concurrent backfill SELECT, after it
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t12b-bound-epoch"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool, totalCount: 0)
+
+        let folder = try #require(
+            try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool))
+
+        let mock = MockEmailProvider()
+        await mock.setFetchMessagesResult([
+            MessageHeaderInfo(
+                messageId: "11", rfc822MessageId: "bound-epoch@example.com",
+                inReplyTo: nil, references: [], threadId: nil,
+                subject: "merged under fetchEpoch", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                cc: "", bcc: "", replyTo: nil,
+                date: Date(timeIntervalSince1970: 1_700_000_000), snippet: "bound",
+                isRead: false, isFlagged: false, hasAttachments: false,
+                isReplied: false, isForwarded: false, actionTag: nil)
+        ])
+        await mock.setMockedBoundFetchEpoch(fetchEpoch, folderPath: "INBOX")
+        await mock.setMockedUidValidity(mirrorEpoch, folderPath: "INBOX")
+
+        _ = try await SyncEngine.runSyncMessages(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        #expect(after?.lastKnownUidValidity == Int(fetchEpoch),
+                """
+                the pass stamped \(String(describing: after?.lastKnownUidValidity)) — that is the \
+                shared mirror's value, which a concurrent backfill/self-heal SELECT wrote AFTER \
+                this fetch, not the epoch the merged headers came from (\(fetchEpoch)). The \
+                column then agrees with the live server while old-epoch rows sit under it, which \
+                is precisely how the deletion-reconcile walk's abort guard gets disarmed
+                """)
+        #expect(try FolderEpochTestFixture.headerCount(accountId: accountId, path: "INBOX", pool: pool) == 1,
+                "precondition: the pass really did merge the batch it stamped for")
+    }
+
+    /// 🚨 What a conformer that does NOT override
+    /// `fetchMessagesWithObservedEpoch` actually produces.
+    ///
+    /// The test above drives `MockEmailProvider`, which DOES override — so on its
+    /// own it pins the fix's shape and says nothing about the shape everything
+    /// else inherits. A mock that mirrors the fix instead of the contract has
+    /// hidden a mismatch here before, and the first draft of this default
+    /// delegated to `lastObservedUidValidity(folderPath:)`, which reproduces
+    /// exactly the unbound read blocker 3 exists to remove: a conformer that
+    /// forgot to override would silently get the defective path.
+    ///
+    /// THE INVARIANT: **the inherited path can never contribute an epoch it did
+    /// not bind.**
+    ///
+    /// ⚠ The witness has to be built, and that is the finding, not an
+    /// inconvenience. On today's tree the set {does not override the bound fetch}
+    /// ∩ {has a populated epoch mirror} is EMPTY — the only two types that
+    /// override `lastObservedUidValidity` (`IMAPProvider`, `MockEmailProvider`)
+    /// also override the bound fetch. So no existing type can tell the two
+    /// defaults apart, and a test written against one would pass under BOTH: that
+    /// is precisely why the delegating default was invisible to review, and a
+    /// non-distinguishing test would have inherited the same blindness.
+    /// `MirrorOnlyProvider` below is the missing case made real — the future
+    /// non-IMAP conformer that starts populating a mirror and forgets to
+    /// override — and it is the one that makes this red-provable.
+    /// `DemoProvider` is asserted alongside it as a PRODUCTION witness that the
+    /// inheritance is real (`GmailProvider`/`ExchangeProvider` are the others;
+    /// both need OAuth credentials to construct, and all three inherit the same
+    /// `extension EmailProvider` implementation).
+    @Test("A provider that does not override the bound fetch reports NO epoch, never the mirror")
+    func aConformerThatDoesNotOverrideReportsNoEpoch() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "t12b-default-conformer"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool, totalCount: 0)
+
+        // The distinguishing witness: a mirror that ANSWERS, and no override.
+        let mirrorOnly = MirrorOnlyProvider(mirrorEpoch: 838_701)
+        #expect(mirrorOnly.lastObservedUidValidity(folderPath: "INBOX") == 838_701,
+                "non-vacuity: the mirror this default must not read is populated")
+        let inherited = try await mirrorOnly.fetchMessagesWithObservedEpoch(
+            folder: "INBOX", limit: 50, offset: 0)
+        #expect(inherited.observedEpoch == nil,
+                """
+                a conformer inheriting the default reported epoch \
+                \(String(describing: inherited.observedEpoch)) — it came from the shared mirror, \
+                which no SELECT of THIS fetch wrote. The default must pair the fetch with an \
+                explicit nil, or every type that forgets to override silently gets back the \
+                unbound value blocker 3 removed, and `runSyncMessages` stamps it
+                """)
+
+        // The production witness: a real conformer really does inherit this.
+        let demo = DemoProvider(accountId: accountId)
+        let demoFetched = try await demo.fetchMessagesWithObservedEpoch(
+            folder: "INBOX", limit: 50, offset: 0)
+        #expect(demoFetched.observedEpoch == nil,
+                "a production conformer that does not override must contribute no epoch")
+    }
+}
+
+/// A conformer with a populated `lastObservedUidValidity` mirror that does NOT
+/// override `fetchMessagesWithObservedEpoch` — the one combination no existing
+/// type occupies, and therefore the only witness that can distinguish the
+/// explicit-nil default from a mirror-delegating one. Every other requirement is
+/// an inert stub; nothing here is under test except the inherited default.
+private actor MirrorOnlyProvider: EmailProvider {
+    private let epoch: UInt32
+    init(mirrorEpoch: UInt32) { self.epoch = mirrorEpoch }
+
+    nonisolated func lastObservedUidValidity(folderPath: String) -> UInt32? { epoch }
+
+    func connect() async throws {}
+    func disconnect() async throws {}
+    func fetchFolders() async throws -> [FolderInfo] { [] }
+    func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] { [] }
+    func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
+        FullMessageInfo(header: MessageHeaderInfo(
+            messageId: id, rfc822MessageId: nil, inReplyTo: nil, references: [], threadId: nil,
+            subject: "", from: "", fromAddress: "", to: "", cc: "", bcc: "",
+            replyTo: nil, date: Date(), snippet: "", isRead: false, isFlagged: false,
+            hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil
+        ), htmlBody: nil, textBody: nil)
+    }
+    func search(query: String, folder: String, after: Date?, before: Date?, from: String?, to: String?) async throws -> [MessageHeaderInfo] { [] }
+    func markRead(ids: [String], folder: String) async throws {}
+    func markUnread(ids: [String], folder: String) async throws {}
+    func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {}
+    func move(ids: [String], from: String, to: String) async throws {}
+    func send(draft: DraftMessage) async throws {}
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool { true }
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "") }
+    func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
+    func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
+    func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
+    func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
 }
