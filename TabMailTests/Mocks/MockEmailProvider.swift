@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 @testable import TabMail
 
 /// Configurable mock EmailProvider for testing services that depend on email operations.
@@ -14,6 +15,62 @@ actor MockEmailProvider: EmailProvider {
 
     init(staleWindowMode: StaleWindowMode = .date) {
         self.staleWindowMode = staleWindowMode
+    }
+
+    // MARK: - UIDVALIDITY observation (the epoch test seam)
+
+    /// Per-folder mocked `lastObservedUidValidity`. `Mutex`-backed nonisolated
+    /// seam (mirrors `IMAPProvider.lastObservedUidValidityBox`,
+    /// `IMAPProvider.swift:80`) — the protocol requirement is synchronous
+    /// (`EmailProvider.swift:188`; callers include a GRDB write closure, which
+    /// cannot `await`), so an actor-isolated `var` cannot satisfy it.
+    ///
+    /// **Without this override the mock inherits the protocol's `nil` default
+    /// (`EmailProvider.swift:258`), and every mock-driven test of "capture the
+    /// folder epoch" observes `nil` on BOTH sides of whatever it is comparing —
+    /// passing without ever executing the branch it was written for.** That is
+    /// the vacuous-assertion shape the plan's structural finding (c) names.
+    ///
+    /// REFERENCE (`v2final`, tag `e28dd4edb`): ported verbatim from
+    /// `v2final:TabMailTests/Mocks/MockEmailProvider.swift:29-71`. This region is
+    /// keying-agnostic — it is about the FOLDER epoch, not about message
+    /// identity — so it needed no adaptation to v3's provider-id keying.
+    private nonisolated let mockedUidValidityBox = Mutex<[String: UInt32]>([:])
+
+    nonisolated func lastObservedUidValidity(folderPath: String) -> UInt32? {
+        if let sequenced = mockedUidValiditySequenceBox.withLock({ box -> UInt32?? in
+            guard var seq = box[folderPath], !seq.isEmpty else { return nil }
+            let next = seq.removeFirst()
+            box[folderPath] = seq
+            return next
+        }) {
+            return sequenced
+        }
+        return mockedUidValidityBox.withLock { $0[folderPath] }
+    }
+
+    /// Test seam: configure the value `lastObservedUidValidity(folderPath:)`
+    /// returns for `folderPath`. Pass `nil` to clear (simulates "never
+    /// SELECTed this folder").
+    func setMockedUidValidity(_ value: UInt32?, folderPath: String) {
+        mockedUidValidityBox.withLock {
+            if let value { $0[folderPath] = value } else { $0.removeValue(forKey: folderPath) }
+        }
+    }
+
+    /// Test seam: a per-CALL sequence of values for
+    /// `lastObservedUidValidity(folderPath:)` — each call CONSUMES the next
+    /// entry; once exhausted, calls fall back to the static
+    /// `setMockedUidValidity` value. Simulates the shared cross-connection
+    /// mirror ADVANCING between a walk's own fetch (which must capture the
+    /// epoch exactly once) and a later guard evaluation (which must NOT re-read
+    /// the live mirror): sequence `[old]` + static `new` yields `old` exactly
+    /// once — at capture time — and `new` for any subsequent (buggy) live
+    /// re-read.
+    private nonisolated let mockedUidValiditySequenceBox = Mutex<[String: [UInt32?]]>([:])
+
+    func setMockedUidValiditySequence(_ values: [UInt32?], folderPath: String) {
+        mockedUidValiditySequenceBox.withLock { $0[folderPath] = values }
     }
 
     // MARK: - Call Recording
@@ -52,6 +109,34 @@ actor MockEmailProvider: EmailProvider {
     var fetchHistoryThrows: Error?
     var fetchMessageHeadersResult: [MessageHeaderInfo] = []
     var fetchMessageHeadersThrows: Error?
+
+    // MARK: - Await-boundary hooks (the in-flight test seam)
+
+    /// Awaited from INSIDE the corresponding provider call, so a test can act
+    /// while that call is genuinely in flight — the durable row is claimed, the
+    /// provider has been entered, and nothing has returned yet. Without them a
+    /// test can only observe the before and after states and must infer the
+    /// window between them, which is exactly where claim/epoch/identity races
+    /// live.
+    ///
+    /// REFERENCE (`v2final`, tag `e28dd4edb`):
+    /// `v2final:TabMailTests/Mocks/MockEmailProvider.swift:119-126` (the
+    /// properties) and `:437-455` (the setters). Ported to the three calls the
+    /// reference's own suites drive — `markRead`
+    /// (`AccountManagerQueueDrainTests`, `AccountManagerQueueLivenessTests`),
+    /// `saveDraft` (`AccountManagerQueueDrainTests`, three draft suites) and
+    /// `move` (`AccountManagerQueueDemotionTests`,
+    /// `AccountManagerQueueLivenessTests`, `InboxGestureActionTests`) — and to
+    /// v3's own signatures, which differ from the reference's on `saveDraft`
+    /// (v3 has no `previousRfc822MessageId` and returns `DraftSaveResult`).
+    var markReadHook: (@Sendable () async -> Void)?
+    var saveDraftHook: (@Sendable () async -> Void)?
+    /// Awaited BEFORE `move()` records or mutates anything — lets a test
+    /// suspend the provider call itself (not just the durable write queue) so
+    /// it can observe/act while the claimed row is genuinely in flight. Never
+    /// held while any gate is held: this fires entirely outside the queue's
+    /// mutation gate, mirroring production.
+    var moveHook: (@Sendable () async -> Void)?
 
     // MARK: - Parameter Tracking
 
@@ -104,6 +189,7 @@ actor MockEmailProvider: EmailProvider {
     func markRead(ids: [String], folder: String) async throws {
         callLog.append("markRead(ids:\(ids),folder:\(folder))")
         markedReadIds.append((ids: ids, folder: folder))
+        if let markReadHook { await markReadHook() }
         if let error = markReadThrows { throw error }
     }
 
@@ -121,6 +207,7 @@ actor MockEmailProvider: EmailProvider {
 
     func move(ids: [String], from: String, to: String) async throws {
         callLog.append("move(ids:\(ids),from:\(from),to:\(to))")
+        if let moveHook { await moveHook() }
         if let (failingId, error) = moveThrowsOnId, ids.contains(failingId) {
             // Partial-batch progress: record everything BEFORE the failing id
             // as if it had already succeeded on the wire (mirrors an IMAP
@@ -177,6 +264,7 @@ actor MockEmailProvider: EmailProvider {
     func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
         callLog.append("saveDraft(existingDraftId:\(existingDraftId ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
         savedDrafts.append((draft: draft, existingDraftId: existingDraftId, draftsFolderPath: draftsFolderPath))
+        if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
         return saveDraftResult
     }
@@ -207,6 +295,18 @@ actor MockEmailProvider: EmailProvider {
         moveThrowsOnId = nil
     }
 
+    func setMarkReadHook(_ hook: (@Sendable () async -> Void)?) {
+        markReadHook = hook
+    }
+
+    func setSaveDraftHook(_ hook: (@Sendable () async -> Void)?) {
+        saveDraftHook = hook
+    }
+
+    func setMoveHook(_ hook: (@Sendable () async -> Void)?) {
+        moveHook = hook
+    }
+
     /// Reset all recorded state.
     func reset() {
         callLog.removeAll()
@@ -216,5 +316,8 @@ actor MockEmailProvider: EmailProvider {
         movedIds.removeAll()
         sentDrafts.removeAll()
         appendedToSent.removeAll()
+        markReadHook = nil
+        saveDraftHook = nil
+        moveHook = nil
     }
 }
