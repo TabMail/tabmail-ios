@@ -528,14 +528,23 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(rows[0].type == .saveDraft)
     }
 
-    @Test("ANTI-BRICK: a draft save on an account with NO drafts-role folder row is admitted")
+    @Test("ANTI-BRICK: a FIRST draft save on an account with NO drafts-role folder row is admitted")
     @MainActor
     func draftSaveWithNoDraftsFolderRowIsAdmitted() async throws {
         // `draftsFolderPath` falls back to a guessed "Drafts" when no drafts-role row
-        // exists, and that guess matches no `Folder` row — the case the missing-row
-        // refusal would otherwise brick permanently. It cannot: an account that has
-        // never had a drafts folder row cannot have produced a numeric serverDraftId,
-        // so the guessed path never reaches the guard.
+        // exists, and that guess matches no `Folder` row — a missing row fails CLOSED,
+        // so this is the case that could brick draft saving entirely. It does not,
+        // because a FIRST save (`serverDraftId == nil`) is classified APPEND-only and
+        // never reaches the guard. That first save is the one that MUST be admitted:
+        // nothing else can create the server copy.
+        //
+        // ⚠ This test's earlier comment claimed something stronger and FALSE — that
+        // "an account that has never had a drafts folder row cannot have produced a
+        // numeric serverDraftId". See `draftSaveWithNoDraftsFolderRowAndNumericIdIsRefused`
+        // immediately below, which exercises the case the old wording called
+        // impossible. The test itself never could have caught it: it builds the draft
+        // with `serverDraftId: nil`, so it does not enter the numeric branch at all
+        // and is green on both sides of the fix.
         let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
         let draftsRow = try await pool.read { db in try Folder.fetchOne(db, key: "acc1:Drafts") }
@@ -548,6 +557,35 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(rows.count == 1, "draft saving must not brick on an account with no drafts folder row")
         guard rows.count == 1 else { return }
         #expect(rows[0].type == .saveDraft)
+    }
+
+    @Test("A NUMERIC draft save on an account with no drafts-role folder row IS refused")
+    @MainActor
+    func draftSaveWithNoDraftsFolderRowAndNumericIdIsRefused() async throws {
+        // The state a previous comment asserted could not exist. It can: a save can
+        // APPEND into a real server mailbox literally named "Drafts" via the guessed
+        // path, the new message is located by Message-ID, and `IMAPProvider.saveDraft`
+        // returns `DraftSaveResult(serverId: String(uid))` — a numeric UID persisted on
+        // the `Draft` row. NONE of that creates a `Folder` row; only
+        // `SyncEngine.fullSync`'s folder-list upsert does. So a LATER save on the same
+        // account is UID-addressed with no row and no epoch, and must be refused —
+        // the delete-then-APPEND would expunge a literal UID under an unknown epoch.
+        //
+        // Fail-closed, and transient: the next folder-list sync creates the row.
+        // Nothing of the user's is lost — the local `Draft` row is untouched, which is
+        // what the second expectation pins.
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        let draftsRow = try await pool.read { db in try Folder.fetchOne(db, key: "acc1:Drafts") }
+        #expect(draftsRow == nil, "fixture precondition: no drafts-role folder row exists")
+        try makeDraftRow(pool, id: "d-nofolder-numeric", serverDraftId: "6120")
+
+        await AccountManager.shared.queueDraftSave(draftId: "d-nofolder-numeric", accountId: "acc1")
+
+        #expect(try await ops(pool).isEmpty,
+                "a UID-addressed draft save must not be admitted when the folder — and so the epoch — is unknown")
+        let draft = try await pool.read { db in try Draft.fetchOne(db, key: "d-nofolder-numeric") }
+        #expect(draft?.body == "Body", "a refused draft save must not touch the user's local content")
     }
 
     @Test("A draft delete addressed by NUMERIC id is refused under a nil epoch")
@@ -658,5 +696,164 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(rows.count == 1, "a local-only tag write is not an epoch-sensitive action")
         guard rows.count == 1 else { return }
         #expect(rows[0].type == .setTag)
+    }
+
+    // MARK: - 10. A draft save is re-classified at EXECUTION time, not only at enqueue
+
+    /// The enqueue-time classification in `queueDraftSave` is correct for the op it
+    /// admits and cannot bind the op that eventually RUNS. `PendingOperation` has a
+    /// UUID primary key and no save-draft dedupe, so two saves queued while
+    /// `serverDraftId` is still nil are BOTH admitted as APPEND-only; the first
+    /// APPENDs and stores the numeric UID the server returned, and the second — long
+    /// since admitted — reloads the LIVE draft and hands that numeric id to
+    /// `IMAPProvider.saveDraft`'s `existingDraftId` branch, which is
+    /// `store(flags: [.deleted])` + `expunge()` on a literal UID with both calls
+    /// `try?`-swallowed. Under an unknown epoch that silently destroys whatever
+    /// occupies the reused UID — constraint C3.
+    ///
+    /// The SYSTEM PROPERTY asserted here is "**no server-mutating call was made**",
+    /// not "some flag was set": this row is the second save's exact state, and the
+    /// provider either got the destructive call or it did not.
+    @Test("A draft save that is UID-addressed by EXECUTION time makes no provider call under a nil epoch")
+    @MainActor
+    func draftSaveIsReclassifiedAtExecutionTime() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        try addDraftsFolder(pool, epoch: nil)
+        // Exactly what the second of two concurrently-admitted saves sees when it
+        // finally drains: the first save's APPEND has already stored a numeric UID.
+        try makeDraftRow(pool, id: "d-live-numeric", serverDraftId: "8842")
+
+        let provider = MockEmailProvider()
+        try await DraftStore.shared.pushDraftToServer(
+            draftId: "d-live-numeric", provider: provider, draftsFolderPath: "Drafts")
+
+        let calls = await provider.callLogSnapshot()
+        #expect(!calls.contains { $0.hasPrefix("saveDraft") },
+                """
+                a UID-addressed draft save reached the provider against an unknown epoch — \
+                its delete-then-APPEND expunges a literal UID and can destroy a different \
+                message. Calls: \(calls)
+                """)
+        // …and nothing of the user's was lost: the local row still holds the content.
+        let draft = try await pool.read { db in try Draft.fetchOne(db, key: "d-live-numeric") }
+        #expect(draft?.body == "Body", "a refused push must not touch the user's local draft")
+        #expect(draft?.serverPushStatus == nil, "a refused push must not claim the draft was pushed")
+    }
+
+    @Test("The same draft save DOES reach the provider once the drafts epoch is known")
+    @MainActor
+    func draftSaveExecutesWhenTheEpochIsKnown() async throws {
+        // Non-vacuity for the test above: the refusal must be about the epoch, not
+        // about `pushDraftToServer` never calling the provider in this fixture.
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        try addDraftsFolder(pool, epoch: 777_001)
+        try makeDraftRow(pool, id: "d-live-known", serverDraftId: "8842")
+
+        let provider = MockEmailProvider()
+        try await DraftStore.shared.pushDraftToServer(
+            draftId: "d-live-known", provider: provider, draftsFolderPath: "Drafts")
+
+        let calls = await provider.callLogSnapshot()
+        #expect(calls.contains { $0.hasPrefix("saveDraft(existingDraftId:8842") },
+                "a known epoch must not block the ordinary UID-addressed save. Calls: \(calls)")
+    }
+
+    // MARK: - 11. A refusal reconciles the presentation state FROM THE DATABASE
+
+    /// 🚨 THE INVARIANT: after any sequence of toggles, admitted or refused, the
+    /// displayed checkmarks equal the durable join rows.
+    ///
+    /// Two taps inside one write window is ordinary use — the menu is a persistent
+    /// `List` of `Button`s, not a dismissing `Menu`, and its `appliedIds` is only
+    /// recomputed by `loadLabels()` on `.onAppear`. The rollback this replaces
+    /// captured `wasApplied` at dispatch and restored it at completion, which
+    /// composes wrongly: tap 1 captures `true` and displays L absent, tap 2 captures
+    /// `false` (from tap 1's UNPERSISTED optimistic state) and displays L applied,
+    /// both writes are refused, rollback 1 re-inserts L and rollback 2 removes it —
+    /// leaving the DB holding L with no checkmark. A phantom success, i.e. the exact
+    /// defect the rollback was added to eliminate, re-created under concurrency.
+    ///
+    /// This asserts `appliedIds == the join rows`, never "the revert ran" — a
+    /// mechanism assertion would stay green on a rollback that composes wrongly.
+    @Test("Two REFUSED label toggles leave the checkmarks equal to the database")
+    @MainActor
+    func twoRefusedTogglesReconcileFromTheDatabase() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: nil)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "901")
+        let label = UserLabel(id: "lbl-work", accountId: "acc1", name: "Work", isSystem: false)
+        try await pool.writeWithoutTransaction { db in
+            try label.insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: label.id).insert(db)
+        }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+        #expect(model.appliedIds.contains(label.id),
+                "fixture precondition: the label is checked before the gesture")
+
+        // Both taps capture their baseline before either write completes.
+        let first = model.toggleLabel(label)
+        let second = model.toggleLabel(label)
+        await first.value
+        await second.value
+
+        #expect(try await ops(pool).isEmpty, "precondition: both toggles were refused")
+        let durable = try await pool.read { db in
+            Set(try MessageUserLabel
+                .filter(Column("messageId") == msg.id)
+                .fetchAll(db)
+                .map(\.userLabelId))
+        }
+        #expect(durable == [label.id], "precondition: a refused toggle changes no join row")
+        #expect(model.appliedIds == durable,
+                """
+                the checkmarks disagree with the database after two refused toggles \
+                (shown \(model.appliedIds.sorted()) vs stored \(durable.sorted())) — \
+                a phantom success
+                """)
+    }
+
+    @Test("Two ADMITTED label toggles also leave the checkmarks equal to the database")
+    @MainActor
+    func twoAdmittedTogglesAgreeWithTheDatabase() async throws {
+        // Non-vacuity, two ways. (1) The property above must not be satisfiable by a
+        // menu whose toggles never change anything: here both writes ARE admitted, so
+        // the join rows really move (remove, then re-add) and the assertion has
+        // something to disagree with. (2) The reconcile runs on the admitted path too
+        // — this pins that it AGREES with the writes rather than clobbering them, the
+        // failure a reconcile-everywhere design could plausibly introduce.
+        let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "902")
+        let label = UserLabel(id: "lbl-later", accountId: "acc1", name: "Later", isSystem: false)
+        try await pool.writeWithoutTransaction { db in
+            try label.insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: label.id).insert(db)
+        }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+
+        let first = model.toggleLabel(label)
+        await first.value
+        let second = model.toggleLabel(label)
+        await second.value
+
+        let rows = try await ops(pool)
+        #expect(rows.count == 2, "precondition: both toggles were admitted")
+        let durable = try await pool.read { db in
+            Set(try MessageUserLabel
+                .filter(Column("messageId") == msg.id)
+                .fetchAll(db)
+                .map(\.userLabelId))
+        }
+        #expect(durable == [label.id], "precondition: remove-then-add leaves the label applied")
+        #expect(model.appliedIds == durable,
+                "shown \(model.appliedIds.sorted()) vs stored \(durable.sorted())")
     }
 }

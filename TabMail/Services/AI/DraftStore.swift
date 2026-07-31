@@ -127,6 +127,44 @@ actor DraftStore {
             print("[DraftStore] pushDraftToServer: skipping \(draftId) — serverPushStatus=\(draft.serverPushStatus ?? "nil") (must be nil or 'dirty')")
             return
         }
+
+        // T1.3 — RE-CLASSIFY AT EXECUTION TIME, from the value actually about to be
+        // sent. `AccountManager.queueDraftSave` classifies the same three cases at
+        // ENQUEUE time (nil ⇒ pure APPEND, non-numeric ⇒ Message-ID SEARCH, numeric ⇒
+        // literal-UID STORE+EXPUNGE) and only guards the numeric one, which is right
+        // for the op it is admitting and WRONG for the op that eventually runs:
+        // `PendingOperation` has a UUID primary key and no save-draft dedupe, so two
+        // saves can both be admitted while `serverDraftId` is still nil, the first
+        // APPENDs and stores the returned numeric UID, and the second — already
+        // admitted — reaches this function, reloads the LIVE row, and hands that
+        // numeric id to `IMAPProvider.saveDraft`'s `existingDraftId` branch:
+        // `store(flags: [.deleted])` + `expunge()` on a literal UID, both
+        // `try?`-swallowed. Under an unknown epoch that deletes whatever occupies the
+        // reused UID — constraint C3, the one hard invariant.
+        //
+        // The check is exact rather than another TOCTOU because it is made against
+        // `draft.serverDraftId` — the SAME value passed as `existingDraftId` below,
+        // from the same snapshot. Refusing an already-admitted op HERE is the
+        // sanctioned trade (C5: dropping at an id-reset boundary is correct): the
+        // local `Draft` row keeps every byte of the user's content, so nothing of the
+        // user's is lost — only the SERVER copy stays stale until the epoch is known
+        // and the next save runs.
+        if let existingId = draft.serverDraftId, UInt32(existingId) != nil {
+            // Copied out of the `var draft` before the closure: capturing the mutable
+            // binding itself is a data race the compiler rejects.
+            let guardedAccountId = draft.accountId
+            let refused = try await AppDatabase.dbPool.read { db in
+                try AccountManager.newGestureRefusedForUnknownEpoch(
+                    accountId: guardedAccountId, folderPath: draftsFolderPath, db: db)
+            }
+            if refused {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DraftStore] pushDraftToServer: refusing \(draftId) — UID-addressed save into '\(draftsFolderPath)' with no known epoch (T1.3, re-checked at execution)")
+                }
+                return
+            }
+        }
+
         if DebugModeManager.isLoggingEnabled() { print("[DraftStore] pushDraftToServer: BEGIN id=\(draftId) status=\(draft.serverPushStatus ?? "nil") serverDraftId=\(draft.serverDraftId ?? "nil") subjectPrefix=\(String(draft.subject.prefix(60))) bodyPrefix=\(String(draft.body.prefix(80)))") }
 
         // Generate a FRESH Message-ID on every push.

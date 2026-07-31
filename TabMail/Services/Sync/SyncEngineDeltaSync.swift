@@ -806,16 +806,20 @@ extension SyncEngine {
 
     /// The bootstrap epoch write itself, as ONE conditional UPDATE, inside a
     /// transaction the caller already owns. Used by delta sync's unchanged and
-    /// changed branches (STATUS-sourced) and by `runSyncMessages` (SELECT-sourced,
-    /// T1.2b).
+    /// changed branches (STATUS-sourced), by `runSyncMessages` (SELECT-sourced,
+    /// T1.2b) and by `SyncEngine.runBackfill`'s IMAP branch (SELECT-sourced, the
+    /// T1.3 anti-brick — the ONLY writer that reaches a custom non-favourite
+    /// folder, which no `syncableFolders` pass ever visits).
     ///
     /// ⚠ It is NOT the only writer of `Folder.lastKnownUidValidity`, and treating
     /// it as one would be dangerous — this column's safety property depends on
     /// knowing every writer (see the column's own doc comment on `Folder`). The
     /// complete set is THREE:
-    ///  1. this function — `runSyncMessages` and delta sync's changed branch call
-    ///     it directly, delta sync's unchanged branch through the async wrapper of
-    ///     the same name below;
+    ///  1. this function — `runSyncMessages`, delta sync's changed branch and
+    ///     `runBackfill`'s IMAP branch (in the FILE `SyncEngineBackfillWalk.swift`,
+    ///     which is an `extension SyncEngine`; there is no `SyncEngineBackfillWalk`
+    ///     type to cite) call it directly, delta sync's unchanged branch through
+    ///     the async wrapper of the same name below;
     ///  2. the folder-list upsert in `SyncEngine.fullSync` (`SyncEngineFullSync.swift`), which sets the
     ///     field on the `Folder` record it is already updating/inserting rather
     ///     than issuing a separate statement — it is safe without the in-statement

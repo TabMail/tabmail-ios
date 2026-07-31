@@ -65,8 +65,11 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// sync's STATUS (`SyncEngine.uidValidityBootstrapWrite` /
     /// `bootstrapFolderUidValidity`), the message-sync pass's own SELECT
     /// (`SyncEngine.runSyncMessages`, via `IMAPProvider.selectMailboxTracked` and
-    /// `EmailProvider.lastObservedUidValidity(folderPath:)` — T1.2b), or the walk's
-    /// own first SELECT (`persistFolderUidValidity` in
+    /// `EmailProvider.lastObservedUidValidity(folderPath:)` — T1.2b), the backfill
+    /// crawl's own pinned-connection SELECT (`SyncEngine.runBackfill`, same mirror —
+    /// the T1.3 anti-brick, and the ONLY one of these that reaches a custom
+    /// NON-FAVOURITE folder, which `syncableFolders` excludes from every sync pass),
+    /// or the walk's own first SELECT (`persistFolderUidValidity` in
     /// `SyncEngineDeletionReconcile.swift`). The SELECT source is not redundant
     /// with STATUS: SwiftMail asks for the `UIDVALIDITY` STATUS attribute only on a
     /// UIDPLUS server, whereas `OK [UIDVALIDITY n]` on SELECT is core IMAP4rev1 —

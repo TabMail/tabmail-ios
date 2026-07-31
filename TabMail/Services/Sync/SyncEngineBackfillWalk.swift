@@ -338,6 +338,65 @@ extension SyncEngine {
                         }
                     }
 
+                    // T1.3 ANTI-BRICK: persist the epoch this crawl observed for this
+                    // folder — BOOTSTRAP-ONLY.
+                    //
+                    // Backfill is the ONLY pass that reaches a custom NON-FAVOURITE
+                    // folder. `syncableFolders` — built identically by full sync, delta
+                    // sync and self-heal — is `primaryRoles ∪ secondaryRoles ∪
+                    // favourites`, so `runSyncMessages`, and with it T1.2b's
+                    // SELECT-sourced bootstrap, never runs for such a folder. Its only
+                    // other epoch source is `fetchFolders`' STATUS, which omits
+                    // UIDVALIDITY on any server that does not advertise UIDPLUS. So
+                    // before this write the column stayed nil FOREVER while backfill
+                    // filled the folder with searchable headers, and
+                    // `AccountManager.newGestureRefusedForUnknownEpoch` silently refused
+                    // every gesture on that mail — a permanent brick, not the bounded
+                    // first-sync window `IOS-EPOCH-001` documents.
+                    //
+                    // The observation already existed; only the persist was missing.
+                    // `withFolderConnection` → `IMAPProvider.createFolderConnection`
+                    // opens the folder through `selectMailboxTracked`, which records the
+                    // epoch in the provider's per-path mirror.
+                    //
+                    // BOOTSTRAP-ONLY IS A DATA-SAFETY RULE, NOT AN OPTIMISATION.
+                    // `bootstrapFolderUidValidity` carries `lastKnownUidValidity IS NULL`
+                    // inside its UPDATE, so it writes nothing once the column holds a
+                    // value. The deletion-reconcile walk's abort guard (ADR-IOS-051) is
+                    // ARMED by a populated column; stamping a live epoch over the one the
+                    // local UIDs belong to DISARMS it and turns that walk into a mass
+                    // deleter. This caller must never be relaxed into an unconditional
+                    // write.
+                    //
+                    // ONE post-walk sample, deliberately — this matches `runSyncMessages`'
+                    // T1.2b bootstrap, which also reads the mirror once, straight after the
+                    // fetch that populated it, and carries the same documented residual (a
+                    // turnover between the observation and this line would stamp an epoch
+                    // the just-inserted UIDs do not belong to). A stronger before/after
+                    // pairing was written first and REJECTED: the mirror is cold at the
+                    // start of the first walk in a process that resumes from a stored
+                    // cursor, so the "before" sample was nil, nothing was stamped, and a
+                    // folder that finishes its crawl in that one pass is never revisited —
+                    // `backfillComplete` is set and no later cycle SELECTs it again. That
+                    // "safer" guard silently preserved the very brick this code removes,
+                    // which is exactly the fix-reintroduces-its-own-defect shape this audit
+                    // train keeps producing. Do not reinstate it without also guaranteeing
+                    // a stamp on the single-pass path.
+                    if let epoch = imapProvider.lastObservedUidValidity(folderPath: folder.path) {
+                        do {
+                            try await AppDatabase.backgroundPool.write { db in
+                                try Self.bootstrapFolderUidValidity(
+                                    db, folderId: folder.id, observed: Int(epoch))
+                            }
+                        } catch {
+                            // Recomputable for free — the next backfill cycle re-observes
+                            // and retries. Never fatal to the crawl.
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Backfill] \(folder.name) epoch bootstrap write failed: \(error) — retries next cycle")
+                            }
+                        }
+                    }
+
                     // Persist confirmed cursor — only advances past ranges that succeeded
                     let finalCursor = await cursor.currentCursor
                     let isComplete = await cursor.isComplete

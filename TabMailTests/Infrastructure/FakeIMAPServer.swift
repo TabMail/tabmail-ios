@@ -1638,22 +1638,42 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
             return "\(tag) OK UID MOVE completed\r\n"
         case "EXPUNGE":
-            // TRIMMED, unlike the raw `subargs` this used to pass. `UID EXPUNGE`
-            // takes a sequence-set and nothing else, so it is the one UID subcommand
-            // with no `split(maxSplits: 1)` to strip the separator for it — and
-            // `resolveUIDSet` splits only on `,` and `:`, never on space. A client
-            // writing `UID EXPUNGE  1:3` (two spaces) therefore handed the parser
-            // " 1:3", whose lower bound `" 1"` is not an nz-number, so the whole
-            // component was rejected and the command deleted NOTHING while still
-            // being answered `OK`. Narrowing, not widening — but a silent no-op
-            // answered as success is exactly what makes a fake certify a broken
-            // client as correct.
-            let uids = Set(parseUIDSet(subargs.trimmingCharacters(in: .whitespaces), in: mailbox))
+            // ⚠ A PREVIOUS REVISION `trimmingCharacters(in: .whitespaces)`-ED THIS
+            // ARGUMENT AND THAT WAS WRONG — it is restored to the raw value, with a
+            // syntax check instead.
+            //
+            // RFC 4315 §2.1 gives `uid-expunge = "UID" SP "EXPUNGE" SP sequence-set`,
+            // and RFC 3501 §9 defines `SP` as exactly ONE space; `sequence-set`
+            // contains no whitespace at all. `handleUID` has already consumed the one
+            // `SP`, so anything left in `subargs` that is not a bare sequence-set is a
+            // syntax error and a conforming server answers `BAD`. `UID EXPUNGE  1:2`
+            // (two spaces) is such an error, and normalising it made this fake ACCEPT
+            // — and act destructively on — a command no real server would honour, i.e.
+            // it certified a broken client as correct. The earlier complaint that the
+            // untrimmed form "deleted NOTHING while still being answered OK" was half
+            // right: the no-op was correct, the `OK` was not. This rejects the whole
+            // command instead, which fixes the response without inventing the
+            // deletion. No well-formed set contains whitespace, so nothing legal is
+            // refused by this check.
+            guard !subargs.isEmpty, !subargs.contains(where: { $0.isWhitespace }) else {
+                return "\(tag) BAD Invalid UID EXPUNGE sequence-set\r\n"
+            }
+            let uids = Set(parseUIDSet(subargs, in: mailbox))
             withState { state in
                 recordOracleCheck(command: "UID EXPUNGE", mailbox: mailbox, uids: uids, state: &state)
+                // RFC 4315 §2.1: UID EXPUNGE removes "all messages that both have the
+                // \Deleted flag set AND have a UID that is included in the specified
+                // sequence set" — being NAMED is not sufficient. That is the whole
+                // point of the command over plain EXPUNGE (whose own handler in this
+                // fake has always filtered on \Deleted): it NARROWS an expunge to a
+                // set, it does not authorise deleting undeleted mail. Without this,
+                // the fake let a client destroy messages it had never marked, so any
+                // wrong-message oracle downstream would bless that as correct.
+                let mailboxFlags = state.flagsByMailbox[mailbox] ?? [:]
+                let expunged = uids.filter { mailboxFlags[$0]?.contains("\\Deleted") ?? false }
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
-                state.messagesByMailbox[mailbox] = sourceMessages.filter { !uids.contains($0.uid) }
-                for uid in uids {
+                state.messagesByMailbox[mailbox] = sourceMessages.filter { !expunged.contains($0.uid) }
+                for uid in expunged {
                     state.flagsByMailbox[mailbox]?.removeValue(forKey: uid)
                 }
             }
@@ -1812,9 +1832,20 @@ final class FakeIMAPServer: @unchecked Sendable {
         // 4294967295 is ten digits; anything longer cannot be in range, and the
         // length cap keeps a pathological token from reaching the conversion.
         guard !token.isEmpty, token.count <= 10 else { return nil }
-        // Rejects `+`/`-` signs, underscores, whitespace and non-ASCII digit forms
-        // (`Character.isNumber` alone is true for e.g. Arabic-Indic digits, which
-        // `Int(_:)` does accept).
+        // Rejects `+`/`-` signs, underscores and whitespace — every one of which
+        // `Int(_:)` either accepts (`+1`, `-1`) or would otherwise have to be caught
+        // downstream.
+        //
+        // ⚠ The `isASCII` conjunct is BELT-AND-BRACES, and an earlier version of this
+        // comment justified it backwards: it claimed `Character.isNumber` is true for
+        // e.g. Arabic-Indic digits "which `Int(_:)` does accept". `Int(_:)` does NOT —
+        // it accepts only ASCII digits with an optional leading sign, so `Int("١٢٣")`,
+        // `Int("１２３")` and `Int("²")` are all nil (verified by execution). The
+        // conjunct is therefore redundant against today's `Int(_:)` rather than
+        // load-bearing. It is kept because it makes the accepted alphabet explicit at
+        // the guard instead of implicit in a stdlib conversion — but do not delete the
+        // `Int(_:)` range checks below in the belief that this line is what enforces
+        // the grammar.
         guard token.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
         // `digit-nz` — a leading zero is not an nz-number, so `007` is malformed
         // rather than 7, and `0` is rejected outright.

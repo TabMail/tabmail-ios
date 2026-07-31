@@ -145,17 +145,43 @@ extension AccountManager {
     /// `AccountManagerSetup.swift`, which is an `extension AccountManager`; there is
     /// no `AccountManagerSetup` type to cite.)
     ///
-    /// The COMPLETE class this exclusion closes — every `Account` construction site was
-    /// enumerated, not sampled. Only two of the five providers are in the predicate at
-    /// all (`.imap`, `.icloud`), so the class is "stored as IMAP-family but not backed
-    /// by a live `IMAPProvider`": `setupOAuthAccount` (`.gmail`/`.outlook` — excluded by
-    /// provider), `addIMAPAccount` (`.imap`, real IMAP — the intended bounded window),
+    /// The COMPLETE class this exclusion closes. Only two of the five providers are in
+    /// the predicate at all (`.imap`, `.icloud`), so the class is "stored as IMAP-family
+    /// but not backed by a live `IMAPProvider`". EIGHT sites, not seven:
+    /// `setupOAuthAccount` (`.gmail`/`.outlook` — excluded by provider),
+    /// `addIMAPAccount` (`.imap`, real IMAP — the intended bounded window),
     /// `addICloudAccount` (`.icloud`, real IMAP — same), `addCalDAVAccount` (`.caldav`,
     /// `calendarOnly` — NOT in the predicate, and it owns no mail folders, so it is
     /// doubly exempt), the two `CalendarSetupView` sites (`.gmail`/`.outlook`,
-    /// `calendarOnly` — excluded by provider), `PreviewMocks` (`.imap`, but SwiftUI
-    /// previews only; never inserted into the shared database) and `DemoSeed`
-    /// (`.imap`, `DemoProvider` — the one real member, closed below).
+    /// `calendarOnly` — excluded by provider), `PreviewMocks`, `ScreenshotMode`, and
+    /// `DemoSeed` (`.imap`, `DemoProvider` — the one real member, closed below).
+    ///
+    /// ⚠ TWO CORRECTIONS TO AN EARLIER VERSION OF THIS CENSUS, both worth keeping
+    /// visible because each was a method error, not a typo:
+    ///
+    /// (a) It listed SEVEN sites and MISSED `ScreenshotMode` (`ScreenshotMode.swift`),
+    /// which inserts an account with `provider = "imap"` and its folders by RAW SQL —
+    /// `INSERT INTO folder (id, accountId, name, path, role, unreadCount, totalCount,
+    /// backfillComplete)`, no `lastKnownUidValidity` column — so those folders are
+    /// nil-epoch forever with no server that could ever stamp them. It was missed
+    /// because the census was taken with an `rg 'Account\('` sweep, which only finds
+    /// Swift literal initialisers; that is the SAME search shape that missed `DemoSeed`
+    /// in the previous round. A census of "who can produce this state" must sweep the
+    /// SQL too. It is currently INERT — every message `ScreenshotMode` seeds targets
+    /// `screenshot-account`, which is `.gmail` and therefore excluded by provider, so
+    /// no gesture ever reaches a nil-epoch `screenshot-imap` folder — and it is a
+    /// screenshot-fixture path that never runs in a shipped session. But it is one
+    /// message-seed away from a second Demo-Mode-shaped brick, so it is named here
+    /// rather than left to be rediscovered.
+    ///
+    /// (b) It dismissed `PreviewMocks` as "never inserted into the shared database".
+    /// That is FALSE: `PreviewMocks.bootstrapAppDatabase` installs a pool INTO
+    /// `AppDatabase.shared` and `PreviewMocks.seedInbox` writes an `.imap` account plus
+    /// a nil-epoch INBOX through it. The conclusion (no production brick) survives, but
+    /// the reason is different and must be stated correctly: the pool it installs is an
+    /// EPHEMERAL per-invocation temp-directory database, and `PreviewMocks` is compiled
+    /// for and reached only from `#Preview` bodies in the Xcode canvas — no shipped
+    /// session executes it, and nothing it writes outlives the preview process.
     ///
     /// A MISSING `Folder` ROW FAILS **CLOSED** for the IMAP family. It is not a benign
     /// unknown: `SyncEngine.fullSync` deletes a vanished folder's row while RETAINING
@@ -167,12 +193,24 @@ extension AccountManager {
     /// epoch is nil. Admitting a gesture on such a header writes a bare UID from the OLD
     /// epoch into a durable op — precisely C3. Orphans are reachable by real gestures
     /// (the notification path queries `messageHeader` without joining `folder`).
-    /// This does NOT brick the two callers that used to justify the fail-open, because
-    /// neither reaches this function with a guessed path any more:
-    /// `UserLabelMenuView.resolvedFolderPath()` now returns `nil` instead of guessing
-    /// `"INBOX"` and its callers abort, and the draft sites only consult this guard when
-    /// the op will actually resolve an existing UID (see `queueDraftSave`), which cannot
-    /// be true on an account that has no drafts-role row to have synced through.
+    /// This does NOT brick the two callers that used to justify the fail-open:
+    /// `UserLabelMenuModel.resolvedFolderPath()` (in the file `UserLabelMenuView.swift`)
+    /// now returns `nil` instead of guessing `"INBOX"` and its callers abort, and the
+    /// draft sites consult this guard only when the op will actually resolve an EXISTING
+    /// UID (see `queueDraftSave`), so a FIRST save on an account with no drafts-role row
+    /// — the one save that must not be refused, because nothing else can create the
+    /// server copy — is classified APPEND-only and never reaches here.
+    ///
+    /// ⚠ That last clause used to read "…which cannot be true on an account that has no
+    /// drafts-role row to have synced through", i.e. it asserted a numeric
+    /// `serverDraftId` is IMPOSSIBLE without a `Folder` row. FALSE, and the false form
+    /// is the more dangerous one because it invites removing the guard: nothing about
+    /// APPENDing into a real server mailbox named "Drafts" and persisting the UID
+    /// `IMAPProvider.saveDraft` returns creates a `Folder` row — only
+    /// `SyncEngine.fullSync`'s folder-list upsert does. So a LATER save on such an
+    /// account CAN be numeric and CAN be refused here. It is transient (the next folder
+    /// list creates the row) and fail-closed, and the user's content is never at risk —
+    /// the local `Draft` row is untouched.
     ///
     /// Every remaining unknown still fails **OPEN** (returns `false` = admit): a missing
     /// account row and a non-IMAP-family provider.
@@ -896,11 +934,37 @@ extension AccountManager {
                 //     (This is the ONLY case the old census description actually fit.)
                 //   • non-numeric             → Message-ID SEARCH, epoch-IMMUNE → admit.
                 //   • numeric                 → literal UID STORE+EXPUNGE → GUARD.
-                // Scoping to the numeric case is also what makes the missing-`Folder`-row
-                // refusal safe here: `draftsFolderPath` falls back to a guessed "Drafts"
-                // only when the account has no drafts-role row, and such an account can
-                // never have produced a numeric `serverDraftId` in the first place — so
-                // the guessed path never reaches the guard, and draft saving cannot brick.
+                // ⚠ THIS CLASSIFICATION IS MADE AT ENQUEUE TIME AND IS NOT THE LAST WORD.
+                // `PendingOperation` has a UUID primary key and no save-draft dedupe, so
+                // two saves queued while `serverDraftId` is still nil are BOTH admitted as
+                // APPEND-only; the first stores the numeric UID the APPEND returned, and
+                // the second then executes against a LIVE snapshot that has become the
+                // numeric case. The re-classification that actually protects the
+                // literal-UID branch therefore lives at execution time, in
+                // `DraftStore.pushDraftToServer`, immediately before the value is handed
+                // to the provider. Do not delete this enqueue-time check in favour of it —
+                // refusing early avoids writing an op that would only be dropped later —
+                // but do not mistake it for the guard either.
+                //
+                // Scoping to the numeric case is what keeps the missing-`Folder`-row
+                // refusal from bricking draft saves: `draftsFolderPath` falls back to a
+                // guessed "Drafts" when the account has no drafts-role row, that guess
+                // matches no `Folder` row, and a missing row fails CLOSED. A first save
+                // (`serverDraftId == nil`) is classified APPEND-only, never reaches the
+                // guard, and so is always admitted.
+                //
+                // ⚠ AN EARLIER VERSION OF THIS COMMENT CLAIMED THE ABSOLUTE — that "an
+                // account that has never had a drafts folder row cannot have produced a
+                // numeric `serverDraftId`". That is FALSE and was removed. A fresh account
+                // can use the guessed "Drafts" path, SELECT/APPEND into a real server
+                // mailbox of that name, have the new message located by Message-ID, and
+                // persist the numeric UID `IMAPProvider.saveDraft` returns — none of which
+                // creates a `Folder` row (only `SyncEngine.fullSync`'s folder-list upsert
+                // does). So the guessed path CAN reach the guard on a later save. The
+                // conclusion still holds and is what matters: such a save is refused, the
+                // local `Draft` row keeps the user's content, and the refusal lifts as
+                // soon as a folder list has been synced — transient and fail-closed, not a
+                // brick.
                 if let existingId = draft.serverDraftId, UInt32(existingId) != nil,
                    try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
                     return nil

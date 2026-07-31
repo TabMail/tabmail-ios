@@ -1903,9 +1903,10 @@ final class InboxViewModel {
     func removeUserLabel(_ label: UserLabel, from snapshot: MessageSnapshot) async {
         // Look up full MessageHeader from DB for correct folderPath
         guard let message = lookupMessage(snapshot.id) else { return }
-        // Optimistic UI: remove label from snapshot. Captured so a REFUSED write can
-        // put it back — see the revert below.
-        let previousLabels = loadedMessages.first(where: { $0.id == snapshot.id })?.userLabels
+        // Optimistic UI: remove label from the on-screen row. A refused or failed
+        // write RECONCILES from the database (see `reconcileUserLabels`) — the
+        // whole-array snapshot this used to capture is not restorable correctly
+        // under concurrent gestures.
         if let idx = loadedMessages.firstIndex(where: { $0.id == snapshot.id }) {
             loadedMessages[idx].userLabels.removeAll { $0.id == label.id }
         }
@@ -1932,25 +1933,50 @@ final class InboxViewModel {
             }
             // A refusal queued nothing and changed no row. Leaving the optimistic
             // removal in place would show the label as gone forever while it is still
-            // applied in the database — a phantom success. Re-find by id rather than
-            // reusing the index: the array can be rebuilt across the await above.
+            // applied in the database — a phantom success.
             guard admitted else {
-                restoreUserLabels(previousLabels, forMessageId: snapshot.id)
+                reconcileUserLabels(forMessageId: snapshot.id)
                 return
             }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             await AccountManager.shared.drainPendingQueue()
+            // Also on the admitted path, for the convergence reason stated on
+            // `UserLabelMenuModel`: reconciling only on refusal leaves a stale row
+            // standing whenever the LAST overlapping gesture to finish was admitted.
+            reconcileUserLabels(forMessageId: snapshot.id)
         } catch {
-            restoreUserLabels(previousLabels, forMessageId: snapshot.id)
+            reconcileUserLabels(forMessageId: snapshot.id)
             print("[InboxViewModel] removeUserLabel failed: \(error)")
         }
     }
 
-    /// Put a message's optimistically-mutated label set back after a write that was
-    /// refused or failed. No-op when the row has since left the list.
-    private func restoreUserLabels(_ labels: [UserLabel]?, forMessageId id: String) {
-        guard let labels, let idx = loadedMessages.firstIndex(where: { $0.id == id }) else { return }
-        loadedMessages[idx].userLabels = labels
+    /// Re-derive a message's on-screen label set from the DATABASE after a write
+    /// that was refused or failed. No-op when the row has since left the list.
+    ///
+    /// 🚨 It RECONCILES; it does not restore a snapshot. The predecessor captured
+    /// the whole `userLabels` array before the await and assigned it back, which
+    /// composes wrongly the moment two label gestures overlap on the same row:
+    /// the second gesture's "previous" array is the FIRST gesture's unpersisted
+    /// optimistic state, so restoring it re-publishes a state that was never
+    /// durable and can leave the row disagreeing with `messageUserLabel` in either
+    /// direction. Undoing each gesture's own delta has the same flaw for the same
+    /// reason. Reading the join rows is the only formulation whose result does not
+    /// depend on what any gesture happened to observe — see
+    /// `UserLabelMenuModel`'s doc comment, which states the same invariant for the
+    /// menu's checkmarks.
+    ///
+    /// Re-finds by id rather than reusing a captured index: the array can be
+    /// rebuilt across an await.
+    private func reconcileUserLabels(forMessageId id: String) {
+        guard let idx = loadedMessages.firstIndex(where: { $0.id == id }) else { return }
+        do {
+            let labels = try AppDatabase.dbPool.read { db in
+                try UserLabelStore.labelsForMessage(id, in: db)
+            }
+            loadedMessages[idx].userLabels = labels
+        } catch {
+            print("[InboxViewModel] reconcileUserLabels failed for \(id): \(error)")
+        }
     }
 
     func move(_ messageId: String, toFolderPath: String) {

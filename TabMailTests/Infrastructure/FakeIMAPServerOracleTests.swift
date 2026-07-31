@@ -278,6 +278,13 @@ struct FakeIMAPServerOracleTests {
                 Self.message(uid: 142, id: declaredId),
             ],
         ])
+        // RFC 4315 §2.1 — `UID EXPUNGE` removes only messages that ALREADY carry
+        // `\Deleted`. Every production caller sets it first (`IMAPProvider.move`'s
+        // recovery path does `store(flags: [.deleted])` immediately before
+        // `expunge(messages:)`), so the fixture does too; without it the command is
+        // a legitimate no-op and this test would be asserting a deletion no real
+        // server performs.
+        server.setFlags(["\\Deleted"], in: "INBOX", uid: occupantUID)
         server.expectMutation(rfc822MessageId: declaredId)
         try server.start()
         defer { server.stop() }
@@ -884,6 +891,13 @@ struct FakeIMAPServerOracleTests {
 
         // 3. UID EXPUNGE with an out-of-range bound. This is the destructive verb:
         //    a widened set here DELETES mail outright, with nothing to recover from.
+        //
+        //    \Deleted is set on the WHOLE mailbox first, so "nothing was expunged"
+        //    below is attributable to the PARSER and not to RFC 4315's flag
+        //    precondition — without it these two expectations would hold on any
+        //    parser at all, including one that resolves the malformed set to
+        //    everything.
+        _ = try client.command(tag: "b4a", "UID STORE 1:3 +FLAGS (\\Deleted)")
         _ = try client.command(tag: "b5", "UID EXPUNGE 1:4294967296")
         #expect(
             server.messageIDs(in: "INBOX").count == 3,
@@ -911,14 +925,18 @@ struct FakeIMAPServerOracleTests {
 
     /// The EXPUNGE call site passes its arguments RAW — it is the one UID
     /// subcommand with no `split(maxSplits: 1)` to strip the separator, because it
-    /// takes a sequence-set and nothing else. `resolveUIDSet` never splits on
-    /// space, so an extra space used to reach the parser as part of the bound,
-    /// which then failed the grammar and made the whole command a silent no-op
-    /// answered `OK`. Narrowing rather than widening — but a command that reports
-    /// success while doing nothing is exactly how a fake certifies a broken client
-    /// as correct.
-    @Test("UID EXPUNGE with extra whitespace still expunges the set it names")
-    func wireLevelUIDExpungeToleratesExtraWhitespace() throws {
+    /// takes a sequence-set and nothing else.
+    ///
+    /// `UID EXPUNGE  1:2` (two spaces) is a SYNTAX ERROR: RFC 4315 §2.1 spells the
+    /// command `"UID" SP "EXPUNGE" SP sequence-set`, RFC 3501 §9 makes `SP` exactly
+    /// one space, and a `sequence-set` contains no whitespace. A conforming server
+    /// answers `BAD` and touches nothing. An earlier revision of the fake instead
+    /// TRIMMED the argument and expunged 1 and 2 — accepting, and acting
+    /// destructively on, a command no real server would honour. That is worse than
+    /// the no-op it replaced: a fake that executes malformed commands certifies a
+    /// broken client as correct.
+    @Test("UID EXPUNGE with extra whitespace is a syntax error and expunges nothing")
+    func wireLevelUIDExpungeRejectsExtraWhitespace() throws {
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [
                 Self.message(uid: 1, id: "wire-ws-first@example.com"),
@@ -935,14 +953,85 @@ struct FakeIMAPServerOracleTests {
         _ = try client.command(tag: "c1", "LOGIN \(server.username) \(server.password)")
         _ = try client.command(tag: "c2", "SELECT INBOX")
 
-        // Two spaces after the verb. Pre-trim this resolved to [] and answered OK.
-        _ = try client.command(tag: "c3", "UID EXPUNGE  1:2")
+        // Flag the whole mailbox \Deleted first, so the only thing standing between
+        // the malformed command and three destroyed messages is the syntax check.
+        _ = try client.command(tag: "c3", "UID STORE 1:3 +FLAGS (\\Deleted)")
+
+        let response = try client.command(tag: "c4", "UID EXPUNGE  1:2")
         #expect(
-            server.messageIDs(in: "INBOX") == ["<wire-ws-third@example.com>"],
-            "UID EXPUNGE silently expunged nothing while answering OK: INBOX holds \(server.messageIDs(in: "INBOX"))"
+            response.contains("c4 BAD"),
+            "a two-space UID EXPUNGE must be answered BAD, got: \(response)"
+        )
+        #expect(
+            server.messageIDs(in: "INBOX").count == 3,
+            "a malformed UID EXPUNGE destroyed mail: INBOX holds \(server.messageIDs(in: "INBOX"))"
         )
 
-        _ = try client.command(tag: "c4", "LOGOUT")
+        // Non-vacuity: the single-SP form of the very same set DOES expunge, so the
+        // expectation above is about the syntax and not about a fake that never
+        // expunges anything.
+        _ = try client.command(tag: "c5", "UID EXPUNGE 1:2")
+        #expect(
+            server.messageIDs(in: "INBOX") == ["<wire-ws-third@example.com>"],
+            "a well-formed UID EXPUNGE must still expunge its set: INBOX holds \(server.messageIDs(in: "INBOX"))"
+        )
+
+        _ = try client.command(tag: "c6", "LOGOUT")
+    }
+
+    /// RFC 4315 §2.1: `UID EXPUNGE` removes "all messages that both have the
+    /// \\Deleted flag set AND have a UID that is included in the specified sequence
+    /// set". Being NAMED is not sufficient — the set NARROWS an expunge, it does not
+    /// authorise deleting mail the client never marked. The fake used to drop every
+    /// named UID regardless of flags, so a client that expunged without ever storing
+    /// \\Deleted was blessed as correct.
+    @Test("UID EXPUNGE removes only the \\Deleted members of the set it names")
+    func wireLevelUIDExpungeRequiresDeletedFlag() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                Self.message(uid: 1, id: "wire-del-first@example.com"),
+                Self.message(uid: 2, id: "wire-del-second@example.com"),
+                Self.message(uid: 3, id: "wire-del-third@example.com"),
+            ],
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "d1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "d2", "SELECT INBOX")
+
+        // Nothing carries \Deleted yet — naming the whole mailbox must remove nothing.
+        _ = try client.command(tag: "d3", "UID EXPUNGE 1:3")
+        #expect(
+            server.messageIDs(in: "INBOX").count == 3,
+            "UID EXPUNGE removed messages that were never flagged \\Deleted: \(server.messageIDs(in: "INBOX"))"
+        )
+
+        // Flag ONE, then name ALL: exactly the flagged one goes.
+        _ = try client.command(tag: "d4", "UID STORE 2 +FLAGS (\\Deleted)")
+        _ = try client.command(tag: "d5", "UID EXPUNGE 1:3")
+        #expect(
+            server.messageIDs(in: "INBOX") == [
+                "<wire-del-first@example.com>", "<wire-del-third@example.com>",
+            ],
+            "UID EXPUNGE must remove exactly the \\Deleted members of its set: \(server.messageIDs(in: "INBOX"))"
+        )
+
+        // And a \Deleted message OUTSIDE the named set survives — the set really does
+        // narrow, rather than the flag alone deciding.
+        _ = try client.command(tag: "d6", "UID STORE 3 +FLAGS (\\Deleted)")
+        _ = try client.command(tag: "d7", "UID EXPUNGE 1")
+        #expect(
+            server.messageIDs(in: "INBOX") == [
+                "<wire-del-first@example.com>", "<wire-del-third@example.com>",
+            ],
+            "UID EXPUNGE removed a \\Deleted message its sequence-set did not name: \(server.messageIDs(in: "INBOX"))"
+        )
+
+        _ = try client.command(tag: "d8", "LOGOUT")
     }
 }
 
