@@ -111,8 +111,8 @@ struct StatefulExchangeActionServerTests {
     /// separately needs a response script that forces both legs to run:
     /// `deleteDraftRetriesOnTheInjectedSessionAfter401` does that.
     ///
-    /// Signature adaptation: `v3`'s `saveDraft` has no
-    /// `previousRfc822MessageId:` parameter (`v2final`-only).
+    /// `previousRfc822MessageId:` is IMAP-only — Exchange PATCHes by the durable
+    /// Graph id and ignores it — so it is passed nil here.
     @Test("an opaque Graph draft id stays one path segment for body GET, attachments, and PATCH")
     func opaqueDraftIdStaysOnePathSegment() async throws {
         let opaqueId = "graph-draft+opaque="
@@ -131,6 +131,7 @@ struct StatefulExchangeActionServerTests {
         _ = try await provider.saveDraft(
             DraftMessage(subject: "Updated", body: "Updated body"),
             existingDraftId: opaqueId,
+            previousRfc822MessageId: nil,
             draftsFolderPath: "Drafts"
         )
 

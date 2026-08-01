@@ -261,10 +261,20 @@ protocol EmailProvider: Sendable {
     /// - Parameters:
     ///   - draft: The draft message content.
     ///   - existingDraftId: Server-side draft ID for update (nil for create).
+    ///   - previousRfc822MessageId: The rfc822 Message-ID the OLD server copy carries —
+    ///     i.e. the value `Draft.rfc822MessageId` held BEFORE `DraftStore.pushDraftToServer`
+    ///     rotated it for this push. IMAP's old-copy delete resolves its target by THIS
+    ///     identity and by nothing else: never by `draft.messageId` (the FRESH id, which the
+    ///     old copy does not carry → the delete would find nothing and orphan it) and never
+    ///     by `existingDraftId` (a raw UID — a mutable address that a `UIDVALIDITY` reset
+    ///     reassigns to a DIFFERENT message, so destroying it destroys the user's real mail).
+    ///     nil/blank ⇒ no old-copy delete is attempted; never substitute the fresh id.
+    ///     Gmail/Exchange/Demo update in place by `existingDraftId` and IGNORE this
+    ///     parameter (their ids are durable identity, not addresses).
     ///   - draftsFolderPath: Server-side Drafts folder path (for IMAP).
     /// - Returns: DraftSaveResult with serverId (for update/delete) and optional messageId
     ///   (Gmail only — the underlying message ID, different from the draft resource ID).
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult
 
     /// Delete a draft from the server's Drafts folder.
     /// Best-effort — failure is logged but does not throw (orphaned drafts are harmless).

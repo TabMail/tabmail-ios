@@ -179,7 +179,9 @@ actor DemoProvider: EmailProvider {
         true
     }
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+        // `previousRfc822MessageId` is IMAP-only. Demo replaces the local row by
+        // `existingDraftId`, so it IGNORES this parameter (behavior unchanged).
         guard let db = AppDatabase.shared.withLock({ $0 }) else {
             throw DemoError.notInDemo
         }

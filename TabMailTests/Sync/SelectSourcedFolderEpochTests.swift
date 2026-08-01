@@ -725,7 +725,7 @@ private actor MirrorOnlyProvider: EmailProvider {
     func move(ids: [String], from: String, to: String) async throws {}
     func send(draft: DraftMessage) async throws {}
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool { true }
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "") }
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "") }
     func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
     func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }

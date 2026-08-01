@@ -566,7 +566,11 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Drafts
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+        // `previousRfc822MessageId` is IMAP-only (it identifies the epoch-immune old
+        // copy to delete). Exchange updates the draft in place by `existingDraftId`
+        // (`PATCH /messages/{id}`) — a durable Graph id, not a reusable address — so it
+        // IGNORES this parameter.
         let message = buildGraphSendPayload(draft: draft)
 
         if let existingId = existingDraftId {

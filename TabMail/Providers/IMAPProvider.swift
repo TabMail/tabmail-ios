@@ -2057,7 +2057,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - Drafts
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
         // Guard: Message-ID is required for IMAP draft tracking (find UID after APPEND).
         // DraftStore.pushDraftToServer generates rfc822MessageId before calling this.
         guard let messageId = draft.messageId, !messageId.isEmpty else {
@@ -2067,34 +2067,88 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         let senderAddr = senderEmail
         return try await withActionConnection(folder: draftsFolderPath) { server in
-            // Delete existing draft by UID if updating.
-            // If existingDraftId is non-numeric (e.g., UID changed), fall back to Message-ID search.
-            // SCOPE, not policy. Both legs below keep their existing `try?`
-            // swallowing and their existing reachability — the ONLY change is that
-            // the purge names the UID(s) being replaced instead of the whole
-            // mailbox. Same defect and same fix as `deleteDraft`, reached through
-            // the old-copy delete rather than the user's delete gesture, and worse
-            // here because these are the very calls that LEAVE `\Deleted` messages
-            // behind when they are swallowed: a later bare EXPUNGE in Drafts
-            // destroys the residue of every earlier save, not just this one's.
-            // See `expungeScopedToTargets` for the UIDPLUS reasoning.
-            if let existingId = existingDraftId {
-                if let uid = UInt32(existingId) {
-                    let uidSet = MessageIdentifierSet<UID>(UID(uid))
-                    try? await server.store(flags: [.deleted], on: uidSet, operation: .add)
-                    try? await self.expungeScopedToTargets(
-                        uidSet, server: server, logDescription: "old draft copy uid=\(uid) in \(draftsFolderPath)")
-                } else {
-                    // Stale UID — try finding by Message-ID (rfc822MessageId survives UID changes)
-                    let found = try await self.searchByMessageId(messageId, server: server)
-                    if !found.isEmpty {
-                        try? await server.store(flags: [.deleted], on: found, operation: .add)
+            // Delete the OLD server copy by its PREVIOUS rfc822 Message-ID, VERIFIED —
+            // and by nothing else. Ported from `v2final`'s `saveDraftOnActionConnection`
+            // (audit #5 + ADR-IOS-061 items D/E), which fixed this exact site.
+            //
+            // The two legs this replaces both destroyed a message they had never
+            // identified:
+            //
+            //  * The NUMERIC leg took `existingDraftId` — `Draft.serverDraftId`, a UID
+            //    persisted at an earlier save — and STORE'd `\Deleted` + EXPUNGEd it
+            //    outright. A UID is a mutable ADDRESS, not an identity: the `Draft` table
+            //    survives a `UIDVALIDITY` reset but the UID it names does NOT, so after a
+            //    renumber that same integer names a DIFFERENT message and this destroyed
+            //    the user's real mail (constraint C3). It bypassed `resolveUID` entirely,
+            //    so none of the identity guards restored by `071b52751` applied. There is
+            //    no verified form of it worth keeping: a Message-ID SEARCH is epoch-IMMUNE
+            //    and finds the old copy wherever the renumber put it, while a
+            //    FETCH-corroborated UID would simply refuse under a new epoch. So the leg
+            //    is GONE — `v2final`'s rule, verbatim: a bare-UID delete stays forbidden.
+            //
+            //  * The SEARCH leg searched for `messageId` — the FRESH id.
+            //    `DraftStore.pushDraftToServer` ROTATES the rfc822 Message-ID on every push
+            //    (`previousRfc822` captured, then `draft.rfc822MessageId = freshRfc822`), so
+            //    the old copy carries the PREVIOUS id and the fresh one is the identity
+            //    about to be APPENDed. Searching by the fresh id MISSES the old copy — a
+            //    stale orphan per re-push — and could match a prior retry's APPEND instead.
+            //    It also STORE-`\Deleted`-ed the whole hit set unverified, and IMAP
+            //    `SEARCH HEADER Message-ID` is RFC 3501 SUBSTRING matching, not equality:
+            //    `xa@example.com` is a hit for `a@example.com`. Hence
+            //    `exactMessageIdMatches` + the cardinality rule below.
+            //
+            // ⚑ DELIBERATE DEVIATION FROM `v2final`, stated rather than hidden — THE
+            // FAIL-SAFE DIRECTION IS INVERTED HERE, AND THAT IS NOT A BUG TO "FIX".
+            // The reference's `deleteDraftStrong`/`deleteDraftLegacy` THROW on a failed
+            // identity check because they serve the user's DELETE gesture, where refusing
+            // is the safe outcome. This is `saveDraft`: a throw here means the APPEND below
+            // never runs. For a TRANSPORT failure that is fine and deliberate (the SEARCH /
+            // FETCH still `try await` — the durable op retries, the local `Draft` row holds
+            // every byte the user typed, and nothing lands, so the next attempt converges).
+            // But for a VERDICT — the identity check completed and says "not this one" (0
+            // exact matches), "which one?" (>1), or "unusable id" — a throw would wedge the
+            // op forever on a state that never changes, so the delete is SKIPPED and the
+            // APPEND PROCEEDS. Worst case is a duplicate draft on the server: visible,
+            // harmless, and reconciled by full sync's draft dedup. The alternatives are
+            // destroyed mail or a lost edit, and "never drop user intention" outranks both.
+            // `v2final`'s own `saveDraft` makes the same call at the same site.
+            if existingDraftId != nil,
+               let previousId = previousRfc822MessageId,
+               !previousId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let found = try await self.searchByMessageId(previousId, server: server)
+                if !found.isEmpty {
+                    let verified = try await self.exactMessageIdMatches(
+                        found, expectedRawMessageId: previousId, server: server)
+                    switch verified.count {
+                    case 0:
+                        // Every hit was substring-only (or `previousId` doesn't
+                        // canonicalize). Nothing here IS the old copy — skip.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] saveDraft: \(found.count) Message-ID hit(s) for previous rfc822 \(previousId) in \(draftsFolderPath) were all substring-only (none exact) — SKIPPING old-copy delete, proceeding to APPEND")
+                        }
+                    case 1:
+                        // The `try?` swallowing on the destructive pair is PRE-EXISTING
+                        // and preserved (⚑ `v2final` uses `try await` here so a STORE /
+                        // EXPUNGE `NO` aborts before the APPEND; on this branch a failed
+                        // purge leaves a duplicate instead, which draft dedup reconciles —
+                        // the same trade §3.4's polarity already accepts).
+                        // `expungeScopedToTargets` keeps the purge named to this UID.
+                        try? await server.store(flags: [.deleted], on: verified, operation: .add)
                         try? await self.expungeScopedToTargets(
-                            found, server: server,
-                            logDescription: "stale draft copy by Message-ID search (existingDraftId=\(existingId) was non-numeric) in \(draftsFolderPath)")
-                        print("[IMAP] Deleted stale draft by Message-ID search (existingDraftId=\(existingId) was non-numeric)")
+                            verified, server: server,
+                            logDescription: "old draft copy (previous rfc822=\(previousId)) in \(draftsFolderPath)")
+                        print("[IMAP] Deleted old draft copy by verified previous Message-ID search in \(draftsFolderPath)")
+                    default:
+                        // FAIL CLOSED, mirroring `deleteDraft`'s >1 guard: 2+ EXACT
+                        // matches are legitimate same-rfc Drafts siblings. Deleting the
+                        // set would destroy one. Refuse the delete, still APPEND.
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] saveDraft: \(verified.count) drafts share the previous rfc822 Message-ID \(previousId) in \(draftsFolderPath) — REFUSING old-copy delete (fail closed, would destroy a sibling), proceeding to APPEND")
+                        }
                     }
                 }
+            } else if existingDraftId != nil, DebugModeManager.isLoggingEnabled() {
+                print("[IMAP] saveDraft: update with no usable previous rfc822 Message-ID in \(draftsFolderPath) — SKIPPING old-copy delete (the fresh id is never substituted as a delete target), proceeding to APPEND")
             }
 
             // APPEND new draft with \Draft + \Seen flags (drafts are never "unread")
@@ -2759,6 +2813,56 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     // MARK: - UID Resolution
+
+    /// Verify raw `searchByMessageId` HEADER SEARCH hits against
+    /// `expectedRawMessageId` by an exact, normalized comparison, before a caller
+    /// issues a DESTRUCTIVE command (STORE `\Deleted` + EXPUNGE) against them.
+    ///
+    /// IMAP `SEARCH HEADER Message-ID` is RFC 3501 SUBSTRING matching, not equality:
+    /// a search for `a@example.com` also returns a message whose id is
+    /// `xa@example.com`. Acting on a raw hit set therefore destroys messages the
+    /// caller never identified. This FETCHes each hit's OWN `Message-ID` header and
+    /// keeps only the ones that canonicalize to the same value.
+    ///
+    /// Returns ALL exact matches; the CALLER owns the cardinality decision. Both
+    /// destructive draft callers refuse a set — `saveDraft`'s old-copy delete skips
+    /// the delete and still APPENDs, `deleteDraft` would refuse outright — because
+    /// 2+ exact matches are legitimate same-rfc Drafts siblings and deleting the set
+    /// destroys one.
+    ///
+    /// Fails to an EMPTY result (never a guess) when `expectedRawMessageId` itself
+    /// does not canonicalize, or when a hit's own FETCHed Message-ID does not.
+    ///
+    /// Ported from `v2final`'s `exactMessageIdMatches` (ADR-IOS-061 item E). The one
+    /// substitution: the reference's `MessageIdentity.durableActionRFC822MessageId`
+    /// is `MessageIdentity.usableRfc822Tail` on this branch (same validation, plus a
+    /// `v3`-only rejection of `':'` — see that function's doc comment). Stricter in
+    /// the safe direction: an id it refuses yields no verified match, so the delete
+    /// is skipped rather than aimed at something unproven.
+    private func exactMessageIdMatches(
+        _ hits: UIDSet,
+        expectedRawMessageId: String,
+        server: IMAPServer
+    ) async throws -> UIDSet {
+        guard !hits.isEmpty else { return hits }
+        guard let expected = MessageIdentity.usableRfc822Tail(expectedRawMessageId) else {
+            return UIDSet()
+        }
+        let hitValues = Set(hits.toArray().map(\.value))
+        let infos = try await server.fetchMessageInfosBulk(using: hits)
+        var exact = UIDSet()
+        for info in infos {
+            guard let uid = info.uid, hitValues.contains(uid.value),
+                  let returned = MessageIdentity.usableRfc822Tail(
+                      IMAPFetchMapping.rfc822MessageId(from: info)
+                  )
+            else { continue }
+            if returned == expected {
+                exact.insert(uid)
+            }
+        }
+        return exact
+    }
 
     /// Search the currently selected mailbox for a message by its RFC 2822 Message-ID.
     /// Single point of resolution — all Message-ID lookups MUST use this method.

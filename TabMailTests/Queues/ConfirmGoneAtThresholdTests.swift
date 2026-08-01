@@ -49,7 +49,7 @@ struct ConfirmGoneAtThresholdTests {
         func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
-        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
+        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
         func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
     }
 
@@ -89,7 +89,7 @@ struct ConfirmGoneAtThresholdTests {
         func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
-        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
+        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
         func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
     }
 

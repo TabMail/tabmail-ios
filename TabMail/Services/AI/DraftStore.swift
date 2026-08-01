@@ -217,8 +217,20 @@ actor DraftStore {
             draftMessage.attachments = attachments
         }
 
-        // Push to server
-        let result = try await provider.saveDraft(draftMessage, existingDraftId: draft.serverDraftId, draftsFolderPath: draftsFolderPath)
+        // Push to server.
+        //
+        // `previousRfc822MessageId:` is `previousRfc822` — the id captured ABOVE, before
+        // the rotation two lines later — and NOT `draft.rfc822MessageId`, which by this
+        // point IS `freshRfc822`. The old server copy carries the PREVIOUS id; the fresh
+        // one is the identity about to be APPENDed and no server message holds it yet.
+        // Passing the fresh id would make IMAP's old-copy delete verify against a value
+        // nothing can match — silently disabling the guard and orphaning a stale copy per
+        // re-push. nil (first push) is correct and means "no old copy to delete".
+        let result = try await provider.saveDraft(
+            draftMessage,
+            existingDraftId: draft.serverDraftId,
+            previousRfc822MessageId: previousRfc822,
+            draftsFolderPath: draftsFolderPath)
 
         // Update ONLY the server-sync columns — NOT user content (subject/body/editHistory).
         // The user may have edited the draft during the network await. A full save() would

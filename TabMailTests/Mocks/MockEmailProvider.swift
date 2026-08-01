@@ -344,12 +344,12 @@ actor MockEmailProvider: EmailProvider {
     var saveDraftResult: DraftSaveResult = DraftSaveResult(serverId: "mock-draft-id")
     var saveDraftThrows: Error?
     var deleteDraftThrows: Error?
-    var savedDrafts: [(draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String)] = []
+    var savedDrafts: [(draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String)] = []
     var deletedDraftIds: [(draftId: String, draftsFolderPath: String)] = []
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
-        callLog.append("saveDraft(existingDraftId:\(existingDraftId ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
-        savedDrafts.append((draft: draft, existingDraftId: existingDraftId, draftsFolderPath: draftsFolderPath))
+    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+        callLog.append("saveDraft(existingDraftId:\(existingDraftId ?? "nil"),previousRfc822MessageId:\(previousRfc822MessageId ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
+        savedDrafts.append((draft: draft, existingDraftId: existingDraftId, previousRfc822MessageId: previousRfc822MessageId, draftsFolderPath: draftsFolderPath))
         if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
         return saveDraftResult
