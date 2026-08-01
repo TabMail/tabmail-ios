@@ -300,6 +300,26 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
+    /// One epoch-stamp oracle hit (invariant test layer, T4.S6b / INV-2): a local
+    /// row claims UID `uid` of `mailbox`, but the mailbox's CURRENT occupant of that
+    /// UID is a different message.
+    ///
+    /// This is the same shape as `WrongMessageViolation` one step EARLIER in the
+    /// causal chain. That oracle catches a mutation that has already landed on the
+    /// wrong message; this one catches the state from which such a mutation is
+    /// merely waiting for its first gesture — a folder carrying an epoch while its
+    /// rows belong to a different numbering.
+    struct EpochStampViolation: Sendable, CustomStringConvertible {
+        let mailbox: String
+        let uid: Int
+        let localRfc: String
+        let serverRfc: String
+
+        var description: String {
+            "[FakeIMAPServer oracle] epoch stamp mailbox=\(mailbox) uid=\(uid) local rfc822MessageId=\"\(localRfc)\" but the server serves \"\(serverRfc)\" at that UID"
+        }
+    }
+
     let host: String
     let username: String
     let password: String
@@ -856,6 +876,46 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     private static func normalizeOracleRfc(_ raw: String) -> String {
         raw.trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
+    }
+
+    /// T4.S6b / INV-2 — the epoch-stamp half of the wire oracle. **A property of
+    /// the WIRE, not of a column:** given every local header of a folder as
+    /// `uid -> rfc822MessageId`, report each UID whose CURRENT occupant in
+    /// `mailbox` is a different message.
+    ///
+    /// A caller asserts `isEmpty` on any end state where the folder carries an
+    /// epoch. That is the executable form of "no folder row ever simultaneously
+    /// holds a `lastKnownUidValidity` and a header whose UID the server says
+    /// belongs to somebody else" — the state from which a bare-UID durable op
+    /// mutates the wrong message (C3), one step before the
+    /// `WrongMessageViolation` oracle would see the mutation itself.
+    ///
+    /// ⚠ **A UID the server does NOT currently serve is NOT a violation, and that
+    /// is deliberate.** Another client deleting a message is routine on a perfectly
+    /// intact mailbox, and it is indistinguishable on the wire from a renumber that
+    /// happened to leave the UID vacant. Counting absence here would make the
+    /// oracle fire on healthy fixtures — the same misreading
+    /// `SyncEngine.classifyEpochVerificationSample` documents at length and refuses
+    /// to make. This oracle reports only POSITIVE evidence: a UID that exists and
+    /// holds someone else's message.
+    ///
+    /// Unlike `expectMutation`, this is not opt-in state on the server; it is a
+    /// pure query over the current mailbox, so it can be called at any point
+    /// without arming anything.
+    func epochStampViolations(
+        mailbox: String, localRfc822ByUID: [Int: String]
+    ) -> [EpochStampViolation] {
+        withState { state in
+            let messages = state.messagesByMailbox[mailbox] ?? []
+            let byUid = Dictionary(uniqueKeysWithValues: messages.map { ($0.uid, $0) })
+            return localRfc822ByUID.compactMap { uid, localRfc in
+                guard let msg = byUid[uid] else { return nil }
+                let serverRfc = Self.normalizeOracleRfc(msg.messageID)
+                guard serverRfc != Self.normalizeOracleRfc(localRfc) else { return nil }
+                return EpochStampViolation(
+                    mailbox: mailbox, uid: uid, localRfc: localRfc, serverRfc: serverRfc)
+            }.sorted { $0.uid < $1.uid }
+        }
     }
 
     /// Core check, called from INSIDE an already-held `withState` closure at

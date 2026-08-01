@@ -116,6 +116,49 @@ actor MockEmailProvider: EmailProvider {
         return (messages, lastObservedUidValidity(folderPath: folder))
     }
 
+    /// T4.S6b: the sample `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch`
+    /// FETCHes, per folder path, plus the epoch the SELECT that served it reported.
+    ///
+    /// **This override is MANDATORY, for the same reason
+    /// `lastObservedUidValidity`'s is.** The `extension EmailProvider` default
+    /// answers `([], nil)`, which the door reads as "the server reported no
+    /// UIDVALIDITY ⇒ do nothing" — so a mock-driven test of the verified door would
+    /// take the anti-brick leg and pass without ever executing the branch it was
+    /// written for. Configure with `setMockedEpochSample`; UNCONFIGURED it keeps the
+    /// protocol default's `([], nil)`, so every OTHER mock-driven suite (which never
+    /// configures it) is unaffected by the door existing at all.
+    ///
+    /// The mock answers ONLY the UIDs it was asked for, from the configured set — a
+    /// real server cannot return a UID the FETCH did not name, and a mock that
+    /// returned extras would let a test "agree" on a row the door never sampled.
+    private nonisolated let mockedEpochSampleBox = Mutex<[String: (messages: [MessageHeaderInfo], observedEpoch: UInt32?)]>([:])
+
+    /// Records every `sampleHeadersForEpochVerification` call, in order, as
+    /// `(folder, uids)`. The read side is how a test asserts that NO verification
+    /// FETCH was issued (INV-4: a genuine first sync must not pay for one) and that
+    /// a second cycle issues none (INV-6: no loop).
+    private nonisolated let epochSampleCallsBox = Mutex<[(folder: String, uids: [UInt32])]>([])
+
+    func setMockedEpochSample(
+        messages: [MessageHeaderInfo], observedEpoch: UInt32?, folderPath: String
+    ) {
+        mockedEpochSampleBox.withLock { $0[folderPath] = (messages, observedEpoch) }
+    }
+
+    nonisolated func epochSampleCalls() -> [(folder: String, uids: [UInt32])] {
+        epochSampleCallsBox.withLock { $0 }
+    }
+
+    func sampleHeadersForEpochVerification(
+        folder: String, uids: [UInt32]
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+        epochSampleCallsBox.withLock { $0.append((folder: folder, uids: uids)) }
+        guard let configured = mockedEpochSampleBox.withLock({ $0[folder] }) else { return ([], nil) }
+        let requested = Set(uids)
+        return (configured.messages.filter { requested.contains(UInt32($0.messageId) ?? 0) },
+                configured.observedEpoch)
+    }
+
     // MARK: - Call Recording
 
     var callLog: [String] = []

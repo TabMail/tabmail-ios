@@ -92,8 +92,20 @@ extension SyncEngine {
                     // cannot overwrite it (which would disarm the walk's abort guard —
                     // ADR-IOS-051; see the helper's doc comment). `localFolders` is read
                     // inside THIS write transaction, so `existing` is not a stale snapshot.
+                    //
+                    // T4.S6b — the header-existence term. This site is the FIRST stamper on
+                    // an upgrade for a UIDPLUS server: it runs before any per-folder SELECT,
+                    // so gating only `runSyncMessages` would leave it stamping every folder
+                    // by assertion. It cannot route through `bootstrapFolderUidValidity`
+                    // (which carries the term in its statement) because it sets the field on
+                    // a record it is already updating, so it discharges the same term in
+                    // Swift — sound HERE and only here, because the count is read inside
+                    // THIS write transaction with no suspension before the `update`.
+                    let existingHoldsRows = try MessageHeader
+                        .filter(Column("folderId") == existing.id).fetchCount(db) > 0
                     if let bootstrap = Self.uidValidityBootstrapWrite(
-                        observed: info.uidValidity, stored: existing.lastKnownUidValidity) {
+                        observed: info.uidValidity, stored: existing.lastKnownUidValidity,
+                        folderHoldsRows: existingHoldsRows) {
                         existing.lastKnownUidValidity = bootstrap
                     }
                     try existing.update(db)
@@ -104,8 +116,19 @@ extension SyncEngine {
                     // A brand-new row is by definition a first observation — the same
                     // bootstrap rule, which here also filters the `0` = "not reported"
                     // sentinel out of the column.
+                    //
+                    // ⚠ T4.S6b — "a new row is by definition an empty folder" is FALSE, and
+                    // that is residual path (b) in `UidValidityTurnoverDeletionGuardTests`:
+                    // `Folder.id` is the deterministic `"\(accountId):\(path)"` and the
+                    // vanished-folder cleanup below deletes the ROW while migration `v2`
+                    // leaves its headers orphaned, so a re-created path RE-ADOPTS old-epoch
+                    // rows the instant this insert lands. The term is therefore required on
+                    // BOTH arms.
+                    let recreatedHoldsRows = try MessageHeader
+                        .filter(Column("folderId") == folder.id).fetchCount(db) > 0
                     folder.lastKnownUidValidity = Self.uidValidityBootstrapWrite(
-                        observed: info.uidValidity, stored: nil)
+                        observed: info.uidValidity, stored: nil,
+                        folderHoldsRows: recreatedHoldsRows)
                     try folder.insert(db)
                 }
             }
@@ -356,6 +379,24 @@ extension SyncEngine {
         // above; the local count is read live AFTER the windowed pass.
         if provider.staleWindowMode == .uid, let imapProvider = provider as? IMAPProvider {
             for folder in syncableFolders where !folder.path.isEmpty {
+                // T4.S6b — the verified door's SECOND call site, and it is not
+                // redundant with the one in `runSyncMessages`. This loop visits EVERY
+                // syncable folder, INCLUDING the CONDSTORE-quiet ones the per-folder
+                // loop above skipped via `skippablePaths` — a quiet Archive never
+                // reaches `runSyncMessages` at all, so without this its epoch would
+                // stay unproven indefinitely while this very loop is about to consult
+                // it. Running BEFORE the reconcile trigger is what makes the walk's
+                // "epoch unverified" refusal a one-cycle over-refusal rather than a
+                // standing one. A no-op for every folder the loop above already
+                // settled.
+                //
+                // `provider` (not `imapProvider`) is passed on purpose: the seam is a
+                // protocol member, and routing it through a downcast would silently
+                // send every non-`IMAPProvider` conformer that models a bound epoch
+                // down the do-nothing leg.
+                await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
+                    folderId: folder.id, folderPath: folder.path, accountId: account.id,
+                    provider: provider, dbPool: pool)
                 do {
                     let folderId = folder.id
                     let localCount = try await pool.read { db in
@@ -868,6 +909,21 @@ extension SyncEngine {
         // (T4.S6), so here the value feeds a bootstrap WRITE, where the identical
         // race is fail-dangerous. The mechanism does NOT transfer across that
         // inversion of consumer direction; the binding below replaces it.
+        // T4.S6b — the VERIFIED door, BEFORE the fetch. A folder that already holds
+        // rows under a nil epoch can no longer be stamped by assertion (the blind
+        // writers all carry a `NOT EXISTS (… messageHeader …)` term now), so this is
+        // where such a folder either EARNS its epoch — by FETCHing a sample of its own
+        // stored UIDs and finding at least one whose RFC-822 Message-ID still answers
+        // there — or gets quarantined for the purge-and-resync reaction.
+        //
+        // The ordering is deliberate: by the time the in-transaction guards below run,
+        // the folder is either stamped (guard (b) proceeds normally) or quarantined
+        // (guard (a) skips this pass and the reaction owns it). It is a no-op — one
+        // small read, no network — for every folder that already has an epoch, holds
+        // no rows, or is already quarantined, which is the steady state.
+        await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
+            folderId: folder.id, folderPath: folder.path, accountId: folder.accountId,
+            provider: provider, dbPool: dbPool)
         let fetched = try await provider.fetchMessagesWithObservedEpoch(
             folder: folder.path, limit: limit, offset: 0)
         let messages = fetched.messages

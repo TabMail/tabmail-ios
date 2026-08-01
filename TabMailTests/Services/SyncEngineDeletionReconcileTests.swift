@@ -14,15 +14,12 @@ import GRDB
 private final class WalkRecorder: Sendable {
     let searchedChunks = Mutex<[[UInt32]]>([])
     let deletedChunks = Mutex<[[UInt32]]>([])
-    let persistedValidities = Mutex<[UInt32]>([])
 
     func recordSearch(_ chunk: [UInt32]) { searchedChunks.withLock { $0.append(chunk) } }
     func recordDelete(_ ghosts: [UInt32]) { deletedChunks.withLock { $0.append(ghosts) } }
-    func recordPersist(_ v: UInt32) { persistedValidities.withLock { $0.append(v) } }
 
     var searchCalls: [[UInt32]] { searchedChunks.withLock { $0 } }
     var deleteCalls: [[UInt32]] { deletedChunks.withLock { $0 } }
-    var persistCalls: [UInt32] { persistedValidities.withLock { $0 } }
 }
 
 /// Error whose description matches none of `SyncEngine.isConnectionError`'s
@@ -147,7 +144,6 @@ struct DeletionReconcileWalkTests {
         script: [ChunkScript],
         recorder: WalkRecorder,
         deleteThrows: Bool = false,
-        persistThrows: Bool = false,
         maxDeletions: Int = Int.max
     ) async -> DeletionReconcileOutcome {
         let callIndex = Mutex<Int>(0)
@@ -176,10 +172,6 @@ struct DeletionReconcileWalkTests {
                 if deleteThrows { throw PlainSearchError() }
                 recorder.recordDelete(ghosts)
                 return ghosts.count
-            },
-            persistUidValidity: { v in
-                if persistThrows { throw PlainSearchError() }
-                recorder.recordPersist(v)
             }
         )
     }
@@ -266,14 +258,17 @@ struct DeletionReconcileWalkTests {
         #expect(outcome.aborted)
         #expect(outcome.deletedCount == 0)
         #expect(recorder.deleteCalls.isEmpty)
-        #expect(recorder.persistCalls.isEmpty) // never overwrite the stored value
     }
 
     @Test("UIDVALIDITY change mid-walk aborts — the changed chunk deletes nothing")
     func midWalkValidityChangeAborts() async {
         let recorder = WalkRecorder()
+        // T4.S6b: stored is 7, NOT nil. Under the head-of-walk refusal a nil stored
+        // epoch would abort before the first SEARCH, making this test vacuous — it
+        // would still be green while proving nothing about the MID-WALK change it is
+        // named for.
         let outcome = await runWalk(
-            localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: nil,
+            localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: 7,
             script: [
                 .found([1, 2], uidValidity: 7),
                 .found([], uidValidity: 9), // changed → abort
@@ -283,10 +278,39 @@ struct DeletionReconcileWalkTests {
         #expect(outcome.aborted)
         #expect(outcome.deletedCount == 0)
         #expect(recorder.deleteCalls.isEmpty)
+        #expect(recorder.searchCalls.count == 2) // it really did reach the 2nd chunk
     }
 
-    @Test("Nil stored UIDVALIDITY is bootstrapped exactly once from the first SELECT")
-    func validityBootstrap() async {
+    /// T4.S6b (supersedes "Nil stored UIDVALIDITY is bootstrapped exactly once from
+    /// the first SELECT"). The walk no longer ADOPTS the first SELECT's epoch onto a
+    /// folder whose rows nobody has verified — that adoption is precisely what made
+    /// the stored-vs-live comparison equal by construction and turned the walk into
+    /// an unguarded mass deleter. A nil stored epoch now REFUSES, before any SEARCH.
+    ///
+    /// RED-FIRST EVIDENCE — MEASURED 2026-07-31 with the adopt-and-delete branch
+    /// restored in place (`var expectedValidity = knownUidValidity(storedUidValidity)…`
+    /// at the head, plus an `expectedValidity = result.uidValidity` adopt arm in the
+    /// chunk loop). Verbatim:
+    ///
+    /// ```
+    /// ✘ Test "Nil stored UIDVALIDITY refuses the walk outright — no SEARCH, no delete"
+    ///   recorded an issue at SyncEngineDeletionReconcileTests.swift:300:9:
+    ///   Expectation failed: (outcome → DeletionReconcileOutcome(deletedCount: 0,
+    ///   failedChunks: 0, searchedChunks: 2, aborted: false, abortReason: nil,
+    ///   uidValidityMismatch: nil)).aborted → false
+    ///   … :301:9: (outcome.abortReason → nil) == "epoch unverified"
+    ///   … :303:9: (outcome.searchedChunks → 2) == 0
+    ///   … :305:9: (recorder.searchCalls → [[1, 2], [3, 4]]).isEmpty → false
+    /// ✘ Test "Stored UIDVALIDITY of 0 is 'unknown', not an epoch — the walk refuses"
+    ///   … :322:9 … :323:9 … :324:9: (recorder.searchCalls → [[1, 2]]).isEmpty → false
+    /// ✘ Test run with 24 tests in 2 suites failed after 1.523 seconds with 7 issues.
+    /// ```
+    ///
+    /// `searchedChunks → 2` with `aborted → false` is the defect: the walk searched
+    /// every chunk and judged each local UID against an epoch it had just invented.
+    /// Every other test in this suite stayed green under that inversion.
+    @Test("Nil stored UIDVALIDITY refuses the walk outright — no SEARCH, no delete")
+    func nilStoredValidityRefusesTheWalk() async {
         let recorder = WalkRecorder()
         let outcome = await runWalk(
             localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: nil,
@@ -296,33 +320,47 @@ struct DeletionReconcileWalkTests {
             ],
             recorder: recorder
         )
-        #expect(!outcome.aborted)
-        #expect(recorder.persistCalls == [42])
+        #expect(outcome.aborted)
+        #expect(outcome.abortReason == "epoch unverified")
+        #expect(outcome.deletedCount == 0)
+        #expect(outcome.searchedChunks == 0)
+        // Not one round trip is spent: the refusal is at the head, not per chunk.
+        #expect(recorder.searchCalls.isEmpty)
+        #expect(recorder.deleteCalls.isEmpty)
     }
 
-    @Test("Unreported UIDVALIDITY (0) aborts — never delete on uncertainty")
-    func zeroValidityAborts() async {
+    /// A STORED 0 is structurally impossible (RFC 3501 types UIDVALIDITY as
+    /// `nz-number`), but `knownUidValidity` treats it as "not reported" everywhere
+    /// else, and the walk must agree — a 0 that read as a real epoch would compare
+    /// unequal to every live value and, worse, could be reached by an `== 0` live
+    /// side.
+    @Test("Stored UIDVALIDITY of 0 is 'unknown', not an epoch — the walk refuses")
+    func zeroStoredValidityRefusesTheWalk() async {
         let recorder = WalkRecorder()
         let outcome = await runWalk(
-            localUIDs: [1, 2], chunkSize: 2, storedUidValidity: nil,
+            localUIDs: [1, 2], chunkSize: 2, storedUidValidity: 0,
+            script: [.found([1, 2], uidValidity: 5)],
+            recorder: recorder
+        )
+        #expect(outcome.aborted)
+        #expect(outcome.abortReason == "epoch unverified")
+        #expect(recorder.searchCalls.isEmpty)
+        #expect(recorder.deleteCalls.isEmpty)
+    }
+
+    @Test("Unreported live UIDVALIDITY (0) aborts — never delete on uncertainty")
+    func zeroValidityAborts() async {
+        let recorder = WalkRecorder()
+        // Stored 5, NOT nil: the point of this test is the LIVE 0, which is only
+        // reachable once the head-of-walk guard has been satisfied.
+        let outcome = await runWalk(
+            localUIDs: [1, 2], chunkSize: 2, storedUidValidity: 5,
             script: [.found([], uidValidity: 0)],
             recorder: recorder
         )
         #expect(outcome.aborted)
-        #expect(recorder.deleteCalls.isEmpty)
-        #expect(recorder.persistCalls.isEmpty)
-    }
-
-    @Test("Persist failure aborts the walk")
-    func persistFailureAborts() async {
-        let recorder = WalkRecorder()
-        let outcome = await runWalk(
-            localUIDs: [1, 2], chunkSize: 2, storedUidValidity: nil,
-            script: [.found([], uidValidity: 5)],
-            recorder: recorder,
-            persistThrows: true
-        )
-        #expect(outcome.aborted)
+        #expect(outcome.abortReason == "uidValidity unreported")
+        #expect(recorder.searchCalls.count == 1)
         #expect(recorder.deleteCalls.isEmpty)
     }
 

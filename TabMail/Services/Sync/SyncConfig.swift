@@ -673,4 +673,32 @@ enum SyncConfig {
     static let uidValidityResetBarrierMaxAttempts = 5
     /// Delay between barrier attempts (seconds).
     static let uidValidityResetBarrierPollSeconds: TimeInterval = 0.05
+
+    // MARK: - Verified epoch bootstrap for pre-populated folders (T4.S6b)
+
+    /// Highest-UID half of the sample
+    /// `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch` FETCHes to decide
+    /// whether a nil-epoch folder's EXISTING rows belong to the numbering the
+    /// server is serving now.
+    static let uidValidityVerifySampleHighCount = 4
+    /// Lowest-UID half of the same sample. A renumber's strongest evidence lives
+    /// HERE: after a UIDVALIDITY change the server re-assigns `1…M`, so a LOW local
+    /// UID usually still EXISTS and addresses a DIFFERENT message — a positive
+    /// MISMATCH. A HIGH local UID (near the old UIDNEXT, above `M`) usually does not
+    /// exist at all, which is no evidence either way. A high-only sample would
+    /// therefore reach the zero-agreements leg by ABSENCE rather than by PROOF.
+    static let uidValidityVerifySampleLowCount = 4
+    /// Minimum RFC-822 agreements required to stamp. Zero agreements is NOT
+    /// verification: after a renumber "every sampled UID is simply missing" is the
+    /// NORMAL shape, so it must never be read as consent. One agreement suffices —
+    /// a stored Message-ID still answering at its stored UID is strong evidence the
+    /// numbering is intact, and requiring more only fails closed on small folders.
+    static let uidValidityVerifyMinAgreements = 1
+    /// Batch size for the verification FETCH. Sized so the whole sample is served by
+    /// ONE SELECT: `IMAPProvider.fetchMessageHeadersWithObservedEpoch` collapses its
+    /// observed epoch to nil when two batches disagree, so a single batch makes
+    /// `observedEpoch == nil` mean exactly "THIS SELECT reported no UIDVALIDITY" —
+    /// the condition the anti-brick rule keys on.
+    static let uidValidityVerifyFetchBatchSize =
+        uidValidityVerifySampleHighCount + uidValidityVerifySampleLowCount
 }

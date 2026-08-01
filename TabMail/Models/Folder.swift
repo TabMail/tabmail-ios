@@ -60,16 +60,26 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// would then be from an invalidated numbering (never delete on uncertainty —
     /// the UID-remap/resync machinery owns that case).
     ///
-    /// **Write rule — BOOTSTRAP-ONLY.** Written only while it is nil, by whichever
-    /// path first observes a non-zero UIDVALIDITY: the folder-list pass and delta
-    /// sync's STATUS (`SyncEngine.uidValidityBootstrapWrite` /
-    /// `bootstrapFolderUidValidity`), the message-sync pass's own SELECT
-    /// (`SyncEngine.runSyncMessages`, via `IMAPProvider.selectMailboxTracked` and
+    /// **Write rule — BOOTSTRAP-ONLY, and (T4.S6b) only over an EMPTY folder or with
+    /// PROOF.** Written only while it is nil, by whichever path first observes a
+    /// non-zero UIDVALIDITY: the folder-list pass and delta sync's STATUS
+    /// (`SyncEngine.uidValidityBootstrapWrite` / `bootstrapFolderUidValidity`), the
+    /// message-sync pass's own SELECT (`SyncEngine.runSyncMessages`, via
+    /// `IMAPProvider.selectMailboxTracked` and
     /// `EmailProvider.lastObservedUidValidity(folderPath:)` — T1.2b), the backfill
     /// crawl's own walk-start SELECT (`SyncEngine.bootstrapCrawledFolderUidValidity`,
-    /// called from `SyncEngine.runBackfill` — the T1.3 anti-brick), or the walk's
-    /// own first SELECT (`persistFolderUidValidity` in
-    /// `SyncEngineDeletionReconcile.swift`).
+    /// called from `SyncEngine.runBackfill` — the T1.3 anti-brick), or — for a folder
+    /// that ALREADY HOLDS ROWS, which is the only case any of the above now refuses —
+    /// `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch` (T4.S6b), which proves
+    /// the rows belong to the observed numbering before stamping.
+    ///
+    /// ⚠ **RETRACTED (T4.S6b): the deletion-reconcile walk's own first SELECT
+    /// (`persistFolderUidValidity` in `SyncEngineDeletionReconcile.swift`) is no
+    /// longer a writer — that function is DELETED.** It was the ONLY writer of this
+    /// column in `v1.6.38`, and it was the shipped mass-deletion path: the walk
+    /// adopted its first chunk's epoch and then judged every local UID against it.
+    /// `SyncEngine.runDeletionReconcileWalk` now ABORTS (`"epoch unverified"`) on a
+    /// nil stored epoch instead.
     ///
     /// ⚠ Round 7 claimed the backfill crawl was the ONLY one of these that can
     /// reach a custom NON-FAVOURITE folder. That is FALSE and is retracted (round
@@ -119,19 +129,58 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// disappearance; their headers are NOT — migration v2 dropped the
     /// `messageHeader.folderId` FK, so they survive orphaned and re-attach under the
     /// deterministic `accountId:path` id), holds OLD-epoch headers under a nil
-    /// epoch. The first bootstrap then ASSERTS those headers belong to the observed
-    /// epoch. Closing that needs a whole-folder epoch-ADVANCEMENT protocol
-    /// (quarantine → purge → stamp → resync, ADR-IOS-061 in the `v2final` line);
-    /// until one exists this is an accepted, documented residual, unchanged from
-    /// the walk's own pre-existing nil-bootstrap branch.
+    /// epoch.
     ///
-    /// ⚠ T4.S6 ported that protocol and it does NOT close this residual. The
-    /// reaction's own trigger validation REFUSES to start on a folder whose stored
-    /// epoch is nil (`AccountManager.runUidValidityResetReaction`), because with no
-    /// stored epoch there is nothing to prove a turnover against — purging on that
-    /// evidence would destroy a folder's local mail whenever a first observation
-    /// happened to be taken. So a nil epoch over pre-existing headers still
-    /// bootstraps by assertion. Unchanged residual, now with a named refusal.
+    /// **✅ T4.S6b CLOSED that residual. The paragraphs below are SUPERSEDED and are
+    /// kept because they state the hazard, which has not gone away — only the
+    /// stamp-by-assertion has.** Two changes together:
+    ///  1. **the unverified stamp is impossible at the SQL level.** Every BLIND
+    ///     writer of this column now also requires the folder to hold NO
+    ///     `messageHeader` row — the `NOT EXISTS` term inside
+    ///     `SyncEngine.bootstrapFolderUidValidity`'s statement, and the same term
+    ///     discharged in Swift (inside the one write transaction) on both folder-list
+    ///     upsert arms in `SyncEngine.fullSync` via
+    ///     `uidValidityBootstrapWrite(observed:stored:folderHoldsRows:)`. Note the
+    ///     INSERT arm needs it too: a re-created row re-adopts orphaned headers the
+    ///     instant it lands;
+    ///  2. **a populated folder EARNS its epoch by proof.**
+    ///     `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch` (in the FILE
+    ///     `SyncEngineEpochVerify.swift`) samples the folder's own highest- and
+    ///     lowest-UID rows, FETCHes those exact UIDs, and stamps — through
+    ///     `bootstrapVerifiedFolderUidValidity`, the ONE writer allowed to omit the
+    ///     `NOT EXISTS` term — only when at least one normalized RFC-822 Message-ID
+    ///     still answers at its own UID and none disagrees. Any mismatch, or zero
+    ///     agreements, quarantines the folder for the purge-and-resync reaction
+    ///     instead.
+    ///
+    /// ⚠ **The one leg that deliberately does NOTHING: a SELECT that reports no
+    /// UIDVALIDITY.** Not a stamp, and — this is the load-bearing half — not a
+    /// quarantine either. Arming there is a PERMANENT BRICK: the reaction purges the
+    /// folder, then cannot obtain a fresh epoch to stamp, and by design leaves
+    /// `uidValidityResetPendingAt` SET, so the folder is quarantined forever with its
+    /// mail already gone. Leaving the column nil is the `IOS-EPOCH-001` accepted
+    /// window instead: gestures refused, the deletion-reconcile walk refuses, NO data
+    /// touched, self-healing the moment one SELECT reports an epoch.
+    ///
+    /// SUPERSEDED (kept for the hazard statement): *"The first bootstrap then ASSERTS
+    /// those headers belong to the observed epoch. Closing that needs a whole-folder
+    /// epoch-ADVANCEMENT protocol (quarantine → purge → stamp → resync, ADR-IOS-061
+    /// in the `v2final` line); until one exists this is an accepted, documented
+    /// residual, unchanged from the walk's own pre-existing nil-bootstrap branch."*
+    ///
+    /// SUPERSEDED (T4.S6, superseded in turn by T4.S6b): *"T4.S6 ported that protocol
+    /// and it does NOT close this residual. The reaction's own trigger validation
+    /// REFUSES to start on a folder whose stored epoch is nil
+    /// (`AccountManager.runUidValidityResetReaction`), because with no stored epoch
+    /// there is nothing to prove a turnover against — purging on that evidence would
+    /// destroy a folder's local mail whenever a first observation happened to be
+    /// taken. So a nil epoch over pre-existing headers still bootstraps by
+    /// assertion."* That refusal is still there and is still correct; T4.S6b does not
+    /// remove it. It enters the reaction through the ARM instead
+    /// (`AccountManager.uidValidityResetArmFlag`), which makes
+    /// `uidValidityResetPendingAt` non-nil and short-circuits the refusal — and it
+    /// only does so having FIRST obtained by FETCH the proof the refusal correctly
+    /// observed it did not have.
     var lastKnownUidValidity: Int?
     /// **UIDVALIDITY reset quarantine (T4.S6).** Non-nil ⇒ this folder is mid-way
     /// through `AccountManager.runUidValidityResetReaction` — its rows either still

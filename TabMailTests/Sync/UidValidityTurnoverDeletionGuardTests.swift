@@ -396,8 +396,14 @@ struct UidValidityTurnoverDeletionGuardTests {
                 """)
     }
 
-    // MARK: - The OPEN hole the bootstrap rule does NOT close
+    // MARK: - The hole the bootstrap rule did NOT close — CLOSED by T4.S6b
 
+    /// ⚠ **EVERYTHING FROM HERE TO THE "✅ T4.S6b CLOSED" NOTE DESCRIBES THE STATE
+    /// BEFORE T4.S6b.** It is preserved verbatim because it is the derivation of
+    /// the two lifecycles the tests below still drive, and because the reasoning
+    /// about WHY `nil` is unprovable is what the fix had to answer. Read it as
+    /// history; the current contract is the ✅ note.
+    ///
     /// **KNOWN OPEN DEFECT — recorded, not blessed.** `withKnownIssue` keeps this
     /// executable and honest: it documents the hole in code instead of prose, and
     /// it will start FAILING ("known issue was not recorded") the moment the hole
@@ -442,7 +448,70 @@ struct UidValidityTurnoverDeletionGuardTests {
     /// is handed a live epoch by the bootstrap, which ASSERTS that the rows already
     /// present belong to it. They do not — they predate any observation — and the
     /// walk then deletes them as ghosts.
-    @Test("OPEN: a folder populated before its first epoch observation loses that mail")
+    ///
+    /// ✅ **T4.S6b CLOSED BOTH RESIDUALS. The two tests below are REWRITTEN, not
+    /// retired** — same two lifecycles, same fixtures, asserting the invariant the
+    /// fix delivers instead of the defect it removed.
+    ///
+    /// ⚠ **The rewritten expectation is NOT `survivors == localHeaderCount`, and
+    /// that is not a weakened fix.** `nil` means UNKNOWN, so the fix cannot make
+    /// unprovable mail provable; what it can do — and now does — is refuse to
+    /// ASSERT. The door FETCHes a spread of the folder's own UIDs and asks the
+    /// server whether they still address the same messages. Here they do not (the
+    /// server is on a fresh numbering starting at 5000, so not one local UID
+    /// resolves), the stamp is refused, and the folder is quarantined and handed to
+    /// the purge-and-resync reaction. The reaction then deletes the old-epoch rows
+    /// AND replaces them with the server's current mail, which is the "answerable
+    /// for replacing what it removed" half of this suite's own invariant.
+    ///
+    /// So both tests now assert, in ONE run and in this order:
+    ///  1. **the sync pass itself deleted nothing** and left the folder QUARANTINED
+    ///     and UNSTAMPED — the silent mass deletion is gone, replaced by a state a
+    ///     component is accountable for;
+    ///  2. **the reaction, driven explicitly and AWAITED**, converges the folder:
+    ///     old-epoch rows gone, new-epoch mail present, epoch stamped, quarantine
+    ///     cleared.
+    ///
+    /// The reaction is driven by hand rather than left to the door's spawned `Task`
+    /// so the assertions cannot race it. The door's own spawn is proved separately
+    /// and deterministically in `EpochVerifiedBootstrapTests` (INV-1 phase 1).
+    ///
+    /// ## Red-first evidence for the REWRITTEN assertions — MEASURED (2026-07-31)
+    ///
+    /// Two independent inversions, each built and run on its own:
+    ///
+    /// **The fail-closed decision inverted** (`epochVerificationStampAllowed`
+    /// returning `true`, i.e. the door stamps on zero agreements and on mismatch):
+    ///
+    /// ```
+    /// ✘ Test "A folder populated before its first epoch observation is quarantined,
+    ///   then converged — never silently swept" recorded an issue at
+    ///   UidValidityTurnoverDeletionGuardTests.swift:507:9: Expectation failed:
+    ///   try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) ==
+    ///   Self.localHeaderCount
+    ///   … :514:9: (quarantined.lastKnownUidValidity → 222222) == nil
+    ///   … :520:9: (quarantined.uidValidityResetPendingAt → nil) != nil
+    /// ✘ Test "A delete/re-create lifecycle quarantines the orphaned mail instead of
+    ///   asserting it into the new epoch" … :595:9 … :598:9:
+    ///   (readopted.lastKnownUidValidity → 222222) == nil … :604:9
+    /// ```
+    ///
+    /// **The `NOT EXISTS` term dropped** from `bootstrapFolderUidValidity` and the
+    /// `folderHoldsRows` guard dropped from `uidValidityBootstrapWrite`:
+    ///
+    /// ```
+    /// ✘ "A folder populated before its first epoch observation …" :507:9 (mail swept)
+    ///   … :514:9: (quarantined.lastKnownUidValidity → 222222) == nil
+    /// ✘ "A delete/re-create lifecycle …" :595:9, :598:9, :604:9
+    /// ✘ Test run with 21 tests in 3 suites failed after 4.617 seconds with 7 issues.
+    /// ```
+    ///
+    /// `lastKnownUidValidity → 222222` over surviving pre-turnover rows is the
+    /// defect in one value: the folder now claims its 2100 old-numbering headers
+    /// belong to the epoch the server moved to. The two blocker tests above stayed
+    /// GREEN through both inversions — they pin a KNOWN stored epoch, which neither
+    /// inversion touches.
+    @Test("A folder populated before its first epoch observation is quarantined, then converged — never silently swept")
     func nilEpochOverPrePopulatedFolderStillLosesMail() async throws {
         let server = FakeIMAPServer(mailboxes: ["INBOX": Self.postTurnoverMessages()])
         server.setUidValidity(Self.newEpoch, for: "INBOX")
@@ -460,20 +529,64 @@ struct UidValidityTurnoverDeletionGuardTests {
             storedEpoch: nil, totalCount: Self.localHeaderCount,
             lastKnownUidNext: Self.firstLocalUID + Self.localHeaderCount)
 
+        // Neutralise the door's spawned reaction for phase 1: it is admitted through
+        // the same single-flight gate, so a seeded entry makes the spawn a no-op and
+        // phase 1 measures the SYNC PASS alone.
+        await AccountManager.shared.seedUidValidityReactionInFlightForTesting(folderId: folderId)
+
         let provider = Self.provider(for: server)
         try await provider.connect()
         let engine = await Self.makeEngine(accountId: accountId, provider: provider)
         _ = try await engine.performDeltaSync(account: account, provider: provider)
+
+        // ── Phase 1: the sync pass. It must destroy nothing and must not stamp.
+        #expect(try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) == Self.localHeaderCount,
+                """
+                the sync pass deleted mail that predates any epoch observation. Every one of \
+                those UIDs belongs to a numbering nobody has verified, so "the server did not \
+                return UID n" is not evidence that message n is gone (ADR-IOS-051).
+                """)
+        let quarantined = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
+        #expect(quarantined.lastKnownUidValidity == nil,
+                """
+                the pass stamped a folder whose rows provably do NOT resolve under the observed \
+                epoch. That stamp is what makes the deletion-reconcile walk's stored-vs-live \
+                comparison equal and turns it into a mass deleter.
+                """)
+        #expect(quarantined.uidValidityResetPendingAt != nil,
+                """
+                the folder was left neither proved nor quarantined, i.e. exactly as unprovable \
+                as before — the door must hand an unprovable populated folder to the reaction.
+                """)
+
+        // ── Phase 2: the recoverer, driven explicitly and fully awaited.
+        await AccountManager.shared.clearUidValidityReactionInFlightForTesting(folderId: folderId)
+        await AccountManager.shared.clearUidValidityReactionRecheckRequestedForTesting(folderId: folderId)
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: "INBOX")
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
         try? await provider.disconnect()
 
-        let survivors = try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId)
-        withKnownIssue("a nil epoch over a NON-EMPTY folder is unprovable — needs an epoch-advancement protocol") {
-            #expect(survivors == Self.localHeaderCount,
-                    "mail that predates any epoch observation must not be asserted into the observed epoch")
-        }
+        #expect(try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) == 0,
+                """
+                old-epoch rows outlived the reaction. Their bare UIDs address a numbering the \
+                server has discarded, so any later gesture on one mutates whichever message the \
+                new epoch put at that number (C3).
+                """)
+        #expect(try Self.postTurnoverCount(pool: pool, folderId: folderId) > 0,
+                """
+                the reaction removed the old mail without replacing it. Deletion is only \
+                legitimate here because the same component commits to a resync — otherwise this \
+                is the mass deletion wearing a different hat.
+                """)
+        let converged = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
+        #expect(converged.lastKnownUidValidity == Self.newEpoch,
+                "the folder must end stamped with the epoch its rows now genuinely belong to")
+        #expect(converged.uidValidityResetPendingAt == nil,
+                "a converged folder must be out of quarantine, or it is bricked")
     }
 
-    @Test("OPEN: a delete/re-create lifecycle still loses the orphaned mail")
+    @Test("A delete/re-create lifecycle quarantines the orphaned mail instead of asserting it into the new epoch")
     func deleteRecreateLifecycleStillLosesOrphanedMail() async throws {
         let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Archive": Self.postTurnoverMessages()])
         server.setUidValidity(Self.oldEpoch, for: "Archive")
@@ -491,6 +604,8 @@ struct UidValidityTurnoverDeletionGuardTests {
             pool: pool, accountId: accountId, folderPath: "Archive", role: .archive,
             storedEpoch: Self.oldEpoch, totalCount: Self.localHeaderCount,
             lastKnownUidNext: Self.firstLocalUID + Self.localHeaderCount)
+
+        await AccountManager.shared.seedUidValidityReactionInFlightForTesting(folderId: folderId)
 
         let provider = Self.provider(for: server)
         try await provider.connect()
@@ -510,12 +625,35 @@ struct UidValidityTurnoverDeletionGuardTests {
         server.markMailboxRestored("Archive")
         server.setUidValidity(Self.newEpoch, for: "Archive")
         try await engine.fullSync(account: account, provider: provider)
+
+        // ── Phase 1: the folder-list upsert re-created the row. It must NOT have
+        // been born stamped, because the headers it re-adopted are not its own.
+        #expect(try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) == Self.localHeaderCount,
+                "the re-create pass itself must not sweep the orphaned mail")
+        let readopted = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
+        #expect(readopted.lastKnownUidValidity == nil,
+                """
+                a freshly INSERTED folder row was born carrying an epoch even though it \
+                immediately re-adopted 2100 orphaned headers through its deterministic \
+                "accountId:path" id. Being new is not evidence of being empty.
+                """)
+        #expect(readopted.uidValidityResetPendingAt != nil,
+                "the re-adopted rows are unprovable, so the folder belongs to the reaction")
+
+        // ── Phase 2: converge it.
+        await AccountManager.shared.clearUidValidityReactionInFlightForTesting(folderId: folderId)
+        await AccountManager.shared.clearUidValidityReactionRecheckRequestedForTesting(folderId: folderId)
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: "Archive")
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
         try? await provider.disconnect()
 
-        let survivors = try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId)
-        withKnownIssue("nil epoch over a non-empty folder cannot be proven — needs an epoch-advancement protocol") {
-            #expect(survivors == Self.localHeaderCount,
-                    "orphaned old-epoch mail must survive a folder re-create under a new epoch")
-        }
+        #expect(try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) == 0,
+                "orphaned old-epoch rows must not outlive the reaction that took responsibility for them")
+        #expect(try Self.postTurnoverCount(pool: pool, folderId: folderId) > 0,
+                "the reaction must replace what it removed")
+        let converged = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
+        #expect(converged.lastKnownUidValidity == Self.newEpoch)
+        #expect(converged.uidValidityResetPendingAt == nil)
     }
 }

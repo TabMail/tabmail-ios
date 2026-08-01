@@ -95,15 +95,15 @@ extension SyncEngine {
     // MARK: - Walk core (orchestration over injected effects — unit-testable)
 
     /// Run the reconcile walk over the folder's local UID set. Pure
-    /// orchestration: all effects (SEARCH, deletion, UIDVALIDITY persistence)
-    /// are injected so the invariants are unit-testable without IMAP:
+    /// orchestration: all effects (SEARCH, deletion) are injected so the
+    /// invariants are unit-testable without IMAP:
     ///
     /// - A thrown SEARCH chunk deletes NOTHING from that chunk. Non-connection
     ///   errors skip the chunk and continue; connection/SELECT errors abort.
-    /// - UIDVALIDITY guard: `storedUidValidity` (when present) and the first
-    ///   successful chunk's SELECT pin the expected value; any later mismatch
-    ///   — or an unreported (0) value — ABORTS the walk. When no stored value
-    ///   exists, the first observation is persisted via `persistUidValidity`.
+    /// - UIDVALIDITY guard: `storedUidValidity` pins the expected value; any
+    ///   mismatch — or an unreported (0) value — ABORTS the walk.
+    /// - **`storedUidValidity == nil` ABORTS before the first SEARCH** with
+    ///   reason `"epoch unverified"` (T4.S6b). See below.
     /// - A failed deletion (e.g. DB suspension, ADR-IOS-041/046) aborts —
     ///   abandon and let the trigger predicate re-fire next sync.
     /// - Deletion circuit breaker: `maxDeletions` caps cumulative deletions at
@@ -114,6 +114,39 @@ extension SyncEngine {
     ///   worst case from "folder wiped" into "walk aborted before the
     ///   offending chunk, logged"; the fresh evidence next sync re-derives a
     ///   correct cap if deletions were legitimate.
+    ///
+    /// 🚨 **T4.S6b — the walk REFUSES on a nil stored epoch; it no longer ADOPTS
+    /// one.** It used to take its first successful chunk's SELECT epoch as the
+    /// expected value and persist it (`persistUidValidity`, the ONLY writer of
+    /// `Folder.lastKnownUidValidity` that existed in `v1.6.38`), then judge every
+    /// local UID against it. That is an ASSERTION, not an observation: this walk
+    /// only ever runs on a folder that HOLDS ROWS (its trigger is
+    /// `localHeaderCount > serverCount`, and `reconcileExternallyDeletedMessages`
+    /// returns early on an empty UID set), and nothing about those rows proves they
+    /// belong to the epoch the server happens to report now. If the numbering HAD
+    /// turned over, "the server did not list UID n" is true of every one of them and
+    /// the walk deletes the whole folder — the shipped mass-deletion path.
+    ///
+    /// The `NOT EXISTS` term T4.S6b added to `bootstrapFolderUidValidity` makes the
+    /// WRITE a no-op for a populated folder, but on its own that is STRICTLY WORSE:
+    /// the walk would still adopt the epoch in memory and still delete, having lost
+    /// even the durable record of what it judged against. The refusal is the half
+    /// that matters. Fail-closed, and consistent with this function's own rule —
+    /// never delete on uncertainty.
+    ///
+    /// The refusal is BOUNDED, not permanent: `SyncEngine
+    /// .verifyAndBootstrapPrePopulatedFolderEpoch` runs at the head of
+    /// `runSyncMessages` and at the head of full sync's reconcile loop — i.e. before
+    /// every trigger that can reach this walk — and either stamps the folder (proof
+    /// by FETCH) or hands it to the purge-and-resync reaction. A folder still nil
+    /// here is one whose server reports no UIDVALIDITY at all, and such a server's
+    /// SEARCH would abort this walk at the `result.uidValidity != 0` guard anyway.
+    ///
+    /// No trigger is fired on this leg. `AccountManager.fireUidValidityChangeHandler`
+    /// takes a NON-OPTIONAL stored epoch, and `runUidValidityResetReaction` refuses
+    /// to start on a folder whose stored epoch is nil and which is not already
+    /// quarantined — there is no turnover to be right about here, only an unproven
+    /// numbering, which is the verified door's subject and not this walk's.
     nonisolated static func runDeletionReconcileWalk(
         localUIDs: [UInt32],
         chunkSize: Int,
@@ -121,11 +154,15 @@ extension SyncEngine {
         maxDeletions: Int,
         interChunkDelaySeconds: TimeInterval,
         search: @Sendable ([UInt32]) async throws -> UIDExistenceResult,
-        deleteGhosts: @Sendable ([UInt32]) async throws -> Int,
-        persistUidValidity: @Sendable (UInt32) async throws -> Void
+        deleteGhosts: @Sendable ([UInt32]) async throws -> Int
     ) async -> DeletionReconcileOutcome {
         var outcome = DeletionReconcileOutcome()
-        var expectedValidity: UInt32? = storedUidValidity.flatMap { UInt32(exactly: $0) }
+        guard let expectedValidity = knownUidValidity(storedUidValidity)
+            .flatMap({ UInt32(exactly: $0) }) else {
+            outcome.aborted = true
+            outcome.abortReason = "epoch unverified"
+            return outcome
+        }
         let chunks = planReconcileChunks(uids: localUIDs, chunkSize: chunkSize)
 
         for (index, chunk) in chunks.enumerated() {
@@ -163,27 +200,16 @@ extension SyncEngine {
                 outcome.abortReason = "uidValidity unreported"
                 break
             }
-            if let expected = expectedValidity {
-                guard result.uidValidity == expected else {
-                    outcome.aborted = true
-                    outcome.abortReason = "uidValidity changed (\(expected) → \(result.uidValidity))"
-                    // T4.S6: the walk's own abort is also the strongest evidence of
-                    // a turnover this engine ever produces — the SELECT that served
-                    // this chunk reported a different epoch than the one the local
-                    // UIDs belong to. Recorded for the caller to fire the reaction;
-                    // this pure function stays free of side effects.
-                    outcome.uidValidityMismatch = (expected: expected, observed: result.uidValidity)
-                    break
-                }
-            } else {
-                expectedValidity = result.uidValidity
-                do {
-                    try await persistUidValidity(result.uidValidity)
-                } catch {
-                    outcome.aborted = true
-                    outcome.abortReason = "persist uidValidity failed: \(error)"
-                    break
-                }
+            guard result.uidValidity == expectedValidity else {
+                outcome.aborted = true
+                outcome.abortReason = "uidValidity changed (\(expectedValidity) → \(result.uidValidity))"
+                // T4.S6: the walk's own abort is also the strongest evidence of
+                // a turnover this engine ever produces — the SELECT that served
+                // this chunk reported a different epoch than the one the local
+                // UIDs belong to. Recorded for the caller to fire the reaction;
+                // this pure function stays free of side effects.
+                outcome.uidValidityMismatch = (expected: expectedValidity, observed: result.uidValidity)
+                break
             }
 
             let ghosts = selectGhostUIDs(localChunk: chunk, serverFound: result.found)
@@ -430,9 +456,6 @@ extension SyncEngine {
                 try await self.deleteServerConfirmedDeletions(
                     folder: capturedFolder, uids: ghosts, reason: "reconcile walk"
                 )
-            },
-            persistUidValidity: { validity in
-                try await self.persistFolderUidValidity(folderId: folderId, uidValidity: validity)
             }
         )
 
@@ -457,24 +480,13 @@ extension SyncEngine {
         }
     }
 
-    /// Persist the bootstrap UIDVALIDITY observation (walk guard, ADR-IOS-051).
-    ///
-    /// BOOTSTRAP-ONLY, and the `lastKnownUidValidity IS NULL` predicate must live in
-    /// the STATEMENT — same rule as the sync writers (`SyncEngineDeltaSync
-    /// .bootstrapFolderUidValidity`). The walk decided to call this from a snapshot
-    /// taken at `:369`, then SUSPENDED on a network SEARCH before reaching here, so
-    /// "the column was nil" is stale by the time this runs: a delta/full sync pass
-    /// can have bootstrapped it in between. An unconditional UPDATE would then
-    /// overwrite a DIFFERING stored epoch with the walk's own — the exact overwrite
-    /// that disarms this walk's abort guard for every later pass. SQLite evaluates
-    /// the predicate inside the writer's serialized transaction, so the race cannot
-    /// be lost; losing the write is the correct outcome (the winner's value is by
-    /// construction the epoch the local UIDs were already being judged against).
-    private func persistFolderUidValidity(folderId: String, uidValidity: UInt32) async throws {
-        try await dbPool.write { db in
-            _ = try Folder
-                .filter(Column("id") == folderId && Column("lastKnownUidValidity") == nil)
-                .updateAll(db, Column("lastKnownUidValidity").set(to: Int(uidValidity)))
-        }
-    }
+    // ⚠ `persistFolderUidValidity(folderId:uidValidity:)` USED TO LIVE HERE and is
+    // DELETED (T4.S6b). It was this walk's own bootstrap — the ONLY writer of
+    // `Folder.lastKnownUidValidity` that existed in `v1.6.38` — and it is
+    // unreachable now that `runDeletionReconcileWalk` refuses a nil stored epoch
+    // instead of adopting the first chunk's SELECT. Do not reinstate it: a writer
+    // here would be stamping the folder's EXISTING rows into an epoch nothing has
+    // proven they belong to, which is precisely the assertion that disarms this
+    // walk's own abort guard (ADR-IOS-051). The verified door
+    // (`SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch`) owns that case.
 }

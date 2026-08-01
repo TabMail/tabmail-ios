@@ -215,6 +215,29 @@ protocol EmailProvider: Sendable {
         folder: String, limit: Int, offset: Int
     ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
 
+    /// T4.S6b: envelope-level sample of SPECIFIC UIDs, plus the UIDVALIDITY the
+    /// SELECT that served it reported — BOUND together, same discipline as
+    /// `fetchMessagesWithObservedEpoch`.
+    ///
+    /// The sole consumer is `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch`,
+    /// which asks one question: *do this folder's OWN stored UIDs still name this
+    /// folder's OWN stored messages on the server right now?* It answers by
+    /// comparing normalized RFC-822 Message-IDs at specific UIDs, so what it needs
+    /// back is `messageId` (the UID, as a string) paired with `rfc822MessageId`.
+    ///
+    /// A `nil` `observedEpoch` means "the SELECT that served this sample reported no
+    /// UIDVALIDITY" — never "an earlier SELECT's value", and never `0` (RFC 3501
+    /// §2.3.1.1 types UIDVALIDITY as `nz-number`; SwiftMail's `UIDValidity(0)` is
+    /// its own "not reported" default). The consumer treats that as DO NOTHING, so
+    /// the binding matters: an unbound epoch could drive a purge of a folder whose
+    /// own SELECT never reported one.
+    ///
+    /// A requested UID that does NOT come back is **no evidence**, never a
+    /// disagreement — see the consumer's classification table.
+    func sampleHeadersForEpochVerification(
+        folder: String, uids: [UInt32]
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
+
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo
     func search(query: String, folder: String, after: Date?, before: Date?, from: String?, to: String?) async throws -> [MessageHeaderInfo]
 
@@ -350,6 +373,37 @@ extension EmailProvider {
     ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
         let messages = try await fetchMessages(folder: folder, limit: limit, offset: offset)
         return (messages, nil)
+    }
+
+    /// Default: no sample, no epoch. **This default is fail-CLOSED here, and only
+    /// here** — state the direction rather than the census, because the census moves
+    /// (see the retraction above).
+    ///
+    /// The sole consumer's rule is: a nil `observedEpoch` ⇒ DO NOTHING — no stamp,
+    /// no quarantine, no reaction. So a conformer that does not override stops
+    /// CONTRIBUTING verification; it can never MANUFACTURE one, in either direction.
+    /// It cannot stamp a folder by assertion (the stamp needs a non-nil epoch AND at
+    /// least one RFC-822 agreement, and `([], nil)` has neither) and it cannot purge
+    /// one (the react leg needs a non-nil epoch too — that asymmetry is the anti-brick
+    /// rule, see the consumer).
+    ///
+    /// For a non-IMAP provider that is also the CORRECT answer, not merely a safe
+    /// one: `Folder.lastKnownUidValidity` is nil forever on Gmail/Graph (neither ever
+    /// populates `FolderInfo.uidValidity`), `fetchMessagesWithObservedEpoch` is nil
+    /// for them by the same default above, and
+    /// `AccountManager.newGestureRefusedForUnknownEpoch` excludes them BY PROVIDER
+    /// rather than by the column — so there is nothing for a verified bootstrap to
+    /// verify and nothing it would unblock.
+    ///
+    /// `IMAPProvider` overrides in `IMAPProviderEpochSample.swift` (a separate file
+    /// on purpose). `MockEmailProvider` overrides too, because it is the double that
+    /// MODELS an IMAP-like bound provider for the epoch suites — without that
+    /// override every mock-driven test of the verified door would take this
+    /// do-nothing leg and pass vacuously.
+    func sampleHeadersForEpochVerification(
+        folder: String, uids: [UInt32]
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
+        ([], nil)
     }
 
     /// Default no-op for HTTP-based providers (Gmail, Exchange) — ephemeral sessions have no stale connections.

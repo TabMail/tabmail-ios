@@ -545,6 +545,14 @@ extension SyncEngine {
     /// wrote a value would have to be added there; this one is enumerated there as a
     /// CLEARER, and T4.S6's reaction stamp as the one ADVANCER.
     ///
+    /// UPDATE (T4.S6b): this clearer is now doubly safe by construction. Clearing the
+    /// column exposes the folder to a re-stamp, and `bootstrapFolderUidValidity`'s
+    /// statement itself now refuses to stamp any folder holding a `messageHeader`
+    /// row — so even if this helper's own `localHeaders == 0` gate were ever
+    /// weakened, the re-stamp could not land on a populated folder. The gate stays:
+    /// it is evaluated in the SAME write transaction, so the two cannot disagree, and
+    /// it is what makes the CURSOR clear (which no SQL term guards) correct too.
+    ///
     /// ⚑ R0 — **NO REFERENCE in `v2final`**: it cannot have one. There a turnover
     /// raises `uidValidityResetPendingAt`, and the reaction purges the old epoch's
     /// rows and stamps the new one for folders EMPTY AND NON-EMPTY ALIKE, so the
@@ -616,6 +624,15 @@ extension SyncEngine {
         return changed > 0
     }
 
+    /// UPDATE (T4.S6b): the `localHeaders == 0` gate below is now REDUNDANT with the
+    /// `NOT EXISTS (SELECT 1 FROM messageHeader …)` term inside
+    /// `bootstrapFolderUidValidity`'s own statement — and it is KEPT deliberately.
+    /// It is evaluated in the same write transaction as that statement, so the two
+    /// can never disagree; it is what makes this function's `Bool` return mean "the
+    /// crawl's precondition held" rather than "some UPDATE matched a row"; and every
+    /// caller in `runBackfill` branches on that `Bool` (a `false` is the ordinary
+    /// "already populated" case, a THROW declines the folder — see the round-10
+    /// distinction). Removing it would silently turn a refusal into a success.
     nonisolated static func bootstrapCrawledFolderUidValidity(
         _ db: Database, folderId: String, observed: UInt32?
     ) throws -> Bool {

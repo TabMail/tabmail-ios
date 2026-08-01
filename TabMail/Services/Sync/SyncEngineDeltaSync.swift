@@ -792,6 +792,16 @@ extension SyncEngine {
     /// - column empty + observation known ⇒ bootstrap it (the point of the item:
     ///   a folder the walk has never visited still ends up with a usable epoch).
     ///
+    /// ⚠ **T4.S6b added a FOURTH branch, and it is NOT expressible here.** A folder
+    /// that already HOLDS `messageHeader` rows may not be stamped by assertion — see
+    /// `uidValidityBootstrapWrite(observed:stored:folderHoldsRows:)` below and the
+    /// `NOT EXISTS` term in `bootstrapFolderUidValidity`. This two-argument form is
+    /// pure and answers only the observed-vs-stored half of the decision; every
+    /// caller must ALSO discharge the header-existence half, either through the
+    /// three-argument overload (callers holding a `Database` and their own record)
+    /// or by routing the write through `bootstrapFolderUidValidity` (which carries
+    /// the term in the STATEMENT).
+    ///
     /// REFERENCE (`v2final`): the identical three-branch contract, expressed as the
     /// single persist API `AccountManager.recordObservedUidValidity`
     /// (`AccountManager.swift:838`) — *"First observation … persist … Same value:
@@ -802,6 +812,35 @@ extension SyncEngine {
     nonisolated static func uidValidityBootstrapWrite(observed: Int?, stored: Int?) -> Int? {
         guard stored == nil else { return nil }
         return knownUidValidity(observed)
+    }
+
+    /// The T4.S6b form: the same decision, plus the header-existence term that makes
+    /// an UNVERIFIED stamp impossible. For callers that hold a `Database` AND the
+    /// `Folder` record they are about to `update`/`insert` inside that same write
+    /// transaction — today the two folder-list upsert arms in `SyncEngine.fullSync`,
+    /// which cannot route through `bootstrapFolderUidValidity` because they set the
+    /// field on a record rather than issuing a statement.
+    ///
+    /// `folderHoldsRows` MUST be read from the SAME write transaction as the write
+    /// it gates (no suspension in between), for the same TOCTOU reason the
+    /// `lastKnownUidValidity IS NULL` predicate lives in the statement.
+    ///
+    /// ⚑ R0 — **NO REFERENCE in `v2final`.** Verified three ways, so the next agent
+    /// does not re-derive them: (1) `v2final`'s single persist API
+    /// `AccountManager.recordObservedUidValidity` stamps a nil row without ever
+    /// asking whether headers exist; (2) `git grep` over
+    /// `v2final -- 'TabMail/Services/Sync/*' 'TabMail/Services/Account/*'` finds no
+    /// `localHeaders`, no `fetchCount(db)` near any epoch write, and no
+    /// `prePopulated`/`unverified`/`verifyEpoch` term; (3) `v2final`'s
+    /// `uidValidityWriteAllowed`/`uidValidityWalkWriteAllowed` are OBSERVED-VS-STORED
+    /// comparisons that both fail OPEN on a nil stored side. The reference never
+    /// named this hazard; v3's `Folder.lastKnownUidValidity` doc comment is where it
+    /// was first named, and this is where it is closed.
+    nonisolated static func uidValidityBootstrapWrite(
+        observed: Int?, stored: Int?, folderHoldsRows: Bool
+    ) -> Int? {
+        guard !folderHoldsRows else { return nil }
+        return uidValidityBootstrapWrite(observed: observed, stored: stored)
     }
 
     /// The bootstrap epoch write itself, as ONE conditional UPDATE, inside a
@@ -839,11 +878,27 @@ extension SyncEngine {
     ///     predicate because it reads `localFolders` INSIDE its own write
     ///     transaction, so its snapshot cannot be stale, and it routes its decision
     ///     through the same `uidValidityBootstrapWrite`;
-    ///  3. `persistFolderUidValidity` in `SyncEngineDeletionReconcile.swift` — the
-    ///     walk's own bootstrap, which carries an identical `lastKnownUidValidity
-    ///     IS NULL` predicate for the identical reason.
+    ///  3. `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch` (in the FILE
+    ///     `SyncEngineEpochVerify.swift`) — the T4.S6b VERIFIED door, and the ONLY
+    ///     path by which a folder that already holds rows may ever be stamped. It
+    ///     does NOT come through this function: it writes through
+    ///     `bootstrapVerifiedFolderUidValidity` below, which omits the `NOT EXISTS`
+    ///     term and keeps `lastKnownUidValidity IS NULL`, because by the time it
+    ///     runs it has PROVEN by FETCH that the folder's own rows still answer at
+    ///     their own UIDs under the epoch it is about to stamp.
     /// Every one of the three is bootstrap-only and 0-filtered. Another bootstrap
     /// writer must be too, and must be added to this list.
+    ///
+    /// ⚠ **RETRACTED (T4.S6b): writer 3 used to be `persistFolderUidValidity` in
+    /// `SyncEngineDeletionReconcile.swift`, the deletion-reconcile walk's own
+    /// bootstrap — the ONLY writer that existed in `v1.6.38`. It is GONE.** The walk
+    /// now REFUSES to run against a folder with no stored epoch
+    /// (`runDeletionReconcileWalk`, abort reason `"epoch unverified"`) instead of
+    /// adopting its first chunk's SELECT epoch and deleting on that authority, so
+    /// there is nothing left for it to persist. That refusal, not the write, is what
+    /// closes the shipped mass-deletion path: with the `NOT EXISTS` term below the
+    /// write was already a no-op for a populated folder, while the in-memory
+    /// adoption would have kept deleting — strictly worse than before.
     ///
     /// ⚠ **FOURTH WRITER — the only one that OVERWRITES a non-nil value (T4.S6):**
     /// `AccountManager.uidValidityResetStampFreshEpoch`, step 5 of the
@@ -884,7 +939,69 @@ extension SyncEngine {
     /// boundaries, so a `0` cannot reach the column even through a caller that
     /// forgot to normalise. That is belt-and-braces on purpose: a stored `0`
     /// makes every later epoch comparison `0 == 0` and therefore vacuous.
+    ///
+    /// 🚨 **T4.S6b — the `NOT EXISTS (SELECT 1 FROM messageHeader …)` term is the
+    /// point of this function now, and it belongs in the STATEMENT for exactly the
+    /// same reason `lastKnownUidValidity IS NULL` does.** `nil` in that column means
+    /// UNKNOWN, never "empty/fresh folder": a folder populated before migration
+    /// `v63` added the column, or one whose row was deleted on a remote
+    /// disappearance and re-created for the same deterministic `accountId:path` id
+    /// (re-adopting its orphaned headers — migration `v2` dropped the
+    /// `messageHeader.folderId` FK), holds OLD-epoch rows under a nil epoch. The
+    /// three-branch rule above then let the first observation ASSERT that those rows
+    /// belong to the epoch just observed — and if the numbering had in fact turned
+    /// over, that assertion is what disarms the deletion-reconcile walk's abort
+    /// guard and turns it into a mass deleter (ADR-IOS-051, the shipped defect this
+    /// item closes). Making the write IMPOSSIBLE at the SQL level covers every blind
+    /// caller at once, including ones added later.
+    ///
+    /// The precedent for the predicate is already in-tree:
+    /// `bootstrapCrawledFolderUidValidity` (`SyncEngineBackfillWalk.swift`) has
+    /// carried the identical `localHeaders == 0` gate since T1.3, for the identical
+    /// reason. That Swift-side gate is now redundant with this one and is KEPT — it
+    /// is evaluated inside the same write transaction, so the two cannot disagree,
+    /// and it documents the crawl's own precondition at the crawl's own call site.
+    ///
+    /// A folder that already holds rows is NOT abandoned: `SyncEngine
+    /// .verifyAndBootstrapPrePopulatedFolderEpoch` samples its own rows against the
+    /// live mailbox and, on proof, stamps through
+    /// `bootstrapVerifiedFolderUidValidity`. Until that runs the column stays nil,
+    /// which is the `IOS-EPOCH-001` accepted window (gestures refused, the reconcile
+    /// walk refuses, NO data touched) — not data loss.
     nonisolated static func bootstrapFolderUidValidity(
+        _ db: Database, folderId: String, observed: Int?
+    ) throws {
+        guard let epoch = knownUidValidity(observed) else { return }
+        try db.execute(
+            sql: """
+                UPDATE folder SET lastKnownUidValidity = :epoch
+                 WHERE id = :folderId
+                   AND lastKnownUidValidity IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM messageHeader WHERE folderId = :folderId)
+                """,
+            arguments: ["epoch": epoch, "folderId": folderId]
+        )
+    }
+
+    /// The VERIFIED bootstrap write — `bootstrapFolderUidValidity` minus ONLY the
+    /// `NOT EXISTS` term, keeping `lastKnownUidValidity IS NULL`.
+    ///
+    /// ⚠ **Exactly ONE caller may ever exist**, and it is not a stylistic rule:
+    /// `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch`, which reaches here
+    /// only after FETCHing a sample of the folder's OWN stored UIDs from the live
+    /// mailbox and finding at least one whose normalized RFC-822 Message-ID still
+    /// matches, with zero mismatches. That FETCH is what discharges the precondition
+    /// the `NOT EXISTS` term stands in for — the same discipline
+    /// `AccountManager.uidValidityResetStampFreshEpoch` follows when it advances a
+    /// non-nil value (there the purge, here the proof). A second caller that skipped
+    /// the proof would re-open the exact hazard the term exists to close.
+    ///
+    /// Still BOOTSTRAP-ONLY: `lastKnownUidValidity IS NULL` stays in the statement,
+    /// so this can never overwrite an epoch the local UIDs already belong to, and a
+    /// concurrent bootstrap that landed during the verification's network round trip
+    /// wins (its value is by construction the one the rows are already judged
+    /// against).
+    nonisolated static func bootstrapVerifiedFolderUidValidity(
         _ db: Database, folderId: String, observed: Int?
     ) throws {
         guard let epoch = knownUidValidity(observed) else { return }
@@ -983,11 +1100,14 @@ extension SyncEngine {
                 // (that would disarm the reconcile walk's abort guard — ADR-IOS-051).
                 //
                 // The pre-read check is a cheap early-out only (WAL etiquette: the steady
-                // state opens no write transaction at all). The BINDING check is the
-                // `lastKnownUidValidity IS NULL` predicate inside the UPDATE itself —
-                // `folder` was read BEFORE the STATUS round trip suspended us, so its
-                // epoch is a stale snapshot and a reentrant path (the reconcile walk,
-                // another sync pass) can have bootstrapped the column in between.
+                // state opens no write transaction at all). The BINDING checks are the
+                // `lastKnownUidValidity IS NULL` **and** `NOT EXISTS (… messageHeader …)`
+                // predicates inside the UPDATE itself — `folder` was read BEFORE the
+                // STATUS round trip suspended us, so its epoch is a stale snapshot and a
+                // reentrant path (another sync pass, a merge, the NSE bridge) can have
+                // bootstrapped the column OR inserted the folder's first row in between.
+                // T4.S6b: a QUIET folder that already holds rows is therefore NOT stamped
+                // here — the verified door owns that case.
                 if Self.uidValidityBootstrapWrite(
                     observed: status.uidValidity, stored: folder.lastKnownUidValidity) != nil {
                     try await bootstrapFolderUidValidity(
