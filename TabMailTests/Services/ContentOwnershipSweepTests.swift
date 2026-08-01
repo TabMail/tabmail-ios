@@ -488,4 +488,161 @@ struct ContentOwnershipSweepTests {
 
         await cleanup(accountId: accountId, keys: [key])
     }
+
+    // MARK: - #45: the third sweep must still terminate
+
+    /// Purge everything a previous run may have left behind. These two tests seed a
+    /// `messageHeader` and FTS rows that SURVIVE on purpose, so an aborted run (a
+    /// red-proof, a cancelled suite) would otherwise collide on `messageHeader.id` or
+    /// leave an already-backfilled FTS row behind.
+    ///
+    /// The `folderId = ''` sweep is GLOBAL — it pages over every such row in the
+    /// index, not just this account's — so these tests must own that ENTIRE set. One
+    /// protected row left behind by anyone else would be paged in first, correctly
+    /// stop the sweep before it ever reached this fixture, and make the outcome depend
+    /// on run history. Any row still carrying an empty folderId when this suite starts
+    /// is abandoned by construction: every suite that seeds one holds the same
+    /// process-global lock and cleans up after itself.
+    private func purge(accountId: String) async {
+        try? await SearchIndex.shared.removeMessagesForAccount(accountId: accountId)
+        let strayEmptyFolderIdRows =
+            (try? await SearchIndex.shared.contentKeysWithEmptyFolderId(limit: 100_000)) ?? []
+        if !strayEmptyFolderIdRows.isEmpty {
+            try? await SearchIndex.shared.removeMessages(contentKeys: strayEmptyFolderIdRows)
+        }
+        await cleanup(accountId: accountId, keys: [])
+    }
+
+    /// RED against HEAD. `backfillFolderIdsIfNeeded` is a `while true` whose only
+    /// non-error exit is "no rows left with `folderId = ''`", and the query behind it
+    /// is an UNCURSORED `SELECT … WHERE folderId = '' LIMIT ?`. Before the protection
+    /// gate, every row of a page left that set on every pass, so the set shrank
+    /// monotonically and the loop ended. The gate added a THIRD outcome — a protected
+    /// orphan is neither given a folderId nor removed — so once the remaining rows are
+    /// all protected the same page is returned forever and the loop spins at 10 Hz for
+    /// the life of the process, with a fresh spinner launched after every account sync.
+    ///
+    /// It is a durable steady state, not a blip: `uidValidityResetPendingAt` is a
+    /// PERSISTED column whose failure paths deliberately leave it armed for re-drive.
+    ///
+    /// Pins the END STATE, never the mechanism: the sweep RETURNS, the protected rows
+    /// are still there with their bodies intact, and everything the sweep can
+    /// legitimately do is still done. The bounded `withTimeout` is deliberate — a
+    /// hung test that never returns would take the whole run down with it, which is
+    /// strictly worse than a red one.
+    @Test("#45 — the folderId backfill sweep terminates when the rows left are protected")
+    func backfillFolderIdsTerminatesOnProtectedOrphans() async throws {
+        let accountId = "stageC-backfill-term"
+        await purge(accountId: accountId)
+        // Quarantined: these orphans can be neither backfilled (no header mints them)
+        // nor removed (protected) — exactly the third outcome that broke termination.
+        try await seedScope(
+            accountId: accountId, folderPath: "INBOX", provider: .imap, quarantined: true)
+        let liveFolderId = try await seedScope(
+            accountId: accountId, folderPath: "Archive", provider: .imap, quarantined: false)
+
+        let protectedA = ContentKey(rawValue: "\(accountId):INBOX:4501")
+        let protectedB = ContentKey(rawValue: "\(accountId):INBOX:4502")
+        try await seedFTSRow(
+            key: protectedA, messageId: "4501", folderId: "", body: "protectedbackfilltokenA body")
+        try await seedFTSRow(
+            key: protectedB, messageId: "4502", folderId: "", body: "protectedbackfilltokenB body")
+
+        // NON-VACUITY, side 1: an orphan nothing owns must STILL be reclaimed. A loop
+        // that simply exited on its first pass would pass every assertion above.
+        let deadKey = ContentKey(rawValue: "\(accountId):Archive:4503")
+        try await seedFTSRow(
+            key: deadKey, messageId: "4503", folderId: "", body: "deadbackfilltoken body")
+
+        // NON-VACUITY, side 2: a row a live header mints must STILL get its folderId.
+        let liveHeader = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "4504")
+        let liveKey = ContentKey(rawValue: liveHeader.id)
+        try await seedFTSRow(
+            key: liveKey, messageId: "4504", folderId: "", body: "livebackfilltoken body")
+
+        let engine = SyncEngine()
+        let sweep = await engine.backfillFolderIdsIfNeeded()
+        // THE INVARIANT. Pre-fix this never resolves and the timeout is what turns an
+        // unterminating sweep into a test failure instead of a hung suite.
+        try await withTimeout(seconds: 20) { await sweep.value }
+
+        let stillEmpty = Set(try await SearchIndex.shared.contentKeysWithEmptyFolderId(limit: 500))
+
+        // The protected rows are kept, still unassigned, and their content is intact —
+        // the sweep stopped instead of deleting what it could not decide about.
+        #expect(stillEmpty.contains(protectedA),
+                "a protected orphan must keep its row rather than be forced out of the set")
+        #expect(stillEmpty.contains(protectedB))
+        #expect(await ftsRowid(protectedA) != nil,
+                "a quarantined folder's FTS row must survive the backfill sweep")
+        #expect(await ftsBody(protectedA)?.contains("protectedbackfilltokenA") == true,
+                "the indexed body must be preserved, not merely the row")
+        #expect(await ftsRowid(protectedB) != nil)
+
+        // …and the work it CAN do was done: the unowned orphan is gone.
+        #expect(await ftsRowid(deadKey) == nil,
+                "an orphan nothing owns must still be reclaimed by the backfill sweep")
+        #expect(!stillEmpty.contains(deadKey))
+
+        // …and the live row left the set by being BACKFILLED, not by being deleted.
+        #expect(await ftsRowid(liveKey) != nil, "the live header's FTS row must not be deleted")
+        #expect(!stillEmpty.contains(liveKey),
+                "a row whose header is alive must be given its folderId")
+        let scoped = try await SearchIndex.shared.keywordSearch(
+            query: "livebackfilltoken", folderIds: [liveFolderId])
+        #expect(scoped.count == 1,
+                "and the folderId written must be the header's own folder, not just any non-empty value")
+
+        await cleanup(accountId: accountId, keys: [protectedA, protectedB, deadKey, liveKey])
+    }
+
+    /// The case that separates a MEASURED loop variant from a page-comparison one: a
+    /// protected set LARGER than one page. `contentKeysWithEmptyFolderId` has no
+    /// `ORDER BY`, so nothing guarantees the same subset comes back twice — "the page
+    /// repeated" is therefore not a sound stop condition, while "the set did not
+    /// shrink" is, whichever rows the query happens to hand over.
+    ///
+    /// Two-sided non-vacuity for the sweep's productive legs lives in the test above.
+    /// What this one adds is that the exit does not depend on WHICH rows are paged in,
+    /// and that termination is never bought by deleting protected content.
+    ///
+    /// It also pins a deliberate behaviour: when a whole page is protected the sweep
+    /// STOPS rather than paging past it. That costs nothing — the pre-fix loop never
+    /// got past such a page either, because the page is uncursored; it just spun on it
+    /// forever instead of returning.
+    @Test("#45 — the sweep terminates even when the protected set is larger than one page")
+    func backfillFolderIdsTerminatesWhenProtectedSetExceedsOnePage() async throws {
+        let accountId = "stageC-backfill-page"
+        await purge(accountId: accountId)
+        try await seedScope(
+            accountId: accountId, folderPath: "INBOX", provider: .imap, quarantined: true)
+
+        // Strictly more than one page, so no single page can hold the whole set.
+        let overflow = SyncConfig.backfillChunkSize + 100
+        let keys = (0..<overflow).map { ContentKey(rawValue: "\(accountId):INBOX:\(46000 + $0)") }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let indexed = try await SearchIndex.shared.indexHeaders(
+            keys.enumerated().map { index, key in
+                FTSHeaderRecord(
+                    contentKey: key, headerId: key.rawValue, messageId: "\(46000 + index)",
+                    subject: "stage C fixture", from: "a <a@example.com>",
+                    to: "b@example.com", cc: "", bcc: "", dateMs: nowMs, folderId: "")
+            })
+        #expect(indexed == overflow, "precondition: the whole oversized set is indexed")
+
+        let engine = SyncEngine()
+        let sweep = await engine.backfillFolderIdsIfNeeded()
+        // THE INVARIANT, with no assumption about which rows a page contains.
+        try await withTimeout(seconds: 30) { await sweep.value }
+
+        let stillEmpty = Set(try await SearchIndex.shared.contentKeysWithEmptyFolderId(
+            limit: overflow + 500))
+        #expect(keys.filter { stillEmpty.contains($0) }.count == overflow,
+                "no protected row may be forced out of the set to make the loop terminate")
+        if let first = keys.first { #expect(await ftsRowid(first) != nil) }
+        if let last = keys.last { #expect(await ftsRowid(last) != nil) }
+
+        await cleanup(accountId: accountId, keys: keys)
+    }
 }

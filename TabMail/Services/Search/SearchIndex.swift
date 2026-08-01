@@ -1132,12 +1132,27 @@ actor SearchIndex {
     }
 
     /// Return content keys where folderId is empty (for backfill).
+    ///
+    /// ⚠️ UNCURSORED — no `ORDER BY`, no `OFFSET`. The caller only ever advances by
+    /// SHRINKING the `folderId = ''` set, so it must measure that set with
+    /// `emptyFolderIdCount()` rather than assume anything about which rows this
+    /// returns or in what order.
     func contentKeysWithEmptyFolderId(limit: Int) throws -> [ContentKey] {
         guard let dbPool else { return [] }
         return try dbPool.read { db in
             try ContentKey.fetchAll(db,
                 sql: "SELECT headerId FROM message_meta WHERE folderId = '' LIMIT ?",
                 arguments: [limit])
+        }
+    }
+
+    /// How many entries still have an empty folderId — the backfill sweep's loop
+    /// variant. Served by `idx_meta_folderId`, so it is an index range scan over
+    /// exactly the rows still awaiting a backfill, not a table scan.
+    func emptyFolderIdCount() throws -> Int {
+        guard let dbPool else { return 0 }
+        return try dbPool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM message_meta WHERE folderId = ''") ?? 0
         }
     }
 

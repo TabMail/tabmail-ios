@@ -713,14 +713,21 @@ extension SyncEngine {
 
     /// Backfill folderId for existing FTS entries that were indexed before the folderId column existed.
     /// Reads GRDB in chunks, updates SearchIndex. Idempotent — no-ops once all entries have folderId.
-    func backfillFolderIdsIfNeeded() {
+    ///
+    /// Returns the sweep task. Production callers discard it; it exists so the
+    /// loop's TERMINATION is observable — that is the property this sweep lost.
+    @discardableResult
+    func backfillFolderIdsIfNeeded() -> Task<Void, Never> {
         // QoS: `.medium` — see SyncEngineBackfill.swift for rationale.
-        Task(priority: .medium) { [weak self] in
+        return Task(priority: .medium) { [weak self] in
             guard let self else { return }
             let batchSize = SyncConfig.backfillChunkSize
             var totalUpdated = 0
+            /// The loop variant. See the termination guard below.
+            var lastRemaining = Int.max
 
             while true {
+                guard !Task.isCancelled else { return }
                 // 🚨 THE THIRD SWEEP. These are CONTENT keys, and every use below
                 // treats them as `messageHeader.id`s — the `fetchOne(db, key:)` lookup
                 // and the "not in GRDB ⇒ orphan ⇒ delete from FTS" conclusion. It has
@@ -739,6 +746,52 @@ extension SyncEngine {
                     break
                 }
                 guard !emptyIds.isEmpty else { break }
+
+                // 🚨 TERMINATION. `contentKeysWithEmptyFolderId` is an UNCURSORED
+                // `SELECT … WHERE folderId = '' LIMIT ?` — no ORDER BY, no OFFSET — so
+                // this loop only advances by SHRINKING that set: a row leaves it by
+                // being given a non-empty folderId, or by being removed. The
+                // protection gate added a THIRD outcome — a protected orphan is
+                // neither updated nor removed — and once the survivors are all
+                // protected the query has nothing new to hand back, forever. That is a
+                // durable steady state, not a blip: `uidValidityResetPendingAt` is a
+                // PERSISTED column that survives relaunch, and the fail-safe below
+                // protects the WHOLE page on a single failed read.
+                //
+                // So the loop variant is the SIZE OF THE SET, measured — not the size
+                // of the work we believe we did. Counting what we handed to
+                // `updateFolderIds` / `removeMessages` would be unsound: both skip a
+                // key whose rowid does not resolve, an `updateFolderIds` failure is
+                // caught and logged, and a header whose own folderId is empty updates
+                // to no effect — every one of those looks productive and changes
+                // nothing. Comparing the returned PAGE would be unsound for a
+                // different reason: the query has no ORDER BY, so a protected set
+                // LARGER than `batchSize` is not guaranteed to hand back the same
+                // subset twice. `COUNT(*)` is answerable regardless of ordering and is
+                // served by `idx_meta_folderId`, so it costs an index range scan over
+                // exactly the rows still awaiting backfill. `lastRemaining` strictly
+                // decreases and is bounded below by 0 ⇒ the loop terminates.
+                //
+                // Stopping is correct, not a give-up. A protected row is legitimately
+                // undecidable *right now*; the next account sync re-drives the sweep,
+                // and by then the quarantine may have cleared. Deleting it instead
+                // would invert the gate — that is the data-loss bug, not the fix.
+                let remaining: Int
+                do {
+                    remaining = try await SearchIndex.shared.emptyFolderIdCount()
+                } catch {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[FTS Backfill] Failed to measure remaining entries: \(error)")
+                    }
+                    break
+                }
+                guard remaining < lastRemaining else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[FTS Backfill] No progress on \(remaining) entries — stopping until the next sync")
+                    }
+                    break
+                }
+                lastRemaining = remaining
 
                 // Look up each headerId in GRDB to get the current folderId
                 let folderMap: [String: String] = (try? await self.dbPool.read { db in
