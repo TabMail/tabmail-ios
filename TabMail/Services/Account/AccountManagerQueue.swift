@@ -236,6 +236,12 @@ extension AccountManager {
                         // unparked onto a UID the new epoch had reassigned. The
                         // admission-time stamp compared below is the second check, and
                         // the one that does not depend on guessing an op's id shapes.
+                        // ⚑ UPDATE (2026-08-01): `IMAPProvider.deleteDraft` no longer
+                        // executes a bare UID at all — it verifies an rfc822 identity on
+                        // the wire and REFUSES an all-digits id — so that provider is now
+                        // guarded at BOTH ends. This check stays: it is provider-agnostic,
+                        // it is what keeps an op recorded under a discarded numbering from
+                        // running at all, and the reasoning above is what it exists for.
                         let sourceFolderId = MessageIdentity.folderId(
                             accountId: fetched.accountId, folderPath: fetched.folderPath)
                         let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId)
@@ -787,11 +793,23 @@ extension AccountManager {
     /// 404/410 or ProviderError.messageNotFound) or the IMAP-backfill miss-count
     /// threshold has been reached after an rfc822 confirmation. Never call on a
     /// transient connection error.
+    /// 🚨 ORDERING CONTRACT (`MessageContentStore`): the content key and its scope
+    /// are captured INSIDE the delete transaction, from the row about to go away,
+    /// and the release happens AFTER that transaction commits. Reversed, the header
+    /// still exists when owners are counted, the count is always ≥ 1, and the FTS
+    /// row is never removed — a silent no-op every outcome-only test still passes.
     func deleteConfirmedGoneHeader(headerId: String, reason: String) async {
+        let captured: MessageContentStore.CapturedContent?
         let existed: Bool
         do {
-            existed = try await dbPool.write { db in
-                try MessageHeader.deleteOne(db, key: headerId)
+            (existed, captured) = try await dbPool.write {
+                db -> (Bool, MessageContentStore.CapturedContent?) in
+                guard let header = try MessageHeader.fetchOne(db, key: headerId) else {
+                    return (false, nil)
+                }
+                let captured = try MessageContentStore.capture(header, db: db)
+                try header.delete(db)
+                return (true, captured)
             }
         } catch {
             print("[Gone] GRDB delete failed for \(headerId): \(error)")
@@ -799,10 +817,15 @@ extension AccountManager {
         }
         guard existed else { return }
         print("[Gone] Deleted header \(headerId) — reason=\(reason)")
-        do {
-            try await SearchIndex.shared.removeMessages(contentKeys: [ContentKey(rawValue: headerId)])
-        } catch {
-            print("[Gone] FTS remove failed for \(headerId): \(error)")
+        if let captured {
+            await MessageContentStore.releaseUnowned(
+                captured.contentKey, scope: captured.scope,
+                stores: .searchIndex, pool: dbPool)
+        } else {
+            // No account row to read a key space from — keep the pre-existing
+            // unconditional removal rather than invent an owner.
+            await MessageContentStore.release(
+                ContentKey(rawValue: headerId), stores: .searchIndex, pool: dbPool)
         }
     }
 

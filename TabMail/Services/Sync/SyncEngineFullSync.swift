@@ -242,8 +242,12 @@ extension SyncEngine {
                 })
             }
             if !result.staleIds.isEmpty {
-                try? await SearchIndex.shared.removeMessages(
-                    contentKeys: result.staleIds.map(ContentKey.init(rawValue:)))
+                // Routed through `MessageContentStore` (as the non-retry path's
+                // `removeHeadersFromFTS` is): the stale headers are already deleted by
+                // the sync write above, so the owner count here sees the post-delete
+                // world — the ordering the gate depends on.
+                await MessageContentStore.releaseUnowned(
+                    result.staleIds.map(ContentKey.init(rawValue:)), stores: .searchIndex)
             }
             if !result.newHeaders.isEmpty {
                 let records = result.newHeaders.map { header in

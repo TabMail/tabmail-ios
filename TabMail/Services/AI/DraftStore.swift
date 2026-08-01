@@ -360,9 +360,16 @@ actor DraftStore {
         }
         // Keep FTS aligned with the migrated GRDB ids: re-key migrated placeholders
         // (preserves the indexed body), remove merged-away ones. After the write.
+        // 🚨 ORDERING CONTRACT (`MessageContentStore`): the merged-away header is
+        // deleted inside the write above; this release runs AFTER that transaction
+        // commits, so the owner count sees the post-merge world. The merge branch is
+        // also the site where N > 1 first becomes real — it writes the SAME fresh
+        // rfc822 onto both the merged-away row and the surviving target row, so at
+        // Stage E1 both mint one content key and releasing the merged-away one must
+        // NOT evict the survivor's indexed body.
         if !draftFtsOps.removals.isEmpty {
-            try? await SearchIndex.shared.removeMessages(
-                contentKeys: draftFtsOps.removals.map(ContentKey.init(rawValue:)))
+            await MessageContentStore.releaseUnowned(
+                draftFtsOps.removals.map(ContentKey.init(rawValue:)), stores: .searchIndex)
         }
         if !draftFtsOps.rekeys.isEmpty {
             try? await SearchIndex.shared.rekeyHeaders(draftFtsOps.rekeys.map {

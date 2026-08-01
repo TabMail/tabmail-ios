@@ -405,18 +405,20 @@ extension SyncEngine {
             guard let last = page.last else { break }
             cursor = last.rowid
 
-            // 🚨 STAGE E1 — THE BIGGEST CONFLATION IN THIS FILE. `page` holds CONTENT
-            // keys; `fetchExistingHeaderIds` asks `SELECT id FROM messageHeader WHERE
-            // id IN (…)`. The instant the content key moves off the provider id, every
-            // UID-addressed FTS row fails that existence probe, is re-checked, still
-            // fails, and is DELETED as a dead orphan — i.e. this sweep erases the
-            // search index for IMAP/iCloud accounts. It must resolve content key →
-            // header id (or compare in the key's own space) before E1 lands.
-            var ids: [String] = page.map(\.contentKey.rawValue)
+            // ⚠ `page` holds CONTENT keys and `fetchExistingHeaderIds` asks
+            // `SELECT id FROM messageHeader WHERE id IN (…)`. That probe answers a
+            // HEADER-space question, so at Stage E1 it will stop matching for every
+            // UID-addressed row. It is kept — but only as a PROTECTION term: a key it
+            // matches is live, and a key it does not match is handed to the ownership
+            // gate and then to drift recovery before anything is deleted. It can no
+            // longer authorize a delete on its own, which is what made it a
+            // mass-deletion hazard.
+            var entries = page
             if let scopePrefix {
-                ids = ids.filter { $0.hasPrefix(scopePrefix) }
+                entries = entries.filter { $0.contentKey.rawValue.hasPrefix(scopePrefix) }
             }
-            guard !ids.isEmpty else { continue }
+            guard !entries.isEmpty else { continue }
+            let ids: [String] = entries.map(\.contentKey.rawValue)
             let existing = try await fetchExistingHeaderIds(ids)
             var candidates = ids.filter { !existing.contains($0) }
             guard !candidates.isEmpty else { continue }
@@ -424,32 +426,58 @@ extension SyncEngine {
             // Re-verify after a beat. FTS entries are written only AFTER their
             // GRDB row commits, so a row still missing on the second look is a
             // true orphan, not an insert in flight.
+            //
+            // ⚠ This sleep is a TIMING HEURISTIC and is deliberately NOT the thing
+            // standing between a key-space divergence and a mass delete — the
+            // ownership + quarantine gate below is, because it tests facts.
             try await Task.sleep(for: .milliseconds(SyncConfig.ftsOrphanPruneRecheckMs))
             let stillExisting = try await fetchExistingHeaderIds(candidates)
             candidates = candidates.filter { !stillExisting.contains($0) }
             guard !candidates.isEmpty else { continue }
+
+            // Ownership + quarantine gate. Protects a key that some header still
+            // MINTS (the question that survives E1), a key whose folder is mid
+            // `UIDVALIDITY` reset, and a key whose ownership read threw.
+            let candidateKeys = candidates.map(ContentKey.init(rawValue:))
+            let protected = try await dbPool.read { db in
+                try MessageContentStore.protectedKeys(among: candidateKeys, db: db)
+            }
+            let survivors = candidateKeys.filter { !protected.contains($0) }
+            guard !survivors.isEmpty else { continue }
 
             // Drift recovery: an orphan whose (accountId, messageId) still exists
             // in GRDB under a NEW id is a MOVED message (Gmail archive/trash etc.),
             // not a dead one. Re-key the FTS entry to the current id — preserving
             // its indexed body — instead of deleting it. This repairs drift for
             // EVERY consumer (search, AI, embeddings), not just on-search.
+            let entryByKey = Dictionary(entries.map { ($0.contentKey, $0) },
+                                        uniquingKeysWith: { first, _ in first })
+            let roster = try await dbPool.read { db in try MessageContentStore.roster(db) }
             var rekeys: [(oldKey: ContentKey, newKey: ContentKey, newMessageId: String?)] = []
+            var newFolderIds: [ContentKey: String] = [:]
             var deadIds: [ContentKey] = []
-            for orphan in candidates {
-                if let newId = try await recoverMovedHeaderId(forOrphan: orphan) {
-                    // ⚠ STAGE E1: `recoverMovedHeaderId` returns a `messageHeader.id`;
-                    // the FTS re-key needs the NEW row's content key. Identical today,
-                    // and this branch only fires for Gmail/Graph — whose keys do not
-                    // move — but the conversion must become a real mint at E1.
-                    rekeys.append((oldKey: ContentKey(rawValue: orphan),
-                                   newKey: ContentKey(rawValue: newId), newMessageId: nil))
+            for orphan in survivors {
+                if let newKey = try await recoverMovedContentKey(
+                    orphan: orphan, entry: entryByKey[orphan], roster: roster
+                ) {
+                    rekeys.append((oldKey: orphan, newKey: newKey, newMessageId: nil))
+                    // `rekeyHeaders` moves `message_ids.headerId`, `message_meta.headerId`
+                    // and the shard's `msgId` — but NOT `message_meta.folderId`. A moved
+                    // message re-keyed without this would keep its OLD folderId and every
+                    // folder-scoped search would place it in the folder it left.
+                    if let scope = MessageContentStore.resolveScope(for: newKey, in: roster) {
+                        newFolderIds[newKey] = scope.folderId
+                    }
                 } else {
-                    deadIds.append(ContentKey(rawValue: orphan))
+                    deadIds.append(orphan)
                 }
             }
             if !rekeys.isEmpty {
                 try await SearchIndex.shared.rekeyHeaders(rekeys)
+                for (newKey, folderId) in newFolderIds {
+                    try? await SearchIndex.shared.updateFolderIds(
+                        contentKeys: [newKey], newFolderId: folderId)
+                }
                 print("[FTS] Orphan reconcile: re-keyed \(rekeys.count) moved messages (cursor \(cursor))")
             }
             if !deadIds.isEmpty {
@@ -461,32 +489,49 @@ extension SyncEngine {
         return pruned
     }
 
-    /// Resolve an orphan FTS headerId to the message's CURRENT GRDB id, if the
-    /// message merely moved folders. Returns nil for genuinely-dead messages or
-    /// when recovery isn't safe.
+    /// Resolve an orphan FTS content key to the key its message is stored under
+    /// NOW, if the message merely moved folders. `nil` for genuinely-dead messages
+    /// or when recovery isn't safe.
     ///
-    /// Only Gmail/Graph are recoverable by `(accountId, messageId)`: their
-    /// messageId is globally unique AND survives folder moves. The headerId
-    /// `accountId:folder:messageId` splits into exactly 3 components for them
-    /// (no ':' in account UUID, folder, or the hex/opaque messageId); a different
-    /// component count means a folder path with ':' (IMAP) — skip, since IMAP's
-    /// per-folder UID changes on move and repeats across folders.
-    private func recoverMovedHeaderId(forOrphan headerId: String) async throws -> String? {
-        let parts = headerId.components(separatedBy: ":")
-        guard parts.count == 3 else { return nil }
-        let accountId = parts[0]
-        let messageId = parts[2]
-        return try await dbPool.read { db -> String? in
-            guard let provider = try Account.fetchOne(db, key: accountId)?.provider,
-                  provider == .gmail || provider == .outlook else { return nil }
-            let matches = try MessageHeader
-                .filter(Column("accountId") == accountId && Column("messageId") == messageId)
-                .fetchAll(db)
-            guard !matches.isEmpty else { return nil }
-            // Same message can live in several folders; any current id works (the
-            // body rides along in the re-key). Prefer a non-trash/spam copy.
-            let preferred = matches.first { !$0.folderPath.contains("TRASH") && !$0.folderPath.contains("SPAM") }
-            return (preferred ?? matches.first)?.id
+    /// 🚨 **The composite is NEVER split on `':'`.** The previous implementation did
+    /// `headerId.components(separatedBy: ":")` + `guard parts.count == 3`, which is
+    /// wrong because `folderPath` may legitimately contain a `':'` — RFC 3501 permits
+    /// any hierarchy delimiter, and a Gmail/Outlook label name can contain one too.
+    /// A four-component key failed the guard, recovery silently declined, and the FTS
+    /// row was **deleted instead of re-keyed**, losing its indexed body and its
+    /// `messages_vec` embedding — precisely for the users with unusual folder names.
+    /// Raising the part count or using `maxSplits:` would not fix it (the tail is the
+    /// LAST component, so a split parse would have to count from the end and would
+    /// still be a parse). Instead the `accountId` and the folder id are carried
+    /// ALONGSIDE the key, out of `message_meta`, exactly as Stage B's both-ids split
+    /// established; the folder roster is the second source for rows indexed before
+    /// `message_meta.folderId` existed.
+    ///
+    /// The Gmail/Graph gate is KEPT. IMAP UIDs change on move and repeat across
+    /// folders, so an `(accountId, messageId)` lookup there would bind the indexed
+    /// body of one message to a completely different one — recovery must decline.
+    /// Under a content key an IMAP row's key moves for a different reason (a
+    /// `UIDVALIDITY` renumber), and that case is handled where the fact lives: the
+    /// quarantine term of `MessageContentStore.protectedKeys`, which keeps the row
+    /// rather than guessing at its new identity.
+    private func recoverMovedContentKey(
+        orphan: ContentKey,
+        entry: SearchIndex.ContentKeyPageEntry?,
+        roster: [MessageContentStore.ContentKeyScope]
+    ) async throws -> ContentKey? {
+        let scope = MessageContentStore.resolveScope(for: orphan, in: roster)
+        // The provider message id, from the folder id the row was INDEXED under,
+        // falling back to the live folder roster for pre-folderId rows.
+        guard let providerMessageId =
+                MessageContentStore.tail(of: orphan, folderId: entry?.folderId ?? "")
+                ?? scope?.tail(of: orphan)
+        else { return nil }
+        let accountId = (entry?.accountId).flatMap { $0.isEmpty ? nil : $0 } ?? scope?.accountId
+        guard let accountId else { return nil }
+        return try await dbPool.read { db in
+            try MessageContentStore.recoverMovedContentKey(
+                orphan: orphan, accountId: accountId,
+                providerMessageId: providerMessageId, db: db)
         }
     }
 
@@ -548,18 +593,24 @@ extension SyncEngine {
 
     /// Remove deleted message IDs from FTS index.
     ///
+    /// The single FTS-removal channel for "a header went away" — deletion reconcile,
+    /// full sync's `staleIds`, and all four delta-sync removal paths funnel here, so
+    /// routing this one function through `MessageContentStore` routes all six.
+    ///
+    /// 🚨 ORDERING CONTRACT: every caller has ALREADY committed its header delete
+    /// before calling. That is load-bearing — count the owners while the header still
+    /// exists and the count is always ≥ 1, so nothing is ever released and the gate
+    /// becomes a permanent silent no-op that every outcome-only test still passes.
+    ///
     /// ⚠ STAGE E1: callers hand `messageHeader.id`s here (deletion is a header-space
     /// event); the FTS delete keys by content. Convert at the mint when they diverge.
     func removeHeadersFromFTS(_ headerIds: [String]) {
         guard !headerIds.isEmpty else { return }
+        let pool = dbPool
         Task.detached(priority: .utility) {
-            do {
-                try await SearchIndex.shared.removeMessages(
-                    contentKeys: headerIds.map(ContentKey.init(rawValue:)))
-                print("[FTS] Removed \(headerIds.count) messages from index")
-            } catch {
-                print("[FTS] Removal failed: \(error)")
-            }
+            let released = await MessageContentStore.releaseUnowned(
+                headerIds.map(ContentKey.init(rawValue:)), stores: .searchIndex, pool: pool)
+            print("[FTS] Removed \(released)/\(headerIds.count) messages from index")
         }
     }
 
@@ -670,10 +721,15 @@ extension SyncEngine {
             var totalUpdated = 0
 
             while true {
-                // ⚠ STAGE E1: these are CONTENT keys, and every use below treats them
-                // as `messageHeader.id`s (the `fetchOne(db, key:)` lookup, and the
-                // "not in GRDB ⇒ orphan ⇒ delete from FTS" conclusion). Same failure
-                // shape as `pruneFTSOrphans`.
+                // 🚨 THE THIRD SWEEP. These are CONTENT keys, and every use below
+                // treats them as `messageHeader.id`s — the `fetchOne(db, key:)` lookup
+                // and the "not in GRDB ⇒ orphan ⇒ delete from FTS" conclusion. It has
+                // the identical mass-delete shape to `pruneFTSOrphans`, and a
+                // type-shaped census MISSED it because `.map(\.rawValue)` converts
+                // straight back to `String` (GRDB's `fetchOne(_:key:)` is generic over
+                // `DatabaseValueConvertible`, so a bare `String` primary key compiles
+                // with no diagnostic at all). It is gated below by the same ownership +
+                // quarantine term as the other two.
                 let emptyIds: [String]
                 do {
                     emptyIds = try await SearchIndex.shared.contentKeysWithEmptyFolderId(
@@ -717,11 +773,22 @@ extension SyncEngine {
                     }
                 }
 
-                // Remove orphaned entries (headerId not in GRDB) per ADR-003 (no fallbacks)
+                // Remove orphaned entries (headerId not in GRDB) per ADR-003 (no
+                // fallbacks) — but only those that clear the SAME ownership +
+                // quarantine gate as the other two sweeps. Without it, this loop
+                // deletes the whole search index of every UID-addressed account the
+                // moment the content key moves off the provider id.
                 if !orphanedIds.isEmpty {
-                    print("[FTS Backfill] Removing \(orphanedIds.count) orphaned FTS entries")
-                    try? await SearchIndex.shared.removeMessages(
-                        contentKeys: orphanedIds.map(ContentKey.init(rawValue:)))
+                    let orphanKeys = orphanedIds.map(ContentKey.init(rawValue:))
+                    let protected = (try? await self.dbPool.read { db in
+                        try MessageContentStore.protectedKeys(among: orphanKeys, db: db)
+                        // FAIL-SAFE: a failed read protects the whole batch.
+                    }) ?? Set(orphanKeys)
+                    let removable = orphanKeys.filter { !protected.contains($0) }
+                    if !removable.isEmpty {
+                        print("[FTS Backfill] Removing \(removable.count)/\(orphanedIds.count) orphaned FTS entries")
+                        try? await SearchIndex.shared.removeMessages(contentKeys: removable)
+                    }
                 }
 
                 try? await Task.sleep(for: .milliseconds(100))

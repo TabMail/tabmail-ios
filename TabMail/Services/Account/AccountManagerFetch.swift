@@ -12,12 +12,28 @@ extension AccountManager {
 
     /// Evict a header that no longer exists on the server (messageNotFound).
     /// Deletes from GRDB, triggers unread recount, and removes from FTS.
+    ///
+    /// 🚨 ORDERING CONTRACT (`MessageContentStore`): the content key and its scope
+    /// are captured INSIDE the delete transaction and the release happens AFTER it
+    /// commits. Reversed, the header still exists when owners are counted, the count
+    /// is always ≥ 1, and the FTS row is never removed — a silent no-op.
     func evictStaleHeader(_ header: MessageHeader) async {
-        _ = try? await dbPool.write { db in
+        let captured = try? await dbPool.write { db -> MessageContentStore.CapturedContent? in
+            let captured = try MessageContentStore.capture(header, db: db)
             try MessageHeader.deleteOne(db, key: header.id)
+            return captured
         }
         Task { await UnreadCountManager.shared.requestRecount(folderId: header.folderId) }
-        _ = try? await SearchIndex.shared.removeMessages(contentKeys: [ContentKey(rawValue: header.id)])
+        if let captured = captured ?? nil {
+            await MessageContentStore.releaseUnowned(
+                captured.contentKey, scope: captured.scope,
+                stores: .searchIndex, pool: dbPool)
+        } else {
+            // No account row to read a key space from — keep the pre-existing
+            // unconditional removal rather than invent an owner.
+            await MessageContentStore.release(
+                ContentKey(rawValue: header.id), stores: .searchIndex, pool: dbPool)
+        }
     }
 
     // MARK: - Body & Attachment Fetching

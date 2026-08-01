@@ -97,9 +97,13 @@ extension SyncEngine {
                         print("[Prune] Delete failed: \(error)")
                     }
                     if !chunkIds.isEmpty {
+                        // Routed through `MessageContentStore`. The headers were
+                        // deleted in the write transaction just above, so this
+                        // detached release counts owners in the post-delete world.
+                        let keys = chunkIds.map(ContentKey.init(rawValue:))
                         Task.detached(priority: .utility) {
-                            try? await SearchIndex.shared.removeMessages(
-                                contentKeys: chunkIds.map(ContentKey.init(rawValue:)))
+                            await MessageContentStore.releaseUnowned(
+                                keys, stores: .searchIndex, pool: dbPool)
                         }
                     }
                 }

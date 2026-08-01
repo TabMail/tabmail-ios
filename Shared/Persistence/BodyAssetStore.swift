@@ -463,33 +463,100 @@ enum BodyAssetStore {
 
     /// Delete all manifest rows + files for a single content key. Returns bytes
     /// reclaimed. Idempotent. Does NOT touch main DB.
+    ///
+    /// ⚑ THE DIRECTORIES COME FROM THE ROWS, NOT FROM THE KEY. An asset row's `id`
+    /// is `"<headerHash>/<assetHash>"`, where `headerHash` was computed from the key
+    /// the row was written under. `headerId` is a mutable COLUMN — `rekeyContentKey`
+    /// moves a moved message's assets to its new key without rewriting the files —
+    /// so after a re-key `headerHash(contentKey)` names a directory that no longer
+    /// holds anything, the removal misses, and every one of that message's files
+    /// leaks until `pruneOrphanFiles()` reclaims it 60s later. Deriving the
+    /// directories from `substr(id, 1, hashHexLength)` of the rows actually being
+    /// deleted is correct in both worlds, and byte-identical at HEAD where no
+    /// re-key has happened (the only distinct prefix IS `headerHash(contentKey)`).
     @discardableResult
     static func deleteAllAssets(forContentKey contentKey: ContentKey) -> Int64 {
         guard let queue = manifestQueue() else { return 0 }
         let bytesReclaimed: Int64
+        var headerHashes: Set<String>
         do {
-            bytesReclaimed = try queue.write { db -> Int64 in
+            let snapshot = try queue.write { db -> (bytes: Int64, hashes: Set<String>) in
                 let total = try Int64.fetchOne(
                     db,
                     sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset WHERE headerId = ?",
                     arguments: [contentKey]
                 ) ?? 0
+                let hashes = try Set(String.fetchAll(
+                    db,
+                    sql: "SELECT DISTINCT substr(id, 1, ?) FROM bodyAsset WHERE headerId = ?",
+                    arguments: [hashHexLength, contentKey]
+                ))
                 try db.execute(
                     sql: "DELETE FROM bodyAsset WHERE headerId = ?",
                     arguments: [contentKey]
                 )
-                return total
+                return (total, hashes)
             }
+            bytesReclaimed = snapshot.bytes
+            headerHashes = snapshot.hashes
         } catch {
             print("[BodyAssetStore] deleteAllAssets manifest failed for \(contentKey): \(error)")
             return 0
         }
+        // No rows: fall back to the key's own hash so a manifest-less directory left
+        // by an interrupted write is still reclaimed — the pre-existing behaviour.
+        if headerHashes.isEmpty { headerHashes = [headerHash(contentKey)] }
         if let dir = storeDirectory() {
-            let folderURL = dir.appendingPathComponent(headerHash(contentKey), isDirectory: true)
-            try? FileManager.default.removeItem(at: folderURL)
+            for hash in headerHashes {
+                let folderURL = dir.appendingPathComponent(hash, isDirectory: true)
+                try? FileManager.default.removeItem(at: folderURL)
+            }
         }
         invalidateUsedBytesCache()
         return bytesReclaimed
+    }
+
+    /// Re-point every manifest row of `oldKey` at `newKey`, preserving the bytes on
+    /// disk. Returns the number of rows moved.
+    ///
+    /// The manifest's counterpart to `SearchIndex.rekeyHeaders`, and it exists for
+    /// the same reason: a message that merely MOVED must keep its cached inline
+    /// images and attachments rather than have them swept as orphans and re-fetched.
+    ///
+    /// Files are NOT moved — the row `id` (and therefore the `tabmail-asset://` URL
+    /// already embedded in cached HTML) keeps the OLD `headerHash`, which is exactly
+    /// why `deleteAllAssets(forContentKey:)` and `pruneOrphanFiles()` both derive
+    /// directories from `substr(id, …)` instead of re-hashing the key.
+    ///
+    /// Collision policy mirrors `rekeyHeaders`: if `newKey` already has rows, those
+    /// are authoritative and the old key's rows + files are deleted instead.
+    @discardableResult
+    static func rekeyContentKey(from oldKey: ContentKey, to newKey: ContentKey) -> Int {
+        guard oldKey != newKey, let queue = manifestQueue() else { return 0 }
+        let moved: Int
+        do {
+            moved = try queue.write { db -> Int in
+                let newExists = try Bool.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) > 0 FROM bodyAsset WHERE headerId = ?",
+                    arguments: [newKey]
+                ) ?? false
+                guard !newExists else { return -1 }
+                try db.execute(
+                    sql: "UPDATE bodyAsset SET headerId = ? WHERE headerId = ?",
+                    arguments: [newKey, oldKey]
+                )
+                return db.changesCount
+            }
+        } catch {
+            print("[BodyAssetStore] rekeyContentKey failed for \(oldKey): \(error)")
+            return 0
+        }
+        if moved < 0 {
+            _ = deleteAllAssets(forContentKey: oldKey)
+            return 0
+        }
+        return moved
     }
 
     /// Delete all manifest rows + files for a kind. Returns the set of content keys

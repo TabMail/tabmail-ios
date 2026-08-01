@@ -871,19 +871,48 @@ actor SearchIndex {
     struct ContentKeyPageEntry: Sendable {
         let rowid: Int64
         let contentKey: ContentKey
+        /// The account the row was indexed under, straight out of
+        /// `message_meta.accountId`. Carried BESIDE the key so the orphan sweep's
+        /// recovery leg never has to parse the key to find it — see
+        /// `MessageContentStore.tail(of:folderId:)` for why parsing is wrong.
+        /// Empty when no `message_meta` row exists for this rowid.
+        let accountId: String
+        /// `"<accountId>:<folderPath>"` from `message_meta.folderId`. Empty for rows
+        /// indexed before that column existed (`backfillFolderIdsIfNeeded` fills
+        /// those in).
+        let folderId: String
     }
 
-    /// Cursor page of (rowid, contentKey) entries from message_ids, ordered by
-    /// rowid — pagination for the one-time FTS→GRDB orphan prune. OFFSET-free
-    /// so cost stays O(page) regardless of position in a large index.
+    /// Cursor page of entries from message_ids, ordered by rowid — pagination for
+    /// the FTS→GRDB orphan prune. OFFSET-free so cost stays O(page) regardless of
+    /// position in a large index.
+    ///
+    /// LEFT JOINs `message_meta` for the `accountId` / `folderId` the row was
+    /// indexed under. Both are already-stored facts, so the sweep can resolve a
+    /// content key's account and provider message id without splitting the key on
+    /// `':'` — a `folderPath` may legitimately contain one.
     func contentKeyPage(afterRowid: Int64, limit: Int) throws -> [ContentKeyPageEntry] {
         guard let dbPool else { return [] }
         return try dbPool.read { db in
             try Row.fetchAll(
                 db,
-                sql: "SELECT rowid, headerId FROM message_ids WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                sql: """
+                    SELECT i.rowid AS rowid, i.headerId AS headerId,
+                           COALESCE(m.accountId, '') AS accountId,
+                           COALESCE(m.folderId, '') AS folderId
+                    FROM message_ids i
+                    LEFT JOIN message_meta m ON m.rowid = i.rowid
+                    WHERE i.rowid > ? ORDER BY i.rowid LIMIT ?
+                    """,
                 arguments: [afterRowid, limit]
-            ).map { ContentKeyPageEntry(rowid: $0["rowid"] as Int64, contentKey: $0["headerId"] as ContentKey) }
+            ).map {
+                ContentKeyPageEntry(
+                    rowid: $0["rowid"] as Int64,
+                    contentKey: $0["headerId"] as ContentKey,
+                    accountId: $0["accountId"] as String,
+                    folderId: $0["folderId"] as String
+                )
+            }
         }
     }
 

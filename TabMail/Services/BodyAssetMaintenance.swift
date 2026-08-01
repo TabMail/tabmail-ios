@@ -163,39 +163,102 @@ enum BodyAssetMaintenance {
     }
 
     /// Cross-DB + filesystem orphan sweep. Main-app only.
-    /// 1. Finds manifest rows whose headerId no longer exists in `messageHeader`.
-    ///    Deletes them via `BodyAssetStore.deleteAllAssets(forContentKey:)`.
-    ///
-    /// 🚨 ⚠ STAGE E1 — step 1 compares manifest CONTENT keys against `messageHeader.id`.
-    ///    Once the content key moves off the provider id, every UID-addressed
-    ///    message's assets look dead and this sweep DELETES the user's cached
-    ///    bodies and attachments wholesale. Same failure shape as
-    ///    `SyncEngine.pruneFTSOrphans`; both need a content-key → header-id
-    ///    resolution before E1 lands.
+    /// 1. Finds manifest rows nothing owns any more and deletes them via
+    ///    `BodyAssetStore.deleteAllAssets(forContentKey:)`.
     /// 2. Filesystem-only orphan files via `BodyAssetStore.pruneOrphanFiles()`.
+    ///
+    /// ## 🚨 THE MASS-DELETION HAZARD THIS SWEEP USED TO CARRY
+    ///
+    /// Step 1 used to be exactly `manifestKeys.subtracting(liveKeys)` where
+    /// `liveKeys` came straight out of `SELECT id FROM messageHeader` — i.e. it
+    /// decided that content was garbage by asking whether its key was still a
+    /// `messageHeader.id`. The instant those two stop being the same string
+    /// (Stage E1 moves a UID-addressed account's content key onto the RFC 822
+    /// Message-ID so a body survives a `UIDVALIDITY` renumber), **every** asset row
+    /// of **every** IMAP/iCloud message reads as an orphan and the user's cached
+    /// bodies and attachments are deleted wholesale.
+    ///
+    /// Three things now stand between a key-space divergence and a delete, and a key
+    /// must clear ALL of them:
+    ///
+    /// 1. it must not be a live `messageHeader.id` (the original probe, kept — it
+    ///    protects every live header even when its `Folder` row is missing);
+    /// 2. `MessageContentStore.protectedKeys` must not protect it — that covers
+    ///    "some header still MINTS this key" (the E1-proof question), "the folder is
+    ///    under a `UIDVALIDITY` quarantine", and "the ownership read threw";
+    /// 3. drift recovery must decline it. A key whose message merely MOVED is
+    ///    re-keyed in the manifest, preserving its cached inline images and
+    ///    attachments, instead of being deleted and re-downloaded — the same
+    ///    heal-don't-delete leg `SyncEngine.pruneFTSOrphans` has had for the FTS
+    ///    index, which this sweep never had.
+    ///
+    /// Deletion is therefore a strict NARROWING of the previous behaviour: nothing
+    /// that survived before can be deleted now.
     static func pruneOrphans() async {
         // 1. Cross-DB row sweep.
         let manifestKeys = BodyAssetStore.allManifestContentKeys()
         if !manifestKeys.isEmpty {
             do {
-                let liveKeys: Set<ContentKey> = try await AppDatabase.dbPool.read { db in
-                    let placeholders = Array(repeating: "?", count: manifestKeys.count).joined(separator: ",")
-                    let args = StatementArguments(Array(manifestKeys))
+                let keys = Array(manifestKeys)
+                // ONE read for both probes: the original "is it a header id" existence
+                // check, and the ownership/quarantine gate.
+                let (liveKeys, protected) = try await AppDatabase.dbPool.read {
+                    db -> (Set<ContentKey>, Set<ContentKey>) in
+                    let placeholders = Array(repeating: "?", count: keys.count).joined(separator: ",")
+                    let args = StatementArguments(keys)
+                    // ⚠ These ARE `messageHeader.id`s. They are typed `ContentKey` only
+                    // to compare against the manifest's key space, which is sound
+                    // BECAUSE the result is used to PROTECT, never to authorize a
+                    // delete: at E1 this probe simply stops matching, and every key it
+                    // stops matching is then judged by the ownership gate below.
                     let ids = try ContentKey.fetchAll(
                         db,
                         sql: "SELECT id FROM messageHeader WHERE id IN (\(placeholders))",
                         arguments: args
                     )
-                    return Set(ids)
+                    return (Set(ids), try MessageContentStore.protectedKeys(among: keys, db: db))
                 }
-                let dead = manifestKeys.subtracting(liveKeys)
+                let dead = manifestKeys.subtracting(liveKeys).subtracting(protected)
+                guard !dead.isEmpty else {
+                    BodyAssetStore.pruneOrphanFiles()
+                    return
+                }
+                // Drift recovery BEFORE deletion — resolved in one read for the whole
+                // dead set rather than one read per key.
+                let recoveries = try await AppDatabase.dbPool.read {
+                    db -> [ContentKey: ContentKey] in
+                    let scopes = try MessageContentStore.roster(db)
+                    var map: [ContentKey: ContentKey] = [:]
+                    for key in dead {
+                        guard let scope = MessageContentStore.resolveScope(for: key, in: scopes),
+                              let tail = scope.tail(of: key),
+                              let newKey = try MessageContentStore.recoverMovedContentKey(
+                                  orphan: key, accountId: scope.accountId,
+                                  providerMessageId: tail, db: db)
+                        else { continue }
+                        map[key] = newKey
+                    }
+                    return map
+                }
+                var recovered = 0
+                var deleted = 0
                 for contentKey in dead {
                     // Abandon if backgrounded mid-sweep (ADR-IOS-046) — non-WAL deletes
                     // held into suspension are the same 0xdead10cc risk as the reads.
                     guard DatabaseSuspension.isAppActive && !DatabaseSuspension.isSuspended else { break }
+                    if let newKey = recoveries[contentKey] {
+                        recovered += BodyAssetStore.rekeyContentKey(from: contentKey, to: newKey) > 0 ? 1 : 0
+                        continue
+                    }
                     _ = BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
+                    deleted += 1
+                }
+                if recovered > 0, DebugModeManager.isLoggingEnabled() {
+                    print("[BodyAssetMaintenance] cross-DB sweep: re-keyed \(recovered) moved messages' assets, deleted \(deleted) orphans")
                 }
             } catch {
+                // FAIL-SAFE: a failed read decides nothing. Deleting on an unanswered
+                // question is the one outcome with no path back for the user.
                 print("[BodyAssetMaintenance] cross-DB sweep failed: \(error)")
             }
         }
