@@ -58,6 +58,50 @@ public enum MessageIdentity {
     // There, `acct:INBOX:` is a prefix of `acct:INBOX:Sub:42` — a DIFFERENT folder's
     // header — so the prefix must be paired with the no-deeper-colon guard below.
 
+    /// Escape a value destined for the **`messageId` slot** of a `headerId` so the
+    /// tail after `headerIdPrefix` stays colon-free.
+    ///
+    /// ⚑ WHY THIS EXISTS — the invariant, not an instance. `headerId` is a
+    /// three-field concatenation with `:` as the separator, and the ONLY field that
+    /// may contain a `:` is `folderPath` (the prefix match consumes it verbatim, so
+    /// it is harmless there). A `:` in the `messageId` tail makes the row fail BOTH
+    /// folder-scoping guards below — `headerIdBelongsToFolder` and
+    /// `headerIdLikeNoDeeperColonSQLFragment` — which EXCLUDE rather than error, so
+    /// the row is SILENTLY skipped by every headerId-prefix purge (the FTS
+    /// `message_ids` sweep, the `chatIdMapping` sweep, the `BodyAssetStore` manifest
+    /// sweep) and its sidecar state orphans on a folder purge or a UIDVALIDITY reset.
+    ///
+    /// ⚠ THE FIX FOR THAT IS ALWAYS HERE, AT THE MINT — never a relaxation of the
+    /// guards. The guards are what makes folder scoping correct under a ':'-delimiter
+    /// IMAP server; widening them lets a nested sibling folder's rows into another
+    /// folder's purge, which is strictly worse than an orphan. Server-assigned message
+    /// ids (IMAP UIDs, Gmail/Graph ids) are colon-free by construction and need no
+    /// escaping; TabMail-MINTED synthetic ids built from an internal key that may
+    /// itself be a colon-joined composite (`AccountManager.queueDraftSave`'s
+    /// `draft-<Draft.id>`, where `Draft.id` is `reply:<accountId>:<stableId>`) MUST
+    /// pass the composite part through here first.
+    ///
+    /// Injective, and therefore collision-free: `%` is escaped before `:`, so the
+    /// escape alphabet is prefix-free and distinct inputs always yield distinct
+    /// outputs (a manufactured collision between two drafts would be a wrong-row
+    /// update/delete). Reversible in principle (`%3A` → `:`, `%25` → `%`), though
+    /// nothing in the codebase reverse-parses a synthetic placeholder id today —
+    /// consumers only test its `draft-`/`sent-` PREFIX (`isSyntheticPlaceholderId`).
+    /// Identity for any colon-free, percent-free input, so existing colon-free
+    /// callers are byte-for-byte unchanged and no stored id is re-keyed.
+    public static func colonSafeMessageIdComponent(_ value: String) -> String {
+        var out = ""
+        out.reserveCapacity(value.count)
+        for ch in value {
+            switch ch {
+            case "%": out += "%25"
+            case ":": out += "%3A"
+            default: out.append(ch)
+            }
+        }
+        return out
+    }
+
     /// The `headerId` prefix every message in `(accountId, folderPath)` starts with,
     /// RAW (no LIKE escaping). Use as the argument to
     /// `headerIdLikeNoDeeperColonSQLFragment` and for Swift-side `hasPrefix` scans.

@@ -1028,8 +1028,23 @@ extension AccountManager {
                     try db.execute(sql: "UPDATE draft SET rfc822MessageId = ? WHERE id = ?", arguments: [rfc822, draftId])
                 }
                 // Placeholder messageId — will be replaced by real IMAP UID via rfc822MessageId dedup in sync
-                let placeholderMsgId = "draft-\(draftId)"
-                let headerId = "\(accountId):\(folderPath):\(placeholderMsgId)"
+                //
+                // ⚑ `draftId` is a `Draft.id`, and for a reply/forward that is
+                // `Draft.draftKey`'s COLON-JOINED composite `reply:<accountId>:<stableId>`
+                // (`ComposeView` builds `stableKey = "\(accountId):\(stableId)"`; on IMAP
+                // `MessageHeader.stableId` is the rfc822 Message-ID). Interpolated raw, the
+                // resulting `headerId` carried FOUR colons where the key format allows
+                // exactly two — and every headerId-prefix purge silently SKIPS such a row
+                // (`MessageIdentity.headerIdBelongsToFolder` /
+                // `headerIdLikeNoDeeperColonSQLFragment` exclude a colon-bearing tail rather
+                // than erroring), orphaning the draft's FTS entry, chat-id mapping and body
+                // assets on a folder purge or a UIDVALIDITY reset. Escaped AT THE MINT — the
+                // guards themselves must never be relaxed; see
+                // `MessageIdentity.colonSafeMessageIdComponent`. Colon-free draft ids (a
+                // plain-`UUID` new compose) are unchanged byte-for-byte.
+                let placeholderMsgId = "draft-\(MessageIdentity.colonSafeMessageIdComponent(draftId))"
+                let headerId = MessageIdentity.headerId(
+                    accountId: accountId, folderPath: folderPath, messageId: placeholderMsgId)
                 let senderAccount = try Account.fetchOne(db, key: accountId)
                 let senderEmail = senderAccount?.emailAddress ?? accountId
                 let senderDisplayName = senderAccount?.displayName ?? senderEmail
@@ -1105,8 +1120,19 @@ extension AccountManager {
                 // protect optimistic headers from deletion while the push is pending.
                 // This is critical for offline support — the drain can't run until
                 // back online, but sync might try to clean up the placeholder.
-                let opPlaceholder = "draft-\(draftId)"
-                var opMsgIds = [draftId, opPlaceholder]
+                //
+                // REUSES the `placeholderMsgId` local rather than re-deriving the string:
+                // pendingAllIds protection is an EXACT match against the header's
+                // `messageId`, so any drift between the two mints silently disarms it.
+                var opMsgIds = [draftId, placeholderMsgId]
+                // Transition safety for headers minted BEFORE the colon escaping above: an
+                // existing optimistic row still carries the raw form, and the stale sweep
+                // matches this set against that row's `messageId`. Protection is
+                // fail-SAFE in the over-inclusive direction (an extra entry keeps a row
+                // alive; a missing one deletes a draft the user has not pushed yet), and
+                // no server-assigned id can ever equal a `draft-`-prefixed string.
+                let legacyRawPlaceholder = "draft-\(draftId)"
+                if legacyRawPlaceholder != placeholderMsgId { opMsgIds.append(legacyRawPlaceholder) }
                 // Also include rfc822MessageId for rfc822-based protection matching
                 // (rfc822 is guaranteed non-nil here — either from draft or freshly generated)
                 if let rfc822Id = rfc822 {
