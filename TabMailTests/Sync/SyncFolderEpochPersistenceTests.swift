@@ -364,7 +364,24 @@ struct SyncFullSyncFolderEpochTests {
     /// (`SyncEngineFullSync.swift:1045-1070` at tag `e28dd4edb`): re-read the
     /// folder row INSIDE the merge transaction and abandon the entire pass —
     /// before any deletion or upsert — when the epoch captured at fetch time
-    /// disagrees with the stored one. Porting that is its own item.
+    /// disagrees with the stored one.
+    ///
+    /// ✅ **T4.S6 PORTED THAT GUARD, and this fixture STILL records its known
+    /// issue — deliberately, not by oversight.** The ported guard is BOTH-KNOWN:
+    /// it needs a stored epoch AND an epoch observed by the fetch that produced
+    /// `messages`. This fixture supplies the turnover only through
+    /// `fetchFoldersResult`'s `FolderInfo.uidValidity`; it never calls
+    /// `setMockedBoundFetchEpoch`, so the fetch reports NO epoch and the guard
+    /// fails OPEN — the same direction every other UIDVALIDITY guard in the tree
+    /// fails, because refusing on an unknown would brick non-UIDPLUS and
+    /// first-sync folders. A real IMAP fetch SELECTs the mailbox and does report
+    /// one (`UidValidityResetReactionTests`'
+    /// `mergePassAbandonsAndTriggersOnTurnover` is the guarded case, and
+    /// `UidValidityTurnoverDeletionGuardTests` drives it through a real
+    /// `FakeIMAPServer`). What stays genuinely OPEN here is the narrower
+    /// statement: a turnover visible ONLY in the folder listing, with no epoch on
+    /// the fetch itself, is still swept. Closing that needs a folder-listing
+    /// trigger, which neither this port nor the reference has.
     ///
     /// ⚠ An earlier draft of T1.2 tried to make a turnover BLOCK the CONDSTORE
     /// fetch-skip, on the reasoning that "more fetching is the conservative

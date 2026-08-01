@@ -294,6 +294,14 @@ extension EmailProvider {
     /// write nothing for a nil observation. Losing this override therefore stops
     /// a provider contributing an epoch; it can never make one up.
     ///
+    /// UPDATE (T4.S6): `runSyncMessages` now has a SECOND consumer of this value —
+    /// the in-transaction epoch comparison that abandons the merge pass and fires
+    /// the purge-and-resync reaction. Its direction agrees: the guard requires BOTH
+    /// sides known, so a nil observation fails OPEN (ordinary pass, no reaction).
+    /// Losing the override therefore still only stops a provider contributing —
+    /// it cannot manufacture a turnover, and it cannot manufacture agreement either,
+    /// because agreement needs a non-nil value on both sides.
+    ///
     /// ⚠ **RETRACTION (round 12, NB1) — the census this comment used to give was
     /// already false when it was written, and the SAME COMMIT falsified it.** It
     /// listed eleven conformers, asserted "exactly two overrides" of

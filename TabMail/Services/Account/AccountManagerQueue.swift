@@ -213,6 +213,28 @@ extension AccountManager {
                         if fetched.status == PendingStatus.inFlight.rawValue {
                             return nil
                         }
+                        // T4.S6 — PARK (never drop) while this op's source folder is
+                        // mid UIDVALIDITY reset. The reaction has purged, or is about
+                        // to purge, every header in that folder, and the UIDs this op
+                        // addresses belong to a numbering the server has discarded:
+                        // executing it now would mutate whichever message the new
+                        // epoch put at that address (C3). The row stays `queued` with
+                        // its retry counters untouched, so nothing is lost and nothing
+                        // ages toward `failed` — Law 5. TRANSIENT: the flag is cleared
+                        // by the reaction's step-5 stamp, and full sync re-drives an
+                        // interrupted reaction on every cycle. The same transaction
+                        // that clears the flag also removes the address-only ops that
+                        // could never be re-resolved, so this park can never hand a
+                        // stale bare UID to the drain.
+                        let sourceFolderId = MessageIdentity.folderId(
+                            accountId: fetched.accountId, folderPath: fetched.folderPath)
+                        if let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId),
+                           sourceFolder.uidValidityResetPendingAt != nil {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Queue] Op \(op.id.prefix(8)) (\(fetched.type.rawValue)) parked — folder \(fetched.folderPath) is mid UIDVALIDITY reset")
+                            }
+                            return nil
+                        }
                         fetched.status = PendingStatus.inFlight.rawValue
                         try fetched.save(db)
                         return fetched

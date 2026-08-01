@@ -230,6 +230,22 @@ extension AccountManager {
             }
             return true
         }
+        // T4.S6 — a folder mid UIDVALIDITY reset is the SAME condition this guard
+        // already refuses, reached from the other side: `lastKnownUidValidity` still
+        // holds an epoch, but it is the one the server has ABANDONED, so a UID
+        // resolved against it addresses whichever message the new numbering put
+        // there. Refusing here is what makes the drain-side park meaningful — a
+        // gesture admitted between the reaction's step 1 (arm) and step 5 (stamp)
+        // would be dropped by the stamp transaction's address-only sweep, i.e. it
+        // would silently vanish; refusing it instead keeps the failure visible at
+        // the point of action. TRANSIENT: bounded by the reaction, which full sync
+        // re-drives on every cycle.
+        if folder.uidValidityResetPendingAt != nil {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] T4.S6 refusing new gesture — folder '\(folderPath)' is mid UIDVALIDITY reset (account \(accountId.prefix(8)))")
+            }
+            return true
+        }
         guard folder.lastKnownUidValidity == nil else { return false }
         if DebugModeManager.isLoggingEnabled() {
             print("[Queue] T1.3 refusing new gesture — folder '\(folderPath)' has no known UIDVALIDITY epoch yet (account \(accountId.prefix(8)))")

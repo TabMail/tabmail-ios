@@ -1944,5 +1944,20 @@ final class AppDatabase: Sendable {
                 t.add(column: "uidResolutionRetryCount", .integer).notNull().defaults(to: 0)
             }
         }
+
+        migrator.registerMigration("v68_addFolderUidValidityResetPending") { db in
+            // T4.S6 — the UIDVALIDITY purge-and-resync reaction's own quarantine
+            // state. Non-nil ⇒ `AccountManager.runUidValidityResetReaction` armed
+            // this folder and has not yet stamped the fresh epoch. Nullable with no
+            // default: every existing folder starts un-quarantined, which is the
+            // correct pre-migration state (no reaction has ever run).
+            //
+            // This column is what makes every abort leg of the reaction RETRYABLE
+            // rather than fire-once: the flag stays set on abort, and full sync's
+            // per-folder loop re-drives on it. See `Folder.uidValidityResetPendingAt`.
+            try db.alter(table: "folder") { t in
+                t.add(column: "uidValidityResetPendingAt", .datetime)
+            }
+        }
     }
 }

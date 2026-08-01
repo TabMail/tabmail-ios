@@ -186,10 +186,18 @@ extension SyncEngine {
             return 0
         case .refuseEpochMismatch:
             // The mailbox was re-created since these rows were written. There is
-            // no correct repair to run — only the purge-and-resync reaction v3
-            // has not ported (T4.S6) — so the folder stays refused until it
-            // exists. PERMANENT until then, and deliberately so: healing here
-            // means mixing two numberings under one stamp (C3).
+            // no correct repair to run HERE — only the purge-and-resync reaction —
+            // so the folder stays refused. Healing here means mixing two numberings
+            // under one stamp (C3).
+            //
+            // UPDATE (T4.S6): the reaction now exists
+            // (`AccountManager.runUidValidityResetReaction`), which makes this
+            // refusal TRANSIENT rather than permanent — full sync's own
+            // in-transaction epoch guard fires the reaction for the same folder, and
+            // its per-folder loop re-drives an interrupted one. Self-heal
+            // deliberately does NOT fire it itself: it runs on a connection it is
+            // about to keep using, and the reaction disconnects the provider before
+            // stamping. Refuse here, let the sync path react.
             if DebugModeManager.isLoggingEnabled() {
                 print("[SelfHeal] \(folder.name) skipped: rows belong to UIDVALIDITY \(String(describing: storedEpoch)), server is at \(String(describing: healEpoch))")
             }

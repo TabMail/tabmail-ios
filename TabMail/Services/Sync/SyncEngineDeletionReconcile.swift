@@ -45,6 +45,23 @@ struct DeletionReconcileOutcome: Sendable, Equatable {
     var aborted = false
     /// Debug-readable abort cause (nil when not aborted).
     var abortReason: String?
+    /// T4.S6 — set when the walk aborted specifically because a chunk's SELECT
+    /// reported a UIDVALIDITY that DISAGREES with the epoch this walk was judging
+    /// against. Typed rather than parsed back out of `abortReason`, so the caller's
+    /// reaction trigger can never drift from the abort that produced it. `nil` for
+    /// every other abort cause, including "uidValidity unreported" — an unknown is
+    /// not a turnover and must not purge a folder.
+    var uidValidityMismatch: (expected: UInt32, observed: UInt32)?
+
+    static func == (lhs: DeletionReconcileOutcome, rhs: DeletionReconcileOutcome) -> Bool {
+        lhs.deletedCount == rhs.deletedCount &&
+        lhs.failedChunks == rhs.failedChunks &&
+        lhs.searchedChunks == rhs.searchedChunks &&
+        lhs.aborted == rhs.aborted &&
+        lhs.abortReason == rhs.abortReason &&
+        lhs.uidValidityMismatch?.expected == rhs.uidValidityMismatch?.expected &&
+        lhs.uidValidityMismatch?.observed == rhs.uidValidityMismatch?.observed
+    }
 }
 
 extension SyncEngine {
@@ -150,6 +167,12 @@ extension SyncEngine {
                 guard result.uidValidity == expected else {
                     outcome.aborted = true
                     outcome.abortReason = "uidValidity changed (\(expected) → \(result.uidValidity))"
+                    // T4.S6: the walk's own abort is also the strongest evidence of
+                    // a turnover this engine ever produces — the SELECT that served
+                    // this chunk reported a different epoch than the one the local
+                    // UIDs belong to. Recorded for the caller to fire the reaction;
+                    // this pure function stays free of side effects.
+                    outcome.uidValidityMismatch = (expected: expected, observed: result.uidValidity)
                     break
                 }
             } else {
@@ -418,6 +441,19 @@ extension SyncEngine {
         }
         if outcome.deletedCount > 0 || outcome.aborted {
             BackgroundSyncLogger.log("reconcileWalk: \(folder.name) deleted=\(outcome.deletedCount) failed=\(outcome.failedChunks) aborted=\(outcome.aborted)")
+        }
+        // T4.S6 — the walk REFUSED to delete because the epoch moved under it. That
+        // refusal is the "stop" half; the reaction is the "recover" half. Without
+        // this the folder stays permanently un-reconciled: the count mismatch that
+        // triggered the walk never resolves, so the walk re-runs and re-aborts on
+        // every cycle. Fired AFTER the walk has fully returned — the reaction
+        // disconnects the provider, and doing that from inside the walk's own chunk
+        // loop would tear down the connection it is still using.
+        if let mismatch = outcome.uidValidityMismatch {
+            AccountManager.shared.fireUidValidityChangeHandler(
+                accountId: folder.accountId, folderPath: folderPath,
+                storedValue: mismatch.expected, observedValue: mismatch.observed
+            )
         }
     }
 

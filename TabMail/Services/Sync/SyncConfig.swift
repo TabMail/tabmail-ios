@@ -661,4 +661,16 @@ enum SyncConfig {
     /// per-ID fan-out and rely on the single `.inboxDataDidChange` to drive a
     /// list refresh.
     static let sentDiscoverNotifyPerIdLimit: Int = 50
+
+    // MARK: - UIDVALIDITY purge-and-resync reaction (T4.S6)
+
+    /// Iteration cap on the reaction's step-2.5 write barrier. UNLIKE
+    /// `AccountManager.awaitWriteQueueDrainOrTimeout` (which races a wall clock and
+    /// is ALLOWED to resume with work still queued), this barrier is bounded by an
+    /// ITERATION count and the reaction ABORTS on exhaustion — it never "proceeds
+    /// anyway". Purging a folder while a queued local write is still in flight
+    /// against it would let that write land on rows the purge has already removed.
+    static let uidValidityResetBarrierMaxAttempts = 5
+    /// Delay between barrier attempts (seconds).
+    static let uidValidityResetBarrierPollSeconds: TimeInterval = 0.05
 }

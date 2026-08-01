@@ -5,13 +5,29 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
-/// **THE INVARIANT: a UIDVALIDITY turnover deletes no local mail.**
+/// **THE INVARIANT: no SYNC DELETER destroys local mail on a UIDVALIDITY
+/// turnover.**
 ///
 /// Every assertion here is on the SYSTEM PROPERTY — pre-turnover messages still
 /// exist — never on the mechanism that delivers it ("the column was not
 /// written"). A mechanism test inherits the spec's error; this one cannot.
+///
+/// ⚠ **T4.S6 SHARPENED THE INVARIANT, and did not weaken it.** The reaction that
+/// landed with it (`AccountManager.runUidValidityResetReaction`) DELIBERATELY
+/// deletes the old epoch's rows — that is the *recover* half this file's own
+/// closing note asked for, and it deletes only after quarantining the folder,
+/// parking its durable ops and committing to a resync. So the invariant is not
+/// "nothing ever deletes"; it is "**nothing deletes as a SIDE EFFECT of merging or
+/// reconciling** — deletion happens only through the reaction, which is answerable
+/// for replacing what it removed". These two blocker tests pin the first half: the
+/// deletion-reconcile walk and the merge pass must not destroy mail on a turnover.
+/// They stub the reaction out (each installs a capturing
+/// `setUidValidityChangeHandlerForTesting`) precisely so that the
+/// deleters, not the recoverer, are what is under test. The reaction has its own
+/// suite, `UidValidityResetReactionTests`.
 ///
 /// ## Why the existing reconcile tests could not see this
 ///
@@ -88,18 +104,15 @@ import GRDB
 /// sweep out, a green run here proves only that *the reconcile walk* deletes
 /// nothing on a turnover. The sweep is the second, independent deleter.
 ///
-/// 🚨 **THE SWEEP IS NOT CLOSED. It is an OPEN, pre-existing data-loss hazard.**
-/// `runSyncMessages` deletes stale rows with no UIDVALIDITY guard on HEAD, and this
-/// item deliberately left that path byte-equivalent to HEAD rather than widening it
-/// — so the hazard is an unclosed *residual*, not a regression introduced here. It
-/// is pinned executably, NOT fixed, by
+/// 🚨 **THE SWEEP WAS NOT CLOSED WHEN THIS WAS WRITTEN.** `runSyncMessages` deleted
+/// stale rows with no UIDVALIDITY guard on HEAD, and that item deliberately left the
+/// path byte-equivalent rather than widening it — an unclosed *residual*, not a
+/// regression introduced there. It was pinned executably, NOT fixed, by
 /// `SyncFullSyncFolderEpochTests.turnoverFetchIsAnUnguardedDeleter`
-/// (`withKnownIssue` — it will flip to a hard failure the day the guard lands),
-/// with the paired control `sameEpochStillLetsTheStaleSweepDelete` proving a future
-/// guard must not become a global off-switch. Two deleters, two suites; neither
-/// alone certifies the invariant, and **today neither certifies the sweep at all.**
+/// (`withKnownIssue`), with the paired control `sameEpochStillLetsTheStaleSweepDelete`
+/// proving a future guard must not become a global off-switch.
 ///
-/// Closing it means porting `v2final`'s §5.5 universal in-txn merge guard
+/// Closing it meant porting `v2final`'s §5.5 universal in-txn merge guard
 /// (`git show v2final:TabMail/Services/Sync/SyncEngineFullSync.swift`, ~1046-1072,
 /// `uidValidityWriteAllowed`) into `runSyncMessages` — but **that guard must not
 /// ship alone.** Ported by itself under bootstrap-only semantics it correctly
@@ -107,6 +120,15 @@ import GRDB
 /// folder never recovers: a deletion bug becomes a permanent-stall bug. It is the
 /// *stop* half of a stop-and-recover pair whose *recover* half is the D5
 /// purge-and-resync reaction (plan item T4.S6). Land them together.
+///
+/// ✅ **T4.S6 landed them together.** `runSyncMessages` now re-reads the folder row
+/// inside its own write transaction and, when a KNOWN stored epoch disagrees with the
+/// epoch the SELECT that served this fetch reported, abandons the whole pass before
+/// any deletion or upsert and raises the turnover on the trigger channel. Both sides
+/// nil-known is required, so a non-UIDPLUS server or a first sync still fails OPEN —
+/// which is why `turnoverFetchIsAnUnguardedDeleter` (whose mock reports no bound
+/// fetch epoch) legitimately still records its known issue: it pins the
+/// UNKNOWN-epoch arm, which the guard deliberately does not refuse.
 ///
 /// `.serialized, .processGlobalState` — replaces `AppDatabase.shared` and binds a
 /// listening socket.
@@ -121,6 +143,18 @@ struct UidValidityTurnoverDeletionGuardTests {
     private static let firstLocalUID = 1000
     private static let serverMessageCount = 60
     private static let firstServerUID = 5000
+
+    /// A turnover as the PRODUCTION trigger channel reports it
+    /// (`AccountManager.fireUidValidityChangeHandler`). Capturing it is what keeps
+    /// the two blocker tests non-vacuous now that T4.S6 stops the pass instead of
+    /// letting it merge — see the preconditions in each test.
+    struct RaisedTurnover: Sendable, Equatable {
+        let accountId: String
+        let folderPath: String
+        let stored: UInt32
+        let observed: UInt32
+    }
+
 
     private static func rfc822(messageId: String) -> String {
         """
@@ -233,6 +267,19 @@ struct UidValidityTurnoverDeletionGuardTests {
 
         let accountId = "turnover-delta"
         let folderId = "\(accountId):INBOX"
+        // Swap the production change handler for a capturing one. This also keeps the
+        // real reaction from being spawned mid-test: this test is about what the
+        // DELETION PATHS do on a turnover, and the reaction is a separate subject
+        // with its own suite (`UidValidityResetReactionTests`). Inlined rather than
+        // factored into a helper because `Mutex` is `~Copyable` and cannot be passed
+        // as an ordinary parameter.
+        let observed = Mutex<[RaisedTurnover]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { acct, path, stored, live in
+            observed.withLock {
+                $0.append(RaisedTurnover(accountId: acct, folderPath: path, stored: stored, observed: live))
+            }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
         // The folder as the last pre-turnover sync left it: its rows, its UIDNEXT,
         // and the epoch those rows belong to.
         let account = try Self.seed(
@@ -250,12 +297,29 @@ struct UidValidityTurnoverDeletionGuardTests {
         try? await provider.disconnect()
 
         #expect(outcome.succeeded == true)
-        #expect(try Self.postTurnoverCount(pool: pool, folderId: folderId) > 0,
-                """
-                precondition: the sync must have really run end-to-end (fetched the new \
-                epoch's messages), otherwise the reconcile trigger below never fires and \
-                this test proves nothing
-                """)
+        // NON-VACUITY. This used to assert that the pass had fetched the new epoch's
+        // messages. T4.S6 made that unsatisfiable BY DESIGN: delta sync now compares
+        // the STATUS epoch against the stored one and skips the folder outright on a
+        // proven turnover, so nothing is merged and nothing is fetched. What still
+        // proves the turnover reached production code is the trigger itself — the
+        // same channel the reaction listens on — captured here with the exact epochs
+        // the fixture set up. If the sync path stopped observing the turnover, this
+        // is empty and the survivor assertion below can no longer pass vacuously.
+        //
+        // The COUNT is deliberately not pinned. A sync pass may pass more than one
+        // independent guard that observes the same turnover (the full-sync sibling
+        // below passes two), and the reaction's single-flight admission is what
+        // collapses them — "exactly once" would be an assertion about how many
+        // guards happen to exist today, not about the invariant.
+        let events = observed.withLock { $0 }
+        #expect(events.isEmpty == false,
+                "precondition: the turnover must have been observed and raised")
+        #expect(events.allSatisfy {
+                    $0.accountId == accountId && $0.folderPath == "INBOX"
+                        && $0.stored == UInt32(Self.oldEpoch)
+                        && $0.observed == UInt32(Self.newEpoch)
+                },
+                "precondition: every raised turnover must be THIS folder's, old → new")
 
         #expect(try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) == Self.localHeaderCount,
                 """
@@ -277,6 +341,19 @@ struct UidValidityTurnoverDeletionGuardTests {
 
         let accountId = "turnover-fullsync"
         let folderId = "\(accountId):INBOX"
+        // Swap the production change handler for a capturing one. This also keeps the
+        // real reaction from being spawned mid-test: this test is about what the
+        // DELETION PATHS do on a turnover, and the reaction is a separate subject
+        // with its own suite (`UidValidityResetReactionTests`). Inlined rather than
+        // factored into a helper because `Mutex` is `~Copyable` and cannot be passed
+        // as an ordinary parameter.
+        let observed = Mutex<[RaisedTurnover]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { acct, path, stored, live in
+            observed.withLock {
+                $0.append(RaisedTurnover(accountId: acct, folderPath: path, stored: stored, observed: live))
+            }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
         let account = try Self.seed(
             pool: pool, accountId: accountId, folderPath: "INBOX", role: .inbox,
             storedEpoch: Self.oldEpoch, totalCount: Self.localHeaderCount,
@@ -291,8 +368,26 @@ struct UidValidityTurnoverDeletionGuardTests {
         try await engine.fullSync(account: account, provider: provider)
         try? await provider.disconnect()
 
-        #expect(try Self.postTurnoverCount(pool: pool, folderId: folderId) > 0,
-                "precondition: the full sync must have really fetched the new epoch's messages")
+        // NON-VACUITY — see the delta case. The full-sync merge pass now ABANDONS
+        // itself in-transaction on a proven turnover, so "it fetched the new epoch's
+        // messages" is no longer a reachable precondition. The walk still runs (it
+        // logs `aborted=true`), and the trigger below is the evidence the turnover
+        // was seen at all.
+        //
+        // This path raises the SAME turnover from two independent guards — the merge
+        // pass abandoning in-transaction, and the deletion-reconcile walk aborting —
+        // which is why the count is not pinned. Both are real observations of a real
+        // turnover; the reaction's single-flight admission (`uidValidityReactionInFlight`
+        // + the recheck flag) is what makes raising it twice harmless.
+        let events = observed.withLock { $0 }
+        #expect(events.isEmpty == false,
+                "precondition: the turnover must have been observed and raised")
+        #expect(events.allSatisfy {
+                    $0.accountId == accountId && $0.folderPath == "INBOX"
+                        && $0.stored == UInt32(Self.oldEpoch)
+                        && $0.observed == UInt32(Self.newEpoch)
+                },
+                "precondition: every raised turnover must be THIS folder's, old → new")
 
         #expect(try Self.survivingPreTurnoverCount(pool: pool, folderId: folderId) == Self.localHeaderCount,
                 """

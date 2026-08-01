@@ -823,7 +823,8 @@ extension SyncEngine {
     /// ⚠ It is NOT the only writer of `Folder.lastKnownUidValidity`, and treating
     /// it as one would be dangerous — this column's safety property depends on
     /// knowing every writer (see the column's own doc comment on `Folder`). The
-    /// complete set is THREE:
+    /// complete set of BOOTSTRAP writers is THREE (a fourth writer, which ADVANCES
+    /// rather than bootstraps, is enumerated after them):
     ///  1. this function — `runSyncMessages` and delta sync's changed branch call it
     ///     directly, delta sync's unchanged branch through the async wrapper of the
     ///     same name below, and `runBackfill`'s IMAP branch (in the FILE
@@ -841,8 +842,22 @@ extension SyncEngine {
     ///  3. `persistFolderUidValidity` in `SyncEngineDeletionReconcile.swift` — the
     ///     walk's own bootstrap, which carries an identical `lastKnownUidValidity
     ///     IS NULL` predicate for the identical reason.
-    /// Every one of the three is bootstrap-only and 0-filtered. A fourth writer
-    /// must be too, and must be added to this list.
+    /// Every one of the three is bootstrap-only and 0-filtered. Another bootstrap
+    /// writer must be too, and must be added to this list.
+    ///
+    /// ⚠ **FOURTH WRITER — the only one that OVERWRITES a non-nil value (T4.S6):**
+    /// `AccountManager.uidValidityResetStampFreshEpoch`, step 5 of the
+    /// purge-and-resync reaction (`AccountManagerUidValidityReset.swift`). It does
+    /// NOT carry the `lastKnownUidValidity IS NULL` predicate, on purpose — its job
+    /// is precisely to advance the column across a turnover. What makes that safe is
+    /// that it discharges the precondition the predicate stands in for: step 3 has
+    /// already DELETED every `messageHeader` row of the folder in its own committed
+    /// transaction, so there are no local UIDs left for the new stamp to
+    /// misdescribe, and the walk's abort guard has nothing to be disarmed over. It
+    /// is reachable only from inside a reaction that armed
+    /// `Folder.uidValidityResetPendingAt` (it re-reads and requires that flag in its
+    /// own write), and it clears the flag in the SAME statement batch. A fifth
+    /// writer that advanced without both halves would reintroduce ADR-IOS-051.
     ///
     /// ⚠ One path CLEARS the column and writes no value:
     /// `SyncEngine.resetEmptyFolderCrawlEpoch` (in the FILE
@@ -913,7 +928,32 @@ extension SyncEngine {
 
         var anyChanged = false
         for folder in syncableFolders {
+            // T4.S6 re-drive: a folder left quarantined by an interrupted reaction
+            // branches into the reaction rather than being delta-synced. Same
+            // ownership rule as full sync's per-folder loop.
+            if folder.uidValidityResetPendingAt != nil {
+                await AccountManager.shared.runUidValidityResetReaction(
+                    accountId: account.id, folderPath: folder.path
+                )
+                continue
+            }
             let status = try await provider.folderStatus(path: folder.path)
+
+            // T4.S6 free trigger: STATUS reports UIDVALIDITY at no extra cost on a
+            // UIDPLUS server. Both sides must be KNOWN — a server that omits the
+            // attribute yields no signal (nil), and a folder whose epoch has never
+            // been bootstrapped has nothing to disagree with. This is a TRIGGER, not
+            // a guard: it decides nothing about this folder's pass, and the reaction
+            // it fires re-reads every value fresh rather than trusting these.
+            if let observedStatusEpoch = Self.knownUidValidity(status.uidValidity).flatMap({ UInt32(exactly: $0) }),
+               let storedEpoch = Self.knownUidValidity(folder.lastKnownUidValidity).flatMap({ UInt32(exactly: $0) }),
+               observedStatusEpoch != storedEpoch {
+                AccountManager.shared.fireUidValidityChangeHandler(
+                    accountId: account.id, folderPath: folder.path,
+                    storedValue: storedEpoch, observedValue: observedStatusEpoch
+                )
+                continue
+            }
 
             let uidNextChanged = folder.lastKnownUidNext != nil && status.uidNext != folder.lastKnownUidNext
             let countChanged = status.messageCount != folder.totalCount

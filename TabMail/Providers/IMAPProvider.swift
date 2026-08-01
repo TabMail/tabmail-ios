@@ -1385,10 +1385,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// mirror, and it is sound because its consumer is the §5.5 in-transaction
     /// COMPARISON that aborts the whole merge pass on disagreement (a race can
     /// only manufacture a false mismatch, never a false match — its own comment
-    /// says so). v3 has not ported that guard (T4.S6), so the same value here
-    /// feeds a WRITE, where the identical race is fail-DANGEROUS. Same mechanism,
-    /// inverted consumer direction; copying it verbatim across that inversion is
-    /// what made this a defect.
+    /// says so). v3 had not ported that guard when this was written, so the same
+    /// value here fed only a WRITE, where the identical race is fail-DANGEROUS. Same
+    /// mechanism, inverted consumer direction; copying it verbatim across that
+    /// inversion is what made this a defect.
+    ///
+    /// T4.S6 has since added the in-transaction comparison to `runSyncMessages`, so
+    /// v3 now has BOTH consumers — and the pairing matters MORE, not less. The
+    /// comparison's fail-safe direction only holds if the epoch it compares is the
+    /// one bound to THIS fetch: a mirror read racing another connection's SELECT
+    /// would manufacture agreement (a false MATCH), which is the direction that
+    /// admits a merge across a turnover. Keep returning the epoch with the messages.
     ///
     /// `observedEpoch` is nil when the SELECT reported no UIDVALIDITY — `0` is
     /// SwiftMail's default for "not reported", never a real epoch (RFC 3501

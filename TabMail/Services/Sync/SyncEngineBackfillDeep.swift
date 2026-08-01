@@ -320,10 +320,14 @@ extension SyncEngine {
     /// `uidValidityWriteAllowed(resetPending:observedEpoch:storedEpoch:)` and the
     /// same "a refused range is FAILED, never confirmed" contract on the caller.
     /// TWO deviations: (1) the reference's `uidValidityResetPendingAt` term does
-    /// not transfer (v3 has no such column — T4.S6); (2) the reference passes a
+    /// not transfer — v3 had no such column when this was written, and T4.S6, which
+    /// added it, deliberately left this guard deciding on the premise alone;
+    /// (2) the reference passes a
     /// bare `UInt32?` and lets `nil` mean "no guard", which it can afford BECAUSE
     /// of that flag — v3 cannot, since the unstamped folder is exactly the one
-    /// whose premise is nil, hence the wrapper type.
+    /// whose premise is nil, hence the wrapper type. Deviation (2) still stands
+    /// after T4.S6: the wrapper type is what carries "premise absent" distinctly
+    /// from "premise nil", which no quarantine flag supplies.
     ///
     /// The premised entry point. A caller that holds a premise MUST reach the
     /// insert through here, and the `BackfillBatchOutcome` it gets back cannot be

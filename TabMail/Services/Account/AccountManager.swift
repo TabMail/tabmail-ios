@@ -227,6 +227,102 @@ actor AccountManager {
 
     var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
+    // MARK: - UIDVALIDITY reset reaction — trigger channel + single-flight (T4.S6)
+
+    /// The purge-and-resync reaction is wired into this closure. `Mutex`-backed
+    /// nonisolated seam (Resilience Rule 5): several detection sites are SYNCHRONOUS
+    /// GRDB write closures, which cannot `await`, so firing must not require one.
+    /// Test-injectable via `setUidValidityChangeHandlerForTesting`.
+    ///
+    /// PORTED from `v2final:TabMail/Services/Account/AccountManager.swift`
+    /// (`uidValidityChangeHandlerBox`). Its companion there,
+    /// `uidValidityLedgerBox` / `recordObservedUidValidity`, does NOT transfer:
+    /// that mirror exists so a SELECT-time compare can read the stored epoch
+    /// without awaiting a DB read, and every v3 detection site already holds a
+    /// `Database` (or a freshly-read `Folder`) and reads `lastKnownUidValidity`
+    /// directly. A second, eventually-consistent copy of a value we already have
+    /// in hand would only add a way to disagree with it.
+    private nonisolated let uidValidityChangeHandlerBox = Mutex<
+        @Sendable (_ accountId: String, _ folderPath: String, _ storedValue: UInt32, _ observedValue: UInt32) -> Void
+    >(AccountManager.defaultUidValidityChangeHandler)
+
+    /// The real entry point: spawns `runUidValidityResetReaction` on an unstructured
+    /// Task (this closure is `nonisolated`/synchronous — it can be invoked from
+    /// inside a GRDB write closure, which cannot `await`).
+    private static func defaultUidValidityChangeHandler(
+        accountId: String, folderPath: String, storedValue: UInt32, observedValue: UInt32
+    ) {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[UIDValidity] CHANGED accountId=\(accountId.prefix(8)) folder=\(folderPath) stored=\(storedValue) observed=\(observedValue) — triggering reset reaction")
+        }
+        Task {
+            await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: folderPath)
+        }
+    }
+
+    /// Test seam: override the change-reaction closure. Callers restore in `defer`
+    /// via `resetUidValidityChangeHandlerForTesting()`.
+    nonisolated func setUidValidityChangeHandlerForTesting(
+        _ handler: @escaping @Sendable (
+            _ accountId: String, _ folderPath: String, _ storedValue: UInt32, _ observedValue: UInt32
+        ) -> Void
+    ) {
+        uidValidityChangeHandlerBox.withLock { $0 = handler }
+    }
+
+    /// Restore the production handler (keeps the default `private`).
+    nonisolated func resetUidValidityChangeHandlerForTesting() {
+        uidValidityChangeHandlerBox.withLock { $0 = AccountManager.defaultUidValidityChangeHandler }
+    }
+
+    /// Fire the change-reaction closure. Callable from a synchronous context (a GRDB
+    /// write closure) without `await`.
+    nonisolated func fireUidValidityChangeHandler(
+        accountId: String, folderPath: String, storedValue: UInt32, observedValue: UInt32
+    ) {
+        uidValidityChangeHandlerBox.withLock { $0 }(accountId, folderPath, storedValue, observedValue)
+    }
+
+    /// In-flight set for `runUidValidityResetReaction`, keyed by
+    /// `MessageIdentity.folderId(accountId:folderPath:)`. A plain actor-isolated
+    /// `Set` (not `Mutex`-boxed) is correct and load-bearing: the membership check
+    /// and the insert happen synchronously inside this actor's isolation with no
+    /// `await` between them, so reentrancy cannot race the check-and-insert. The
+    /// durable `Folder.uidValidityResetPendingAt` flag is RE-DRIVE state, not
+    /// admission arbitration — THIS set is the admission gate.
+    var uidValidityReactionInFlight: Set<String> = []
+
+    /// A trigger that arrived WHILE its folder's reaction was already running is
+    /// recorded here instead of dropped, and consumed at release (which re-spawns a
+    /// fresh attempt whose own trigger validation decides whether anything is still
+    /// warranted).
+    var uidValidityReactionRecheckRequested: Set<String> = []
+
+    /// Test seam: simulate "a reaction for this folder is already running".
+    func seedUidValidityReactionInFlightForTesting(folderId: String) {
+        uidValidityReactionInFlight.insert(folderId)
+    }
+
+    /// Test seam: read side of `uidValidityReactionInFlight`.
+    func isUidValidityReactionInFlightForTesting(folderId: String) -> Bool {
+        uidValidityReactionInFlight.contains(folderId)
+    }
+
+    /// Test seam: clear a single-flight entry (teardown).
+    func clearUidValidityReactionInFlightForTesting(folderId: String) {
+        uidValidityReactionInFlight.remove(folderId)
+    }
+
+    /// Test seam: read side of `uidValidityReactionRecheckRequested`.
+    func isUidValidityReactionRecheckRequestedForTesting(folderId: String) -> Bool {
+        uidValidityReactionRecheckRequested.contains(folderId)
+    }
+
+    /// Test seam: clear a recheck-requested entry (teardown).
+    func clearUidValidityReactionRecheckRequestedForTesting(folderId: String) {
+        uidValidityReactionRecheckRequested.remove(folderId)
+    }
+
     // MARK: - Demo Mode provider injection
 
     /// Plug a demo email + calendar provider into the active provider lookup.

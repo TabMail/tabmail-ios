@@ -186,6 +186,13 @@ extension SyncEngine {
     /// refusing gestures. That is the sanctioned trade (C6/C3): a wrong stamp is
     /// silent data corruption, a refusal is a silent no-op.
     ///
+    /// UPDATE (T4.S6): the reaction and its `Folder.uidValidityResetPendingAt`
+    /// quarantine column now EXIST in v3
+    /// (`AccountManager.runUidValidityResetReaction`). This precondition is left
+    /// exactly as it is: the crawl still decides on the epoch comparison alone, and
+    /// consulting the quarantine flag here is a separate change with its own
+    /// argument to make. Nothing below assumes the column is absent any more.
+    ///
     /// ⚠ **RETRACTION (round 10) — round 8 wrote "from this build on,
     /// `backfillUidCursor != nil` implies the epoch was already bootstrapped".
     /// That is FALSE, in two independent ways** (NB6), and a future reader could
@@ -251,8 +258,10 @@ extension SyncEngine {
     /// REFERENCE (`v2final`): the same observed-vs-stored comparison, expressed
     /// as `uidValidityWalkWriteAllowed` / `uidValidityWriteAllowed`, re-read
     /// inside each bookkeeping write's own transaction and combined there with a
-    /// `uidValidityResetPendingAt` quarantine flag v3 does not have. The
-    /// comparison ports; the quarantine does not.
+    /// `uidValidityResetPendingAt` quarantine flag v3 did not have when this was
+    /// written. The comparison ports; the quarantine does not. (T4.S6 has since
+    /// added the column and the reaction; this guard still deliberately decides on
+    /// the comparison alone.)
     nonisolated static func crawlEpochAgrees(stored: UInt32?, walk: UInt32?) -> Bool {
         guard let stored, let walk else { return true }
         return stored == walk
@@ -401,15 +410,19 @@ extension SyncEngine {
     /// direction, on a folder whose identity another pass has just torn down.
     /// The complete writer set is enumerated on
     /// `SyncEngine.bootstrapFolderUidValidity`: three bootstrap-only VALUE
-    /// writers (nil → E) plus that one CLEARER (E → nil). A CAS refuses in both
-    /// directions and needs no case analysis at all, which is why it replaced the
-    /// comparison rather than being added beside it.
+    /// writers (nil → E), one CLEARER (E → nil), and — since T4.S6 — the reset
+    /// reaction's step-5 stamp, which is the only E → E' ADVANCER. A CAS refuses in
+    /// all of those directions and needs no case analysis at all, which is why it
+    /// replaced the comparison rather than being added beside it; the advancer
+    /// arriving later is exactly the kind of new skew the CAS absorbed in advance.
     ///
     /// Both refusals are TRANSIENT: a skew means some other pass re-derived this
     /// folder's identity while this one was on the network, so this pass's
     /// cursor/completeness describe a premise that no longer holds, and the NEXT
-    /// call reads the new premise and proceeds under it. The value writers are
-    /// bootstrap-only, so nil → E can happen at most once per folder.
+    /// call reads the new premise and proceeds under it. The BOOTSTRAP value writers
+    /// are bootstrap-only, so nil → E can happen at most once per folder; E → E' is
+    /// bounded instead by the reaction, which arms a durable quarantine flag and
+    /// runs at most one attempt per folder at a time.
     ///
     /// 🚨 **ROUND 13, BLOCKER 1 — A MISSING ROW IS NOT AN UNSTAMPED ROW.** The
     /// body used to be one optional chain,
@@ -463,12 +476,16 @@ extension SyncEngine {
     /// observedEpoch:)` in the same function's file at the tag — same in-txn
     /// `Folder.fetchOne`, same use on every cursor/completeness write the walk
     /// makes. TWO deviations, both deliberate: (1) its `uidValidityResetPendingAt`
-    /// quarantine term does not transfer — v3 has no such column (T4.S6); (2) the
+    /// quarantine term does not transfer — v3 had no such column when this was
+    /// written, and T4.S6, which added it, deliberately did not wire it in here;
+    /// (2) the
     /// reference COMPARES (`observedEpoch` vs `storedEpoch`) where this CASes,
     /// because the reference has no clearer — its `lastKnownUidValidity` is
     /// advanced by the reset reaction's purge-then-stamp, so "the row's stamp
     /// changed under me" is a state its quarantine flag already refuses. v3 has
-    /// the clearer and not the flag, so the CAS is the ⚑ INVENTED half.
+    /// the clearer and, since T4.S6, the flag as well — but this guard does not
+    /// read the flag, so the CAS is still doing the work and is still the
+    /// ⚑ INVENTED half.
     nonisolated static func crawlWalkWriteAllowed(
         _ db: Database, folderId: String, premiseEpoch: UInt32?
     ) throws -> Bool {
@@ -491,15 +508,20 @@ extension SyncEngine {
     /// bookkeeping. The folder is now: empty, incomplete, cursor-bearing, durably
     /// stamped E1. On EVERY later `runBackfill` the fresh SELECT reports E2, the
     /// walk-start gate returns `.refuseEpochMismatch`, and the folder is declined
-    /// again. Every epoch value-writer is bootstrap-only and `resetCrawlState`
-    /// clears cursors without clearing the stamp, so a restart does not help and a
-    /// Smart Reindex does not either. **The decline SET is genuinely transient
+    /// again. Every epoch value-writer reachable from the CRAWL is bootstrap-only
+    /// and `resetCrawlState` clears cursors without clearing the stamp, so a restart
+    /// does not help and a Smart Reindex does not either. (T4.S6's reset reaction
+    /// can advance the stamp, but it needs a folder whose stored epoch a live
+    /// observation contradicts AND which it is willing to purge; it is not a
+    /// substitute for this clearer — see the note on
+    /// `resetEmptyFolderCrawlEpoch`.) **The decline SET is genuinely transient
     /// (function-local, destroyed when the call returns); the REFUSAL is permanent
     /// because a durable condition re-inserts the folder on every call. A
     /// transient container plus a durable re-entry condition is a permanent
     /// refusal — that is the lesson, and this fix must not re-make it.**
     ///
-    /// Why this is NOT the deferred T4.S6 carve-out: that one covers a folder
+    /// Why this is NOT the T4.S6 carve-out (deferred when this was written, landed
+    /// since): that one covers a folder
     /// holding ROWS whose epoch nothing can prove, where advancing the stamp would
     /// assert something false about real data. Here the folder holds ZERO rows.
     /// There is nothing to purge, nothing to resync, and no reaction needed — the
@@ -518,16 +540,24 @@ extension SyncEngine {
     /// **This writes only NULLs.** The stamping is still
     /// `bootstrapFolderUidValidity`'s, on the next iteration, under its own
     /// `lastKnownUidValidity IS NULL` predicate and its own count gate — so the
-    /// set of paths that write a VALUE into `Folder.lastKnownUidValidity` stays at
-    /// THREE (see that function's enumeration). A fourth path that wrote a value
-    /// would have to be added there; this one is enumerated there as a CLEARER.
+    /// set of BOOTSTRAP paths that write a VALUE into `Folder.lastKnownUidValidity`
+    /// stays at THREE (see that function's enumeration). Another bootstrap path that
+    /// wrote a value would have to be added there; this one is enumerated there as a
+    /// CLEARER, and T4.S6's reaction stamp as the one ADVANCER.
     ///
     /// ⚑ R0 — **NO REFERENCE in `v2final`**: it cannot have one. There a turnover
     /// raises `uidValidityResetPendingAt`, and the reaction purges the old epoch's
     /// rows and stamps the new one for folders EMPTY AND NON-EMPTY ALIKE, so the
-    /// empty-folder case is not distinguished and cannot brick. v3 has no
-    /// reaction, so the empty case is the one the crawl can still discharge on its
-    /// own, and it is discharged here. The non-empty case stays refused (T4.S6).
+    /// empty-folder case is not distinguished and cannot brick. v3 had no reaction
+    /// when this was written, so the empty case was the one the crawl could still
+    /// discharge on its own, and it is discharged here.
+    ///
+    /// UPDATE (T4.S6): v3 now has the reaction, but this clearer is still needed and
+    /// is NOT redundant with it. The reaction refuses to start unless the folder has
+    /// a STORED epoch that a live observation DISAGREES with; the state this clearer
+    /// exists for is a stale stamp on a folder holding zero headers, which the
+    /// crawl's own gate refuses without any live disagreement being available to
+    /// prove. The two cover different states and both stay.
     ///
     /// 🚨 **`expectedStoredEpoch` IS THE CAS, AND IT IS LOAD-BEARING** (round 12,
     /// blocker B). The decision to reset is made at the walk-start gate, which is
@@ -660,7 +690,11 @@ extension SyncEngine {
         // folder as "still incomplete" and immediately walks it again — under the
         // NEW epoch, inserting exactly the mixed-epoch population the refusal was
         // for. (`v2final` needs no such set: its refusals persist through the
-        // `uidValidityResetPendingAt` quarantine column, which v3 has not ported.)
+        // `uidValidityResetPendingAt` quarantine column. T4.S6 has since ported that
+        // column, but this set stays: the reaction only arms the flag for a folder
+        // whose stored epoch a live observation CONTRADICTS, whereas this set also
+        // covers the mailbox-moved-under-an-in-flight-walk decline, which the flag
+        // never sees.)
         var epochDeclinedFolderIds = Set<String>()
         // Folders whose stale epoch+cursor this CALL already dropped because they
         // held no headers (`resetEmptyFolderCrawlEpoch`). Bounds that recovery to
@@ -838,7 +872,10 @@ extension SyncEngine {
                         // because the durable stamp re-enters the folder into the
                         // decline set on every later call). If it holds rows,
                         // nothing here can prove their epoch and the folder stays
-                        // refused until the T4.S6 reset reaction exists.
+                        // refused here. (T4.S6 has since landed the reset reaction,
+                        // which purges and resyncs such a folder — so the refusal is
+                        // now bounded by that, not permanent. This branch still
+                        // refuses; it does not fire the reaction itself.)
                         //
                         // ONCE per folder per call: a mailbox turning over between
                         // the reset and the next iteration's SELECT would otherwise

@@ -86,11 +86,21 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// with STATUS: SwiftMail asks for the `UIDVALIDITY` STATUS attribute only on a
     /// UIDPLUS server, whereas `OK [UIDVALIDITY n]` on SELECT is core IMAP4rev1 —
     /// so without it a non-UIDPLUS account would leave every folder here nil
-    /// forever. NEVER overwritten afterwards — an
-    /// observation that DIFFERS is a turnover, and advancing this column without
-    /// first purging the rows that belong to the old epoch silently disarms the
-    /// guard above and turns the walk into a mass-deleter. `0` is "the server did
+    /// forever. An observation that DIFFERS is a turnover, and advancing this column
+    /// without first purging the rows that belong to the old epoch silently disarms
+    /// the guard above and turns the walk into a mass-deleter. `0` is "the server did
     /// not report a value" and is never stored (`SyncEngine.knownUidValidity`).
+    ///
+    /// **EXACTLY ONE path overwrites a non-nil value (T4.S6):**
+    /// `AccountManager.uidValidityResetStampFreshEpoch`, step 5 of the
+    /// purge-and-resync reaction. It is allowed to because it discharges the very
+    /// precondition the bootstrap-only rule protects: by the time it runs, step 3
+    /// has DELETED every `messageHeader` row of this folder in its own committed
+    /// transaction, so the stamp it advances describes an empty set and can be wrong
+    /// about nothing. It is gated on `uidValidityResetPendingAt != nil` — i.e. only
+    /// reachable from inside a reaction that armed the quarantine — and it clears
+    /// that flag in the SAME write. Any OTHER advancing writer would have to
+    /// reproduce both halves; do not add one.
     ///
     /// **One path CLEARS it back to nil, and only for a folder holding ZERO
     /// headers:** `SyncEngine.resetEmptyFolderCrawlEpoch` (in the FILE
@@ -114,18 +124,56 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// (quarantine → purge → stamp → resync, ADR-IOS-061 in the `v2final` line);
     /// until one exists this is an accepted, documented residual, unchanged from
     /// the walk's own pre-existing nil-bootstrap branch.
+    ///
+    /// ⚠ T4.S6 ported that protocol and it does NOT close this residual. The
+    /// reaction's own trigger validation REFUSES to start on a folder whose stored
+    /// epoch is nil (`AccountManager.runUidValidityResetReaction`), because with no
+    /// stored epoch there is nothing to prove a turnover against — purging on that
+    /// evidence would destroy a folder's local mail whenever a first observation
+    /// happened to be taken. So a nil epoch over pre-existing headers still
+    /// bootstraps by assertion. Unchanged residual, now with a named refusal.
     var lastKnownUidValidity: Int?
+    /// **UIDVALIDITY reset quarantine (T4.S6).** Non-nil ⇒ this folder is mid-way
+    /// through `AccountManager.runUidValidityResetReaction` — its rows either still
+    /// belong to an epoch the server has abandoned, or have already been purged and
+    /// not yet resynced. Armed in the reaction's step 1 and cleared in step 5, in
+    /// the SAME gated write that stamps the fresh epoch (never one without the
+    /// other).
+    ///
+    /// It is **re-drive state, not admission arbitration**: every abort leg of the
+    /// reaction leaves it SET, so the folder is retryable rather than half-reset.
+    /// Two consumers act on it, and both are the reason the column exists rather
+    /// than the reaction relying on "stored epoch still disagrees with live":
+    ///  - `SyncEngine.fullSync`'s per-folder loop BRANCHES INTO the reaction for a
+    ///    quarantined folder instead of running an ordinary pass. Ordinary sync on a
+    ///    purged-but-unstamped folder would insert NEW-epoch headers under the OLD
+    ///    stamp, and a durable op holding a bare UID from the old epoch would then
+    ///    address whichever new message occupies it — C3.
+    ///  - `AccountManager.drainPendingQueue` PARKS (never drops) this folder's
+    ///    durable ops while it is set, and
+    ///    `AccountManager.newGestureRefusedForUnknownEpoch` refuses new ones.
+    ///
+    /// The value is a `Date` for diagnostics ("how long has this folder been
+    /// quarantined") and to keep the shape identical to the reference's; nothing
+    /// compares it. `v2final`'s companion column `lastUidValidityResetAt` is
+    /// deliberately NOT ported — its sole purpose there is to be the monotonic
+    /// authority sidecar producers compare against, and v3 has no such producer.
+    var uidValidityResetPendingAt: Date?
     /// IMAP CONDSTORE (RFC 7162): last observed HIGHESTMODSEQ — the flag-aware
     /// change cursor for delta/full sync. When `uidNext`+`totalCount` are unchanged
     /// but this bumped, a \Seen/flag change happened on an EXISTING message (which
     /// STATUS-count-only detection misses today). Only comparable WITHIN one
-    /// UIDVALIDITY epoch. It is NOT reset on a turnover: under the bootstrap-only
-    /// rule above the stored epoch stays behind until an epoch-advancement protocol
-    /// exists, so a reset-on-mismatch rule would re-fire every cycle and destroy the
-    /// CONDSTORE signal for that folder permanently. Nor does the epoch gate the
+    /// UIDVALIDITY epoch. It is NOT reset merely on OBSERVING a mismatch: such a
+    /// rule would re-fire every cycle for as long as the stored epoch stayed behind
+    /// and destroy the CONDSTORE signal for that folder permanently. It IS cleared,
+    /// once, by the epoch-advancement protocol T4.S6 added —
+    /// `AccountManager.uidValidityResetPurgeTxn` nulls it in the same transaction
+    /// that deletes the folder's headers, i.e. only where the whole local population
+    /// is being rebuilt anyway. Nor does the epoch gate the
     /// CONDSTORE fetch-SKIP: forcing a fetch across a turnover hands the folder to
-    /// `runSyncMessages`, whose stale sweep has no epoch guard, so "fetch more" is
-    /// the DESTRUCTIVE direction there, not the safe one. A turnover moves
+    /// `runSyncMessages`, whose stale sweep had no epoch guard when this was written
+    /// (T4.S6 has since added one, which ABANDONS the pass rather than widening it),
+    /// so "fetch more" is the DESTRUCTIVE direction there, not the safe one. A turnover moves
     /// uidNext/count anyway, so a stale-epoch modseq self-corrects on the following
     /// cycle. Nil until the first STATUS on a CONDSTORE server; nil also means "no
     /// CONDSTORE" → callers fall back to the uidNext+count comparison.
