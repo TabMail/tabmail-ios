@@ -2069,17 +2069,29 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return try await withActionConnection(folder: draftsFolderPath) { server in
             // Delete existing draft by UID if updating.
             // If existingDraftId is non-numeric (e.g., UID changed), fall back to Message-ID search.
+            // SCOPE, not policy. Both legs below keep their existing `try?`
+            // swallowing and their existing reachability — the ONLY change is that
+            // the purge names the UID(s) being replaced instead of the whole
+            // mailbox. Same defect and same fix as `deleteDraft`, reached through
+            // the old-copy delete rather than the user's delete gesture, and worse
+            // here because these are the very calls that LEAVE `\Deleted` messages
+            // behind when they are swallowed: a later bare EXPUNGE in Drafts
+            // destroys the residue of every earlier save, not just this one's.
+            // See `expungeScopedToTargets` for the UIDPLUS reasoning.
             if let existingId = existingDraftId {
                 if let uid = UInt32(existingId) {
                     let uidSet = MessageIdentifierSet<UID>(UID(uid))
                     try? await server.store(flags: [.deleted], on: uidSet, operation: .add)
-                    try? await server.expunge()
+                    try? await self.expungeScopedToTargets(
+                        uidSet, server: server, logDescription: "old draft copy uid=\(uid) in \(draftsFolderPath)")
                 } else {
                     // Stale UID — try finding by Message-ID (rfc822MessageId survives UID changes)
                     let found = try await self.searchByMessageId(messageId, server: server)
                     if !found.isEmpty {
                         try? await server.store(flags: [.deleted], on: found, operation: .add)
-                        try? await server.expunge()
+                        try? await self.expungeScopedToTargets(
+                            found, server: server,
+                            logDescription: "stale draft copy by Message-ID search (existingDraftId=\(existingId) was non-numeric) in \(draftsFolderPath)")
                         print("[IMAP] Deleted stale draft by Message-ID search (existingDraftId=\(existingId) was non-numeric)")
                     }
                 }
@@ -2108,8 +2120,55 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try await withActionConnection(folder: draftsFolderPath) { server in
             let uidSet = try await resolveUID(draftId, server: server)
             try await server.store(flags: [.deleted], on: uidSet, operation: .add)
-            try await server.expunge()
+            try await self.expungeScopedToTargets(uidSet, server: server,
+                                                  logDescription: "draft \(draftId) from \(draftsFolderPath)")
             print("[IMAP] Deleted draft \(draftId) from \(draftsFolderPath)")
+        }
+    }
+
+    /// STORE-`\Deleted`'s purge tail, scoped to the UID(s) actually being deleted.
+    ///
+    /// A bare `EXPUNGE` is MAILBOX-WIDE (RFC 3501 §6.4.3): it names no UID and
+    /// removes EVERY message flagged `\Deleted` in the selected mailbox — another
+    /// client's soft-deleted mail, or a copy a crashed prior attempt left marked
+    /// but unexpunged. On the draft path the blast radius lands in Drafts, which is
+    /// precisely where `saveDraft` leaves `\Deleted`-but-unexpunged messages behind
+    /// on its `try?`-swallowed legs. That is a wrong-message deletion — C3 — with
+    /// or without any UIDVALIDITY change.
+    ///
+    /// The shape is `idempotentMove`'s, the in-repo precedent for exactly this
+    /// decision (same file, same `server.expunge(messages:)` primitive, same
+    /// UIDPLUS gate): UID EXPUNGE (RFC 4315) when the server advertises UIDPLUS,
+    /// and the mailbox-wide command ONLY when there is no narrower primitive to
+    /// use. `target` must already name exactly the verified UID(s).
+    ///
+    /// ⚑ DELIBERATE DEVIATION FROM `v2final`, stated rather than hidden: the
+    /// reference's `storeDeletedAndMaybeExpunge` FAILS CLOSED without UIDPLUS —
+    /// it leaves the draft soft-deleted and skips the purge entirely. That trade
+    /// is not available here. v3 has no draft-side reconciliation that would
+    /// finish the job, so a soft delete alone leaves the server draft in place for
+    /// the very next sync to re-materialise: the user deletes a draft, watches it
+    /// vanish, and watches it come back — a permanent user-visible failure on
+    /// every non-UIDPLUS server, i.e. the mirror-image bug. `idempotentMove`
+    /// already accepted the same bounded collateral for the same reason, and the
+    /// narrowing above removes it outright for every UIDPLUS server (all three
+    /// mainstream providers, and effectively every server this app connects to).
+    private func expungeScopedToTargets(
+        _ target: UIDSet, server: IMAPServer, logDescription: String
+    ) async throws {
+        // Debug-gated: these two lines are NEW trace, not the pre-existing
+        // production logs. Every log this refactor displaced is preserved verbatim
+        // and unconditional at its original call site.
+        if await server.supportsUIDPlus {
+            try await server.expunge(messages: target)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[IMAP] Purged \(logDescription) (UID EXPUNGE)")
+            }
+        } else {
+            try await server.expunge()
+            if DebugModeManager.isLoggingEnabled() {
+                print("[IMAP] Purged \(logDescription) (no UIDPLUS — mailbox-wide EXPUNGE)")
+            }
         }
     }
 

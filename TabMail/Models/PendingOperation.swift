@@ -56,6 +56,40 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// rows are backfilled by the ALTER TABLE, so decode never sees a missing
     /// column post-migration).
     var uidResolutionRetryCount: Int = 0
+    /// UIDVALIDITY admission stamp — the value of `Folder.lastKnownUidValidity`
+    /// for this op's `folderPath` at the instant the op was inserted, read inside
+    /// the SAME write transaction as the insert so the stamp and the row observe
+    /// one consistent epoch.
+    ///
+    /// It exists for ONE class of op: one the executor addresses by a BARE
+    /// NUMERIC UID rather than by a durable identity. A UID means nothing outside
+    /// the numbering it was observed in — after a UIDVALIDITY change the same
+    /// number names a DIFFERENT message — so such an op must not survive into a
+    /// numbering it was not recorded under (owner directive, 2026-07-31: *"the
+    /// delete op should NOT survive a UIDVALIDITY reset — it cannot; the op
+    /// should no-op once that validity gets invalid"*). `AccountManager
+    /// .drainPendingQueue`'s claim transaction compares this against the folder's
+    /// CURRENT `lastKnownUidValidity` and, on disagreement, deletes the row
+    /// without executing it. Dropping intention at an identity-reset boundary is
+    /// the blessed resolution (constraint C5): sync reconciles and the user redoes
+    /// the gesture — the alternative is mutating an unrelated message (C3).
+    ///
+    /// **`nil` is the fail-open default and MUST stay the common case.** Only
+    /// `AccountManager.queueDraftDelete` stamps today, and only when its
+    /// `serverDraftId` is numeric — the same discriminator `newGestureRefusedForUnknownEpoch`
+    /// already uses, because `IMAPProvider.resolveUID` short-circuits a numeric id
+    /// to a literal `UIDSet` with no SEARCH while a non-numeric one goes to
+    /// `searchByMessageId` and is epoch-IMMUNE. Stamping an rfc822-addressed op
+    /// would let the claim-time compare drop intention that is still perfectly
+    /// resolvable — the mirror-image bug, a permanent refusal. Non-IMAP accounts
+    /// stamp `nil` for free: Gmail and Graph never populate
+    /// `Folder.lastKnownUidValidity`.
+    ///
+    /// Typed `Int?` to mirror `Folder.lastKnownUidValidity`'s established storage
+    /// convention for this exact value (same choice, same reasoning, as the
+    /// reference's `v2final:TabMail/Models/PendingOperation.swift`).
+    /// Backed by the v69 migration; `nil` on every pre-migration row.
+    var observedUidValidity: Int?
     /// PendingStatus rawValue — stored as String for GRDB compatibility
     var status: String
 
@@ -77,7 +111,8 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         folderPath: String,
         destinationPath: String? = nil,
         tagValue: String? = nil,
-        userLabelId: String? = nil
+        userLabelId: String? = nil,
+        observedUidValidity: Int? = nil
     ) {
         self.id = UUID().uuidString
         self.type = type
@@ -90,6 +125,7 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.createdAt = Date()
         self.retryCount = 0
         self.uidResolutionRetryCount = 0
+        self.observedUidValidity = observedUidValidity
         self.status = PendingStatus.queued.rawValue
     }
 }

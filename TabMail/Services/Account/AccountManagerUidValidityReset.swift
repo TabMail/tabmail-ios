@@ -482,6 +482,18 @@ extension AccountManager {
     ///    untouched. `IMAPProvider.idempotentMove` and its siblings resolve a
     ///    non-numeric id by SEARCH, so the user's intention lands on the RIGHT
     ///    message under the new numbering. This is the common case;
+    ///    ⚠ SURVIVING THIS SWEEP IS NOT THE SAME AS BEING SAFE TO EXECUTE, and
+    ///    reading it that way was a confirmed C3 defect (2026-07-31). "Carries a
+    ///    non-numeric id" is a property of the ROW; "resolves by SEARCH" is a
+    ///    property of the EXECUTOR, and `.deleteDraft` breaks the correspondence:
+    ///    `AccountManager.queueDraftDelete` records `[uid, rfc822]` — the rfc822
+    ///    is there for the sync filter — while `executeOperation` passes
+    ///    `messageIds.first`, the UID, to `provider.deleteDraft`. Such an op is
+    ///    NOT address-only, survives here, and would then execute against a bare
+    ///    UID in the discarded numbering. The closure is `PendingOperation
+    ///    .observedUidValidity`, compared in `AccountManager.drainPendingQueue`'s
+    ///    claim transaction — a per-op record of the epoch it was recorded under,
+    ///    which cannot be defeated by a future op shape this classifier misreads;
     ///  - an op every one of whose `messageIds` is a BARE NUMERIC UID has no
     ///    identity beyond an ADDRESS in a numbering the server has just discarded.
     ///    Executing it would mutate an unrelated message. C5 states that dropping

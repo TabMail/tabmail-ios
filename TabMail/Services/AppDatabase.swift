@@ -1959,5 +1959,25 @@ final class AppDatabase: Sendable {
                 t.add(column: "uidValidityResetPendingAt", .datetime)
             }
         }
+
+        migrator.registerMigration("v69_addPendingOperationObservedUidValidity") { db in
+            // T4.S6 follow-up — the admission-time UIDVALIDITY stamp for a durable op
+            // that will be executed by BARE UID (see `PendingOperation
+            // .observedUidValidity`). Nullable, no default and no backfill: a
+            // pre-migration row simply has no stamp, so the claim-time compare in
+            // `AccountManager.drainPendingQueue` skips it and the op behaves exactly
+            // as it does today (fail open). Those rows drain within one session and
+            // carry only the pre-existing residual.
+            //
+            // PORTED from the reference's `v74_addPendingOperationObservedUidValidity`
+            // (`v2final:TabMail/Services/AppDatabase.swift`) — same column, same type,
+            // same nullable/no-backfill policy. The number differs because v3's
+            // migration ceiling is v68; v2final's v68–v91 range is IRRELEVANT here
+            // (that line never shipped, so no device carries it) and deliberately
+            // NOT skipped.
+            try db.alter(table: "pendingOperation") { t in
+                t.add(column: "observedUidValidity", .integer)
+            }
+        }
     }
 }

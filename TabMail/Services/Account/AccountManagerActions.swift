@@ -1215,11 +1215,36 @@ extension AccountManager {
                 if let rfc822 = rfc822MessageId {
                     opMsgIds.append(rfc822)
                 }
+                // T4.S6 follow-up — RECORD THE EPOCH THIS OP'S ADDRESS BELONGS TO.
+                //
+                // The rfc822 id appended above is carried for the SYNC FILTER
+                // (`pendingAllIds`), NOT for resolution: `executeOperation` passes
+                // `messageIds.first` — the UID — to `provider.deleteDraft`. So the op is
+                // executed by bare UID while CLASSIFYING as identity-carrying, which is
+                // exactly why `AccountManager.opIsAddressOnly` returns false for it and
+                // the reaction's step-5 sweep leaves it alone. Post-reaction it would
+                // otherwise unpark and expunge whichever message the NEW numbering put at
+                // that UID — C3, the one hard invariant.
+                //
+                // Stamping the folder's epoch INSIDE this same transaction (the write is
+                // already gated by the refusal above, so the row exists and its epoch is
+                // non-nil for any numeric id on an IMAP-family account) makes the op
+                // self-describing: the claim transaction in `drainPendingQueue` compares
+                // the stamp against the folder's CURRENT epoch and drops the op rather
+                // than executing it under a numbering it was never recorded under.
+                //
+                // ONLY for a numeric id. A non-numeric `serverDraftId` resolves through
+                // `searchByMessageId` and survives any epoch change intact — stamping it
+                // would manufacture a permanent refusal out of a safe op.
+                let observedUidValidity: Int? = UInt32(serverDraftId) != nil
+                    ? try Folder.fetchOne(db, key: folderId)?.lastKnownUidValidity
+                    : nil
                 try PendingOperation(
                     type: .deleteDraft,
                     messageIds: opMsgIds,
                     accountId: accountId,
-                    folderPath: folderPath
+                    folderPath: folderPath,
+                    observedUidValidity: observedUidValidity
                 ).insert(db)
             }
             // Refresh UI so the optimistic removal is visible immediately.

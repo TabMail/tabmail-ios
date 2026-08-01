@@ -222,17 +222,52 @@ extension AccountManager {
                         // its retry counters untouched, so nothing is lost and nothing
                         // ages toward `failed` — Law 5. TRANSIENT: the flag is cleared
                         // by the reaction's step-5 stamp, and full sync re-drives an
-                        // interrupted reaction on every cycle. The same transaction
-                        // that clears the flag also removes the address-only ops that
-                        // could never be re-resolved, so this park can never hand a
-                        // stale bare UID to the drain.
+                        // interrupted reaction on every cycle.
+                        //
+                        // ⚠ WHAT MAKES THE UNPARK SAFE — TWO CHECKS, NOT ONE. This
+                        // comment used to claim the step-5 transaction alone was enough
+                        // ("the same transaction that clears the flag also removes the
+                        // address-only ops"). It is NOT: `opIsAddressOnly` is false for
+                        // any op carrying a non-numeric id ALONGSIDE a UID, and
+                        // `.deleteDraft` is exactly that shape — `queueDraftDelete`
+                        // records `[uid, rfc822]` for the sync filter while
+                        // `executeOperation` hands `messageIds.first` (the UID) to
+                        // `provider.deleteDraft`. Such an op survived the sweep and then
+                        // unparked onto a UID the new epoch had reassigned. The
+                        // admission-time stamp compared below is the second check, and
+                        // the one that does not depend on guessing an op's id shapes.
                         let sourceFolderId = MessageIdentity.folderId(
                             accountId: fetched.accountId, folderPath: fetched.folderPath)
-                        if let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId),
-                           sourceFolder.uidValidityResetPendingAt != nil {
+                        let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId)
+                        if let sourceFolder, sourceFolder.uidValidityResetPendingAt != nil {
                             if DebugModeManager.isLoggingEnabled() {
                                 print("[Queue] Op \(op.id.prefix(8)) (\(fetched.type.rawValue)) parked — folder \(fetched.folderPath) is mid UIDVALIDITY reset")
                             }
+                            return nil
+                        }
+                        // T4.S6 follow-up — an op RECORDED under a numbering the server
+                        // has since discarded NEVER EXECUTES. It is deleted here, not
+                        // parked: parking would be a permanent wedge (the old epoch never
+                        // comes back), and executing it would address a UID whose referent
+                        // changed underneath it — C3. Constraint C5 blesses dropping
+                        // intention at an identity-reset boundary: sync reconciles the
+                        // surviving server draft and the user redoes the delete.
+                        //
+                        // Ordered AFTER the park on purpose: during quarantine the folder
+                        // still holds the OLD epoch (step 5 owns advancing it), so the
+                        // stamp still AGREES and this would not fire anyway — but reading
+                        // the park first keeps "mid-reset" a single, unambiguous outcome.
+                        //
+                        // FAILS OPEN on a nil live epoch (a vanished `Folder` row, or one
+                        // `SyncEngine.resetEmptyFolderCrawlEpoch` cleared back to nil):
+                        // "unknown" is not "different", and refusing on it would drop
+                        // intention for a folder that is merely un-bootstrapped. Same
+                        // polarity as the reference's claim-time check.
+                        if let stamped = fetched.observedUidValidity,
+                           let live = sourceFolder?.lastKnownUidValidity,
+                           live != stamped {
+                            _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                            BackgroundSyncLogger.log("[Queue] UIDVALIDITY changed under op \(fetched.id.prefix(8)) (\(fetched.type.rawValue), \(fetched.folderPath)): recorded under \(stamped), folder now \(live) — dropped without executing (C5)")
                             return nil
                         }
                         fetched.status = PendingStatus.inFlight.rawValue
