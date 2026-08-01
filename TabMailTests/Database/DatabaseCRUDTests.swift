@@ -155,7 +155,14 @@ struct DatabaseCRUDTests {
 
     // MARK: - CASCADE chain
 
-    @Test("Full CASCADE: account → folder → messageHeader → messageBody")
+    /// The schema cascade now runs `account → folder → messageHeader` and STOPS.
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) removed the body link: a content key
+    /// is not a header id, so once N headers can share one key a per-header cascade
+    /// deletes a row the other N−1 still own — below the application layer, where
+    /// `MessageContentStore` cannot veto it. Cached bodies are reclaimed by
+    /// `AccountManager.removeAccountRowsTxn` instead, pinned in
+    /// `DatabaseSchemaValidationTests.removeAccountLeavesNoCachedMailBehind`.
+    @Test("Full CASCADE: account → folder → messageHeader, stopping before messageBody")
     func fullCascade() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -171,7 +178,7 @@ struct DatabaseCRUDTests {
         let bodies = try db.read { try MessageBody.fetchAll($0) }
         #expect(folders.isEmpty)
         #expect(headers.isEmpty)
-        #expect(bodies.isEmpty)
+        #expect(bodies.count == 1, "content must not ride a header-space cascade")
     }
 
     // MARK: - Folder

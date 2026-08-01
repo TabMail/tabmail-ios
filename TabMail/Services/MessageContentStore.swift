@@ -21,12 +21,16 @@ import GRDB
 ///
 /// ## Why this exists — the mass-deletion hazard
 ///
-/// Three sweeps decide what content is garbage by asking whether its key is still
+/// Four sweeps decide what content is garbage by asking whether its key is still
 /// a `messageHeader.id`:
 ///
 /// - `SyncEngine.pruneFTSOrphans`
 /// - `SyncEngine.backfillFolderIdsIfNeeded`
 /// - `BodyAssetMaintenance.pruneOrphans`
+/// - `SyncEngine.runEvictStaleBodies` — the fourth, gated at Stage D. Stage C's
+///   census named only the first three: this one is a TTL cache evictor whose
+///   orphan branch was unreachable while the FK cascade front-ran it, and Stage D
+///   is precisely what makes it live.
 ///
 /// The instant a content key stops equalling `messageHeader.id`, **every** FTS row
 /// and **every** asset row of a UID-addressed account reads as an orphan and is
@@ -52,15 +56,22 @@ import GRDB
 /// tests: the contract in isolation, and the same contract through a routed production
 /// caller asserting on the FTS row — a store the FK cascade does not reach.
 ///
-/// ## ⚠ At Stage C the FK cascade still front-runs the body release
+/// ## The FK cascade is GONE as of Stage D — this type is the body's only reclaimer
 ///
-/// `AppDatabase`'s `messageBody.id` references `messageHeader(id)` `onDelete:
-/// .cascade`, so deleting a header already removes its body row before this type
-/// is consulted. That is correct **today** (keys are 1:1, so the cascade and
-/// `releaseUnowned` always agree and the cascade simply gets there first) and
-/// becomes a data-loss bug the day keys diverge: it would delete content still
-/// owned by the other N−1 headers. Dropping that FK is **Stage D's** migration —
-/// which is exactly why the ordering C → D → E1 cannot be shortcut.
+/// `messageBody.id` used to reference `messageHeader(id)` `onDelete: .cascade`, so
+/// deleting a header removed its body row before this type was ever consulted. That
+/// was correct while keys were 1:1 (the cascade and `releaseUnowned` always agreed
+/// and the cascade simply got there first) and would have become a data-loss bug the
+/// day they diverge — it deletes content still owned by the other N−1 headers, below
+/// the application layer where this type cannot veto it. Worse, with
+/// `foreignKeysEnabled = true` the live FK would REJECT the body INSERT outright for
+/// every rfc-tailed key. `v70_dropMessageBodyHeaderFK` removed it, which is why the
+/// ordering C → D → E1 cannot be shortcut.
+///
+/// The consequence for every caller: **`.body` is no longer implicit.** A site that
+/// deletes a header and wants its cached HTML reclaimed must either pass `.body`
+/// here or delete the row itself in the same transaction. Anything missed degrades
+/// to a bounded leak that `runEvictStaleBodies` reclaims — never to over-eviction.
 enum MessageContentStore {
 
     // MARK: - Scope

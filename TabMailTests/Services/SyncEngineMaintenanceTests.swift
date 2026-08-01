@@ -234,8 +234,15 @@ struct SyncEngineMaintenanceTests {
         #expect(bodyGone == nil)
     }
 
-    @Test("Deleting MessageHeader cascades to MessageBody")
-    func headerDeletionCascadesToBody() throws {
+    /// The maintenance sweeps reclaim bodies EXPLICITLY as of Stage D
+    /// (`v70_dropMessageBodyHeaderFK`): `pruneOldMessages` routes its header ids
+    /// through `MessageContentStore.releaseUnowned(…, stores: [.searchIndex,
+    /// .body])`, and `runEvictStaleBodies` is the TTL/orphan backstop. Neither
+    /// depends on a cascade any more, and the cascade had to go — it deletes
+    /// content below the application layer, where the ownership gate cannot
+    /// veto it once N headers can share one content key.
+    @Test("Deleting MessageHeader no longer cascades to MessageBody")
+    func headerDeletionLeavesBodyToTheSweeps() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -246,10 +253,10 @@ struct SyncEngineMaintenanceTests {
             _ = try MessageHeader.deleteAll(dbConn, keys: [header.id])
         }
 
-        let bodyGone = try db.read { dbConn in
+        let body = try db.read { dbConn in
             try MessageBody.fetchOne(dbConn, key: header.id)
         }
-        #expect(bodyGone == nil)
+        #expect(body != nil, "the schema must not delete cached content as a side effect")
     }
 
     // MARK: - Chunk-based processing

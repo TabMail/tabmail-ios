@@ -129,8 +129,14 @@ private func simulateFullSync(
             let oldId = staleMsg.id
             let newMsgId = match.messageId
             let newId = "\(accountId):\(folderPath):\(newMsgId)"
+            // Fetch the body BEFORE deleting the header, then delete its row
+            // EXPLICITLY — mirroring `SyncEngine.reconcileUidRemaps` after Stage D
+            // (`v70_dropMessageBodyHeaderFK`) removed the cascade that used to do it.
+            // Without the delete the copy re-inserted under `newId` below leaves the
+            // old row behind: a duplicate plus a leak.
             let oldBody = try MessageBody.fetchOne(dbConn, key: oldId)
             try staleMsg.delete(dbConn)
+            try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
             var migrated = staleMsg
             migrated.id = newId
             migrated.messageId = newMsgId
@@ -645,8 +651,24 @@ struct MoveUIDRemapBodyTests {
 @Suite("ActiveBodyQueue — UID Remap Race Condition")
 struct ActiveBodyQueueRaceTests {
 
-    @Test("body write to stale headerId fails gracefully (FK constraint)")
-    func bodyWriteToStaleHeaderIdFails() throws {
+    /// 🚨 THIS TEST'S PREMISE WAS INVERTED BY STAGE D — deliberately, and it is the
+    /// change's whole point.
+    ///
+    /// It used to assert that the FK REJECTED a body write whose header had been
+    /// UID-remapped away. `v70_dropMessageBodyHeaderFK` removed that FK because at
+    /// Stage E1 a content key is not a header id, and "no header holds this key" is
+    /// then the NORMAL case for every rfc-having IMAP/iCloud message: the FK would
+    /// have rejected *every* body write those accounts make, on the on-demand open
+    /// path, the backfill and the NSE render alike.
+    ///
+    /// So the property is restated as what must be true NOW: the write SUCCEEDS, and
+    /// a row addressed by a key no header holds is a legitimate resident of the
+    /// table. Reclamation moved from the schema to the application —
+    /// `runEvictStaleBodies`' orphan leg, gated by `MessageContentStore
+    /// .protectedKeys` — which is exactly the leg Stage D made reachable, and which
+    /// `SyncEngineMaintenanceTests` pins.
+    @Test("body write to a stale headerId now succeeds — the schema no longer vetoes it")
+    func bodyWriteToStaleHeaderIdSucceeds() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
@@ -678,27 +700,35 @@ struct ActiveBodyQueueRaceTests {
             try newHeader.insert(dbConn)
         }
 
-        // ActiveBodyQueue completion: tries to insert body for the OLD headerId
-        // This should fail with FK constraint (header no longer exists)
+        // ActiveBodyQueue completion: writes the body for the OLD headerId, which no
+        // longer names a header. The schema must not refuse it.
         let bodyInsertResult = try db.write { dbConn -> Bool in
             let body = MessageBody( contentKey: ContentKey(rawValue: oldHeaderId), htmlContent: "<p>Fetched body</p>")
             do {
                 try body.insert(dbConn)
                 return true // inserted
             } catch {
-                // FK constraint violation expected
                 return false
             }
         }
-        #expect(bodyInsertResult == false, "Body insert should fail — header no longer exists")
+        #expect(bodyInsertResult == true,
+                "with the FK gone, a body write is never rejected for want of a header")
 
-        // Body should NOT exist under old ID
+        // …and the row is really there, readable, under that key.
         let oldBody = try db.read { try MessageBody.fetchOne($0, key: oldHeaderId) }
-        #expect(oldBody == nil)
+        #expect(oldBody?.htmlContent == "<p>Fetched body</p>")
+
+        // Two-sided: the remapped header is untouched by any of this, so the write
+        // cannot have gone anywhere except where it was addressed.
+        #expect(try db.read { try MessageHeader.fetchCount($0) } == 1)
+        #expect(try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:uid-200") } == nil,
+                "the body must land under the key it was addressed with, not the live header's")
     }
 
-    @Test("body .save() to stale headerId also fails (upsert still checks FK)")
-    func bodySaveToStaleHeaderIdFails() throws {
+    /// The upsert path, same inversion, same reason — `save()` went through the same
+    /// FK and is the shape `MessageContentStore`-era body writes actually use.
+    @Test("body .save() to a stale headerId now succeeds too — no FK to check")
+    func bodySaveToStaleHeaderIdSucceeds() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
@@ -715,7 +745,9 @@ struct ActiveBodyQueueRaceTests {
                 return false
             }
         }
-        #expect(saveResult == false, "save() should also fail — FK prevents orphan body")
+        #expect(saveResult == true, "save() must not be vetoed by a constraint Stage D removed")
+        #expect(try db.read { try MessageBody.fetchOne($0, key: oldHeaderId) }?.htmlContent
+                == "<p>Orphan body</p>")
     }
 
     @Test("snippet update to stale headerId is no-op (UPDATE WHERE id = ?)")

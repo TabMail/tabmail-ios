@@ -159,8 +159,14 @@ struct AccountManagerFetchTests {
 
     // MARK: - Stale header eviction pattern
 
-    @Test("evict pattern: deleting MessageHeader also deletes MessageBody via cascade")
-    func evictPatternCascade() throws {
+    /// `evictStaleHeader`'s eviction is now TWO steps, not one: the header delete,
+    /// then `MessageContentStore.releaseUnowned(…, stores: [.searchIndex, .body])`
+    /// AFTER that transaction commits. Stage D dropped the FK that used to fuse
+    /// them. This pins the half this in-memory queue can see — the delete alone
+    /// does not touch the body; the routed second half is pinned against the
+    /// production path in `ContentOwnershipSweepTests`.
+    @Test("evict pattern: deleting MessageHeader no longer deletes MessageBody by itself")
+    func evictPatternLeavesBodyToTheRoutedRelease() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -171,9 +177,9 @@ struct AccountManagerFetchTests {
         try db.write { _ = try MessageHeader.deleteOne($0, key: header.id) }
 
         let headerGone = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        let bodyGone = try db.read { try MessageBody.fetchOne($0, key: header.id) }
+        let body = try db.read { try MessageBody.fetchOne($0, key: header.id) }
         #expect(headerGone == nil)
-        #expect(bodyGone == nil)
+        #expect(body != nil, "the body must outlive the header delete — only the routed release may remove it")
     }
 
     // MARK: - MockEmailProvider fetchMessage

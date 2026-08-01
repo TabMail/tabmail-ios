@@ -100,10 +100,16 @@ extension SyncEngine {
                         // Routed through `MessageContentStore`. The headers were
                         // deleted in the write transaction just above, so this
                         // detached release counts owners in the post-delete world.
+                        //
+                        // `.body` joins `.searchIndex` from Stage D and MATTERS MOST
+                        // here: this whole function exists to reclaim disk when the
+                        // user is over their storage budget, and without it the
+                        // bodies — the bulk of the bytes — would sit for up to
+                        // `bodyCacheTTLHours` waiting on `runEvictStaleBodies`.
                         let keys = chunkIds.map(ContentKey.init(rawValue:))
                         Task.detached(priority: .utility) {
                             await MessageContentStore.releaseUnowned(
-                                keys, stores: .searchIndex, pool: dbPool)
+                                keys, stores: [.searchIndex, .body], pool: dbPool)
                         }
                     }
                 }
@@ -116,6 +122,36 @@ extension SyncEngine {
     }
 
     /// Nonisolated evict — runs entirely off the main thread.
+    ///
+    /// 🚨 THE FOURTH SWEEP. `994c5ca8f` (Stage C) gated three sweeps that decided
+    /// content was garbage by asking whether its key was still a `messageHeader.id`;
+    /// its census named `pruneFTSOrphans`, `backfillFolderIdsIfNeeded` and
+    /// `BodyAssetMaintenance.pruneOrphans` and MISSED this one, because it is not an
+    /// orphan sweep by name — it is a TTL cache evictor whose orphan branch is a
+    /// two-line early-out that the FK cascade made unreachable by construction.
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) is exactly what makes it reachable,
+    /// so the gate lands with the migration.
+    ///
+    /// ⚑ R0: `v2final` has this leg byte-for-byte and it is SOUND there — that
+    /// branch re-keyed `messageHeader.id` ITSELF, so `body.id` IS a header id by
+    /// construction and "no header holds it" genuinely means orphan. Same name,
+    /// same code, different function across trees. Its soundness does not port.
+    ///
+    /// ## Termination — checked before adding the KEEP outcome
+    ///
+    /// `206ec48cf` had to repair `backfillFolderIdsIfNeeded` because the Stage C
+    /// gate added a third per-row outcome to a loop whose variant assumed every row
+    /// LEAVES the queried set each pass. That loop was UNCURSORED. This one is not:
+    /// its page is `LIMIT chunkSize OFFSET skipCount`, and every row of a batch
+    /// increments exactly one of `batchEvicted` (leaves the set) or `batchSkipped`
+    /// (advances the offset past it). So with `R` = rows still older than the TTL
+    /// cutoff and `S` = `skipCount`, each pass returns `min(chunk, R − S)` rows and
+    /// drives `R − S` down by exactly that many; it is bounded below by 0, and the
+    /// batch goes empty at `S ≥ R`. A KEEP outcome that counts as a SKIP therefore
+    /// sits INSIDE the existing variant and needs no measured counterpart — which is
+    /// why this gate does not repeat `206ec48cf`'s shape. The variant holds however
+    /// the uncursored page happens to be ordered, because only the COUNT of rows
+    /// returned enters it.
     nonisolated static func runEvictStaleBodies(dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>) {
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date()) ?? Date.distantPast
         let recentPerFolder = SyncConfig.bodyCacheRecentPerFolder
@@ -138,6 +174,34 @@ extension SyncEngine {
                         .fetchAll(db)
                     guard !batch.isEmpty else { return (0, 0, true) }
 
+                    // The orphan leg's gate, computed ONCE per page and only for the
+                    // keys that would take it. One batched existence probe replaces
+                    // nothing in the loop below (which still needs the header row for
+                    // `isInInbox`/`folderId`); it only says WHICH keys are orphan
+                    // candidates, so `protectedKeys` is asked about exactly those.
+                    // A throw here aborts the batch and deletes nothing — the
+                    // fail-safe direction.
+                    let batchIds = batch.map(\.id.rawValue)
+                    let existingHeaderIds = try Set(String.fetchAll(
+                        db,
+                        MessageHeader.select(Column("id")).filter(batchIds.contains(Column("id")))
+                    ))
+                    let orphanCandidates = batch.map(\.id).filter {
+                        !existingHeaderIds.contains($0.rawValue)
+                    }
+                    // 🚨 FAIL-SAFE DIRECTION. `protectedKeys` throws only when the
+                    // folder/account roster itself cannot be read, and its contract
+                    // says the caller must then protect the WHOLE page. A leaked body
+                    // row is disk garbage this very sweep reclaims on a later pass; an
+                    // over-eviction silently drops cached mail.
+                    let protectedOrphans: Set<ContentKey>
+                    do {
+                        protectedOrphans = try MessageContentStore.protectedKeys(
+                            among: orphanCandidates, db: db)
+                    } catch {
+                        protectedOrphans = Set(orphanCandidates)
+                    }
+
                     var batchEvicted = 0
                     var batchSkipped = 0
                     for body in batch {
@@ -147,8 +211,8 @@ extension SyncEngine {
                         // `fetchOne` below addresses `messageHeader` by primary key.
                         // Byte-identical today. At E1 the undo guard stops matching
                         // (a body the user can still undo gets evicted) and the header
-                        // lookup misses (`header == nil` → the body is DELETED as an
-                        // orphan). GRDB's `fetchOne(_:key:)` is generic over
+                        // lookup misses — which is why the miss is no longer a licence
+                        // to delete. GRDB's `fetchOne(_:key:)` is generic over
                         // `DatabaseValueConvertible`, so neither crossing is
                         // compiler-visible — `.rawValue` is spelled out to make them
                         // greppable.
@@ -157,6 +221,16 @@ extension SyncEngine {
                             continue
                         }
                         guard let header = try MessageHeader.fetchOne(db, key: body.id.rawValue) else {
+                            // "No header holds this id" is a HEADER-space answer to a
+                            // CONTENT-space question. It survives only as a PROTECTION
+                            // term — it can no longer authorize the delete on its own.
+                            // The ownership gate decides, and a key it cannot prove
+                            // dead is KEPT (counted as a skip, so the page cursor
+                            // still advances past it and the loop still terminates).
+                            guard !protectedOrphans.contains(body.id) else {
+                                batchSkipped += 1
+                                continue
+                            }
                             try body.delete(db)
                             batchEvicted += 1
                             continue

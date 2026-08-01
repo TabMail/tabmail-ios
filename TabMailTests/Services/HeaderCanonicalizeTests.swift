@@ -111,11 +111,23 @@ struct HeaderCanonicalizeTests {
         // The FTS entry (incl. indexed body) rides the in-place re-key —
         // bodyComplete stays truthful, no refetch churn.
         #expect(rows[0].bodyComplete == true)
-        // Body survived the re-key under the new id (CASCADE would have eaten it).
+        // The body moved to the new id, and — the NEW failure mode — left NO row
+        // behind under the old one.
+        //
+        // ⚠ Both halves used to be satisfied by the FK cascade firing on the
+        // canonicalizer's delete+reinsert. Stage D (`v70_dropMessageBodyHeaderFK`)
+        // removed that cascade, so the second half now depends entirely on the
+        // explicit `MessageBody.deleteOne` the re-key leg gained. The count
+        // assertion makes a leftover visible as a DUPLICATE, not just as a
+        // survivor.
         let body = try db.read { try MessageBody.fetchOne($0, key: "acc1:TRASH:g1") }
         #expect(body?.htmlContent == "<p>body</p>")
         let oldBody = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:g1") }
-        #expect(oldBody == nil)
+        #expect(oldBody == nil, "a leftover body under the pre-re-key id is a duplicate AND a leak")
+        let totalBodies = try db.read {
+            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageBody") ?? -1
+        }
+        #expect(totalBodies == 1, "the re-key must MOVE the body, not copy it")
     }
 
     @Test("Confirmed-empty body keeps bodyComplete through a re-key")

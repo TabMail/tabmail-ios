@@ -327,8 +327,12 @@ struct DraftOptimisticSaveTests {
             // Preserve body
             let oldBody = try MessageBody.fetchOne(db, key: oldHeaderId)
 
-            // Delete optimistic header (cascade deletes body)
+            // Delete the optimistic header AND, explicitly, its content row. Since
+            // `v70_dropMessageBodyHeaderFK` the header delete does not cascade to
+            // `messageBody`; `SyncEngineDeltaSync` deletes the old key in the same
+            // transaction, and this harness mirrors it.
             try optimistic?.delete(db)
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldHeaderId))
 
             // Insert real IMAP header
             var realHeader = MessageHeader(
@@ -364,6 +368,11 @@ struct DraftOptimisticSaveTests {
 
         let newBody = try db.read { db in try MessageBody.fetchOne(db, key: newHeaderId) }
         #expect(newBody?.htmlContent?.contains("Draft body") == true)
+        // The re-key must MOVE the content, not duplicate it: with no cascade, an
+        // old key left behind is a leak that only the TTL evictor would find.
+        let oldBodyAfter = try db.read { db in try MessageBody.fetchOne(db, key: oldHeaderId) }
+        #expect(oldBodyAfter == nil, "the old content key must be reclaimed explicitly")
+        #expect(try db.read { try MessageBody.fetchCount($0) } == 1)
     }
 
     // MARK: - headerComplete set after FTS (simulated)

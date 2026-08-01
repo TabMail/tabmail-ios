@@ -147,9 +147,14 @@ private func simulateRunSyncMessages(
             let oldId = staleMsg.id
             let newMsgId = match.messageId
             let newId = "\(accountId):\(folderPath):\(newMsgId)"
-            // Fetch body BEFORE deleting header — CASCADE would delete body too
+            // Mirrors production (`SyncEngineFullSync` UID-remap leg): fetch the body
+            // BEFORE deleting the header, then delete its row EXPLICITLY. Stage D
+            // (`v70_dropMessageBodyHeaderFK`) removed the FK cascade that used to do
+            // the second half, and without it the old row survives alongside the copy
+            // re-inserted under the new id — a duplicate plus a leak.
             let oldBody = try MessageBody.fetchOne(dbConn, key: oldId)
             try staleMsg.delete(dbConn)
+            _ = try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
             var migrated = staleMsg
             migrated.id = newId
             migrated.messageId = newMsgId
@@ -783,7 +788,14 @@ struct RunSyncUIDRemapTests {
         #expect(allMsgs.count == 1)
     }
 
-    @Test("UID remap: body preserved through CASCADE delete (fetch-before-delete fix)")
+    /// ⚠ This test USED to pass for a reason that no longer exists. Its "old body is
+    /// gone" assertion was satisfied by the FK cascade firing on the header delete;
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) removed that cascade, so the same
+    /// assertion is now satisfied only by the explicit `MessageBody.deleteOne` the
+    /// remap leg gained. Keeping it green therefore means something different — and
+    /// it is the NEW failure mode (a leftover row under the OLD key, alongside the
+    /// copy under the new one) that it now guards.
+    @Test("UID remap: body moves to the new id and leaves NO row under the old key")
     func uidRemapBodyPreserved() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -808,9 +820,15 @@ struct RunSyncUIDRemapTests {
         let result = try simulateRunSyncMessages(db: db, folder: folder, messages: remoteMessages, limit: 50)
         #expect(result.uidMigratedOldIds.contains("300"))
 
-        // Old body is gone (header deleted, CASCADE cleaned up)
+        // THE NEW FAILURE MODE: no leftover row under the OLD key. With the cascade
+        // gone this is exactly what an unfixed remap leg would leave behind, and the
+        // count is asserted (not just `fetchOne == nil`) so a duplicate is visible.
         let oldBody = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:300") }
-        #expect(oldBody == nil)
+        #expect(oldBody == nil, "a leftover body under the pre-remap key is a duplicate AND a leak")
+        let totalBodies = try db.read {
+            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageBody") ?? -1
+        }
+        #expect(totalBodies == 1, "the re-key must MOVE the body, not copy it")
 
         // New header exists with correct rfc822MessageId
         let newMsg = try db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:400") }

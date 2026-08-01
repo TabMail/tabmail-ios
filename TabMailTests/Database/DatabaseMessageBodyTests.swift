@@ -27,8 +27,12 @@ struct DatabaseMessageBodyTests {
         #expect(fetched?.htmlContent == "<p>First</p>")
     }
 
-    @Test("MessageBody cascades on header deletion")
-    func cascadesOnHeaderDeletion() throws {
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) removed the cascade this test used to
+    /// assert. It now pins the property that REPLACED it: a header delete leaves the
+    /// content row alone, because at Stage E1 that row can be shared by other
+    /// headers and only `MessageContentStore` may decide it is unowned.
+    @Test("MessageBody does NOT cascade on header deletion")
+    func doesNotCascadeOnHeaderDeletion() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -38,7 +42,7 @@ struct DatabaseMessageBodyTests {
         try db.write { _ = try MessageHeader.deleteOne($0, key: "acc1:INBOX:1") }
 
         let body = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:1") }
-        #expect(body == nil)
+        #expect(body != nil, "no header-space cascade may reach a content row")
     }
 
     @Test("MessageBody fetchedAt is set")

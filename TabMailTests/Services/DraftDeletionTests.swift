@@ -277,11 +277,18 @@ struct DraftDeletionTests {
         }
 
         // Simulate migration (what pushDraftToServer does).
-        // Must save body content BEFORE deleting header (ON DELETE CASCADE deletes body too).
+        //
+        // Stage D (`v70_dropMessageBodyHeaderFK`): deleting the header NO LONGER
+        // removes its `messageBody` row — a content key is not a header id, so the
+        // cascade would delete a row the other N−1 owners still hold. The old body
+        // is therefore deleted EXPLICITLY, in the same transaction, exactly as
+        // `DraftStore.pushDraftToServer` does. Read the body first regardless: the
+        // re-key needs its HTML.
         try db.write { db in
             if let existing = try MessageHeader.fetchOne(db, key: oldHeaderId) {
                 let savedHtml = try MessageBody.fetchOne(db, key: oldHeaderId)?.htmlContent
-                try existing.delete(db) // CASCADE deletes body
+                try existing.delete(db)
+                _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldHeaderId))
                 var migrated = existing
                 migrated.id = newHeaderId
                 migrated.messageId = realMessageId
@@ -295,7 +302,8 @@ struct DraftDeletionTests {
         let oldHeader = try db.read { db in try MessageHeader.fetchOne(db, key: oldHeaderId) }
         #expect(oldHeader == nil)
         let oldBody = try db.read { db in try MessageBody.fetchOne(db, key: oldHeaderId) }
-        #expect(oldBody == nil)
+        #expect(oldBody == nil,
+                "the old content row must be reclaimed EXPLICITLY — since v70 no cascade does it")
 
         // New PK should exist with preserved content
         let newHeader = try db.read { db in try MessageHeader.fetchOne(db, key: newHeaderId) }

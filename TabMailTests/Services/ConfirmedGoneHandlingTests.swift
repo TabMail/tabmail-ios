@@ -222,8 +222,15 @@ struct IsConfirmedGoneErrorTests {
 @Suite("Confirmed-gone header deletion — scoped to exact headerId")
 struct DeleteConfirmedGoneHeaderTests {
 
-    @Test("DELETE by headerId removes the row and cascades to messageBody")
-    func deleteCascadesToBody() throws {
+    /// `deleteConfirmedGoneHeader` reclaims the body through
+    /// `MessageContentStore.releaseUnowned(…, stores: [.searchIndex, .body])` AFTER
+    /// its delete transaction commits — Stage D (`v70_dropMessageBodyHeaderFK`)
+    /// removed the FK cascade that used to do it inline. This pins the transaction
+    /// half: the header goes, the body stays for the routed release to decide on.
+    /// The end state (no body outlives its owner) is pinned against the production
+    /// path in `ContentOwnershipSweepTests`, which has a real `DatabasePool`.
+    @Test("DELETE by headerId removes the row and leaves messageBody to the routed release")
+    func deleteLeavesBodyToTheRoutedRelease() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -246,7 +253,8 @@ struct DeleteConfirmedGoneHeaderTests {
         let bodyCountAfter = try db.read { conn in
             try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM messageBody WHERE id = ?", arguments: [header.id]) ?? 0
         }
-        #expect(bodyCountAfter == 0)
+        #expect(bodyCountAfter == 1,
+                "the delete transaction must not reclaim content — only the routed release may")
     }
 
     /// The exact bug that motivated the audit fix. Two IMAP folders in one account

@@ -290,7 +290,12 @@ struct MessageHeaderQueryTests {
         #expect(headers.isEmpty)
     }
 
-    @Test("Deleting account cascades through folder to headers")
+    /// The cascade reaches `messageHeader` and stops there. Stage D
+    /// (`v70_dropMessageBodyHeaderFK`) removed the body link — a content key is not
+    /// a header id, so a per-header cascade would delete a row other headers still
+    /// own. `AccountManager.removeAccountRowsTxn` reclaims the cached body instead;
+    /// see `DatabaseSchemaValidationTests.removeAccountLeavesNoCachedMailBehind`.
+    @Test("Deleting account cascades through folder to headers, but not to bodies")
     func accountDeleteCascadesHeaders() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -303,7 +308,7 @@ struct MessageHeaderQueryTests {
         let headers = try db.read { try MessageHeader.fetchAll($0) }
         let bodies = try db.read { try MessageBody.fetchAll($0) }
         #expect(headers.isEmpty)
-        #expect(bodies.isEmpty)
+        #expect(bodies.count == 1, "content must not ride a header-space cascade")
     }
 
     // MARK: - AI fields persistence

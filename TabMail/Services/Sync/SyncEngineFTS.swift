@@ -604,12 +604,16 @@ extension SyncEngine {
     ///
     /// ⚠ STAGE E1: callers hand `messageHeader.id`s here (deletion is a header-space
     /// event); the FTS delete keys by content. Convert at the mint when they diverge.
+    ///
+    /// `.body` joins `.searchIndex` from Stage D: `v70_dropMessageBodyHeaderFK`
+    /// removed the FK cascade that used to reclaim `messageBody` as a side effect of
+    /// each caller's header delete. Routing it here covers all six callers at once.
     func removeHeadersFromFTS(_ headerIds: [String]) {
         guard !headerIds.isEmpty else { return }
         let pool = dbPool
         Task.detached(priority: .utility) {
             let released = await MessageContentStore.releaseUnowned(
-                headerIds.map(ContentKey.init(rawValue:)), stores: .searchIndex, pool: pool)
+                headerIds.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body], pool: pool)
             print("[FTS] Removed \(released)/\(headerIds.count) messages from index")
         }
     }

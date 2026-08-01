@@ -504,19 +504,7 @@ extension AccountManager {
 
         let wasPrimary = account.isPrimary
         try? await dbPool.write { db in
-            // Clean up non-cascaded tables first
-            try PendingOperation.filter(Column("accountId") == acctId).deleteAll(db)
-            try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE ? || ':%'", arguments: [acctId])
-            // Cascade: account → folders → messageHeaders → messageBodies → outboxMessages
-            try Account.deleteOne(db, key: acctId)
-
-            // Promote next oldest active account to primary if we just removed the primary
-            if wasPrimary {
-                try db.execute(sql: """
-                    UPDATE account SET isPrimary = 1
-                    WHERE id = (SELECT id FROM account WHERE isActive = 1 ORDER BY createdAt LIMIT 1)
-                """)
-            }
+            try Self.removeAccountRowsTxn(db, accountId: acctId, wasPrimary: wasPrimary)
         }
 
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
@@ -534,6 +522,44 @@ extension AccountManager {
         Task.detached(priority: .utility) {
             try? await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
             print("[AccountManager] Cleaned up FTS entries for removed account \(acctId)")
+        }
+    }
+
+    /// The whole database side of account removal, in ONE transaction.
+    ///
+    /// `nonisolated static` so tests can drive the real thing: `removeAccount`
+    /// itself needs providers, Keychain and push unsubscription, none of which a
+    /// unit test can stand up, and the invariant that matters here — **nothing of a
+    /// removed account's mail is left behind** — is entirely a property of this
+    /// transaction. Same idiom as `AccountManagerUidValidityReset
+    /// .uidValidityResetPurgeTxn` and `SyncEngine.deleteConfirmedGhostHeaders`.
+    nonisolated static func removeAccountRowsTxn(
+        _ db: Database, accountId: String, wasPrimary: Bool
+    ) throws {
+        // Clean up non-cascaded tables first
+        try PendingOperation.filter(Column("accountId") == accountId).deleteAll(db)
+        try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE ? || ':%'", arguments: [accountId])
+        // `messageBody` is keyed by CONTENT key, not by `messageHeader.id`, and
+        // Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK that used to carry
+        // it out on the cascade. Without this the removed account's cached email
+        // HTML would survive in the database for up to `bodyCacheTTLHours` after the
+        // user asked for the account to be gone. LIKE-escaped (account ids are
+        // colon-free UUIDs today, so this is hygiene rather than a fix) — content
+        // keys share the header id's `accountId:folderPath:` prefix, so one prefix
+        // covers every folder of the account.
+        try db.execute(
+            sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
+            arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
+        // Cascade: account → folders → messageHeaders → outboxMessages.
+        // (messageBody is NO LONGER on this chain — see the explicit delete above.)
+        try Account.deleteOne(db, key: accountId)
+
+        // Promote next oldest active account to primary if we just removed the primary
+        if wasPrimary {
+            try db.execute(sql: """
+                UPDATE account SET isPrimary = 1
+                WHERE id = (SELECT id FROM account WHERE isActive = 1 ORDER BY createdAt LIMIT 1)
+            """)
         }
     }
 

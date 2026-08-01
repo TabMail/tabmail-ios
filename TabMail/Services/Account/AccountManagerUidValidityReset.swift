@@ -385,11 +385,21 @@ extension AccountManager {
     }
 
     /// Step 3 — ONE write transaction: (i) pre-delete capture, (ii) `messageHeader`
-    /// (explicit — there is no folder→header foreign key; body/references/label
-    /// associations cascade off the header), (iii) `pendingRender`, (iv)
-    /// `chatIdMapping` (LIKE-escaped prefix plus the colon-hierarchy guard, so a
-    /// nested sibling under a ':'-delimiter IMAP server is not swept), (v) the
-    /// folder's own sync-state reset.
+    /// (explicit — there is no folder→header foreign key; references/label
+    /// associations cascade off the header), (iii) `messageBody` (explicit since
+    /// Stage D — see below), (iv) `pendingRender`, (v) `chatIdMapping` (LIKE-escaped
+    /// prefix plus the colon-hierarchy guard, so a nested sibling under a
+    /// ':'-delimiter IMAP server is not swept), (vi) the folder's own sync-state
+    /// reset.
+    ///
+    /// 🚨 The body purge is a PREFIX DELETE, deliberately NOT
+    /// `MessageContentStore.releaseUnowned`. This function runs while
+    /// `Folder.uidValidityResetPendingAt` is armed, and the quarantine term in
+    /// `MessageContentStore.protectedKeys` refuses every key in a quarantined folder
+    /// BY DESIGN. Routing through the gate here would therefore keep 100% of them
+    /// and reclaim nothing — the purge would silently become a no-op. The correct
+    /// shape is the unconditional, transaction-local prefix delete this function
+    /// already uses two statements later for `chatIdMapping`.
     ///
     /// ⚑ The quarantine flag stays SET — this is not step 5.
     /// ⚑ `pendingOperation` and `outboxMessage` rows are NEVER touched (Law 5).
@@ -401,6 +411,7 @@ extension AccountManager {
         let chatLikePrefix = MessageIdentity.escapedHeaderIdLikePrefix(accountId: accountId, folderPath: folderPath) + "%"
         let chatRawPrefix = MessageIdentity.headerIdPrefix(accountId: accountId, folderPath: folderPath)
         let chatNoDeeperColonSQL = MessageIdentity.headerIdLikeNoDeeperColonSQLFragment(column: "realId")
+        let bodyNoDeeperColonSQL = MessageIdentity.headerIdLikeNoDeeperColonSQLFragment(column: "id")
         do {
             return try await dbPool.write { db -> UidValidityResetPurgeResult in
                 // (i) Pre-delete capture.
@@ -410,13 +421,23 @@ extension AccountManager {
                 // (ii) messageHeader — explicit delete.
                 try MessageHeader.filter(Column("folderId") == folderId).deleteAll(db)
 
-                // (iii) pendingRender.
+                // (iii) messageBody — explicit since Stage D dropped the FK cascade
+                // that used to carry these out with their headers. Same LIKE-escaped
+                // prefix + no-deeper-colon guard as (v), so a nested sibling folder
+                // on a ':'-delimiter IMAP server is not swept. This mirrors what
+                // `purgeBodyAssetsForFolder` already does for the on-disk assets.
+                try db.execute(
+                    sql: "DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\\' AND \(bodyNoDeeperColonSQL)",
+                    arguments: [chatLikePrefix, chatRawPrefix]
+                )
+
+                // (iv) pendingRender.
                 try db.execute(
                     sql: "DELETE FROM pendingRender WHERE accountId = ? AND folderPath = ?",
                     arguments: [accountId, folderPath]
                 )
 
-                // (iv) chatIdMapping — a stale mapping would resolve a chat pill to
+                // (v) chatIdMapping — a stale mapping would resolve a chat pill to
                 // a reused UID under the new epoch, i.e. show one message as
                 // another.
                 try db.execute(
@@ -424,7 +445,7 @@ extension AccountManager {
                     arguments: [chatLikePrefix, chatRawPrefix]
                 )
 
-                // (v) Folder sync-state reset, scoped to THIS folder only.
+                // (vi) Folder sync-state reset, scoped to THIS folder only.
                 // `lastKnownUidValidity` is deliberately left at the OLD value —
                 // step 5 owns advancing it, and leaving it here is what makes an
                 // abort between the two re-drivable.

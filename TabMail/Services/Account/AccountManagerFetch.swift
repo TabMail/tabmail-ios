@@ -17,6 +17,10 @@ extension AccountManager {
     /// are captured INSIDE the delete transaction and the release happens AFTER it
     /// commits. Reversed, the header still exists when owners are counted, the count
     /// is always ≥ 1, and the FTS row is never removed — a silent no-op.
+    ///
+    /// `.body` joins `.searchIndex` from Stage D: `v70_dropMessageBodyHeaderFK`
+    /// removed the FK cascade that used to reclaim the `messageBody` row as a side
+    /// effect of the header delete, so this release is now the eager reclaimer.
     func evictStaleHeader(_ header: MessageHeader) async {
         let captured = try? await dbPool.write { db -> MessageContentStore.CapturedContent? in
             let captured = try MessageContentStore.capture(header, db: db)
@@ -27,12 +31,13 @@ extension AccountManager {
         if let captured = captured ?? nil {
             await MessageContentStore.releaseUnowned(
                 captured.contentKey, scope: captured.scope,
-                stores: .searchIndex, pool: dbPool)
+                stores: [.searchIndex, .body], pool: dbPool)
         } else {
             // No account row to read a key space from — keep the pre-existing
-            // unconditional removal rather than invent an owner.
+            // unconditional removal rather than invent an owner. `.body` is part of
+            // that pre-existing behaviour: the cascade deleted it here too.
             await MessageContentStore.release(
-                ContentKey(rawValue: header.id), stores: .searchIndex, pool: dbPool)
+                ContentKey(rawValue: header.id), stores: [.searchIndex, .body], pool: dbPool)
         }
     }
 

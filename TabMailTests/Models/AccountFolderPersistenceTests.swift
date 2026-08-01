@@ -237,7 +237,11 @@ struct AccountFolderPersistenceTests {
         #expect(folders[0].accountId == "acc2")
     }
 
-    @Test("Full cascade: account → folder → messageHeader → messageBody")
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) ended the cascade at `messageHeader`
+    /// — a content key is not a header id. `AccountManager.removeAccountRowsTxn` is
+    /// what reclaims a removed account's cached bodies now; that is pinned by
+    /// `DatabaseSchemaValidationTests.removeAccountLeavesNoCachedMailBehind`.
+    @Test("Full cascade: account → folder → messageHeader, stopping before messageBody")
     func fullCascadeChain() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1")
@@ -252,7 +256,7 @@ struct AccountFolderPersistenceTests {
         let bodies = try db.read { try MessageBody.fetchAll($0) }
         #expect(folders.isEmpty)
         #expect(headers.isEmpty)
-        #expect(bodies.isEmpty)
+        #expect(bodies.count == 1, "content must not ride a header-space cascade")
     }
 
     // MARK: - Folder role filtering

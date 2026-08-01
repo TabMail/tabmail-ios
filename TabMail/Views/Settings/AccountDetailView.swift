@@ -511,11 +511,19 @@ struct AccountDetailView: View {
         Task {
             let acctId = account.id
 
-            // Delete all headers for this account (CASCADE deletes bodies)
+            // Delete all headers for this account, and their cached bodies.
+            // Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK cascade that
+            // used to take `messageBody` out with the header, so the body rows are
+            // deleted explicitly — in the SAME transaction, by content-key prefix.
+            // Content keys share the header id's `accountId:folderPath:` prefix.
             try? await dbPool.write { db in
                 try db.execute(
                     sql: "DELETE FROM messageHeader WHERE accountId = ?",
                     arguments: [acctId]
+                )
+                try db.execute(
+                    sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
+                    arguments: [MessageIdentity.escapeForLike(acctId) + ":%"]
                 )
             }
 

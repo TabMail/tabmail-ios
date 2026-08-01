@@ -642,12 +642,18 @@ actor BackfillBodyQueue {
 
     /// Re-key a header whose stored UID is dead to the server's current UID,
     /// preserving body/flags. Mirrors full-sync's UID-remap migration
-    /// (SyncEngineFullSync UID remap block): delete + reinsert because
-    /// messageBody's FK CASCADE forbids a PK UPDATE, then move the FTS entry
-    /// IN PLACE via `SearchIndex.rekeyHeaders` (preserves the indexed body text
-    /// and the embedding). Without this, a deep-history remap retries the dead
+    /// (SyncEngineFullSync UID remap block): delete + reinsert, then move the FTS
+    /// entry IN PLACE via `SearchIndex.rekeyHeaders` (preserves the indexed body
+    /// text and the embedding). Without this, a deep-history remap retries the dead
     /// UID forever — full-sync's remap window only covers recent messages, so
     /// `pendingBodyCount` never reaches 0 (the permanent "99% indexed" stall).
+    ///
+    /// The delete+reinsert shape originally existed because `messageBody`'s FK
+    /// CASCADE forbade a PK UPDATE. Stage D (`v70_dropMessageBodyHeaderFK`) removed
+    /// that FK, but the shape is deliberately KEPT here — converting it would be a
+    /// behaviour change riding a schema commit, and Stage E1 reshapes this leg
+    /// again. What Stage D does change is that the old body row must now be deleted
+    /// EXPLICITLY, on every exit including `duplicateDropped`.
     ///
     /// Exposed as `internal` (not private) so tests can drive it directly.
     func rekeyRemappedHeader(item: Item, newUID: String) async -> RekeyOutcome {
@@ -661,9 +667,15 @@ actor BackfillBodyQueue {
                     // Row already gone (raced with sync/prune) — nothing to migrate.
                     return .duplicateDropped
                 }
-                // Fetch body BEFORE deleting the header — FK CASCADE deletes it too.
+                // Fetch the body BEFORE deleting the header, then delete its row
+                // EXPLICITLY (Stage D removed the FK cascade that used to). Both
+                // statements sit ABOVE the `duplicateDropped` guard on purpose: that
+                // leg returns with the header already gone, so a body delete placed
+                // after it would strand the row exactly on the branch that discards
+                // the message.
                 let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: item.headerId))
                 try header.delete(db)
+                _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: item.headerId))
                 guard try MessageHeader.fetchOne(db, key: newHeaderId) == nil else {
                     // The new UID was independently backfilled — old row was a duplicate.
                     return .duplicateDropped

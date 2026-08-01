@@ -245,9 +245,10 @@ extension SyncEngine {
                 // Routed through `MessageContentStore` (as the non-retry path's
                 // `removeHeadersFromFTS` is): the stale headers are already deleted by
                 // the sync write above, so the owner count here sees the post-delete
-                // world — the ordering the gate depends on.
+                // world — the ordering the gate depends on. `.body` joins from
+                // Stage D, which dropped the FK cascade that used to reclaim it.
                 await MessageContentStore.releaseUnowned(
-                    result.staleIds.map(ContentKey.init(rawValue:)), stores: .searchIndex)
+                    result.staleIds.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body])
             }
             if !result.newHeaders.isEmpty {
                 let records = result.newHeaders.map { header in
@@ -668,8 +669,11 @@ extension SyncEngine {
         var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
         var removedIds: [String] = []
 
-        // Preserve the richest cached body across all rows BEFORE any delete —
-        // MessageBody is keyed 1:1 by header id and CASCADE-deletes with it.
+        // Preserve the richest cached body across all rows BEFORE any delete. Each
+        // loser's body row is then deleted EXPLICITLY where its header goes: Stage D
+        // (`v70_dropMessageBodyHeaderFK`) removed the cascade that used to do it,
+        // and leaving them behind would mean one leaked body per merged duplicate.
+        // These are value copies, so deleting the rows does not disturb `bestBody`.
         var bestBody: MessageBody?
         for row in rows {
             if let body = try MessageBody.fetchOne(db, key: row.id),
@@ -697,6 +701,7 @@ extension SyncEngine {
             // survivor's flags must describe its OWN FTS row, and the losers'
             // FTS rows leave via staleIds.
             try row.delete(db)
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: row.id))
             removedIds.append(row.id)
             print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
         }
@@ -718,11 +723,17 @@ extension SyncEngine {
                 if !removedIds.isEmpty { try survivor.update(db) }
                 return (survivor, removedIds, nil)
             }
-            // Re-key the optimistic-move remnant to the canonical PK. The PK
-            // can't be UPDATEd in place (messageBody references it with
-            // ON DELETE CASCADE), so delete + reinsert, body reattached below.
+            // Re-key the optimistic-move remnant to the canonical PK, by delete +
+            // reinsert with the body reattached below. (The FK that used to FORBID a
+            // PK `UPDATE` here is gone as of Stage D, but converting these legs is
+            // deliberately NOT part of that change — it is a behaviour change riding
+            // a schema commit, and Stage E1 reshapes them again.) The old body row
+            // is now deleted EXPLICITLY: without it the row would survive the re-key
+            // AND a copy would be inserted under the canonical id — a duplicate plus
+            // a leak, where the cascade used to leave exactly one row.
             let oldId = survivor.id
             try survivor.delete(db)
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
             survivor.id = canonicalId
             survivor.folderPath = folderPath
             try survivor.insert(db)
@@ -1227,9 +1238,16 @@ extension SyncEngine {
                 let newMsgId = match.messageId
                 let newId = "\(accountId):\(folderPath):\(newMsgId)"
                 print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
-                // Fetch body BEFORE deleting header — CASCADE would delete body too
+                // Fetch the body BEFORE deleting the header, then delete its row
+                // EXPLICITLY: the FK cascade that used to do that is gone as of
+                // Stage D, and the copy re-inserted under the new id below would
+                // otherwise leave the old row behind — a duplicate plus a leak.
+                // Both statements must precede EVERY exit from this iteration,
+                // including the `continue` guard below, or the leg that skips the
+                // re-insert still leaves the orphan.
                 let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId))
                 try staleMsg.delete(db)
+                _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                 var migrated = staleMsg
                 migrated.id = newId
                 migrated.messageId = newMsgId

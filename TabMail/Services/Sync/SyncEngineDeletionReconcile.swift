@@ -309,7 +309,10 @@ extension SyncEngine {
 
         let deletable = candidates.filter { !isProtected($0) }
         for msg in deletable {
-            try msg.delete(db) // messageBody CASCADE-deletes; MessageAICache survives by design
+            // The returned ids go to `removeHeadersFromFTS`, which since Stage D
+            // releases `.body` alongside `.searchIndex` — there is no FK cascade
+            // behind `messageBody` any more. MessageAICache survives by design.
+            try msg.delete(db)
         }
         return deletable.map(\.id)
     }

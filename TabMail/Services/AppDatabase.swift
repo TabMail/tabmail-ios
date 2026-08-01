@@ -1979,5 +1979,121 @@ final class AppDatabase: Sendable {
                 t.add(column: "observedUidValidity", .integer)
             }
         }
+
+        migrator.registerMigration("v70_dropMessageBodyHeaderFK") { db in
+            // #37 Stage D. `messageBody.id` is a CONTENT key, not a header id
+            // (`ContentKeySpace`). Once its tail becomes the RFC 822 Message-ID at
+            // Stage E1 the reference is invalid in BOTH directions: the FK REJECTS
+            // the insert outright (`FOREIGN KEY constraint failed` on every body
+            // write for every rfc-having IMAP/iCloud message), and where a row does
+            // exist the cascade deletes content still owned by the other N−1 headers
+            // — below the application layer, where `MessageContentStore` cannot veto
+            // it. Ownership is answered by `MessageContentStore` from here on.
+            //
+            // NO key is re-written here. v3 changes only what NEW content keys are
+            // minted, so every surviving key stays byte-identical and there is no
+            // bulk re-key (that is what `PLAN_RFC_KEY_MIGRATION_ADR062.md` §4
+            // describes for the LARGER design — re-keying `messageHeader.id` itself
+            // — which v3 does not do).
+            //
+            // `messageReference.messageHeaderId` and `messageUserLabel.messageId`
+            // KEEP their cascades deliberately: both are header-space rows (threading
+            // references, the user-label junction), neither moves to the content key
+            // space, and nothing would reclaim them if the cascade were dropped.
+            // Do not "complete" Stage D by removing those.
+            //
+            // ── WHY DROP-AND-RECREATE, AND WHY LOSING THE CACHE IS ACCEPTABLE ──
+            //
+            // SQLite has no `ALTER TABLE … DROP CONSTRAINT` and GRDB offers no
+            // drop-FK helper, so the constraint can only leave with the table that
+            // declares it. `messageBody` is a RE-FETCHABLE CACHE of rendered email
+            // HTML — every row can be rebuilt from the server, and the app already
+            // discards these rows routinely and by design (`runEvictStaleBodies`
+            // TTL sweep, `BodyAssetMaintenance.evictIfOverCap` LRU,
+            // `runPruneIfOverBudget`). Dropping all of it is therefore the SAME
+            // class of event those sweeps produce every day, not a new one, and the
+            // OWNER HAS EXPLICITLY ACCEPTED the one-time cache loss on upgrade.
+            //
+            // Measured: drop+create is 0.319 s with ZERO extra disk, and the
+            // freelist those pages return to is consumed again as the cache refills
+            // — so the file never grows and no `VACUUM` is ever needed.
+            //
+            // The two alternatives were costed and REJECTED:
+            // - The textbook 12-step rebuild (`v2_dropMessageHeaderFolderFK` here,
+            //   `v71_accountScopeUserLabels` on `v2final`) preserves the rows but
+            //   measured ~11 s for a 2 GB body table on a Mac — 2–4× worse on
+            //   device — needs ≈3× the table free at peak, and leaves the file at
+            //   ≈2× until a `VACUUM` the app never runs outside `AppDataWiper`.
+            //   That permanent growth feeds `StorageEstimator.totalSizeMB()` →
+            //   `isOverBudget()` → `SyncEngine.runPruneIfOverBudget`, which deletes
+            //   `MessageHeader` ROWS oldest-first: a schema-only migration causing
+            //   MESSAGE pruning. `StorageEstimator.defaultBudgetMB == Int.max`, so
+            //   this table is unbounded and multi-GB is normal. On a device without
+            //   3× headroom it cannot complete at all — the app loops at the
+            //   "Updating…" splash, which is this app's documented boot-hang shape
+            //   (see the `PLAN_HANG_FIX` note above).
+            // - An in-place `sqlite_master` DDL edit via `PRAGMA writable_schema`
+            //   would have been ~0 s and lossless, but it is BLOCKED: Apple's system
+            //   SQLite ships `SQLITE_DBCONFIG_DEFENSIVE = 1` by default, which makes
+            //   `PRAGMA writable_schema = ON` a SILENT no-op (measured three ways).
+            //   Clearing it needs a C shim; the owner declined that dependency.
+            //
+            // ── WHAT MUST **NOT** BE "REPAIRED" ALONGSIDE THIS ──
+            //
+            // `messageHeader.bodyComplete` is NOT reset, and that is deliberate. It
+            // is the FTS-indexed truth (backfill completion / `pendingBodyCount` /
+            // AI + embedding gating), NOT an assertion that a cached row exists —
+            // exactly as stated by the type-level INVARIANT (2026-07-02) on
+            // `BodyAssetMaintenance`, which this migration is bound by. Flipping it
+            // re-enqueues every victim into the backfill body queue, which re-fetches
+            // the bodies, which re-fills the cache past its cap, which evicts again:
+            // the "indexing goes backwards" infinite refetch loop. "HTML cache
+            // present" needs no flag — the `messageBody` row's existence IS that
+            // state, and every reader already computes it live
+            // (`MessageDetailViewModel.loadThreadMessageBody`,
+            // `AccountManagerFetch.fetchBodyIfNeeded`) and fetches on cache-miss.
+            // `v2final`'s `repairPayloadTooLargeEmptyBodies` DOES pair a body delete
+            // with `bodyComplete = 0`, but only for bodies that were never VALIDLY
+            // fetched (`bodyEmptyConfirmed = 1 AND emptyFetchCount < 3`) — the
+            // repair case, not the eviction case. This is the eviction case.
+            //
+            // `BodyAssetStore` is NOT cleared either. Its manifest ids are
+            // deterministic (`headerHash(contentKey)/assetHash(cid|section)`) and
+            // written with `ON CONFLICT(id) DO UPDATE`, so a re-fetch re-attaches
+            // the SAME rows and the SAME files — it cannot duplicate either. The
+            // assets stay owned (their headers are untouched, so
+            // `BodyAssetMaintenance.pruneOrphans` correctly protects them), stay
+            // bounded (`evictIfOverCap` against `attachmentsBudgetMB`, default
+            // 1024 MB), and are still reclaimed when their header dies via the
+            // routed `MessageContentStore.releaseUnowned(… .assets)` sites. Clearing
+            // them would delete still-reachable user data and force a re-download of
+            // every cached attachment.
+            //
+            // `SearchIndex.message_meta.hasBody` is NOT reset. It lives in the
+            // separate FTS database, which this DDL does not touch, and it means
+            // "the FTS row carries non-empty indexed body TEXT" — which stays TRUE,
+            // because the FTS text survives. Search keeps working over bodies whose
+            // HTML cache this migration discarded.
+            if DebugModeManager.isLoggingEnabled() {
+                let discarded = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageBody") ?? -1
+                print("[Migration v70] discarding \(discarded) cached body row(s) to drop the header FK")
+            }
+            try db.drop(table: "messageBody")
+            // Recreated WITHOUT the `.references("messageHeader", onDelete: .cascade)`
+            // that `v1`/`v2` declared. Every other column is reproduced exactly as the
+            // v69 schema had it — `icsText` last, because `v19` added it by `ALTER`.
+            // `messageBody` carries no named index on any schema up to v69: its only
+            // index is the implicit `sqlite_autoindex` behind the TEXT primary key,
+            // which `CREATE TABLE` reproduces. If a later migration ever adds one
+            // BEFORE v70, it must be recreated here too — `v70RecreatesEveryIndex`
+            // pins that.
+            try db.create(table: "messageBody") { t in
+                t.primaryKey("id", .text)
+                t.column("htmlContent", .text)
+                t.column("attachmentsJSON", .text)
+                t.column("fetchedAt", .datetime).notNull()
+                t.column("icsText", .text)
+            }
+        }
     }
 }

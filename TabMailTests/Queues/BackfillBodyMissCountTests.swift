@@ -152,8 +152,12 @@ struct BackfillBodyMissCountTests {
         #expect(SyncConfig.backfillBodyMissThreshold == 5)
     }
 
-    @Test("Delete at threshold removes header — same FK cascade as confirmed-gone path")
-    func deleteAtThresholdCascades() throws {
+    /// The threshold delete funnels into `deleteConfirmedGoneHeader`, which since
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) reclaims the body through
+    /// `MessageContentStore.releaseUnowned(…, stores: [.searchIndex, .body])` after
+    /// its transaction commits, rather than through an FK cascade inside it.
+    @Test("Delete at threshold removes header — same routed reclamation as the confirmed-gone path")
+    func deleteAtThresholdRemovesHeader() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -178,10 +182,11 @@ struct BackfillBodyMissCountTests {
         }
         #expect(headerCount == 0)
 
-        // Body cascaded out
+        // The body is NOT carried out by the delete — no FK cascade remains. It is
+        // reclaimed by the routed release that runs after the transaction commits.
         let bodyCount = try db.read { conn in
             try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM messageBody WHERE id = ?", arguments: [h.id]) ?? 0
         }
-        #expect(bodyCount == 0)
+        #expect(bodyCount == 1)
     }
 }

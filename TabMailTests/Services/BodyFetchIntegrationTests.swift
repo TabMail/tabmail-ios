@@ -274,8 +274,20 @@ struct BodyFetchMessageBodyPersistenceTests {
         #expect(fetched?.id.rawValue == header.id)
     }
 
-    @Test("MessageBody CASCADE deletes when header deleted")
-    func cascadeDeleteOnHeaderRemoval() throws {
+    /// Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK that used to make a
+    /// bare header delete take the body with it. This test used to bless that
+    /// cascade; it now pins the property that REPLACED it, because the cascade is
+    /// the thing that becomes a data-loss engine once N headers share one content
+    /// key: it would delete a row still owned by the other N−1, below the
+    /// application layer where `MessageContentStore` cannot veto it.
+    ///
+    /// The end-state invariant the old assertion was really guarding — *a deleted
+    /// header leaves no body behind* — did not go away; it moved to the routed
+    /// release, and is pinned against the PRODUCTION deletion path (with a real
+    /// `DatabasePool`, which this in-memory queue cannot provide) in
+    /// `ContentOwnershipSweepTests`.
+    @Test("A bare header delete no longer takes the body with it — reclamation is explicit")
+    func headerDeleteLeavesBodyForTheRoutedRelease() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -291,9 +303,10 @@ struct BodyFetchMessageBodyPersistenceTests {
             _ = try MessageHeader.deleteOne(dbConn, key: header.id)
         }
 
-        // Body should be cascade-deleted
+        #expect(try db.read { try MessageHeader.fetchOne($0, key: header.id) } == nil)
         let bodyAfter = try db.read { try MessageBody.fetchOne($0, key: header.id) }
-        #expect(bodyAfter == nil)
+        #expect(bodyAfter != nil,
+                "no FK may delete content as a side effect of a header delete — at Stage E1 that row can be owned by other headers")
     }
 
     @Test("save() acts as upsert — second write updates existing body")

@@ -121,7 +121,12 @@ struct DatabaseDataIntegrityTests {
         }
     }
 
-    @Test("Cascade chain: account → folder → header → body")
+    /// The cascade chain stops at `messageHeader` from Stage D
+    /// (`v70_dropMessageBodyHeaderFK`) — see
+    /// `DatabaseSchemaValidationTests.cascadeDeleteChain` for why, and
+    /// `removeAccountLeavesNoCachedMailBehind` for the production path that reclaims
+    /// the body instead.
+    @Test("Cascade chain: account → folder → header, and no longer → body")
     func fullCascadeChain() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -138,11 +143,12 @@ struct DatabaseDataIntegrityTests {
         // Delete account
         try db.write { _ = try Account.deleteAll($0, keys: ["acc1"]) }
 
-        // All cascaded
+        // Header-space rows cascaded…
         #expect(try db.read { try Account.fetchCount($0) } == 0)
         #expect(try db.read { try Folder.fetchCount($0) } == 0)
         #expect(try db.read { try MessageHeader.fetchCount($0) } == 0)
-        #expect(try db.read { try MessageBody.fetchCount($0) } == 0)
+        // …and the content row did not ride along.
+        #expect(try db.read { try MessageBody.fetchCount($0) } == 1)
     }
 
     @Test("ChatTurn persists with all fields including sessionId")

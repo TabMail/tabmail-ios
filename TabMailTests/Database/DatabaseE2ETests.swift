@@ -40,14 +40,19 @@ struct DatabaseE2ETests {
         }
         #expect(archiveCount == 1)
 
-        // Delete account — cascades everything
+        // Delete account — cascades the header-space rows. Stage D
+        // (`v70_dropMessageBodyHeaderFK`) ended the chain before `messageBody`,
+        // because a content key is not a header id; the cached body is reclaimed by
+        // `AccountManager.removeAccountRowsTxn`, which this raw `Account.deleteAll`
+        // deliberately bypasses. See
+        // `DatabaseSchemaValidationTests.removeAccountLeavesNoCachedMailBehind`.
         try db.write { _ = try Account.deleteAll($0, keys: ["acc1"]) }
 
         let totalHeaders = try db.read { try MessageHeader.fetchCount($0) }
         let totalBodies = try db.read { try MessageBody.fetchCount($0) }
         let totalFolders = try db.read { try Folder.fetchCount($0) }
         #expect(totalHeaders == 0)
-        #expect(totalBodies == 0)
+        #expect(totalBodies == 1, "content must not ride a header-space cascade")
         #expect(totalFolders == 0)
     }
 

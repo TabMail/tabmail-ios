@@ -34,7 +34,10 @@ enum AppDataWiper {
         // 4. Disconnect Device Sync WebSocket
         DeviceSyncService.shared.disconnect()
 
-        // 5. Nuke all database tables (order matters for foreign keys)
+        // 5. Nuke all database tables. Order still matters for the foreign keys that
+        // remain (folder/account cascades). `messageBody` no longer has one — Stage D
+        // dropped it — so its explicit DELETE here is now REQUIRED rather than merely
+        // ordered: nothing else would remove those rows.
         try? await dbPool.write { db in
             try db.execute(sql: "DELETE FROM messageBody")
             try db.execute(sql: "DELETE FROM messageHeader")

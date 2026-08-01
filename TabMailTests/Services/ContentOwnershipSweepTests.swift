@@ -115,9 +115,37 @@ struct ContentOwnershipSweepTests {
         try? await SearchIndex.shared.removeMessages(contentKeys: keys)
         try? await AppDatabase.dbPool.write { db in
             try db.execute(sql: "DELETE FROM messageHeader WHERE accountId = ?", arguments: [accountId])
+            // Explicit since Stage D: the header delete above no longer cascades to
+            // `messageBody`, so without this a suite would leak its own fixtures into
+            // the shared production pool and the next run's global sweeps would see
+            // them. Prefix-scoped, LIKE-escaped, exactly as `removeAccountRowsTxn`.
+            try db.execute(
+                sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
+                arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
             try db.execute(sql: "DELETE FROM folder WHERE accountId = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM account WHERE id = ?", arguments: [accountId])
         }
+    }
+
+    /// Seed a `messageBody` row, optionally backdated past the eviction TTL so
+    /// `runEvictStaleBodies` will consider it. No hardcoded dates — the cutoff is
+    /// computed from `Date()` exactly as the sweep computes its own.
+    private func seedBody(key: ContentKey, html: String, ageHours: Int) async throws {
+        let fetchedAt = Calendar.current.date(
+            byAdding: .hour, value: -ageHours, to: Date()) ?? Date()
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: """
+                INSERT OR REPLACE INTO messageBody (id, htmlContent, attachmentsJSON, fetchedAt, icsText)
+                VALUES (?, ?, NULL, ?, NULL)
+                """, arguments: [key.rawValue, html, fetchedAt])
+        }
+    }
+
+    private func bodyHTML(_ key: ContentKey) async -> String? {
+        let fetched = try? await AppDatabase.dbPool.read { db in
+            try MessageBody.fetchOne(db, key: key)
+        }
+        return fetched?.htmlContent
     }
 
     // MARK: - R8: the sweeps do not mass-delete
@@ -191,6 +219,127 @@ struct ContentOwnershipSweepTests {
 
         #expect(await ftsRowid(key) == nil, "unowned FTS row must still be pruned")
         #expect(!manifestKeys().contains(key), "unowned asset rows must still be pruned")
+        await cleanup(accountId: accountId, keys: [key])
+    }
+
+    // MARK: - #37 Stage D: the FOURTH sweep, and the body store
+
+    /// 🚨 THE FOURTH SWEEP. Stage C's census gated `pruneFTSOrphans`,
+    /// `backfillFolderIdsIfNeeded` and `BodyAssetMaintenance.pruneOrphans` and missed
+    /// `runEvictStaleBodies`, because it is not an orphan sweep by name — it is a TTL
+    /// cache evictor whose orphan branch (`no messageHeader holds this id` → delete)
+    /// was unreachable while the `messageBody → messageHeader` FK cascade removed the
+    /// row first. `v70_dropMessageBodyHeaderFK` is exactly what makes it reachable,
+    /// which is why the gate ships with the migration and not after it.
+    ///
+    /// Two-sided by construction — an evictor that simply stopped deleting would fail
+    /// the second half:
+    ///
+    /// - a stale orphan in a QUARANTINED folder must be KEPT (red without the gate);
+    /// - a stale orphan nothing owns must STILL be evicted;
+    /// - a stale orphan whose folder no longer exists must STILL be evicted — the
+    ///   deliberate "unresolvable scope is not protected" rule, without which a
+    ///   removed account's cached HTML would be a FOREVER leak rather than the
+    ///   reclaimed-on-a-later-pass kind the fail-safe direction trades for;
+    /// - a body a live header still holds must be KEPT, so the sweep is demonstrably
+    ///   still doing its normal job around the new branch.
+    ///
+    /// The bounded wait is deliberate. `206ec48cf` had to repair a sibling sweep whose
+    /// loop stopped terminating when the Stage C gate added a third per-row outcome;
+    /// this sweep is cursored (`LIMIT/OFFSET`) and a KEEP counts as a SKIP, so the
+    /// offset still advances — asserted here as an OUTCOME (the sweep returns) rather
+    /// than by reading the loop.
+    @Test("#37 — the stale-body evictor keeps what it cannot prove dead, and still reclaims what is")
+    func evictStaleBodiesGatesItsOrphanLegAndStillReclaims() async throws {
+        let accountId = "stageD-evict"
+        try await seedScope(
+            accountId: accountId, folderPath: "INBOX", provider: .imap, quarantined: true)
+        try await seedScope(
+            accountId: accountId, folderPath: "Archive", provider: .imap, quarantined: false)
+
+        // Older than the TTL by a clear margin, computed from `Date()` — never a
+        // hardcoded date.
+        let staleHours = SyncConfig.bodyCacheTTLHours + 24
+
+        // KEEP: orphan under a UIDVALIDITY quarantine.
+        let quarantinedOrphan = ContentKey(rawValue: "\(accountId):INBOX:3701")
+        try await seedBody(key: quarantinedOrphan, html: "<p>quarantined</p>", ageHours: staleHours)
+        // EVICT: orphan in a live folder that nothing owns.
+        let deadOrphan = ContentKey(rawValue: "\(accountId):Archive:3702")
+        try await seedBody(key: deadOrphan, html: "<p>dead</p>", ageHours: staleHours)
+        // EVICT: orphan whose folder does not exist at all — scope unresolvable.
+        let ghostFolderOrphan = ContentKey(rawValue: "\(accountId):GhostFolder:3704")
+        try await seedBody(key: ghostFolderOrphan, html: "<p>ghost</p>", ageHours: staleHours)
+        // KEEP: a body a live header still holds.
+        let liveHeader = try await seedHeader(
+            accountId: accountId, folderPath: "Archive", messageId: "3703")
+        let liveKey = ContentKey(rawValue: liveHeader.id)
+        try await seedBody(key: liveKey, html: "<p>live</p>", ageHours: staleHours)
+
+        let sweep = Task.detached(priority: .utility) {
+            SyncEngine.runEvictStaleBodies(
+                dbPool: AppDatabase.dbPool, undoProtectedBodyIds: [])
+        }
+        do {
+            try await withTimeout(seconds: 30) { await sweep.value }
+        } catch {
+            sweep.cancel()
+            throw error
+        }
+
+        #expect(await bodyHTML(quarantinedOrphan) == "<p>quarantined</p>",
+                "a quarantined folder's cached body must survive the TTL evictor's orphan leg")
+        #expect(await bodyHTML(liveKey) == "<p>live</p>",
+                "a body a live header still holds must not be evicted")
+        #expect(await bodyHTML(deadOrphan) == nil,
+                "an orphan nothing owns must STILL be reclaimed")
+        #expect(await bodyHTML(ghostFolderOrphan) == nil,
+                "an orphan whose folder is gone must still be reclaimed — otherwise it leaks forever")
+
+        await cleanup(
+            accountId: accountId,
+            keys: [quarantinedOrphan, deadOrphan, ghostFolderOrphan, liveKey])
+    }
+
+    /// Part 3 of Stage D: `.body` is no longer implicit. With the FK cascade gone,
+    /// a routed site that deletes a header and wants its cached HTML reclaimed must
+    /// say so — and must still be refused while the header is alive.
+    ///
+    /// RED with `.body` dropped from the `stores` set: the cached HTML survives a
+    /// header that no longer exists, forever, because nothing else reclaims a key
+    /// whose folder still resolves.
+    ///
+    /// Both directions in one test on purpose: a `releaseUnowned` that released
+    /// unconditionally would satisfy the second assertion alone.
+    @Test("Stage D — a routed release reclaims the cached body, and only once nothing owns it")
+    func routedReleaseReclaimsTheBodyOnlyWhenUnowned() async throws {
+        let accountId = "stageD-release"
+        try await seedScope(accountId: accountId, folderPath: "INBOX", provider: .gmail)
+        let header = try await seedHeader(
+            accountId: accountId, folderPath: "INBOX", messageId: "rel1")
+        let key = ContentKey(rawValue: header.id)
+        try await seedBody(key: key, html: "<p>routed</p>", ageHours: 0)
+        let scope = MessageContentStore.ContentKeyScope(
+            accountId: accountId, folderPath: "INBOX", space: .stableProviderId)
+
+        let releasedWhileOwned = await MessageContentStore.releaseUnowned(
+            key, scope: scope, stores: [.searchIndex, .body])
+        #expect(releasedWhileOwned == false, "an owned key must never be released")
+        #expect(await bodyHTML(key) == "<p>routed</p>",
+                "and its cached body must be untouched")
+
+        try await AppDatabase.dbPool.write { db in
+            _ = try MessageHeader.deleteOne(db, key: header.id)
+        }
+        #expect(await bodyHTML(key) == "<p>routed</p>",
+                "precondition: with the v70 cascade gone, the header delete alone leaves the body behind")
+
+        let releasedWhenUnowned = await MessageContentStore.releaseUnowned(
+            key, scope: scope, stores: [.searchIndex, .body])
+        #expect(releasedWhenUnowned == true, "an unowned key must be released")
+        #expect(await bodyHTML(key) == nil,
+                "the cached body must be reclaimed by the release — nothing else will")
+
         await cleanup(accountId: accountId, keys: [key])
     }
 
@@ -280,8 +429,11 @@ struct ContentOwnershipSweepTests {
     /// The ordering contract, pinned DIRECTLY rather than by outcome: the SAME key
     /// and the SAME scope must produce opposite verdicts either side of the header
     /// delete. A helper called before the commit sees an owner and can never
-    /// release — a permanent, silent no-op that an outcome-only assertion would not
-    /// catch, because the `messageBody` FK cascade satisfies it either way.
+    /// release — a permanent, silent no-op that an outcome-only assertion on the
+    /// BODY would not have caught while the `messageBody` FK cascade satisfied it
+    /// either way. That cascade is gone at Stage D, but the reason to pin the order
+    /// directly is not: it is the property, and the FTS store it is asserted on has
+    /// never had a cascade to hide behind.
     @Test("Ordering contract — releaseUnowned refuses before the header delete and releases after")
     func releaseUnownedRefusesBeforeTheDeleteAndReleasesAfter() async throws {
         let accountId = "stageC-ordering"
@@ -336,6 +488,7 @@ struct ContentOwnershipSweepTests {
             accountId: accountId, folderPath: "INBOX", messageId: "gone1")
         let key = ContentKey(rawValue: header.id)
         try await seedFTSRow(key: key, messageId: "gone1", folderId: folderId, body: "gone body")
+        try await seedBody(key: key, html: "<p>gone</p>", ageHours: 0)
         #expect(await ftsRowid(key) != nil, "precondition: indexed")
 
         await AccountManager.shared.deleteConfirmedGoneHeader(
@@ -347,6 +500,10 @@ struct ContentOwnershipSweepTests {
         #expect(stillThere == false, "precondition: the header was deleted")
         #expect(await ftsRowid(key) == nil,
                 "the orphaned search row must be released — only possible if owners were counted AFTER the commit")
+        // Stage D: the FK cascade no longer reclaims the body either, so this routed
+        // caller has to ask for `.body` explicitly. RED if it does not.
+        #expect(await bodyHTML(key) == nil,
+                "the orphaned cached body must be released too — no cascade does it any more")
 
         await cleanup(accountId: accountId, keys: [key])
     }

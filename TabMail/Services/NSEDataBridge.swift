@@ -1948,6 +1948,16 @@ enum NSEDataBridge {
         var successfullyConsumedIds: [String] = []
         var deletedTotal = 0
         var outerCommitted = false
+        // 🚨 ORDERING CONTRACT (`MessageContentStore`): the content keys are captured
+        // INSIDE the delete transaction, from the rows about to go away, and released
+        // AFTER it commits. Reversed, the headers still exist when owners are counted,
+        // the count is always ≥ 1, and nothing is ever released.
+        //
+        // This is the highest-FREQUENCY site that used to lean on the FK cascade —
+        // every archive/delete/move performed on another device arrives here. Without
+        // the release, Stage D would turn it into a recurring push-driven body leak,
+        // reclaimed only by `runEvictStaleBodies` up to `bodyCacheTTLHours` later.
+        var releasedContentKeys: [ContentKey] = []
 
         do {
             try AppDatabase.dbPool.write { db in
@@ -1969,6 +1979,11 @@ enum NSEDataBridge {
                     // (IOERR/FULL/INTERRUPT) abort the outer tx and bubble
                     // out to the catch below.
                     do {
+                        let doomedIds = try String.fetchAll(db, sql: """
+                            SELECT id FROM messageHeader
+                            WHERE accountId = ? AND messageId = ?
+                              AND folderId IN (\(inboxPlaceholders))
+                            """, arguments: StatementArguments([removal.accountId, removal.messageId] + inboxFolderIds))
                         try db.execute(sql: """
                             DELETE FROM messageHeader
                             WHERE accountId = ? AND messageId = ?
@@ -1976,6 +1991,11 @@ enum NSEDataBridge {
                             """, arguments: StatementArguments([removal.accountId, removal.messageId] + inboxFolderIds))
                         deletedTotal += db.changesCount
                         successfullyConsumedIds.append(removal.id)
+                        // ⚠ STAGE E1: a header id is handed here as a content key, the
+                        // same crossing `SyncEngineFTS.removeHeadersFromFTS` and
+                        // `pruneOldMessages` already carry. Convert at the mint when
+                        // the two key spaces diverge.
+                        releasedContentKeys.append(contentsOf: doomedIds.map(ContentKey.init(rawValue:)))
                     } catch {
                         print("[NSEDataBridge] Per-removal failed for \(removal.id): \(error) — left in staging for retry")
                     }
@@ -1999,6 +2019,17 @@ enum NSEDataBridge {
         // staging rows must NOT be cleared — next wake will retry.
         guard outerCommitted else {
             return false
+        }
+
+        // The header deletes are durable now, so the owner count below sees the
+        // post-delete world. Gated on `outerCommitted` for the same reason the
+        // staging cleanup is: on a rolled-back outer tx the headers are still there,
+        // every key would read as owned, and the release would be a no-op anyway.
+        if !releasedContentKeys.isEmpty {
+            let keys = releasedContentKeys
+            Task.detached(priority: .utility) {
+                await MessageContentStore.releaseUnowned(keys, stores: .body)
+            }
         }
 
         // Clear only the removals that committed.

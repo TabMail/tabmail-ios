@@ -237,9 +237,14 @@ private func simulateSyncForSentFolder(
             let oldId = staleMsg.id
             let newMsgId = match.messageId
             let newId = "\(accountId):\(folderPath):\(newMsgId)"
-            // Fetch body BEFORE deleting header (CASCADE would delete body too)
+            // Fetch the body BEFORE deleting the header, then delete its row
+            // EXPLICITLY — mirroring `SyncEngine.reconcileUidRemaps` after Stage D
+            // (`v70_dropMessageBodyHeaderFK`) removed the cascade that used to do it.
+            // Without the delete the copy re-inserted under `newId` below leaves the
+            // old row behind: a duplicate plus a leak.
             let oldBody = try MessageBody.fetchOne(dbConn, key: oldId)
             try staleMsg.delete(dbConn)
+            try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
             var migrated = staleMsg
             migrated.id = newId
             migrated.messageId = newMsgId
@@ -1387,9 +1392,12 @@ struct BodyMigrationFKSafetyTests {
     ) throws -> MessageHeader {
         try db.write { dbConn in
             let newId = "\(folder.accountId):\(folder.path):\(newMessageId)"
-            // Fetch body BEFORE deleting header (CASCADE fix)
+            // Fetch the body BEFORE deleting the header, then delete its row
+            // EXPLICITLY — mirroring `SyncEngine.reconcileUidRemaps` after Stage D
+            // (`v70_dropMessageBodyHeaderFK`) removed the cascade that used to do it.
             let oldBody = try MessageBody.fetchOne(dbConn, key: staleHeader.id)
             try staleHeader.delete(dbConn)
+            try MessageBody.deleteOne(dbConn, key: staleHeader.id)
             var migrated = staleHeader
             migrated.id = newId
             migrated.messageId = newMessageId

@@ -779,8 +779,10 @@ extension AccountManager {
     }
 
     /// Delete a single messageHeader (identified by its full primary key) that has
-    /// been structurally confirmed gone from the server. FK CASCADE removes the
-    /// MessageBody + MessageReference children. The FTS row is removed out-of-band.
+    /// been structurally confirmed gone from the server. The FK cascade removes the
+    /// MessageReference children; the `messageBody` row is reclaimed by the routed
+    /// release below (Stage D dropped that cascade — a content key is not a header
+    /// id). The FTS row is removed on the same release.
     /// Safe to call with a headerId that isn't in the local DB — DELETE returns 0
     /// rows and FTS remove is idempotent.
     ///
@@ -820,12 +822,13 @@ extension AccountManager {
         if let captured {
             await MessageContentStore.releaseUnowned(
                 captured.contentKey, scope: captured.scope,
-                stores: .searchIndex, pool: dbPool)
+                stores: [.searchIndex, .body], pool: dbPool)
         } else {
             // No account row to read a key space from — keep the pre-existing
-            // unconditional removal rather than invent an owner.
+            // unconditional removal rather than invent an owner. `.body` is part of
+            // that pre-existing behaviour: the cascade deleted it here too.
             await MessageContentStore.release(
-                ContentKey(rawValue: headerId), stores: .searchIndex, pool: dbPool)
+                ContentKey(rawValue: headerId), stores: [.searchIndex, .body], pool: dbPool)
         }
     }
 

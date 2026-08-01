@@ -369,7 +369,7 @@ actor DraftStore {
         // NOT evict the survivor's indexed body.
         if !draftFtsOps.removals.isEmpty {
             await MessageContentStore.releaseUnowned(
-                draftFtsOps.removals.map(ContentKey.init(rawValue:)), stores: .searchIndex)
+                draftFtsOps.removals.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body])
         }
         if !draftFtsOps.rekeys.isEmpty {
             try? await SearchIndex.shared.rekeyHeaders(draftFtsOps.rekeys.map {
