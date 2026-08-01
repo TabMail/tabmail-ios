@@ -117,7 +117,7 @@ struct BodyFetchProviderToDBTests {
 
         let body = try await db.read { try MessageBody.fetchOne($0, key: header.id) }
         #expect(body != nil)
-        #expect(body?.id == header.id)
+        #expect(body?.id.rawValue == header.id)
         #expect(body?.htmlContent == "<p>Hello world</p>")
     }
 
@@ -267,11 +267,11 @@ struct BodyFetchMessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "100")
 
-        let body = MessageBody(headerId: header.id, htmlContent: "<p>Test</p>")
+        let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Test</p>")
         try db.write { try body.save($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: header.id) }
-        #expect(fetched?.id == header.id)
+        #expect(fetched?.id.rawValue == header.id)
     }
 
     @Test("MessageBody CASCADE deletes when header deleted")
@@ -304,11 +304,11 @@ struct BodyFetchMessageBodyPersistenceTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "100")
 
         // First write
-        let body1 = MessageBody(headerId: header.id, htmlContent: "<p>Version 1</p>")
+        let body1 = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Version 1</p>")
         try db.write { try body1.save($0) }
 
         // Second write (upsert)
-        let body2 = MessageBody(headerId: header.id, htmlContent: "<p>Version 2</p>")
+        let body2 = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Version 2</p>")
         try db.write { try body2.save($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: header.id) }
@@ -350,7 +350,7 @@ struct BodyFetchMessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "100")
 
-        let body = MessageBody(headerId: header.id, htmlContent: nil)
+        let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: nil)
         try db.write { try body.save($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: header.id) }
@@ -366,12 +366,12 @@ struct BodyFetchMessageBodyPersistenceTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "100")
 
         let htmlContent = "<html><body><h1>Title</h1><p>Paragraph with <em>emphasis</em> and <a href=\"https://example.com\">link</a>.</p></body></html>"
-        let body = MessageBody(headerId: header.id, htmlContent: htmlContent)
+        let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: htmlContent)
         try db.write { try body.save($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: header.id) }
         #expect(fetched?.htmlContent == htmlContent)
-        #expect(fetched?.id == header.id)
+        #expect(fetched?.id.rawValue == header.id)
     }
 }
 

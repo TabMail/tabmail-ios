@@ -18,7 +18,7 @@ struct SearchIndexSchemaTests {
 
     @Test("FTSHeaderRecord stores expected fields")
     func ftsHeaderRecordFields() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "acc1:INBOX:1"),
             headerId: "acc1:INBOX:1",
             messageId: "1",
             subject: "Budget Review",
@@ -35,14 +35,13 @@ struct SearchIndexSchemaTests {
 
     @Test("FTSSearchResult stores score and snippet")
     func ftsSearchResult() {
-        let result = FTSSearchResult(
-            headerId: "acc1:INBOX:1",
+        let result = FTSSearchResult( contentKey: ContentKey(rawValue: "acc1:INBOX:1"),
             messageId: "1",
             snippet: "...budget review...",
             rank: -5.2,
             dateMs: Int64(Date().timeIntervalSince1970 * 1000)
         )
-        #expect(result.headerId == "acc1:INBOX:1")
+        #expect(result.contentKey.rawValue == "acc1:INBOX:1")
         #expect(result.rank < 0) // BM25 scores are negative (higher magnitude = better match)
         #expect(result.snippet.contains("budget"))
     }

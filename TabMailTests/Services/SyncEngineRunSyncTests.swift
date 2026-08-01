@@ -158,7 +158,7 @@ private func simulateRunSyncMessages(
             migrated.date = match.date
             try migrated.insert(dbConn)
             if var body = oldBody {
-                body.id = newId
+                body.id = ContentKey(rawValue: newId)
                 try body.insert(dbConn)
             }
             uidMigratedRemoteIds.insert(newMsgId)
@@ -1012,7 +1012,7 @@ struct RunSyncUIDRemapFtsRekeyTests {
             header.headerComplete = true
             header.bodyComplete = true
             try header.insert(db)
-            try MessageBody(headerId: "racc:INBOX:100", htmlContent: "<p>kept</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: "racc:INBOX:100"), htmlContent: "<p>kept</p>").insert(db)
         }
 
         let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }

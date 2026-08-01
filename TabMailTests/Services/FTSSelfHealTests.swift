@@ -12,23 +12,23 @@ import GRDB
 /// historical buggy write paths (pre-fix NSE merge, attachment-only BodyFetch
 /// branch, v31 snapshot migration) and left messages stuck in an AI-dropping
 /// loop. The fix is `SyncEngine.selfHealFTSBodyMembership`, which uses
-/// `SearchIndex.headerIdsMissingFromFTS` + re-index + reset bodyComplete=0.
+/// `SearchIndex.contentKeysMissingFromFTS` + re-index + reset bodyComplete=0.
 @Suite("FTS Self-Heal - Missing Body Membership", .serialized, .processGlobalState)
 struct FTSSelfHealTests {
 
     private var index: SearchIndex { SearchIndex.shared }
     private func prefix(_ label: String) -> String { "selfheal_\(label)" }
 
-    @Test("headerIdsMissingFromFTS returns headers not indexed in FTS")
+    @Test("contentKeysMissingFromFTS returns headers not indexed in FTS")
     func detectsMissingHeaders() async throws {
         let indexedId = "\(prefix("det")):INBOX:present"
         let missingId = "\(prefix("det")):INBOX:absent"
 
         // Clean any leftovers
-        try await index.removeMessages(headerIds: [indexedId, missingId])
+        try await index.removeMessages( contentKeys: [indexedId, missingId].map(ContentKey.init(rawValue:)))
 
         // Index one, leave the other absent
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: indexedId),
             headerId: indexedId,
             messageId: "m1",
             subject: "Present",
@@ -38,12 +38,12 @@ struct FTSSelfHealTests {
         )
         _ = try await index.indexHeaders([record])
 
-        let missing = try await index.headerIdsMissingFromFTS([indexedId, missingId])
+        let missing = try await index.contentKeysMissingFromFTS([indexedId, missingId].map(ContentKey.init(rawValue:)))
         #expect(missing.count == 1)
-        #expect(missing.contains(missingId))
-        #expect(!missing.contains(indexedId))
+        #expect(missing.contains(ContentKey(rawValue: missingId)))
+        #expect(!missing.contains(ContentKey(rawValue: indexedId)))
 
-        try await index.removeMessages(headerIds: [indexedId])
+        try await index.removeMessages( contentKeys: [indexedId].map(ContentKey.init(rawValue:)))
     }
 
     @Test("Stuck-state is healable: detect, re-index, reset bodyComplete")
@@ -68,14 +68,14 @@ struct FTSSelfHealTests {
                 arguments: [header.id]
             )
         }
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // Step 1: detect
-        let missing = try await index.headerIdsMissingFromFTS([header.id])
-        #expect(missing == [header.id])
+        let missing = try await index.contentKeysMissingFromFTS([header.id].map(ContentKey.init(rawValue:)))
+        #expect(missing == [ContentKey(rawValue: header.id)])
 
         // Step 2: re-index (what indexHeadersForFTS does)
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -96,7 +96,7 @@ struct FTSSelfHealTests {
 
         // Post-heal invariants:
         // - no longer missing from FTS
-        let stillMissing = try await index.headerIdsMissingFromFTS([header.id])
+        let stillMissing = try await index.contentKeysMissingFromFTS([header.id].map(ContentKey.init(rawValue:)))
         #expect(stillMissing.isEmpty)
 
         // - bodyComplete is now 0 (eligible for body queue)
@@ -115,7 +115,7 @@ struct FTSSelfHealTests {
         }
         #expect(headerFlag == true)
 
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 
     @Test("Attachment-only placeholder body writes to FTS when header is indexed")
@@ -125,9 +125,9 @@ struct FTSSelfHealTests {
         // actually write to FTS (not be filtered as whitespace) so bodyComplete
         // can legitimately advance to 1.
         let hid = "\(prefix("att")):INBOX:1"
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
 
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid,
             messageId: "m_att",
             subject: "Invoice PDF",
@@ -137,14 +137,14 @@ struct FTSSelfHealTests {
         )
         _ = try await index.indexHeaders([record])
 
-        let written = try await index.updateBodies([(headerId: hid, body: "[attachment]")])
-        #expect(written.contains(hid), "placeholder body must write to FTS — otherwise bodyComplete gets silently deferred forever")
+        let written = try await index.updateBodies([(headerId: hid, body: "[attachment]")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
+        #expect(written.contains(ContentKey(rawValue: hid)), "placeholder body must write to FTS — otherwise bodyComplete gets silently deferred forever")
 
         // And the FTS body is retrievable
-        let body = try await index.bodyText(headerId: hid)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body == "[attachment]")
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("NSE rollback invariant: updateBodies returns empty when header absent from FTS")
@@ -154,9 +154,9 @@ struct FTSSelfHealTests {
         // empty written set so the Task can roll bodyComplete back to 0.
         // Without this signal, NSE-created messages stay stuck.
         let hid = "\(prefix("nse")):INBOX:rollback"
-        try await index.removeMessages(headerIds: [hid])  // ensure absent
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))  // ensure absent
 
-        let written = try await index.updateBodies([(headerId: hid, body: "real body text")])
+        let written = try await index.updateBodies([(headerId: hid, body: "real body text")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
         #expect(written.isEmpty, "missing FTS header must yield empty writtenIds → triggers NSE rollback path")
     }
 
@@ -179,7 +179,7 @@ struct FTSSelfHealTests {
         }
 
         // Properly indexed in FTS
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -189,10 +189,10 @@ struct FTSSelfHealTests {
         )
         _ = try await index.indexHeaders([record])
 
-        let missing = try await index.headerIdsMissingFromFTS([header.id])
+        let missing = try await index.contentKeysMissingFromFTS([header.id].map(ContentKey.init(rawValue:)))
         #expect(missing.isEmpty, "Healthy message should not be flagged as missing from FTS")
 
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }
 

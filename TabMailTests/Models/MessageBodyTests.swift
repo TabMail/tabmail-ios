@@ -46,8 +46,8 @@ struct MessageBodyTests {
 
     @Test("create factory with HTML body")
     func createWithHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hello</p>")
-        #expect(body.id == "h1")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "<p>Hello</p>")
+        #expect(body.id.rawValue == "h1")
         #expect(body.htmlContent == "<p>Hello</p>")
     }
 
@@ -60,13 +60,13 @@ struct MessageBodyTests {
 
     @Test("create factory stores html verbatim")
     func createStoresHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<b>Bold</b>")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "<b>Bold</b>")
         #expect(body.htmlContent == "<b>Bold</b>")
     }
 
     @Test("attachmentsJSON round-trip")
     func attachmentsJSONRoundTrip() {
-        var body = MessageBody(headerId: "h1", htmlContent: nil)
+        var body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         let jsonStr = "[{\"filename\":\"test.pdf\",\"mimeType\":\"application/pdf\",\"size\":1024}]"
         body.attachmentsJSON = jsonStr
         #expect(body.attachmentsJSON == jsonStr)
@@ -75,13 +75,13 @@ struct MessageBodyTests {
     @Test("init sets fetchedAt")
     func initSetsFetchedAt() {
         let before = Date()
-        let body = MessageBody(headerId: "h1", htmlContent: nil)
+        let body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         #expect(body.fetchedAt >= before)
     }
 
     @Test("icsText is nil by default")
     func icsTextDefault() {
-        let body = MessageBody(headerId: "h1", htmlContent: nil)
+        let body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         #expect(body.icsText == nil)
     }
 }

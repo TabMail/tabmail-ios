@@ -38,10 +38,10 @@ struct FTSHeaderIndexingIntegrationTests {
         #expect(beforeHC == false, "Should start with headerComplete=false")
 
         // Clean up any stale FTS entry
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // Index into FTS and set headerComplete=1 (replicating SyncEngineFTS.indexHeadersForFTS)
-        let ftsRecord = FTSHeaderRecord(
+        let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -69,11 +69,11 @@ struct FTSHeaderIndexingIntegrationTests {
         #expect(afterHC == true, "Should be headerComplete=true after indexing")
 
         // Verify FTS entry exists
-        let isIndexed = try await index.isIndexed(headerId: header.id)
+        let isIndexed = try await index.isIndexed( contentKey: ContentKey(rawValue: header.id))
         #expect(isIndexed == true, "FTS entry should exist")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }
 
@@ -100,7 +100,7 @@ struct RecoverIncompleteHeadersIntegrationTests {
         )
 
         // Ensure no FTS entry (simulates crash between GRDB insert and FTS index)
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // Verify: headerComplete=0, no FTS entry
         let hcBefore: Bool = try await db.read { dbConn in
@@ -109,7 +109,7 @@ struct RecoverIncompleteHeadersIntegrationTests {
                 arguments: [header.id]) ?? true
         }
         #expect(hcBefore == false)
-        let ftsBeforeExists = try await index.isIndexed(headerId: header.id)
+        let ftsBeforeExists = try await index.isIndexed( contentKey: ContentKey(rawValue: header.id))
         #expect(ftsBeforeExists == false)
 
         // Run the recovery logic (mirrors SyncEngineFTS.recoverIncompleteHeaders)
@@ -123,7 +123,7 @@ struct RecoverIncompleteHeadersIntegrationTests {
         guard incomplete.count == 1 else { return }
 
         let records = incomplete.map { h in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: h.id),
                 headerId: h.id,
                 messageId: h.messageId,
                 subject: h.subject,
@@ -152,11 +152,11 @@ struct RecoverIncompleteHeadersIntegrationTests {
         }
         #expect(hcAfter == true, "headerComplete should be true after recovery")
 
-        let ftsAfterExists = try await index.isIndexed(headerId: header.id)
+        let ftsAfterExists = try await index.isIndexed( contentKey: ContentKey(rawValue: header.id))
         #expect(ftsAfterExists == true, "FTS entry should exist after recovery")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }
 
@@ -192,11 +192,11 @@ struct FlushBatchMixedFTSTests {
         }
 
         // Clean up FTS for all 3
-        try await index.removeMessages(headerIds: [h1.id, h2.id, h3.id])
+        try await index.removeMessages( contentKeys: [h1.id, h2.id, h3.id].map(ContentKey.init(rawValue:)))
 
         // Index h1 and h2 into FTS (h3 stays un-indexed)
         let ftsRecords = [h1, h2].map { h in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: h.id),
                 headerId: h.id,
                 messageId: h.messageId,
                 subject: h.subject,
@@ -216,15 +216,15 @@ struct FlushBatchMixedFTSTests {
         ]
 
         // Call real SearchIndex.updateBodies (mirrors what flushBatch does)
-        let writtenToFts = try await index.updateBodies(ftsBuffer)
+        let writtenToFts = try await index.updateBodies(ftsBuffer.map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         // h1 and h2 should be written, h3 should not (not in FTS index)
-        #expect(writtenToFts.contains(h1.id), "h1 should be in writtenToFts")
-        #expect(writtenToFts.contains(h2.id), "h2 should be in writtenToFts")
-        #expect(!writtenToFts.contains(h3.id), "h3 should NOT be in writtenToFts (not indexed)")
+        #expect(writtenToFts.contains(ContentKey(rawValue: h1.id)), "h1 should be in writtenToFts")
+        #expect(writtenToFts.contains(ContentKey(rawValue: h2.id)), "h2 should be in writtenToFts")
+        #expect(!writtenToFts.contains(ContentKey(rawValue: h3.id)), "h3 should NOT be in writtenToFts (not indexed)")
 
         // Set bodyComplete=1 only for items written to FTS (mirrors flushBatch logic)
-        let confirmedIds = [h1.id, h2.id, h3.id].filter { writtenToFts.contains($0) }
+        let confirmedIds = [h1.id, h2.id, h3.id].filter { writtenToFts.contains(ContentKey(rawValue: $0)) }
         try await db.write { dbConn in
             for headerId in confirmedIds {
                 try dbConn.execute(
@@ -244,7 +244,7 @@ struct FlushBatchMixedFTSTests {
         #expect(bc3 == false, "h3 should have bodyComplete=0 (not in FTS)")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [h1.id, h2.id, h3.id])
+        try await index.removeMessages( contentKeys: [h1.id, h2.id, h3.id].map(ContentKey.init(rawValue:)))
     }
 }
 
@@ -284,8 +284,8 @@ struct EndToEndPipelineTests {
         #expect(flags0.1 == false, "bodyComplete should start false")
 
         // 2. FTS index header
-        try await index.removeMessages(headerIds: [header.id])
-        let ftsRecord = FTSHeaderRecord(
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
+        let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -314,8 +314,8 @@ struct EndToEndPipelineTests {
         #expect(flags1.1 == false, "bodyComplete should still be false")
 
         // 4. Write body to FTS (simulates BodyFetchProcessor.flushBatch)
-        let writtenIds = try await index.updateBodies([(headerId: header.id, body: uniqueBodyText)])
-        #expect(writtenIds.contains(header.id), "Body should be written to FTS")
+        let writtenIds = try await index.updateBodies([(headerId: header.id, body: uniqueBodyText)].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
+        #expect(writtenIds.contains(ContentKey(rawValue: header.id)), "Body should be written to FTS")
 
         // 5. Set bodyComplete=1 and snippet
         try await db.write { dbConn in
@@ -336,7 +336,7 @@ struct EndToEndPipelineTests {
 
         // 6. Verify body is searchable in FTS
         let results = try await index.keywordSearch(query: uniqueBodyText)
-        #expect(results.contains { $0.headerId == header.id }, "Body should be FTS-searchable")
+        #expect(results.contains { $0.contentKey.rawValue == header.id }, "Body should be FTS-searchable")
 
         // 7. Verify excluded from repopulate query
         let repopIds: [String] = try await db.read { dbConn in
@@ -349,7 +349,7 @@ struct EndToEndPipelineTests {
         #expect(!found, "Completed message should be excluded from repopulate")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }
 

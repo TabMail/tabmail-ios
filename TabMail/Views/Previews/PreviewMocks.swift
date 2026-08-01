@@ -158,7 +158,7 @@ enum PreviewMocks {
             "<p>Hi!</p><p>Free around 7 on Friday? Thinking the new ramen place downtown — heard the tonkotsu is great.</p><p>xo Carol</p>",
             "<h2>This Week in Swift</h2><p>SE-0433 lands in Swift 6.0, TipKit gets new APIs for testing, and a deep dive on strict concurrency warnings.</p><p><a href=\"#\">Read the full issue →</a></p>",
         ]).map { header, html in
-            MessageBody(headerId: header.id, htmlContent: html)
+            MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: html)
         }
 
         do {

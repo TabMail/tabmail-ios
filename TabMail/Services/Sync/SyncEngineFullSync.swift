@@ -236,14 +236,19 @@ extension SyncEngine {
             if !result.ftsRekeys.isEmpty {
                 // In-place FTS re-key (UID remap / remnant canonicalization) —
                 // preserves the indexed body text + embedding under the new id.
-                try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys)
+                try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys.map {
+                    (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId),
+                     newMessageId: $0.newMessageId)
+                })
             }
             if !result.staleIds.isEmpty {
-                try? await SearchIndex.shared.removeMessages(headerIds: result.staleIds)
+                try? await SearchIndex.shared.removeMessages(
+                    contentKeys: result.staleIds.map(ContentKey.init(rawValue:)))
             }
             if !result.newHeaders.isEmpty {
                 let records = result.newHeaders.map { header in
                     FTSHeaderRecord(
+                        contentKey: ContentKey(rawValue: header.id),
                         headerId: header.id,
                         messageId: header.messageId,
                         subject: header.subject,
@@ -477,7 +482,10 @@ extension SyncEngine {
         if !result.ftsRekeys.isEmpty {
             // In-place FTS re-key (UID remap / remnant canonicalization) —
             // preserves the indexed body text + embedding under the new id.
-            try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys)
+            try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys.map {
+                (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId),
+                 newMessageId: $0.newMessageId)
+            })
         }
         if !result.staleIds.isEmpty {
             removeHeadersFromFTS(result.staleIds)
@@ -721,9 +729,9 @@ extension SyncEngine {
         }
 
         // Reattach the preserved body under the final id if none is present.
-        if let body = bestBody, try MessageBody.fetchOne(db, key: survivor.id) == nil {
+        if let body = bestBody, try MessageBody.fetchOne(db, key: ContentKey(rawValue: survivor.id)) == nil {
             var rekeyedBody = body
-            rekeyedBody.id = survivor.id
+            rekeyedBody.id = ContentKey(rawValue: survivor.id)
             try rekeyedBody.insert(db)
         }
 
@@ -1216,7 +1224,7 @@ extension SyncEngine {
                 let newId = "\(accountId):\(folderPath):\(newMsgId)"
                 print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
                 // Fetch body BEFORE deleting header — CASCADE would delete body too
-                let oldBody = try MessageBody.fetchOne(db, key: oldId)
+                let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId))
                 try staleMsg.delete(db)
                 var migrated = staleMsg
                 migrated.id = newId
@@ -1241,7 +1249,7 @@ extension SyncEngine {
                 }
                 try migrated.insert(db)
                 if var body = oldBody {
-                    body.id = newId
+                    body.id = ContentKey(rawValue: newId)
                     try body.insert(db)
                 }
                 // Move the FTS entry to the new id IN PLACE (preserves the
@@ -1571,10 +1579,10 @@ extension SyncEngine {
                     let oldId = optimistic.id
                     // Capture body for migration — defer insert until after header (FK constraint)
                     var deferredBody: MessageBody?
-                    if let body = try MessageBody.fetchOne(db, key: oldId) {
+                    if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                         var newBody = body
-                        newBody.id = header.id
-                        try MessageBody.deleteOne(db, key: oldId)
+                        newBody.id = ContentKey(rawValue: header.id)
+                        try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                         deferredBody = newBody
                     }
                     // MessageAICache uses composite key, not headerId — unlikely for drafts
@@ -1704,10 +1712,10 @@ extension SyncEngine {
                     header.notified = header.notified || preSync.notified
                     // Migrate MessageBody (FK to old id) before delete.
                     var deferredBody: MessageBody?
-                    if let body = try MessageBody.fetchOne(db, key: oldId) {
+                    if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                         var newBody = body
-                        newBody.id = header.id
-                        try MessageBody.deleteOne(db, key: oldId)
+                        newBody.id = ContentKey(rawValue: header.id)
+                        try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                         deferredBody = newBody
                     }
                     // Migrate AI cache key (folderPath changed → key changed).

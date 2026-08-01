@@ -297,7 +297,7 @@ struct OutboxSendMainActorBlockTests {
                         folderPath: "INBOX", isInInbox: true)
                     h.isRead = true
                     try h.insert(db)
-                    try MessageBody(headerId: h.id, htmlContent: bodyHTML).insert(db)
+                    try MessageBody( contentKey: ContentKey(rawValue: h.id), htmlContent: bodyHTML).insert(db)
                 }
             }
         }

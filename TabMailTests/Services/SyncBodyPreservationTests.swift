@@ -139,7 +139,7 @@ private func simulateFullSync(
             migrated.date = match.date
             try migrated.insert(dbConn)
             if var body = oldBody {
-                body.id = newId
+                body.id = ContentKey(rawValue: newId)
                 try body.insert(dbConn)
             }
             uidMigratedRemoteIds.insert(newMsgId)
@@ -197,10 +197,10 @@ private func simulateFullSync(
                 .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                 .fetchOne(dbConn) {
                 let oldId = optimistic.id
-                if let body = try MessageBody.fetchOne(dbConn, key: oldId) {
+                if let body = try MessageBody.fetchOne(dbConn, key: ContentKey(rawValue: oldId)) {
                     var newBody = body
-                    newBody.id = header.id
-                    try MessageBody.deleteOne(dbConn, key: oldId)
+                    newBody.id = ContentKey(rawValue: header.id)
+                    try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
                     deferredBody = newBody
                 }
                 try optimistic.delete(dbConn)
@@ -251,7 +251,7 @@ private func insertOptimisticDraftHeader(
         try header.insert(dbConn)
 
         let htmlBody = MessageBody.plainTextToHTML(body)
-        let messageBody = MessageBody(headerId: headerId, htmlContent: htmlBody)
+        let messageBody = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: htmlBody)
         try messageBody.save(dbConn)
 
         return header
@@ -325,7 +325,7 @@ struct DraftBodyDedupTests {
         // Simulate updating the draft body (as queueDraftSave does on re-save)
         try db.write { dbConn in
             let htmlBody = MessageBody.plainTextToHTML("Updated draft content v3")
-            let body = MessageBody(headerId: optimistic.id, htmlContent: htmlBody)
+            let body = MessageBody( contentKey: ContentKey(rawValue: optimistic.id), htmlContent: htmlBody)
             try body.save(dbConn) // upsert
         }
 
@@ -368,7 +368,7 @@ struct DraftBodyDedupTests {
             header.rfc822MessageId = rfc822
             header.isRead = true
             try header.insert(dbConn)
-            let body = MessageBody(headerId: "acc1:Drafts:old-uid-10", htmlContent: "<p>Preserved draft body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:Drafts:old-uid-10"), htmlContent: "<p>Preserved draft body</p>")
             try body.insert(dbConn)
         }
 
@@ -530,7 +530,7 @@ struct MoveUIDRemapBodyTests {
             )
             header.rfc822MessageId = rfc822
             try header.insert(dbConn)
-            let body = MessageBody(headerId: "acc1:Archive:old-uid-50", htmlContent: "<p>Must survive move+remap</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:Archive:old-uid-50"), htmlContent: "<p>Must survive move+remap</p>")
             try body.insert(dbConn)
         }
 
@@ -573,7 +573,7 @@ struct MoveUIDRemapBodyTests {
             )
             header.rfc822MessageId = rfc822
             try header.insert(dbConn)
-            let body = MessageBody(headerId: "acc1:Archive:move-uid-10", htmlContent: "<p>Protected body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:Archive:move-uid-10"), htmlContent: "<p>Protected body</p>")
             try body.insert(dbConn)
 
             // PendingOperation from INBOX → Archive, messageIds contain stableId
@@ -614,7 +614,7 @@ struct MoveUIDRemapBodyTests {
                 )
                 header.rfc822MessageId = "msg\(i)@example.com"
                 try header.insert(dbConn)
-                let body = MessageBody(headerId: "acc1:INBOX:old-\(i)", htmlContent: "<p>Body \(i)</p>")
+                let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:old-\(i)"), htmlContent: "<p>Body \(i)</p>")
                 try body.insert(dbConn)
             }
         }
@@ -681,7 +681,7 @@ struct ActiveBodyQueueRaceTests {
         // ActiveBodyQueue completion: tries to insert body for the OLD headerId
         // This should fail with FK constraint (header no longer exists)
         let bodyInsertResult = try db.write { dbConn -> Bool in
-            let body = MessageBody(headerId: oldHeaderId, htmlContent: "<p>Fetched body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: oldHeaderId), htmlContent: "<p>Fetched body</p>")
             do {
                 try body.insert(dbConn)
                 return true // inserted
@@ -707,7 +707,7 @@ struct ActiveBodyQueueRaceTests {
         // No header exists for this ID
 
         let saveResult = try db.write { dbConn -> Bool in
-            let body = MessageBody(headerId: oldHeaderId, htmlContent: "<p>Orphan body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: oldHeaderId), htmlContent: "<p>Orphan body</p>")
             do {
                 try body.save(dbConn)
                 return true
@@ -800,7 +800,7 @@ struct OptimisticMoveBodyTests {
             )
             header.rfc822MessageId = "archive-me@example.com"
             try header.insert(dbConn)
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>Body to preserve</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Body to preserve</p>")
             try body.insert(dbConn)
         }
 
@@ -845,7 +845,7 @@ struct OptimisticMoveBodyTests {
             )
             header.rfc822MessageId = rfc822
             try header.insert(dbConn)
-            let body = MessageBody(headerId: "acc1:INBOX:inbox-uid-10", htmlContent: "<p>E2E body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:inbox-uid-10"), htmlContent: "<p>E2E body</p>")
             try body.insert(dbConn)
         }
 

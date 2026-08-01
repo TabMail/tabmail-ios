@@ -20,7 +20,7 @@ struct DatabaseMessageBodyTests {
         let headerId = "acc1:INBOX:1"
         try TestDatabase.insertMessageBody(db, headerId: headerId, htmlContent: "<p>First</p>")
         try db.write { db in
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>Second</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Second</p>")
             try body.insert(db, onConflict: .ignore)
         }
         let fetched = try db.read { try MessageBody.fetchOne($0, key: headerId) }
@@ -76,7 +76,7 @@ struct DatabaseMessageBodyTests {
         try TestDatabase.insertMessageHeader(db, messageId: "1")
 
         try db.write { db in
-            var body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>test</p>")
+            var body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:1"), htmlContent: "<p>test</p>")
             body.attachmentsJSON = "[{\"filename\":\"doc.pdf\",\"contentType\":\"application/pdf\",\"section\":\"1\",\"size\":100}]"
             try body.insert(db)
         }

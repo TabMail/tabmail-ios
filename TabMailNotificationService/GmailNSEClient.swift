@@ -191,17 +191,25 @@ enum GmailNSEClient {
             auth: NSEAuthSource(accountId: accountId, provider: "gmail"),
             retry: .gmail, logLabel: "NSE-Gmail"
         )
-        // Compute the canonical headerId via the shared `MessageIdentity` helper —
+        // Mint the canonical CONTENT key through the sanctioned factory —
         // identical to what the main-app merge will use when persisting MessageBody.
         // Passing it through to `GmailAPI.messageFull` routes inline images
-        // through `BodyAssetStore.makeInlineImageWriter(forHeaderId:)` so NSE-
+        // through `BodyAssetStore.makeInlineImageWriter(forContentKey:)` so NSE-
         // written assets land at the same paths the main app reads.
-        let headerId = MessageIdentity.headerId(
-            accountId: accountId, folderPath: folderPath, messageId: messageId
+        //
+        // `space: .stableProviderId` is not a guess — this client only ever serves
+        // Gmail, whose message ids the provider never reassigns, so the RFC id is
+        // not consulted for the tail (see `MessageIdentity.contentKey`) and
+        // `rfc822MessageId: nil` is exact rather than a fallback. Today the factory
+        // returns `messageHeader.id` verbatim, so this is byte-identical to the
+        // `MessageIdentity.headerId` call it replaces.
+        let contentKey = ContentKey.forHeader(
+            accountId: accountId, folderPath: folderPath, providerMessageId: messageId,
+            rfc822MessageId: nil, space: .stableProviderId
         )
         do {
             let (_, rendered) = try await GmailAPI.messageFull(
-                http: http, id: messageId, headerId: headerId
+                http: http, id: messageId, contentKey: contentKey
             )
             return rendered
         } catch {

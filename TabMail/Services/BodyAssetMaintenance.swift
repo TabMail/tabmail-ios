@@ -86,7 +86,7 @@ enum BodyAssetMaintenance {
 
             for victim in batch {
                 let bytesReclaimed = await dropMessage(
-                    headerId: victim.headerId, inlineCount: victim.inlineCount
+                    contentKey: victim.contentKey, inlineCount: victim.inlineCount
                 )
                 current -= bytesReclaimed
                 victims += 1
@@ -108,23 +108,26 @@ enum BodyAssetMaintenance {
     /// INSERT … ON CONFLICT.
     /// `internal` (not private) so tests can pin the "never touches
     /// bodyComplete" invariant directly.
-    static func dropMessage(headerId: String, inlineCount: Int) async -> Int64 {
+    static func dropMessage(contentKey: ContentKey, inlineCount: Int) async -> Int64 {
         if inlineCount > 0 {
             do {
                 try await AppDatabase.dbPool.write { db in
                     // Cache-presence is the messageBody row itself — do NOT
                     // touch bodyComplete here (see type-level invariant).
+                    // `messageBody.id` is a CONTENT key, same space as
+                    // `bodyAsset.headerId` — both move together at E1, so this pair
+                    // stays consistent by construction.
                     try db.execute(
                         sql: "DELETE FROM messageBody WHERE id = ?",
-                        arguments: [headerId]
+                        arguments: [contentKey]
                     )
                 }
             } catch {
-                print("[BodyAssetMaintenance] dropMessage main-DB write failed for \(headerId): \(error)")
+                print("[BodyAssetMaintenance] dropMessage main-DB write failed for \(contentKey): \(error)")
                 return 0
             }
         }
-        return BodyAssetStore.deleteAllAssets(forHeaderId: headerId)
+        return BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
     }
 
     /// Wipe all assets for a specific kind.
@@ -138,7 +141,7 @@ enum BodyAssetMaintenance {
         if kind == .inlineImage {
             // Main DB write FIRST. If it fails for kind=0, abort the wipe —
             // leaving manifest+files in place is safer than orphaned HTML refs.
-            let affected = BodyAssetStore.allManifestHeaderIdsByKind(kind: .inlineImage)
+            let affected = BodyAssetStore.allManifestContentKeysByKind(kind: .inlineImage)
             guard !affected.isEmpty else { return }
             do {
                 try await AppDatabase.dbPool.write { db in
@@ -161,29 +164,36 @@ enum BodyAssetMaintenance {
 
     /// Cross-DB + filesystem orphan sweep. Main-app only.
     /// 1. Finds manifest rows whose headerId no longer exists in `messageHeader`.
-    ///    Deletes them via `BodyAssetStore.deleteAllAssets(forHeaderId:)`.
+    ///    Deletes them via `BodyAssetStore.deleteAllAssets(forContentKey:)`.
+    ///
+    /// 🚨 ⚠ STAGE E1 — step 1 compares manifest CONTENT keys against `messageHeader.id`.
+    ///    Once the content key moves off the provider id, every UID-addressed
+    ///    message's assets look dead and this sweep DELETES the user's cached
+    ///    bodies and attachments wholesale. Same failure shape as
+    ///    `SyncEngine.pruneFTSOrphans`; both need a content-key → header-id
+    ///    resolution before E1 lands.
     /// 2. Filesystem-only orphan files via `BodyAssetStore.pruneOrphanFiles()`.
     static func pruneOrphans() async {
         // 1. Cross-DB row sweep.
-        let manifestHeaderIds = BodyAssetStore.allManifestHeaderIds()
-        if !manifestHeaderIds.isEmpty {
+        let manifestKeys = BodyAssetStore.allManifestContentKeys()
+        if !manifestKeys.isEmpty {
             do {
-                let liveHeaderIds: Set<String> = try await AppDatabase.dbPool.read { db in
-                    let placeholders = Array(repeating: "?", count: manifestHeaderIds.count).joined(separator: ",")
-                    let args = StatementArguments(Array(manifestHeaderIds))
-                    let ids = try String.fetchAll(
+                let liveKeys: Set<ContentKey> = try await AppDatabase.dbPool.read { db in
+                    let placeholders = Array(repeating: "?", count: manifestKeys.count).joined(separator: ",")
+                    let args = StatementArguments(Array(manifestKeys))
+                    let ids = try ContentKey.fetchAll(
                         db,
                         sql: "SELECT id FROM messageHeader WHERE id IN (\(placeholders))",
                         arguments: args
                     )
                     return Set(ids)
                 }
-                let dead = manifestHeaderIds.subtracting(liveHeaderIds)
-                for headerId in dead {
+                let dead = manifestKeys.subtracting(liveKeys)
+                for contentKey in dead {
                     // Abandon if backgrounded mid-sweep (ADR-IOS-046) — non-WAL deletes
                     // held into suspension are the same 0xdead10cc risk as the reads.
                     guard DatabaseSuspension.isAppActive && !DatabaseSuspension.isSuspended else { break }
-                    _ = BodyAssetStore.deleteAllAssets(forHeaderId: headerId)
+                    _ = BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
                 }
             } catch {
                 print("[BodyAssetMaintenance] cross-DB sweep failed: \(error)")

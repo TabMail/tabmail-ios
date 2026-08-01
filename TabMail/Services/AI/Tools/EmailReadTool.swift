@@ -63,7 +63,8 @@ struct EmailReadTool: AgentTool, Sendable {
         let bodyText: String
         if let html = body?.htmlContent, !html.isEmpty {
             bodyText = EmailFilter.htmlToPlainText(html)
-        } else if let ftsBody = try? await SearchIndex.shared.bodyText(headerId: realId), !ftsBody.isEmpty {
+        } else if let ftsBody = try? await SearchIndex.shared.bodyText(
+            contentKey: ContentKey(rawValue: realId)), !ftsBody.isEmpty {
             bodyText = ftsBody
         } else {
             bodyText = header.snippet

@@ -452,11 +452,13 @@ extension AccountManager {
     /// ids. Recomputable on a re-drive whose purge transaction found no headers
     /// left to capture.
     func purgeBodyAssetsForFolder(accountId: String, folderPath: String) {
-        let victims = BodyAssetStore.allManifestHeaderIds().filter {
-            MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
+        // Folder scoping works on the key's PREFIX (`accountId:folderPath:`), which is
+        // unchanged by where the tail comes from — so this filter stays correct at E1.
+        let victims = BodyAssetStore.allManifestContentKeys().filter {
+            MessageIdentity.headerIdBelongsToFolder($0.rawValue, accountId: accountId, folderPath: folderPath)
         }
-        for headerId in victims {
-            _ = BodyAssetStore.deleteAllAssets(forHeaderId: headerId)
+        for contentKey in victims {
+            _ = BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
         }
     }
 

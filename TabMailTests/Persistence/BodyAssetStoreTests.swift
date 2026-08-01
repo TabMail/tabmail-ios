@@ -33,8 +33,8 @@ struct BodyAssetStoreTests {
 
     @Test("headerHash is deterministic across calls")
     func headerHashDeterministic() {
-        let h1 = BodyAssetStore.headerHash("acc1:INBOX:42")
-        let h2 = BodyAssetStore.headerHash("acc1:INBOX:42")
+        let h1 = BodyAssetStore.headerHash(ContentKey(rawValue: "acc1:INBOX:42"))
+        let h2 = BodyAssetStore.headerHash(ContentKey(rawValue: "acc1:INBOX:42"))
         #expect(h1 == h2)
         #expect(h1.count == 16)
         #expect(h1.allSatisfy { $0.isHexDigit })
@@ -42,8 +42,8 @@ struct BodyAssetStoreTests {
 
     @Test("headerHash differs across distinct inputs")
     func headerHashDistinct() {
-        let h1 = BodyAssetStore.headerHash("acc1:INBOX:42")
-        let h2 = BodyAssetStore.headerHash("acc1:INBOX:43")
+        let h1 = BodyAssetStore.headerHash(ContentKey(rawValue: "acc1:INBOX:42"))
+        let h2 = BodyAssetStore.headerHash(ContentKey(rawValue: "acc1:INBOX:43"))
         #expect(h1 != h2)
     }
 
@@ -58,7 +58,7 @@ struct BodyAssetStoreTests {
             String(repeating: "a", count: 10_000),
         ]
         for input in inputs {
-            let h = BodyAssetStore.headerHash(input)
+            let h = BodyAssetStore.headerHash(ContentKey(rawValue: input))
             #expect(h.count == 16)
             #expect(h.allSatisfy { $0.isHexDigit })
         }
@@ -98,8 +98,7 @@ struct BodyAssetStoreTests {
         let dir = try Self.setupTest()
         defer { Self.teardown(dir) }
         let bytes = Data("hello, world".utf8)
-        guard let id = BodyAssetStore.writeInlineImage(
-            headerId: "acc1:INBOX:42",
+        guard let id = BodyAssetStore.writeInlineImage( contentKey: ContentKey(rawValue: "acc1:INBOX:42"),
             contentId: "img1@test",
             contentType: "image/png",
             data: bytes
@@ -113,13 +112,12 @@ struct BodyAssetStoreTests {
         let dir = try Self.setupTest()
         defer { Self.teardown(dir) }
         let bytes = Data(repeating: 0xAB, count: 1_000)
-        guard let id = BodyAssetStore.writeAttachment(
-            headerId: "acc1:INBOX:42",
+        guard let id = BodyAssetStore.writeAttachment( contentKey: ContentKey(rawValue: "acc1:INBOX:42"),
             section: "1.2",
             contentType: "application/pdf",
             data: bytes
         ) else { Issue.record("write failed"); return }
-        let lookedUpId = BodyAssetStore.attachmentAssetId(headerId: "acc1:INBOX:42", section: "1.2")
+        let lookedUpId = BodyAssetStore.attachmentAssetId( contentKey: ContentKey(rawValue: "acc1:INBOX:42"), section: "1.2")
         #expect(lookedUpId == id)
         #expect(BodyAssetStore.read(assetId: id) == bytes)
         #expect(BodyAssetStore.contentType(assetId: id) == "application/pdf")
@@ -132,11 +130,9 @@ struct BodyAssetStoreTests {
         defer { Self.teardown(dir) }
         let v1 = Data("first".utf8)
         let v2 = Data("second-different-content".utf8)
-        let id1 = BodyAssetStore.writeInlineImage(
-            headerId: "acc1:INBOX:42", contentId: "cid", contentType: "image/png", data: v1
+        let id1 = BodyAssetStore.writeInlineImage( contentKey: ContentKey(rawValue: "acc1:INBOX:42"), contentId: "cid", contentType: "image/png", data: v1
         )
-        let id2 = BodyAssetStore.writeInlineImage(
-            headerId: "acc1:INBOX:42", contentId: "cid", contentType: "image/png", data: v2
+        let id2 = BodyAssetStore.writeInlineImage( contentKey: ContentKey(rawValue: "acc1:INBOX:42"), contentId: "cid", contentType: "image/png", data: v2
         )
         #expect(id1 == id2)
         // Latest write wins.
@@ -146,7 +142,7 @@ struct BodyAssetStoreTests {
     // MARK: - Cross-target identity
 
     /// The MessageIdentity-derived headerId is the basis for every cross-target
-    /// path. `BodyAssetStore.makeInlineImageWriter(forHeaderId:)` is the SINGLE
+    /// path. `BodyAssetStore.makeInlineImageWriter( forContentKey: ContentKey(rawValue: ))` is the SINGLE
     /// factory both NSE and main-app callers use; given the same headerId, they
     /// produce identical output URLs by construction.
     @Test("makeInlineImageWriter produces identical URLs across targets for same headerId")
@@ -162,10 +158,10 @@ struct BodyAssetStoreTests {
         )
 
         // Writer used by main-app BodyFetchProcessor.renderBody.
-        let mainAppWriter = BodyAssetStore.makeInlineImageWriter(forHeaderId: headerId)
+        let mainAppWriter = BodyAssetStore.makeInlineImageWriter( forContentKey: ContentKey(rawValue: headerId))
         // Writer used by NSE (IMAPFetchMapping.renderBody / GmailAPI.messageFull /
         // GraphAPI.messageFull, all via the same factory).
-        let nseWriter = BodyAssetStore.makeInlineImageWriter(forHeaderId: headerId)
+        let nseWriter = BodyAssetStore.makeInlineImageWriter( forContentKey: ContentKey(rawValue: headerId))
 
         let img = InlineImageRef(
             contentId: "image001@test",

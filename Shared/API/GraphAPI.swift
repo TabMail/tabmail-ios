@@ -147,7 +147,7 @@ enum GraphAPI {
     static func messageFull(
         http: AuthedHTTP,
         id: String,
-        headerId: String? = nil,
+        contentKey: ContentKey? = nil,
         attachmentFetcher: BodyRenderer.AttachmentFetcher? = nil,
         icsRenderer: BodyRenderer.ICSRenderer? = nil
     ) async throws -> (MessageMetadata, RenderedBody) {
@@ -175,9 +175,9 @@ enum GraphAPI {
         )
         // Bind the inline-image writer once per render — same factory that
         // IMAP and Gmail paths use, so behavior is identical across providers
-        // *and* across targets (main app + NSE). `headerId == nil` → data URIs.
+        // *and* across targets (main app + NSE). `contentKey == nil` → data URIs.
         let inlineImageWriter: BodyRenderer.InlineImageWriter? =
-            headerId.map { BodyAssetStore.makeInlineImageWriter(forHeaderId: $0) }
+            contentKey.map { BodyAssetStore.makeInlineImageWriter(forContentKey: $0) }
         let rendered = await BodyRenderer.render(
             ingredients: ingredients,
             attachmentFetcher: attachmentFetcher,

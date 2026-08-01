@@ -208,10 +208,11 @@ struct AttachmentListView: View {
 
             // Store-first: if BodyAssetStore has this attachment cached, skip the network.
             // User tap on a cached attachment counts as a message access, so bump LRU.
-            if let assetId = BodyAssetStore.attachmentAssetId(headerId: message.id, section: attachment.section),
+            if let assetId = BodyAssetStore.attachmentAssetId(
+                contentKey: ContentKey(rawValue: message.id), section: attachment.section),
                let storedURL = BodyAssetStore.urlOnDisk(assetId: assetId) {
                 print("[Attachment] Cache HIT for \(attachment.filename) — skipping network")
-                BodyAssetStore.bumpMessageAccess(headerId: message.id)
+                BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
                 let fileURL = makePreviewURL(from: storedURL, originalFilename: attachment.filename)
                 downloadedFiles[attachment.section] = fileURL
                 AttachmentQuickLook.present(url: fileURL)
@@ -226,12 +227,12 @@ struct AttachmentListView: View {
                 // Cache to BodyAssetStore — best-effort. If write fails, fall back
                 // to a tmp file so the preview still works.
                 let cachedAssetId = BodyAssetStore.writeAttachment(
-                    headerId: message.id,
+                    contentKey: ContentKey(rawValue: message.id),
                     section: attachment.section,
                     contentType: attachment.contentType,
                     data: data
                 )
-                BodyAssetStore.bumpMessageAccess(headerId: message.id)
+                BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
                 let fileURL: URL
                 if let cachedAssetId, let storedURL = BodyAssetStore.urlOnDisk(assetId: cachedAssetId) {
                     fileURL = makePreviewURL(from: storedURL, originalFilename: attachment.filename)

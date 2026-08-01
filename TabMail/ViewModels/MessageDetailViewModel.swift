@@ -1150,7 +1150,7 @@ final class MessageDetailViewModel {
         // reading. Single UPDATE in BodyAssetStore's manifest DB; fire-and-forget.
         // This is the SOLE bump site for opened-message access (the WKURLSchemeHandler
         // does NOT bump per-image).
-        BodyAssetStore.bumpMessageAccess(headerId: msg.id)
+        BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: msg.id))
 
         // Mark-as-read on open lives in `markReadOnOpenIfNeeded()` — called
         // from the view's `.task`/`.onAppear` on its own unstructured Task so

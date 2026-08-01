@@ -28,7 +28,7 @@ extension SyncEngine {
         var totalInserted = 0
         var totalFound = 0
         var allFTSRecords: [FTSHeaderRecord] = []
-        var allCcBccUpdates: [(headerId: String, cc: String, bcc: String)] = []
+        var allCcBccUpdates: [(contentKey: ContentKey, cc: String, bcc: String)] = []
 
         if account.provider == .imap, let provider = providers[account.id] as? IMAPProvider {
             guard let workQueue = workQueues[account.id] else { return (inserted: 0, found: 0) }
@@ -272,7 +272,7 @@ extension SyncEngine {
         case landed(
             inserted: Int,
             ftsRecords: [FTSHeaderRecord],
-            ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]
+            ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)]
         )
         /// At least one chunk's in-transaction CAS refused: the folder no longer
         /// holds the `lastKnownUidValidity` the caller premised. NOTHING was
@@ -369,7 +369,7 @@ extension SyncEngine {
         folderPath: String,
         folderRole: FolderRole,
         isInInbox: Bool
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)]) {
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)]) {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil
@@ -385,14 +385,14 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise?
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)], refused: Bool) {
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool) {
         guard !headers.isEmpty else { return (0, [], [], false) }
 
         var ftsRecords: [FTSHeaderRecord] = []
         var count = 0
         var unreadInserted = 0
         var discoveredParents: [String] = []
-        var ccBccFtsUpdates: [(headerId: String, cc: String, bcc: String)] = []
+        var ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)] = []
         var anyChunkRefused = false
 
         // CHUNKED async insert: split the batch into transactions of
@@ -408,7 +408,7 @@ extension SyncEngine {
             let end = min(start + chunkSize, headers.count)
             let chunk = Array(headers[start..<end])
             do {
-                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], ccBcc: [(headerId: String, cc: String, bcc: String)], parents: [String], refused: Bool) =
+                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], ccBcc: [(contentKey: ContentKey, cc: String, bcc: String)], parents: [String], refused: Bool) =
                     try await AppDatabase.backgroundPool.write { db in
                         // THE C3 GUARD — re-read the folder row INSIDE this txn and
                         // compare it against the caller's premise. A chunk refused
@@ -441,7 +441,7 @@ extension SyncEngine {
                         )
 
                         var fts: [FTSHeaderRecord] = []
-                        var ccBcc: [(headerId: String, cc: String, bcc: String)] = []
+                        var ccBcc: [(contentKey: ContentKey, cc: String, bcc: String)] = []
                         var inserted = 0
                         var unread = 0
 
@@ -456,7 +456,12 @@ extension SyncEngine {
                                         sql: "UPDATE messageHeader SET cc = ?, bcc = ? WHERE id = ?",
                                         arguments: [info.cc, info.bcc, headerId]
                                     )
-                                    ccBcc.append((headerId: headerId, cc: info.cc, bcc: info.bcc))
+                                    // ⚠ STAGE E1: this list feeds `SearchIndex.updateCcBcc`,
+                                    // which addresses FTS rows — content-key space. The
+                                    // `UPDATE messageHeader … WHERE id = ?` two lines up
+                                    // keeps using the plain `headerId` (F2).
+                                    ccBcc.append((contentKey: ContentKey(rawValue: headerId),
+                                                  cc: info.cc, bcc: info.bcc))
                                 }
                                 continue
                             }
@@ -527,6 +532,7 @@ extension SyncEngine {
                             if !info.isRead { unread += 1 }
 
                             fts.append(FTSHeaderRecord(
+                                contentKey: ContentKey(rawValue: header.id),
                                 headerId: header.id,
                                 messageId: header.messageId,
                                 subject: header.subject,

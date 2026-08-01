@@ -152,7 +152,7 @@ struct MessageDetailStagedFallbackTests {
         }
         let body = NSEDataBridge.stagedBodyFallback(headerId: "acc1:INBOX:m-tap")
         #expect(body?.htmlContent == "<p>staged body</p>")
-        #expect(body?.id == "acc1:INBOX:m-tap")
+        #expect(body?.id.rawValue == "acc1:INBOX:m-tap")
         #expect(NSEDataBridge.stagedBodyFallback(headerId: "acc1:INBOX:m-nope") == nil)
     }
 
@@ -267,7 +267,7 @@ struct MessageDetailStagedFallbackTests {
         // The merge writes the body durable, THEN posts the end-of-merge signal
         // (production order: MessageBody insert → main tx commit → .nseMergeDidCommit).
         try await pool.write { db in
-            try MessageBody(headerId: row.headerId, htmlContent: "<p>durable merge body</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: row.headerId), htmlContent: "<p>durable merge body</p>").insert(db)
         }
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
 
@@ -297,7 +297,7 @@ struct MessageDetailStagedFallbackTests {
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
         try insertDurableHeader(row.toMessageHeader(), into: pool)
         try await pool.write { db in
-            try MessageBody(headerId: row.headerId, htmlContent: "<p>durable body</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: row.headerId), htmlContent: "<p>durable body</p>").insert(db)
         }
         let vm = MessageDetailViewModel(messageId: row.headerId, dbPool: pool, fetchBodyOverride: { _ in })
         #expect(vm.messageBody == nil)
@@ -381,7 +381,7 @@ struct MessageDetailStagedFallbackTests {
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
         // The body then becomes durable and an end-of-merge-style post fires.
         try await pool.write { db in
-            try MessageBody(headerId: row.headerId, htmlContent: "<p>durable now</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: row.headerId), htmlContent: "<p>durable now</p>").insert(db)
         }
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
 

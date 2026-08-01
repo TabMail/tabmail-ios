@@ -16,90 +16,90 @@ struct SearchIndexBodyWriteTests {
     @Test("updateBody writes body text to FTS")
     func updateBodyWritesToFTS() async throws {
         let hid = "test_bodywrite:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Body write test",
             from: "a@a.com", to: "b@b.com",
             dateMs: Int64(Date().timeIntervalSince1970 * 1000)
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         _ = try await index.indexHeaders([record])
 
-        try await index.updateBody(headerId: hid, body: "Uniquebodywritetest content here")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "Uniquebodywritetest content here")
 
         let results = try await index.keywordSearch(query: "uniquebodywritetest")
-        #expect(results.contains { $0.headerId == hid })
+        #expect(results.contains { $0.contentKey.rawValue == hid })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBody silently skips whitespace-only body")
     func updateBodySkipsWhitespace() async throws {
         let hid = "test_bodywrite_ws:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Whitespace body test",
             from: "a@a.com", to: "b@b.com",
             dateMs: Int64(Date().timeIntervalSince1970 * 1000)
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         _ = try await index.indexHeaders([record])
 
         // Write whitespace — should be silently skipped
-        try await index.updateBody(headerId: hid, body: "   \n\t  ")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "   \n\t  ")
 
         // Body should not be searchable
         let results = try await index.keywordSearch(query: "\"   \"")
-        #expect(!results.contains { $0.headerId == hid })
+        #expect(!results.contains { $0.contentKey.rawValue == hid })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBodies filters out whitespace entries, writes real ones")
     func updateBodiesMixed() async throws {
         let hids = ["test_bulkwrite:INBOX:1", "test_bulkwrite:INBOX:2"]
         let records = hids.enumerated().map { i, hid in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
                 headerId: hid, messageId: "m\(i)",
                 subject: "Bulk \(i)",
                 from: "a@a.com", to: "b@b.com",
                 dateMs: Int64(Date().timeIntervalSince1970 * 1000)
             )
         }
-        try await index.removeMessages(headerIds: hids)
+        try await index.removeMessages( contentKeys: hids.map(ContentKey.init(rawValue:)))
         _ = try await index.indexHeaders(records)
 
         try await index.updateBodies([
             (headerId: hids[0], body: "Uniquebulkwritereal content"),
             (headerId: hids[1], body: "   "),  // whitespace — skipped
-        ])
+        ].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         let r1 = try await index.keywordSearch(query: "uniquebulkwritereal")
-        #expect(r1.contains { $0.headerId == hids[0] })
+        #expect(r1.contains { $0.contentKey.rawValue == hids[0] })
 
-        try await index.removeMessages(headerIds: hids)
+        try await index.removeMessages( contentKeys: hids.map(ContentKey.init(rawValue:)))
     }
 
     @Test("clearBodies removes body text from FTS")
     func clearBodiesRemovesText() async throws {
         let hid = "test_clearbody:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Clear test",
             from: "a@a.com", to: "b@b.com",
             dateMs: Int64(Date().timeIntervalSince1970 * 1000)
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         _ = try await index.indexHeaders([record])
 
-        try await index.updateBody(headerId: hid, body: "Uniqueclearbodytest text")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "Uniqueclearbodytest text")
         let before = try await index.keywordSearch(query: "uniqueclearbodytest")
-        #expect(before.contains { $0.headerId == hid })
+        #expect(before.contains { $0.contentKey.rawValue == hid })
 
-        try await index.clearBodies(headerIds: [hid])
+        try await index.clearBodies( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let after = try await index.keywordSearch(query: "uniqueclearbodytest")
-        #expect(!after.contains { $0.headerId == hid })
+        #expect(!after.contains { $0.contentKey.rawValue == hid })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 }

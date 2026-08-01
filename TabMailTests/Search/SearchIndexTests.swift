@@ -13,7 +13,7 @@ struct FTSHeaderRecordFieldTests {
 
     @Test("Default cc and bcc are empty strings")
     func defaultCcBcc() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "acc1:INBOX:1"),
             headerId: "acc1:INBOX:1",
             messageId: "<msg1@example.com>",
             subject: "Hello",
@@ -27,7 +27,7 @@ struct FTSHeaderRecordFieldTests {
 
     @Test("All fields stored correctly")
     func allFields() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "acc2:Sent:42"),
             headerId: "acc2:Sent:42",
             messageId: "<msg42@example.com>",
             subject: "Quarterly Budget Review",
@@ -49,7 +49,7 @@ struct FTSHeaderRecordFieldTests {
 
     @Test("Empty strings are valid field values")
     func emptyFields() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: ""),
             headerId: "", messageId: "", subject: "",
             from: "", to: "", cc: "", bcc: "", dateMs: 0
         )
@@ -64,14 +64,13 @@ struct FTSSearchResultFieldTests {
 
     @Test("All fields stored correctly")
     func allFields() {
-        let result = FTSSearchResult(
-            headerId: "acc1:INBOX:99",
+        let result = FTSSearchResult( contentKey: ContentKey(rawValue: "acc1:INBOX:99"),
             messageId: "<msg99@example.com>",
             snippet: "...quarterly [budget] review...",
             rank: -8.5,
             dateMs: 1_710_000_000_000
         )
-        #expect(result.headerId == "acc1:INBOX:99")
+        #expect(result.contentKey.rawValue == "acc1:INBOX:99")
         #expect(result.messageId == "<msg99@example.com>")
         #expect(result.snippet == "...quarterly [budget] review...")
         #expect(result.rank == -8.5)
@@ -80,19 +79,19 @@ struct FTSSearchResultFieldTests {
 
     @Test("BM25 rank is typically negative")
     func bm25RankNegative() {
-        let result = FTSSearchResult(headerId: "", messageId: "", snippet: "", rank: -3.14, dateMs: 0)
+        let result = FTSSearchResult( contentKey: ContentKey(rawValue: ""), messageId: "", snippet: "", rank: -3.14, dateMs: 0)
         #expect(result.rank < 0)
     }
 
     @Test("Zero rank is valid for date-range-only results")
     func zeroRank() {
-        let result = FTSSearchResult(headerId: "", messageId: "", snippet: "", rank: 0, dateMs: 0)
+        let result = FTSSearchResult( contentKey: ContentKey(rawValue: ""), messageId: "", snippet: "", rank: 0, dateMs: 0)
         #expect(result.rank == 0)
     }
 
     @Test("Empty snippet is valid for vector-only results")
     func emptySnippet() {
-        let result = FTSSearchResult(headerId: "h1", messageId: "m1", snippet: "", rank: -1.0, dateMs: 100)
+        let result = FTSSearchResult( contentKey: ContentKey(rawValue: "h1"), messageId: "m1", snippet: "", rank: -1.0, dateMs: 100)
         #expect(result.snippet.isEmpty)
     }
 }
@@ -108,7 +107,7 @@ struct SearchIndexCRUDTests {
     @Test("indexHeaders inserts new records and deduplicates")
     func indexHeadersInsert() async throws {
         let records = [
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_crud_1:INBOX:1"),
                 headerId: "test_crud_1:INBOX:1",
                 messageId: "<msg1@test.com>",
                 subject: "First Message",
@@ -116,7 +115,7 @@ struct SearchIndexCRUDTests {
                 to: "bob@test.com",
                 dateMs: 1_700_000_000_000
             ),
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_crud_1:INBOX:2"),
                 headerId: "test_crud_1:INBOX:2",
                 messageId: "<msg2@test.com>",
                 subject: "Second Message",
@@ -127,7 +126,7 @@ struct SearchIndexCRUDTests {
         ]
 
         // Clean up any leftovers from a previous failed run
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
 
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 2)
@@ -137,7 +136,7 @@ struct SearchIndexCRUDTests {
         #expect(reinserted == 0)
 
         // Cleanup
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
     }
 
     @Test("indexHeaders with empty array returns 0")
@@ -152,7 +151,7 @@ struct SearchIndexCRUDTests {
         // as ONE token, so partial-address queries matched nothing. With the
         // splitting tokenizer, any address PART is matchable too.
         let hid = "test_email_q:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "<emailq1@test.com>",
             subject: "Aggregate report", from: "noreply-dmarc-helper@domain.com",
             to: "admin@domain.com", dateMs: 1_700_000_000_000
@@ -163,27 +162,27 @@ struct SearchIndexCRUDTests {
         // now so the insert below lands in a new-tokenizer shard (idempotent).
         await index.rebuildStaleTokenizerShards()
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         // Mid-address part (could never match under glued tokenchars indexing)
         let part = try await index.keywordSearch(query: "dmarc")
-        #expect(part.contains { $0.headerId == hid }, "mid-address part must match")
+        #expect(part.contains { $0.contentKey.rawValue == hid }, "mid-address part must match")
 
         // Partial with trailing hyphen, as typed mid-flight
         let midway = try await index.keywordSearch(query: "dmarc-help")
-        #expect(midway.contains { $0.headerId == hid }, "mid-typing partial must match")
+        #expect(midway.contains { $0.contentKey.rawValue == hid }, "mid-typing partial must match")
 
         // Multi-part partial from the start
         let partial = try await index.keywordSearch(query: "noreply-dmarc-")
-        #expect(partial.contains { $0.headerId == hid }, "partial local-part must match")
+        #expect(partial.contains { $0.contentKey.rawValue == hid }, "partial local-part must match")
 
         // Full address (adjacency phrase under the splitting tokenizer)
         let full = try await index.keywordSearch(query: "noreply-dmarc-helper@domain.com")
-        #expect(full.contains { $0.headerId == hid }, "full address must match")
+        #expect(full.contains { $0.contentKey.rawValue == hid }, "full address must match")
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("Tokenizer migration rebuilds old-tokenchars shards in place, preserving rowids")
@@ -193,11 +192,10 @@ struct SearchIndexCRUDTests {
         // then run the migration and verify: new tokenizer in sqlite_master,
         // rowids preserved, and part-queries match.
         let hid = "test_retok:INBOX:1"
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let oldTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
         let rowid: Int64 = try await index.testSeedLegacyShard(
-            year: 2001, tokenize: oldTokenize,
-            headerId: hid, msgId: "<retok1@test.com>",
+            year: 2001, tokenize: oldTokenize, contentKey: ContentKey(rawValue: hid), msgId: "<retok1@test.com>",
             subject: "Weekly digest", from: "billing-alerts@domain.com",
             body: "full body text here", dateMs: 980_000_000_000 // 2001 epoch ms
         )
@@ -208,27 +206,26 @@ struct SearchIndexCRUDTests {
         #expect(!(sql?.contains("tokenchars") ?? true), "shard must use the new tokenizer, got: \(sql ?? "nil")")
 
         // rowid alignment with message_meta must survive the rebuild
-        let newRowid = try await index.testRowidForHeader(hid)
+        let newRowid = try await index.testRowidForHeader(ContentKey(rawValue: hid))
         #expect(newRowid == rowid, "rowid must be preserved across rebuild")
 
         // Part-query now matches content indexed under the old scheme
         let hits = try await index.keywordSearch(query: "billing")
-        #expect(hits.contains { $0.headerId == hid }, "address part must match after rebuild")
+        #expect(hits.contains { $0.contentKey.rawValue == hid }, "address part must match after rebuild")
         let bodyHits = try await index.keywordSearch(query: "\"full body text\"")
-        #expect(bodyHits.contains { $0.headerId == hid }, "body must survive rebuild")
+        #expect(bodyHits.contains { $0.contentKey.rawValue == hid }, "body must survive rebuild")
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         try await index.testDropShard(year: 2001)
     }
 
     @Test("Tokenizer migration honors the deadline and resumes; hasStaleTokenizerShards tracks it")
     func tokenizerRebuildDeadline() async throws {
         let hid = "test_retok_dl:INBOX:1"
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let oldTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
         _ = try await index.testSeedLegacyShard(
-            year: 2002, tokenize: oldTokenize,
-            headerId: hid, msgId: "<retokdl@test.com>",
+            year: 2002, tokenize: oldTokenize, contentKey: ContentKey(rawValue: hid), msgId: "<retokdl@test.com>",
             subject: "Deadline test", from: "alerts@domain.com",
             body: "body", dateMs: 1_010_000_000_000 // 2002 epoch ms
         )
@@ -247,7 +244,7 @@ struct SearchIndexCRUDTests {
         #expect(sqlAfterFuture?.contains("tokenchars") == false, "future deadline must convert")
         #expect(!(await index.hasStaleTokenizerShards()), "no stale shards after full run")
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         try await index.testDropShard(year: 2002)
     }
 
@@ -256,13 +253,12 @@ struct SearchIndexCRUDTests {
         let hid = "test_retok_empty:INBOX:1"
         let oldTokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'"
         _ = try await index.testSeedLegacyShard(
-            year: 2003, tokenize: oldTokenize,
-            headerId: hid, msgId: "<retokempty@test.com>",
+            year: 2003, tokenize: oldTokenize, contentKey: ContentKey(rawValue: hid), msgId: "<retokempty@test.com>",
             subject: "Empty test", from: "x@domain.com",
             body: "body", dateMs: 1_041_400_000_000 // 2003 epoch ms
         )
         // Empty the shard — removeMessages deletes the FTS row but leaves the table
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
 
         await index.rebuildStaleTokenizerShards()
 
@@ -275,74 +271,74 @@ struct SearchIndexCRUDTests {
     @Test("updateBody writes body text to FTS")
     func updateBodyWritesToFTS() async throws {
         let hid = "test_body_1:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "<body1@test.com>",
             subject: "Body Test", from: "a@test.com", to: "b@test.com",
             dateMs: 1_700_000_000_000
         )
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateBody(headerId: hid, body: "This is the full email body text for testing.")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "This is the full email body text for testing.")
 
         // Verify body is searchable
         let results = try await index.keywordSearch(query: "\"full email body text\"")
-        #expect(results.contains { $0.headerId == hid })
+        #expect(results.contains { $0.contentKey.rawValue == hid })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBody for non-existent header is a no-op")
     func updateBodyNonExistent() async throws {
-        try await index.updateBody(headerId: "nonexistent_test:INBOX:999", body: "some body")
+        try await index.updateBody( contentKey: ContentKey(rawValue: "nonexistent_test:INBOX:999"), body: "some body")
     }
 
     @Test("removeMessages removes indexed headers")
     func removeMessages() async throws {
         let hid = "test_remove_1:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "<remove1@test.com>",
             subject: "To Be Removed", from: "x@test.com", to: "y@test.com",
             dateMs: 1_700_000_000_000
         )
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        let isIndexedBefore = try await index.isIndexed(headerId: hid)
+        let isIndexedBefore = try await index.isIndexed( contentKey: ContentKey(rawValue: hid))
         #expect(isIndexedBefore == true)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
 
-        let isIndexedAfter = try await index.isIndexed(headerId: hid)
+        let isIndexedAfter = try await index.isIndexed( contentKey: ContentKey(rawValue: hid))
         #expect(isIndexedAfter == false)
     }
 
     @Test("removeMessages with empty array is a no-op")
     func removeMessagesEmpty() async throws {
-        try await index.removeMessages(headerIds: [])
+        try await index.removeMessages( contentKeys: [])
     }
 
     @Test("isIndexed returns false for non-existent header")
     func isIndexedNonExistent() async throws {
-        let result = try await index.isIndexed(headerId: "nonexistent_test:INBOX:999")
+        let result = try await index.isIndexed( contentKey: ContentKey(rawValue: "nonexistent_test:INBOX:999"))
         #expect(result == false)
     }
 
     @Test("documentCountForAccount uses headerId prefix matching")
     func documentCountForAccount() async throws {
         let records = [
-            FTSHeaderRecord(headerId: "test_acct_count_a:INBOX:1", messageId: "m1", subject: "S1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_acct_count_a:INBOX:1"),headerId: "test_acct_count_a:INBOX:1", messageId: "m1", subject: "S1",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
-            FTSHeaderRecord(headerId: "test_acct_count_a:INBOX:2", messageId: "m2", subject: "S2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_acct_count_a:INBOX:2"),headerId: "test_acct_count_a:INBOX:2", messageId: "m2", subject: "S2",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
-            FTSHeaderRecord(headerId: "test_acct_count_b:INBOX:1", messageId: "m3", subject: "S3",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_acct_count_b:INBOX:1"),headerId: "test_acct_count_b:INBOX:1", messageId: "m3", subject: "S3",
                             from: "c@c.com", to: "d@d.com", dateMs: 1_700_000_000_000),
         ]
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 3)
 
@@ -355,20 +351,20 @@ struct SearchIndexCRUDTests {
         let countNone = try await index.documentCountForAccount(accountId: "test_acct_count_nonexistent")
         #expect(countNone == 0)
 
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
     }
 
     @Test("removeMessagesForAccount removes all messages for given account")
     func removeMessagesForAccount() async throws {
         let records = [
-            FTSHeaderRecord(headerId: "test_acct_rm_a:INBOX:1", messageId: "m1", subject: "S1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_acct_rm_a:INBOX:1"),headerId: "test_acct_rm_a:INBOX:1", messageId: "m1", subject: "S1",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
-            FTSHeaderRecord(headerId: "test_acct_rm_a:INBOX:2", messageId: "m2", subject: "S2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_acct_rm_a:INBOX:2"),headerId: "test_acct_rm_a:INBOX:2", messageId: "m2", subject: "S2",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
-            FTSHeaderRecord(headerId: "test_acct_rm_b:INBOX:1", messageId: "m3", subject: "S3",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_acct_rm_b:INBOX:1"),headerId: "test_acct_rm_b:INBOX:1", messageId: "m3", subject: "S3",
                             from: "c@c.com", to: "d@d.com", dateMs: 1_700_000_000_000),
         ]
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         try await index.removeMessagesForAccount(accountId: "test_acct_rm_a")
         try await index.removeMessagesForAccount(accountId: "test_acct_rm_b")
 
@@ -383,33 +379,33 @@ struct SearchIndexCRUDTests {
         let countB = try await index.documentCountForAccount(accountId: "test_acct_rm_b")
         #expect(countB == 1)
 
-        try await index.removeMessages(headerIds: ["test_acct_rm_b:INBOX:1"])
+        try await index.removeMessages( contentKeys: ["test_acct_rm_b:INBOX:1"].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBodies batch updates body text for multiple messages")
     func updateBodies() async throws {
         let records = [
-            FTSHeaderRecord(headerId: "test_bulk_body:INBOX:1", messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_bulk_body:INBOX:1"),headerId: "test_bulk_body:INBOX:1", messageId: "m1",
                             subject: "Bulk 1", from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
-            FTSHeaderRecord(headerId: "test_bulk_body:INBOX:2", messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_bulk_body:INBOX:2"),headerId: "test_bulk_body:INBOX:2", messageId: "m2",
                             subject: "Bulk 2", from: "a@a.com", to: "b@b.com", dateMs: 1_710_000_000_000),
         ]
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 2)
 
         try await index.updateBodies([
             (headerId: "test_bulk_body:INBOX:1", body: "Body text one"),
             (headerId: "test_bulk_body:INBOX:2", body: "Body text two"),
-        ])
+        ].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         // Verify bodies are searchable
         let r1 = try await index.keywordSearch(query: "\"Body text one\"")
         let r2 = try await index.keywordSearch(query: "\"Body text two\"")
-        #expect(r1.contains { $0.headerId == "test_bulk_body:INBOX:1" })
-        #expect(r2.contains { $0.headerId == "test_bulk_body:INBOX:2" })
+        #expect(r1.contains { $0.contentKey.rawValue == "test_bulk_body:INBOX:1" })
+        #expect(r2.contains { $0.contentKey.rawValue == "test_bulk_body:INBOX:2" })
 
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBodies with empty array is a no-op")
@@ -420,45 +416,45 @@ struct SearchIndexCRUDTests {
     @Test("clearBodies removes body text from FTS")
     func clearBodies() async throws {
         let hid = "test_clear_body:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Clear Test",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateBody(headerId: hid, body: "Uniquecleartestbodytext here")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "Uniquecleartestbodytext here")
         let beforeClear = try await index.keywordSearch(query: "uniquecleartestbodytext")
-        #expect(beforeClear.contains { $0.headerId == hid })
+        #expect(beforeClear.contains { $0.contentKey.rawValue == hid })
 
-        try await index.clearBodies(headerIds: [hid])
+        try await index.clearBodies( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let afterClear = try await index.keywordSearch(query: "uniquecleartestbodytext")
-        #expect(!afterClear.contains { $0.headerId == hid })
+        #expect(!afterClear.contains { $0.contentKey.rawValue == hid })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("clearBodies with empty array is a no-op")
     func clearBodiesEmpty() async throws {
-        try await index.clearBodies(headerIds: [])
+        try await index.clearBodies( contentKeys: [])
     }
 
     @Test("updateCcBcc updates cc and bcc fields")
     func updateCcBcc() async throws {
         let hid = "test_ccbcc:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "CcBcc Test",
             from: "a@a.com", to: "b@b.com", cc: "", bcc: "",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateCcBcc([(headerId: hid, cc: "cc@test.com", bcc: "bcc@test.com")])
+        try await index.updateCcBcc([(headerId: hid, cc: "cc@test.com", bcc: "bcc@test.com")].map { (contentKey: ContentKey(rawValue: $0.headerId), cc: $0.cc, bcc: $0.bcc) })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateCcBcc with empty array is a no-op")
@@ -482,43 +478,43 @@ struct SearchIndexCRUDTests {
 
     @Test("bodyText returns nil for non-existent header")
     func bodyTextNonExistent() async throws {
-        let body = try await index.bodyText(headerId: "nonexistent_test:INBOX:999")
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: "nonexistent_test:INBOX:999"))
         #expect(body == nil)
     }
 
     @Test("bodyText returns nil when body is empty")
     func bodyTextEmpty() async throws {
         let hid = "test_bodytext:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Body Text Test",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        let body = try await index.bodyText(headerId: hid)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body == nil)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("bodyText returns text after updateBody")
     func bodyTextAfterUpdate() async throws {
         let hid = "test_bodytext2:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Body Text Test",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateBody(headerId: hid, body: "The actual email body content")
-        let body = try await index.bodyText(headerId: hid)
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "The actual email body content")
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body == "The actual email body content")
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("sortedShardYears returns years in descending order")
@@ -532,22 +528,22 @@ struct SearchIndexCRUDTests {
     @Test("keywordSearch finds indexed messages by subject")
     func keywordSearchBySubject() async throws {
         let hid = "test_kwsearch:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Zephyranthes Budgeticus Forecasticus",
             from: "finance@company.com", to: "team@company.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         // Use a unique word to avoid matching other indexed messages
         let results = try await index.keywordSearch(query: "zephyranthes")
-        let found = results.contains { $0.headerId == hid }
+        let found = results.contains { $0.contentKey.rawValue == hid }
         #expect(found)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("keywordSearch returns empty for non-matching query")
@@ -577,35 +573,35 @@ struct SearchIndexCRUDTests {
     @Test("Year shard for dateMs=0 uses fallback year 2000")
     func yearShardFallback() async throws {
         let hid = "test_year0:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Zero Date Test",
             from: "a@a.com", to: "b@b.com", dateMs: 0
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let years = await index.sortedShardYears
         #expect(years.contains(2000))
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("Year shard for negative dateMs uses fallback year 2000")
     func yearShardNegativeDate() async throws {
         let hid = "test_negdate:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Negative Date Test",
             from: "a@a.com", to: "b@b.com", dateMs: -1000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let years = await index.sortedShardYears
         #expect(years.contains(2000))
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     // headerIdsNeedingEmbeddings, textForEmbedding removed — embeddings logic moved out of SearchIndex
@@ -613,37 +609,37 @@ struct SearchIndexCRUDTests {
     @Test("storeEmbedding does not crash for non-existent header")
     func storeEmbeddingNonExistent() async throws {
         let fakeEmbedding = [Float](repeating: 0.1, count: SearchConfig.embeddingDims)
-        try await index.storeEmbedding(headerId: "nonexistent_test:INBOX:999", embedding: fakeEmbedding)
+        try await index.storeEmbedding( contentKey: ContentKey(rawValue: "nonexistent_test:INBOX:999"), embedding: fakeEmbedding)
     }
 
     @Test("storeEmbedding stores embedding for indexed message")
     func storeEmbedding() async throws {
         let hid = "test_store_emb:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Embed Store Test",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let embedding = [Float](repeating: 0.5, count: SearchConfig.embeddingDims)
-        try await index.storeEmbedding(headerId: hid, embedding: embedding)
+        try await index.storeEmbedding( contentKey: ContentKey(rawValue: hid), embedding: embedding)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("keywordSearch with date range filters results")
     func keywordSearchWithDateRange() async throws {
         let records = [
-            FTSHeaderRecord(headerId: "test_date_range:INBOX:1", messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_date_range:INBOX:1"),headerId: "test_date_range:INBOX:1", messageId: "m1",
                             subject: "Xylophone Zygote January Report",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_704_067_200_000),
-            FTSHeaderRecord(headerId: "test_date_range:INBOX:2", messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_date_range:INBOX:2"),headerId: "test_date_range:INBOX:2", messageId: "m2",
                             subject: "Xylophone Zygote June Report",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_719_792_000_000),
         ]
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 2)
 
@@ -652,32 +648,32 @@ struct SearchIndexCRUDTests {
             fromDateMs: 1_704_067_200_000,
             toDateMs: 1_711_929_600_000
         )
-        let foundJan = results.contains { $0.headerId == "test_date_range:INBOX:1" }
-        let foundJun = results.contains { $0.headerId == "test_date_range:INBOX:2" }
+        let foundJan = results.contains { $0.contentKey.rawValue == "test_date_range:INBOX:1" }
+        let foundJun = results.contains { $0.contentKey.rawValue == "test_date_range:INBOX:2" }
         if !results.isEmpty {
             #expect(foundJan)
             #expect(!foundJun)
         }
 
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
     }
 
     @Test("search with field-scoped query does not crash")
     func searchWithFieldScope() async throws {
         let hid = "test_field_search:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Important Report",
             from: "alice@company.com", to: "team@company.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let results = try await index.keywordSearch(query: "from:alice")
         #expect(results.count >= 0)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("optimize runs without error")

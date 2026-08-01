@@ -226,7 +226,7 @@ struct DraftDeletionTests {
             header.isRead = true
             try header.insert(db)
 
-            let body = MessageBody(headerId: headerId, htmlContent: MessageBody.plainTextToHTML("Hello world"))
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: MessageBody.plainTextToHTML("Hello world"))
             try body.save(db)
         }
 
@@ -272,7 +272,7 @@ struct DraftDeletionTests {
             header.rfc822MessageId = "draft-rfc822@test.com"
             try header.insert(db)
 
-            let body = MessageBody(headerId: oldHeaderId, htmlContent: "<p>Body text</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: oldHeaderId), htmlContent: "<p>Body text</p>")
             try body.save(db)
         }
 
@@ -286,7 +286,7 @@ struct DraftDeletionTests {
                 migrated.id = newHeaderId
                 migrated.messageId = realMessageId
                 try migrated.insert(db)
-                let newBody = MessageBody(headerId: newHeaderId, htmlContent: savedHtml)
+                let newBody = MessageBody( contentKey: ContentKey(rawValue: newHeaderId), htmlContent: savedHtml)
                 try newBody.insert(db)
             }
         }

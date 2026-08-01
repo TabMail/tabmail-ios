@@ -249,10 +249,15 @@ enum StuckMessageDiagnostics {
             return
         }
         // FTS membership for the sampled ids (confirms "searchable") — one batch call.
+        // ⚠ STAGE E1: `rows` carry `messageHeader.id`s; FTS membership is a CONTENT-key
+        // question. Diagnostic-only, so a divergence here mis-reports rather than
+        // corrupting — but it will mis-report every UID-addressed row as `inFTS=n`.
         let ids = rows.map(\.id)
-        let missingFromFTS: Set<String> = (try? await SearchIndex.shared.headerIdsMissingFromFTS(ids)).map(Set.init) ?? []
+        let missingFromFTS: Set<ContentKey> =
+            (try? await SearchIndex.shared.contentKeysMissingFromFTS(
+                ids.map(ContentKey.init(rawValue:)))).map(Set.init) ?? []
         for r in rows {
-            let inFTS = missingFromFTS.contains(r.id) ? "n" : "Y"
+            let inFTS = missingFromFTS.contains(ContentKey(rawValue: r.id)) ? "n" : "Y"
             // Display-only: id/messageId/subject are abbreviated, full data stays in DB.
             BackgroundSyncLogger.logStuckDiag(
                 "  id=\(r.id) prov=\(r.provider) folderId=\(r.folderId.isEmpty ? "''" : r.folderId) path=\(r.folderPath) msgId=\(r.messageId) rfc822=\(r.hasRfc822 ? "Y" : "n") body=\(r.bodyComplete ? "Y" : "n") emptyConf=\(r.bodyEmptyConfirmed ? "Y" : "n") emptyCnt=\(r.emptyFetchCount) inbox=\(r.isInInbox ? "Y" : "n") folderExists=\(r.folderExists ? "Y" : "n") role=\(r.folderRole) sibling=\(r.hasHealthySibling ? "Y" : "n") inFTS=\(inFTS) date=\(r.dateStr) subj=\"\(r.subject)\""

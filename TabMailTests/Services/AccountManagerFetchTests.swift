@@ -21,19 +21,19 @@ struct AccountManagerFetchTests {
 
     @Test("MessageBody.create stores the provided html")
     func messageBodyCreateStoresHtml() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hello</p>")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "<p>Hello</p>")
         #expect(body.htmlContent == "<p>Hello</p>")
     }
 
     @Test("MessageBody.create produces nil htmlContent when html is nil")
     func messageBodyCreateNilWhenNil() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: nil)
         #expect(body.htmlContent == nil)
     }
 
     @Test("MessageBody.create produces nil htmlContent when html is empty")
     func messageBodyCreateNilWhenEmpty() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "")
         #expect(body.htmlContent == nil)
     }
 
@@ -47,7 +47,7 @@ struct AccountManagerFetchTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "100")
 
         // Simulate fetchBody writing the body
-        let body = MessageBody(headerId: header.id, htmlContent: "<p>Email body</p>")
+        let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Email body</p>")
         try db.write { try body.save($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: header.id) }
@@ -63,11 +63,11 @@ struct AccountManagerFetchTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "100")
 
         // Background render inserts first
-        let bgBody = MessageBody(headerId: header.id, htmlContent: "<p>Background render</p>")
+        let bgBody = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Background render</p>")
         try db.write { try bgBody.insert($0, onConflict: .ignore) }
 
         // User-open path uses save() which overwrites
-        let userBody = MessageBody(headerId: header.id, htmlContent: "<p>User-open render with CID images</p>")
+        let userBody = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>User-open render with CID images</p>")
         try db.write { try userBody.save($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: header.id) }
@@ -295,7 +295,7 @@ struct AccountManagerFetchTests {
 
         // Simulate fetchBody: fetch from provider then write
         let fetched = try await mock.fetchMessage(id: header.messageId, folder: header.folderPath)
-        let body = MessageBody.create(headerId: header.id, htmlBody: fetched.htmlBody)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: header.id), htmlBody: fetched.htmlBody)
         try await db.write { try body.save($0) }
 
         let stored = try await db.read { try MessageBody.fetchOne($0, key: header.id) }
@@ -337,7 +337,7 @@ struct AccountManagerFetchTests {
         await mock.setFetchMessageResult(fullMsg)
 
         let fetched = try await mock.fetchMessage(id: "200", folder: "INBOX")
-        let body = MessageBody.create(headerId: header.id, htmlBody: fetched.htmlBody)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: header.id), htmlBody: fetched.htmlBody)
         try await db.write { try body.save($0) }
 
         let stored = try await db.read { try MessageBody.fetchOne($0, key: header.id) }

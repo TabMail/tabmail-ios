@@ -8,7 +8,15 @@ import GRDB
 struct MessageBody: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
     static let databaseTableName = "messageBody"
 
-    var id: String // Same as headerId — 1:1 with MessageHeader
+    /// The message's CONTENT key — not its `messageHeader.id`.
+    ///
+    /// The two are the same string today, and were 1:1 with `MessageHeader` by
+    /// construction. They stop being the same string once the content key's tail
+    /// moves off the provider id (`ContentKeySpace`): a body belongs to the
+    /// *content*, so it survives a `UIDVALIDITY` renumber that re-addresses the
+    /// header. Typed so a `messageHeader.id` cannot be handed to
+    /// `MessageBody.fetchOne(db, key:)` — or vice versa — without saying so.
+    var id: ContentKey
     var htmlContent: String?
     /// JSON-encoded [AttachmentInfo] for attachment metadata
     var attachmentsJSON: String?
@@ -16,8 +24,8 @@ struct MessageBody: Codable, FetchableRecord, PersistableRecord, Identifiable, S
     /// Raw ICS text from text/calendar attachment (for "Add to Calendar" action)
     var icsText: String?
 
-    init(headerId: String, htmlContent: String?) {
-        self.id = headerId
+    init(contentKey: ContentKey, htmlContent: String?) {
+        self.id = contentKey
         self.htmlContent = htmlContent
         self.fetchedAt = Date()
     }
@@ -28,11 +36,11 @@ struct MessageBody: Codable, FetchableRecord, PersistableRecord, Identifiable, S
     /// structurally removes the historic double-escape site (`plainTextToHTML`
     /// applied to content that was already HTML). Pass the `RenderedBody.htmlContent`
     /// produced by `BodyRenderer`.
-    static func create(headerId: String, htmlBody: String?) -> MessageBody {
+    static func create(contentKey: ContentKey, htmlBody: String?) -> MessageBody {
         if let html = htmlBody, !html.isEmpty {
-            return MessageBody(headerId: headerId, htmlContent: html)
+            return MessageBody(contentKey: contentKey, htmlContent: html)
         }
-        return MessageBody(headerId: headerId, htmlContent: nil)
+        return MessageBody(contentKey: contentKey, htmlContent: nil)
     }
 
     /// Convert plain text email to HTML for WKWebView rendering.
@@ -53,3 +61,4 @@ struct MessageBody: Codable, FetchableRecord, PersistableRecord, Identifiable, S
         return (try? JSONDecoder().decode([AttachmentInfo].self, from: data)) ?? []
     }
 }
+

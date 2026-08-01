@@ -121,7 +121,7 @@ struct RFC822IdentityMergeGuardTests {
                 )
             }
             if let bodyHTML {
-                try MessageBody(headerId: header.id, htmlContent: bodyHTML).insert(db)
+                try MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: bodyHTML).insert(db)
             }
         }
         return header.id

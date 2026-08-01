@@ -610,14 +610,18 @@ actor ActiveAIQueue {
 
         // Read body text from FTS (already persisted by ActiveBodyQueue/backfill).
         // If body is missing, drop — body fetch pipeline will enqueue AI when body arrives.
-        guard let plainText = try? await SearchIndex.shared.bodyText(headerId: job.headerId),
+        // ⚠ STAGE E1: the AI queue is keyed by `messageHeader.id`; the FTS body it
+        // reads is keyed by CONTENT.
+        guard let plainText = try? await SearchIndex.shared.bodyText(
+            contentKey: ContentKey(rawValue: job.headerId)),
               !plainText.isEmpty else {
             // Diagnostic: distinguish failure modes to find root cause of FTS body loss
             let ftsDbReady = await SearchIndex.shared.isReady
             let hasMessageBody = (try? await dbPool.read { db in
                 try MessageBody.fetchOne(db, key: job.headerId) != nil
             }) ?? false
-            let ftsReason = await SearchIndex.shared.bodyTextDiagnostic(headerId: job.headerId)
+            let ftsReason = await SearchIndex.shared.bodyTextDiagnostic(
+                contentKey: ContentKey(rawValue: job.headerId))
             let diag = "bodyComplete=\(message.bodyComplete), hasMessageBody=\(hasMessageBody), ftsReady=\(ftsDbReady), fts=\(ftsReason)"
             print("[ActiveAI] No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
             BackgroundSyncLogger.logAIProcessing("No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")

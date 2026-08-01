@@ -307,10 +307,10 @@ extension SyncEngine {
                                     .filter(Column("folderId") == folder.id && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                                     .fetchOne(db) {
                                     let oldId = optimistic.id
-                                    if let body = try MessageBody.fetchOne(db, key: oldId) {
+                                    if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                                         var newBody = body
-                                        newBody.id = header.id
-                                        try MessageBody.deleteOne(db, key: oldId)
+                                        newBody.id = ContentKey(rawValue: header.id)
+                                        try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                                         deferredSentBody = newBody
                                     }
                                     removedIds.append(oldId)
@@ -664,10 +664,10 @@ extension SyncEngine {
                                 .filter(Column("folderId") == folder.id && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                                 .fetchOne(db) {
                                 let oldId = optimistic.id
-                                if let body = try MessageBody.fetchOne(db, key: oldId) {
+                                if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                                     var newBody = body
-                                    newBody.id = header.id
-                                    try MessageBody.deleteOne(db, key: oldId)
+                                    newBody.id = ContentKey(rawValue: header.id)
+                                    try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                                     deferredSentBody = newBody
                                 }
                                 removedIds.append(oldId)

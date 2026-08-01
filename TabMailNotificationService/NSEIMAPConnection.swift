@@ -147,16 +147,23 @@ enum NSEIMAPConnection {
             return nil
         }
 
-        // Compute headerId via the shared MessageIdentity helper (identical to
-        // what main-app merge will use). Threaded through `renderBody` so inline
-        // images route through `BodyAssetStore.makeInlineImageWriter(forHeaderId:)`
+        // Mint the CONTENT key through the sanctioned factory (identical to what
+        // main-app merge will use). Threaded through `renderBody` so inline images
+        // route through `BodyAssetStore.makeInlineImageWriter(forContentKey:)`
         // — same factory the main-app and Gmail/Outlook NSE paths use, so disk
         // assets land at identical paths across targets, by construction.
-        let headerId = MessageIdentity.headerId(
-            accountId: accountId, folderPath: folderPath, messageId: meta.messageId
+        //
+        // `space: .uidAddressed` is not a guess — this connection only ever serves
+        // IMAP and iCloud, whose UIDs a `UIDVALIDITY` change reassigns, so the RFC
+        // id (when usable) becomes the tail. Today the factory returns
+        // `messageHeader.id` verbatim, so this is byte-identical to the
+        // `MessageIdentity.headerId` call it replaces.
+        let contentKey = ContentKey.forHeader(
+            accountId: accountId, folderPath: folderPath, providerMessageId: meta.messageId,
+            rfc822MessageId: meta.rfc822MessageId, space: .uidAddressed
         )
         let rendered = await IMAPFetchMapping.renderBody(
-            info: info, message: message, headerId: headerId
+            info: info, message: message, contentKey: contentKey
         )
         return (meta, rendered)
     }

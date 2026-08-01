@@ -285,7 +285,7 @@ enum IMAPFetchMapping {
     static func renderBody(
         info: MessageInfo,
         message: Message,
-        headerId: String? = nil,
+        contentKey: ContentKey? = nil,
         maxInlineImages: Int = BodyRenderer.maxInlineImages
     ) async -> RenderedBody {
         let ingredients = buildRawBodyIngredients(
@@ -299,15 +299,15 @@ enum IMAPFetchMapping {
             guard let invite = ICSBuilder.parseIncoming(icsText) else { return nil }
             return ICSBuilder.buildIncomingInviteBody(invite)
         }
-        // When `headerId` is supplied, route inline images through
+        // When `contentKey` is supplied, route inline images through
         // `BodyAssetStore` so they land on disk and the rendered HTML
         // references `tabmail-asset://` URLs rather than baked-in data URIs.
         // Both main-app (`BodyFetchProcessor.renderBody`) and NSE
-        // (`NSEIMAPConnection.fetchRenderedBody`) callers pass the headerId
+        // (`NSEIMAPConnection.fetchRenderedBody`) callers pass the content key
         // — so the disk-asset path is exercised identically by both targets,
         // by construction. Compose preview / Eml preview pass nil → data URIs.
         let inlineImageWriter: BodyRenderer.InlineImageWriter? =
-            headerId.map { BodyAssetStore.makeInlineImageWriter(forHeaderId: $0) }
+            contentKey.map { BodyAssetStore.makeInlineImageWriter(forContentKey: $0) }
         return await BodyRenderer.render(
             ingredients: ingredients,
             attachmentFetcher: nil,

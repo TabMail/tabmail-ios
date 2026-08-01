@@ -662,7 +662,7 @@ actor BackfillBodyQueue {
                     return .duplicateDropped
                 }
                 // Fetch body BEFORE deleting the header — FK CASCADE deletes it too.
-                let oldBody = try MessageBody.fetchOne(db, key: item.headerId)
+                let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: item.headerId))
                 try header.delete(db)
                 guard try MessageHeader.fetchOne(db, key: newHeaderId) == nil else {
                     // The new UID was independently backfilled — old row was a duplicate.
@@ -673,7 +673,7 @@ actor BackfillBodyQueue {
                 header.missFetchCount = 0
                 try header.insert(db)
                 if var body = oldBody {
-                    body.id = newHeaderId
+                    body.id = ContentKey(rawValue: newHeaderId)
                     try body.insert(db)
                 }
                 return .migrated(Item(
@@ -692,7 +692,9 @@ actor BackfillBodyQueue {
         // Move the FTS entry to the new id IN PLACE. rekeyHeaders' collision
         // branch drops the old entry when the new id is already indexed — which
         // is exactly the duplicateDropped case.
-        try? await SearchIndex.shared.rekeyHeaders([(oldId: item.headerId, newId: newHeaderId, newMessageId: newUID)])
+        try? await SearchIndex.shared.rekeyHeaders([(oldKey: ContentKey(rawValue: item.headerId),
+                                                     newKey: ContentKey(rawValue: newHeaderId),
+                                                     newMessageId: newUID)])
         return outcome
     }
 

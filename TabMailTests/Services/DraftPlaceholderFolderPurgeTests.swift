@@ -109,7 +109,7 @@ struct DraftPlaceholderFolderPurgeTests {
     /// Index one header straight into the shared FTS database, bypassing sync.
     private func indexFTS(headerId: String, messageId: String, folderId: String) async throws {
         _ = try await SearchIndex.shared.indexHeaders([
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: headerId),
                 headerId: headerId, messageId: messageId,
                 subject: "Zanzibarquixotic subject", from: "sender@example.com",
                 to: "recipient@example.com",
@@ -120,7 +120,7 @@ struct DraftPlaceholderFolderPurgeTests {
     }
 
     private func isInFTS(_ headerId: String) async throws -> Bool {
-        try await SearchIndex.shared.headerIdsMissingFromFTS([headerId]).isEmpty
+        try await SearchIndex.shared.contentKeysMissingFromFTS([ContentKey(rawValue: headerId)]).isEmpty
     }
 
     private func chatMappingExists(_ pool: DatabasePool, realId: String) async throws -> Bool {
@@ -216,7 +216,7 @@ struct DraftPlaceholderFolderPurgeTests {
 
         defer {
             let ids = [replyHeaderId, plainHeaderId, syncedHeaderId, siblingHeaderId]
-            Task.detached { try? await SearchIndex.shared.removeMessages(headerIds: ids) }
+            Task.detached { try? await SearchIndex.shared.removeMessages(contentKeys: ids.map(ContentKey.init(rawValue:))) }
         }
 
         // A chat pill mapping for each — the second sidecar the purge owns.
@@ -237,7 +237,7 @@ struct DraftPlaceholderFolderPurgeTests {
         let scopedBefore = try await SearchIndex.shared.keywordSearch(
             query: "zanzibarquixotic",
             folderIds: [MessageIdentity.folderId(accountId: accountId, folderPath: Self.draftsPath)]
-        ).map(\.headerId)
+        ).map(\.contentKey.rawValue)
         #expect(scopedBefore.contains(plainHeaderId),
                 "over-refusal control: a normal draft must be visible to a folder-scoped query")
         #expect(scopedBefore.contains(syncedHeaderId),
@@ -301,7 +301,7 @@ struct DraftPlaceholderFolderPurgeTests {
             folderId: MessageIdentity.folderId(accountId: accountId, folderPath: Self.siblingPath))
         defer {
             let ids = [parentHeaderId, childHeaderId]
-            Task.detached { try? await SearchIndex.shared.removeMessages(headerIds: ids) }
+            Task.detached { try? await SearchIndex.shared.removeMessages(contentKeys: ids.map(ContentKey.init(rawValue:))) }
         }
         try insertChatMapping(pool, numericId: 1, realId: parentHeaderId)
         try insertChatMapping(pool, numericId: 2, realId: childHeaderId)

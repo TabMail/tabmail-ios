@@ -103,7 +103,7 @@ struct DatabaseTransactionTests {
 
         // Second insert with INSERT OR IGNORE should not overwrite
         try db.write { db in
-            let body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Second</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:1"), htmlContent: "<p>Second</p>")
             try body.insert(db, onConflict: .ignore)
         }
 

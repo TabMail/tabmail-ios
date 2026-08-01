@@ -11,7 +11,7 @@ import GRDB
 ///
 /// The self-heal is the safety net that catches the FTS orphan case described
 /// in the original log (`logmain.log`): rows with `headerComplete=1` that the
-/// FTS index doesn't actually have. Without the heal, `updateBodies()` silently
+/// FTS index doesn't actually have. Without the heal, `updateBodies(…)` silently
 /// defers, `bodyComplete` stays 0, and the backfill queue re-dispatches the
 /// same rows every cycle.
 ///
@@ -65,12 +65,12 @@ struct SelfHealBackfillFTSTests {
         try? await AppDatabase.dbPool.write { db in
             try db.execute(sql: "DELETE FROM messageHeader WHERE id = ?", arguments: [headerId])
         }
-        try? await SearchIndex.shared.removeMessages(headerIds: [headerId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [headerId].map(ContentKey.init(rawValue:)))
     }
 
     private func isMissingFromFTS(headerId: String) async -> Bool {
-        let missing = (try? await SearchIndex.shared.headerIdsMissingFromFTS([headerId])) ?? []
-        return missing.contains(headerId)
+        let missing = (try? await SearchIndex.shared.contentKeysMissingFromFTS([headerId].map(ContentKey.init(rawValue:)))) ?? []
+        return missing.contains(ContentKey(rawValue: headerId))
     }
 
     // MARK: - Tests
@@ -241,7 +241,7 @@ struct SelfHealBackfillFTSTests {
 struct FTSOrphanPruneTests {
 
     private func makeRecord(_ headerId: String) -> FTSHeaderRecord {
-        FTSHeaderRecord(
+        FTSHeaderRecord( contentKey: ContentKey(rawValue: headerId),
             headerId: headerId, messageId: "m-\(headerId.suffix(6))",
             subject: "orphanprune test", from: "a@x", to: "b@x",
             dateMs: Int64(Date().timeIntervalSince1970 * 1000),
@@ -287,7 +287,7 @@ struct FTSOrphanPruneTests {
     func prunesDeadKeepsLive() async throws {
         let liveId = "orphanprune-acct:INBOX:op-live-1"
         let deadId = "orphanprune-acct:INBOX:op-dead-1"
-        try? await SearchIndex.shared.removeMessages(headerIds: [liveId, deadId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [liveId, deadId].map(ContentKey.init(rawValue:)))
 
         try await insertLiveHeader(headerId: liveId)
         _ = try await SearchIndex.shared.indexHeaders([makeRecord(liveId), makeRecord(deadId)])
@@ -297,11 +297,11 @@ struct FTSOrphanPruneTests {
         // and an unscoped sweep would remove their fixtures.
         _ = try await engine.pruneFTSOrphans(scopePrefix: "orphanprune-acct:")
 
-        let missing = try await SearchIndex.shared.headerIdsMissingFromFTS([liveId, deadId])
-        #expect(!missing.contains(liveId), "live entry must survive the prune")
-        #expect(missing.contains(deadId), "dead entry must be pruned")
+        let missing = try await SearchIndex.shared.contentKeysMissingFromFTS([liveId, deadId].map(ContentKey.init(rawValue:)))
+        #expect(!missing.contains(ContentKey(rawValue: liveId)), "live entry must survive the prune")
+        #expect(missing.contains(ContentKey(rawValue: deadId)), "dead entry must be pruned")
 
-        try? await SearchIndex.shared.removeMessages(headerIds: [liveId, deadId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [liveId, deadId].map(ContentKey.init(rawValue:)))
         await cleanupGRDB(accountId: "orphanprune-acct")
     }
 
@@ -314,23 +314,23 @@ struct FTSOrphanPruneTests {
         defer { UserDefaults(suiteName: suiteName)!.removePersistentDomain(forName: suiteName) }
         let deadA = "orphanprune-acct:INBOX:op-gate-a"
         let deadB = "orphanprune-acct:INBOX:op-gate-b"
-        try? await SearchIndex.shared.removeMessages(headerIds: [deadA, deadB])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [deadA, deadB].map(ContentKey.init(rawValue:)))
 
         _ = try await SearchIndex.shared.indexHeaders([makeRecord(deadA)])
 
         let engine = SyncEngine()
         await engine.oneTimeFTSReconciliation(defaults: UserDefaults(suiteName: suiteName)!, scopePrefix: "orphanprune-acct:")
         #expect(UserDefaults(suiteName: suiteName)!.bool(forKey: SyncEngine.ftsReconcileDoneKey) == true)
-        let missingA = try await SearchIndex.shared.headerIdsMissingFromFTS([deadA])
-        #expect(missingA.contains(deadA), "first run prunes")
+        let missingA = try await SearchIndex.shared.contentKeysMissingFromFTS([deadA].map(ContentKey.init(rawValue:)))
+        #expect(missingA.contains(ContentKey(rawValue: deadA)), "first run prunes")
 
         // Second run is gated — a fresh dead entry must survive untouched.
         _ = try await SearchIndex.shared.indexHeaders([makeRecord(deadB)])
         await engine.oneTimeFTSReconciliation(defaults: UserDefaults(suiteName: suiteName)!, scopePrefix: "orphanprune-acct:")
-        let missingB = try await SearchIndex.shared.headerIdsMissingFromFTS([deadB])
-        #expect(!missingB.contains(deadB), "gated second run must not prune")
+        let missingB = try await SearchIndex.shared.contentKeysMissingFromFTS([deadB].map(ContentKey.init(rawValue:)))
+        #expect(!missingB.contains(ContentKey(rawValue: deadB)), "gated second run must not prune")
 
-        try? await SearchIndex.shared.removeMessages(headerIds: [deadA, deadB])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [deadA, deadB].map(ContentKey.init(rawValue:)))
     }
 
     @Test("Moved Gmail message: orphan is RE-KEYED to current id (body preserved), not deleted")
@@ -339,7 +339,7 @@ struct FTSOrphanPruneTests {
         let msgId = "drift-msg-1"
         let oldId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: msgId)
         let newId = MessageIdentity.headerId(accountId: accountId, folderPath: "Archive", messageId: msgId)
-        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, newId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
 
         // GRDB has the message ONLY at its current (Archive) location — a Gmail archive.
         try await AppDatabase.dbPool.write { db in
@@ -361,25 +361,25 @@ struct FTSOrphanPruneTests {
 
         // FTS still carries the STALE INBOX entry WITH its indexed body — the drift.
         _ = try await SearchIndex.shared.indexHeaders([
-            FTSHeaderRecord(headerId: oldId, messageId: msgId, subject: "moved", from: "a@x", to: "b@x",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: oldId),headerId: oldId, messageId: msgId, subject: "moved", from: "a@x", to: "b@x",
                 dateMs: Int64(Date().timeIntervalSince1970 * 1000),
                 folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"))
         ])
-        _ = try await SearchIndex.shared.updateBodies([(headerId: oldId, body: "secret body phrase")])
-        #expect(try await SearchIndex.shared.headerIdsMissingFromFTS([newId]).contains(newId),
+        _ = try await SearchIndex.shared.updateBodies([(headerId: oldId, body: "secret body phrase")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
+        #expect(try await SearchIndex.shared.contentKeysMissingFromFTS([newId].map(ContentKey.init(rawValue:))).contains(ContentKey(rawValue: newId)),
                 "precondition: current id not yet indexed")
 
         let engine = SyncEngine()
         _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
 
         // Re-keyed, not deleted: current id is indexed, the body survived, old id is gone.
-        let missing = try await SearchIndex.shared.headerIdsMissingFromFTS([oldId, newId])
-        #expect(missing.contains(oldId), "stale INBOX id must be re-keyed away")
-        #expect(!missing.contains(newId), "moved message must now resolve under its current id")
-        let body = try await SearchIndex.shared.bodyText(headerId: newId)
+        let missing = try await SearchIndex.shared.contentKeysMissingFromFTS([oldId, newId].map(ContentKey.init(rawValue:)))
+        #expect(missing.contains(ContentKey(rawValue: oldId)), "stale INBOX id must be re-keyed away")
+        #expect(!missing.contains(ContentKey(rawValue: newId)), "moved message must now resolve under its current id")
+        let body = try await SearchIndex.shared.bodyText( contentKey: ContentKey(rawValue: newId))
         #expect(body == "secret body phrase", "re-key must preserve the indexed body, not discard it")
 
-        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, newId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
         try? await AppDatabase.dbPool.write { db in _ = try Account.deleteOne(db, key: accountId) }
     }
 
@@ -392,7 +392,7 @@ struct FTSOrphanPruneTests {
         let uid = "42"
         let oldId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: uid)
         let collidingId = MessageIdentity.headerId(accountId: accountId, folderPath: "Archive", messageId: uid)
-        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, collidingId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [oldId, collidingId].map(ContentKey.init(rawValue:)))
 
         // GRDB: an IMAP account + a DIFFERENT message carrying the same UID in Archive.
         try await AppDatabase.dbPool.write { db in
@@ -414,7 +414,7 @@ struct FTSOrphanPruneTests {
 
         // FTS has the stale INBOX orphan (no GRDB INBOX header).
         _ = try await SearchIndex.shared.indexHeaders([
-            FTSHeaderRecord(headerId: oldId, messageId: uid, subject: "original", from: "a@x", to: "b@x",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: oldId),headerId: oldId, messageId: uid, subject: "original", from: "a@x", to: "b@x",
                 dateMs: Int64(Date().timeIntervalSince1970 * 1000),
                 folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"))
         ])
@@ -424,11 +424,11 @@ struct FTSOrphanPruneTests {
 
         // IMAP must NOT be recovered by UID — the orphan is pruned, the unrelated
         // Archive message is never pulled into FTS.
-        let missing = try await SearchIndex.shared.headerIdsMissingFromFTS([oldId, collidingId])
-        #expect(missing.contains(oldId), "IMAP orphan must be pruned, not re-keyed onto a UID-colliding message")
-        #expect(missing.contains(collidingId), "the unrelated Archive message must not be pulled into FTS")
+        let missing = try await SearchIndex.shared.contentKeysMissingFromFTS([oldId, collidingId].map(ContentKey.init(rawValue:)))
+        #expect(missing.contains(ContentKey(rawValue: oldId)), "IMAP orphan must be pruned, not re-keyed onto a UID-colliding message")
+        #expect(missing.contains(ContentKey(rawValue: collidingId)), "the unrelated Archive message must not be pulled into FTS")
 
-        try? await SearchIndex.shared.removeMessages(headerIds: [oldId, collidingId])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [oldId, collidingId].map(ContentKey.init(rawValue:)))
         try? await AppDatabase.dbPool.write { db in _ = try Account.deleteOne(db, key: accountId) }
     }
 }

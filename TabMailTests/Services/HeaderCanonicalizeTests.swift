@@ -255,7 +255,7 @@ struct SearchIndexRekeyTests {
     private let prefix = "test_rekey"
 
     private func makeRecord(_ headerId: String, subject: String) -> FTSHeaderRecord {
-        FTSHeaderRecord(
+        FTSHeaderRecord( contentKey: ContentKey(rawValue: headerId),
             headerId: headerId, messageId: "m-\(headerId.suffix(4))",
             subject: subject,
             from: "a@a.com", to: "b@b.com",
@@ -268,41 +268,41 @@ struct SearchIndexRekeyTests {
     func rekeyPreservesEntry() async throws {
         let oldId = "\(prefix)_mv:INBOX:1"
         let newId = "\(prefix)_mv:TRASH:1"
-        try? await index.removeMessages(headerIds: [oldId, newId])
+        try? await index.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
 
         _ = try await index.indexHeaders([makeRecord(oldId, subject: "Rekeymovetest unique subject")])
-        _ = try await index.updateBodies([(headerId: oldId, body: "rekeybodytoken unmistakable content")])
+        _ = try await index.updateBodies([(headerId: oldId, body: "rekeybodytoken unmistakable content")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
-        try await index.rekeyHeaders([(oldId: oldId, newId: newId, newMessageId: nil)])
+        try await index.rekeyHeaders([(oldId: oldId, newId: newId, newMessageId: nil)].map { (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId), newMessageId: $0.newMessageId) })
 
         // Body text searchable, hit resolves to the NEW id; old id gone.
         let hits = try await index.keywordSearch(query: "rekeybodytoken")
-        #expect(hits.contains { $0.headerId == newId })
-        #expect(!hits.contains { $0.headerId == oldId })
+        #expect(hits.contains { $0.contentKey.rawValue == newId })
+        #expect(!hits.contains { $0.contentKey.rawValue == oldId })
 
-        try? await index.removeMessages(headerIds: [oldId, newId])
+        try? await index.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
     }
 
     @Test("rekey collision keeps the existing new-id entry and drops the old one")
     func rekeyCollisionDropsOld() async throws {
         let oldId = "\(prefix)_col:INBOX:1"
         let newId = "\(prefix)_col:TRASH:1"
-        try? await index.removeMessages(headerIds: [oldId, newId])
+        try? await index.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
 
         _ = try await index.indexHeaders([
             makeRecord(oldId, subject: "Rekeycollisionold unique subject"),
             makeRecord(newId, subject: "Rekeycollisionnew unique subject"),
         ])
 
-        try await index.rekeyHeaders([(oldId: oldId, newId: newId, newMessageId: nil)])
+        try await index.rekeyHeaders([(oldId: oldId, newId: newId, newMessageId: nil)].map { (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId), newMessageId: $0.newMessageId) })
 
         // The pre-existing new-id entry survives; the old entry is removed
         // (two FTS rows must never share a headerId).
         let newHits = try await index.keywordSearch(query: "rekeycollisionnew")
-        #expect(newHits.contains { $0.headerId == newId })
+        #expect(newHits.contains { $0.contentKey.rawValue == newId })
         let oldHits = try await index.keywordSearch(query: "rekeycollisionold")
         #expect(oldHits.isEmpty)
 
-        try? await index.removeMessages(headerIds: [oldId, newId])
+        try? await index.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
     }
 }

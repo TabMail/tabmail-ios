@@ -69,7 +69,7 @@ struct OnDemandBodyFetchGRDBTests {
 
         // Pre-insert a body
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: "<p>Already cached body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Already cached body</p>")
             try body.insert(db)
         }
 
@@ -100,7 +100,7 @@ struct OnDemandBodyFetchGRDBTests {
         // deep-link's own NSE merge wrote the body before loadBody's task got
         // cancelled (by the inbox-reload/nav churn) and deferred to the poll.
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: "<p>cached before poll</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>cached before poll</p>")
             try body.insert(db)
         }
 
@@ -145,7 +145,7 @@ struct OnDemandBodyFetchGRDBTests {
             fetchBodyOverride: { msg in
                 fetchBodyCalled = true
                 // Simulate successful fetch by writing body to DB
-                let body = MessageBody(headerId: msg.id, htmlContent: "<p>Fetched from server</p>")
+                let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>Fetched from server</p>")
                 try await pool.write { try body.insert($0) }
             }
         )
@@ -214,7 +214,7 @@ struct OnDemandBodyFetchRaceTests {
                 // We simulate the race: body was written just before fetch.
                 let exists = try await pool.read { try MessageBody.fetchOne($0, key: msg.id) != nil }
                 if !exists {
-                    let body = MessageBody(headerId: msg.id, htmlContent: "<p>Background wrote this</p>")
+                    let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>Background wrote this</p>")
                     try await pool.write { try body.insert($0) }
                 }
             }
@@ -222,7 +222,7 @@ struct OnDemandBodyFetchRaceTests {
 
         // Simulate: background writes body just before loadBody
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: "<p>Background wrote this</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>Background wrote this</p>")
             try body.insert(db)
         }
 
@@ -363,7 +363,7 @@ struct MarkReadOnOpenTests {
 
         // Pre-insert body so loadBody takes the cached-body path (no fetchBody call).
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: "<p>body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>body</p>")
             try body.insert(db)
         }
 
@@ -458,7 +458,7 @@ struct MessageDetailOverlayTests {
         // which still runs `message = msg` (the bug's primary entry point) before
         // returning.
         try await pool.write { db in
-            try MessageBody(headerId: header.id, htmlContent: "<p>body</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>body</p>").insert(db)
         }
 
         let vm = MessageDetailViewModel(
@@ -500,7 +500,7 @@ struct MessageDetailOverlayTests {
                 // updated it during body fetch") runs. That read sees DB
                 // isRead=false and must layer overlay on top.
                 try await pool.write { db in
-                    try MessageBody(headerId: msg.id, htmlContent: "<p>fetched</p>").insert(db)
+                    try MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>fetched</p>").insert(db)
                 }
             }
         )
@@ -525,7 +525,7 @@ struct MessageDetailOverlayTests {
             isRead: false
         )
         try await pool.write { db in
-            try MessageBody(headerId: header.id, htmlContent: "<p>body</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>body</p>").insert(db)
         }
 
         let vm = MessageDetailViewModel(
@@ -553,7 +553,7 @@ struct MessageDetailOverlayTests {
         )
         // DB has isFlagged=false (default). Overlay says user just flagged it.
         try await pool.write { db in
-            try MessageBody(headerId: header.id, htmlContent: "<p>body</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>body</p>").insert(db)
         }
 
         let vm = MessageDetailViewModel(
@@ -585,7 +585,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
         // after 3 consecutive empty fetches (BodyFetchProcessor.swift:171–189): empty
         // MessageBody row + stub summaryBlurb + delete tag + completion flags.
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: nil)
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: nil)
             try body.insert(db)
             try db.execute(
                 sql: """
@@ -608,7 +608,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
             messageId: header.id,
             dbPool: pool,
             fetchBodyOverride: { msg in
-                let body = MessageBody(headerId: msg.id, htmlContent: "<p>real content</p>")
+                let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>real content</p>")
                 try await pool.write { try body.insert($0) }
             }
         )
@@ -636,7 +636,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
 
         // Real successful state: real summary, real tag, body present.
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: "<p>old body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>old body</p>")
             try body.insert(db)
             try db.execute(
                 sql: """
@@ -658,7 +658,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
             messageId: header.id,
             dbPool: pool,
             fetchBodyOverride: { msg in
-                let body = MessageBody(headerId: msg.id, htmlContent: "<p>fresh body</p>")
+                let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>fresh body</p>")
                 try await pool.write { try body.insert($0) }
             }
         )
@@ -684,7 +684,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
         // User (or AI) tagged a real, non-empty message as "delete" — must NOT be
         // mistaken for the empty-confirmed stub. Gate is `bodyEmptyConfirmed = 1`.
         try await pool.write { db in
-            let body = MessageBody(headerId: header.id, htmlContent: "<p>real content</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>real content</p>")
             try body.insert(db)
             try db.execute(
                 sql: """
@@ -704,7 +704,7 @@ struct RefetchBodyConfirmedEmptyResetTests {
             messageId: header.id,
             dbPool: pool,
             fetchBodyOverride: { msg in
-                let body = MessageBody(headerId: msg.id, htmlContent: "<p>refetched</p>")
+                let body = MessageBody( contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>refetched</p>")
                 try await pool.write { try body.insert($0) }
             }
         )

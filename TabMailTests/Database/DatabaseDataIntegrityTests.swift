@@ -78,7 +78,7 @@ struct DatabaseDataIntegrityTests {
 
         // Background body render tries INSERT OR IGNORE
         try db.write { db in
-            var body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Background content</p>")
+            var body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:1"), htmlContent: "<p>Background content</p>")
             try body.insert(db, onConflict: .ignore)
         }
 

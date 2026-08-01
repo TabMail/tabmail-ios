@@ -9,7 +9,22 @@ import GRDB
 // Uses GRDB DatabasePool with WAL mode. Shared actor — all calls serialized.
 
 /// A record to be indexed into FTS5.
+///
+/// 🚨 **THIS RECORD CARRIES TWO DIFFERENT IDS ON PURPOSE.** It used to carry one
+/// `headerId` doing two unrelated jobs — keying the FTS row *and* naming the
+/// `messageHeader` row whose `headerComplete` / `bodyComplete` flag the indexing
+/// pipeline flips afterwards. That worked only because the two were the same
+/// string. When the content key moves off the provider id (`ContentKeySpace`),
+/// feeding the FTS key to `UPDATE messageHeader … WHERE id IN (…)` matches
+/// **nothing**: headers never flip to complete, and the inbox query gates on
+/// `headerComplete == true`, so the user's mail never becomes visible. Keep them
+/// apart; the types now say which is which.
 struct FTSHeaderRecord: Sendable {
+    /// The FTS row's own key — written to `message_ids.headerId` and
+    /// `message_meta.headerId`. **Never** a `messageHeader.id` predicate.
+    let contentKey: ContentKey
+    /// The `messageHeader.id` this record was built from. Use this — and only
+    /// this — for `WHERE messageHeader.id …`.
     let headerId: String
     let messageId: String
     let subject: String
@@ -20,8 +35,10 @@ struct FTSHeaderRecord: Sendable {
     let dateMs: Int64
     let folderId: String
 
-    init(headerId: String, messageId: String, subject: String, from: String, to: String,
-         cc: String = "", bcc: String = "", dateMs: Int64, folderId: String = "") {
+    init(contentKey: ContentKey, headerId: String, messageId: String, subject: String,
+         from: String, to: String, cc: String = "", bcc: String = "",
+         dateMs: Int64, folderId: String = "") {
+        self.contentKey = contentKey
         self.headerId = headerId
         self.messageId = messageId
         self.subject = subject
@@ -35,8 +52,12 @@ struct FTSHeaderRecord: Sendable {
 }
 
 /// A search result from the FTS5 index.
+///
+/// ⚠ `contentKey` is what the FTS index stores; it is NOT guaranteed to be a
+/// `messageHeader.id` once the content key moves. Callers resolving a hit back
+/// to a header must go through the header lookup that owns that mapping.
 struct FTSSearchResult {
-    let headerId: String
+    let contentKey: ContentKey
     let messageId: String
     let snippet: String
     let rank: Double
@@ -101,14 +122,14 @@ actor SearchIndex {
         })
     }
 
-    /// Resolve (rowid, shardYear) for a headerId in a single query.
-    private func resolveRowidAndYear(_ headerId: String, db: Database) throws -> (rowid: Int64, year: Int)? {
+    /// Resolve (rowid, shardYear) for a content key in a single query.
+    private func resolveRowidAndYear(_ contentKey: ContentKey, db: Database) throws -> (rowid: Int64, year: Int)? {
         guard let row = try Row.fetchOne(db, sql: """
             SELECT mi.rowid, meta.shardYear
             FROM message_ids mi
             JOIN message_meta meta ON mi.rowid = meta.rowid
             WHERE mi.headerId = ?
-            """, arguments: [headerId]) else { return nil }
+            """, arguments: [contentKey]) else { return nil }
         return (rowid: row["rowid"], year: row["shardYear"])
     }
 
@@ -571,16 +592,16 @@ actor SearchIndex {
     /// TEST ONLY: seed a year shard created with an arbitrary (legacy) tokenizer,
     /// with one row aligned across message_ids / shard / message_meta exactly the
     /// way indexHeaders writes them. Returns the rowid.
-    func testSeedLegacyShard(year: Int, tokenize: String, headerId: String, msgId: String,
+    func testSeedLegacyShard(year: Int, tokenize: String, contentKey: ContentKey, msgId: String,
                              subject: String, from: String, body: String, dateMs: Int64) async throws -> Int64 {
         ensureReady()
         guard let dbPool else { return -1 }
         let table = ftsTableName(year: year)
         let rowid = try await dbPool.write { db -> Int64 in
             try db.execute(sql: "INSERT OR IGNORE INTO message_ids (headerId) VALUES (?)",
-                           arguments: [headerId])
+                           arguments: [contentKey])
             let rowid = try Int64.fetchOne(db, sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
-                                           arguments: [headerId])!
+                                           arguments: [contentKey])!
             try db.execute(sql: """
                 CREATE VIRTUAL TABLE IF NOT EXISTS \(table) USING fts5(
                     msgId, subject, from_, to_, cc, bcc, body,
@@ -591,10 +612,10 @@ actor SearchIndex {
                 sql: "INSERT INTO \(table) (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?, ?, ?, ?, '', '', '', ?)",
                 arguments: [rowid, msgId, subject, from, body]
             )
-            let accountId = String(headerId.prefix(while: { $0 != ":" }))
+            let accountId = String(contentKey.rawValue.prefix(while: { $0 != ":" }))
             try db.execute(
                 sql: "INSERT OR IGNORE INTO message_meta (rowid, headerId, dateMs, accountId, shardYear, folderId) VALUES (?, ?, ?, ?, ?, '')",
-                arguments: [rowid, headerId, dateMs, accountId, year]
+                arguments: [rowid, contentKey, dateMs, accountId, year]
             )
             return rowid
         }
@@ -612,12 +633,12 @@ actor SearchIndex {
         }
     }
 
-    /// TEST ONLY: message_meta rowid for a headerId.
-    func testRowidForHeader(_ headerId: String) async throws -> Int64? {
+    /// TEST ONLY: message_meta rowid for a content key.
+    func testRowidForHeader(_ contentKey: ContentKey) async throws -> Int64? {
         guard let dbPool else { return nil }
         return try await dbPool.read { db in
             try Int64.fetchOne(db, sql: "SELECT rowid FROM message_meta WHERE headerId = ?",
-                               arguments: [headerId])
+                               arguments: [contentKey])
         }
     }
 
@@ -757,8 +778,11 @@ actor SearchIndex {
 
     // MARK: - Indexing
 
-    /// Batch index message headers into FTS5. Deduplicates by headerId.
+    /// Batch index message headers into FTS5. Deduplicates by content key.
     /// Returns count of newly inserted documents.
+    ///
+    /// ⚠ Reads `record.contentKey` and never `record.headerId` — the FTS row is
+    /// keyed by content. See `FTSHeaderRecord`'s two-id note.
     func indexHeaders(_ records: [FTSHeaderRecord]) throws -> Int {
         ensureReady()
         guard let dbPool, !records.isEmpty else { return 0 }
@@ -770,14 +794,14 @@ actor SearchIndex {
                 // Dedup check
                 try db.execute(
                     sql: "INSERT OR IGNORE INTO message_ids (headerId) VALUES (?)",
-                    arguments: [record.headerId]
+                    arguments: [record.contentKey]
                 )
                 guard db.changesCount > 0 else { continue }
 
                 let rowid = try Int64.fetchOne(
                     db,
                     sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
-                    arguments: [record.headerId]
+                    arguments: [record.contentKey]
                 )!
 
                 // Route to year-specific FTS table
@@ -791,13 +815,13 @@ actor SearchIndex {
                     arguments: [rowid, record.messageId, record.subject, record.from, record.to, record.cc, record.bcc]
                 )
 
-                // Metadata (accountId extracted from headerId prefix "accountId:...")
-                let accountId = String(record.headerId.prefix(while: { $0 != ":" }))
+                // Metadata (accountId extracted from the key's prefix "accountId:...")
+                let accountId = String(record.contentKey.rawValue.prefix(while: { $0 != ":" }))
                 // INSERT OR IGNORE: don't overwrite existing entries.
                 // Flags (bodyComplete, bodyEmptyConfirmed) live in GRDB only.
                 try db.execute(
                     sql: "INSERT OR IGNORE INTO message_meta (rowid, headerId, dateMs, accountId, shardYear, folderId) VALUES (?, ?, ?, ?, ?, ?)",
-                    arguments: [rowid, record.headerId, record.dateMs, accountId, year, record.folderId]
+                    arguments: [rowid, record.contentKey, record.dateMs, accountId, year, record.folderId]
                 )
 
                 inserted += 1
@@ -809,14 +833,14 @@ actor SearchIndex {
 
     /// Write body text to FTS for a message. Caller sets GRDB flags (bodyComplete, bodyEmptyConfirmed).
     /// Whitespace-only bodies are silently skipped — caller should set bodyEmptyConfirmed in GRDB.
-    func updateBody(headerId: String, body: String) throws {
+    func updateBody(contentKey: ContentKey, body: String) throws {
         ensureReady()
         guard let dbPool else { return }
         guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         try dbPool.write { [self] db in
-            guard let resolved = try resolveRowidAndYear(headerId, db: db) else {
-                print("[SearchIndex] updateBody: header \(headerId.prefix(30)) not in FTS yet, deferring")
+            guard let resolved = try resolveRowidAndYear(contentKey, db: db) else {
+                print("[SearchIndex] updateBody: header \(contentKey.rawValue.prefix(30)) not in FTS yet, deferring")
                 return
             }
             let table = ftsTableName(year: resolved.year)
@@ -826,12 +850,12 @@ actor SearchIndex {
     }
 
     /// Update cc/bcc fields in FTS for existing messages (v10 migration backfill).
-    func updateCcBcc(_ updates: [(headerId: String, cc: String, bcc: String)]) throws {
+    func updateCcBcc(_ updates: [(contentKey: ContentKey, cc: String, bcc: String)]) throws {
         ensureReady()
         guard let dbPool, !updates.isEmpty else { return }
         try dbPool.write { [self] db in
             for update in updates {
-                guard let resolved = try resolveRowidAndYear(update.headerId, db: db) else { continue }
+                guard let resolved = try resolveRowidAndYear(update.contentKey, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 try db.execute(sql: "UPDATE \(table) SET cc = ?, bcc = ? WHERE rowid = ?",
                                arguments: [update.cc, update.bcc, resolved.rowid])
@@ -844,41 +868,41 @@ actor SearchIndex {
     /// Swift 6 region-isolation checker ("pattern that the region-based
     /// isolation checker does not understand", surfacing as a compile error
     /// in unrelated call sites of this actor).
-    struct HeaderIdPageEntry: Sendable {
+    struct ContentKeyPageEntry: Sendable {
         let rowid: Int64
-        let headerId: String
+        let contentKey: ContentKey
     }
 
-    /// Cursor page of (rowid, headerId) entries from message_ids, ordered by
+    /// Cursor page of (rowid, contentKey) entries from message_ids, ordered by
     /// rowid — pagination for the one-time FTS→GRDB orphan prune. OFFSET-free
     /// so cost stays O(page) regardless of position in a large index.
-    func headerIdPage(afterRowid: Int64, limit: Int) throws -> [HeaderIdPageEntry] {
+    func contentKeyPage(afterRowid: Int64, limit: Int) throws -> [ContentKeyPageEntry] {
         guard let dbPool else { return [] }
         return try dbPool.read { db in
             try Row.fetchAll(
                 db,
                 sql: "SELECT rowid, headerId FROM message_ids WHERE rowid > ? ORDER BY rowid LIMIT ?",
                 arguments: [afterRowid, limit]
-            ).map { HeaderIdPageEntry(rowid: $0["rowid"] as Int64, headerId: $0["headerId"] as String) }
+            ).map { ContentKeyPageEntry(rowid: $0["rowid"] as Int64, contentKey: $0["headerId"] as ContentKey) }
         }
     }
 
-    /// Returns headerIds from the input that are NOT in FTS message_meta.
+    /// Returns content keys from the input that are NOT in FTS message_meta.
     /// Used by backfill self-heal to find GRDB headers missing from FTS.
-    func headerIdsMissingFromFTS(_ headerIds: [String]) throws -> [String] {
-        guard let dbPool, !headerIds.isEmpty else { return [] }
+    func contentKeysMissingFromFTS(_ contentKeys: [ContentKey]) throws -> [ContentKey] {
+        guard let dbPool, !contentKeys.isEmpty else { return [] }
         return try dbPool.read { db in
-            var existing = Set<String>()
-            for chunk in headerIds.chunked(into: 500) {
+            var existing = Set<ContentKey>()
+            for chunk in contentKeys.chunked(into: 500) {
                 let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
                 let rows = try Row.fetchAll(db,
                     sql: "SELECT headerId FROM message_meta WHERE headerId IN (\(placeholders))",
                     arguments: StatementArguments(chunk))
                 for row in rows {
-                    existing.insert(row["headerId"] as String)
+                    existing.insert(row["headerId"] as ContentKey)
                 }
             }
-            return headerIds.filter { !existing.contains($0) }
+            return contentKeys.filter { !existing.contains($0) }
         }
     }
 
@@ -886,10 +910,15 @@ actor SearchIndex {
     /// Batch write body text to FTS. Caller sets GRDB flags (bodyComplete, bodyEmptyConfirmed).
     /// Whitespace-only bodies are silently skipped — caller should set bodyEmptyConfirmed in GRDB.
     /// Writes in sub-batches, grouped by year shard to minimize table switching.
-    /// Returns the set of headerIds that were actually written to FTS. Headers not yet
+    /// Returns the set of CONTENT KEYS that were actually written to FTS. Headers not yet
     /// in the FTS index are skipped — caller must NOT set bodyComplete for those.
+    ///
+    /// ⚠ The returned set is keyed by CONTENT KEY. A caller that flips
+    /// `messageHeader.bodyComplete` for the confirmed subset must map each
+    /// confirmed key back to its own `messageHeader.id` — the two are not
+    /// interchangeable once the content key moves.
     @discardableResult
-    func updateBodies(_ updates: [(headerId: String, body: String)]) throws -> Set<String> {
+    func updateBodies(_ updates: [(contentKey: ContentKey, body: String)]) throws -> Set<ContentKey> {
         ensureReady()
         guard let dbPool, !updates.isEmpty else { return [] }
 
@@ -897,27 +926,27 @@ actor SearchIndex {
         let realUpdates = updates.filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !realUpdates.isEmpty else { return [] }
 
-        var writtenIds = Set<String>()
+        var writtenIds = Set<ContentKey>()
         let chunkSize = SyncConfig.ftsWriteBatchSize
         for chunkStart in stride(from: 0, to: realUpdates.count, by: chunkSize) {
             let chunk = realUpdates[chunkStart..<min(chunkStart + chunkSize, realUpdates.count)]
-            let chunkWritten: [String] = try dbPool.write { [self] db in
-                var updatesByYear: [Int: [(rowid: Int64, body: String, headerId: String)]] = [:]
-                for (headerId, body) in chunk {
-                    guard let resolved = try resolveRowidAndYear(headerId, db: db) else {
-                        print("[SearchIndex] updateBodies: header \(headerId.prefix(30)) not in FTS yet, deferring")
+            let chunkWritten: [ContentKey] = try dbPool.write { [self] db in
+                var updatesByYear: [Int: [(rowid: Int64, body: String, contentKey: ContentKey)]] = [:]
+                for (contentKey, body) in chunk {
+                    guard let resolved = try resolveRowidAndYear(contentKey, db: db) else {
+                        print("[SearchIndex] updateBodies: header \(contentKey.rawValue.prefix(30)) not in FTS yet, deferring")
                         continue
                     }
-                    updatesByYear[resolved.year, default: []].append((rowid: resolved.rowid, body: body, headerId: headerId))
+                    updatesByYear[resolved.year, default: []].append((rowid: resolved.rowid, body: body, contentKey: contentKey))
                 }
 
-                var written: [String] = []
+                var written: [ContentKey] = []
                 for (year, yearUpdates) in updatesByYear {
                     let table = ftsTableName(year: year)
-                    for (rowid, body, headerId) in yearUpdates {
+                    for (rowid, body, contentKey) in yearUpdates {
                         try db.execute(sql: "UPDATE \(table) SET body = ? WHERE rowid = ?",
                                        arguments: [body, rowid])
-                        written.append(headerId)
+                        written.append(contentKey)
                     }
                 }
                 return written
@@ -928,12 +957,12 @@ actor SearchIndex {
     }
 
     /// Clear body text from FTS for a batch of messages. Caller resets GRDB bodyComplete.
-    func clearBodies(headerIds: [String]) throws {
+    func clearBodies(contentKeys: [ContentKey]) throws {
         ensureReady()
-        guard let dbPool, !headerIds.isEmpty else { return }
+        guard let dbPool, !contentKeys.isEmpty else { return }
         try dbPool.write { [self] db in
-            for headerId in headerIds {
-                guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
+            for contentKey in contentKeys {
+                guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 try db.execute(sql: "UPDATE \(table) SET body = '' WHERE rowid = ?",
                                arguments: [resolved.rowid])
@@ -942,7 +971,7 @@ actor SearchIndex {
     }
 
     /// Store an embedding vector for a message in the sqlite-vec KNN table.
-    func storeEmbedding(headerId: String, embedding: [Float]) throws {
+    func storeEmbedding(contentKey: ContentKey, embedding: [Float]) throws {
         ensureReady()
         guard let dbPool else { return }
         try dbPool.write { db in
@@ -955,7 +984,7 @@ actor SearchIndex {
             guard let rowid = try Int64.fetchOne(
                 db,
                 sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
-                arguments: [headerId]
+                arguments: [contentKey]
             ) else { return }
 
             let blob = embedding.withUnsafeBytes { Data($0) }
@@ -969,7 +998,7 @@ actor SearchIndex {
     }
 
     /// Bulk store embeddings in a single FTS write transaction.
-    func storeEmbeddings(_ items: [(headerId: String, embedding: [Float])]) throws {
+    func storeEmbeddings(_ items: [(contentKey: ContentKey, embedding: [Float])]) throws {
         ensureReady()
         guard let dbPool, !items.isEmpty else { return }
         try dbPool.write { db in
@@ -978,11 +1007,11 @@ actor SearchIndex {
                 """) ?? false
             guard vecTableExists else { return }
 
-            for (headerId, embedding) in items {
+            for (contentKey, embedding) in items {
                 guard let rowid = try Int64.fetchOne(
                     db,
                     sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
-                    arguments: [headerId]
+                    arguments: [contentKey]
                 ) else { continue }
 
                 let blob = embedding.withUnsafeBytes { Data($0) }
@@ -996,13 +1025,13 @@ actor SearchIndex {
     }
 
     /// Remove messages from all FTS tables (for pruning/account deletion).
-    func removeMessages(headerIds: [String]) throws {
+    func removeMessages(contentKeys: [ContentKey]) throws {
         ensureReady()
-        guard let dbPool, !headerIds.isEmpty else { return }
+        guard let dbPool, !contentKeys.isEmpty else { return }
         try dbPool.write { [self] db in
-            for headerId in headerIds {
-                guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
-                try deleteEntry(headerId: headerId, rowid: resolved.rowid, year: resolved.year, db: db)
+            for contentKey in contentKeys {
+                guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { continue }
+                try deleteEntry(contentKey: contentKey, rowid: resolved.rowid, year: resolved.year, db: db)
             }
         }
     }
@@ -1011,12 +1040,12 @@ actor SearchIndex {
     /// id mapping). The single source of truth for removal — used by
     /// `removeMessages` and `rekeyHeaders`' collision branch so the statement
     /// set can't drift between them.
-    private func deleteEntry(headerId: String, rowid: Int64, year: Int, db: Database) throws {
+    private func deleteEntry(contentKey: ContentKey, rowid: Int64, year: Int, db: Database) throws {
         let table = ftsTableName(year: year)
         try db.execute(sql: "DELETE FROM \(table) WHERE rowid = ?", arguments: [rowid])
         try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [rowid])
         try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [rowid])
-        try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [headerId])
+        try db.execute(sql: "DELETE FROM message_ids WHERE headerId = ?", arguments: [contentKey])
     }
 
     /// Re-key FTS entries to a new header id IN PLACE — the FTS rowid (and
@@ -1029,27 +1058,27 @@ actor SearchIndex {
     /// If the new id already exists in FTS (e.g. a leftover orphan or a
     /// concurrent index), the old entry is removed instead — two rows must
     /// never share a headerId (`message_ids.headerId` is the primary key).
-    func rekeyHeaders(_ rekeys: [(oldId: String, newId: String, newMessageId: String?)]) throws {
+    func rekeyHeaders(_ rekeys: [(oldKey: ContentKey, newKey: ContentKey, newMessageId: String?)]) throws {
         ensureReady()
         guard let dbPool, !rekeys.isEmpty else { return }
         try dbPool.write { [self] db in
             for rekey in rekeys {
-                guard let resolved = try resolveRowidAndYear(rekey.oldId, db: db) else { continue }
+                guard let resolved = try resolveRowidAndYear(rekey.oldKey, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 let newExists = try Bool.fetchOne(
                     db,
                     sql: "SELECT COUNT(*) > 0 FROM message_ids WHERE headerId = ?",
-                    arguments: [rekey.newId]
+                    arguments: [rekey.newKey]
                 ) ?? false
                 if newExists {
-                    print("[SearchIndex] rekeyHeaders: \(rekey.newId.prefix(40)) already indexed — removing old entry \(rekey.oldId.prefix(40))")
-                    try deleteEntry(headerId: rekey.oldId, rowid: resolved.rowid, year: resolved.year, db: db)
+                    print("[SearchIndex] rekeyHeaders: \(rekey.newKey.rawValue.prefix(40)) already indexed — removing old entry \(rekey.oldKey.rawValue.prefix(40))")
+                    try deleteEntry(contentKey: rekey.oldKey, rowid: resolved.rowid, year: resolved.year, db: db)
                     continue
                 }
                 try db.execute(sql: "UPDATE message_ids SET headerId = ? WHERE headerId = ?",
-                               arguments: [rekey.newId, rekey.oldId])
+                               arguments: [rekey.newKey, rekey.oldKey])
                 try db.execute(sql: "UPDATE message_meta SET headerId = ? WHERE rowid = ?",
-                               arguments: [rekey.newId, resolved.rowid])
+                               arguments: [rekey.newKey, resolved.rowid])
                 if let newMessageId = rekey.newMessageId {
                     try db.execute(sql: "UPDATE \(table) SET msgId = ? WHERE rowid = ?",
                                    arguments: [newMessageId, resolved.rowid])
@@ -1061,23 +1090,23 @@ actor SearchIndex {
     // MARK: - Folder ID Updates
 
     /// Batch-update folderId for messages (used by backfill and move sync).
-    func updateFolderIds(headerIds: [String], newFolderId: String) throws {
+    func updateFolderIds(contentKeys: [ContentKey], newFolderId: String) throws {
         ensureReady()
-        guard let dbPool, !headerIds.isEmpty else { return }
+        guard let dbPool, !contentKeys.isEmpty else { return }
         try dbPool.write { [self] db in
-            for headerId in headerIds {
-                guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
+            for contentKey in contentKeys {
+                guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { continue }
                 try db.execute(sql: "UPDATE message_meta SET folderId = ? WHERE rowid = ?",
                                arguments: [newFolderId, resolved.rowid])
             }
         }
     }
 
-    /// Return headerIds where folderId is empty (for backfill).
-    func headerIdsWithEmptyFolderId(limit: Int) throws -> [String] {
+    /// Return content keys where folderId is empty (for backfill).
+    func contentKeysWithEmptyFolderId(limit: Int) throws -> [ContentKey] {
         guard let dbPool else { return [] }
         return try dbPool.read { db in
-            try String.fetchAll(db,
+            try ContentKey.fetchAll(db,
                 sql: "SELECT headerId FROM message_meta WHERE folderId = '' LIMIT ?",
                 arguments: [limit])
         }
@@ -1111,7 +1140,7 @@ actor SearchIndex {
             let rows = try Row.fetchAll(db, sql: sql, arguments: [ftsQuery, limit])
             return rows.map { row in
                 FTSSearchResult(
-                    headerId: row["headerId"],
+                    contentKey: row["headerId"],
                     messageId: row["msgId"],
                     snippet: row["snippet"],
                     rank: row["rank"],
@@ -1133,9 +1162,10 @@ actor SearchIndex {
     }
 
     /// Demo-scope check for results assembled without SQL scoping (vector-only
-    /// hybrid hits). FTS headerIds are `accountId:folderPath:messageId`.
-    nonisolated static func headerIdInDemoScope(_ headerId: String, demoActive: Bool) -> Bool {
-        headerId.hasPrefix("\(DemoSeed.demoAccountId):") == demoActive
+    /// hybrid hits). Content keys are `accountId:folderPath:<tail>`, so the
+    /// account prefix is unaffected by where the tail comes from.
+    nonisolated static func contentKeyInDemoScope(_ contentKey: ContentKey, demoActive: Bool) -> Bool {
+        contentKey.rawValue.hasPrefix("\(DemoSeed.demoAccountId):") == demoActive
     }
 
     /// FTS5-only search across all year shards using a single UNION ALL query.
@@ -1231,9 +1261,9 @@ actor SearchIndex {
             limit: limit)
 
         // --- Assemble results ---
-        var ftsMap = [Int64: (headerId: String, messageId: String, snippet: String, dateMs: Int64)]()
+        var ftsMap = [Int64: (contentKey: ContentKey, messageId: String, snippet: String, dateMs: Int64)]()
         for c in ftsCandidates {
-            ftsMap[c.rowid] = (c.headerId, c.messageId, c.snippet, c.dateMs)
+            ftsMap[c.rowid] = (c.contentKey, c.messageId, c.snippet, c.dateMs)
         }
 
         var results = [FTSSearchResult]()
@@ -1241,7 +1271,7 @@ actor SearchIndex {
             if let fts = ftsMap[hr.rowid] {
                 // FTS result — has snippet
                 results.append(FTSSearchResult(
-                    headerId: fts.headerId, messageId: fts.messageId,
+                    contentKey: fts.contentKey, messageId: fts.messageId,
                     snippet: fts.snippet, rank: -hr.finalScore, dateMs: fts.dateMs
                 ))
             } else {
@@ -1250,11 +1280,11 @@ actor SearchIndex {
                 // out-of-scope vector hits are dropped here (headerId is
                 // accountId-prefixed).
                 if let meta = try fetchMeta(rowid: hr.rowid) {
-                    guard Self.headerIdInDemoScope(meta.headerId, demoActive: DemoModeStore.isDemoActive) else { continue }
+                    guard Self.contentKeyInDemoScope(meta.contentKey, demoActive: DemoModeStore.isDemoActive) else { continue }
                     if let from = fromDateMs, meta.dateMs < from { continue }
                     if let to = toDateMs, meta.dateMs > to { continue }
                     results.append(FTSSearchResult(
-                        headerId: meta.headerId, messageId: meta.messageId,
+                        contentKey: meta.contentKey, messageId: meta.messageId,
                         snippet: "", rank: -hr.finalScore, dateMs: meta.dateMs
                     ))
                 }
@@ -1271,7 +1301,7 @@ actor SearchIndex {
     /// FTS candidate for hybrid merge — includes rowid for matching with vector results.
     private struct FTSCandidate {
         let rowid: Int64
-        let headerId: String
+        let contentKey: ContentKey
         let messageId: String
         let snippet: String
         let rank: Double
@@ -1328,7 +1358,7 @@ actor SearchIndex {
             print("[SearchIndex] FTS candidates returned \(rows.count) rows")
             return rows.map { row in
                 FTSCandidate(
-                    rowid: row["rowid"], headerId: row["headerId"],
+                    rowid: row["rowid"], contentKey: row["headerId"],
                     messageId: row["msgId"], snippet: row["snippet"],
                     rank: row["rank"], dateMs: row["dateMs"]
                 )
@@ -1384,7 +1414,7 @@ actor SearchIndex {
             print("[SearchIndex] FTS-only returned \(rows.count) rows")
             return rows.map { row in
                 FTSSearchResult(
-                    headerId: row["headerId"], messageId: row["msgId"],
+                    contentKey: row["headerId"], messageId: row["msgId"],
                     snippet: row["snippet"], rank: row["rank"], dateMs: row["dateMs"]
                 )
             }
@@ -1412,7 +1442,7 @@ actor SearchIndex {
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             return rows.map { row in
                 FTSSearchResult(
-                    headerId: row["headerId"], messageId: "",
+                    contentKey: row["headerId"], messageId: "",
                     snippet: "", rank: 0, dateMs: row["dateMs"]
                 )
             }
@@ -1559,7 +1589,7 @@ actor SearchIndex {
 
     // MARK: - Helpers
 
-    private func fetchMeta(rowid: Int64) throws -> (headerId: String, messageId: String, dateMs: Int64)? {
+    private func fetchMeta(rowid: Int64) throws -> (contentKey: ContentKey, messageId: String, dateMs: Int64)? {
         guard let dbPool else { return nil }
         return try dbPool.read { [self] db in
             guard let metaRow = try Row.fetchOne(db, sql: """
@@ -1573,14 +1603,14 @@ actor SearchIndex {
         }
     }
 
-    /// Check if a header is already indexed.
-    func isIndexed(headerId: String) throws -> Bool {
+    /// Check if a content row is already indexed.
+    func isIndexed(contentKey: ContentKey) throws -> Bool {
         guard let dbPool else { return false }
         return try dbPool.read { db in
             let count = try Int.fetchOne(
                 db,
                 sql: "SELECT COUNT(*) FROM message_ids WHERE headerId = ?",
-                arguments: [headerId]
+                arguments: [contentKey]
             ) ?? 0
             return count > 0
         }
@@ -1705,12 +1735,12 @@ actor SearchIndex {
 
     /// Diagnostic: returns a human-readable reason why bodyText() would return nil.
     /// Used by AI queue to log root cause of missing FTS body.
-    func bodyTextDiagnostic(headerId: String) -> String {
+    func bodyTextDiagnostic(contentKey: ContentKey) -> String {
         ensureReady()
         guard let dbPool else { return "dbPoolNil" }
         do {
             return try dbPool.read { [self] db in
-                guard let resolved = try resolveRowidAndYear(headerId, db: db) else {
+                guard let resolved = try resolveRowidAndYear(contentKey, db: db) else {
                     return "notInFtsIndex"
                 }
                 let table = ftsTableName(year: resolved.year)
@@ -1727,11 +1757,11 @@ actor SearchIndex {
     }
 
     /// Get body text for a header (for snippet derivation from existing FTS data).
-    func bodyText(headerId: String) throws -> String? {
+    func bodyText(contentKey: ContentKey) throws -> String? {
         ensureReady()
         guard let dbPool else { return nil }
         return try dbPool.read { [self] db in
-            guard let resolved = try resolveRowidAndYear(headerId, db: db) else { return nil }
+            guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { return nil }
             let table = ftsTableName(year: resolved.year)
             let body = try String.fetchOne(db, sql: "SELECT body FROM \(table) WHERE rowid = ?",
                                            arguments: [resolved.rowid])
@@ -1741,18 +1771,18 @@ actor SearchIndex {
     }
 
     /// Bulk read body texts for multiple headers in a single FTS transaction.
-    func bodyTexts(headerIds: [String]) throws -> [String: String] {
+    func bodyTexts(contentKeys: [ContentKey]) throws -> [ContentKey: String] {
         ensureReady()
-        guard let dbPool, !headerIds.isEmpty else { return [:] }
+        guard let dbPool, !contentKeys.isEmpty else { return [:] }
         return try dbPool.read { [self] db in
-            var result: [String: String] = [:]
-            for headerId in headerIds {
-                guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
+            var result: [ContentKey: String] = [:]
+            for contentKey in contentKeys {
+                guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 let body = try String.fetchOne(db, sql: "SELECT body FROM \(table) WHERE rowid = ?",
                                                arguments: [resolved.rowid])
                 guard let body, !body.isEmpty, body != " " else { continue }
-                result[headerId] = body
+                result[contentKey] = body
             }
             return result
         }
@@ -1763,18 +1793,18 @@ actor SearchIndex {
     /// bodyComplete restore feeds this thousands of ids at once). A length-1
     /// body is treated as absent: it's either the " " sentinel or too short to
     /// distinguish from one — conservative callers refetch it once.
-    func headerIdsWithFTSBody(_ headerIds: [String]) throws -> Set<String> {
+    func contentKeysWithFTSBody(_ contentKeys: [ContentKey]) throws -> Set<ContentKey> {
         ensureReady()
-        guard let dbPool, !headerIds.isEmpty else { return [] }
+        guard let dbPool, !contentKeys.isEmpty else { return [] }
         return try dbPool.read { [self] db in
-            var result = Set<String>()
-            for headerId in headerIds {
-                guard let resolved = try resolveRowidAndYear(headerId, db: db) else { continue }
+            var result = Set<ContentKey>()
+            for contentKey in contentKeys {
+                guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 let length = try Int.fetchOne(db, sql: "SELECT length(body) FROM \(table) WHERE rowid = ?",
                                               arguments: [resolved.rowid])
                 if let length, length > 1 {
-                    result.insert(headerId)
+                    result.insert(contentKey)
                 }
             }
             return result
@@ -1783,10 +1813,10 @@ actor SearchIndex {
 
     /// Raw FTS body without sentinel filtering — used by self-heal to distinguish
     /// sentinel values (e.g. " ") from truly empty bodies.
-    func rawFTSBody(headerId: String) throws -> String? {
+    func rawFTSBody(contentKey: ContentKey) throws -> String? {
         guard let dbPool else { return nil }
         return try dbPool.read { [self] db in
-            guard let resolved = try resolveRowidAndYear(headerId, db: db) else { return nil }
+            guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { return nil }
             let table = ftsTableName(year: resolved.year)
             return try String.fetchOne(db, sql: "SELECT body FROM \(table) WHERE rowid = ?",
                                        arguments: [resolved.rowid])

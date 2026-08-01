@@ -90,7 +90,7 @@ struct NSEMergeFullHeaderTests {
     private func insert(
         _ msg: NSEDataBridge.StagedMessage, into db: DatabaseQueue
     ) throws -> (inserted: Bool, headerId: String) {
-        var ftsBatch: [(headerId: String, textContent: String)] = []
+        var ftsBatch: [NSEDataBridge.NSEFTSBodyItem] = []
         var inserted = false
         try db.write { db in
             inserted = try NSEDataBridge.insertNewHeaderFromStaging(
@@ -118,7 +118,7 @@ struct NSEMergeFullHeaderTests {
             actionTag: "reply", aiCompleted: true,
             htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary"
         )
-        var ftsA: [(headerId: String, textContent: String)] = []
+        var ftsA: [NSEDataBridge.NSEFTSBodyItem] = []
         try dbA.write { db in
             _ = try NSEDataBridge.insertNewHeaderFromStaging(msgA, db: db, ftsBatch: &ftsA, headerOnly: true)
         }
@@ -146,7 +146,7 @@ struct NSEMergeFullHeaderTests {
             actionTag: "reply", aiCompleted: true,
             htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary"
         )
-        var ftsB: [(headerId: String, textContent: String)] = []
+        var ftsB: [NSEDataBridge.NSEFTSBodyItem] = []
         try dbB.write { db in
             _ = try NSEDataBridge.insertNewHeaderFromStaging(msgB, db: db, ftsBatch: &ftsB)
         }

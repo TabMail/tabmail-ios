@@ -21,7 +21,7 @@ struct UpdateBodiesReturnValueTests {
     func returnsAllWrittenIds() async throws {
         let ids = (1...3).map { "\(prefix("all")):\("INBOX"):\($0)" }
         let records = ids.enumerated().map { i, hid in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
                 headerId: hid,
                 messageId: "m\(i)",
                 subject: "Subject \(i)",
@@ -32,21 +32,21 @@ struct UpdateBodiesReturnValueTests {
         }
 
         // Cleanup + index
-        try await index.removeMessages(headerIds: ids)
+        try await index.removeMessages( contentKeys: ids.map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 3)
 
         // Update bodies for all 3
         let updates = ids.map { (headerId: $0, body: "Body content for \($0)") }
-        let writtenIds = try await index.updateBodies(updates)
+        let writtenIds = try await index.updateBodies(updates.map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         #expect(writtenIds.count == 3)
         for id in ids {
-            #expect(writtenIds.contains(id), "\(id) should be in written set")
+            #expect(writtenIds.contains(ContentKey(rawValue: id)), "\(id) should be in written set")
         }
 
         // Cleanup
-        try await index.removeMessages(headerIds: ids)
+        try await index.removeMessages( contentKeys: ids.map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBodies skips items not in FTS index")
@@ -54,11 +54,11 @@ struct UpdateBodiesReturnValueTests {
         let hid = "\(prefix("skip")):INBOX:1"
 
         // Make sure this header is NOT in FTS
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
 
         let writtenIds = try await index.updateBodies([
             (headerId: hid, body: "This body should be skipped")
-        ])
+        ].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         #expect(writtenIds.isEmpty, "Unindexed header should not appear in written set")
     }
@@ -69,11 +69,11 @@ struct UpdateBodiesReturnValueTests {
         let unindexedId = "\(prefix("mix_out")):INBOX:99"
 
         // Clean everything
-        try await index.removeMessages(headerIds: indexedIds + [unindexedId])
+        try await index.removeMessages( contentKeys: (indexedIds + [unindexedId]).map(ContentKey.init(rawValue:)))
 
         // Index only the first 2
         let records = indexedIds.enumerated().map { i, hid in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
                 headerId: hid,
                 messageId: "m\(i)",
                 subject: "Indexed \(i)",
@@ -89,16 +89,16 @@ struct UpdateBodiesReturnValueTests {
         let updates = (indexedIds + [unindexedId]).map {
             (headerId: $0, body: "Body for \($0)")
         }
-        let writtenIds = try await index.updateBodies(updates)
+        let writtenIds = try await index.updateBodies(updates.map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         #expect(writtenIds.count == 2, "Only 2 indexed items should be written")
         for id in indexedIds {
-            #expect(writtenIds.contains(id))
+            #expect(writtenIds.contains(ContentKey(rawValue: id)))
         }
-        #expect(!writtenIds.contains(unindexedId))
+        #expect(!writtenIds.contains(ContentKey(rawValue: unindexedId)))
 
         // Cleanup
-        try await index.removeMessages(headerIds: indexedIds + [unindexedId])
+        try await index.removeMessages( contentKeys: (indexedIds + [unindexedId]).map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBodies with empty array returns empty set")
@@ -111,8 +111,8 @@ struct UpdateBodiesReturnValueTests {
     func whitespaceOnlyBodySkipped() async throws {
         let hid = "\(prefix("ws")):INBOX:1"
 
-        try await index.removeMessages(headerIds: [hid])
-        let record = FTSHeaderRecord(
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid,
             messageId: "mws",
             subject: "Whitespace Test",
@@ -126,11 +126,11 @@ struct UpdateBodiesReturnValueTests {
         // Update with whitespace-only body
         let writtenIds = try await index.updateBodies([
             (headerId: hid, body: "   \n\t  \n  ")
-        ])
+        ].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
         #expect(writtenIds.isEmpty, "Whitespace-only body should be skipped")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 }
 
@@ -165,9 +165,9 @@ struct FlushBatchBodyCompleteTests {
         }
 
         // Index only h1 and h2 in FTS (NOT h3)
-        try await index.removeMessages(headerIds: [h1.id, h2.id, h3.id])
+        try await index.removeMessages( contentKeys: [h1.id, h2.id, h3.id].map(ContentKey.init(rawValue:)))
         let records = [h1, h2].map { h in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: h.id),
                 headerId: h.id,
                 messageId: h.messageId,
                 subject: h.subject,
@@ -185,15 +185,15 @@ struct FlushBatchBodyCompleteTests {
             (headerId: h2.id, body: "Body for h2"),
             (headerId: h3.id, body: "Body for h3"),  // not in FTS — will be skipped
         ]
-        let writtenToFts = try await index.updateBodies(ftsBuffer)
+        let writtenToFts = try await index.updateBodies(ftsBuffer.map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         #expect(writtenToFts.count == 2)
-        #expect(writtenToFts.contains(h1.id))
-        #expect(writtenToFts.contains(h2.id))
-        #expect(!writtenToFts.contains(h3.id))
+        #expect(writtenToFts.contains(ContentKey(rawValue: h1.id)))
+        #expect(writtenToFts.contains(ContentKey(rawValue: h2.id)))
+        #expect(!writtenToFts.contains(ContentKey(rawValue: h3.id)))
 
         // Only set bodyComplete=1 for written items (mirrors flushBatch logic)
-        let confirmedItems = [h1, h2, h3].filter { writtenToFts.contains($0.id) }
+        let confirmedItems = [h1, h2, h3].filter { writtenToFts.contains(ContentKey(rawValue: $0.id)) }
         try await db.write { dbConn in
             for item in confirmedItems {
                 try dbConn.execute(
@@ -222,7 +222,7 @@ struct FlushBatchBodyCompleteTests {
         #expect(bc3 == false, "Unwritten item should keep bodyComplete=0")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [h1.id, h2.id, h3.id])
+        try await index.removeMessages( contentKeys: [h1.id, h2.id, h3.id].map(ContentKey.init(rawValue:)))
     }
 
     @Test("flushBatch skipped items keep bodyComplete=0")
@@ -247,12 +247,12 @@ struct FlushBatchBodyCompleteTests {
         }
 
         // Don't index in FTS — simulate the orphan case
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // Try to write body — should be skipped
         let writtenToFts = try await index.updateBodies([
             (headerId: header.id, body: "Body that should be deferred")
-        ])
+        ].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
         #expect(writtenToFts.isEmpty)
 
         // bodyComplete must remain 0
@@ -275,8 +275,8 @@ struct FlushBatchBodyCompleteTests {
         let h2 = try TestDatabase.insertMessageHeader(db, messageId: "fb_ai_skip", subject: "AI Skipped", date: now, snippet: "")
 
         // Index only h1 in FTS
-        try await index.removeMessages(headerIds: [h1.id, h2.id])
-        let record = FTSHeaderRecord(
+        try await index.removeMessages( contentKeys: [h1.id, h2.id].map(ContentKey.init(rawValue:)))
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: h1.id),
             headerId: h1.id,
             messageId: h1.messageId,
             subject: h1.subject,
@@ -292,21 +292,21 @@ struct FlushBatchBodyCompleteTests {
             (headerId: h1.id, body: "Real body content"),
             (headerId: h2.id, body: "Body for unindexed item"),
         ]
-        let writtenToFts = try await index.updateBodies(ftsBuffer)
+        let writtenToFts = try await index.updateBodies(ftsBuffer.map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         // Build the confirmedItems list that flushBatch uses for AI enqueue
         let allItems = [
             (headerId: h1.id, accountId: "acc1", isInInbox: true),
             (headerId: h2.id, accountId: "acc1", isInInbox: true),
         ]
-        let confirmedForAI = allItems.filter { writtenToFts.contains($0.headerId) }
+        let confirmedForAI = allItems.filter { writtenToFts.contains(ContentKey(rawValue: $0.headerId)) }
 
         #expect(confirmedForAI.count == 1, "Only written item should be enqueued for AI")
         guard confirmedForAI.count == 1 else { return }
         #expect(confirmedForAI[0].headerId == h1.id)
 
         // Cleanup
-        try await index.removeMessages(headerIds: [h1.id, h2.id])
+        try await index.removeMessages( contentKeys: [h1.id, h2.id].map(ContentKey.init(rawValue:)))
     }
 
     @Test("flushBatch FTS write failure leaves all bodyComplete=0")

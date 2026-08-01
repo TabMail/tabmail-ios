@@ -30,21 +30,21 @@ struct SearchIndexEdgeCaseTests {
     @Test("keywordSearch handles query with wildcards")
     func searchWildcardQuery() async throws {
         let hid = "test_wildcard:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Peculiarexactmatch Testing Wildcards",
             from: "a@a.com", to: "b@b.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let results = try await index.keywordSearch(query: "peculiarexact*")
-        let found = results.contains { $0.headerId == hid }
+        let found = results.contains { $0.contentKey.rawValue == hid }
         #expect(found)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("keywordSearch handles query with only whitespace")
@@ -72,13 +72,13 @@ struct SearchIndexEdgeCaseTests {
     func searchSameDateRange() async throws {
         let dateMs: Int64 = 1_700_000_000_000
         let hid = "test_samedate:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Uniquephraseforsamedatetest",
             from: "a@a.com", to: "b@b.com",
             dateMs: dateMs
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
@@ -87,10 +87,10 @@ struct SearchIndexEdgeCaseTests {
             fromDateMs: dateMs,
             toDateMs: dateMs
         )
-        let found = results.contains { $0.headerId == hid }
+        let found = results.contains { $0.contentKey.rawValue == hid }
         #expect(found)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("keywordSearch with only fromDate filters correctly")
@@ -146,64 +146,64 @@ struct SearchIndexEdgeCaseTests {
     @Test("updateBody with empty body string does not set hasBody")
     func updateBodyEmptyString() async throws {
         let hid = "test_emptybody:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Empty Body",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         // updateBody sets hasBody=1 even with empty string (the SQL UPDATE runs)
         // because hasBody flag is about whether the write was attempted
-        try await index.updateBody(headerId: hid, body: "")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "")
 
         // bodyText should return nil for empty body
-        let body = try await index.bodyText(headerId: hid)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body == nil)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBody with very long body text succeeds")
     func updateBodyLongText() async throws {
         let hid = "test_longbody:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Long Body",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let longBody = String(repeating: "This is a long body text. ", count: 1000)
-        try await index.updateBody(headerId: hid, body: longBody)
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: longBody)
 
-        let body = try await index.bodyText(headerId: hid)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body != nil)
         #expect(body!.count == longBody.count)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("updateBody with unicode content round-trips correctly")
     func updateBodyUnicode() async throws {
         let hid = "test_unicodebody:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Unicode Body",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let unicodeBody = "Hello 世界! Привет мир! مرحبا بالعالم"
-        try await index.updateBody(headerId: hid, body: unicodeBody)
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: unicodeBody)
 
-        let body = try await index.bodyText(headerId: hid)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body == unicodeBody)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - Index/Remove Edge Cases
@@ -211,36 +211,36 @@ struct SearchIndexEdgeCaseTests {
     @Test("indexHeaders handles large batch")
     func indexLargeBatch() async throws {
         let records = (1...50).map { i in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_largebatch:INBOX:\(i)"),
                 headerId: "test_largebatch:INBOX:\(i)", messageId: "m\(i)",
                 subject: "Batch Message \(i)", from: "a@a.com", to: "b@b.com",
                 dateMs: Int64(1_700_000_000_000 + i * 1000)
             )
         }
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 50)
 
         let count = try await index.documentCountForAccount(accountId: "test_largebatch")
         #expect(count == 50)
 
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
     }
 
     @Test("indexHeaders with messages spanning multiple years creates shards")
     func indexMultipleYears() async throws {
         let records = [
-            FTSHeaderRecord(headerId: "test_multiyear:INBOX:1", messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_multiyear:INBOX:1"),headerId: "test_multiyear:INBOX:1", messageId: "m1",
                             subject: "Year 2020", from: "a@a.com", to: "b@b.com",
                             dateMs: 1_577_836_800_000), // 2020-01-01
-            FTSHeaderRecord(headerId: "test_multiyear:INBOX:2", messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_multiyear:INBOX:2"),headerId: "test_multiyear:INBOX:2", messageId: "m2",
                             subject: "Year 2023", from: "a@a.com", to: "b@b.com",
                             dateMs: 1_672_531_200_000), // 2023-01-01
-            FTSHeaderRecord(headerId: "test_multiyear:INBOX:3", messageId: "m3",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_multiyear:INBOX:3"),headerId: "test_multiyear:INBOX:3", messageId: "m3",
                             subject: "Year 2025", from: "a@a.com", to: "b@b.com",
                             dateMs: 1_735_689_600_000), // 2025-01-01
         ]
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 3)
 
@@ -249,31 +249,31 @@ struct SearchIndexEdgeCaseTests {
         #expect(years.contains(2023))
         #expect(years.contains(2025))
 
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
     }
 
     @Test("removeMessages is idempotent for already-removed headers")
     func removeIdempotent() async throws {
         let hid = "test_idempotent_rm:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Idempotent",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         // Removing again should not throw
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
 
-        let isIndexed = try await index.isIndexed(headerId: hid)
+        let isIndexed = try await index.isIndexed( contentKey: ContentKey(rawValue: hid))
         #expect(isIndexed == false)
     }
 
     @Test("removeMessages with non-existent headerIds is a no-op")
     func removeNonExistent() async throws {
-        try await index.removeMessages(headerIds: ["nonexistent_never_inserted:INBOX:999"])
+        try await index.removeMessages( contentKeys: ["nonexistent_never_inserted:INBOX:999"].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - clearBodies Edge Cases
@@ -281,47 +281,47 @@ struct SearchIndexEdgeCaseTests {
     @Test("clearBodies on message with no body is safe")
     func clearBodiesNoBody() async throws {
         let hid = "test_clearnobody:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "No Body Clear",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         // clearBodies on a message that never had a body — should not throw
-        try await index.clearBodies(headerIds: [hid])
+        try await index.clearBodies( contentKeys: [hid].map(ContentKey.init(rawValue:)))
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("clearBodies for non-existent headerIds is safe")
     func clearBodiesNonExistent() async throws {
-        try await index.clearBodies(headerIds: ["nonexistent_clear:INBOX:999"])
+        try await index.clearBodies( contentKeys: ["nonexistent_clear:INBOX:999"].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - updateCcBcc Edge Cases
 
     @Test("updateCcBcc for non-existent header is a no-op")
     func updateCcBccNonExistent() async throws {
-        try await index.updateCcBcc([(headerId: "nonexistent_ccbcc:INBOX:999", cc: "a@b.com", bcc: "c@d.com")])
+        try await index.updateCcBcc([(headerId: "nonexistent_ccbcc:INBOX:999", cc: "a@b.com", bcc: "c@d.com")].map { (contentKey: ContentKey(rawValue: $0.headerId), cc: $0.cc, bcc: $0.bcc) })
     }
 
     @Test("updateCcBcc with unicode addresses succeeds")
     func updateCcBccUnicode() async throws {
         let hid = "test_ccbcc_unicode:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Unicode CC",
             from: "a@a.com", to: "b@b.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateCcBcc([(headerId: hid, cc: "名前@example.com", bcc: "тест@example.com")])
+        try await index.updateCcBcc([(headerId: hid, cc: "名前@example.com", bcc: "тест@example.com")].map { (contentKey: ContentKey(rawValue: $0.headerId), cc: $0.cc, bcc: $0.bcc) })
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - Search by Body Content
@@ -329,23 +329,23 @@ struct SearchIndexEdgeCaseTests {
     @Test("keywordSearch finds messages by body text")
     func searchByBody() async throws {
         let hid = "test_bodysearch:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Plain Subject",
             from: "a@a.com", to: "b@b.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateBody(headerId: hid, body: "UniqueBodyTermXyzzy for search testing")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "UniqueBodyTermXyzzy for search testing")
 
         let results = try await index.keywordSearch(query: "uniquebodytermxyzzy")
-        let found = results.contains { $0.headerId == hid }
+        let found = results.contains { $0.contentKey.rawValue == hid }
         #expect(found)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - storeEmbedding Edge Cases
@@ -353,21 +353,21 @@ struct SearchIndexEdgeCaseTests {
     @Test("storeEmbedding replaces existing embedding without error")
     func storeEmbeddingReplace() async throws {
         let hid = "test_emb_replace:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Embed Replace",
             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let emb1 = [Float](repeating: 0.1, count: SearchConfig.embeddingDims)
-        try await index.storeEmbedding(headerId: hid, embedding: emb1)
+        try await index.storeEmbedding( contentKey: ContentKey(rawValue: hid), embedding: emb1)
 
         let emb2 = [Float](repeating: 0.9, count: SearchConfig.embeddingDims)
-        try await index.storeEmbedding(headerId: hid, embedding: emb2)
+        try await index.storeEmbedding( contentKey: ContentKey(rawValue: hid), embedding: emb2)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - textForEmbedding
@@ -375,23 +375,23 @@ struct SearchIndexEdgeCaseTests {
     @Test("textForEmbedding returns data for indexed message with body")
     func textForEmbeddingWithBody() async throws {
         let hid = "test_textforemb:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1", subject: "Embed Text Subject",
             from: "sender@test.com", to: "receiver@test.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
-        try await index.updateBody(headerId: hid, body: "The embedding body text")
+        try await index.updateBody( contentKey: ContentKey(rawValue: hid), body: "The embedding body text")
 
         // textForEmbedding needs a rowid, but we tested via the rowid lookup
         // Just verify that the message is properly indexed and has body
-        let body = try await index.bodyText(headerId: hid)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: hid))
         #expect(body == "The embedding body text")
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     // ftsProgress, emptyBodyCount removed — flags live in GRDB only
@@ -406,12 +406,12 @@ struct SearchIndexEdgeCaseTests {
     @Test("removeMessagesForAccount does not affect other accounts")
     func removeForAccountIsolation() async throws {
         let records = [
-            FTSHeaderRecord(headerId: "test_rm_iso_a:INBOX:1", messageId: "m1", subject: "A1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_rm_iso_a:INBOX:1"),headerId: "test_rm_iso_a:INBOX:1", messageId: "m1", subject: "A1",
                             from: "a@a.com", to: "b@b.com", dateMs: 1_700_000_000_000),
-            FTSHeaderRecord(headerId: "test_rm_iso_b:INBOX:1", messageId: "m2", subject: "B1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: "test_rm_iso_b:INBOX:1"),headerId: "test_rm_iso_b:INBOX:1", messageId: "m2", subject: "B1",
                             from: "c@c.com", to: "d@d.com", dateMs: 1_700_000_000_000),
         ]
-        try await index.removeMessages(headerIds: records.map(\.headerId))
+        try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders(records)
         #expect(inserted == 2)
 
@@ -423,7 +423,7 @@ struct SearchIndexEdgeCaseTests {
         let countB = try await index.documentCountForAccount(accountId: "test_rm_iso_b")
         #expect(countB == 1)
 
-        try await index.removeMessages(headerIds: ["test_rm_iso_b:INBOX:1"])
+        try await index.removeMessages( contentKeys: ["test_rm_iso_b:INBOX:1"].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - Search by From/To
@@ -431,42 +431,42 @@ struct SearchIndexEdgeCaseTests {
     @Test("keywordSearch finds messages by sender email")
     func searchBySender() async throws {
         let hid = "test_sendersearch:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Regular Subject",
             from: "uniquesenderxyzzy99@domain.com",
             to: "b@b.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let results = try await index.keywordSearch(query: "uniquesenderxyzzy99")
-        let found = results.contains { $0.headerId == hid }
+        let found = results.contains { $0.contentKey.rawValue == hid }
         #expect(found)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 
     @Test("keywordSearch finds messages by CC address")
     func searchByCc() async throws {
         let hid = "test_ccsearch:INBOX:1"
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "CC Test",
             from: "a@a.com", to: "b@b.com",
             cc: "uniqueccxyzzy88@domain.com",
             dateMs: 1_700_000_000_000
         )
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         #expect(inserted == 1)
 
         let results = try await index.keywordSearch(query: "uniqueccxyzzy88")
-        let found = results.contains { $0.headerId == hid }
+        let found = results.contains { $0.contentKey.rawValue == hid }
         #expect(found)
 
-        try await index.removeMessages(headerIds: [hid])
+        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
     }
 }

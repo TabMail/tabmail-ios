@@ -92,7 +92,7 @@ struct MessageDetailHeaderRecoveryTests {
         let header = row.toMessageHeader()
         try insertDurableHeader(header, into: pool)
         try await pool.write { db in
-            try MessageBody(headerId: header.id, htmlContent: "<p>durable body</p>").insert(db)
+            try MessageBody( contentKey: ContentKey(rawValue: header.id), htmlContent: "<p>durable body</p>").insert(db)
         }
 
         // Staged snapshot is empty → zero-I/O init misses → skeleton state,

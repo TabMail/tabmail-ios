@@ -49,10 +49,10 @@ struct SyncPreSyncReclaimTests {
         header.notified = header.notified || preSync.notified
 
         var deferredBody: MessageBody?
-        if let body = try MessageBody.fetchOne(db, key: oldId) {
+        if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
             var newBody = body
-            newBody.id = header.id
-            try MessageBody.deleteOne(db, key: oldId)
+            newBody.id = ContentKey(rawValue: header.id)
+            try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
             deferredBody = newBody
         }
         let oldCacheKey = MessageIdentity.aiCacheKey(

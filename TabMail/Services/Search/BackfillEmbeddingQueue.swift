@@ -214,9 +214,13 @@ actor BackfillEmbeddingQueue {
         }
 
         // 2. Bulk read body texts from FTS (1 transaction instead of N)
-        let bodiesById: [String: String]
+        let bodiesByContentKey: [ContentKey: String]
         do {
-            bodiesById = try await SearchIndex.shared.bodyTexts(headerIds: headerIds)
+            // ⚠ STAGE E1: the embedding queue is keyed by `messageHeader.id` but its
+            // storage (`messages_vec`, joined through `message_ids.headerId`) is keyed
+            // by CONTENT. Deciding which space this queue lives in is a Stage C item.
+            bodiesByContentKey = try await SearchIndex.shared.bodyTexts(
+                contentKeys: headerIds.map(ContentKey.init(rawValue:)))
         } catch {
             print("[BackfillEmbeddingQueue] Bulk body read failed: \(error)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries) }
@@ -235,7 +239,7 @@ actor BackfillEmbeddingQueue {
                 storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries)
                 continue
             }
-            guard let body = bodiesById[item.headerId], !body.isEmpty else {
+            guard let body = bodiesByContentKey[ContentKey(rawValue: item.headerId)], !body.isEmpty else {
                 // No body — mark embeddingComplete so we don't retry
                 emptyBodyIds.append(item.headerId)
                 storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries)
@@ -262,7 +266,9 @@ actor BackfillEmbeddingQueue {
         // 4. Bulk write embeddings to FTS (1 transaction instead of N)
         if !succeeded.isEmpty {
             do {
-                try await SearchIndex.shared.storeEmbeddings(succeeded)
+                try await SearchIndex.shared.storeEmbeddings(succeeded.map {
+                    (contentKey: ContentKey(rawValue: $0.headerId), embedding: $0.embedding)
+                })
             } catch {
                 print("[BackfillEmbeddingQueue] Bulk embedding write failed: \(error)")
             }

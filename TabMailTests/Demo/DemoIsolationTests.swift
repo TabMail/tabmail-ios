@@ -184,10 +184,10 @@ struct DemoIsolationTests {
         #expect(try ids(demoActive: false) == ["real-1:INBOX:9"])
 
         // Vector-leg assembly check (no SQL scoping there — prefix based)
-        #expect(SearchIndex.headerIdInDemoScope("demo-account:INBOX:1", demoActive: true))
-        #expect(!SearchIndex.headerIdInDemoScope("real-1:INBOX:9", demoActive: true))
-        #expect(SearchIndex.headerIdInDemoScope("real-1:INBOX:9", demoActive: false))
-        #expect(!SearchIndex.headerIdInDemoScope("demo-account:INBOX:1", demoActive: false))
+        #expect(SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "demo-account:INBOX:1"), demoActive: true))
+        #expect(!SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "real-1:INBOX:9"), demoActive: true))
+        #expect(SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "real-1:INBOX:9"), demoActive: false))
+        #expect(!SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "demo-account:INBOX:1"), demoActive: false))
     }
 
     @Test("DemoToolGuard.accountScope filters by demo account in both modes")

@@ -98,7 +98,7 @@ struct HeaderCompleteFTSIndexingTests {
         #expect(beforeComplete == false)
 
         // Index into FTS via SearchIndex
-        let ftsRecord = FTSHeaderRecord(
+        let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -126,7 +126,7 @@ struct HeaderCompleteFTSIndexingTests {
         #expect(afterComplete == true)
 
         // Cleanup FTS
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }
 
@@ -266,11 +266,11 @@ struct HeaderCompleteRecoveryTests {
         guard incomplete.count == 1 else { return }
 
         // Clean up any stale FTS entry
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // Index to FTS
         let records = incomplete.map { h in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: h.id),
                 headerId: h.id,
                 messageId: h.messageId,
                 subject: h.subject,
@@ -300,7 +300,7 @@ struct HeaderCompleteRecoveryTests {
         #expect(after == true)
 
         // Cleanup FTS
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 
     @Test("recoverIncompleteHeaders is idempotent")
@@ -318,10 +318,10 @@ struct HeaderCompleteRecoveryTests {
             snippet: "test"
         )
 
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // First recovery pass
-        let ftsRecord = FTSHeaderRecord(
+        let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -353,7 +353,7 @@ struct HeaderCompleteRecoveryTests {
         #expect(inserted2 == 0, "Re-indexing already-indexed header inserts 0")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 
     @Test("recoverIncompleteHeaders with 0 orphans is fast no-op")
@@ -403,7 +403,7 @@ struct HeaderCompleteRecoveryTests {
         )
 
         // Ensure no stale FTS entry
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // headerComplete should be 0
         let hcBefore: Bool = try await db.read { dbConn in
@@ -414,7 +414,7 @@ struct HeaderCompleteRecoveryTests {
         #expect(hcBefore == false)
 
         // FTS should not have this header
-        let isIndexedBefore = try await index.isIndexed(headerId: header.id)
+        let isIndexedBefore = try await index.isIndexed( contentKey: ContentKey(rawValue: header.id))
         #expect(isIndexedBefore == false)
 
         // Run recovery: find incomplete, index to FTS, set flag
@@ -428,7 +428,7 @@ struct HeaderCompleteRecoveryTests {
         guard incomplete.count == 1 else { return }
 
         let records = incomplete.map { h in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: h.id),
                 headerId: h.id,
                 messageId: h.messageId,
                 subject: h.subject,
@@ -457,11 +457,11 @@ struct HeaderCompleteRecoveryTests {
         }
         #expect(hcAfter == true)
 
-        let isIndexedAfter = try await index.isIndexed(headerId: header.id)
+        let isIndexedAfter = try await index.isIndexed( contentKey: ContentKey(rawValue: header.id))
         #expect(isIndexedAfter == true)
 
         // Cleanup
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }
 
@@ -499,10 +499,10 @@ struct HeaderCompleteFullPipelineTests {
         #expect(flags1.1 == false, "bodyComplete should start false")
 
         // 2. Clean up any stale FTS entries
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
 
         // 3. Index header into FTS
-        let ftsRecord = FTSHeaderRecord(
+        let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,
@@ -531,7 +531,7 @@ struct HeaderCompleteFullPipelineTests {
         #expect(flags2.1 == false, "bodyComplete should still be false")
 
         // 5. Simulate body fetch: write body text to FTS
-        try await index.updateBody(headerId: header.id, body: "This is the fullpipelinebody content.")
+        try await index.updateBody( contentKey: ContentKey(rawValue: header.id), body: "This is the fullpipelinebody content.")
 
         // 6. Set bodyComplete=1 (what flushBatch does)
         try await db.write { dbConn in
@@ -552,7 +552,7 @@ struct HeaderCompleteFullPipelineTests {
 
         // 7. Verify body is searchable in FTS
         let results = try await index.keywordSearch(query: "fullpipelinebody")
-        #expect(results.contains { $0.headerId == header.id })
+        #expect(results.contains { $0.contentKey.rawValue == header.id })
 
         // 8. Verify this header is now excluded from repopulate query
         let repopIds: [String] = try await db.read { dbConn in
@@ -565,6 +565,6 @@ struct HeaderCompleteFullPipelineTests {
         #expect(!found, "Completed header should be excluded from repopulate")
 
         // Cleanup
-        try await index.removeMessages(headerIds: [header.id])
+        try await index.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 }

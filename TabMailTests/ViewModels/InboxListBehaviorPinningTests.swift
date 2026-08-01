@@ -970,14 +970,13 @@ struct InboxListBehaviorPinningTests {
         // snippet`, InboxViewModel.swift ~1336) — the exact mechanism
         // `flushAIBatch`'s snippet-fallback comment documents.
         _ = try await SearchIndex.shared.indexHeaders([
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: id),
                 headerId: id, messageId: "m-g1-snippet-fill", subject: "Subj",
                 from: "Sender", to: "me@example.com",
                 dateMs: Int64(Date().timeIntervalSince1970 * 1000)
             )
         ])
-        try await SearchIndex.shared.updateBody(
-            headerId: id, body: "This is the real message body used to drive the in-place snippet fill."
+        try await SearchIndex.shared.updateBody( contentKey: ContentKey(rawValue: id), body: "This is the real message body used to drive the in-place snippet fill."
         )
 
         // Drive the real public entry point — debounces 100ms then runs
@@ -997,7 +996,7 @@ struct InboxListBehaviorPinningTests {
         }
         guard let filledSnippet else {
             Issue.record("SnippetLoader tier-1 in-place fill did not land — test setup issue, not the fix under test")
-            try? await SearchIndex.shared.removeMessages(headerIds: [id])
+            try? await SearchIndex.shared.removeMessages( contentKeys: [id].map(ContentKey.init(rawValue:)))
             return
         }
 
@@ -1010,7 +1009,7 @@ struct InboxListBehaviorPinningTests {
             reloaded?.snippet == filledSnippet,
             "Pass-1 let an empty fresh snippet clobber the SnippetLoader's in-place fill"
         )
-        try? await SearchIndex.shared.removeMessages(headerIds: [id])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [id].map(ContentKey.init(rawValue:)))
     }
 
     @Test("Pass-1 does NOT over-preserve: a durable fresh row with a real, DIFFERENT snippet/computedThreadId always wins")

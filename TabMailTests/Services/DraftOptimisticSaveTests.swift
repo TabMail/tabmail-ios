@@ -157,7 +157,7 @@ struct DraftOptimisticSaveTests {
             header.headerComplete = true
             try header.insert(db)
 
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>old body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>old body</p>")
             try body.save(db)
         }
 
@@ -172,7 +172,7 @@ struct DraftOptimisticSaveTests {
                 existing.date = Date()
                 try existing.update(db)
 
-                let body = MessageBody(headerId: existing.id, htmlContent: "<p>new body</p>")
+                let body = MessageBody( contentKey: ContentKey(rawValue: existing.id), htmlContent: "<p>new body</p>")
                 try body.save(db)
             }
         }
@@ -312,7 +312,7 @@ struct DraftOptimisticSaveTests {
             header.headerComplete = true
             try header.insert(db)
 
-            let body = MessageBody(headerId: oldHeaderId, htmlContent: "<p>Draft body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: oldHeaderId), htmlContent: "<p>Draft body</p>")
             try body.save(db)
         }
 
@@ -349,7 +349,7 @@ struct DraftOptimisticSaveTests {
 
             // Re-insert preserved body with new headerId
             if let oldBody {
-                let newBody = MessageBody(headerId: newHeaderId, htmlContent: oldBody.htmlContent)
+                let newBody = MessageBody( contentKey: ContentKey(rawValue: newHeaderId), htmlContent: oldBody.htmlContent)
                 try newBody.save(db)
             }
         }

@@ -399,7 +399,7 @@ enum DemoSeed {
             header.bodyComplete = true
             try header.insert(db)
 
-            let body = MessageBody(headerId: header.id, htmlContent: m.body)
+            let body = MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: m.body)
             try body.insert(db)
 
             // Pre-bake AI cache row so the production short-circuit (which

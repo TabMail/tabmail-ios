@@ -325,13 +325,13 @@ actor DraftStore {
                         try merged.update(db)
 
                         // Body too: user's fresh body wins over sync's lagged copy.
-                        if let freshBody = try MessageBody.fetchOne(db, key: header.id) {
-                            _ = try? MessageBody.deleteOne(db, key: newHeaderId)
+                        if let freshBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: header.id)) {
+                            _ = try? MessageBody.deleteOne(db, key: ContentKey(rawValue: newHeaderId))
                             var newBody = freshBody
-                            newBody.id = newHeaderId
+                            newBody.id = ContentKey(rawValue: newHeaderId)
                             try newBody.insert(db)
                         }
-                        _ = try? MessageBody.deleteOne(db, key: header.id)
+                        _ = try? MessageBody.deleteOne(db, key: ContentKey(rawValue: header.id))
                         draftFtsRemovals.append(header.id)
                         try header.delete(db)
                         if DebugModeManager.isLoggingEnabled() { print("[DraftStore] Migration: MERGED fresh content from \(header.id) onto existing \(newHeaderId) (snippet=\(String(header.snippet.prefix(60))))") }
@@ -348,9 +348,9 @@ actor DraftStore {
                     // updated identity on the next save cycle.
                     migrated.rfc822MessageId = freshRfc822
                     try migrated.insert(db)
-                    if var body = try MessageBody.fetchOne(db, key: header.id) {
+                    if var body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: header.id)) {
                         try body.delete(db)
-                        body.id = newHeaderId
+                        body.id = ContentKey(rawValue: newHeaderId)
                         try body.insert(db)
                     }
                     print("[DraftStore] Migrated header \(header.id) → \(newHeaderId) (messageId \(header.messageId) → \(realMessageId), rfc822 \(header.rfc822MessageId ?? "nil") → \(freshRfc822))")
@@ -361,10 +361,14 @@ actor DraftStore {
         // Keep FTS aligned with the migrated GRDB ids: re-key migrated placeholders
         // (preserves the indexed body), remove merged-away ones. After the write.
         if !draftFtsOps.removals.isEmpty {
-            try? await SearchIndex.shared.removeMessages(headerIds: draftFtsOps.removals)
+            try? await SearchIndex.shared.removeMessages(
+                contentKeys: draftFtsOps.removals.map(ContentKey.init(rawValue:)))
         }
         if !draftFtsOps.rekeys.isEmpty {
-            try? await SearchIndex.shared.rekeyHeaders(draftFtsOps.rekeys)
+            try? await SearchIndex.shared.rekeyHeaders(draftFtsOps.rekeys.map {
+                (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId),
+                 newMessageId: $0.newMessageId)
+            })
         }
         // Notify list to reload after header migration so the snapshot PK is current.
         // Without this, the list has the old placeholder PK which no longer resolves.

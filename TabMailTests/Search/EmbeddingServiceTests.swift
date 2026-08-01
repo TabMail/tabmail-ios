@@ -75,7 +75,7 @@ struct FTSHeaderRecordTests {
 
     @Test("Init with all fields")
     func initAllFields() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "acc1:INBOX:1"),
             headerId: "acc1:INBOX:1",
             messageId: "1",
             subject: "Test",
@@ -92,7 +92,7 @@ struct FTSHeaderRecordTests {
 
     @Test("Init with default cc/bcc empty")
     func initDefaultCcBcc() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "h1"),
             headerId: "h1",
             messageId: "m1",
             subject: "Sub",
@@ -110,14 +110,13 @@ struct FTSSearchResultTests {
 
     @Test("FTSSearchResult stores all fields")
     func storesAllFields() {
-        let result = FTSSearchResult(
-            headerId: "h1",
+        let result = FTSSearchResult( contentKey: ContentKey(rawValue: "h1"),
             messageId: "m1",
             snippet: "...matching text...",
             rank: -5.0,
             dateMs: 1000
         )
-        #expect(result.headerId == "h1")
+        #expect(result.contentKey.rawValue == "h1")
         #expect(result.snippet == "...matching text...")
         #expect(result.rank == -5.0)
     }

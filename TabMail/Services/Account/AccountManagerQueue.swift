@@ -800,7 +800,7 @@ extension AccountManager {
         guard existed else { return }
         print("[Gone] Deleted header \(headerId) — reason=\(reason)")
         do {
-            try await SearchIndex.shared.removeMessages(headerIds: [headerId])
+            try await SearchIndex.shared.removeMessages(contentKeys: [ContentKey(rawValue: headerId)])
         } catch {
             print("[Gone] FTS remove failed for \(headerId): \(error)")
         }

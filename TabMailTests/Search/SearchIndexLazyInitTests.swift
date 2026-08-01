@@ -26,7 +26,7 @@ struct SearchIndexLazyInitTests {
 
     private func testRecord() -> FTSHeaderRecord {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        return FTSHeaderRecord(
+        return FTSHeaderRecord( contentKey: ContentKey(rawValue: testHeaderId),
             headerId: testHeaderId,
             messageId: "<lazy-init-test@test.com>",
             subject: "Lazy Init Test Message",
@@ -41,20 +41,20 @@ struct SearchIndexLazyInitTests {
     private func withTestData<T>(_ body: () async throws -> T) async throws -> T {
         // Ensure initialized and seed data
         let record = testRecord()
-        try await index.removeMessages(headerIds: [testHeaderId])
+        try await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
         let inserted = try await index.indexHeaders([record])
         guard inserted == 1 else {
-            try await index.removeMessages(headerIds: [testHeaderId])
+            try await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
             throw TestError(message: "Failed to seed test data")
         }
-        try await index.updateBodies([(headerId: testHeaderId, body: "Lazy init test body content for verification")])
+        try await index.updateBodies([(headerId: testHeaderId, body: "Lazy init test body content for verification")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
         // Run test
         defer {
             // Always re-initialize and clean up
             Task {
                 try? await index.initialize()
-                try? await index.removeMessages(headerIds: [testHeaderId])
+                try? await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
             }
         }
         return try await body()
@@ -70,7 +70,7 @@ struct SearchIndexLazyInitTests {
     func bodyTextRecoversAfterNuke() async throws {
         try await withTestData {
             // Verify data is accessible before nuke
-            let before = try await index.bodyText(headerId: testHeaderId)
+            let before = try await index.bodyText( contentKey: ContentKey(rawValue: testHeaderId))
             #expect(before != nil)
             #expect(before?.contains("Lazy init test body") == true)
 
@@ -80,7 +80,7 @@ struct SearchIndexLazyInitTests {
             #expect(readyAfterNuke == false)
 
             // bodyText should lazily re-initialize and find the data
-            let after = try await index.bodyText(headerId: testHeaderId)
+            let after = try await index.bodyText( contentKey: ContentKey(rawValue: testHeaderId))
             #expect(after != nil, "bodyText must recover via ensureReady — was nil (the race condition bug)")
             #expect(after?.contains("Lazy init test body") == true)
 
@@ -96,7 +96,7 @@ struct SearchIndexLazyInitTests {
             await index.closeForNuke()
 
             // Diagnostic should trigger ensureReady and return actual FTS state, not "dbPoolNil"
-            let diag = await index.bodyTextDiagnostic(headerId: testHeaderId)
+            let diag = await index.bodyTextDiagnostic( contentKey: ContentKey(rawValue: testHeaderId))
             #expect(diag != "dbPoolNil", "ensureReady should have initialized before diagnostic ran")
             #expect(diag.contains("bodyPresent"), "Expected body to be found after lazy init, got: \(diag)")
         }
@@ -105,12 +105,12 @@ struct SearchIndexLazyInitTests {
     @Test("indexHeaders works after closeForNuke")
     func indexHeadersAfterNuke() async throws {
         let extraId = "test_lazy_init:INBOX:2"
-        defer { Task { try? await index.removeMessages(headerIds: [extraId]) } }
+        defer { Task { try? await index.removeMessages( contentKeys: [extraId].map(ContentKey.init(rawValue:))) } }
 
         await index.closeForNuke()
 
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: extraId),
             headerId: extraId,
             messageId: "<lazy-extra@test.com>",
             subject: "Extra after nuke",
@@ -127,9 +127,9 @@ struct SearchIndexLazyInitTests {
             await index.closeForNuke()
 
             // updateBodies should trigger ensureReady and succeed
-            try await index.updateBodies([(headerId: testHeaderId, body: "Updated after nuke")])
+            try await index.updateBodies([(headerId: testHeaderId, body: "Updated after nuke")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
-            let body = try await index.bodyText(headerId: testHeaderId)
+            let body = try await index.bodyText( contentKey: ContentKey(rawValue: testHeaderId))
             #expect(body == "Updated after nuke")
         }
     }
@@ -139,7 +139,7 @@ struct SearchIndexLazyInitTests {
         try await withTestData {
             // Verify search works before nuke
             let beforeResults = try await index.keywordSearch(query: "verification")
-            let foundBefore = beforeResults.contains { $0.headerId == testHeaderId }
+            let foundBefore = beforeResults.contains { $0.contentKey.rawValue == testHeaderId }
             #expect(foundBefore, "Search must work before nuke")
 
             await index.closeForNuke()
@@ -150,7 +150,7 @@ struct SearchIndexLazyInitTests {
             #expect(isReady == false, "Should not be ready immediately after nuke")
 
             // bodyText triggers ensureReady — verify reinit works
-            let body = try await index.bodyText(headerId: testHeaderId)
+            let body = try await index.bodyText( contentKey: ContentKey(rawValue: testHeaderId))
             #expect(body != nil, "bodyText must recover after nuke")
 
             let readyAfter = await index.isReady
@@ -162,16 +162,16 @@ struct SearchIndexLazyInitTests {
     func removeMessagesAfterNuke() async throws {
         // Seed, nuke, remove — should not crash
         let record = testRecord()
-        try await index.removeMessages(headerIds: [testHeaderId])
+        try await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
         _ = try await index.indexHeaders([record])
 
         await index.closeForNuke()
 
         // Should trigger ensureReady and succeed
-        try await index.removeMessages(headerIds: [testHeaderId])
+        try await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
 
         // Verify gone
-        let body = try await index.bodyText(headerId: testHeaderId)
+        let body = try await index.bodyText( contentKey: ContentKey(rawValue: testHeaderId))
         #expect(body == nil)
     }
 
@@ -185,9 +185,9 @@ struct SearchIndexLazyInitTests {
         #expect(ready1 == true)
 
         // Call bodyText multiple times — each calls ensureReady internally
-        _ = try await index.bodyText(headerId: "nonexistent")
-        _ = try await index.bodyText(headerId: "nonexistent")
-        _ = try await index.bodyText(headerId: "nonexistent")
+        _ = try await index.bodyText( contentKey: ContentKey(rawValue: "nonexistent"))
+        _ = try await index.bodyText( contentKey: ContentKey(rawValue: "nonexistent"))
+        _ = try await index.bodyText( contentKey: ContentKey(rawValue: "nonexistent"))
 
         let ready2 = await index.isReady
         #expect(ready2 == true)
@@ -199,7 +199,7 @@ struct SearchIndexLazyInitTests {
             await index.closeForNuke()
             await index.closeForNuke()
 
-            let body = try await index.bodyText(headerId: testHeaderId)
+            let body = try await index.bodyText( contentKey: ContentKey(rawValue: testHeaderId))
             #expect(body != nil, "Must recover even after double nuke")
         }
     }

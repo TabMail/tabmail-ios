@@ -98,7 +98,8 @@ extension SyncEngine {
                     }
                     if !chunkIds.isEmpty {
                         Task.detached(priority: .utility) {
-                            try? await SearchIndex.shared.removeMessages(headerIds: chunkIds)
+                            try? await SearchIndex.shared.removeMessages(
+                                contentKeys: chunkIds.map(ContentKey.init(rawValue:)))
                         }
                     }
                 }
@@ -136,11 +137,22 @@ extension SyncEngine {
                     var batchEvicted = 0
                     var batchSkipped = 0
                     for body in batch {
-                        if undoProtectedBodyIds.contains(body.id) {
+                        // ⚠ STAGE E1 — TWO CROSSINGS IN FOUR LINES. `body.id` is a
+                        // CONTENT key; `undoProtectedBodyIds` holds `messageHeader.id`s
+                        // (`UndoService.undoStack … messages.map(\.id)`) and the
+                        // `fetchOne` below addresses `messageHeader` by primary key.
+                        // Byte-identical today. At E1 the undo guard stops matching
+                        // (a body the user can still undo gets evicted) and the header
+                        // lookup misses (`header == nil` → the body is DELETED as an
+                        // orphan). GRDB's `fetchOne(_:key:)` is generic over
+                        // `DatabaseValueConvertible`, so neither crossing is
+                        // compiler-visible — `.rawValue` is spelled out to make them
+                        // greppable.
+                        if undoProtectedBodyIds.contains(body.id.rawValue) {
                             batchSkipped += 1
                             continue
                         }
-                        guard let header = try MessageHeader.fetchOne(db, key: body.id) else {
+                        guard let header = try MessageHeader.fetchOne(db, key: body.id.rawValue) else {
                             try body.delete(db)
                             batchEvicted += 1
                             continue

@@ -475,6 +475,8 @@ struct SearchView: View {
     /// Self-healing: if FTS returned a result whose folderId is stale (message moved),
     /// exclude it from results and correct the FTS entry in the background.
     private func ftsResultsToSearchResults(_ ftsResults: [FTSSearchResult]) -> [SearchResult] {
+        // ⚠ Both heal lists are consumed by `SearchIndex` (content-key space) but
+        // are populated from `MessageHeader.id` values — another E1 crossing.
         var staleCorrections: [(headerId: String, correctFolderId: String)] = []
         // Drift heal: stale FTS headerId → current GRDB id (+ folderId). The FTS
         // key embeds the folder ("accountId:folder:messageId"); a folder move
@@ -492,7 +494,14 @@ struct SearchView: View {
         let scope = activeFolderIds
 
         let results: [SearchResult] = ftsResults.compactMap { ftsResult in
-            let headerId = ftsResult.headerId
+            // 🚨 STAGE E1 — DAY-ONE BREAKAGE, already known to the plan.
+            // `ftsResult.contentKey` addresses an FTS row; the very next line uses
+            // it as a `messageHeader.id` primary key. Byte-identical today. At E1
+            // every UID-addressed (IMAP/iCloud) hit misses this lookup and falls
+            // into the drift-recovery branch below — which deliberately REFUSES
+            // IMAP — so local search would silently return nothing for those
+            // accounts. A content-key → header-id resolution must land first.
+            let headerId = ftsResult.contentKey.rawValue
             // 1. Exact lookup by the FTS-stored id.
             var header = (try? dbPool.read { db in
                 try MessageHeader.fetchOne(db, key: headerId)
@@ -570,7 +579,8 @@ struct SearchView: View {
         if !staleCorrections.isEmpty {
             Task {
                 for (headerId, correctFolderId) in staleCorrections {
-                    try? await SearchIndex.shared.updateFolderIds(headerIds: [headerId], newFolderId: correctFolderId)
+                    try? await SearchIndex.shared.updateFolderIds(
+                        contentKeys: [ContentKey(rawValue: headerId)], newFolderId: correctFolderId)
                 }
             }
         }
@@ -582,9 +592,11 @@ struct SearchView: View {
             let heals = rekeyHeals
             Task {
                 try? await SearchIndex.shared.rekeyHeaders(
-                    heals.map { (oldId: $0.old, newId: $0.new, newMessageId: $0.newMessageId) })
+                    heals.map { (oldKey: ContentKey(rawValue: $0.old), newKey: ContentKey(rawValue: $0.new),
+                                 newMessageId: $0.newMessageId) })
                 for heal in heals {
-                    try? await SearchIndex.shared.updateFolderIds(headerIds: [heal.new], newFolderId: heal.newFolderId)
+                    try? await SearchIndex.shared.updateFolderIds(
+                        contentKeys: [ContentKey(rawValue: heal.new)], newFolderId: heal.newFolderId)
                 }
             }
         }

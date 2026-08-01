@@ -89,7 +89,7 @@ enum GmailAPI {
     static func messageFull(
         http: AuthedHTTP,
         id: String,
-        headerId: String? = nil,
+        contentKey: ContentKey? = nil,
         attachmentFetcher: BodyRenderer.AttachmentFetcher? = nil,
         icsRenderer: BodyRenderer.ICSRenderer? = nil
     ) async throws -> (MessageMetadata, RenderedBody) {
@@ -141,10 +141,10 @@ enum GmailAPI {
         )
         // Bind the inline-image writer once per render — same factory that
         // IMAP and Graph paths use, so behavior is identical across providers
-        // *and* across targets (main app + NSE). `headerId == nil` (compose
+        // *and* across targets (main app + NSE). `contentKey == nil` (compose
         // preview, tooltip, etc.) → no writer → data URIs.
         let inlineImageWriter: BodyRenderer.InlineImageWriter? =
-            headerId.map { BodyAssetStore.makeInlineImageWriter(forHeaderId: $0) }
+            contentKey.map { BodyAssetStore.makeInlineImageWriter(forContentKey: $0) }
         let rendered = await BodyRenderer.render(
             ingredients: ingredients,
             attachmentFetcher: attachmentFetcher,

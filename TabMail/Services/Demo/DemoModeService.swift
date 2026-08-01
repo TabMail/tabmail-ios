@@ -254,6 +254,7 @@ final class DemoModeService {
         // generate embeddings during demo seed (FTS-only).
         let records = headers.map { h in
             FTSHeaderRecord(
+                contentKey: ContentKey(rawValue: h.id),
                 headerId: h.id,
                 messageId: h.messageId,
                 subject: h.subject,
@@ -268,12 +269,12 @@ final class DemoModeService {
         do {
             _ = try await SearchIndex.shared.indexHeaders(records)
             let bodyMap: [String: String] = bodies.reduce(into: [:]) { acc, b in
-                if let html = b.htmlContent { acc[b.id] = html }
+                if let html = b.htmlContent { acc[b.id.rawValue] = html }
             }
             for header in headers {
                 if let html = bodyMap[header.id] {
                     let plain = stripHTML(html)
-                    try await SearchIndex.shared.updateBody(headerId: header.id, body: plain)
+                    try await SearchIndex.shared.updateBody(contentKey: ContentKey(rawValue: header.id), body: plain)
                 }
             }
         } catch {

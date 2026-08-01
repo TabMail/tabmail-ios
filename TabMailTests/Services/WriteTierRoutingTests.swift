@@ -98,7 +98,7 @@ struct WriteTierRoutingTests {
             headerId: headerId, accountId: accountId, folderPath: folderPath,
             messageId: messageId, isInInbox: true
         )
-        let body = MessageBody.create(headerId: headerId, htmlBody: "<p>Tier test body</p>")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: headerId), htmlBody: "<p>Tier test body</p>")
         return BodyFetchProcessor.FetchResult(
             item: item, renderedBody: body, plainText: "Tier test body plain text",
             hasAttachments: false, hasUnresolvedICS: false
@@ -207,18 +207,19 @@ struct WriteTierRoutingTests {
         // Index the header in FTS first so flushBatch's updateBodies confirms it
         // (writtenToFts) and proceeds to the GRDB bodyComplete/snippet write —
         // otherwise the write is deferred and there's nothing to observe.
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id, messageId: header.messageId, subject: header.subject,
             from: "\(header.from) <\(header.fromAddress)>", to: header.to,
             dateMs: Int64(header.date.timeIntervalSince1970 * 1000)
         )
-        try await SearchIndex.shared.removeMessages(headerIds: [header.id])
+        try await SearchIndex.shared.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
         _ = try await SearchIndex.shared.indexHeaders([record])
 
         let recorded = Mutex<[(WritePriority, String?)]>([])
         let clearObserver = await installObserver { priority, label in recorded.withLock { $0.append((priority, label)) } }
 
         let processed = BodyFetchProcessor.ProcessedItem(
+            contentKey: ContentKey(rawValue: header.id),
             headerId: header.id, accountId: header.accountId, isInInbox: true,
             body: "Tier test flush body", snippet: "Tier test flush snippet"
         )
@@ -239,7 +240,7 @@ struct WriteTierRoutingTests {
         let updated = try await AppDatabase.rawPool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
         #expect(updated?.bodyComplete == true, "sanity: the write actually landed")
 
-        try? await SearchIndex.shared.removeMessages(headerIds: [header.id])
+        try? await SearchIndex.shared.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - ActiveAIQueue / ActiveBodyQueue own pool tier

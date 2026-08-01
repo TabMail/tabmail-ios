@@ -124,7 +124,20 @@ enum BodyFetchProcessor {
     }
 
     /// Data returned from process for batched FTS writes.
+    ///
+    /// 🚨 **TWO IDS ON PURPOSE.** `flushBatch` uses this record for two unrelated
+    /// jobs: it writes the body into FTS (keyed by CONTENT) and then flips
+    /// `messageHeader.bodyComplete` for the confirmed subset (keyed by the
+    /// HEADER). One field served both only while the two were the same string.
+    /// Once the content key moves, a content key in the `WHERE id = ?` of that
+    /// flip matches nothing — `bodyComplete` never flips and the body is
+    /// re-fetched forever.
     struct ProcessedItem: Sendable {
+        /// FTS row key. Feeds `SearchIndex.updateBodies` and the confirmed-set
+        /// membership test against its return value.
+        let contentKey: ContentKey
+        /// `messageHeader.id`. Feeds `UPDATE messageHeader … WHERE id = ?` and the
+        /// downstream AI queue. **Never** an FTS lookup.
         let headerId: String
         let accountId: String
         let isInInbox: Bool
@@ -163,6 +176,7 @@ enum BodyFetchProcessor {
             }
             let snippet = EmailFilter.snippetFromPlainText(plainText)
             let processed = ProcessedItem(
+                contentKey: ContentKey(rawValue: item.headerId),
                 headerId: item.headerId,
                 accountId: item.accountId,
                 isInInbox: item.isInInbox,
@@ -197,6 +211,7 @@ enum BodyFetchProcessor {
             }
             let placeholder = "[attachment]"
             let processed = ProcessedItem(
+                contentKey: ContentKey(rawValue: item.headerId),
                 headerId: item.headerId,
                 accountId: item.accountId,
                 isInInbox: item.isInInbox,
@@ -280,8 +295,8 @@ enum BodyFetchProcessor {
         // 1. Batch FTS write — returns which headerIds were actually written.
         // Items not yet in FTS index are skipped (bodyComplete stays 0 for retry).
         let tFts = CFAbsoluteTimeGetCurrent()
-        let ftsBuffer = items.map { (headerId: $0.headerId, body: $0.body) }
-        let writtenToFts: Set<String>
+        let ftsBuffer = items.map { (contentKey: $0.contentKey, body: $0.body) }
+        let writtenToFts: Set<ContentKey>
         do {
             writtenToFts = try await SearchIndex.shared.updateBodies(ftsBuffer)
         } catch {
@@ -298,7 +313,7 @@ enum BodyFetchProcessor {
 
         let skippedCount = items.count - writtenToFts.count
         if skippedCount > 0 {
-            let skippedItems = items.filter { !writtenToFts.contains($0.headerId) }
+            let skippedItems = items.filter { !writtenToFts.contains($0.contentKey) }
             let accountIds = Set(skippedItems.map(\.accountId)).sorted().joined(separator: ",")
             print("[BodyFetch] flushBatch: \(skippedCount)/\(items.count) items not in FTS yet — bodyComplete deferred (accounts=[\(accountIds)])")
         }
@@ -306,7 +321,9 @@ enum BodyFetchProcessor {
         // 2. Batch GRDB flag update (snippets + bodyComplete) — ONLY for items written to FTS.
         // Items skipped by FTS keep bodyComplete=0 so body fetch queue retries them.
         let tDb = CFAbsoluteTimeGetCurrent()
-        let confirmedItems = items.filter { writtenToFts.contains($0.headerId) }
+        // ⚠ Membership is tested on the CONTENT key (that is what `updateBodies`
+        // returns); the flip below binds the HEADER id. Do not collapse the two.
+        let confirmedItems = items.filter { writtenToFts.contains($0.contentKey) }
         do {
             try await dbPool.write { db in
                 for item in confirmedItems {
@@ -427,11 +444,19 @@ enum BodyFetchProcessor {
             return ICSBuilder.buildIncomingInviteBody(invite)
         }
 
+        // ⚠ STAGE E1: `renderBody` receives a `messageHeader.id` and uses it as the
+        // CONTENT key for both the asset store and the `MessageBody` row it builds.
+        // `BodyFetchProcessor.Item` (which is where `headerId` comes from) carries no
+        // `rfc822MessageId` and no provider space, so this cannot mint through
+        // `ContentKey.forHeader` yet — plumbing those two fields onto `Item` is a
+        // prerequisite for E1. Byte-identical today.
+        let contentKey = ContentKey(rawValue: headerId)
+
         // Single source of the writer — same factory the NSE clients use.
-        // Both targets call `BodyAssetStore.makeInlineImageWriter(forHeaderId:)`,
+        // Both targets call `BodyAssetStore.makeInlineImageWriter(forContentKey:)`,
         // so persisted assets land at the same paths and the rendered HTML
         // references identical `tabmail-asset://` URLs across targets.
-        let inlineImageWriter = BodyAssetStore.makeInlineImageWriter(forHeaderId: headerId)
+        let inlineImageWriter = BodyAssetStore.makeInlineImageWriter(forContentKey: contentKey)
         let rendered = await BodyRenderer.render(
             ingredients: ingredients,
             attachmentFetcher: fetchAttachment,
@@ -444,7 +469,7 @@ enum BodyFetchProcessor {
         // create() just stores it: no re-conversion, no double-escape. The canonical
         // plain text for snippet/FTS is `rendered.textContent`, returned to the caller
         // (NOT re-derived from htmlContent, which would round-trip plain→HTML→plain).
-        var body = MessageBody.create(headerId: headerId, htmlBody: rendered.htmlContent)
+        var body = MessageBody.create(contentKey: contentKey, htmlBody: rendered.htmlContent)
         // Diagnostic (debug-gated, no-op in prod): flag if a double-escaped body ever
         // reaches storage. Captured in body_render.log (DebugMenu › Logs).
         BackgroundSyncLogger.diagnoseStoredBody(source: "BodyFetch", headerId: headerId, htmlContent: body.htmlContent)

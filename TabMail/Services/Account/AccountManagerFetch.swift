@@ -17,7 +17,7 @@ extension AccountManager {
             try MessageHeader.deleteOne(db, key: header.id)
         }
         Task { await UnreadCountManager.shared.requestRecount(folderId: header.folderId) }
-        _ = try? await SearchIndex.shared.removeMessages(headerIds: [header.id])
+        _ = try? await SearchIndex.shared.removeMessages(contentKeys: [ContentKey(rawValue: header.id)])
     }
 
     // MARK: - Body & Attachment Fetching

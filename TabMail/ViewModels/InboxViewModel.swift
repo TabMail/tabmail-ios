@@ -1312,7 +1312,8 @@ final class InboxViewModel {
         // Tier 1: FTS lookup (local, no network)
         for headerId in needsFTS {
             guard !Task.isCancelled else { return }
-            if let body = try? await SearchIndex.shared.bodyText(headerId: headerId) {
+            if let body = try? await SearchIndex.shared.bodyText(
+                contentKey: ContentKey(rawValue: headerId)) {
                 let snippet = EmailFilter.snippetFromPlainText(body)
                 if !snippet.isEmpty {
                     try? await dbPool.write { db in

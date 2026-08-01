@@ -132,7 +132,8 @@ enum NSEDataBridge {
     /// wins — call ONLY on a GRDB `messageBody` miss (mirrors
     /// `stagedRowFallback`'s contract for headers).
     static func stagedBodyFallback(headerId: String) -> MessageBody? {
-        latestStagedBodies.withLock { $0[headerId] }?.toMessageBody(headerId: headerId)
+        latestStagedBodies.withLock { $0[headerId] }?
+            .toMessageBody(contentKey: ContentKey(rawValue: headerId))
     }
 
     /// The staged set (headerId-sorted) of the last `.messagesStaged` post — a
@@ -1118,7 +1119,7 @@ enum NSEDataBridge {
                                     // No header yet — create the header-only row
                                     // (snippet + thread + junctions; NO body blob,
                                     // NO AI fields). Body + AI land in phase 2.
-                                    var dummyFts: [(headerId: String, textContent: String)] = []
+                                    var dummyFts: [NSEFTSBodyItem] = []
                                     _ = try Self.insertNewHeaderFromStaging(
                                         msg, db: db, ftsBatch: &dummyFts, headerOnly: true
                                     )
@@ -1225,7 +1226,7 @@ enum NSEDataBridge {
             // INSIDE the savepoint and only merged into this batch after the
             // savepoint commits — so a savepoint rollback doesn't leak stale
             // entries that point at non-existent main-GRDB rows.
-            var ftsBatch: [(headerId: String, textContent: String)] = []
+            var ftsBatch: [NSEFTSBodyItem] = []
             // The id of EVERY committed merged header (bodied or not). Header
             // visibility (headerComplete) is independent of body presence, so the
             // post-tx flush indexes + flips headerComplete for this full set — an
@@ -1266,7 +1267,7 @@ enum NSEDataBridge {
                 // late-surfacing residual is writer contention, not the write itself.
                 let writeReqT0 = CFAbsoluteTimeGetCurrent()
                 BootProfiler.mark("merge: requesting GRDB writer for \(writeSet.count) staged msg(s)")
-                let writeResult: (ids: [String], committed: Int, fts: [(headerId: String, textContent: String)], headers: [String], realChanged: Bool, committedIds: [String]) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
+                let writeResult: (ids: [String], committed: Int, fts: [NSEFTSBodyItem], headers: [String], realChanged: Bool, committedIds: [String]) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
                     BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
                     // Connection-level write counter snapshot. The delta over this
                     // whole transaction tells us whether phase 2 changed anything
@@ -1280,7 +1281,7 @@ enum NSEDataBridge {
                     var localMergedIds: [String] = []
                     var localCommitted = 0
                     var localCommittedMsgIds: [String] = []
-                    var localFtsAccumulator: [(headerId: String, textContent: String)] = []
+                    var localFtsAccumulator: [NSEFTSBodyItem] = []
                     var localHeaderAccumulator: [String] = []
                     for msg in writeSet {
                         // Per-message savepoint: a single bad row (FK
@@ -1298,7 +1299,7 @@ enum NSEDataBridge {
                         // the loop-level state after the savepoint commits, so
                         // a rollback doesn't leak FTS entries pointing at
                         // non-existent rows.
-                        var localFtsBatch: [(headerId: String, textContent: String)] = []
+                        var localFtsBatch: [NSEFTSBodyItem] = []
                         // The id of the header this savepoint committed (existing or
                         // newly inserted). Captured regardless of body so the post-tx
                         // flush can index it + flip headerComplete → inbox-visible.
@@ -2210,6 +2211,29 @@ enum NSEDataBridge {
     /// Invariants `headerComplete=1 ⇒ FTS has header` and `bodyComplete=1 ⇒ FTS
     /// has body` are enforced by the post-tx batch flush, NOT here. Neither flag
     /// is ever touched inside the main tx.
+    /// One bodied message queued by a merge savepoint for the post-transaction
+    /// FTS pass.
+    ///
+    /// 🚨 **THIS CARRIES TWO DIFFERENT IDS ON PURPOSE.** `flushNSEBatchToFTS`
+    /// uses each entry for two unrelated jobs:
+    ///   • `contentKey` addresses the **FTS row** the body text is written into
+    ///     (`message_ids.headerId` / `messages_fts_YYYY`).
+    ///   • `headerId` addresses the **`messageHeader` row** whose `bodyComplete`
+    ///     flag the very same pass flips.
+    ///
+    /// They are the same string today. They stop being the same string at Stage
+    /// E1, when the content key's tail moves off the provider id
+    /// (`ContentKeySpace`). If a single field fed both jobs, the
+    /// `UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (…)` would match
+    /// **nothing** for UID-addressed accounts and the user's pushed mail would
+    /// never become visible. Keep the two fields separate; the type is what
+    /// stops them being collapsed.
+    struct NSEFTSBodyItem: Sendable {
+        let contentKey: ContentKey
+        let headerId: String
+        let textContent: String
+    }
+
     fileprivate static func persistRenderedBodyFromStaging(
         db: GRDB.Database,
         headerId: String,
@@ -2218,7 +2242,7 @@ enum NSEDataBridge {
         attachmentsJSON: String?,
         icsText: String?,
         hasUnresolvedCIDs: Bool,
-        ftsBatch: inout [(headerId: String, textContent: String)]
+        ftsBatch: inout [NSEFTSBodyItem]
     ) throws {
         // Nothing to persist — NSE didn't render (old build / fetch failure).
         guard htmlContent != nil || textContent != nil else { return }
@@ -2228,7 +2252,7 @@ enum NSEDataBridge {
         if !hasUnresolvedCIDs {
             // `htmlContent` is the display-ready html the NSE's BodyRenderer produced
             // (plain bodies already converted there) — store it as-is, no re-conversion.
-            var body = MessageBody.create(headerId: headerId, htmlBody: htmlContent)
+            var body = MessageBody.create(contentKey: ContentKey(rawValue: headerId), htmlBody: htmlContent)
             // Diagnostic (debug-gated, no-op in prod): flag a double-escaped stored body.
             BackgroundSyncLogger.diagnoseStoredBody(source: "NSEMerge", headerId: headerId, htmlContent: body.htmlContent)
             body.attachmentsJSON = attachmentsJSON
@@ -2272,7 +2296,15 @@ enum NSEDataBridge {
         // all-headers path (`allMergedHeaderIds`), so they ARE inbox-visible at merge
         // time — they no longer wait for a recoverIncompleteHeaders pass.
         if let text = textContent, !text.isEmpty, !hasUnresolvedCIDs {
-            ftsBatch.append((headerId: headerId, textContent: text))
+            // ⚠ STAGE E1: `persistRenderedBodyFromStaging` receives only a
+            // `headerId` — the staged message's RFC id / provider space are not
+            // threaded here yet, so the content key is asserted from the header
+            // id rather than minted by `ContentKey.forHeader`.
+            ftsBatch.append(NSEFTSBodyItem(
+                contentKey: ContentKey(rawValue: headerId),
+                headerId: headerId,
+                textContent: text
+            ))
         }
     }
 
@@ -2320,6 +2352,7 @@ enum NSEDataBridge {
         //    IDs are skipped; header records carry no body, so this is cheap.
         let records = validHeaders.map { header -> FTSHeaderRecord in
             FTSHeaderRecord(
+                contentKey: ContentKey(rawValue: header.id),
                 headerId: header.id,
                 messageId: header.messageId,
                 subject: header.subject,
@@ -2350,7 +2383,10 @@ enum NSEDataBridge {
         //    headerComplete = 0` clause keeps the flip idempotent AND makes
         //    `changesCount` the count of headers that became NEWLY visible — the
         //    caller renders only when that's > 0.
-        let indexedIds = validHeaders.map(\.id)
+        // ⚠ `[String]` is load-bearing (F2): this list is bound into a
+        // `WHERE messageHeader.id IN (…)` predicate, so it MUST be the HEADER id.
+        // `records.map(\.contentKey)` must not compile here.
+        let indexedIds: [String] = validHeaders.map(\.id)
         do {
             return try await AppDatabase.dbPool.write { db -> Int in
                 let placeholders = indexedIds.map { _ in "?" }.joined(separator: ",")
@@ -2391,7 +2427,7 @@ enum NSEDataBridge {
     /// refetch), and drain-time self-repopulate.
     fileprivate static func flushNSEBatchToFTS(
         headerIds: [String],
-        bodyItems: [(headerId: String, textContent: String)]
+        bodyItems: [NSEFTSBodyItem]
     ) async {
         guard !headerIds.isEmpty else { return }
 
@@ -2418,6 +2454,7 @@ enum NSEDataBridge {
         //    IDs are skipped; header records carry no body, so this is cheap.
         let records = validHeaders.map { header -> FTSHeaderRecord in
             FTSHeaderRecord(
+                contentKey: ContentKey(rawValue: header.id),
                 headerId: header.id,
                 messageId: header.messageId,
                 subject: header.subject,
@@ -2439,7 +2476,10 @@ enum NSEDataBridge {
         // 3. Batch flip headerComplete=1 for ALL indexed headers → inbox-visible
         //    NOW. This is the fix for body-less / unresolved-CID pushed mail being
         //    invisible until a later recoverIncompleteHeaders pass.
-        let indexedIds = validHeaders.map(\.id)
+        // ⚠ `[String]` is load-bearing (F2): this list is bound into a
+        // `WHERE messageHeader.id IN (…)` predicate, so it MUST be the HEADER id.
+        // `records.map(\.contentKey)` must not compile here.
+        let indexedIds: [String] = validHeaders.map(\.id)
         do {
             try await AppDatabase.dbPool.write { db in
                 let placeholders = indexedIds.map { _ in "?" }.joined(separator: ",")
@@ -2458,14 +2498,17 @@ enum NSEDataBridge {
         //    now headerComplete=1 / bodyComplete=0, so the body queue fetches them
         //    (we never set bodyComplete for a body we didn't index — "never mark
         //    unfetched content as fetched").
-        let validBodyItems = bodyItems.compactMap { item -> (headerId: String, textContent: String, header: MessageHeader)? in
+        let validBodyItems = bodyItems.compactMap { item -> (item: NSEFTSBodyItem, header: MessageHeader)? in
             guard let header = headersById[item.headerId] else { return nil }
-            return (item.headerId, item.textContent, header)
+            return (item, header)
         }
         guard !validBodyItems.isEmpty else { return }
 
-        let ftsBodies = validBodyItems.map { ($0.headerId, $0.textContent) }
-        let written: Set<String>
+        // FTS write keys by CONTENT; the confirmation set that comes back is
+        // therefore in content-key space and must be intersected with
+        // `item.contentKey` — NEVER with `item.headerId` (F2).
+        let ftsBodies = validBodyItems.map { (contentKey: $0.item.contentKey, body: $0.item.textContent) }
+        let written: Set<ContentKey>
         do {
             written = try await SearchIndex.shared.updateBodies(ftsBodies)
         } catch {
@@ -2473,14 +2516,17 @@ enum NSEDataBridge {
             return
         }
 
-        let confirmedItems = validBodyItems.filter { written.contains($0.headerId) }
+        let confirmedItems = validBodyItems.filter { written.contains($0.item.contentKey) }
         guard !confirmedItems.isEmpty else {
             print("[NSEDataBridge] FTS batch: no body writes confirmed (\(ftsBodies.count) attempted) — body queue will retry")
             return
         }
 
         // 5. Batch flip bodyComplete=1 for confirmed writes.
-        let confirmedIds = confirmedItems.map(\.headerId)
+        // ⚠ `[String]` is load-bearing (F2): bound into `WHERE messageHeader.id
+        // IN (…)`, so it takes the HEADER id even though the membership test
+        // above ran in content-key space.
+        let confirmedIds: [String] = confirmedItems.map(\.item.headerId)
         do {
             try await AppDatabase.dbPool.write { db in
                 let placeholders = confirmedIds.map { _ in "?" }.joined(separator: ",")
@@ -2511,7 +2557,7 @@ enum NSEDataBridge {
         // is re-discovered by `ActiveAIQueue.repopulateFromDatabase` on the next
         // foreground poll — the enqueue is an optimization, not the only path.
         let downstream: [(headerId: String, accountId: String, isInInbox: Bool)] =
-            confirmedItems.map { ($0.headerId, $0.header.accountId, $0.header.isInInbox) }
+            confirmedItems.map { ($0.item.headerId, $0.header.accountId, $0.header.isInInbox) }
         Task.detached(priority: .utility) {
             // Gate only when a REAL foreground app is running. `dbReady` is true at
             // any production merge time (the merge needs the DB) and false in unit
@@ -2664,7 +2710,7 @@ enum NSEDataBridge {
     static func insertNewHeaderFromStaging(
         _ msg: StagedMessage,
         db: GRDB.Database,
-        ftsBatch: inout [(headerId: String, textContent: String)],
+        ftsBatch: inout [NSEFTSBodyItem],
         headerOnly: Bool = false
     ) throws -> Bool {
         // CRITICAL: use the folderPath NSE captured from the provider
@@ -3051,8 +3097,8 @@ extension NSEDataBridge.StagedMessage {
 extension NSEDataBridge.StagedBodySnapshot {
     /// Synthesize a display-only `MessageBody` from the staged body snapshot.
     /// Shared by `stagedBodyFallback` (in-memory) and the tap-path direct read.
-    func toMessageBody(headerId: String) -> MessageBody {
-        var body = MessageBody.create(headerId: headerId, htmlBody: htmlContent)
+    func toMessageBody(contentKey: ContentKey) -> MessageBody {
+        var body = MessageBody.create(contentKey: contentKey, htmlBody: htmlContent)
         body.attachmentsJSON = attachmentsJSON
         body.icsText = icsText
         return body

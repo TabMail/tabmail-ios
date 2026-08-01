@@ -193,8 +193,8 @@ enum BodyAssetStore {
 
     /// First `hashHexLength` hex chars of SHA-256(headerId). Used as the per-message
     /// folder name on disk. Identical computation across both targets.
-    static func headerHash(_ headerId: String) -> String {
-        sha256Hex(headerId, take: hashHexLength)
+    static func headerHash(_ contentKey: ContentKey) -> String {
+        sha256Hex(contentKey.rawValue, take: hashHexLength)
     }
 
     private static func assetHash(_ input: String) -> String {
@@ -249,35 +249,35 @@ enum BodyAssetStore {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
-    /// Folder URL for a given headerId (debug/reporting only).
-    static func folder(for headerId: String) -> URL? {
-        storeDirectory()?.appendingPathComponent(headerHash(headerId), isDirectory: true)
+    /// Folder URL for a given content key (debug/reporting only).
+    static func folder(for contentKey: ContentKey) -> URL? {
+        storeDirectory()?.appendingPathComponent(headerHash(contentKey), isDirectory: true)
     }
 
     // MARK: - Public: writes (identical path in NSE and main app)
 
     /// Writes inline image bytes. Returns the assetId on success, nil on failure.
     static func writeInlineImage(
-        headerId: String, contentId: String, contentType: String, data: Data
+        contentKey: ContentKey, contentId: String, contentType: String, data: Data
     ) -> String? {
-        write(headerId: headerId, kind: .inlineImage, key: contentId,
+        write(contentKey: contentKey, kind: .inlineImage, key: contentId,
               contentType: contentType, data: data)
     }
 
     /// Writes attachment bytes. Returns the assetId on success, nil on failure.
     static func writeAttachment(
-        headerId: String, section: String, contentType: String, data: Data
+        contentKey: ContentKey, section: String, contentType: String, data: Data
     ) -> String? {
-        write(headerId: headerId, kind: .attachment, key: section,
+        write(contentKey: contentKey, kind: .attachment, key: section,
               contentType: contentType, data: data)
     }
 
     private static func write(
-        headerId: String, kind: BodyAssetKind, key: String,
+        contentKey: ContentKey, kind: BodyAssetKind, key: String,
         contentType: String, data: Data
     ) -> String? {
         guard let dir = storeDirectory(), let queue = manifestQueue() else { return nil }
-        let hHash = headerHash(headerId)
+        let hHash = headerHash(contentKey)
         let aHash = assetHash(key)
         let id = "\(hHash)/\(aHash)"
 
@@ -308,7 +308,7 @@ enum BodyAssetStore {
                         sizeBytes = excluded.sizeBytes
                     """,
                     arguments: [
-                        id, headerId, kind.rawValue,
+                        id, contentKey, kind.rawValue,
                         contentIdValue, attachmentSectionValue,
                         contentType, data.count, nowMs
                     ]
@@ -341,10 +341,10 @@ enum BodyAssetStore {
     /// Returns an `InlineImageWriter` closure bound to a given headerId.
     /// Used by both NSE and main-app render paths. By design, no caller
     /// constructs the closure inline.
-    static func makeInlineImageWriter(forHeaderId headerId: String) -> BodyRenderer.InlineImageWriter {
+    static func makeInlineImageWriter(forContentKey contentKey: ContentKey) -> BodyRenderer.InlineImageWriter {
         return { img in
             guard let id = writeInlineImage(
-                headerId: headerId,
+                contentKey: contentKey,
                 contentId: img.contentId,
                 contentType: img.contentType,
                 data: img.data
@@ -362,15 +362,15 @@ enum BodyAssetStore {
         return try? Data(contentsOf: url)
     }
 
-    /// Looks up the assetId for an attachment by (headerId, section).
-    static func attachmentAssetId(headerId: String, section: String) -> String? {
+    /// Looks up the assetId for an attachment by (contentKey, section).
+    static func attachmentAssetId(contentKey: ContentKey, section: String) -> String? {
         guard let queue = manifestQueue() else { return nil }
         do {
             return try queue.read { db in
                 try String.fetchOne(
                     db,
                     sql: "SELECT id FROM bodyAsset WHERE headerId = ? AND kind = ? AND attachmentSection = ?",
-                    arguments: [headerId, BodyAssetKind.attachment.rawValue, section]
+                    arguments: [contentKey, BodyAssetKind.attachment.rawValue, section]
                 )
             }
         } catch {
@@ -400,7 +400,7 @@ enum BodyAssetStore {
 
     /// Bump every asset of a given message to "now". Single UPDATE; touches all
     /// rows for that headerId. Fire-and-forget.
-    static func bumpMessageAccess(headerId: String) {
+    static func bumpMessageAccess(contentKey: ContentKey) {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         Task.detached(priority: .utility) {
             guard let queue = manifestQueue() else { return }
@@ -408,11 +408,11 @@ enum BodyAssetStore {
                 try queue.write { db in
                     try db.execute(
                         sql: "UPDATE bodyAsset SET lastAccessedAt = ? WHERE headerId = ?",
-                        arguments: [nowMs, headerId]
+                        arguments: [nowMs, contentKey]
                     )
                 }
             } catch {
-                print("[BodyAssetStore] bumpMessageAccess failed for \(headerId): \(error)")
+                print("[BodyAssetStore] bumpMessageAccess failed for \(contentKey): \(error)")
             }
         }
     }
@@ -421,7 +421,7 @@ enum BodyAssetStore {
 
     /// Snapshot of one message's asset aggregate, for eviction ordering.
     struct VictimSummary: Sendable {
-        let headerId: String
+        let contentKey: ContentKey
         let totalBytes: Int64
         let inlineCount: Int
     }
@@ -449,7 +449,7 @@ enum BodyAssetStore {
                 )
                 return rows.map {
                     VictimSummary(
-                        headerId: $0["headerId"],
+                        contentKey: $0["headerId"],
                         totalBytes: $0["totalBytes"],
                         inlineCount: $0["inlineCount"]
                     )
@@ -461,10 +461,10 @@ enum BodyAssetStore {
         }
     }
 
-    /// Delete all manifest rows + files for a single headerId. Returns bytes
+    /// Delete all manifest rows + files for a single content key. Returns bytes
     /// reclaimed. Idempotent. Does NOT touch main DB.
     @discardableResult
-    static func deleteAllAssets(forHeaderId headerId: String) -> Int64 {
+    static func deleteAllAssets(forContentKey contentKey: ContentKey) -> Int64 {
         guard let queue = manifestQueue() else { return 0 }
         let bytesReclaimed: Int64
         do {
@@ -472,33 +472,33 @@ enum BodyAssetStore {
                 let total = try Int64.fetchOne(
                     db,
                     sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset WHERE headerId = ?",
-                    arguments: [headerId]
+                    arguments: [contentKey]
                 ) ?? 0
                 try db.execute(
                     sql: "DELETE FROM bodyAsset WHERE headerId = ?",
-                    arguments: [headerId]
+                    arguments: [contentKey]
                 )
                 return total
             }
         } catch {
-            print("[BodyAssetStore] deleteAllAssets manifest failed for \(headerId): \(error)")
+            print("[BodyAssetStore] deleteAllAssets manifest failed for \(contentKey): \(error)")
             return 0
         }
         if let dir = storeDirectory() {
-            let folderURL = dir.appendingPathComponent(headerHash(headerId), isDirectory: true)
+            let folderURL = dir.appendingPathComponent(headerHash(contentKey), isDirectory: true)
             try? FileManager.default.removeItem(at: folderURL)
         }
         invalidateUsedBytesCache()
         return bytesReclaimed
     }
 
-    /// Delete all manifest rows + files for a kind. Returns the set of headerIds
+    /// Delete all manifest rows + files for a kind. Returns the set of content keys
     /// affected (so the maintenance layer can do its main-DB cleanup for kind=0).
     /// Idempotent. Does NOT touch main DB.
     @discardableResult
-    static func deleteAllAssets(kind: BodyAssetKind) -> Set<String> {
+    static func deleteAllAssets(kind: BodyAssetKind) -> Set<ContentKey> {
         guard let queue = manifestQueue() else { return [] }
-        let snapshot: [(id: String, headerId: String)]
+        let snapshot: [(id: String, contentKey: ContentKey)]
         do {
             snapshot = try queue.read { db in
                 let rows = try Row.fetchAll(
@@ -506,14 +506,14 @@ enum BodyAssetStore {
                     sql: "SELECT id, headerId FROM bodyAsset WHERE kind = ?",
                     arguments: [kind.rawValue]
                 )
-                return rows.map { (id: $0["id"], headerId: $0["headerId"]) }
+                return rows.map { (id: $0["id"], contentKey: $0["headerId"]) }
             }
         } catch {
             print("[BodyAssetStore] deleteAllAssets(kind:) snapshot failed: \(error)")
             return []
         }
         guard !snapshot.isEmpty else { return [] }
-        let headerIds = Set(snapshot.map(\.headerId))
+        let contentKeys = Set(snapshot.map(\.contentKey))
         do {
             try queue.write { db in
                 try db.execute(
@@ -528,8 +528,8 @@ enum BodyAssetStore {
             for entry in snapshot {
                 try? FileManager.default.removeItem(at: dir.appendingPathComponent(entry.id))
             }
-            for headerId in headerIds {
-                let folderURL = dir.appendingPathComponent(headerHash(headerId), isDirectory: true)
+            for contentKey in contentKeys {
+                let folderURL = dir.appendingPathComponent(headerHash(contentKey), isDirectory: true)
                 // Only rmdir if now empty (other kind's files may remain).
                 if let contents = try? FileManager.default.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil),
                    contents.isEmpty {
@@ -538,32 +538,32 @@ enum BodyAssetStore {
             }
         }
         invalidateUsedBytesCache()
-        return headerIds
+        return contentKeys
     }
 
-    /// Returns the set of distinct headerIds present in the manifest.
+    /// Returns the set of distinct content keys present in the manifest.
     /// Used by `BodyAssetMaintenance.pruneOrphans` for the cross-DB sweep.
-    static func allManifestHeaderIds() -> Set<String> {
+    static func allManifestContentKeys() -> Set<ContentKey> {
         guard let queue = manifestQueue() else { return [] }
         do {
             return try queue.read { db in
-                let ids = try String.fetchAll(db, sql: "SELECT DISTINCT headerId FROM bodyAsset")
+                let ids = try ContentKey.fetchAll(db, sql: "SELECT DISTINCT headerId FROM bodyAsset")
                 return Set(ids)
             }
         } catch {
-            print("[BodyAssetStore] allManifestHeaderIds failed: \(error)")
+            print("[BodyAssetStore] allManifestContentKeys failed: \(error)")
             return []
         }
     }
 
-    /// Returns the set of distinct headerIds in the manifest that have at least
+    /// Returns the set of distinct content keys in the manifest that have at least
     /// one row of the given kind. Used by `BodyAssetMaintenance.wipeAll` to
     /// scope the main-DB MessageBody/bodyComplete cleanup to affected headers.
-    static func allManifestHeaderIdsByKind(kind: BodyAssetKind) -> Set<String> {
+    static func allManifestContentKeysByKind(kind: BodyAssetKind) -> Set<ContentKey> {
         guard let queue = manifestQueue() else { return [] }
         do {
             return try queue.read { db in
-                let ids = try String.fetchAll(
+                let ids = try ContentKey.fetchAll(
                     db,
                     sql: "SELECT DISTINCT headerId FROM bodyAsset WHERE kind = ?",
                     arguments: [kind.rawValue]
@@ -571,7 +571,7 @@ enum BodyAssetStore {
                 return Set(ids)
             }
         } catch {
-            print("[BodyAssetStore] allManifestHeaderIdsByKind failed: \(error)")
+            print("[BodyAssetStore] allManifestContentKeysByKind failed: \(error)")
             return []
         }
     }

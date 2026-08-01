@@ -20,6 +20,9 @@ extension SyncEngine {
     func indexHeadersForFTS(_ headers: [MessageHeader]) async {
         let records = headers.map { header in
             FTSHeaderRecord(
+                // ⚠ STAGE E1: mint through `ContentKey.forHeader` once the provider
+                // space is plumbed here. Byte-identical today.
+                contentKey: ContentKey(rawValue: header.id),
                 headerId: header.id,
                 messageId: header.messageId,
                 subject: header.subject,
@@ -50,7 +53,9 @@ extension SyncEngine {
                 print("[FTS] Indexed \(inserted) new messages")
             }
             // Mark headers as fully indexed — body queue requires headerComplete=1.
-            let headerIds = records.map(\.headerId)
+            // ⚠ `[String]` is load-bearing: this binds `messageHeader.id`, so
+            // `records.map(\.contentKey)` must not compile here (F2).
+            let headerIds: [String] = records.map(\.headerId)
             try await AppDatabase.backgroundPool.write { db in
                 for headerId in headerIds {
                     try db.execute(
@@ -103,8 +108,14 @@ extension SyncEngine {
             }
             guard !candidateIds.isEmpty else { return }
 
-            let missingIds = try await SearchIndex.shared.headerIdsMissingFromFTS(candidateIds)
-            guard !missingIds.isEmpty else { return }
+            // ⚠ STAGE E1: `candidateIds` are `messageHeader.id`s and are being asked
+            // "are you in FTS?" — a CONTENT-key question. Same string today; when the
+            // content key moves this probe answers "missing" for every UID-addressed
+            // row and the heal re-indexes the whole account on every launch.
+            let missingKeys = try await SearchIndex.shared.contentKeysMissingFromFTS(
+                candidateIds.map(ContentKey.init(rawValue:)))
+            guard !missingKeys.isEmpty else { return }
+            let missingIds: [String] = missingKeys.map(\.rawValue)
 
             print("[FTS] Self-heal: \(missingIds.count) headers with bodyComplete=1 missing from FTS — re-indexing")
             BackgroundSyncLogger.log("[FTS] Self-heal: re-indexing \(missingIds.count) orphaned headers")
@@ -166,8 +177,12 @@ extension SyncEngine {
             }
             guard !candidateIds.isEmpty else { return }
 
-            let missingIds = try await SearchIndex.shared.headerIdsMissingFromFTS(candidateIds)
-            guard !missingIds.isEmpty else { return }
+            // ⚠ STAGE E1 — same header-id-asked-as-a-content-key probe as
+            // `selfHealFTSBodyMembership`; see the note there.
+            let missingKeys = try await SearchIndex.shared.contentKeysMissingFromFTS(
+                candidateIds.map(ContentKey.init(rawValue:)))
+            guard !missingKeys.isEmpty else { return }
+            let missingIds: [String] = missingKeys.map(\.rawValue)
 
             print("[FTS] Backfill self-heal: \(missingIds.count)/\(candidateIds.count) headers missing from FTS — re-indexing")
             BackgroundSyncLogger.log("[FTS] Backfill self-heal: re-indexing \(missingIds.count) orphans")
@@ -252,7 +267,7 @@ extension SyncEngine {
     /// Predicate (each condition load-bearing):
     /// - `headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0` —
     ///   the body queues' pending population.
-    /// - FTS body text present (`headerIdsWithFTSBody`, length > 1 — excludes
+    /// - FTS body text present (`contentKeysWithFTSBody`, length > 1 — excludes
     ///   the " " sentinel and header-only FTS entries). NSE unresolved-CID mail
     ///   never writes an FTS body, so it is naturally excluded.
     /// - NO `messageBody` row. A row that still has cached HTML while flagged
@@ -292,9 +307,13 @@ extension SyncEngine {
                     print("[FTS] bodyComplete restore paused by suspension — resuming next launch")
                     return
                 }
-                let withBody = try await SearchIndex.shared.headerIdsWithFTSBody(chunk)
+                // ⚠ STAGE E1 — `chunk` holds `messageHeader.id`s; the FTS probe and the
+                // `messageBody` probe below both key by CONTENT, and the heal's UPDATE
+                // keys by HEADER. All three are the same string only until E1.
+                let withBody = try await SearchIndex.shared.contentKeysWithFTSBody(
+                    chunk.map(ContentKey.init(rawValue:)))
                 guard !withBody.isEmpty else { continue }
-                let withBodyArr = Array(withBody)
+                let withBodyArr: [String] = withBody.map(\.rawValue)
                 let cachedIds: Set<String> = try await dbPool.read { db in
                     let placeholders = withBodyArr.map { _ in "?" }.joined(separator: ",")
                     return try Set(String.fetchAll(
@@ -358,8 +377,11 @@ extension SyncEngine {
             }
             guard !ids.isEmpty else { continue }
 
-            let missingIds = try await SearchIndex.shared.headerIdsMissingFromFTS(ids)
-            guard !missingIds.isEmpty else { continue }
+            // ⚠ STAGE E1 — see `selfHealFTSBodyMembership`.
+            let missingKeys = try await SearchIndex.shared.contentKeysMissingFromFTS(
+                ids.map(ContentKey.init(rawValue:)))
+            guard !missingKeys.isEmpty else { continue }
+            let missingIds: [String] = missingKeys.map(\.rawValue)
 
             try await reindexAndRequeueBodies(missingIds: missingIds)
             healed += missingIds.count
@@ -378,12 +400,19 @@ extension SyncEngine {
         var cursor: Int64 = 0
         var pruned = 0
         while true {
-            let page = try await SearchIndex.shared.headerIdPage(
+            let page = try await SearchIndex.shared.contentKeyPage(
                 afterRowid: cursor, limit: SyncConfig.ftsOrphanPruneChunk)
             guard let last = page.last else { break }
             cursor = last.rowid
 
-            var ids = page.map(\.headerId)
+            // 🚨 STAGE E1 — THE BIGGEST CONFLATION IN THIS FILE. `page` holds CONTENT
+            // keys; `fetchExistingHeaderIds` asks `SELECT id FROM messageHeader WHERE
+            // id IN (…)`. The instant the content key moves off the provider id, every
+            // UID-addressed FTS row fails that existence probe, is re-checked, still
+            // fails, and is DELETED as a dead orphan — i.e. this sweep erases the
+            // search index for IMAP/iCloud accounts. It must resolve content key →
+            // header id (or compare in the key's own space) before E1 lands.
+            var ids: [String] = page.map(\.contentKey.rawValue)
             if let scopePrefix {
                 ids = ids.filter { $0.hasPrefix(scopePrefix) }
             }
@@ -405,13 +434,18 @@ extension SyncEngine {
             // not a dead one. Re-key the FTS entry to the current id — preserving
             // its indexed body — instead of deleting it. This repairs drift for
             // EVERY consumer (search, AI, embeddings), not just on-search.
-            var rekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
-            var deadIds: [String] = []
+            var rekeys: [(oldKey: ContentKey, newKey: ContentKey, newMessageId: String?)] = []
+            var deadIds: [ContentKey] = []
             for orphan in candidates {
                 if let newId = try await recoverMovedHeaderId(forOrphan: orphan) {
-                    rekeys.append((oldId: orphan, newId: newId, newMessageId: nil))
+                    // ⚠ STAGE E1: `recoverMovedHeaderId` returns a `messageHeader.id`;
+                    // the FTS re-key needs the NEW row's content key. Identical today,
+                    // and this branch only fires for Gmail/Graph — whose keys do not
+                    // move — but the conversion must become a real mint at E1.
+                    rekeys.append((oldKey: ContentKey(rawValue: orphan),
+                                   newKey: ContentKey(rawValue: newId), newMessageId: nil))
                 } else {
-                    deadIds.append(orphan)
+                    deadIds.append(ContentKey(rawValue: orphan))
                 }
             }
             if !rekeys.isEmpty {
@@ -419,7 +453,7 @@ extension SyncEngine {
                 print("[FTS] Orphan reconcile: re-keyed \(rekeys.count) moved messages (cursor \(cursor))")
             }
             if !deadIds.isEmpty {
-                try await SearchIndex.shared.removeMessages(headerIds: deadIds)
+                try await SearchIndex.shared.removeMessages(contentKeys: deadIds)
                 print("[FTS] Orphan prune: removed \(deadIds.count) dead entries (cursor \(cursor))")
             }
             pruned += deadIds.count
@@ -513,11 +547,15 @@ extension SyncEngine {
     }
 
     /// Remove deleted message IDs from FTS index.
+    ///
+    /// ⚠ STAGE E1: callers hand `messageHeader.id`s here (deletion is a header-space
+    /// event); the FTS delete keys by content. Convert at the mint when they diverge.
     func removeHeadersFromFTS(_ headerIds: [String]) {
         guard !headerIds.isEmpty else { return }
         Task.detached(priority: .utility) {
             do {
-                try await SearchIndex.shared.removeMessages(headerIds: headerIds)
+                try await SearchIndex.shared.removeMessages(
+                    contentKeys: headerIds.map(ContentKey.init(rawValue:)))
                 print("[FTS] Removed \(headerIds.count) messages from index")
             } catch {
                 print("[FTS] Removal failed: \(error)")
@@ -576,6 +614,8 @@ extension SyncEngine {
 
                             let records = batch.map { header in
                                 FTSHeaderRecord(
+                                    // ⚠ STAGE E1: mint through `ContentKey.forHeader`.
+                                    contentKey: ContentKey(rawValue: header.id),
                                     headerId: header.id,
                                     messageId: header.messageId,
                                     subject: header.subject,
@@ -591,8 +631,9 @@ extension SyncEngine {
                             if inserted > 0 {
                                 print("[FTS Bulk] Batch \(batchNum + 1): indexed \(inserted)")
                             }
-                            // Mark headers as fully indexed
-                            let headerIds = records.map(\.headerId)
+                            // Mark headers as fully indexed. `[String]` is load-bearing:
+                            // this binds `messageHeader.id` (F2).
+                            let headerIds: [String] = records.map(\.headerId)
                             try? await AppDatabase.backgroundPool.write { db in
                                 for hid in headerIds {
                                     try db.execute(
@@ -629,9 +670,14 @@ extension SyncEngine {
             var totalUpdated = 0
 
             while true {
+                // ⚠ STAGE E1: these are CONTENT keys, and every use below treats them
+                // as `messageHeader.id`s (the `fetchOne(db, key:)` lookup, and the
+                // "not in GRDB ⇒ orphan ⇒ delete from FTS" conclusion). Same failure
+                // shape as `pruneFTSOrphans`.
                 let emptyIds: [String]
                 do {
-                    emptyIds = try await SearchIndex.shared.headerIdsWithEmptyFolderId(limit: batchSize)
+                    emptyIds = try await SearchIndex.shared.contentKeysWithEmptyFolderId(
+                        limit: batchSize).map(\.rawValue)
                 } catch {
                     print("[FTS Backfill] Failed to query empty folderIds: \(error)")
                     break
@@ -663,7 +709,8 @@ extension SyncEngine {
                 // Update each folder group
                 for (folderId, headerIds) in byFolder {
                     do {
-                        try await SearchIndex.shared.updateFolderIds(headerIds: headerIds, newFolderId: folderId)
+                        try await SearchIndex.shared.updateFolderIds(
+                            contentKeys: headerIds.map(ContentKey.init(rawValue:)), newFolderId: folderId)
                         totalUpdated += headerIds.count
                     } catch {
                         print("[FTS Backfill] Failed to update folderId for \(headerIds.count) entries: \(error)")
@@ -673,7 +720,8 @@ extension SyncEngine {
                 // Remove orphaned entries (headerId not in GRDB) per ADR-003 (no fallbacks)
                 if !orphanedIds.isEmpty {
                     print("[FTS Backfill] Removing \(orphanedIds.count) orphaned FTS entries")
-                    try? await SearchIndex.shared.removeMessages(headerIds: orphanedIds)
+                    try? await SearchIndex.shared.removeMessages(
+                        contentKeys: orphanedIds.map(ContentKey.init(rawValue:)))
                 }
 
                 try? await Task.sleep(for: .milliseconds(100))

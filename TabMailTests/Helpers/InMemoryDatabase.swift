@@ -96,7 +96,7 @@ enum TestDatabase {
         headerId: String,
         htmlContent: String? = "<p>Test body</p>"
     ) throws -> MessageBody {
-        let body = MessageBody(headerId: headerId, htmlContent: htmlContent)
+        let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: htmlContent)
         try db.write { try body.insert($0) }
         return body
     }

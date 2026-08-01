@@ -18,7 +18,7 @@ struct SyncEngineFTSTests {
     @Test("FTSHeaderRecord maps all fields correctly")
     func ftsRecordFieldMapping() {
         let date = Date(timeIntervalSince1970: 1700000000)
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "acc1:INBOX:42"),
             headerId: "acc1:INBOX:42",
             messageId: "42",
             subject: "Important Email",
@@ -46,7 +46,7 @@ struct SyncEngineFTSTests {
         let headerFromAddress = "alice@example.com"
         let ftsFrom = "\(headerFrom) <\(headerFromAddress)>"
 
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "test"),
             headerId: "test",
             messageId: "1",
             subject: "Test",
@@ -60,7 +60,7 @@ struct SyncEngineFTSTests {
 
     @Test("FTSHeaderRecord handles empty cc and bcc with defaults")
     func ftsRecordEmptyCcBcc() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "test"),
             headerId: "test",
             messageId: "1",
             subject: "Test",
@@ -103,7 +103,7 @@ struct SyncEngineFTSTests {
 
         // Replicate the mapping from SyncEngineFTS.indexHeadersForFTS
         let records = headers.map { header in
-            FTSHeaderRecord(
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
                 headerId: header.id,
                 messageId: header.messageId,
                 subject: header.subject,
@@ -124,7 +124,7 @@ struct SyncEngineFTSTests {
 
     @Test("FTSHeaderRecord maps special characters in subject and from")
     func ftsRecordSpecialCharacters() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "test"),
             headerId: "test",
             messageId: "1",
             subject: "Re: [URGENT] Price <$100 & free shipping!",
@@ -139,7 +139,7 @@ struct SyncEngineFTSTests {
 
     @Test("FTSHeaderRecord handles empty subject")
     func ftsRecordEmptySubject() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "test"),
             headerId: "test",
             messageId: "1",
             subject: "",

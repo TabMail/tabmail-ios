@@ -15,7 +15,7 @@ struct SearchIndexFolderScopeTests {
     private let prefix = "test_fscope"
 
     private func cleanup(_ headerIds: [String]) async {
-        try? await index.removeMessages(headerIds: headerIds)
+        try? await index.removeMessages( contentKeys: headerIds.map(ContentKey.init(rawValue:)))
     }
 
     // MARK: - FTSHeaderRecord folderId
@@ -25,7 +25,7 @@ struct SearchIndexFolderScopeTests {
         let hid = "\(prefix)_write:INBOX:1"
         await cleanup([hid])
 
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Folderscopewritetest unique phrase",
             from: "a@a.com", to: "b@b.com",
@@ -38,7 +38,7 @@ struct SearchIndexFolderScopeTests {
         // Verify folderId was written by searching with folder filter
         let scoped = try await index.keywordSearch(
             query: "folderscopewritetest", folderIds: ["\(prefix)_write:INBOX"])
-        #expect(scoped.contains { $0.headerId == hid })
+        #expect(scoped.contains { $0.contentKey.rawValue == hid })
 
         await cleanup([hid])
     }
@@ -53,11 +53,11 @@ struct SearchIndexFolderScopeTests {
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let records = [
-            FTSHeaderRecord(headerId: hidInbox, messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hidInbox),headerId: hidInbox, messageId: "m1",
                 subject: "Uniquefolderscopefilter inbox message",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_filter:INBOX"),
-            FTSHeaderRecord(headerId: hidArchive, messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hidArchive),headerId: hidArchive, messageId: "m2",
                 subject: "Uniquefolderscopefilter archive message",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_filter:Archive"),
@@ -70,14 +70,14 @@ struct SearchIndexFolderScopeTests {
             query: "uniquefolderscopefilter", folderIds: ["\(prefix)_filter:INBOX"])
         #expect(inboxResults.count == 1)
         guard inboxResults.count == 1 else { await cleanup([hidInbox, hidArchive]); return }
-        #expect(inboxResults[0].headerId == hidInbox)
+        #expect(inboxResults[0].contentKey.rawValue == hidInbox)
 
         // Scoped to Archive — should find only archive message
         let archiveResults = try await index.keywordSearch(
             query: "uniquefolderscopefilter", folderIds: ["\(prefix)_filter:Archive"])
         #expect(archiveResults.count == 1)
         guard archiveResults.count == 1 else { await cleanup([hidInbox, hidArchive]); return }
-        #expect(archiveResults[0].headerId == hidArchive)
+        #expect(archiveResults[0].contentKey.rawValue == hidArchive)
 
         await cleanup([hidInbox, hidArchive])
     }
@@ -90,11 +90,11 @@ struct SearchIndexFolderScopeTests {
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let records = [
-            FTSHeaderRecord(headerId: hidA, messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hidA),headerId: hidA, messageId: "m1",
                 subject: "Uniquenilfolder testword",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_nil:FolderA"),
-            FTSHeaderRecord(headerId: hidB, messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hidB),headerId: hidB, messageId: "m2",
                 subject: "Uniquenilfolder testword",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_nil:FolderB"),
@@ -103,7 +103,7 @@ struct SearchIndexFolderScopeTests {
 
         let allResults = try await index.keywordSearch(
             query: "uniquenilfolder", folderIds: nil)
-        let matchingIds = Set(allResults.map(\.headerId))
+        let matchingIds = Set(allResults.map(\.contentKey.rawValue))
         #expect(matchingIds.contains(hidA))
         #expect(matchingIds.contains(hidB))
 
@@ -115,7 +115,7 @@ struct SearchIndexFolderScopeTests {
         let hid = "\(prefix)_empty:INBOX:1"
         await cleanup([hid])
 
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Uniqueemptyfolder testphrase",
             from: "a@a.com", to: "b@b.com",
@@ -141,15 +141,15 @@ struct SearchIndexFolderScopeTests {
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let records = [
-            FTSHeaderRecord(headerId: hid1, messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hid1),headerId: hid1, messageId: "m1",
                 subject: "Uniquemultifolder meeting notes",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_multi:Inbox1"),
-            FTSHeaderRecord(headerId: hid2, messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hid2),headerId: hid2, messageId: "m2",
                 subject: "Uniquemultifolder meeting notes",
                 from: "c@c.com", to: "d@d.com", dateMs: now,
                 folderId: "\(prefix)_multi:Inbox2"),
-            FTSHeaderRecord(headerId: hid3, messageId: "m3",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hid3),headerId: hid3, messageId: "m3",
                 subject: "Uniquemultifolder meeting notes",
                 from: "e@e.com", to: "f@f.com", dateMs: now,
                 folderId: "\(prefix)_multi:Sent"),
@@ -161,7 +161,7 @@ struct SearchIndexFolderScopeTests {
             query: "uniquemultifolder",
             folderIds: ["\(prefix)_multi:Inbox1", "\(prefix)_multi:Inbox2"])
         #expect(results.count == 2)
-        let ids = Set(results.map(\.headerId))
+        let ids = Set(results.map(\.contentKey.rawValue))
         #expect(ids.contains(hid1))
         #expect(ids.contains(hid2))
         #expect(!ids.contains(hid3))
@@ -176,7 +176,7 @@ struct SearchIndexFolderScopeTests {
         let hid = "\(prefix)_update:INBOX:1"
         await cleanup([hid])
 
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
             headerId: hid, messageId: "m1",
             subject: "Uniqueupdatefolder testmsg",
             from: "a@a.com", to: "b@b.com",
@@ -191,7 +191,7 @@ struct SearchIndexFolderScopeTests {
         #expect(inboxResults.count == 1)
 
         // Update to Archive
-        try await index.updateFolderIds(headerIds: [hid], newFolderId: "\(prefix)_update:Archive")
+        try await index.updateFolderIds( contentKeys: [hid].map(ContentKey.init(rawValue:)), newFolderId: "\(prefix)_update:Archive")
 
         // No longer in INBOX scope
         inboxResults = try await index.keywordSearch(
@@ -209,34 +209,33 @@ struct SearchIndexFolderScopeTests {
     @Test("updateFolderIds with unknown headerId is a no-op")
     func updateFolderIdsUnknownId() async throws {
         // Should not crash
-        try await index.updateFolderIds(
-            headerIds: ["nonexistent:folder:id"], newFolderId: "acct:Archive")
+        try await index.updateFolderIds( contentKeys: ["nonexistent:folder:id"].map(ContentKey.init(rawValue:)), newFolderId: "acct:Archive")
     }
 
-    // MARK: - headerIdsWithEmptyFolderId
+    // MARK: - contentKeysWithEmptyFolderId
 
-    @Test("headerIdsWithEmptyFolderId returns only empty entries")
-    func headerIdsWithEmptyFolderId() async throws {
+    @Test("contentKeysWithEmptyFolderId returns only empty entries")
+    func contentKeysWithEmptyFolderId() async throws {
         let hidEmpty = "\(prefix)_backfill:INBOX:1"
         let hidFilled = "\(prefix)_backfill:INBOX:2"
         await cleanup([hidEmpty, hidFilled])
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let records = [
-            FTSHeaderRecord(headerId: hidEmpty, messageId: "m1",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hidEmpty),headerId: hidEmpty, messageId: "m1",
                 subject: "Backfill empty folderId",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: ""),  // empty — needs backfill
-            FTSHeaderRecord(headerId: hidFilled, messageId: "m2",
+            FTSHeaderRecord( contentKey: ContentKey(rawValue: hidFilled),headerId: hidFilled, messageId: "m2",
                 subject: "Backfill filled folderId",
                 from: "a@a.com", to: "b@b.com", dateMs: now,
                 folderId: "\(prefix)_backfill:INBOX"),  // already set
         ]
         _ = try await index.indexHeaders(records)
 
-        let emptyIds = try await index.headerIdsWithEmptyFolderId(limit: 100)
-        #expect(emptyIds.contains(hidEmpty))
-        #expect(!emptyIds.contains(hidFilled))
+        let emptyIds = try await index.contentKeysWithEmptyFolderId(limit: 100)
+        #expect(emptyIds.contains(ContentKey(rawValue: hidEmpty)))
+        #expect(!emptyIds.contains(ContentKey(rawValue: hidFilled)))
 
         await cleanup([hidEmpty, hidFilled])
     }
@@ -245,7 +244,7 @@ struct SearchIndexFolderScopeTests {
 
     @Test("FTSHeaderRecord default folderId is empty string")
     func defaultFolderIdEmpty() {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: "test:INBOX:1"),
             headerId: "test:INBOX:1", messageId: "m1",
             subject: "Test", from: "a@a.com", to: "b@b.com",
             dateMs: 1_700_000_000_000

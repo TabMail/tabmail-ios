@@ -87,7 +87,7 @@ struct PruneAlgorithmTests {
         // The remaining bodies belong to the 3 newest messages
         let remainingIds = Set(remainingBodies.map(\.id))
         for i in (totalMessages - floor)..<totalMessages {
-            #expect(remainingIds.contains(headers[i].id))
+            #expect(remainingIds.contains(ContentKey(rawValue: headers[i].id)))
         }
 
         // All headers still exist
@@ -312,8 +312,8 @@ struct BodyCacheEvictionTests {
         try db.write { dbConn in
             let batch = try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchAll(dbConn)
             for body in batch {
-                if undoProtected.contains(body.id) { continue }
-                guard let h = try MessageHeader.fetchOne(dbConn, key: body.id) else {
+                if undoProtected.contains(body.id.rawValue) { continue }
+                guard let h = try MessageHeader.fetchOne(dbConn, key: body.id.rawValue) else {
                     try body.delete(dbConn)
                     evicted += 1
                     continue
@@ -371,7 +371,7 @@ struct BodyCacheEvictionTests {
         try db.write { dbConn in
             let batch = try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchAll(dbConn)
             for body in batch {
-                if undoProtected.contains(body.id) {
+                if undoProtected.contains(body.id.rawValue) {
                     skipped += 1
                     continue
                 }
@@ -418,8 +418,8 @@ struct BodyCacheEvictionTests {
         try db.write { dbConn in
             let batch = try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchAll(dbConn)
             for body in batch {
-                if undoProtected.contains(body.id) { skipCount += 1; continue }
-                guard let header = try MessageHeader.fetchOne(dbConn, key: body.id) else {
+                if undoProtected.contains(body.id.rawValue) { skipCount += 1; continue }
+                guard let header = try MessageHeader.fetchOne(dbConn, key: body.id.rawValue) else {
                     try body.delete(dbConn); evicted += 1; continue
                 }
                 if header.isInInbox { skipCount += 1; continue }

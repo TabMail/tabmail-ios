@@ -546,15 +546,16 @@ extension AccountManager {
 
                 // Also create MessageBody so the message is viewable immediately
                 if draft.isHTML {
-                    let body = MessageBody(headerId: headerId, htmlContent: draft.body)
+                    let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: draft.body)
                     try body.save(db)
                 } else {
                     let htmlBody = MessageBody.plainTextToHTML(draft.body)
-                    let body = MessageBody(headerId: headerId, htmlContent: htmlBody)
+                    let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: htmlBody)
                     try body.save(db)
                 }
 
                 return (FTSHeaderRecord(
+                    contentKey: ContentKey(rawValue: headerId),
                     headerId: headerId,
                     messageId: placeholderMsgId,
                     subject: msg.subject,
@@ -575,7 +576,7 @@ extension AccountManager {
                 do {
                     _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
                     if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        _ = try await SearchIndex.shared.updateBodies([(headerId: ftsInfo.record.headerId, body: ftsInfo.bodyText)])
+                        _ = try await SearchIndex.shared.updateBodies([(contentKey: ftsInfo.record.contentKey, body: ftsInfo.bodyText)])
                     }
                 } catch {
                     print("[Outbox] WARNING: FTS indexing failed for sent \(ftsInfo.record.headerId): \(error)")

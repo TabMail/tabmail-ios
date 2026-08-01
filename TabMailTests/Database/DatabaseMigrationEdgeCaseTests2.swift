@@ -132,7 +132,7 @@ struct DatabaseSchemaEdgeCaseTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        let body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: nil)
+        let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:1"), htmlContent: nil)
         try db.write { try body.insert($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:1") }

@@ -130,7 +130,7 @@ struct InsertBackfillBatchDedupTests {
                 try header.insert(db)
                 count += 1
 
-                ftsRecords.append(FTSHeaderRecord(
+                ftsRecords.append(FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
                     headerId: header.id,
                     messageId: header.messageId,
                     subject: header.subject,
@@ -522,7 +522,7 @@ struct InsertBackfillBatchFTSTests {
         header.bcc = info.bcc
         try db.write { try header.insert($0) }
 
-        let ftsRecord = FTSHeaderRecord(
+        let ftsRecord = FTSHeaderRecord( contentKey: ContentKey(rawValue: header.id),
             headerId: header.id,
             messageId: header.messageId,
             subject: header.subject,

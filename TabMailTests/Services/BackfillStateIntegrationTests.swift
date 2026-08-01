@@ -435,7 +435,7 @@ struct BackfillBodyFetchTests {
 
         let body = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:1") }
         #expect(body != nil)
-        #expect(body?.id == "acc1:INBOX:1")
+        #expect(body?.id.rawValue == "acc1:INBOX:1")
         #expect(body?.htmlContent == "<p>Hello</p>")
     }
 
@@ -474,7 +474,7 @@ struct BackfillBodyFetchTests {
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:1", htmlContent: "<p>First</p>")
 
         try db.write { dbConn in
-            let body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Updated</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:1"), htmlContent: "<p>Updated</p>")
             try body.save(dbConn)
         }
 

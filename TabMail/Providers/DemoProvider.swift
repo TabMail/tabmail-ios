@@ -170,7 +170,8 @@ actor DemoProvider: EmailProvider {
             header.headerComplete = true
             header.bodyComplete = true
             try header.insert(conn)
-            try MessageBody(headerId: header.id, htmlContent: draft.isHTML ? draft.body : "<pre>\(draft.body)</pre>").insert(conn)
+            try MessageBody(contentKey: ContentKey(rawValue: header.id),
+                            htmlContent: draft.isHTML ? draft.body : "<pre>\(draft.body)</pre>").insert(conn)
         }
     }
 
@@ -208,7 +209,7 @@ actor DemoProvider: EmailProvider {
             header.rfc822MessageId = serverId
             header.headerComplete = true
             try header.insert(conn)
-            try MessageBody(headerId: header.id, htmlContent: draft.body).insert(conn)
+            try MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: draft.body).insert(conn)
         }
         return DraftSaveResult(serverId: serverId, messageId: nil)
     }

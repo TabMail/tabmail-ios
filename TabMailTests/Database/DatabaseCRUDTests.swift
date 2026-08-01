@@ -108,7 +108,7 @@ struct DatabaseCRUDTests {
         try TestDatabase.insertMessageBody(db, headerId: headerId, htmlContent: "<p>First</p>")
         // Second insert with INSERT OR IGNORE should not overwrite
         try db.write { db in
-            let body2 = MessageBody(headerId: headerId, htmlContent: "<p>Second</p>")
+            let body2 = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Second</p>")
             try body2.insert(db, onConflict: .ignore)
         }
         let fetched = try db.read { try MessageBody.fetchOne($0, key: headerId) }

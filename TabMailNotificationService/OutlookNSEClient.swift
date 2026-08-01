@@ -107,15 +107,25 @@ enum OutlookNSEClient {
             auth: NSEAuthSource(accountId: accountId, provider: "outlook"),
             retry: .graph, logLabel: "NSE-Outlook"
         )
-        // Compute headerId via the shared MessageIdentity helper; pass to
+        // Mint the CONTENT key through the sanctioned factory; pass it to
         // GraphAPI.messageFull so inline images route through BodyAssetStore
-        // identically to main-app and Gmail/IMAP NSE paths.
-        let headerId = MessageIdentity.headerId(
-            accountId: accountId, folderPath: folderPath, messageId: messageId
+        // identically to main-app and Gmail/IMAP NSE paths. The key must match
+        // what the main-app merge writes for the same message, or the NSE's disk
+        // assets land under a folder the main app never reads.
+        //
+        // `space: .stableProviderId` is not a guess — this client only ever
+        // serves Outlook, whose message ids the provider never reassigns, so the
+        // RFC id is not consulted for the tail (see `MessageIdentity.contentKey`)
+        // and `rfc822MessageId: nil` is exact rather than a fallback. Today the
+        // factory returns `messageHeader.id` verbatim, so this is byte-identical
+        // to the `MessageIdentity.headerId` call it replaces.
+        let contentKey = ContentKey.forHeader(
+            accountId: accountId, folderPath: folderPath, providerMessageId: messageId,
+            rfc822MessageId: nil, space: .stableProviderId
         )
         do {
             let (_, rendered) = try await GraphAPI.messageFull(
-                http: http, id: messageId, headerId: headerId
+                http: http, id: messageId, contentKey: contentKey
             )
             return rendered
         } catch {

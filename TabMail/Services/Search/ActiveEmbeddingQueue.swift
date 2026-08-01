@@ -135,9 +135,11 @@ actor ActiveEmbeddingQueue {
             return
         }
 
-        let bodiesById: [String: String]
+        let bodiesByContentKey: [ContentKey: String]
         do {
-            bodiesById = try await SearchIndex.shared.bodyTexts(headerIds: headerIds)
+            // ⚠ STAGE E1 — see `BackfillEmbeddingQueue`; same key-space question.
+            bodiesByContentKey = try await SearchIndex.shared.bodyTexts(
+                contentKeys: headerIds.map(ContentKey.init(rawValue:)))
         } catch {
             print("[ActiveEmbed] Bulk body read failed: \(error)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries) }
@@ -154,7 +156,7 @@ actor ActiveEmbeddingQueue {
                 storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries)
                 continue
             }
-            guard let body = bodiesById[item.headerId], !body.isEmpty else {
+            guard let body = bodiesByContentKey[ContentKey(rawValue: item.headerId)], !body.isEmpty else {
                 emptyBodyIds.append(item.headerId)
                 storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries)
                 continue
@@ -179,7 +181,9 @@ actor ActiveEmbeddingQueue {
 
         if !succeeded.isEmpty {
             do {
-                try await SearchIndex.shared.storeEmbeddings(succeeded)
+                try await SearchIndex.shared.storeEmbeddings(succeeded.map {
+                    (contentKey: ContentKey(rawValue: $0.headerId), embedding: $0.embedding)
+                })
             } catch {
                 print("[ActiveEmbed] Bulk embedding write failed: \(error)")
             }

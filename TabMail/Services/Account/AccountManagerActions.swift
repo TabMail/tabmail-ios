@@ -1082,7 +1082,7 @@ extension AccountManager {
                     try existing.update(db)
                     // Update body so draft content is viewable immediately
                     let htmlBody = MessageBody.plainTextToHTML(draft.body)
-                    let body = MessageBody(headerId: existing.id, htmlContent: htmlBody)
+                    let body = MessageBody(contentKey: ContentKey(rawValue: existing.id), htmlContent: htmlBody)
                     try body.save(db)
                     capturedHeaderId = existing.id
                     capturedMessageId = existing.messageId
@@ -1109,7 +1109,7 @@ extension AccountManager {
 
                     // Also create MessageBody so draft content is viewable
                     let htmlBody = MessageBody.plainTextToHTML(draft.body)
-                    let body = MessageBody(headerId: headerId, htmlContent: htmlBody)
+                    let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: htmlBody)
                     try body.save(db)
                     capturedHeaderId = headerId
                     capturedMessageId = placeholderMsgId
@@ -1146,6 +1146,7 @@ extension AccountManager {
                 ).insert(db)
 
                 return (FTSHeaderRecord(
+                    contentKey: ContentKey(rawValue: capturedHeaderId),
                     headerId: capturedHeaderId,
                     messageId: capturedMessageId,
                     subject: draft.subject,
@@ -1165,7 +1166,7 @@ extension AccountManager {
                 do {
                     _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
                     if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        _ = try await SearchIndex.shared.updateBodies([(headerId: ftsInfo.record.headerId, body: ftsInfo.bodyText)])
+                        _ = try await SearchIndex.shared.updateBodies([(contentKey: ftsInfo.record.contentKey, body: ftsInfo.bodyText)])
                     }
                 } catch {
                     print("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")

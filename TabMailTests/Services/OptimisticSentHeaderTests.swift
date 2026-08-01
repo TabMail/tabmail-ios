@@ -110,7 +110,7 @@ private func insertOptimisticSentHeader(
         try ThreadUtils.insertMessageReferences(for: header, db: dbConn)
 
         let htmlContent = isHTML ? body : MessageBody.plainTextToHTML(body)
-        let messageBody = MessageBody(headerId: headerId, htmlContent: htmlContent)
+        let messageBody = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: htmlContent)
         try messageBody.save(dbConn)
 
         return header
@@ -248,7 +248,7 @@ private func simulateSyncForSentFolder(
             migrated.date = match.date
             try migrated.insert(dbConn)
             if var body = oldBody {
-                body.id = newId
+                body.id = ContentKey(rawValue: newId)
                 try body.insert(dbConn)
             }
             uidMigratedRemoteIds.insert(newMsgId)
@@ -307,10 +307,10 @@ private func simulateSyncForSentFolder(
                 .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                 .fetchOne(dbConn) {
                 let oldId = optimistic.id
-                if let body = try MessageBody.fetchOne(dbConn, key: oldId) {
+                if let body = try MessageBody.fetchOne(dbConn, key: ContentKey(rawValue: oldId)) {
                     var newBody = body
-                    newBody.id = header.id
-                    try MessageBody.deleteOne(dbConn, key: oldId)
+                    newBody.id = ContentKey(rawValue: header.id)
+                    try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
                     deferredBody = newBody
                 }
                 try optimistic.delete(dbConn)
@@ -515,7 +515,7 @@ struct OptimisticSentHeaderInsertionTests {
             // queueDraftSave behavior. If this changes upstream, this test will
             // start to require bodyComplete=1 too, surfacing the gap.
             try header.insert(dbConn)
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>Draft body</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Draft body</p>")
             try body.save(dbConn)
         }
 
@@ -1078,10 +1078,10 @@ struct OptimisticSentHeaderDeltaSyncTests {
                 .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                 .fetchOne(dbConn) {
                 let oldId = optimistic.id
-                if let body = try MessageBody.fetchOne(dbConn, key: oldId) {
+                if let body = try MessageBody.fetchOne(dbConn, key: ContentKey(rawValue: oldId)) {
                     var newBody = body
-                    newBody.id = header.id
-                    try MessageBody.deleteOne(dbConn, key: oldId)
+                    newBody.id = ContentKey(rawValue: header.id)
+                    try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
                     deferredBody = newBody
                 }
                 try optimistic.delete(dbConn)
@@ -1362,10 +1362,10 @@ struct BodyMigrationFKSafetyTests {
                 .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
                 .fetchOne(dbConn) {
                 let oldId = optimistic.id
-                if let body = try MessageBody.fetchOne(dbConn, key: oldId) {
+                if let body = try MessageBody.fetchOne(dbConn, key: ContentKey(rawValue: oldId)) {
                     var newBody = body
-                    newBody.id = header.id
-                    try MessageBody.deleteOne(dbConn, key: oldId)
+                    newBody.id = ContentKey(rawValue: header.id)
+                    try MessageBody.deleteOne(dbConn, key: ContentKey(rawValue: oldId))
                     deferredBody = newBody
                 }
                 try optimistic.delete(dbConn)
@@ -1395,7 +1395,7 @@ struct BodyMigrationFKSafetyTests {
             migrated.messageId = newMessageId
             try migrated.insert(dbConn)
             if var body = oldBody {
-                body.id = newId
+                body.id = ContentKey(rawValue: newId)
                 try body.insert(dbConn)
             }
             return migrated
@@ -1423,7 +1423,7 @@ struct BodyMigrationFKSafetyTests {
             header.rfc822MessageId = rfc822
             header.isRead = true
             try header.insert(dbConn)
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>My draft content</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>My draft content</p>")
             try body.insert(dbConn)
         }
 
@@ -1506,7 +1506,7 @@ struct BodyMigrationFKSafetyTests {
             h.rfc822MessageId = rfc822
             try h.insert(dbConn)
             header = h
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>Must not be lost</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Must not be lost</p>")
             try body.insert(dbConn)
         }
 

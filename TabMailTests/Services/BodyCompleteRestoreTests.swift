@@ -66,7 +66,7 @@ struct BodyCompleteRestoreTests {
 
     /// Index the header in FTS; optionally write real body text for it.
     private func indexInFTS(headerId: String, messageId: String, body: String?) async throws {
-        let record = FTSHeaderRecord(
+        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: headerId),
             headerId: headerId,
             messageId: messageId,
             subject: "restore test",
@@ -76,8 +76,8 @@ struct BodyCompleteRestoreTests {
         )
         _ = try await index.indexHeaders([record])
         if let body {
-            let written = try await index.updateBodies([(headerId: headerId, body: body)])
-            #expect(written.contains(headerId), "test setup: FTS body write must succeed")
+            let written = try await index.updateBodies([(headerId: headerId, body: body)].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
+            #expect(written.contains(ContentKey(rawValue: headerId)), "test setup: FTS body write must succeed")
         }
     }
 
@@ -91,7 +91,7 @@ struct BodyCompleteRestoreTests {
         try? await AppDatabase.dbPool.write { db in
             try db.execute(sql: "DELETE FROM messageHeader WHERE id = ?", arguments: [headerId])
         }
-        try? await index.removeMessages(headerIds: [headerId])
+        try? await index.removeMessages( contentKeys: [headerId].map(ContentKey.init(rawValue:)))
     }
 
     /// Fresh, isolated defaults suite so the one-time gate never leaks across
@@ -130,7 +130,7 @@ struct BodyCompleteRestoreTests {
         let headerId = try await insertHeader(accountId: acct, messageId: "m1", bodyComplete: false)
         try await indexInFTS(headerId: headerId, messageId: "m1", body: "indexed body text")
         try await AppDatabase.dbPool.write { db in
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>cached</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>cached</p>")
             try body.insert(db)
         }
 
@@ -192,7 +192,7 @@ struct BodyCompleteRestoreTests {
         await cleanup(headerId: headerId)
     }
 
-    @Test("headerIdsWithFTSBody: body-present vs header-only vs unindexed")
+    @Test("contentKeysWithFTSBody: body-present vs header-only vs unindexed")
     func ftsBodyProbe() async throws {
         let acct = "bcr-probe-\(UUID().uuidString.prefix(8))"
         let withBody = try await insertHeader(accountId: acct, messageId: "b1", bodyComplete: false)
@@ -201,8 +201,8 @@ struct BodyCompleteRestoreTests {
         try await indexInFTS(headerId: withBody, messageId: "b1", body: "real body content here")
         try await indexInFTS(headerId: headerOnly, messageId: "b2", body: nil)
 
-        let present = try await index.headerIdsWithFTSBody([withBody, headerOnly, unindexed])
-        #expect(present == [withBody])
+        let present = try await index.contentKeysWithFTSBody([withBody, headerOnly, unindexed].map(ContentKey.init(rawValue:)))
+        #expect(present == [ContentKey(rawValue: withBody)])
 
         for id in [withBody, headerOnly, unindexed] { await cleanup(headerId: id) }
     }
@@ -214,11 +214,11 @@ struct BodyCompleteRestoreTests {
         let acct = "bcr-evict-\(UUID().uuidString.prefix(8))"
         let headerId = try await insertHeader(accountId: acct, messageId: "m1", bodyComplete: true)
         try await AppDatabase.dbPool.write { db in
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>cached html with images</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>cached html with images</p>")
             try body.insert(db)
         }
 
-        _ = await BodyAssetMaintenance.dropMessage(headerId: headerId, inlineCount: 1)
+        _ = await BodyAssetMaintenance.dropMessage( contentKey: ContentKey(rawValue: headerId), inlineCount: 1)
 
         let bodyRow: Bool = (try? await AppDatabase.dbPool.read { db in
             try MessageBody.fetchOne(db, key: headerId) != nil

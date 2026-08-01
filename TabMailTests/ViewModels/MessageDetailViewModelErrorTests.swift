@@ -185,7 +185,7 @@ struct MessageDetailViewModelErrorTests {
         // Insert body into DB before loadBody runs
         try await vm._dbPoolOverride!.write { db in
             let headerId = try MessageHeader.fetchOne(db, sql: "SELECT * FROM messageHeader LIMIT 1")!.id
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>Hello</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Hello</p>")
             try body.insert(db)
         }
 
@@ -257,7 +257,7 @@ struct MessageDetailViewModelErrorTests {
             try MessageHeader.fetchOne(db, sql: "SELECT * FROM messageHeader LIMIT 1")!.id
         }
         try await vmPool.write { db in
-            let body = MessageBody(headerId: headerId, htmlContent: "<p>Poll test</p>")
+            let body = MessageBody( contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>Poll test</p>")
             try body.insert(db)
         }
         // Poll checks every 2s — wait for it to pick up the body

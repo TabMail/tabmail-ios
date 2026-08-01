@@ -43,7 +43,7 @@ enum BodyRenderer {
     /// failures don't break the whole render).
     ///
     /// Both main-app and NSE render paths bind this via
-    /// `BodyAssetStore.makeInlineImageWriter(forHeaderId:)` so behavior is
+    /// `BodyAssetStore.makeInlineImageWriter(forContentKey:)` so behavior is
     /// identical across targets by construction. Compose preview / Eml
     /// preview / tooltip paths pass nil and get inline data URIs.
     typealias InlineImageWriter = @Sendable (_ image: InlineImageRef) -> String?

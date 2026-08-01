@@ -136,32 +136,32 @@ struct MessageBodyCreateTests {
 
     @Test("Stores the provided html verbatim")
     func storesHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>HTML</p>")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "<p>HTML</p>")
         #expect(body.htmlContent == "<p>HTML</p>")
     }
 
     @Test("nil html → nil htmlContent")
     func nilHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: nil)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: nil)
         #expect(body.htmlContent == nil)
     }
 
     @Test("empty html → nil htmlContent")
     func emptyHTML() {
-        let body = MessageBody.create(headerId: "h1", htmlBody: "")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "")
         #expect(body.htmlContent == nil)
     }
 
     @Test("Sets headerId correctly")
     func setsHeaderId() {
-        let body = MessageBody.create(headerId: "custom-id-123", htmlBody: "<p>Hi</p>")
-        #expect(body.id == "custom-id-123")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "custom-id-123"), htmlBody: "<p>Hi</p>")
+        #expect(body.id.rawValue == "custom-id-123")
     }
 
     @Test("Sets fetchedAt to current time")
     func setsFetchedAt() {
         let before = Date()
-        let body = MessageBody.create(headerId: "h1", htmlBody: "<p>Hi</p>")
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: "<p>Hi</p>")
         #expect(body.fetchedAt >= before)
     }
 
@@ -170,7 +170,7 @@ struct MessageBodyCreateTests {
         // Display html with correctly-encoded entities is stored verbatim — the
         // factory must never run plainTextToHTML over it (that was the bug).
         let html = "<p>Tom &amp; Jerry &nbsp;say hi</p>"
-        let body = MessageBody.create(headerId: "h1", htmlBody: html)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "h1"), htmlBody: html)
         #expect(body.htmlContent == html)
         #expect(body.htmlContent?.contains("&amp;amp;") == false)
         #expect(body.htmlContent?.contains("&lt;p&gt;") == false)
@@ -311,7 +311,7 @@ struct MessageBodyDraftDisplayTests {
         // lost because HTML renders \n as whitespace. Inbound bodies avoid this by
         // going through BodyRenderer (which converts plain text via plainTextToHTML).
         let rawText = "Line 1\nLine 2\nLine 3"
-        let body = MessageBody.create(headerId: "draft1", htmlBody: rawText)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "draft1"), htmlBody: rawText)
         #expect(body.htmlContent == rawText)
         #expect(body.htmlContent?.contains("<div>") == false)
     }
@@ -319,7 +319,7 @@ struct MessageBodyDraftDisplayTests {
     @Test("HTML body is used as-is without conversion")
     func htmlBodyUsedAsIs() {
         let htmlBody = "<div>Hello</div><div><br></div><div>World</div>"
-        let body = MessageBody.create(headerId: "draft1", htmlBody: htmlBody)
+        let body = MessageBody.create( contentKey: ContentKey(rawValue: "draft1"), htmlBody: htmlBody)
         #expect(body.htmlContent == htmlBody)
     }
 
@@ -376,13 +376,13 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "msg1")
 
-        let body = MessageBody(headerId: "acc1:INBOX:msg1", htmlContent: "<p>Hello World</p>")
+        let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg1"), htmlContent: "<p>Hello World</p>")
         try db.write { try body.insert($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:msg1") }
         #expect(fetched != nil)
         #expect(fetched?.htmlContent == "<p>Hello World</p>")
-        #expect(fetched?.id == "acc1:INBOX:msg1")
+        #expect(fetched?.id.rawValue == "acc1:INBOX:msg1")
     }
 
     @Test("Insert with nil htmlContent")
@@ -392,7 +392,7 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "msg2")
 
-        let body = MessageBody(headerId: "acc1:INBOX:msg2", htmlContent: nil)
+        let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg2"), htmlContent: nil)
         try db.write { try body.insert($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:msg2") }
@@ -407,7 +407,7 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "msg3")
 
-        var body = MessageBody(headerId: "acc1:INBOX:msg3", htmlContent: "<p>Original</p>")
+        var body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg3"), htmlContent: "<p>Original</p>")
         try db.write { try body.insert($0) }
 
         body.htmlContent = "<p>Updated</p>"
@@ -424,7 +424,7 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "msg4")
 
-        let body = MessageBody(headerId: "acc1:INBOX:msg4", htmlContent: "<p>Delete me</p>")
+        let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg4"), htmlContent: "<p>Delete me</p>")
         try db.write { try body.insert($0) }
 
         try db.write { try body.delete($0) }
@@ -441,7 +441,7 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertMessageHeader(db, messageId: "msg5")
 
         let before = Date().addingTimeInterval(-1) // 1s tolerance for Date precision
-        let body = MessageBody(headerId: "acc1:INBOX:msg5", htmlContent: "<p>Test</p>")
+        let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg5"), htmlContent: "<p>Test</p>")
         try db.write { try body.insert($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:msg5") }
@@ -456,7 +456,7 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "msg6")
 
-        var body = MessageBody(headerId: "acc1:INBOX:msg6", htmlContent: "<p>With attachment</p>")
+        var body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg6"), htmlContent: "<p>With attachment</p>")
         body.attachmentsJSON = """
         [{"filename":"report.pdf","contentType":"application/pdf","section":"1.1","size":2048}]
         """
@@ -477,7 +477,7 @@ struct MessageBodyPersistenceTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "msg7")
 
-        var body = MessageBody(headerId: "acc1:INBOX:msg7", htmlContent: "<p>Meeting</p>")
+        var body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg7"), htmlContent: "<p>Meeting</p>")
         body.icsText = "BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR"
         try db.write { try body.insert($0) }
 
@@ -491,7 +491,7 @@ struct MessageBodyAttachmentsTests {
 
     @Test("Parses attachments from JSON")
     func parsesAttachments() {
-        var body = MessageBody(headerId: "h1", htmlContent: "<p>test</p>")
+        var body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: "<p>test</p>")
         body.attachmentsJSON = """
         [{"filename":"doc.pdf","contentType":"application/pdf","section":"1.2","size":1024,"encoding":"base64"}]
         """
@@ -504,27 +504,27 @@ struct MessageBodyAttachmentsTests {
 
     @Test("Nil attachmentsJSON returns empty array")
     func nilJSON() {
-        let body = MessageBody(headerId: "h1", htmlContent: nil)
+        let body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         #expect(body.attachments.isEmpty)
     }
 
     @Test("Invalid JSON returns empty array")
     func invalidJSON() {
-        var body = MessageBody(headerId: "h1", htmlContent: nil)
+        var body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         body.attachmentsJSON = "not json"
         #expect(body.attachments.isEmpty)
     }
 
     @Test("Empty array JSON returns empty array")
     func emptyArrayJSON() {
-        var body = MessageBody(headerId: "h1", htmlContent: nil)
+        var body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         body.attachmentsJSON = "[]"
         #expect(body.attachments.isEmpty)
     }
 
     @Test("Multiple attachments parsed correctly")
     func multipleAttachments() {
-        var body = MessageBody(headerId: "h1", htmlContent: nil)
+        var body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         body.attachmentsJSON = """
         [
             {"filename":"doc.pdf","contentType":"application/pdf","section":"1.1","size":1024},
@@ -540,7 +540,7 @@ struct MessageBodyAttachmentsTests {
 
     @Test("Attachment without encoding field decodes (nil encoding)")
     func attachmentWithoutEncoding() {
-        var body = MessageBody(headerId: "h1", htmlContent: nil)
+        var body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: nil)
         body.attachmentsJSON = """
         [{"filename":"test.txt","contentType":"text/plain","section":"1","size":100}]
         """
@@ -560,7 +560,7 @@ struct MessageBodyICSTextTests {
         try TestDatabase.insertFolder(db)
         try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        var body = MessageBody(headerId: "acc1:INBOX:1", htmlContent: "<p>Meeting invite</p>")
+        var body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:1"), htmlContent: "<p>Meeting invite</p>")
         body.icsText = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Team Meeting\nEND:VEVENT\nEND:VCALENDAR"
         try db.write { try body.insert($0) }
 
@@ -571,7 +571,7 @@ struct MessageBodyICSTextTests {
 
     @Test("icsText defaults to nil")
     func icsTextDefaultNil() {
-        let body = MessageBody(headerId: "h1", htmlContent: "<p>No calendar</p>")
+        let body = MessageBody( contentKey: ContentKey(rawValue: "h1"), htmlContent: "<p>No calendar</p>")
         #expect(body.icsText == nil)
     }
 }

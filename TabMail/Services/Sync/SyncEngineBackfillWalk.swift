@@ -1716,13 +1716,20 @@ extension SyncEngine {
 
                         // Step 2: Write bodies to FTS for inserted messages.
                         // Match body data to headerIds using ftsRecords (which have headerId + messageId).
-                        var ftsBodyBuffer: [(headerId: String, body: String)] = []
+                        // 🚨 TWO BUFFERS, TWO KEY SPACES (F2). `ftsBodyBuffer` is keyed by
+                        // CONTENT (it addresses FTS rows); `snippetBuffer` is keyed by
+                        // `messageHeader.id` (`applySnippetUpdates` writes
+                        // `UPDATE messageHeader … WHERE id = ?`). The confirmation set
+                        // comes back in content-key space, so the two are zipped by
+                        // INDEX below — never by comparing an id from one space against
+                        // the other.
+                        var ftsBodyBuffer: [(contentKey: ContentKey, body: String)] = []
                         var snippetBuffer: [(headerId: String, snippet: String)] = []
                         for ftsRecord in ftsRecords {
                             if let body = bodyData[ftsRecord.messageId] {
                                 let plainText = EmailFilter.extractPlainText(htmlBody: body.htmlBody, textBody: body.textBody)
                                 if let plainText, !plainText.isEmpty {
-                                    ftsBodyBuffer.append((headerId: ftsRecord.headerId, body: plainText))
+                                    ftsBodyBuffer.append((contentKey: ftsRecord.contentKey, body: plainText))
                                     let snippet = EmailFilter.snippetFromPlainText(plainText)
                                     snippetBuffer.append((headerId: ftsRecord.headerId, snippet: snippet))
                                 }
@@ -1732,7 +1739,13 @@ extension SyncEngine {
                             do {
                                 let writtenIds = try await SearchIndex.shared.updateBodies(ftsBodyBuffer)
                                 // Only set bodyComplete for items actually written to FTS.
-                                let confirmedSnippets = snippetBuffer.filter { writtenIds.contains($0.headerId) }
+                                // Both buffers were appended in lockstep, so entry i of
+                                // `snippetBuffer` is the header for entry i of
+                                // `ftsBodyBuffer` — that positional pairing is what
+                                // carries the confirmation across the key-space boundary.
+                                let confirmedSnippets = zip(ftsBodyBuffer, snippetBuffer)
+                                    .filter { writtenIds.contains($0.0.contentKey) }
+                                    .map(\.1)
                                 applySnippetUpdates(confirmedSnippets)
                                 let skipped = ftsBodyBuffer.count - writtenIds.count
                                 if skipped > 0 {

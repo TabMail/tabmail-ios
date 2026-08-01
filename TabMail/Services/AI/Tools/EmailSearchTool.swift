@@ -87,7 +87,7 @@ struct EmailSearchTool: AgentTool, Sendable {
         // Log top results for debugging
         for (i, hit) in hits.prefix(10).enumerated() {
             let date = Date(timeIntervalSince1970: Double(hit.dateMs) / 1000)
-            print("[EmailSearchTool]   [\(i)] rank=\(String(format: "%.4f", hit.rank)) headerId=\(hit.headerId.prefix(40)) date=\(ToolFormatters.formatDate(date)) snippet=\(hit.snippet.prefix(60))")
+            print("[EmailSearchTool]   [\(i)] rank=\(String(format: "%.4f", hit.rank)) headerId=\(hit.contentKey.rawValue.prefix(40)) date=\(ToolFormatters.formatDate(date)) snippet=\(hit.snippet.prefix(60))")
         }
 
         if total == 0 {
@@ -113,12 +113,19 @@ struct EmailSearchTool: AgentTool, Sendable {
         var blocks: [String] = []
 
         for hit in slice {
+            // 🚨 STAGE E1 — DAY-ONE BREAKAGE, already known to the plan. `hit.contentKey`
+            // addresses an FTS row; both uses below treat it as a `messageHeader.id`
+            // (primary-key fetch, and the agent-facing numeric-id translation that later
+            // round-trips back into `MessageHeader.fetchOne`). Byte-identical today; at
+            // E1 every UID-addressed account's agent search resolves no header and the
+            // numeric ids it hands the model point at nothing.
+            let ftsKeyAsHeaderId = hit.contentKey.rawValue
             // Fetch header for full metadata
             let header: MessageHeader? = try await ctx.db.read { db in
-                try MessageHeader.fetchOne(db, key: hit.headerId)
+                try MessageHeader.fetchOne(db, key: ftsKeyAsHeaderId)
             }
 
-            let numericId = await translator.toNumericId(hit.headerId)
+            let numericId = await translator.toNumericId(ftsKeyAsHeaderId)
             var lines: [String] = []
             lines.append("unique_id: \(numericId)")
 
@@ -141,7 +148,7 @@ struct EmailSearchTool: AgentTool, Sendable {
             }
 
             blocks.append(lines.joined(separator: "\n\n"))
-            print("[EmailSearchTool] registered id=\(numericId) → headerId=...\(hit.headerId.suffix(30))")
+            print("[EmailSearchTool] registered id=\(numericId) → headerId=...\(ftsKeyAsHeaderId.suffix(30))")
         }
 
         let body = blocks.joined(separator: "\n\n")
