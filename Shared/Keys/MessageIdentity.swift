@@ -216,6 +216,42 @@ public enum MessageIdentity {
     /// `colonSafeMessageIdComponent` above; the tripwire is
     /// `DraftPlaceholderFolderPurgeTests.nestedSiblingFolderSurvivesTheParentPurge`.
     public static func usableRfc822Tail(_ rawValue: String?) -> String? {
+        // ⚑ The v3-only term, and the ONLY thing this adds to
+        // `comparableRfc822Identity`. See the doc comment: a colon here makes the
+        // row stop belonging to its own folder in both scoping guards.
+        guard let normalized = comparableRfc822Identity(rawValue),
+              !normalized.contains(":")
+        else { return nil }
+        return normalized
+    }
+
+    /// The same RFC 822 Message-ID normalization as `usableRfc822Tail`, MINUS its
+    /// `':'` rejection — for the only other question this value is ever asked:
+    /// **are these two Message-IDs the SAME identity?**
+    ///
+    /// This is `v2final`'s `MessageIdentity.durableActionRFC822MessageId`, ported
+    /// verbatim in semantics (same file there; the two bodies differ by exactly the
+    /// one `!normalized.contains(":")` guard above, which is why the shared work
+    /// lives here and `usableRfc822Tail` is expressed as this plus that guard —
+    /// there is no second validator to drift).
+    ///
+    /// ⚑ WHY THE TWO QUESTIONS NEED DIFFERENT ANSWERS. The `':'` rejection exists
+    /// for CONTENT-KEY FOLDER SCOPING — a colon in a key's tail escapes the
+    /// `no-deeper-colon` prefix match, so such a row stops belonging to its own
+    /// folder (see `usableRfc822Tail`'s doc comment in full). Identity COMPARISON
+    /// builds no key and scopes nothing: it normalizes two values and asks whether
+    /// they are equal. Carrying the scoping term into it is not merely redundant,
+    /// it is HARMFUL — RFC 5322 permits a colon inside a `no-fold-literal` domain
+    /// (`<x@[IPv6:2001:db8::1]>`) and `EmailFilter.normalizeMessageId` passes it
+    /// through intact, so a caller comparing SERVER-ORIGINATED ids through the
+    /// strict form gets `nil` for every such id, i.e. "never the same message" for a
+    /// message that plainly IS the same one. Where the caller fails CLOSED on a
+    /// failed verdict — `IMAPProvider.deleteDraft` — that is a delete that can never
+    /// converge for the affected drafts.
+    ///
+    /// Use this ONLY to compare identities. Anything that MINTS a stored key must
+    /// keep using `usableRfc822Tail`.
+    public static func comparableRfc822Identity(_ rawValue: String?) -> String? {
         guard let rawValue,
               !rawValue.utf8.contains(0x0D),
               !rawValue.utf8.contains(0x0A)
@@ -229,9 +265,6 @@ public enum MessageIdentity {
         guard !normalized.isEmpty,
               !normalized.contains("<"),
               !normalized.contains(">"),
-              // ⚑ The v3-only term. See the doc comment: a colon here makes the
-              // row stop belonging to its own folder in both scoping guards.
-              !normalized.contains(":"),
               normalized.rangeOfCharacter(
                   from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
               ) == nil

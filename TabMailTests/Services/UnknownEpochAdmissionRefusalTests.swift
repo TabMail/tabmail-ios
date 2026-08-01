@@ -591,9 +591,12 @@ struct UnknownEpochAdmissionRefusalTests {
     @Test("A draft delete addressed by NUMERIC id is refused under a nil epoch")
     @MainActor
     func imapNilEpochRefusesDraftDeleteWithNumericId() async throws {
-        // `IMAPProvider.deleteDraft` calls `resolveUID(draftId)`, which short-circuits
-        // a numeric id straight to `UIDSet(UID(uidValue))` with no SEARCH — so the
-        // following `store(.deleted)` + `expunge()` is literal-UID addressed.
+        // `IMAPProvider.deleteDraft` USED TO call `resolveUID(draftId)`, which
+        // short-circuits a numeric id straight to `UIDSet(UID(uidValue))` with no
+        // SEARCH — so the following `store(.deleted)` + `expunge()` was literal-UID
+        // addressed. Since 2026-08-01 that provider refuses an all-digits id outright
+        // (`IMAPDeleteDraftIdentityTests`); this admission guard is the OTHER end of the
+        // same invariant and still owns "never record a gesture that cannot resolve".
         let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: 12345)
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
         try addDraftsFolder(pool, epoch: nil)

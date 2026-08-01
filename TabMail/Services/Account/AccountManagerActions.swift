@@ -1206,12 +1206,17 @@ extension AccountManager {
             try await dbPool.write { db in
                 // T1.3 — same classification as `queueDraftSave`, by what the provider
                 // DOES with the id rather than by the op's name. `.deleteDraft` drains to
-                // `IMAPProvider.deleteDraft`, which calls `resolveUID(draftId)`: a numeric
-                // id short-circuits straight to `UIDSet(UID(uidValue))` with no SEARCH, so
-                // the following `store(flags: [.deleted])` + `expunge()` is addressed by a
-                // LITERAL UID and mutates whatever occupies it in the CURRENT epoch. A
-                // non-numeric id goes to `searchByMessageId` and is epoch-immune.
-                // This was already acknowledged as a residual C3 vector; it is now guarded.
+                // `IMAPProvider.deleteDraft`, which USED TO call `resolveUID(draftId)`: a
+                // numeric id short-circuited straight to `UIDSet(UID(uidValue))` with no
+                // SEARCH, so the following `store(flags: [.deleted])` + `expunge()` was
+                // addressed by a LITERAL UID and mutated whatever occupied it in the
+                // CURRENT epoch. A non-numeric id goes to `searchByMessageId` and is
+                // epoch-immune. This was already acknowledged as a residual C3 vector;
+                // it is now guarded HERE and, since 2026-08-01, at the provider too —
+                // `IMAPProvider.deleteDraft` verifies an rfc822 identity on the wire and
+                // REFUSES an all-digits id. This admission guard stays: it is
+                // provider-agnostic, and refusing to record an unresolvable gesture beats
+                // recording one that can only fail its retry budget and drop.
                 if UInt32(serverDraftId) != nil,
                    try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
                     return
@@ -1251,7 +1256,11 @@ extension AccountManager {
                 // exactly why `AccountManager.opIsAddressOnly` returns false for it and
                 // the reaction's step-5 sweep leaves it alone. Post-reaction it would
                 // otherwise unpark and expunge whichever message the NEW numbering put at
-                // that UID — C3, the one hard invariant.
+                // that UID — C3, the one hard invariant. (⚑ Since 2026-08-01
+                // `IMAPProvider.deleteDraft` refuses a bare UID rather than expunging it,
+                // so the C3 outcome described here is closed at the provider as well. The
+                // stamp is still what keeps the op from being executed — and re-executed —
+                // under a numbering it was never recorded under.)
                 //
                 // Stamping the folder's epoch INSIDE this same transaction (the write is
                 // already gated by the refusal above, so the row exists and its epoch is

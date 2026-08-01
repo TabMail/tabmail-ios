@@ -29,6 +29,16 @@ import Foundation
 /// is independent of any UIDVALIDITY question: it wrong-deletes on a perfectly
 /// healthy mailbox.
 ///
+/// ⚠ **These three cases used to address the delete by a bare numeric UID, and in
+/// doing so they BLESSED a second, independent defect** — `deleteDraft` resolving an
+/// all-digits `draftId` through `resolveUID`'s numeric short-circuit and issuing the
+/// destructive pair against a literal UID, i.e. against an ADDRESS it had never
+/// identified. That leg is gone (it now refuses), so each case addresses its target
+/// by the rfc822 Message-ID — which is what `MessageHeader.stableId` hands the queue
+/// for an IMAP draft anyway. The EXPUNGE-scope property each case pins is unchanged;
+/// only the way the target is named is. The identity property itself lives in
+/// `IMAPDeleteDraftIdentityTests`.
+///
 /// `.serialized` — the fake binds a listening socket; parallel suites would
 /// contend on ephemeral port allocation.
 @Suite("A draft delete purges only its own UID, never the mailbox", .serialized)
@@ -91,7 +101,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: "\(targetUID)", draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
 
         let violations = server.wrongMessageViolations()
         #expect(violations.isEmpty,
@@ -135,7 +145,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: "6100", draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
 
         #expect(server.messageIDs(in: "Drafts") == ["<\(survivorId)>"],
                 """
@@ -174,7 +184,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: "7100", draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
 
         #expect(server.messageIDs(in: "Drafts").isEmpty,
                 """

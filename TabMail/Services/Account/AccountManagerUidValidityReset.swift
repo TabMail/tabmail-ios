@@ -495,7 +495,12 @@ extension AccountManager {
     ///    UID in the discarded numbering. The closure is `PendingOperation
     ///    .observedUidValidity`, compared in `AccountManager.drainPendingQueue`'s
     ///    claim transaction — a per-op record of the epoch it was recorded under,
-    ///    which cannot be defeated by a future op shape this classifier misreads;
+    ///    which cannot be defeated by a future op shape this classifier misreads.
+    ///    ⚑ UPDATE (2026-08-01): the EXECUTOR half is closed too —
+    ///    `IMAPProvider.deleteDraft` now resolves by a wire-verified rfc822
+    ///    Message-ID and REFUSES an all-digits id outright, so it can no longer
+    ///    execute against a bare UID under any numbering. The stamp stays: it is
+    ///    provider-agnostic and stops the op before it reaches any executor;
     ///  - an op every one of whose `messageIds` is a BARE NUMERIC UID has no
     ///    identity beyond an ADDRESS in a numbering the server has just discarded.
     ///    Executing it would mutate an unrelated message. C5 states that dropping

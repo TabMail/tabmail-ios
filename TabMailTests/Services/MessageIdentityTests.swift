@@ -206,6 +206,53 @@ struct MessageIdentityContentKeyTests {
         #expect(key("4210", rfc: colonBearing, space: .uidAddressed) != wouldBeKey)
     }
 
+    @Test("The two normalizers differ by the ':' term and by NOTHING else")
+    func identityNormalizerDiffersFromTheKeyMintOnlyByTheColon() {
+        // 🚨 THE INVARIANT BEHIND THE SPLIT. `usableRfc822Tail` answers "can this be
+        // the TAIL of a folder-scoped content key?" and `comparableRfc822Identity`
+        // answers "is this a Message-ID I can compare for EQUALITY?" — two different
+        // questions, and only the first one cares about ':' (see the case above for
+        // exactly why it must). The second is `v2final`'s
+        // `MessageIdentity.durableActionRFC822MessageId`, ported so that
+        // `IMAPProvider.deleteDraft` can verify SERVER-ORIGINATED ids, which RFC 5322
+        // permits to carry a colon inside a `no-fold-literal` domain.
+        //
+        // What this pins is the RELATIONSHIP, not either implementation: the strict
+        // form must equal the tolerant form everywhere the tolerant form is
+        // colon-free, and must be nil wherever it is not. A future edit that adds a
+        // term to one and forgets the other — the classic way two near-identical
+        // validators drift — fails here rather than silently changing which drafts
+        // can be deleted or which rows can be keyed.
+        let corpus = [
+            "a.b+c@example.com", "<a.b+c@example.com>", "  <a.b+c@example.com>  ",
+            "a@[IPv6:2001:db8::1]", "<a@[IPv6:2001:db8::1]>", "x:y@example.com",
+            "<unbalanced@example.com", "unbalanced@example.com>",
+            "", "   ", "no-at-sign", "@example.com", "local@", "two@at@signs.example.com",
+            "has space@example.com", "line\nbreak@example.com", "carriage\rreturn@example.com",
+            "draft-00000000-0000-0000-0000-000000000000@example.com",
+        ]
+        for raw in corpus {
+            let tolerant = MessageIdentity.comparableRfc822Identity(raw)
+            let strict = MessageIdentity.usableRfc822Tail(raw)
+            if let tolerant, !tolerant.contains(":") {
+                #expect(strict == tolerant,
+                        "'\(raw)': the two normalizers disagree on a colon-free value")
+            } else {
+                #expect(strict == nil,
+                        "'\(raw)': the key mint accepted a value the identity form rejects, or a colon-bearing one")
+            }
+        }
+        // Two-sided: the corpus must actually EXERCISE the difference, or the loop
+        // above holds vacuously.
+        let differing = corpus.filter {
+            MessageIdentity.comparableRfc822Identity($0) != MessageIdentity.usableRfc822Tail($0)
+        }
+        #expect(differing.count == 3,
+                "expected exactly the three colon-bearing entries to differ; got \(differing)")
+        #expect(differing.allSatisfy { $0.contains(":") },
+                "the normalizers diverged on something other than a colon: \(differing)")
+    }
+
     @Test("A usable RFC id becomes the tail — the same message keys identically across a UID renumber")
     func usableRfcBecomesTheTailAcrossRenumbers() {
         // One Message-ID, three wire spellings, three different UIDs — exactly
