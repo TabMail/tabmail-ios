@@ -4,6 +4,38 @@
 
 import Foundation
 
+/// Which identity space a **content** row draws its key TAIL from.
+///
+/// Durable rows are keyed `"<accountId>:<folderPath>:<tail>"`. For the ACTION
+/// queue the tail is always the provider message id, because two copies of the
+/// same content are different targets and archiving *this* one must not archive
+/// *that* one. For the CONTENT stores (the FTS `message_ids` / `message_meta`
+/// rows, `messageBody`, `bodyAsset.headerId`) there is nothing to distinguish —
+/// same content IS same content — so the tail may instead be the RFC 822
+/// Message-ID, which survives the `UIDVALIDITY` renumber that would otherwise
+/// invalidate every body and search row in the folder and force a full
+/// re-download. This is Thunderbird parity: `fts/incrementalIndexer.js` queues by
+/// `headerMessageId`, "stable, NOT weId (unstable)".
+///
+/// ⚑ This is a standalone enum rather than `AccountProvider` ON PURPOSE.
+/// `AccountProvider` is declared in `TabMail/Models/Account.swift`, which is NOT
+/// a member of the notification-service target, while this file is compiled into
+/// BOTH targets (`project.yml` lists `Shared` under `TabMail` and under
+/// `TabMailNotificationService`). Keying the helper on the provider enum would
+/// break the NSE build. Main-app callers bridge through
+/// `AccountProvider.contentKeySpace`.
+public enum ContentKeySpace: Sendable {
+    /// The provider assigns message ids it never reassigns (Gmail, Microsoft
+    /// Graph). The provider id is itself durable identity, so the tail stays the
+    /// provider id and content keys are byte-identical to `MessageIdentity.headerId`.
+    case stableProviderId
+    /// The provider addresses messages by a mutable, reusable number (IMAP and
+    /// iCloud UIDs, which a `UIDVALIDITY` change reassigns to different messages).
+    /// Prefer a usable RFC 822 Message-ID for the tail; fall back to the provider
+    /// id when the message has none.
+    case uidAddressed
+}
+
 /// Deterministic identity helpers shared between the main app and the NSE so
 /// both sides emit identical GRDB row IDs and AI-cache keys for the same
 /// message. A drift here breaks `MessageHeader.fetchOne(db, key:)` lookups
@@ -142,5 +174,131 @@ public enum MessageIdentity {
         let prefix = headerIdPrefix(accountId: accountId, folderPath: folderPath)
         guard headerId.hasPrefix(prefix) else { return false }
         return !headerId.dropFirst(prefix.count).contains(":")
+    }
+
+    // MARK: - Content-store keys (RFC-first tail)
+
+    /// The RFC 822 Message-ID of a message, normalized into a form that is safe to
+    /// use as the TAIL of a `headerId` — or `nil` when the raw value cannot serve
+    /// as one and the caller must fall back.
+    ///
+    /// The validation semantics are ported from branch `v2final`'s
+    /// `MessageIdentity.durableActionRFC822MessageId` (same file path there).
+    /// Deliberately RENAMED: `v3` reversed that branch's decision to key the ACTION
+    /// queue by RFC id, so reintroducing the old name would read to a future
+    /// reader as reinstating a rejected design. Rejected, in order: `nil`; any
+    /// `CR` or `LF`; empty after trimming; UNBALANCED angle brackets
+    /// (`hasPrefix("<") != hasSuffix(">")`). Then normalized via
+    /// `EmailFilter.normalizeMessageId`, after which a residual `<`/`>`, any
+    /// whitespace or control character, and anything other than exactly one `@`
+    /// with a non-empty local part and a non-empty domain are also rejected.
+    ///
+    /// ⚑ ONE TERM IS NEW ON THIS BRANCH: A `':'` IS REJECTED. The reference permits
+    /// it, and RFC 5322 genuinely allows one inside a no-fold-literal domain
+    /// (`<a@[IPv6:2001:db8::1]>`); `EmailFilter.normalizeMessageId` performs no
+    /// validation at all (it trims and strips one leading `<` / trailing `>`), so
+    /// such a value survives intact. On `v3` that is fatal to folder scoping, which
+    /// is "shares the prefix AND has no deeper colon" — `headerIdBelongsToFolder`
+    /// and its SQL twin `headerIdLikeNoDeeperColonSQLFragment`, both just above.
+    /// Both EXCLUDE a colon-bearing tail rather than erroring, so such a key would
+    /// stop belonging to its own folder in every folder-scoped query and every SQL
+    /// sweep — silent invisibility, not a loud failure — and its FTS row, chat-id
+    /// mapping and body assets would orphan on the next folder purge or UIDVALIDITY
+    /// reset.
+    ///
+    /// ⚠ THE FIX FOR THAT IS ALWAYS HERE, AT THE MINT — never a relaxation of those
+    /// guards. A `folderPath` may legitimately contain `':'` (RFC 3501 allows any
+    /// hierarchy delimiter), so a message in `Drafts/Sub` has the id
+    /// `acct:Drafts:Sub:77`, which MATCHES the `acct:Drafts:` prefix and is saved
+    /// from the parent folder's purge ONLY by the no-deeper-colon term. Widening
+    /// the guards admits a genuinely foreign folder's rows into another folder's
+    /// purge, which is strictly worse than an orphan. Same rule, same reason as
+    /// `colonSafeMessageIdComponent` above; the tripwire is
+    /// `DraftPlaceholderFolderPurgeTests.nestedSiblingFolderSurvivesTheParentPurge`.
+    public static func usableRfc822Tail(_ rawValue: String?) -> String? {
+        guard let rawValue,
+              !rawValue.utf8.contains(0x0D),
+              !rawValue.utf8.contains(0x0A)
+        else { return nil }
+
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.hasPrefix("<") == trimmed.hasSuffix(">") else { return nil }
+
+        let normalized = EmailFilter.normalizeMessageId(trimmed)
+        guard !normalized.isEmpty,
+              !normalized.contains("<"),
+              !normalized.contains(">"),
+              // ⚑ The v3-only term. See the doc comment: a colon here makes the
+              // row stop belonging to its own folder in both scoping guards.
+              !normalized.contains(":"),
+              normalized.rangeOfCharacter(
+                  from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+              ) == nil
+        else { return nil }
+
+        let addressParts = normalized.split(
+            separator: "@",
+            omittingEmptySubsequences: false
+        )
+        guard addressParts.count == 2,
+              !addressParts[0].isEmpty,
+              !addressParts[1].isEmpty
+        else { return nil }
+
+        return normalized
+    }
+
+    /// The key a CONTENT row is stored under — the FTS `message_ids` /
+    /// `message_meta` rows, `messageBody`, and `bodyAsset.headerId`.
+    ///
+    /// The SHAPE is UNCHANGED: `"<accountId>:<folderPath>:<tail>"`, built through
+    /// `headerId` rather than re-interpolated (this file's own header comment calls
+    /// ad-hoc interpolation of that format a code smell). Only the tail can differ,
+    /// and only under `.uidAddressed`. `messageHeader.id` and the durable action
+    /// queue are NOT affected — see `ContentKeySpace` for why the two key spaces
+    /// differ on purpose.
+    ///
+    /// ⚑ THE rfc-LESS RUNG DEVIATES FROM `v2final`, ON OWNER INSTRUCTION
+    /// (2026-07-31). The reference ladder — `DisplayedAttachmentIdentity.resolve(for:)`
+    /// in `v2final`'s `TabMail/Services/BodyAssetMaintenance.swift` — REFUSES when an
+    /// IMAP/iCloud message has neither a usable RFC id nor a settled mailbox epoch.
+    /// Refusal is available to it because it gates *attachment access*, where
+    /// refusing is a degraded but safe UX. It is not available here: a content key
+    /// that cannot be produced means the body cannot be STORED at all. Falling back
+    /// to the provider id leaves rfc-less rows keyed exactly as they are today,
+    /// still covered by the existing ADR-IOS-061 epoch guards.
+    ///
+    /// It also does NOT synthesize a `synth:<hash>` tail. That supersedes the
+    /// 2026-07-18 draft decision in `PLAN_RFC_KEY_MIGRATION_ADR062.md` §3 (which now
+    /// carries a supersession banner), for three reasons: (1) SYNTHESIZE existed so
+    /// the epoch guards could be DELETED, and this branch has spent ~15 audit rounds
+    /// BUILDING them out (ADR-IOS-061 plus the T4.S6 purge-and-resync reaction), so
+    /// the premise does not hold here; (2) `synth:<hash>` contains a `':'` — see
+    /// `usableRfc822Tail`; (3) a hash over envelope fields creates a NEW collapse
+    /// surface between genuinely DIFFERENT messages, strictly worse than the
+    /// accepted duplicate-RFC collapse.
+    ///
+    /// ACCEPTED LIMITATION (owner-decided, `PLAN_RFC_KEY_MIGRATION_ADR062.md` §1):
+    /// two messages in ONE folder carrying the same normalized Message-ID collapse
+    /// onto a single content key. That matches Thunderbird/Gloda and Gmail, both of
+    /// which dedup by Message-ID, and the derived stores already assume it
+    /// (`messageAICache`'s key, `nse_badge_counted`, `pendingAIRefinement`). It is
+    /// the only collapse channel — distinct messages otherwise mint distinct tails.
+    public static func contentKey(
+        accountId: String,
+        folderPath: String,
+        providerMessageId: String,
+        rfc822MessageId: String?,
+        space: ContentKeySpace
+    ) -> String {
+        let tail: String
+        switch space {
+        case .stableProviderId:
+            tail = providerMessageId
+        case .uidAddressed:
+            tail = usableRfc822Tail(rfc822MessageId) ?? providerMessageId
+        }
+        return headerId(accountId: accountId, folderPath: folderPath, messageId: tail)
     }
 }

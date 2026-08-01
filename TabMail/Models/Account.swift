@@ -23,6 +23,35 @@ enum AccountProvider: String, Codable, Sendable {
         case .caldav: return "CalDAV"
         }
     }
+
+    /// Which identity space this provider's CONTENT rows (FTS, `messageBody`,
+    /// `bodyAsset`) draw their key tail from — the main-app bridge into
+    /// `MessageIdentity.contentKey`. Mirrors the provider ladder in branch
+    /// `v2final`'s `DisplayedAttachmentIdentity.resolve(for:)`.
+    ///
+    /// ⚑ Written EXHAUSTIVELY with no `default:` clause on purpose: a sixth
+    /// provider must be a compile error here, not a silent mis-keying of that
+    /// provider's bodies and search rows.
+    var contentKeySpace: ContentKeySpace {
+        switch self {
+        // Server-assigned message ids that are never reassigned. The provider id
+        // IS durable identity, so these keys must not move.
+        case .gmail, .outlook: return .stableProviderId
+        // UIDs — a mutable address the server reuses across a UIDVALIDITY change.
+        case .imap, .icloud: return .uidAddressed
+        // Calendar-only. `AccountManager.connectAccount` returns for `.caldav`
+        // before any `EmailProvider` is created, so no header, body, FTS or
+        // body-asset row is ever minted under this provider and the case is
+        // unreachable from every content-key call site. The reference ladder
+        // THROWS here, which a non-optional key mint cannot do (see
+        // `MessageIdentity.contentKey`). `.stableProviderId` is the fail-safe
+        // choice for an unreachable case: it reproduces `MessageIdentity.headerId`
+        // byte-for-byte, so were the case ever to become reachable it would key
+        // exactly as it does today rather than silently re-key a store that has no
+        // migration behind it.
+        case .caldav: return .stableProviderId
+        }
+    }
 }
 
 struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable, Equatable {
