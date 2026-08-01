@@ -509,19 +509,22 @@ extension AccountManager {
     ///    reading it that way was a confirmed C3 defect (2026-07-31). "Carries a
     ///    non-numeric id" is a property of the ROW; "resolves by SEARCH" is a
     ///    property of the EXECUTOR, and `.deleteDraft` breaks the correspondence:
-    ///    `AccountManager.queueDraftDelete` records `[uid, rfc822]` — the rfc822
-    ///    is there for the sync filter — while `executeOperation` passes
-    ///    `messageIds.first`, the UID, to `provider.deleteDraft`. Such an op is
-    ///    NOT address-only, survives here, and would then execute against a bare
-    ///    UID in the discarded numbering. The closure is `PendingOperation
-    ///    .observedUidValidity`, compared in `AccountManager.drainPendingQueue`'s
-    ///    claim transaction — a per-op record of the epoch it was recorded under,
-    ///    which cannot be defeated by a future op shape this classifier misreads.
+    ///    `AccountManager.queueDraftDelete` records `[uid, rfc822]` while
+    ///    `executeOperation` used to pass `messageIds.first`, the UID, alone to
+    ///    `provider.deleteDraft`. Such an op is NOT address-only, survives here,
+    ///    and would then execute against a bare UID in the discarded numbering.
+    ///    The closure is `PendingOperation.observedUidValidity`, compared in
+    ///    `AccountManager.drainPendingQueue`'s claim transaction — a per-op record
+    ///    of the epoch it was recorded under, which cannot be defeated by a future
+    ///    op shape this classifier misreads.
     ///    ⚑ UPDATE (2026-08-01): the EXECUTOR half is closed too —
-    ///    `IMAPProvider.deleteDraft` now resolves by a wire-verified rfc822
-    ///    Message-ID and REFUSES an all-digits id outright, so it can no longer
-    ///    execute against a bare UID under any numbering. The stamp stays: it is
-    ///    provider-agnostic and stops the op before it reaches any executor;
+    ///    `IMAPProvider.deleteDraft` now resolves either by a wire-verified rfc822
+    ///    Message-ID or, when the op recorded the epoch its UID was MINTED under
+    ///    (`PendingOperation.draftServerUidValidity`, v72), by that UID inside a
+    ///    SELECT whose live UIDVALIDITY equals it. A bare UID with no recorded
+    ///    epoch is refused outright, so no numbering is ever assumed. The stamp
+    ///    stays: it is provider-agnostic and stops the op before it reaches any
+    ///    executor;
     ///  - an op every one of whose `messageIds` is a BARE NUMERIC UID has no
     ///    identity beyond an ADDRESS in a numbering the server has just discarded.
     ///    Executing it would mutate an unrelated message. C5 states that dropping

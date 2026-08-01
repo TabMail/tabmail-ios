@@ -594,7 +594,12 @@ actor ExchangeProvider: EmailProvider {
         }
     }
 
-    func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
+    /// `rfc822MessageId` / `uidValidity` are IMAP's epoch-safety pair and carry no
+    /// meaning here: a Graph message id is a durable IDENTITY, not an address in a
+    /// numbering, so there is no epoch to corroborate.
+    func deleteDraft(
+        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
+    ) async throws {
         // Exchange may auto-delete drafts after send. A 404 means already gone — treat as success.
         let token = try await accessToken(false)
         let result = try await performHTTPRequestWithRetry(

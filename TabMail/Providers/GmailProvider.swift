@@ -540,7 +540,12 @@ actor GmailProvider: EmailProvider {
         }
     }
 
-    func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
+    /// `rfc822MessageId` / `uidValidity` are IMAP's epoch-safety pair and carry no
+    /// meaning here: a Gmail draft resource id (or message id) is a durable IDENTITY,
+    /// not an address in a numbering, so there is no epoch to corroborate.
+    func deleteDraft(
+        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
+    ) async throws {
         // Try DELETE /drafts/{id} first (works when draftId is a draft resource ID).
         // If 404: either the draft was already auto-deleted after send, or draftId is
         // actually a Gmail message ID (from synced Drafts folder). Fall back to

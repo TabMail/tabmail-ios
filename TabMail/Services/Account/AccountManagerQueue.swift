@@ -230,18 +230,20 @@ extension AccountManager {
                         // address-only ops"). It is NOT: `opIsAddressOnly` is false for
                         // any op carrying a non-numeric id ALONGSIDE a UID, and
                         // `.deleteDraft` is exactly that shape — `queueDraftDelete`
-                        // records `[uid, rfc822]` for the sync filter while
-                        // `executeOperation` hands `messageIds.first` (the UID) to
-                        // `provider.deleteDraft`. Such an op survived the sweep and then
-                        // unparked onto a UID the new epoch had reassigned. The
-                        // admission-time stamp compared below is the second check, and
-                        // the one that does not depend on guessing an op's id shapes.
+                        // records `[uid, rfc822]`, and `executeOperation` used to hand
+                        // `messageIds.first` (the UID) alone to `provider.deleteDraft`.
+                        // Such an op survived the sweep and then unparked onto a UID the
+                        // new epoch had reassigned. The admission-time stamp compared
+                        // below is the second check, and the one that does not depend on
+                        // guessing an op's id shapes.
                         // ⚑ UPDATE (2026-08-01): `IMAPProvider.deleteDraft` no longer
-                        // executes a bare UID at all — it verifies an rfc822 identity on
-                        // the wire and REFUSES an all-digits id — so that provider is now
-                        // guarded at BOTH ends. This check stays: it is provider-agnostic,
-                        // it is what keeps an op recorded under a discarded numbering from
-                        // running at all, and the reasoning above is what it exists for.
+                        // executes a bare UID on the strength of the number alone — it
+                        // either verifies an rfc822 identity on the wire, or (v72)
+                        // corroborates the UID against the recorded epoch it was minted
+                        // in — so that provider is now guarded at BOTH ends. This check
+                        // stays: it is provider-agnostic, it is what keeps an op recorded
+                        // under a discarded numbering from running at all, and the
+                        // reasoning above is what it exists for.
                         let sourceFolderId = MessageIdentity.folderId(
                             accountId: fetched.accountId, folderPath: fetched.folderPath)
                         let sourceFolder = try Folder.fetchOne(db, key: sourceFolderId)
@@ -587,41 +589,32 @@ extension AccountManager {
             // Ported from `v2final:AccountManagerQueue`'s `.deleteDraft` arm
             // ("TERMINAL drop of a provider-authoritative identity refusal").
             if case ProviderError.actionIdentityResolutionFailed(let refusedId) = error {
-                if currentOp.messageIds.count > 1 {
-                    // The op carries MORE than one id — for `.deleteDraft` those are
-                    // the server address AND the durable rfc822 identity of the SAME
-                    // draft. Split so the sibling the provider CAN verify gets its own
-                    // op and the user's intention still lands. This is the existing
-                    // rescue split, entered without burning a retry budget.
-                    print("[Queue] Identity refused in \(opType) (\(opMsgCount) ids: \(refusedId) is not verifiable) — splitting so a verifiable sibling id can execute")
-                    do {
-                        try await dbPool.write { db in
-                            for msgId in currentOp.messageIds {
-                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
-                                // Split ops inherit the batch's queue position — see
-                                // the identical comment on the messageNotFound split.
-                                splitOp.createdAt = currentOp.createdAt
-                                try splitOp.insert(db)
-                            }
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                    } catch {
-                        print("[Queue] Failed to split identity-refused op \(currentOp.id): \(error) — will retry as-is")
-                    }
-                    context.executedAny = true
-                    // Halt the lane rather than .proceed — see the identical
-                    // never-run-ahead comment on the messageNotFound split above.
-                    return .haltLane
-                }
-                // A single id the provider will refuse forever. Retrying cannot change
-                // it and parking it is a permanent lane wedge, so it ends here — but
-                // LOUDLY and immediately, not after three fake retries dressed up as a
-                // staleness confirmation. Nothing is destroyed: the server-side object
-                // this op named is still there, still visible after the next sync, and
-                // the user's re-issued gesture goes through the UI paths that DO carry
-                // an rfc822 identity (`InboxViewModel.deleteDraftMessage`,
-                // `ComposeView`'s discard/send paths).
-                print("[Queue] Identity refused in \(opType): '\(refusedId)' is not a verifiable identity and never will be — dropping the op (the server-side object is untouched and remains visible for a re-issued gesture)")
+                // ⚑ NEVER SPLIT THIS ONE. A revision of this branch, on seeing an op
+                // with more than one id, split it into one op per id so "the sibling the
+                // provider CAN verify" could execute. For `.deleteDraft` — the only op
+                // that raises this error — the ids are not siblings: slot 0 is the
+                // ADDRESS and slot 1 is the IDENTITY *of the same draft*, and splitting
+                // them manufactured an identity-only op that resolves by Message-ID
+                // SEARCH. Run after the addressed target has gone, that search returns a
+                // legitimate same-Message-ID SIBLING as its sole exact match and deletes
+                // it — a wrong-message delete (C3) built out of a refusal. The op now
+                // carries every id to the provider in ONE call (see the `.deleteDraft`
+                // executor arm), so a refusal here is the provider's FINAL verdict on
+                // the whole identity, not an invitation to retry a fragment of it.
+                //
+                // Retrying cannot change it and parking it is a permanent lane wedge, so
+                // it ends here — but LOUDLY and immediately, not after three fake
+                // retries dressed up as a staleness confirmation. Nothing is destroyed:
+                // the server-side object this op named is still there, still visible
+                // after the next sync, and the user's re-issued gesture goes through the
+                // UI paths that carry a full identity (`InboxViewModel.deleteDraftMessage`,
+                // `ComposeView`'s discard/send paths). ⚑ `v2final` demotes this case to
+                // its queue tail instead of dropping it, via
+                // `ProviderError.persistentActionFailure` — machinery this tree does not
+                // have (F2b L4). Terminal drop is the disposition v3 already shipped and
+                // keeps; the intention loss is bounded and visible, and adding a demote
+                // path is a separate change.
+                print("[Queue] Identity refused in \(opType) (\(opMsgCount) id(s)): '\(refusedId)' is not a verifiable identity and never will be — dropping the op (the server-side object is untouched and remains visible for a re-issued gesture)")
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
@@ -1044,25 +1037,36 @@ extension AccountManager {
             )
         case .deleteDraft:
             // messageIds[0] = serverDraftId (IMAP UID / Gmail ID)
+            // messageIds[1] = the DRAFT's own rfc822 Message-ID, when the admission site
+            //                 had one (`queueDraftDelete` appends it, deduped against
+            //                 slot 0). Slot 0 is an ADDRESS; slot 1 is an IDENTITY.
+            // draftServerUidValidity = the epoch slot 0 was minted under, when known.
             // folderPath = server-side Drafts folder path
+            //
+            // All three go to the provider TOGETHER, which is what lets IMAP resolve the
+            // exact message in its exact numbering instead of degrading to a Message-ID
+            // search that cannot tell this draft from a legitimate same-Message-ID
+            // sibling. (Before v72 only slot 0 was passed, so an op that carried a
+            // perfectly good identity in slot 1 was still refused as an address.)
             guard let serverDraftId = op.messageIds.first else { return }
-            // Silently swallow 404/410: some providers (notably Gmail) auto-
-            // delete a draft when the corresponding message is sent, so by the
-            // time our queueDraftDelete runs the server row is already gone.
-            // Treat "not found" as a successful delete.
-            do {
-                try await provider.deleteDraft(draftId: serverDraftId, draftsFolderPath: op.folderPath)
-            } catch {
-                let desc = String(describing: error).lowercased()
-                let isNotFound = desc.contains("404") || desc.contains("410")
-                    || desc.contains("not found") || desc.contains("notfound")
-                    || desc.contains("does not exist")
-                if isNotFound {
-                    print("[Queue] deleteDraft: server draft \(serverDraftId) already gone — treating as success")
-                } else {
-                    throw error
-                }
-            }
+            let draftRfc822: String? = op.messageIds.count > 1 ? op.messageIds[1] : nil
+            // ⚑ NO "already gone" STRING MATCH HERE. This arm used to swallow any error
+            // whose `String(describing:)` contained "404", "410", "not found", … as a
+            // successful delete. 404 and 410 are ORDINARY IMAP UID VALUES — and any UID
+            // containing them as a SUBSTRING matches too, so
+            // `actionIdentityResolutionFailed("4041")` and `uidResolutionFailed("410")`
+            // were both read as "the server says it is gone" when nothing had asked the
+            // server: the op was deleted, its typed handling never ran, and the draft
+            // survived. Every provider normalizes authoritative absence itself (Gmail's
+            // `drafts.delete` → `messages.trash` 404 chain, Exchange's 404 arm, IMAP's
+            // absent-FETCH / empty-SEARCH arms), so there is nothing left for the queue
+            // to infer from an error's TEXT. `v2final`'s `.deleteDraft` executor makes
+            // the same call, in the same words: no queue-side string match.
+            try await provider.deleteDraft(
+                draftId: serverDraftId,
+                rfc822MessageId: draftRfc822,
+                uidValidity: op.draftServerUidValidity,
+                draftsFolderPath: op.folderPath)
         case .addUserLabel:
             guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return }
             if let gmail = provider as? GmailProvider {

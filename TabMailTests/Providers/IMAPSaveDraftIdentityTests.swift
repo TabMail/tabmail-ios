@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 /// 🚨 THE SYSTEM PROPERTY: **no mutation lands on a message whose identity
@@ -48,8 +49,10 @@ import Foundation
 /// "never delete".
 ///
 /// `.serialized` — the fake binds a listening socket; parallel suites would
-/// contend on ephemeral port allocation.
-@Suite("A draft save deletes only the old copy it identified, never an address", .serialized)
+/// contend on ephemeral port allocation. `.processGlobalState` — §3 installs a temp
+/// `AppDatabase` into the shared slot to drive the ADMISSION half of the property.
+@Suite("A draft save deletes only the old copy it identified, never an address",
+       .serialized, .processGlobalState)
 struct IMAPSaveDraftIdentityTests {
 
     private static func rfc822(messageId: String) -> String {
@@ -379,5 +382,151 @@ struct IMAPSaveDraftIdentityTests {
         #expect(remaining.contains(Self.bracketed(freshDraftId)), "the fresh copy must be appended")
         #expect(remaining.contains(Self.bracketed(bystanderId)), "the unrelated draft must be untouched")
         #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    // MARK: - 3. Where the previous id COMES FROM
+
+    /// Installs a temp `AppDatabase` holding one IMAP account, a drafts-role folder
+    /// whose epoch is KNOWN (so the T1.3 admission guard admits — this defect lives
+    /// entirely on the admitted path), a `Draft` row addressed by `staleUID` with no
+    /// rfc822 of its own, and the header a resync left sitting at that address.
+    @MainActor
+    private func installStaleAddressFixture(
+        staleUID: Int,
+        draftsEpoch: Int,
+        strangerRfc822: String,
+        draftId: String
+    ) throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current
+            current = appDb
+            return prev
+        }
+
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "user@example.com", displayName: "Test", provider: .imap)
+            acc.id = "acc1"
+            try acc.insert(db)
+
+            var drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+            drafts.lastKnownUidValidity = draftsEpoch
+            try drafts.insert(db)
+
+            // What a resync after the renumber leaves behind: the PK the `Draft` row
+            // still points at, now occupied by somebody else's message.
+            var stranger = MessageHeader(
+                messageId: String(staleUID),
+                subject: "Not the user's draft",
+                from: "Someone Else",
+                fromAddress: "someone@example.com",
+                to: "user@example.com",
+                date: Date(),
+                snippet: "unrelated",
+                folderId: "acc1:Drafts",
+                accountId: "acc1",
+                folderPath: "Drafts",
+                isInInbox: false
+            )
+            stranger.headerComplete = true
+            stranger.rfc822MessageId = strangerRfc822
+            try stranger.insert(db)
+
+            // The draft itself: an ADDRESS it can no longer trust, and no identity.
+            let draft = Draft(
+                id: draftId, accountId: "acc1",
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "User's draft", body: "Body",
+                replyToId: nil, isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970,
+                serverDraftId: String(staleUID), serverPushStatus: "pushed",
+                rfc822MessageId: nil, attachmentsDirName: nil
+            )
+            try draft.insert(db)
+        }
+        return (pool, dir, previous)
+    }
+
+    /// 🚨 The same system property as §1, reached from the other end: §1 asks whether
+    /// `saveDraft` destroys only what the previous id NAMES; this asks whether that id
+    /// is allowed to be a stranger's in the first place. Both halves must hold, because
+    /// `exactMessageIdMatches` verifies the message against the id it was GIVEN — an id
+    /// that is wrong at the source is verified perfectly and destroys the wrong message.
+    ///
+    /// The removed defect: `queueDraftSave` used to read the header at
+    /// `accountId:folderPath:<serverDraftId>` and, when the `Draft` row had no rfc822 of
+    /// its own, adopt that header's identity and **persist** it. `serverDraftId` is a
+    /// UID — an address — so once it is stale the PK names a different message, and
+    /// `DraftStore.pushDraftToServer` then feeds the adopted id straight back in as
+    /// `previousRfc822MessageId`. This test wires those two halves together exactly as
+    /// that push does.
+    ///
+    /// ⚠ The seeded row (`serverDraftId` set, `rfc822MessageId` nil) is a state the two
+    /// production writers of `serverDraftId` cannot currently produce — both write the
+    /// rfc822 in the same statement. That is deliberate: the invariant must hold on the
+    /// state itself, not on the coupling that happens to keep it unreachable today.
+    @Test("A draft save never adopts the identity of whatever now occupies its stale address")
+    @MainActor
+    func saveDraftNeverAdoptsTheIdentityAtItsStaleAddress() async throws {
+        let strangerId = Self.unique("unrelated-occupant")
+        let freshDraftId = Self.unique("fresh-draft")
+        // Carries no message — the draft has no identity, so this save is entitled to
+        // destroy NOTHING. Registering an id nothing holds ARMS the oracle while
+        // declaring an empty entitlement (an empty registration set leaves it silent).
+        let entitlement = Self.unique("this-draft-has-no-identity-of-its-own")
+        let staleUID = 4712
+        let draftsEpoch = 820_001
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [],
+            "Drafts": [Self.message(uid: staleUID, id: strangerId)],
+        ])
+        server.setUidValidity(draftsEpoch, for: "Drafts")
+        server.expectMutation(rfc822MessageId: entitlement)
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try installStaleAddressFixture(
+            staleUID: staleUID, draftsEpoch: draftsEpoch,
+            strangerRfc822: strangerId, draftId: "d-stale-address")
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+
+        await AccountManager.shared.queueDraftSave(draftId: "d-stale-address", accountId: "acc1")
+
+        // Exactly `pushDraftToServer`'s wiring: whatever identity the admission left on
+        // the row becomes the old-copy target of the next push.
+        let previousRfc822 = try await pool.read { db in
+            try Draft.fetchOne(db, key: "d-stale-address")?.rfc822MessageId
+        }
+
+        let provider = Self.provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        _ = try await provider.saveDraft(
+            Self.draft(messageId: freshDraftId),
+            existingDraftId: String(staleUID),
+            previousRfc822MessageId: previousRfc822,
+            draftsFolderPath: "Drafts")
+
+        let violations = server.wrongMessageViolations()
+        #expect(violations.isEmpty,
+                """
+                the save destroyed a message the draft never identified: \(violations). The \
+                identity came from the header sitting at the draft's STALE UID, so it was a \
+                stranger's — and verifying the search hit against it proves nothing, because \
+                the id itself is the wrong one.
+                """)
+        #expect(server.messageIDs(in: "Drafts").contains(Self.bracketed(strangerId)),
+                "the unrelated occupant of the stale address must survive untouched")
+        // The user-intention half: refusing to adopt must never cost the edit.
+        #expect(server.messageIDs(in: "Drafts").contains(Self.bracketed(freshDraftId)),
+                "the user's edit must still be APPENDed after the adoption was refused")
     }
 }

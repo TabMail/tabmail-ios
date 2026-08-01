@@ -50,7 +50,7 @@ struct ConfirmGoneAtThresholdTests {
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
         func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
-        func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
+        func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
     }
 
     /// Probe-conforming provider — controls `currentUIDs` return value
@@ -90,7 +90,7 @@ struct ConfirmGoneAtThresholdTests {
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
         func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
-        func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
+        func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
     }
 
     struct ProbeError: Error, Equatable { let reason: String }

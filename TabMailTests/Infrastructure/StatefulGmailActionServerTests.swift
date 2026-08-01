@@ -617,7 +617,7 @@ struct StatefulGmailActionServerTests {
             response: .json(raw: #"{"historyId":"424242","history":[{"messagesAdded":[{"message":{"id":"gmail-history-added-1","labelIds":["INBOX"]}}]}]}"#)
         )
 
-        try await provider.deleteDraft(draftId: providerMessageId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         let history = try await provider.fetchHistory(since: "424241")
         #expect(history != nil, "fetchHistory returned nil — the canned delta never arrived, so the request did not reach the fake")
@@ -674,7 +674,7 @@ struct StatefulGmailActionServerTests {
             .status(draftDelete.next())
         }
 
-        try await provider.deleteDraft(draftId: providerMessageId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(
             draftDelete.served == [401, 204],
@@ -726,7 +726,7 @@ struct StatefulGmailActionServerTests {
             return status == 200 ? .json(raw: "{}") : .status(status)
         }
 
-        try await provider.deleteDraft(draftId: providerMessageId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(
             draftDelete.served == [404],

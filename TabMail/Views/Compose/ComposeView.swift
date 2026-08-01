@@ -1433,7 +1433,8 @@ struct ComposeView: View {
                     await AccountManager.shared.queueDraftDelete(
                         serverDraftId: serverId,
                         accountId: draftRecord.accountId,
-                        rfc822MessageId: draftRecord.rfc822MessageId
+                        rfc822MessageId: draftRecord.rfc822MessageId,
+                        uidValidity: draftRecord.serverDraftUidValidity
                     )
                 }
             } else if let rfc822 = draftRecord.rfc822MessageId {
@@ -1810,6 +1811,11 @@ struct ComposeView: View {
             draft.serverDraftId = draftRecord?.serverDraftId
             draft.serverPushStatus = draftRecord?.serverPushStatus
             draft.rfc822MessageId = draftRecord?.rfc822MessageId
+            // …and v72's epoch, which travels with `serverDraftId` and is meaningless
+            // apart from it. Carrying the address forward while dropping the numbering
+            // it belongs to would leave a UID nothing can trust, silently demoting every
+            // later delete of this draft to the Message-ID-search arm.
+            draft.serverDraftUidValidity = draftRecord?.serverDraftUidValidity
             draft.attachmentsDirName = dirName
 
             try await DraftStore.shared.saveAsync(draft)
@@ -1836,6 +1842,13 @@ struct ComposeView: View {
                 // what let the backstops resolve when this view's fire-and-forget
                 // `Task { queueDraftDelete }` never got to run.
                 draftRfc822: draftRecord?.rfc822MessageId ?? serverDraftHeader?.rfc822MessageId,
+                // …and the epoch that `serverDraftId` is an address IN. Only the `Draft`
+                // row has it (`DraftStore.pushDraftToServer` writes it in the same
+                // statement as `serverDraftId`, from the SELECT that minted the UID);
+                // the `serverDraftHeader` fallback addresses by `stableId`, which on
+                // IMAP is the Message-ID and is epoch-free by construction, so there is
+                // no epoch to pair with it and nil is the correct value there.
+                draftUidValidity: draftRecord?.serverDraftUidValidity,
                 draftId: draftId
             )
         } catch {
@@ -1860,7 +1873,7 @@ struct ComposeView: View {
         if let draftRecord {
             if let serverId = draftRecord.serverDraftId {
                 await optimisticDeleteDraftHeader(serverDraftId: serverId, accountId: draftRecord.accountId, rfc822MessageId: draftRecord.rfc822MessageId)
-                Task { await AccountManager.shared.queueDraftDelete(serverDraftId: serverId, accountId: draftRecord.accountId, rfc822MessageId: draftRecord.rfc822MessageId) }
+                Task { await AccountManager.shared.queueDraftDelete(serverDraftId: serverId, accountId: draftRecord.accountId, rfc822MessageId: draftRecord.rfc822MessageId, uidValidity: draftRecord.serverDraftUidValidity) }
             } else if let rfc822 = draftRecord.rfc822MessageId {
                 Task { await AccountManager.shared.removeOptimisticDraftHeader(accountId: draftRecord.accountId, rfc822MessageId: rfc822) }
             }

@@ -56,7 +56,7 @@ struct FetchMessagesBatchContractTests {
         func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
             DraftSaveResult(serverId: "mock")
         }
-        func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
+        func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
     }
 
     private func makeFullMessage(id: String) -> FullMessageInfo {

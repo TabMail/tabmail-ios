@@ -90,6 +90,33 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// reference's `v2final:TabMail/Models/PendingOperation.swift`).
     /// Backed by the v69 migration; `nil` on every pre-migration row.
     var observedUidValidity: Int?
+    /// v72 — the UIDVALIDITY epoch `messageIds[0]` was MINTED under, for a
+    /// `.deleteDraft` whose slot 0 is a bare IMAP UID. **Not the same datum as
+    /// `observedUidValidity` above, and the difference is the whole point.**
+    ///
+    /// `observedUidValidity` is the folder's epoch AT ADMISSION — it answers "has
+    /// the numbering moved since this op was recorded?" and it agrees with itself
+    /// by construction, so it can never reveal that the ADDRESS was already stale
+    /// when the op was recorded. This column is the epoch the address itself was
+    /// born in, carried forward from `Draft.serverDraftUidValidity` through
+    /// `OutboxMessage.draftServerUidValidity`. Non-nil therefore means: slot 0 is
+    /// a UID that is meaningful in EXACTLY this epoch and no other, and
+    /// `IMAPProvider.deleteDraft` may take its STRONG arm — compare the live
+    /// SELECT's UIDVALIDITY against it, fail closed on any disagreement, and only
+    /// then FETCH that UID and corroborate its Message-ID.
+    ///
+    /// nil means UNKNOWN — never "current", never zero — and keeps the op on the
+    /// unchanged Message-ID-search arm. Stamped only when slot 0 is numeric: an
+    /// rfc822-addressed op is epoch-immune and an epoch beside it would be an
+    /// asymmetric identity the provider refuses outright.
+    ///
+    /// ⚑ The reference (`v2final`) carries this as positional slot 2 of
+    /// `messageIds` with a typed decoder. A TYPED COLUMN is used here instead
+    /// because v3's stale sweep builds its protection set as
+    /// `Set(opsTargetingThisFolder.flatMap(\.messageIds))` — every slot value,
+    /// including the reference's empty-string placeholders, becomes an id that
+    /// can protect an unrelated header that happens to match it.
+    var draftServerUidValidity: Int?
     /// PendingStatus rawValue — stored as String for GRDB compatibility
     var status: String
 
@@ -112,7 +139,8 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         destinationPath: String? = nil,
         tagValue: String? = nil,
         userLabelId: String? = nil,
-        observedUidValidity: Int? = nil
+        observedUidValidity: Int? = nil,
+        draftServerUidValidity: Int? = nil
     ) {
         self.id = UUID().uuidString
         self.type = type
@@ -126,6 +154,7 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.retryCount = 0
         self.uidResolutionRetryCount = 0
         self.observedUidValidity = observedUidValidity
+        self.draftServerUidValidity = draftServerUidValidity
         self.status = PendingStatus.queued.rawValue
     }
 }

@@ -394,7 +394,7 @@ struct DraftDeletionTests {
     @Test("MockEmailProvider.deleteDraft records call")
     func mockDeleteDraft() async throws {
         let provider = MockEmailProvider()
-        try await provider.deleteDraft(draftId: "draft-123", draftsFolderPath: "DRAFT")
+        try await provider.deleteDraft(draftId: "draft-123", rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "DRAFT")
         let log = await provider.callLog
         #expect(log.contains { $0.contains("deleteDraft") })
     }

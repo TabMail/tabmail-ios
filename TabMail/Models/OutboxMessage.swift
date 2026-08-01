@@ -68,6 +68,28 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// `reconcileOutbox` after a crash — neither of which has a live `Draft` row
     /// to read) hand `queueDraftDelete` an identity that can actually resolve.
     var draftRfc822MessageId: String?
+    /// The UIDVALIDITY epoch `serverDraftId` was minted under, snapshotted at
+    /// queue-send time from `Draft.serverDraftUidValidity` in the same caller
+    /// snapshot as `serverDraftId` and `draftRfc822MessageId`. (v72)
+    ///
+    /// The rfc822 column above gives the backstops an IDENTITY; this one gives
+    /// them the epoch that identity's ADDRESS belongs to, and they are not
+    /// interchangeable. Two legitimately distinct drafts can share a Message-ID
+    /// (a copy, another client's save), so with the identity alone a delete
+    /// issued after its own target has gone — another client removed it, or the
+    /// primary delete already did — finds exactly one remaining exact match, the
+    /// SIBLING, and destroys it. That is a wrong-message delete. With the epoch
+    /// the same delete resolves through `IMAPProvider.deleteDraft`'s STRONG arm:
+    /// live UIDVALIDITY must equal this value, then the recorded UID is FETCHed
+    /// and corroborated, and a target that is already gone is a clean no-op.
+    ///
+    /// nil for non-IMAP providers, for a draft that was never pushed, and for
+    /// any row written before v72 — all of which keep that row on the unchanged
+    /// Message-ID-search arm.
+    ///
+    /// Ported from `v2final:TabMail/Models/OutboxMessage.swift`'s
+    /// `draftServerUidValidity` (its migration `v85`).
+    var draftServerUidValidity: Int?
     /// Wall-clock deadline before drain is allowed to claim this row. Set by
     /// queueSend to now + outboxUndoHoldSeconds + outboxClaimBufferSeconds.
     /// NULL for legacy pre-v49 rows (treated as "no hold" by the drain gate).

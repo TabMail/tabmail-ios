@@ -246,12 +246,21 @@ actor DraftStore {
         draftFtsOps = try await AppDatabase.dbPool.write { db in
             var draftFtsRemovals: [String] = []
             var draftFtsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
+            // `serverDraftUidValidity` is written in the SAME statement as
+            // `serverDraftId`, because it is not a separate fact — it is the numbering
+            // that address is scoped to, and the two are only meaningful together. It
+            // is also written UNCONDITIONALLY (including to nil): a re-push mints a new
+            // UID under whatever epoch this save observed, so carrying the previous
+            // save's epoch forward would pair a fresh address with a stale numbering,
+            // which is the exact shape that makes the delete path's equality check pass
+            // vacuously.
             try db.execute(
                 sql: """
-                    UPDATE draft SET serverDraftId = ?, serverPushStatus = ?, rfc822MessageId = ?
+                    UPDATE draft SET serverDraftId = ?, serverPushStatus = ?, rfc822MessageId = ?,
+                                     serverDraftUidValidity = ?
                     WHERE id = ?
                     """,
-                arguments: [result.serverId, "pushed", rfc822, draftIdForUpdate]
+                arguments: [result.serverId, "pushed", rfc822, result.uidValidity, draftIdForUpdate]
             )
 
             // If the server returned a real messageId (Gmail/IMAP: message.id

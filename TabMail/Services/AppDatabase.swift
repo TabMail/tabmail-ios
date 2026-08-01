@@ -2122,5 +2122,63 @@ final class AppDatabase: Sendable {
                 t.add(column: "draftRfc822MessageId", .text)
             }
         }
+
+        migrator.registerMigration("v72_addDraftServerUidValidity") { db in
+            // The UIDVALIDITY EPOCH the draft's server address (`serverDraftId`, a bare
+            // IMAP UID) was MINTED under, carried beside that address everywhere the
+            // address goes: the `draft` row that owns it, the `outboxMessage` snapshot
+            // the post-send backstops read, and the `.deleteDraft` PendingOperation the
+            // backstops record.
+            //
+            // WHY v71 ALONE WAS NOT THE CLOSURE. v71 gave the delete an rfc822
+            // IDENTITY, and identity alone cannot tell one draft from a LEGITIMATE
+            // same-Message-ID SIBLING — two distinct drafts may share a Message-ID after
+            // a copy or another client's save, which is why `IMAPProvider.deleteDraft`
+            // refuses outright when it sees 2+ exact matches. The dangerous crossing is
+            // when the gesture's own target is already gone (another client removed it,
+            // or the primary delete got there first) and the sibling is the SOLE
+            // remaining match: the Message-ID SEARCH then returns exactly one hit — the
+            // sibling — and deleting it is a wrong-message delete (C3).
+            //
+            // With the epoch, that delete resolves through the STRONG arm instead:
+            // SELECT reports the live UIDVALIDITY, it must EQUAL the recorded one (a
+            // mismatch fails closed), and only then may the recorded UID be FETCHed and
+            // corroborated against the recorded rfc822. If the gesture's target is gone
+            // the FETCH finds nothing and the delete is a clean no-op — the sibling is
+            // never even a candidate.
+            //
+            // PORTED from the reference's `v85_addOutboxDraftServerUidValidity`
+            // (`OutboxMessage.draftServerUidValidity`) and `Draft.serverDraftUidValidity`
+            // (`v2final`). Two migrations exist there for the same reason two columns
+            // exist here: the rfc822 column and the epoch column are separate halves of
+            // one identity, and the reference shipped the second only after the
+            // same-rfc-sibling failure was found. The migration NUMBER is v3's own — v71
+            // is v3's ceiling and has already been APPLIED to local databases, so it is
+            // immutable and this is a new migration rather than an edit.
+            //
+            // `pendingOperation.draftServerUidValidity` is a TYPED COLUMN where the
+            // reference uses a positional `messageIds` slot. ⚑ DELIBERATE DEVIATION,
+            // forced by v3: `SyncEngine`'s stale sweep builds its protection set as
+            // `Set(opsTargetingThisFolder.flatMap(\.messageIds))`, so ANY value parked in
+            // a `messageIds` slot — a numeric epoch, or the reference's empty-string
+            // positional placeholders — enters that set and can protect a header whose
+            // own id happens to equal it. A column carries the same datum with no such
+            // aliasing.
+            //
+            // All three nullable, no default, no backfill: a pre-migration row simply has
+            // no recorded epoch, which reads as "unknown" and keeps that row on the
+            // unchanged legacy rfc822-search arm. Never "0" — RFC 3501 §2.3.1.1 types
+            // UIDVALIDITY as `nz-number`, so a synthesised zero would be an epoch that
+            // compares equal to another synthesised zero.
+            try db.alter(table: "draft") { t in
+                t.add(column: "serverDraftUidValidity", .integer)
+            }
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "draftServerUidValidity", .integer)
+            }
+            try db.alter(table: "pendingOperation") { t in
+                t.add(column: "draftServerUidValidity", .integer)
+            }
+        }
     }
 }

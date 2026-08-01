@@ -34,6 +34,28 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     var rfc822MessageId: String?  // Stable Message-ID for IMAP dedup
     var attachmentsDirName: String? // Disk directory under draft_attachments/
 
+    /// v72: the IMAP UIDVALIDITY epoch `serverDraftId` was MINTED under — the
+    /// value the SELECT that carried the draft's APPEND reported, returned by the
+    /// provider as `DraftSaveResult.uidValidity` and written here in the same
+    /// statement as `serverDraftId`.
+    ///
+    /// A bare UID is an ADDRESS scoped to exactly one `(mailbox, UIDVALIDITY)`
+    /// pair. Without the epoch it was minted under, nothing downstream can tell a
+    /// still-valid address from one the server has since re-pointed at a different
+    /// message, so a bare UID with a nil or stale epoch must never activate a
+    /// destructive match. Carrying the epoch is what lets
+    /// `IMAPProvider.deleteDraft` take its STRONG arm — verify the live epoch
+    /// EQUALS this one, then FETCH and corroborate — instead of degrading to a
+    /// Message-ID search that cannot distinguish this draft from a legitimate
+    /// same-Message-ID sibling.
+    ///
+    /// nil for a never-pushed draft, for every non-IMAP provider (Gmail/Graph
+    /// resource ids are stable and epoch-free), and for any row written before
+    /// v72. nil means UNKNOWN — never "unchanged", never zero.
+    ///
+    /// Ported from `v2final:TabMail/Models/Draft.swift`'s `serverDraftUidValidity`.
+    var serverDraftUidValidity: Int?
+
     // MARK: - JSON Helpers
 
     var toArray: [String] {

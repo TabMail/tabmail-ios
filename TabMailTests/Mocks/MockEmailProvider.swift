@@ -345,7 +345,9 @@ actor MockEmailProvider: EmailProvider {
     var saveDraftThrows: Error?
     var deleteDraftThrows: Error?
     var savedDrafts: [(draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String)] = []
-    var deletedDraftIds: [(draftId: String, draftsFolderPath: String)] = []
+    /// Every argument `deleteDraft` was called with — the epoch-safety pair included, so
+    /// a test can assert WHAT the queue handed the provider, not merely that it called.
+    var deletedDraftIds: [(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String)] = []
 
     func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
         callLog.append("saveDraft(existingDraftId:\(existingDraftId ?? "nil"),previousRfc822MessageId:\(previousRfc822MessageId ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
@@ -355,9 +357,11 @@ actor MockEmailProvider: EmailProvider {
         return saveDraftResult
     }
 
-    func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
-        callLog.append("deleteDraft(draftId:\(draftId),draftsFolderPath:\(draftsFolderPath))")
-        deletedDraftIds.append((draftId: draftId, draftsFolderPath: draftsFolderPath))
+    func deleteDraft(
+        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
+    ) async throws {
+        callLog.append("deleteDraft(draftId:\(draftId),rfc822MessageId:\(rfc822MessageId ?? "nil"),uidValidity:\(uidValidity.map(String.init) ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
+        deletedDraftIds.append((draftId: draftId, rfc822MessageId: rfc822MessageId, uidValidity: uidValidity, draftsFolderPath: draftsFolderPath))
         if let error = deleteDraftThrows { throw error }
     }
 

@@ -154,7 +154,7 @@ struct StatefulExchangeActionServerTests {
 
         // Gap 2's restored leg. `deleteDraft` addresses the same opaque id, and
         // both of its request paths now carry `session: testSession`.
-        try await provider.deleteDraft(draftId: opaqueId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: opaqueId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
         #expect(
             server.snapshot(providerMessageId: opaqueId) == nil,
             "deleteDraft must remove the addressed resource from THIS fixture — a surviving snapshot means the DELETE never reached the injected session"
@@ -648,7 +648,7 @@ struct StatefulExchangeActionServerTests {
             .status(draftDelete.next())
         }
 
-        try await provider.deleteDraft(draftId: providerMessageId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(
             draftDelete.served == [401, 204],

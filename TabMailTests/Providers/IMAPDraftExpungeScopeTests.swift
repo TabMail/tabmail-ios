@@ -101,7 +101,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         let violations = server.wrongMessageViolations()
         #expect(violations.isEmpty,
@@ -145,7 +145,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(server.messageIDs(in: "Drafts") == ["<\(survivorId)>"],
                 """
@@ -199,7 +199,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         let violations = server.wrongMessageViolations()
         #expect(violations.isEmpty,
@@ -243,7 +243,7 @@ struct IMAPDraftExpungeScopeTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         let flags = server.flags(in: "Drafts", rfc822MessageId: targetId)
         #expect(flags?.contains("\\Deleted") == true,

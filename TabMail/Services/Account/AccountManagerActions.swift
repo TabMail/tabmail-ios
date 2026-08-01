@@ -1000,25 +1000,41 @@ extension AccountManager {
                 // list reverts to the pre-edit server-synced header, and the
                 // user sees stale content.
                 //
-                // Resolution: if the draft has serverDraftId, find the
-                // existing server-synced MessageHeader by its PK and adopt
-                // its rfc822MessageId for the Draft row. The update branch
-                // below then finds that same header and updates it in place.
-                if rfc822 == nil, let sid = draft.serverDraftId {
-                    let serverHeaderId = "\(accountId):\(folderPath):\(sid)"
-                    if let serverHeader = try MessageHeader.fetchOne(db, key: serverHeaderId),
-                       let serverRfc822 = serverHeader.rfc822MessageId,
-                       !serverRfc822.isEmpty {
-                        rfc822 = serverRfc822
-                        try db.execute(
-                            sql: "UPDATE draft SET rfc822MessageId = ? WHERE id = ?",
-                            arguments: [rfc822, draftId]
-                        )
-                        print("[Queue] queueDraftSave: adopted rfc822 from server header \(serverHeaderId) → \(serverRfc822)")
-                    } else {
-                        print("[Queue] queueDraftSave: no server header found for serverDraftId=\(sid) — will generate fresh rfc822")
-                    }
-                }
+                // ⚑ NO ADOPTION HERE, EITHER — the same rule, and for the same reason,
+                // as `queueDraftDelete` below. What used to stand here read the header
+                // at the PK `accountId:folderPath:<serverDraftId>` and, when the `Draft`
+                // row had no rfc822 of its own, ADOPTED that header's identity and
+                // PERSISTED it (`UPDATE draft SET rfc822MessageId = …`).
+                //
+                // `serverDraftId` is an IMAP UID — an ADDRESS. When it is stale (the
+                // `Draft` table survives a UIDVALIDITY renumber; the UID it names does
+                // not) the PK names a DIFFERENT message, so the adopted id belongs to a
+                // stranger. And unlike the delete site's transient version, this one
+                // STUCK: `DraftStore.pushDraftToServer` later reads it back as
+                // `previousRfc822` and hands it to `saveDraft(…​previousRfc822MessageId:)`,
+                // whose old-copy leg SEARCHes for it, finds exactly one exact match —
+                // the stranger — and STOREs `\Deleted` + EXPUNGEs it. A persisted wrong
+                // identity is worse than a transient one precisely because every
+                // subsequent push re-aims at the same stranger.
+                //
+                // `exactMessageIdMatches` is NOT a mitigation: it proves the message
+                // found carries the ADOPTED id, which it does — the id is wrong at the
+                // source, so verifying against it proves nothing. Nor is the T1.3 guard
+                // above: that refuses when the epoch is UNKNOWN, and after a completed
+                // reset the epoch is perfectly well known — just not the one the UID was
+                // minted under.
+                //
+                // Nothing is lost by removing it. The ServerDraftCompose case it was
+                // written for — reuse the server-synced display row instead of orphaning
+                // a second one next to it — is handled by the `lookedUp` PK fallback
+                // below, which is not gated on `rfc822 == nil` and which writes only
+                // INTO the header (never back into the `Draft` row), so it cannot carry a
+                // stranger's identity into the push path.
+                //
+                // ⚑ DELIBERATE DEVIATION FROM `v2final`, which still carries this block
+                // verbatim (`v2final:TabMail/Services/Account/AccountManagerActions.swift`
+                // `queueDraftSave`) together with the same destructive `saveDraft` leg.
+                // The reference has not closed this one; it is not a shape to port.
 
                 // Generate stable rfc822MessageId if still not assigned (fresh local draft).
                 if rfc822 == nil {
@@ -1200,7 +1216,16 @@ extension AccountManager {
     /// Optimistically removes the MessageHeader from the Drafts folder immediately.
     /// Requires the serverDraftId (IMAP UID / Gmail ID) from the Draft record.
     /// Pass rfc822MessageId to also remove optimistic headers (which use placeholder messageIds).
-    func queueDraftDelete(serverDraftId: String, accountId: String, rfc822MessageId: String? = nil) async {
+    /// - Parameter uidValidity: the UIDVALIDITY epoch `serverDraftId` was MINTED under
+    ///   (`Draft.serverDraftUidValidity` / `OutboxMessage.draftServerUidValidity`), when
+    ///   the call site has it. Recorded on the op so `IMAPProvider.deleteDraft` can take
+    ///   its epoch-corroborated STRONG arm instead of a Message-ID search that cannot
+    ///   tell this draft from a legitimate same-Message-ID sibling. nil (no Draft/outbox
+    ///   row in hand, non-IMAP, or a pre-v72 row) keeps the op on the unchanged arm.
+    func queueDraftDelete(
+        serverDraftId: String, accountId: String, rfc822MessageId: String? = nil,
+        uidValidity: Int? = nil
+    ) async {
         do {
             let folderPath = try await draftsFolderPath(accountId: accountId)
             try await dbPool.write { db in
@@ -1226,32 +1251,34 @@ extension AccountManager {
                 // Remove by server UID (synced header)
                 let serverId = "\(accountId):\(folderPath):\(serverDraftId)"
 
-                // LEGACY RESCUE: a caller with no rfc822 to give (a `Draft` row from
-                // before the push wrote both columns together, or an outbox row queued
-                // before v71) would record an op whose only id is a bare UID — an
-                // ADDRESS the IMAP provider refuses to build a destructive command
-                // from, so the op could only ever be refused and dropped while the
-                // server draft survived. The server-synced header for this very
-                // `serverDraftId` already carries the draft's Message-ID, so adopt it.
-                // Same resolution `queueDraftSave` above applies to the same gap
-                // (ported from `v2final:AccountManagerActions`); read-only here —
-                // there may be no `Draft` row left to write it back to.
-                var resolvedRfc822 = rfc822MessageId
-                if resolvedRfc822 == nil,
-                   let serverHeader = try MessageHeader.fetchOne(db, key: serverId),
-                   let headerRfc822 = serverHeader.rfc822MessageId,
-                   !headerRfc822.isEmpty {
-                    resolvedRfc822 = headerRfc822
-                    if DebugModeManager.isLoggingEnabled() {
-                        print("[Queue] queueDraftDelete: adopted rfc822 from server header \(serverId) → \(headerRfc822)")
-                    }
-                }
-
+                // ⚑ NO ADOPTION HERE, EVER. A revision of this function read the
+                // `MessageHeader` sitting at `serverId` and, when the caller had no
+                // rfc822 of its own, ADOPTED that row's Message-ID as the delete's
+                // identity — recording it on the op, which the provider then resolved
+                // by SEARCH and EXPUNGED.
+                //
+                // `serverDraftId` is, on IMAP, a bare UID: an address scoped to one
+                // `(folderPath, UIDVALIDITY)` pair. When the epoch it was minted under
+                // is not the epoch in force now — after a reset (`uidValidityResetPurgeTxn`
+                // purges headers but deliberately PRESERVES `draft`/`outboxMessage`
+                // rows, so a delayed cleanup can still name an address from the
+                // discarded numbering), or when `draftsFolderPath`'s literal `"Drafts"`
+                // fallback resolved to a real mailbox before folder-list sync assigned
+                // the role elsewhere — this PK names a DIFFERENT message, and adopting
+                // its identity aims the delete at a stranger. Refusing costs the user a
+                // draft that stays visible and re-deletable; adopting costs them mail
+                // they never asked to delete (C3).
+                //
+                // The reference agrees by construction: `v2final`'s `queueDraftDelete`
+                // reads the row at the PK ONLY as a corroboration INPUT to
+                // `DraftHeaderDeleteGate.rawPKDeleteAllowed` (which must ALSO see the
+                // caller's own rfc, equal to the row's, and a canonical group of exactly
+                // one) — and the op it records carries nothing but CALLER-SUPPLIED ids.
                 if try MessageHeader.deleteOne(db, key: serverId) {
                     _ = try? MessageBody.deleteOne(db, key: serverId)
                 }
                 // Also remove optimistic header by rfc822MessageId (placeholder UID)
-                if let rfc822 = resolvedRfc822 {
+                if let rfc822 = rfc822MessageId {
                     let optimistic = try MessageHeader
                         .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822)
                         .fetchAll(db)
@@ -1266,23 +1293,24 @@ extension AccountManager {
                 // from the server during the brief window before .deleteDraft drains.
                 // Matches the protection pattern in queueDraftSave.
                 var opMsgIds = [serverDraftId]
-                if let rfc822 = resolvedRfc822, rfc822 != serverDraftId {
+                if let rfc822 = rfc822MessageId, rfc822 != serverDraftId {
                     opMsgIds.append(rfc822)
                 }
                 // T4.S6 follow-up — RECORD THE EPOCH THIS OP'S ADDRESS BELONGS TO.
                 //
-                // The rfc822 id appended above is carried for the SYNC FILTER
-                // (`pendingAllIds`), NOT for resolution: `executeOperation` passes
-                // `messageIds.first` — the UID — to `provider.deleteDraft`. So the op is
-                // executed by bare UID while CLASSIFYING as identity-carrying, which is
-                // exactly why `AccountManager.opIsAddressOnly` returns false for it and
-                // the reaction's step-5 sweep leaves it alone. Post-reaction it would
-                // otherwise unpark and expunge whichever message the NEW numbering put at
-                // that UID — C3, the one hard invariant. (⚑ Since 2026-08-01
-                // `IMAPProvider.deleteDraft` refuses a bare UID rather than expunging it,
-                // so the C3 outcome described here is closed at the provider as well. The
-                // stamp is still what keeps the op from being executed — and re-executed —
-                // under a numbering it was never recorded under.)
+                // Slot 1's rfc822 is carried for the SYNC FILTER (`pendingAllIds`) AND,
+                // since v72, handed to `provider.deleteDraft` as the identity to
+                // corroborate — `executeOperation` passes slot 0 as the address and slot
+                // 1 as the identity, rather than resolving whatever `messageIds.first`
+                // happened to be. `AccountManager.opIsAddressOnly` therefore still
+                // returns false for such an op and the reaction's step-5 sweep leaves it
+                // alone; post-reaction it would otherwise unpark and expunge whichever
+                // message the NEW numbering put at that UID — C3, the one hard
+                // invariant. (⚑ Since 2026-08-01 `IMAPProvider.deleteDraft` refuses a
+                // bare UID rather than expunging it, so the C3 outcome described here is
+                // closed at the provider as well. The stamp is still what keeps the op
+                // from being executed — and re-executed — under a numbering it was never
+                // recorded under.)
                 //
                 // Stamping the folder's epoch INSIDE this same transaction (the write is
                 // already gated by the refusal above, so the row exists and its epoch is
@@ -1297,12 +1325,27 @@ extension AccountManager {
                 let observedUidValidity: Int? = UInt32(serverDraftId) != nil
                     ? try Folder.fetchOne(db, key: folderId)?.lastKnownUidValidity
                     : nil
+                // …and, separately, THE EPOCH THE ADDRESS ITSELF WAS MINTED IN. The two
+                // are different questions and only this one can be wrong at admission:
+                // `observedUidValidity` reads the folder's epoch NOW, so it agrees with
+                // itself by construction and can never reveal that `serverDraftId` was
+                // already an address from a discarded numbering when the caller handed
+                // it over. `uidValidity` comes from the row that owns the address
+                // (`Draft.serverDraftUidValidity`, itself the epoch of the SELECT that
+                // minted the UID), so a disagreement is detectable — the provider's
+                // STRONG arm compares it against the live SELECT and fails closed.
+                //
+                // ONLY for a numeric id, for the same reason the stamp above is: an
+                // epoch beside a non-numeric (rfc822) address is an asymmetric identity
+                // that names nothing, and the provider refuses it outright.
+                let mintedUidValidity: Int? = UInt32(serverDraftId) != nil ? uidValidity : nil
                 try PendingOperation(
                     type: .deleteDraft,
                     messageIds: opMsgIds,
                     accountId: accountId,
                     folderPath: folderPath,
-                    observedUidValidity: observedUidValidity
+                    observedUidValidity: observedUidValidity,
+                    draftServerUidValidity: mintedUidValidity
                 ).insert(db)
             }
             // Refresh UI so the optimistic removal is visible immediately.

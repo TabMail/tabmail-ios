@@ -38,6 +38,15 @@ import GRDB
 /// identity that survives any renumbering. ⚠ NOT `sentMessageId` — that belongs
 /// to the message SMTP delivered, which the Drafts copy never carries.
 ///
+/// **…and identity alone was never enough.** A Message-ID is not unique across a
+/// Drafts folder, and a bare UID is an address in a numbering nothing recorded, so
+/// the cases below also pin the two ways this cleanup can mutate the WRONG message:
+/// adopting the identity of whatever row occupies a stale address, and deleting a
+/// legitimate same-Message-ID sibling once the gesture's own target has gone.
+/// `OutboxMessage.draftServerUidValidity` (v72) is what closes the second —
+/// `v2final` carries the same pair of columns, added by two separate migrations for
+/// exactly this reason.
+///
 /// `.serialized, .processGlobalState` — replaces `AppDatabase.shared`, drives the
 /// shared `AccountManager`'s provider registry and drain, and the fake binds a
 /// listening socket (parallel suites would contend on ephemeral ports).
@@ -101,6 +110,7 @@ struct PostSendServerDraftCleanupTests {
         accountId: String,
         serverDraftId: String,
         draftRfc822: String?,
+        draftUidValidity: Int? = nil,
         pool: DatabasePool
     ) throws {
         var msg = OutboxMessage(
@@ -114,13 +124,15 @@ struct PostSendServerDraftCleanupTests {
         msg.sentMessageId = "sent-message-not-the-draft@example.com"
         msg.serverDraftId = serverDraftId
         msg.draftRfc822MessageId = draftRfc822
+        msg.draftServerUidValidity = draftUidValidity
         let toInsert = msg
         try pool.write { db in try toInsert.insert(db) }
     }
 
-    /// The server-synced Drafts header the user was looking at — the row a legacy
-    /// outbox message (queued before the v71 snapshot existed) can still be resolved
-    /// through, because it carries the draft's Message-ID next to its UID.
+    /// The server-synced Drafts header sitting at the primary key
+    /// `accountId:folderPath:serverDraftId`. Its `rfc822MessageId` is a parameter on
+    /// purpose: whether that row IS the gesture's target or a STRANGER occupying a
+    /// reused UID is the whole variable these cases turn on.
     private static func insertServerDraftHeader(
         accountId: String, uid: Int, rfc822MessageId: String?, pool: DatabasePool
     ) throws {
@@ -217,36 +229,64 @@ struct PostSendServerDraftCleanupTests {
                 "the cleanup op neither completed nor terminated — it is parked, which wedges this lane")
     }
 
-    // MARK: - 2. The legacy row (no snapshot to inherit)
+    // MARK: - 2. The legacy row: a delete with no identity of its own
 
-    @Test("A pre-v71 outbox row still resolves its draft through the synced header")
+    @Test("A delete with no identity of its own never adopts the one at its stale address")
     @MainActor
-    func legacyOutboxRowAdoptsTheIdentityFromTheServerHeader() async throws {
-        // An outbox row queued before `draftRfc822MessageId` existed carries only the
-        // UID, and there is no `Draft` row left to read. Dropping the cleanup here
-        // would leave the same permanent duplicate as the defect above, for the whole
-        // population of rows that were in flight across the upgrade. The server-synced
-        // Drafts header for that very UID already carries the draft's Message-ID, so
-        // the admission site adopts it — the same resolution `queueDraftSave` applies
-        // to the same gap.
+    func aDeleteWithNoIdentityNeverAdoptsTheOneAtItsStaleAddress() async throws {
+        // 🚨 THE INVARIANT: **no mutation lands on a message whose identity differs from
+        // the gesture's target.**
+        //
+        // ⚠ THIS TEST REPLACES ONE THAT BLESSED A DEFECT.
+        // `legacyOutboxRowAdoptsTheIdentityFromTheServerHeader` asserted the OUTCOME of a
+        // "LEGACY RESCUE" in `queueDraftDelete`: when the caller had no rfc822, the
+        // admission site read the `MessageHeader` sitting at the primary key
+        // `accountId:folderPath:serverDraftId` and ADOPTED that row's Message-ID as the
+        // delete's identity. It seeded that PK row with the CORRECT identity, so it never
+        // crossed the only case that matters — the row at the PK being a DIFFERENT
+        // message — and it therefore reported success on code that could destroy a
+        // stranger. Reproducing its scenario proves nothing about the rescue's safety;
+        // this case reproduces the crossing instead.
+        //
+        // WHY THE PK CAN NAME A STRANGER. `serverDraftId` is, on IMAP, a bare UID: an
+        // address scoped to one `(folderPath, UIDVALIDITY)` pair, and nothing in the
+        // `outboxMessage` row records the epoch it was minted under. A UIDVALIDITY reset
+        // purges `messageHeader` rows but deliberately PRESERVES `draft`/`outboxMessage`
+        // rows, so a delayed cleanup still names an address from the discarded numbering;
+        // resync then puts an UNRELATED draft at that number. (`draftsFolderPath`'s
+        // literal `"Drafts"` fallback reaching a real mailbox before folder-list sync
+        // assigns the role elsewhere produces the same crossing without any reset.)
+        //
+        // Here the gesture targets a draft that had NO Message-ID and is already gone;
+        // the address it left behind now belongs to someone else's draft. Adopting that
+        // stranger's identity and resolving it by SEARCH ends in `STORE \Deleted` + `UID
+        // EXPUNGE` on the stranger. Refusing costs the user nothing they can see.
         let accountId = "post-send-legacy"
-        let draftRfc822 = "legacy-draft-identity@example.com"
-        let draftUID = 4712
+        let strangerRfc822 = "unrelated-occupant@example.com"
+        let gestureTarget = "the-rfc-less-draft-that-is-already-gone@example.com"
+        let reusedUID = 4712
         let (pool, dir, previous) = try Self.makeFixture(accountId: accountId)
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
+        // The Drafts folder now holds ONE message, and it is not the one the gesture
+        // means: an unrelated draft that resync placed at the reused UID.
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [],
-            "Drafts": [Self.message(uid: draftUID, id: draftRfc822)],
+            "Drafts": [Self.message(uid: reusedUID, id: strangerRfc822)],
         ])
-        server.expectMutation(rfc822MessageId: draftRfc822)
+        server.setUidValidity(Self.draftsEpoch, for: "Drafts")
+        // The oracle is armed with the GESTURE'S target, so any mutation touching the
+        // stranger is reported as a wrong-message mutation on the wire.
+        server.expectMutation(rfc822MessageId: gestureTarget)
         try server.start()
         defer { server.stop() }
 
+        // The local header at that PK is the STRANGER's — this is the whole crossing.
         try Self.insertServerDraftHeader(
-            accountId: accountId, uid: draftUID, rfc822MessageId: draftRfc822, pool: pool)
+            accountId: accountId, uid: reusedUID, rfc822MessageId: strangerRfc822, pool: pool)
+        // …and the cleanup that names the address, with no identity of its own to give.
         try Self.insertCompletedSend(
-            accountId: accountId, serverDraftId: "\(draftUID)",
+            accountId: accountId, serverDraftId: "\(reusedUID)",
             draftRfc822: nil, pool: pool)
 
         let provider = Self.provider(for: server)
@@ -258,13 +298,177 @@ struct PostSendServerDraftCleanupTests {
             await Self.drainUntilSettled(pool)
         }
 
+        #expect(server.messageIDs(in: "Drafts") == ["<\(strangerRfc822)>"],
+                """
+                the unrelated draft occupying the reused UID \(reusedUID) was destroyed \
+                (Drafts holds \(server.messageIDs(in: "Drafts"))). The cleanup carried no \
+                identity of its own, so the only way it could resolve anything is by \
+                adopting the identity of whatever row happened to sit at its stale \
+                address — which is a different message. Failing closed here leaves a \
+                draft the user can still see and still delete; adopting destroys mail \
+                they never gestured on (C3).
+                """)
+        #expect(server.wrongMessageViolations().isEmpty,
+                "a mutation landed on a message the gesture never named: \(server.wrongMessageViolations())")
+        let remaining = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(remaining.isEmpty,
+                "the unresolvable cleanup is parked rather than terminated, which wedges this lane")
+    }
+
+    // MARK: - 2b. The same-Message-ID sibling
+
+    @Test("A post-send cleanup whose own draft is gone never deletes a same-Message-ID sibling")
+    @MainActor
+    func aCleanupWhoseTargetIsGoneNeverDeletesASameRfcSibling() async throws {
+        // 🚨 THE INVARIANT: **when the gesture's target is gone, a same-Message-ID
+        // sibling is not deleted.**
+        //
+        // Two distinct drafts may legitimately carry the same rfc822 Message-ID — a copy,
+        // another client's save — which is why `IMAPProvider.deleteDraft` refuses outright
+        // when it sees 2+ exact matches. That refusal only holds while BOTH are present.
+        // Here the send gesture named A (UID 10) and another client removed A before the
+        // unconditional post-send backstop ran, so the Message-ID SEARCH returns exactly
+        // ONE exact match — B, the sibling at UID 11 — and identity-alone resolution
+        // deletes it. No UIDVALIDITY change is involved and the identity genuinely
+        // matches; it is simply the wrong copy.
+        //
+        // The closure is the epoch: `OutboxMessage.draftServerUidValidity` (v72) carries
+        // the UIDVALIDITY that UID 10 was MINTED under, so the delete resolves through the
+        // STRONG arm — SELECT's live epoch must equal it, then FETCH UID 10 — and an
+        // absent FETCH is a clean no-op. B is never a candidate. This is exactly what
+        // `v2final` records on its own `v85` migration; v71's rfc822 column alone was
+        // never the closure.
+        let accountId = "post-send-sibling"
+        let sharedRfc822 = "shared-draft-identity@example.com"
+        let sentDraftUID = 10        // A — the copy this send actually named
+        let siblingUID = 11          // B — a legitimate sibling sharing the Message-ID
+        let (pool, dir, previous) = try Self.makeFixture(accountId: accountId)
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        // A is already gone — another client deleted it. Only B remains, so the SEARCH
+        // this cleanup would run returns exactly one exact match.
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [],
+            "Drafts": [Self.message(uid: siblingUID, id: sharedRfc822)],
+        ])
+        server.setUidValidity(Self.draftsEpoch, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+
+        try Self.insertCompletedSend(
+            accountId: accountId, serverDraftId: "\(sentDraftUID)",
+            draftRfc822: sharedRfc822, draftUidValidity: Self.draftsEpoch, pool: pool)
+
+        let provider = Self.provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.reconcileOutbox()
+            await Self.drainUntilSettled(pool)
+        }
+
+        // ⚠ The wire oracle keys on rfc822 Message-ID and CANNOT see this one: both
+        // copies carry the same id, so a mutation on the sibling looks expected to it.
+        // The observation has to be the sibling's own survival, by UID.
+        #expect(server.messageIDs(in: "Drafts") == ["<\(sharedRfc822)>"],
+                """
+                the sibling draft at UID \(siblingUID) was destroyed (Drafts holds \
+                \(server.messageIDs(in: "Drafts"))). The cleanup named UID \(sentDraftUID), \
+                which was already gone; resolving it by Message-ID alone found the only \
+                remaining exact match and deleted it. A Message-ID is not unique across a \
+                Drafts folder, so identity alone can never establish that a survivor IS \
+                the copy the gesture named.
+                """)
+        #expect(!server.flags(in: "Drafts", uid: siblingUID).contains("\\Deleted"),
+                """
+                the sibling at UID \(siblingUID) was marked \\Deleted (flags: \
+                \(server.flags(in: "Drafts", uid: siblingUID))). A soft delete on a message \
+                the gesture never named is still a wrong-message mutation — it is the \
+                recorded intent to destroy it, which the next UIDPLUS-capable client \
+                completes.
+                """)
+        let remaining = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(remaining.isEmpty,
+                "the cleanup neither completed nor terminated — it is parked, which wedges this lane")
+    }
+
+    // MARK: - 2c. A UID that merely LOOKS like an HTTP status
+
+    @Test("A draft delete whose UID contains 404 is retried, not dropped as already-gone")
+    @MainActor
+    func aUidContainingFourZeroFourIsNotSwallowedAsAlreadyGone() async throws {
+        // 🚨 THE INVARIANT: **a delete whose UID happens to contain 404 reaches the same
+        // typed handling as any other, and its intention is not dropped while the draft
+        // survives.**
+        //
+        // The `.deleteDraft` executor used to classify failures by SUBSTRING:
+        // `String(describing: error).lowercased().contains("404") || …("410") || …("not
+        // found")` meant "the server says it is already gone — treat as success". 404 and
+        // 410 are ORDINARY IMAP UID VALUES, and the match is on a substring, so every UID
+        // containing them (4041, 1404, 410, …) took that branch for ANY error mentioning
+        // it — including `uidResolutionFailed`, whose whole documented meaning is that the
+        // miss can be TRANSIENT (server-side indexing lag) and earns the drain's dedicated
+        // retry budget. The op was deleted on the first miss, the local header had already
+        // been removed optimistically, and the draft stayed on the server forever.
+        //
+        // The crossing: one armed empty SEARCH resolution, on a draft whose UID contains
+        // "404". Under the substring rule the first miss ends the op; under typed handling
+        // the retry finds the draft and removes it.
+        let accountId = "post-send-uid-404"
+        let draftRfc822 = "uid-with-404-inside@example.com"
+        let draftUID = 4041
+        #expect("\(draftUID)".contains("404"), "fixture precondition: the UID must contain 404")
+        let (pool, dir, previous) = try Self.makeFixture(accountId: accountId)
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [],
+            "Drafts": [Self.message(uid: draftUID, id: draftRfc822)],
+        ])
+        server.setUidValidity(Self.draftsEpoch, for: "Drafts")
+        server.expectMutation(rfc822MessageId: draftRfc822)
+        // ONE transient miss. The draft is there the whole time; the server simply fails
+        // to return it for the first resolution.
+        server.returnEmptySearch(forMessageId: draftRfc822, resolutionCount: 1)
+        try server.start()
+        defer { server.stop() }
+
+        try Self.insertCompletedSend(
+            accountId: accountId, serverDraftId: "\(draftUID)",
+            draftRfc822: draftRfc822, pool: pool)
+
+        let provider = Self.provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.reconcileOutbox()
+            await Self.drainUntilSettled(pool)
+        }
+
+        // Two-sided non-vacuity: the WIRE fault was actually served (otherwise this is a
+        // green-always control), and the DURABLE outcome is the draft's removal.
+        #expect(server.consumedEmptySearchResolutions()[draftRfc822] == 1,
+                """
+                the armed empty SEARCH resolution was never served \
+                (consumed: \(server.consumedEmptySearchResolutions())), so this case never \
+                exercised the transient-miss crossing it exists for.
+                """)
         #expect(server.messageIDs(in: "Drafts").isEmpty,
                 """
-                a legacy outbox row with no captured rfc822 left its draft on the server \
-                (Drafts holds \(server.messageIDs(in: "Drafts"))) even though the synced \
-                header for UID \(draftUID) carried the draft's Message-ID all along.
+                the draft is still on the server (Drafts holds \
+                \(server.messageIDs(in: "Drafts"))). Its UID contains "404", so a failure \
+                classified by substring reads a transient SEARCH miss as "the server \
+                confirmed it is gone", deletes the durable op on the first attempt, and \
+                never retries — while the draft the user just sent stays in Drafts as a \
+                permanent duplicate.
                 """)
-        #expect(server.wrongMessageViolations().isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty,
+                "the retried delete landed on a message the gesture never named: \(server.wrongMessageViolations())")
+        let remaining = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(remaining.isEmpty,
+                "the cleanup op neither completed nor terminated — it is parked, which wedges this lane")
     }
 
     // MARK: - 3. An unexecutable op must not block the ops behind it

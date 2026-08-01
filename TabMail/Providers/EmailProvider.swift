@@ -10,9 +10,20 @@ import Foundation
 struct DraftSaveResult: Sendable {
     let serverId: String
     let messageId: String?
-    init(serverId: String, messageId: String? = nil) {
+    /// IMAP only — the UIDVALIDITY reported by the very SELECT that carried this
+    /// save's APPEND, i.e. the epoch `serverId` was MINTED under. Persisted as
+    /// `Draft.serverDraftUidValidity` so a later delete can prove the address is
+    /// still the one it was given, rather than a number the server has since
+    /// re-pointed at another message.
+    ///
+    /// nil for Gmail/Exchange/Demo (their ids are durable identity, not
+    /// addresses) and whenever the epoch was not observed. nil means UNKNOWN —
+    /// callers must not synthesise a value from it.
+    let uidValidity: Int?
+    init(serverId: String, messageId: String? = nil, uidValidity: Int? = nil) {
         self.serverId = serverId
         self.messageId = messageId
+        self.uidValidity = uidValidity
     }
 }
 
@@ -277,8 +288,26 @@ protocol EmailProvider: Sendable {
     func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult
 
     /// Delete a draft from the server's Drafts folder.
-    /// Best-effort — failure is logged but does not throw (orphaned drafts are harmless).
-    func deleteDraft(draftId: String, draftsFolderPath: String) async throws
+    ///
+    /// The three id parameters are the ONE draft described three ways, and a
+    /// provider uses whichever of them it can actually verify:
+    ///   - `draftId` — the op's slot 0, the caller's primary handle. A durable
+    ///     resource id on Gmail/Exchange/Demo; on IMAP a bare UID (an ADDRESS) or
+    ///     an rfc822 Message-ID, depending on which the admission site had.
+    ///   - `rfc822MessageId` — the DRAFT's own Message-ID when the admission site
+    ///     knew it. An IDENTITY: it survives renumbering, but it is NOT unique —
+    ///     two legitimately distinct drafts can carry the same one.
+    ///   - `uidValidity` — IMAP only: the epoch `draftId` was minted under, when
+    ///     `draftId` is a UID. Non-nil is what upgrades the pair from "an
+    ///     identity that might match a sibling" to "this exact message in this
+    ///     exact numbering". nil means UNKNOWN and must never be substituted for.
+    ///
+    /// Throws `ProviderError.actionIdentityResolutionFailed` when it can build no
+    /// verifiable destructive target from them — a deterministic, pre-wire
+    /// refusal the drain terminalizes rather than retries. Authoritative absence
+    /// ("the server says it is already gone") is normalized to a clean return by
+    /// each provider itself; the queue does not inspect error text for it.
+    func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws
 
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
     func fetchHistory(since historyId: String) async throws -> HistoryResponse?

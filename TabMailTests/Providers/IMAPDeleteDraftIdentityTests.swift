@@ -118,7 +118,7 @@ struct IMAPDeleteDraftIdentityTests {
         defer { Task { try? await provider.disconnect() } }
 
         await #expect(throws: ProviderError.self) {
-            try await provider.deleteDraft(draftId: String(staleUID), draftsFolderPath: "Drafts")
+            try await provider.deleteDraft(draftId: String(staleUID), rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
         }
 
         let violations = server.wrongMessageViolations()
@@ -159,7 +159,7 @@ struct IMAPDeleteDraftIdentityTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(server.wrongMessageViolations().isEmpty,
                 """
@@ -201,7 +201,7 @@ struct IMAPDeleteDraftIdentityTests {
         defer { Task { try? await provider.disconnect() } }
 
         await #expect(throws: ProviderError.self) {
-            try await provider.deleteDraft(draftId: sharedId, draftsFolderPath: "Drafts")
+            try await provider.deleteDraft(draftId: sharedId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
         }
 
         #expect(server.wrongMessageViolations().isEmpty,
@@ -239,7 +239,7 @@ struct IMAPDeleteDraftIdentityTests {
         defer { Task { try? await provider.disconnect() } }
 
         await #expect(throws: ProviderError.self) {
-            try await provider.deleteDraft(draftId: malformed, draftsFolderPath: "Drafts")
+            try await provider.deleteDraft(draftId: malformed, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
         }
 
         #expect(server.wrongMessageViolations().isEmpty,
@@ -283,7 +283,7 @@ struct IMAPDeleteDraftIdentityTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: draftId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: draftId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(server.wrongMessageViolations().isEmpty,
                 "the delete mutated a message the gesture never named: \(server.wrongMessageViolations())")
@@ -329,7 +329,7 @@ struct IMAPDeleteDraftIdentityTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: colonDraftId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: colonDraftId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(server.wrongMessageViolations().isEmpty,
                 "the delete mutated a message the gesture never named: \(server.wrongMessageViolations())")
@@ -364,7 +364,7 @@ struct IMAPDeleteDraftIdentityTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(draftId: targetId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
 
         #expect(server.messageIDs(in: "Drafts") == [Self.bracketed(bystanderId)],
                 """

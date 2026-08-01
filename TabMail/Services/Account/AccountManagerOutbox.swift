@@ -16,6 +16,10 @@ struct ServerDraftCleanup: Sendable, Equatable {
     let accountId: String
     let serverDraftId: String
     let rfc822MessageId: String?
+    /// The UIDVALIDITY epoch `serverDraftId` was minted under, carried out of the
+    /// crash-recovery transaction beside the address itself so the queued delete can be
+    /// corroborated by `(identity, epoch)` rather than identity alone.
+    let uidValidity: Int?
 }
 
 extension AccountManager {
@@ -40,7 +44,7 @@ extension AccountManager {
     /// existing id is returned. (This is the persistence-layer guarantee; the UI
     /// `isSending` guard in ComposeView is the first line of defense.)
     @discardableResult
-    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftRfc822: String? = nil, draftId: String) async throws -> String {
+    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftRfc822: String? = nil, draftUidValidity: Int? = nil, draftId: String) async throws -> String {
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
@@ -48,6 +52,7 @@ extension AccountManager {
             isForward: isForward,
             serverDraftId: serverDraftId,
             draftRfc822: draftRfc822,
+            draftUidValidity: draftUidValidity,
             draftId: draftId
         )
         if DebugModeManager.isLoggingEnabled() {
@@ -106,6 +111,7 @@ extension AccountManager {
         isForward: Bool,
         serverDraftId: String?,
         draftRfc822: String? = nil,
+        draftUidValidity: Int? = nil,
         draftId: String
     ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) {
         var outbox = OutboxMessage(
@@ -120,6 +126,11 @@ extension AccountManager {
         // `sentMessageId` — a different message). Paired with `serverDraftId` from
         // the same caller snapshot. Ported from `v2final:AccountManagerOutbox`.
         outbox.draftRfc822MessageId = draftRfc822
+        // …and the epoch that `serverDraftId` belongs to, from the same snapshot. The
+        // rfc822 alone lets the backstops NAME the Drafts copy; only the epoch lets them
+        // tell that copy from a legitimate same-Message-ID sibling once their own target
+        // has gone. Ported from `v2final:AccountManagerOutbox` (`v85`).
+        outbox.draftServerUidValidity = draftUidValidity
         outbox.draftId = draftId
         // Hold the send until `now + undoHold + claimBuffer`. UI Undo button is
         // shown for `undoHold` (5 s); drain claim fires after +1 s claim buffer.
@@ -860,7 +871,15 @@ extension AccountManager {
             await queueDraftDelete(
                 serverDraftId: serverDraftId,
                 accountId: msg.accountId,
-                rfc822MessageId: msg.draftRfc822MessageId
+                rfc822MessageId: msg.draftRfc822MessageId,
+                // …with the epoch the address belongs to. This backstop runs
+                // UNCONDITIONALLY, after the primary delete queued at the send gesture
+                // has already had its chance, so by the time it resolves its own target
+                // is frequently gone — which is precisely the state in which a
+                // Message-ID search returns a same-Message-ID SIBLING as the sole
+                // remaining match. With the epoch it FETCHes the recorded UID instead
+                // and finds nothing: a clean no-op, sibling untouched.
+                uidValidity: msg.draftServerUidValidity
             )
         }
 
@@ -951,7 +970,8 @@ extension AccountManager {
                                 drafts.append(ServerDraftCleanup(
                                     accountId: msg.accountId,
                                     serverDraftId: sdi,
-                                    rfc822MessageId: msg.draftRfc822MessageId
+                                    rfc822MessageId: msg.draftRfc822MessageId,
+                                    uidValidity: msg.draftServerUidValidity
                                 ))
                             }
                             // Collect local Draft row for cleanup (same — finalizeOutboxMessage
@@ -1020,7 +1040,8 @@ extension AccountManager {
             await queueDraftDelete(
                 serverDraftId: cleanup.serverDraftId,
                 accountId: cleanup.accountId,
-                rfc822MessageId: cleanup.rfc822MessageId
+                rfc822MessageId: cleanup.rfc822MessageId,
+                uidValidity: cleanup.uidValidity
             )
         }
 

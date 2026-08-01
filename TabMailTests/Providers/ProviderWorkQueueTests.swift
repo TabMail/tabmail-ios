@@ -448,7 +448,7 @@ private actor WorkQueueMockProvider: EmailProvider {
     func send(draft: DraftMessage) async throws {}
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool { true }
     func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "") }
-    func deleteDraft(draftId: String, draftsFolderPath: String) async throws {}
+    func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
     func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
     func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }

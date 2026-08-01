@@ -214,7 +214,11 @@ actor DemoProvider: EmailProvider {
         return DraftSaveResult(serverId: serverId, messageId: nil)
     }
 
-    func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
+    /// `rfc822MessageId` / `uidValidity` are IMAP's epoch-safety pair; the demo store is
+    /// keyed by local id and has no numbering to corroborate against.
+    func deleteDraft(
+        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
+    ) async throws {
         guard let db = AppDatabase.shared.withLock({ $0 }) else { return }
         try await db.dbPool.write { conn in
             let headerId = MessageIdentity.headerId(accountId: self.accountId, folderPath: draftsFolderPath, messageId: draftId)
