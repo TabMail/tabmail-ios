@@ -1828,6 +1828,14 @@ struct ComposeView: View {
                 replyToHeaderId: replyTo?.id,
                 isForward: isForward,
                 serverDraftId: draftRecord?.serverDraftId ?? serverDraftHeader?.stableId,
+                // Snapshot the DRAFT's own rfc822 from the SAME source as
+                // `serverDraftId` above, so the post-send backstops in
+                // `finalizeOutboxMessage` / `reconcileOutbox` can name the Drafts copy
+                // by identity rather than by the bare UID `saveDraft` returned. The
+                // primary delete queued below already carries it; these two lines are
+                // what let the backstops resolve when this view's fire-and-forget
+                // `Task { queueDraftDelete }` never got to run.
+                draftRfc822: draftRecord?.rfc822MessageId ?? serverDraftHeader?.rfc822MessageId,
                 draftId: draftId
             )
         } catch {

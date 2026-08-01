@@ -1938,10 +1938,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if await server.supportsUIDPlus {
                 try await server.expunge(messages: srcUIDs)
             } else {
-                // No UIDPLUS: folder-wide EXPUNGE. May remove other \Deleted messages
-                // from this folder, which is acceptable on servers where we have no
-                // narrower primitive.
-                try await server.expunge()
+                // No UIDPLUS: FAIL CLOSED. A folder-wide EXPUNGE removes EVERY
+                // `\Deleted` message in this mailbox, not just `srcUIDs` — another
+                // client's soft-deleted mail, or a copy an interrupted earlier
+                // attempt left marked-but-unexpunged. The `\Deleted` STORE above
+                // already recorded this copy's removal (soft delete) and the
+                // destination copy is confirmed present, so the move's user-visible
+                // outcome is complete; a UIDPLUS-capable client or the server's own
+                // policy reclaims the source. Matches `v2final`'s `deleteActionSource`
+                // and `expungeScopedToTargets` below — "never wrong-delete" is
+                // unconditional, not UIDPLUS-gated.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] IMAPProvider.move — \(id): server lacks UIDPLUS — source marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
+                }
             }
         } else {
             _ = try await server.selectMailbox(source)
@@ -2222,6 +2231,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// its terminal no-op was the only non-wedging option available to it. The error
     /// TYPE is load-bearing for the same reason: an UNCLASSIFIED throw halts that
     /// account's lane on every drain, forever, behind an op that can never succeed.
+    ///
+    /// ⚑ WHICH ERROR, AND WHY IT IS NOT ONE ERROR. The two guards ABOVE the wire
+    /// (all-digits id, non-canonicalizing id) throw `actionIdentityResolutionFailed`;
+    /// every verdict BELOW the wire throws `uidResolutionFailed`. That split is the
+    /// whole classification: the pre-wire guards read a string and can NEVER decide
+    /// differently on a retry, so spending the retry budget on them is a lie that ends
+    /// in a "confirmed stale" drop the server never confirmed — the drain terminalizes
+    /// them instead (`v2final:AccountManagerQueue`'s `.deleteDraft` arm does the same).
+    /// The post-wire verdicts genuinely can flip: a SEARCH miss can be server-side
+    /// indexing lag, and a `>1` ambiguity resolves the moment one sibling goes away.
     func deleteDraft(draftId: String, draftsFolderPath: String) async throws {
         // Refuse BEFORE touching the wire. `draftId` is `MessageHeader.stableId` /
         // `Draft.serverDraftId`: for IMAP the former is the rfc822 Message-ID
@@ -2233,11 +2252,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // destructive command aimed at an address.
         guard UInt32(draftId) == nil else {
             print("[IMAP] deleteDraft: '\(draftId)' in \(draftsFolderPath) is a bare UID — an ADDRESS, not an identity, and nothing here can corroborate it. REFUSING (fail closed; the draft remains and the gesture can be re-issued)")
-            throw ProviderError.uidResolutionFailed(draftId)
+            throw ProviderError.actionIdentityResolutionFailed(draftId)
         }
         guard let expectedIdentity = MessageIdentity.comparableRfc822Identity(draftId) else {
             print("[IMAP] deleteDraft: '\(draftId)' in \(draftsFolderPath) does not canonicalize to an rfc822 Message-ID — REFUSING (fail closed; a malformed identity resolves nothing and must never fall through to a destructive command)")
-            throw ProviderError.uidResolutionFailed(draftId)
+            throw ProviderError.actionIdentityResolutionFailed(draftId)
         }
         try await withActionConnection(folder: draftsFolderPath) { server in
             // Epoch-immune: the SEARCH finds the draft under whatever UID the current
@@ -2285,23 +2304,22 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// on its `try?`-swallowed legs. That is a wrong-message deletion — C3 — with
     /// or without any UIDVALIDITY change.
     ///
-    /// The shape is `idempotentMove`'s, the in-repo precedent for exactly this
-    /// decision (same file, same `server.expunge(messages:)` primitive, same
-    /// UIDPLUS gate): UID EXPUNGE (RFC 4315) when the server advertises UIDPLUS,
-    /// and the mailbox-wide command ONLY when there is no narrower primitive to
-    /// use. `target` must already name exactly the verified UID(s).
+    /// UID EXPUNGE (RFC 4315) when the server advertises UIDPLUS, and NOTHING
+    /// otherwise. `target` must already name exactly the verified UID(s) to
+    /// delete — this is never a mailbox-wide operation. Ported from `v2final`'s
+    /// `storeDeletedAndMaybeExpunge` ("audit #9 semantics"), including its
+    /// fail-closed non-UIDPLUS arm.
     ///
-    /// ⚑ DELIBERATE DEVIATION FROM `v2final`, stated rather than hidden: the
-    /// reference's `storeDeletedAndMaybeExpunge` FAILS CLOSED without UIDPLUS —
-    /// it leaves the draft soft-deleted and skips the purge entirely. That trade
-    /// is not available here. v3 has no draft-side reconciliation that would
-    /// finish the job, so a soft delete alone leaves the server draft in place for
-    /// the very next sync to re-materialise: the user deletes a draft, watches it
-    /// vanish, and watches it come back — a permanent user-visible failure on
-    /// every non-UIDPLUS server, i.e. the mirror-image bug. `idempotentMove`
-    /// already accepted the same bounded collateral for the same reason, and the
-    /// narrowing above removes it outright for every UIDPLUS server (all three
-    /// mainstream providers, and effectively every server this app connects to).
+    /// An earlier revision of this function ran a bare `server.expunge()` on the
+    /// non-UIDPLUS branch and carried a comment presenting that as a deliberate
+    /// deviation from `v2final`, on the reasoning that a soft delete alone lets
+    /// the server draft re-materialise on the next sync. **That reasoning was
+    /// wrong and the comment has been removed.** The "never wrong-delete"
+    /// invariant (C3) is UNCONDITIONAL, not UIDPLUS-gated: trading a guaranteed
+    /// wrong-delete of somebody else's mail for a cosmetic reappearance is not a
+    /// trade this codebase is allowed to make. A draft that comes back is
+    /// visible, re-deletable, and costs the user a second gesture; a draft this
+    /// call destroyed without ever identifying it is gone.
     private func expungeScopedToTargets(
         _ target: UIDSet, server: IMAPServer, logDescription: String
     ) async throws {
@@ -2314,9 +2332,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 print("[IMAP] Purged \(logDescription) (UID EXPUNGE)")
             }
         } else {
-            try await server.expunge()
+            // No UIDPLUS: a mailbox-wide EXPUNGE is the ONLY server-side purge
+            // available, and it removes EVERY `\Deleted` message in the selected
+            // mailbox (RFC 3501 §6.4.3) — another client's soft-deleted mail, or a
+            // copy a crashed `saveDraft` left marked-but-unexpunged on one of its
+            // `try?`-swallowed legs. That is a wrong-message deletion, with or
+            // without any UIDVALIDITY change. FAIL CLOSED: the `\Deleted` STORE the
+            // caller already issued records the deletion intent (soft delete), and a
+            // UIDPLUS-capable client or the server's own policy completes the purge.
+            // NEVER a mailbox-wide EXPUNGE.
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Purged \(logDescription) (no UIDPLUS — mailbox-wide EXPUNGE)")
+                print("[IMAP] \(logDescription): server lacks UIDPLUS — marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
             }
         }
     }

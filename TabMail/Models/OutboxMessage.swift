@@ -52,6 +52,22 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// Server draft ID captured from local Draft table before deletion.
     /// Used to delete the server draft after send confirmation in drainOutbox.
     var serverDraftId: String?
+    /// The DRAFT's own RFC 822 Message-ID, captured at queue-send time from
+    /// `Draft.rfc822MessageId` and paired with `serverDraftId` from the same
+    /// caller snapshot. (v71)
+    ///
+    /// ⚠️ NOT `sentMessageId`. Those are two different messages: `sentMessageId`
+    /// belongs to the message SMTP delivered and IMAP appended to Sent, and the
+    /// copy sitting in Drafts never carries it — keying the post-send cleanup by
+    /// it searches Drafts and finds nothing.
+    ///
+    /// Exists because `IMAPProvider.saveDraft` returns a bare numeric UID as
+    /// `serverDraftId`, and a UID is a mutable ADDRESS that `IMAPProvider
+    /// .deleteDraft` refuses to build a destructive command from. This column is
+    /// what lets the post-send backstops (`finalizeOutboxMessage`, and
+    /// `reconcileOutbox` after a crash — neither of which has a live `Draft` row
+    /// to read) hand `queueDraftDelete` an identity that can actually resolve.
+    var draftRfc822MessageId: String?
     /// Wall-clock deadline before drain is allowed to claim this row. Set by
     /// queueSend to now + outboxUndoHoldSeconds + outboxClaimBufferSeconds.
     /// NULL for legacy pre-v49 rows (treated as "no hold" by the drain gate).

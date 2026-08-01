@@ -2095,5 +2095,32 @@ final class AppDatabase: Sendable {
                 t.column("icsText", .text)
             }
         }
+
+        migrator.registerMigration("v71_addOutboxDraftRfc822MessageId") { db in
+            // The DRAFT's own RFC 822 Message-ID, snapshotted at queue-send time so
+            // the post-send server-draft cleanup can name the Drafts copy by an
+            // identity instead of by the bare IMAP UID `IMAPProvider.saveDraft`
+            // returns. Without it, `finalizeOutboxMessage` and `reconcileOutbox`
+            // queued a `.deleteDraft` carrying nothing but that UID — which
+            // `IMAPProvider.deleteDraft` refuses (a UID is an ADDRESS, not an
+            // identity), so the op could only fail and be dropped while the sent
+            // draft stayed on the server.
+            //
+            // This is NOT `sentMessageId`: that is the SENT message's own
+            // independently-generated id, which the Drafts copy never carries, so
+            // keying the cleanup by it searches Drafts and finds nothing.
+            //
+            // Nullable, no default, no backfill — a pre-migration outbox row simply
+            // has no snapshot and its cleanup behaves exactly as it does today. Such
+            // rows drain within one session.
+            //
+            // PORTED from the reference's `OutboxMessage.draftRfc822MessageId`
+            // (`v2final:TabMail/Models/OutboxMessage.swift`). The migration NUMBER is
+            // v3's own: v3's ceiling is v70 and `v2final` never shipped, so its
+            // numbering is irrelevant here and must not be copied.
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "draftRfc822MessageId", .text)
+            }
+        }
     }
 }

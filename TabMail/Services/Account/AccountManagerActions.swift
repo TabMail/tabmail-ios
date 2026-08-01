@@ -1225,11 +1225,33 @@ extension AccountManager {
                 let folderId = "\(accountId):\(folderPath)"
                 // Remove by server UID (synced header)
                 let serverId = "\(accountId):\(folderPath):\(serverDraftId)"
+
+                // LEGACY RESCUE: a caller with no rfc822 to give (a `Draft` row from
+                // before the push wrote both columns together, or an outbox row queued
+                // before v71) would record an op whose only id is a bare UID — an
+                // ADDRESS the IMAP provider refuses to build a destructive command
+                // from, so the op could only ever be refused and dropped while the
+                // server draft survived. The server-synced header for this very
+                // `serverDraftId` already carries the draft's Message-ID, so adopt it.
+                // Same resolution `queueDraftSave` above applies to the same gap
+                // (ported from `v2final:AccountManagerActions`); read-only here —
+                // there may be no `Draft` row left to write it back to.
+                var resolvedRfc822 = rfc822MessageId
+                if resolvedRfc822 == nil,
+                   let serverHeader = try MessageHeader.fetchOne(db, key: serverId),
+                   let headerRfc822 = serverHeader.rfc822MessageId,
+                   !headerRfc822.isEmpty {
+                    resolvedRfc822 = headerRfc822
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Queue] queueDraftDelete: adopted rfc822 from server header \(serverId) → \(headerRfc822)")
+                    }
+                }
+
                 if try MessageHeader.deleteOne(db, key: serverId) {
                     _ = try? MessageBody.deleteOne(db, key: serverId)
                 }
                 // Also remove optimistic header by rfc822MessageId (placeholder UID)
-                if let rfc822 = rfc822MessageId {
+                if let rfc822 = resolvedRfc822 {
                     let optimistic = try MessageHeader
                         .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822)
                         .fetchAll(db)
@@ -1244,7 +1266,7 @@ extension AccountManager {
                 // from the server during the brief window before .deleteDraft drains.
                 // Matches the protection pattern in queueDraftSave.
                 var opMsgIds = [serverDraftId]
-                if let rfc822 = rfc822MessageId {
+                if let rfc822 = resolvedRfc822, rfc822 != serverDraftId {
                     opMsgIds.append(rfc822)
                 }
                 // T4.S6 follow-up — RECORD THE EPOCH THIS OP'S ADDRESS BELONGS TO.

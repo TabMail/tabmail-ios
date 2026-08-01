@@ -576,6 +576,58 @@ extension AccountManager {
                 context.executedAny = true
                 return .proceed
             }
+            // The provider REFUSED the id before touching the wire — it is not an
+            // identity anything can verify (a bare numeric UID, or a value that does
+            // not canonicalize to an rfc822 Message-ID). DETERMINISTIC: the same
+            // string will be refused on every future drain, so this must not spend
+            // `uidResolutionRetryCount` and must not reach the "confirmed stale"
+            // branch below — that branch's whole meaning is "the server told us the
+            // message is gone", and nothing here ever asked the server.
+            //
+            // Ported from `v2final:AccountManagerQueue`'s `.deleteDraft` arm
+            // ("TERMINAL drop of a provider-authoritative identity refusal").
+            if case ProviderError.actionIdentityResolutionFailed(let refusedId) = error {
+                if currentOp.messageIds.count > 1 {
+                    // The op carries MORE than one id — for `.deleteDraft` those are
+                    // the server address AND the durable rfc822 identity of the SAME
+                    // draft. Split so the sibling the provider CAN verify gets its own
+                    // op and the user's intention still lands. This is the existing
+                    // rescue split, entered without burning a retry budget.
+                    print("[Queue] Identity refused in \(opType) (\(opMsgCount) ids: \(refusedId) is not verifiable) — splitting so a verifiable sibling id can execute")
+                    do {
+                        try await dbPool.write { db in
+                            for msgId in currentOp.messageIds {
+                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
+                                // Split ops inherit the batch's queue position — see
+                                // the identical comment on the messageNotFound split.
+                                splitOp.createdAt = currentOp.createdAt
+                                try splitOp.insert(db)
+                            }
+                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                        }
+                    } catch {
+                        print("[Queue] Failed to split identity-refused op \(currentOp.id): \(error) — will retry as-is")
+                    }
+                    context.executedAny = true
+                    // Halt the lane rather than .proceed — see the identical
+                    // never-run-ahead comment on the messageNotFound split above.
+                    return .haltLane
+                }
+                // A single id the provider will refuse forever. Retrying cannot change
+                // it and parking it is a permanent lane wedge, so it ends here — but
+                // LOUDLY and immediately, not after three fake retries dressed up as a
+                // staleness confirmation. Nothing is destroyed: the server-side object
+                // this op named is still there, still visible after the next sync, and
+                // the user's re-issued gesture goes through the UI paths that DO carry
+                // an rfc822 identity (`InboxViewModel.deleteDraftMessage`,
+                // `ComposeView`'s discard/send paths).
+                print("[Queue] Identity refused in \(opType): '\(refusedId)' is not a verifiable identity and never will be — dropping the op (the server-side object is untouched and remains visible for a re-issued gesture)")
+                try? await retryWrite(dbPool, label: "Queue") { db in
+                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                }
+                context.executedAny = true
+                return .proceed
+            }
             // UID resolution failed — message not found in source folder via IMAP SEARCH.
             // Confirm staleness by checking destination (for move ops) or drop (for flag ops).
             if case ProviderError.uidResolutionFailed(let failedId) = error {

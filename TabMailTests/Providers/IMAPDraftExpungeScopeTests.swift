@@ -156,26 +156,41 @@ struct IMAPDraftExpungeScopeTests {
         #expect(server.wrongMessageViolations().isEmpty)
     }
 
-    @Test("Control: a server WITHOUT UIDPLUS still gets its draft deleted")
-    func deleteDraftWorksOnAServerWithoutUidPlus() async throws {
-        // UID EXPUNGE (RFC 4315) is a UIDPLUS extension. The narrowing above is
-        // therefore conditional, and the fallback must remain the mailbox-wide
-        // command — `IMAPProvider.idempotentMove`'s established in-repo precedent
-        // for the same decision, and the only server-side purge such a server
-        // offers. Bricking draft deletion on non-UIDPLUS servers to buy a narrower
-        // blast radius would be a strictly worse trade: the draft would come back
-        // on the very next sync, forever.
+    // MARK: - 3. The same invariant with NO UIDPLUS to narrow the purge
+
+    @Test("A server WITHOUT UIDPLUS still leaves a Deleted-flagged bystander alone")
+    func deleteDraftWithoutUidPlusDoesNotDestroyABystander() async throws {
+        // ⚠ THE COVERAGE GAP THAT LET THE DEFECT THROUGH, CLOSED. The invariant case
+        // above runs on a UIDPLUS server, where `expunge(messages:)` narrows the purge
+        // for free; the old non-UIDPLUS case ran with a mailbox containing NOTHING but
+        // the target, so the branch that actually issued the mailbox-wide command was
+        // never observed destroying anything. Between them they proved nothing about
+        // the only branch where the blast radius exists. This case is the crossing of
+        // the two: no UIDPLUS, AND a pre-`\Deleted` bystander the gesture never named.
         //
-        // ⚑ This is a DELIBERATE deviation from `v2final`, whose
-        // `storeDeletedAndMaybeExpunge` fails closed here (soft delete only). That
-        // tree carried draft-side reconciliation this one does not.
+        // UID EXPUNGE (RFC 4315) is a UIDPLUS extension, so on this server there is no
+        // narrower purge to fall back to — only the mailbox-wide one, which takes every
+        // `\Deleted` message in Drafts with it. The resolution is to FAIL CLOSED and
+        // skip the purge, not to widen it: "never wrong-delete" is unconditional, not
+        // UIDPLUS-gated. (Matches `v2final`'s `storeDeletedAndMaybeExpunge`.)
         let targetId = "draft-no-uidplus-target@example.com"
+        let bystanderId = "draft-no-uidplus-bystander@example.com"
+        let bystanderUID = 7099
         let capabilities = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" }
         #expect(!capabilities.contains("UIDPLUS"), "fixture precondition: UIDPLUS must be absent")
 
         let server = FakeIMAPServer(
             capabilities: capabilities,
-            mailboxes: ["INBOX": [], "Drafts": [Self.message(uid: 7100, id: targetId)]])
+            mailboxes: [
+                "INBOX": [],
+                "Drafts": [
+                    Self.message(uid: bystanderUID, id: bystanderId),
+                    Self.message(uid: 7100, id: targetId),
+                ],
+            ])
+        // Same residue as the UIDPLUS case: marked \Deleted by an interrupted save or
+        // by another client, never expunged, never gestured on here.
+        server.setFlags(["\\Deleted"], in: "Drafts", uid: bystanderUID)
         server.expectMutation(rfc822MessageId: targetId)
         try server.start()
         defer { server.stop() }
@@ -186,11 +201,57 @@ struct IMAPDraftExpungeScopeTests {
 
         try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
 
-        #expect(server.messageIDs(in: "Drafts").isEmpty,
+        let violations = server.wrongMessageViolations()
+        #expect(violations.isEmpty,
                 """
-                a draft delete against a server with no UIDPLUS left the draft in place \
-                (Drafts holds \(server.messageIDs(in: "Drafts"))). The scoping must degrade to \
-                the mailbox-wide EXPUNGE, not refuse.
+                deleting one draft on a server without UIDPLUS destroyed a message the \
+                gesture never named: \(violations). A bare EXPUNGE is mailbox-wide \
+                (RFC 3501 §6.4.3) and there is no narrower primitive here, so the purge \
+                must be SKIPPED — the \\Deleted STORE has already recorded the deletion \
+                intent and a UIDPLUS-capable client or the server's own policy completes \
+                it. Widening the blast radius to complete this one delete is the trade \
+                the "never wrong-delete" invariant exists to forbid.
+                """)
+        #expect(server.messageIDs(in: "Drafts").contains("<\(bystanderId)>"),
+                """
+                the untargeted \\Deleted bystander is gone from Drafts (it holds \
+                \(server.messageIDs(in: "Drafts"))) — a message this call never identified \
+                was destroyed.
+                """)
+    }
+
+    @Test("Control: a server WITHOUT UIDPLUS still records the deletion, as a soft delete")
+    func deleteDraftWithoutUidPlusStillMarksItsTargetDeleted() async throws {
+        // Non-vacuity for the case above, and the mirror-image guard: failing closed on
+        // the PURGE must not become failing closed on the DELETE. The user's gesture
+        // still has to reach the server — as the `\Deleted` STORE, which is the only
+        // durable record of intent such a server can hold. A `deleteDraft` that
+        // returned without touching the target at all would satisfy the bystander
+        // assertion trivially while silently doing nothing.
+        let targetId = "draft-no-uidplus-soft@example.com"
+        let capabilities = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" }
+        #expect(!capabilities.contains("UIDPLUS"), "fixture precondition: UIDPLUS must be absent")
+
+        let server = FakeIMAPServer(
+            capabilities: capabilities,
+            mailboxes: ["INBOX": [], "Drafts": [Self.message(uid: 7200, id: targetId)]])
+        server.expectMutation(rfc822MessageId: targetId)
+        try server.start()
+        defer { server.stop() }
+
+        let provider = Self.provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await provider.deleteDraft(draftId: targetId, draftsFolderPath: "Drafts")
+
+        let flags = server.flags(in: "Drafts", rfc822MessageId: targetId)
+        #expect(flags?.contains("\\Deleted") == true,
+                """
+                the addressed draft was not even marked \\Deleted on a server without \
+                UIDPLUS (flags: \(flags.map { String(describing: $0) } ?? "message absent")). \
+                Skipping the mailbox-wide EXPUNGE is the fix; skipping the STORE too would \
+                make the delete a silent no-op — the mirror image.
                 """)
         #expect(server.wrongMessageViolations().isEmpty)
     }

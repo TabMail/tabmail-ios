@@ -6,6 +6,18 @@ import Foundation
 import GRDB
 import SwiftMail
 
+/// One completed send's server-side draft cleanup, collected INSIDE the crash
+/// recovery transaction and acted on outside it (network work must never run in
+/// a write block). Carries the draft's durable rfc822 identity alongside its
+/// server address so the `.deleteDraft` it queues can actually resolve — on IMAP
+/// the address alone is a bare UID the provider refuses to act on. Mirrors
+/// `v2final`'s `CompletedSendCleanupDisposition.ServerDraftCleanup`.
+struct ServerDraftCleanup: Sendable, Equatable {
+    let accountId: String
+    let serverDraftId: String
+    let rfc822MessageId: String?
+}
+
 extension AccountManager {
 
     // MARK: - Outbox (Offline Send Queue)
@@ -28,13 +40,14 @@ extension AccountManager {
     /// existing id is returned. (This is the persistence-layer guarantee; the UI
     /// `isSending` guard in ComposeView is the first line of defense.)
     @discardableResult
-    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftId: String) async throws -> String {
+    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftRfc822: String? = nil, draftId: String) async throws -> String {
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
             replyToHeaderId: replyToHeaderId,
             isForward: isForward,
             serverDraftId: serverDraftId,
+            draftRfc822: draftRfc822,
             draftId: draftId
         )
         if DebugModeManager.isLoggingEnabled() {
@@ -92,6 +105,7 @@ extension AccountManager {
         replyToHeaderId: String?,
         isForward: Bool,
         serverDraftId: String?,
+        draftRfc822: String? = nil,
         draftId: String
     ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) {
         var outbox = OutboxMessage(
@@ -101,6 +115,11 @@ extension AccountManager {
             isForward: isForward
         )
         outbox.serverDraftId = serverDraftId
+        // Capture the DRAFT's own server rfc822 so the post-send server-draft
+        // cleanup resolves by the id the Drafts copy actually carries (never
+        // `sentMessageId` — a different message). Paired with `serverDraftId` from
+        // the same caller snapshot. Ported from `v2final:AccountManagerOutbox`.
+        outbox.draftRfc822MessageId = draftRfc822
         outbox.draftId = draftId
         // Hold the send until `now + undoHold + claimBuffer`. UI Undo button is
         // shown for `undoHold` (5 s); drain claim fires after +1 s claim buffer.
@@ -831,7 +850,18 @@ extension AccountManager {
         // Queue server draft deletion via PendingOperation (crash-safe, retried on failure).
         // The email has been sent — the draft on the server is now stale.
         if let serverDraftId = msg.serverDraftId {
-            await queueDraftDelete(serverDraftId: serverDraftId, accountId: msg.accountId)
+            // Hand over the DRAFT's own rfc822 alongside its server address. On IMAP
+            // `serverDraftId` is a bare UID, which `IMAPProvider.deleteDraft` refuses
+            // to build a destructive command from — without the identity this backstop
+            // could only fail, and the sent draft would stay in Drafts. The snapshot is
+            // read off the OUTBOX row, not the `Draft` row, because the local Draft was
+            // already deleted a few lines above (and, in `reconcileOutbox`, may never
+            // have existed in this process at all).
+            await queueDraftDelete(
+                serverDraftId: serverDraftId,
+                accountId: msg.accountId,
+                rfc822MessageId: msg.draftRfc822MessageId
+            )
         }
 
         // Sync the Sent folder so the sent message appears there immediately.
@@ -898,16 +928,16 @@ extension AccountManager {
         // Collect cleanup work to do OUTSIDE the DB transaction
         // (file I/O and network calls inside a write block would roll back on failure).
         var dirsToClean: [String] = []
-        var serverDraftsToDelete: [(accountId: String, serverDraftId: String)] = []
+        var serverDraftsToDelete: [ServerDraftCleanup] = []
 
         var localDraftsToDelete: [String] = []
         do {
-            let result: (dirs: [String], drafts: [(String, String)], localDrafts: [String]) = try await retryWrite(dbPool, retryDelay: .milliseconds(200), label: "Outbox") { db in
+            let result: (dirs: [String], drafts: [ServerDraftCleanup], localDrafts: [String]) = try await retryWrite(dbPool, retryDelay: .milliseconds(200), label: "Outbox") { db in
                 let stale = try OutboxMessage
                     .filter(Column("status") == OutboxStatus.sending.rawValue)
                     .fetchAll(db)
                 var dirs: [String] = []
-                var drafts: [(String, String)] = []
+                var drafts: [ServerDraftCleanup] = []
                 var localDrafts: [String] = []
                 for msg in stale {
                     if msg.sentAt != nil {
@@ -918,7 +948,11 @@ extension AccountManager {
                             print("[Outbox] Crash recovery: deleting fully-completed message \(msg.id)")
                             // Collect server draft for cleanup (may have been missed on crash)
                             if let sdi = msg.serverDraftId {
-                                drafts.append((msg.accountId, sdi))
+                                drafts.append(ServerDraftCleanup(
+                                    accountId: msg.accountId,
+                                    serverDraftId: sdi,
+                                    rfc822MessageId: msg.draftRfc822MessageId
+                                ))
                             }
                             // Collect local Draft row for cleanup (same — finalizeOutboxMessage
                             // would have deleted it; this catches the crash-before-finalize case).
@@ -979,9 +1013,15 @@ extension AccountManager {
             try? FileManager.default.removeItem(at: dir)
         }
 
-        // Queue server draft deletion via PendingOperation for crash-recovered messages
-        for (accountId, serverDraftId) in serverDraftsToDelete {
-            await queueDraftDelete(serverDraftId: serverDraftId, accountId: accountId)
+        // Queue server draft deletion via PendingOperation for crash-recovered messages.
+        // Carries the draft's own rfc822 (see finalizeOutboxMessage) — this path has no
+        // live Draft row at all, so the outbox snapshot is the ONLY identity available.
+        for cleanup in serverDraftsToDelete {
+            await queueDraftDelete(
+                serverDraftId: cleanup.serverDraftId,
+                accountId: cleanup.accountId,
+                rfc822MessageId: cleanup.rfc822MessageId
+            )
         }
 
         // Delete local Draft rows for fully-completed crash-recovered messages.
