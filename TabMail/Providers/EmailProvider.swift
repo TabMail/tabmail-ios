@@ -4,27 +4,45 @@
 
 import Foundation
 
-/// Result of saving a draft to the server.
-/// For Gmail: serverId is the draft resource ID, messageId is the underlying Gmail message ID.
-/// For IMAP/Exchange: serverId is the UID/message ID (same as messageId), so messageId is nil.
-struct DraftSaveResult: Sendable {
-    let serverId: String
-    let messageId: String?
-    /// IMAP only — the UIDVALIDITY reported by the very SELECT that carried this
-    /// save's APPEND, i.e. the epoch `serverId` was MINTED under. Persisted as
-    /// `Draft.serverDraftUidValidity` so a later delete can prove the address is
-    /// still the one it was given, rather than a number the server has since
-    /// re-pointed at another message.
-    ///
-    /// nil for Gmail/Exchange/Demo (their ids are durable identity, not
-    /// addresses) and whenever the epoch was not observed. nil means UNKNOWN —
-    /// callers must not synthesise a value from it.
-    let uidValidity: Int?
-    init(serverId: String, messageId: String? = nil, uidValidity: Int? = nil) {
-        self.serverId = serverId
-        self.messageId = messageId
-        self.uidValidity = uidValidity
-    }
+/// PORT — reduced from v2final `DraftSaveOutcome` / `CreatedId` (82c9ce5c9).
+/// A created address is provider-native; no display/header identifier may be
+/// reinterpreted as mutation authority.
+enum DraftCreatedAddress: Sendable, Equatable {
+    case gmail(resourceId: String, containedMessageId: String?)
+    case outlook(graphId: String)
+    case imap(folder: String, uidValidity: Int, uid: Int)
+    case demo(localId: String)
+}
+
+enum DraftSaveOutcome: Sendable, Equatable {
+    case created(DraftCreatedAddress)
+    /// The provider may have created a copy, but this attempt produced no
+    /// destructive-capable address. Terminal for this attempt; sync reconciles.
+    case unaddressable
+}
+
+/// PORT — reduced typed delete seam from v2final commit 83205c5a7.
+enum DraftDeleteIdentity: Sendable, Equatable {
+    case gmail(resourceId: String)
+    case gmailContainedMessage(messageId: String)
+    case outlook(graphId: String)
+    case imap(folder: String, uidValidity: Int, uid: Int)
+    case demo(localId: String)
+}
+
+enum DraftDeleteAddressKind: String, Codable, Sendable {
+    case providerResource
+    case gmailContainedMessage
+}
+
+/// PORT adaptation of v2final's concrete registered-provider switch. This is
+/// deliberately runtime truth, never the persisted Account.provider column.
+enum DraftRuntimeIdentityKind: Sendable, Equatable {
+    case gmail
+    case outlook
+    case imap
+    case demo
+    case unknown
 }
 
 struct FolderInfo: Sendable {
@@ -268,46 +286,24 @@ protocol EmailProvider: Sendable {
     /// - Returns: `true` if the message was appended (or confirmed already present).
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool
 
-    /// Save a draft to the server's Drafts folder. Creates or updates.
-    /// - Parameters:
-    ///   - draft: The draft message content.
-    ///   - existingDraftId: Server-side draft ID for update (nil for create).
-    ///   - previousRfc822MessageId: The rfc822 Message-ID the OLD server copy carries —
-    ///     i.e. the value `Draft.rfc822MessageId` held BEFORE `DraftStore.pushDraftToServer`
-    ///     rotated it for this push. IMAP's old-copy delete resolves its target by THIS
-    ///     identity and by nothing else: never by `draft.messageId` (the FRESH id, which the
-    ///     old copy does not carry → the delete would find nothing and orphan it) and never
-    ///     by `existingDraftId` (a raw UID — a mutable address that a `UIDVALIDITY` reset
-    ///     reassigns to a DIFFERENT message, so destroying it destroys the user's real mail).
-    ///     nil/blank ⇒ no old-copy delete is attempted; never substitute the fresh id.
-    ///     Gmail/Exchange/Demo update in place by `existingDraftId` and IGNORE this
-    ///     parameter (their ids are durable identity, not addresses).
-    ///   - draftsFolderPath: Server-side Drafts folder path (for IMAP).
-    /// - Returns: DraftSaveResult with serverId (for update/delete) and optional messageId
-    ///   (Gmail only — the underlying message ID, different from the draft resource ID).
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult
+    /// Save a draft using only typed provider-native prior authority.
+    func saveDraft(
+        _ draft: DraftMessage,
+        existingIdentity: DraftDeleteIdentity?,
+        draftsFolderPath: String
+    ) async throws -> DraftSaveOutcome
 
-    /// Delete a draft from the server's Drafts folder.
-    ///
-    /// The three id parameters are the ONE draft described three ways, and a
-    /// provider uses whichever of them it can actually verify:
-    ///   - `draftId` — the op's slot 0, the caller's primary handle. A durable
-    ///     resource id on Gmail/Exchange/Demo; on IMAP a bare UID (an ADDRESS) or
-    ///     an rfc822 Message-ID, depending on which the admission site had.
-    ///   - `rfc822MessageId` — the DRAFT's own Message-ID when the admission site
-    ///     knew it. An IDENTITY: it survives renumbering, but it is NOT unique —
-    ///     two legitimately distinct drafts can carry the same one.
-    ///   - `uidValidity` — IMAP only: the epoch `draftId` was minted under, when
-    ///     `draftId` is a UID. Non-nil is what upgrades the pair from "an
-    ///     identity that might match a sibling" to "this exact message in this
-    ///     exact numbering". nil means UNKNOWN and must never be substituted for.
-    ///
-    /// Throws `ProviderError.actionIdentityResolutionFailed` when it can build no
-    /// verifiable destructive target from them — a deterministic, pre-wire
-    /// refusal the drain terminalizes rather than retries. Authoritative absence
-    /// ("the server says it is already gone") is normalized to a clean return by
-    /// each provider itself; the queue does not inspect error text for it.
-    func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws
+    /// PORT — narrowed from v2final `resolveDraftResource`. A Gmail Drafts
+    /// header carries the contained MESSAGE id, while mutations require the
+    /// wrapping RESOURCE id. Exactly one byte-exact wrapper returns its typed
+    /// address; zero or multiple wrappers fail closed as `nil`.
+    func resolveDraftResource(
+        containedMessageId: String,
+        draftsFolderPath: String
+    ) async throws -> DraftCreatedAddress?
+
+    /// Delete exactly one typed provider-native draft identity.
+    func deleteDraft(identity: DraftDeleteIdentity) async throws
 
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
     func fetchHistory(since historyId: String) async throws -> HistoryResponse?
@@ -332,6 +328,14 @@ protocol EmailProvider: Sendable {
 }
 
 extension EmailProvider {
+    func resolveDraftResource(
+        containedMessageId: String,
+        draftsFolderPath: String
+    ) async throws -> DraftCreatedAddress? {
+        throw ProviderError.actionIdentityResolutionFailed(
+            "resolveDraftResource: provider has no contained-message adapter")
+    }
+
     /// Default `nil` — UIDVALIDITY is an IMAP concept, so every other provider
     /// (and every generic test double) reports "unknown". `nil` is the FAIL-SAFE
     /// answer here: the only consumer is a bootstrap-only persist that writes

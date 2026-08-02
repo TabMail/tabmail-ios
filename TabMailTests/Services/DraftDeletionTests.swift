@@ -8,7 +8,7 @@ import GRDB
 @testable import TabMail
 
 /// Tests for draft save/delete lifecycle: isPermanentlyInvalidError classification,
-/// DraftSaveResult struct, pendingAllIds protection for .saveDraft ops, and
+/// typed DraftSaveOutcome, pendingAllIds protection for .saveDraft ops, and
 /// flushAIBatch folder filtering.
 @Suite("Draft Deletion Tests")
 struct DraftDeletionTests {
@@ -113,22 +113,6 @@ struct DraftDeletionTests {
         let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 429))
         let manager = AccountManager.shared
         #expect(!manager.isPermanentlyInvalidError(error))
-    }
-
-    // MARK: - DraftSaveResult
-
-    @Test("DraftSaveResult: init with serverId only")
-    func draftSaveResultServerIdOnly() {
-        let result = DraftSaveResult(serverId: "r-123")
-        #expect(result.serverId == "r-123")
-        #expect(result.messageId == nil)
-    }
-
-    @Test("DraftSaveResult: init with serverId and messageId (Gmail)")
-    func draftSaveResultGmail() {
-        let result = DraftSaveResult(serverId: "r-123", messageId: "19d4abc")
-        #expect(result.serverId == "r-123")
-        #expect(result.messageId == "19d4abc")
     }
 
     // MARK: - PendingOperation messageIds for .saveDraft
@@ -394,9 +378,31 @@ struct DraftDeletionTests {
     @Test("MockEmailProvider.deleteDraft records call")
     func mockDeleteDraft() async throws {
         let provider = MockEmailProvider()
-        try await provider.deleteDraft(draftId: "draft-123", rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "DRAFT")
+        try await provider.deleteDraft(
+            identity: .gmail(resourceId: "draft-123"))
         let log = await provider.callLog
         #expect(log.contains { $0.contains("deleteDraft") })
+    }
+
+    @Test("Concrete Demo and Gmail providers never cross typed draft namespaces")
+    func concreteProvidersRefuseForeignDraftNamespaces() async {
+        let demo = DemoProvider(accountId: "demo-account")
+        await #expect(throws: ProviderError.self) {
+            try await demo.deleteDraft(
+                identity: .gmail(resourceId: "gmail-resource"))
+        }
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let gmail = GmailProvider(
+            userEmail: "owner@example.com",
+            accessToken: { _ in "unused-token" },
+            session: http.session)
+        await #expect(throws: ProviderError.self) {
+            try await gmail.deleteDraft(
+                identity: .demo(localId: "demo-local"))
+        }
+        #expect(http.recordedCalls().isEmpty)
     }
 
     // MARK: - isMessageNotFoundError (boundary with isPermanentlyInvalidError)

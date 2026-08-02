@@ -67,7 +67,34 @@ final class ActiveAgentTracker {
 
     /// The draftId of the currently working compose session, if any.
     var workingComposeDraftId: String? {
-        workingSessions.first { $0.hasPrefix("compose:") }.map { String($0.dropFirst("compose:".count)) }
+        workingSessions.lazy.compactMap {
+            Self.parseComposeSession($0)?.draftId
+        }.first
+    }
+
+    /// PORT 3f2cc4c34: injective process/persistence session identity for one
+    /// logical draft generation. Draft ids and epochs may both contain colons.
+    nonisolated static func composeSessionKey(draftId: String, epoch: String) -> String {
+        "compose:\(epoch.utf8.count):\(epoch)\(draftId)"
+    }
+
+    nonisolated static func parseComposeSession(
+        _ sessionKey: String
+    ) -> (draftId: String, epoch: String)? {
+        let prefix = "compose:"
+        guard sessionKey.hasPrefix(prefix) else { return nil }
+        let bytes = Array(sessionKey.utf8.dropFirst(prefix.utf8.count))
+        guard let separator = bytes.firstIndex(of: UInt8(ascii: ":")),
+              let countText = String(bytes: bytes[..<separator], encoding: .utf8),
+              let epochCount = Int(countText), epochCount > 0 else { return nil }
+        let suffix = bytes[(separator + 1)...]
+        guard suffix.count > epochCount else { return nil }
+        let epochEnd = suffix.startIndex + epochCount
+        guard let epoch = String(
+                bytes: suffix[suffix.startIndex..<epochEnd], encoding: .utf8),
+              let draftId = String(bytes: suffix[epochEnd...], encoding: .utf8),
+              !epoch.isEmpty, !draftId.isEmpty else { return nil }
+        return (draftId, epoch)
     }
 
     /// Whether any non-inbox session is working (message-detail or compose).

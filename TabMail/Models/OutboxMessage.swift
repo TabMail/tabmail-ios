@@ -90,6 +90,12 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// Ported from `v2final:TabMail/Models/OutboxMessage.swift`'s
     /// `draftServerUidValidity` (its migration `v85`).
     var draftServerUidValidity: Int?
+    /// Immutable compose generation that owns this send.
+    var instanceEpoch: String?
+    /// Gmail contained MESSAGE id, distinct from the draft RESOURCE id.
+    var serverDraftGmailMessageId: String?
+    /// Mailbox component of the strong IMAP cleanup address.
+    var draftServerFolderPath: String?
     /// Wall-clock deadline before drain is allowed to claim this row. Set by
     /// queueSend to now + outboxUndoHoldSeconds + outboxClaimBufferSeconds.
     /// NULL for legacy pre-v49 rows (treated as "no hold" by the drain gate).
@@ -151,6 +157,9 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
         self.createdAt = Date()
         self.originalMessageHeaderId = originalMessageHeaderId
         self.isForward = isForward
+        self.instanceEpoch = nil
+        self.serverDraftGmailMessageId = nil
+        self.draftServerFolderPath = nil
     }
 
     // MARK: - Attachment Disk Storage

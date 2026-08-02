@@ -160,6 +160,24 @@ actor AccountManager {
     var providers: [String: any EmailProvider] = [:]
     var workQueues: [String: ProviderWorkQueue] = [:]
     var calendarProviders: [String: any CalendarProvider] = [:]
+
+    /// PORT adaptation of v2final AccountManagerQueue's concrete registered-
+    /// provider switch. Persisted Account.provider is never mutation authority.
+    nonisolated static func draftRuntimeIdentityKind(
+        for provider: any EmailProvider
+    ) -> DraftRuntimeIdentityKind {
+        switch provider {
+        case is GmailProvider: .gmail
+        case is ExchangeProvider: .outlook
+        case is IMAPProvider: .imap
+        case is DemoProvider: .demo
+        default: .unknown
+        }
+    }
+
+    func draftRuntimeIdentityKind(accountId: String) -> DraftRuntimeIdentityKind? {
+        providers[accountId].map(Self.draftRuntimeIdentityKind(for:))
+    }
     /// Per-op outcome awaiters used by `calendar_event_create` to surface drain
     /// results back to the LLM in the same turn (so it can correct args on
     /// permanent failure). Key = `PendingCalendarOperation.id`. Resumed exactly

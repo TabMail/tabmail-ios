@@ -1709,27 +1709,110 @@ final class InboxViewModel {
     }
 
     /// Delete a draft message from the Drafts folder using the draft-specific deletion path.
-    /// Optimistically removes the MessageHeader locally, then queues server deletion.
+    /// Provider-native identities only. An actual IMAP header has no source-bound
+    /// UIDVALIDITY and therefore fails closed; the next sync preserves truth.
     private func deleteDraftMessage(_ message: MessageHeader) async {
-        // Optimistic local removal
+        let drafts: [Draft]
         do {
-            try await dbPool.write { db in
-                _ = try MessageHeader.deleteOne(db, key: message.id)
-                _ = try? MessageBody.deleteOne(db, key: message.id)
+            drafts = try await dbPool.read { db in
+                try Draft
+                    .filter(Column("accountId") == message.accountId)
+                    .fetchAll(db)
             }
         } catch {
-            print("[Queue] ERROR: failed to delete draft header locally: \(error)")
+            return
         }
-        NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
-        // Queue server-side draft deletion using stableId (survives UID remaps/restarts).
-        // For Gmail/Exchange: stableId == messageId (non-numeric). For IMAP: stableId ==
-        // rfc822MessageId, resolved to UID at execution time via IMAPProvider.resolveUID.
-        // GmailProvider.deleteDraft handles fallback from draft resource ID to messages.trash.
-        await manager.queueDraftDelete(
-            serverDraftId: message.stableId,
+
+        let placeholderMatches = drafts.filter {
+            PendingOperation.draftPlaceholderMessageId(
+                draftId: $0.id, instanceEpoch: $0.instanceEpoch) == message.messageId
+        }
+        if placeholderMatches.count == 1, let owned = placeholderMatches.first {
+            guard let epoch = owned.instanceEpoch, !epoch.isEmpty else { return }
+            if owned.serverDraftId == nil {
+                do {
+                    let dir = try await dbPool.write { db -> String? in
+                        guard let fresh = try Draft.fetchOne(db, key: owned.id),
+                              fresh.instanceEpoch == epoch else { return nil }
+                        _ = try MessageHeader.deleteOne(db, key: message.id)
+                        _ = try MessageBody.deleteOne(
+                            db, key: ContentKey(rawValue: message.id))
+                        try DraftStore.applyDelete(
+                            id: owned.id,
+                            expectedInstanceEpoch: epoch,
+                            db: db)
+                        return fresh.attachmentsDirName
+                    }
+                    if let dir { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
+                    NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+                } catch { }
+                return
+            }
+            guard let serverId = owned.serverDraftId,
+                  let runtimeKind = await manager.draftRuntimeIdentityKind(
+                    accountId: owned.accountId) else { return }
+            let identity: DraftDeleteIdentity
+            switch runtimeKind {
+            case .gmail:
+                identity = .gmail(resourceId: serverId)
+            case .outlook:
+                identity = .outlook(graphId: serverId)
+            case .demo:
+                identity = .demo(localId: serverId)
+            case .imap:
+                guard let folder = owned.serverDraftFolderPath,
+                      let uidValidity = owned.serverDraftUidValidity,
+                      let uid = Int(serverId), uid > 0 else { return }
+                identity = .imap(
+                    folder: folder, uidValidity: uidValidity, uid: uid)
+            case .unknown:
+                return
+            }
+            _ = await manager.queueDraftDelete(
+                identity: identity,
+                accountId: owned.accountId,
+                folderPath: owned.serverDraftFolderPath,
+                draftId: owned.id,
+                instanceEpoch: epoch,
+                deleteOwnedLocalDraft: true)
+            return
+        }
+
+        guard let runtimeKind = await manager.draftRuntimeIdentityKind(
+            accountId: message.accountId) else { return }
+        let identity: DraftDeleteIdentity
+        switch runtimeKind {
+        case .gmail:
+            identity = .gmailContainedMessage(messageId: message.messageId)
+        case .outlook:
+            identity = .outlook(graphId: message.messageId)
+        case .demo:
+            identity = .demo(localId: message.messageId)
+        case .imap, .unknown:
+            return
+        }
+
+        let nativeMatches = drafts.filter { draft in
+            switch runtimeKind {
+            case .gmail:
+                // SUBTRACT — no persisted contained-MESSAGE carrier on Draft.
+                // The exact contained address still authorizes the provider
+                // delete, but local ownership remains unproven and is preserved.
+                return false
+            case .outlook, .demo:
+                return draft.serverDraftId == message.messageId
+            case .imap, .unknown:
+                return false
+            }
+        }
+        let owned = nativeMatches.count == 1 ? nativeMatches.first : nil
+        _ = await manager.queueDraftDelete(
+            identity: identity,
             accountId: message.accountId,
-            rfc822MessageId: message.rfc822MessageId
-        )
+            folderPath: message.folderPath,
+            draftId: owned?.id,
+            instanceEpoch: owned?.instanceEpoch,
+            deleteOwnedLocalDraft: owned != nil)
     }
 
     /// Current state comes from the ON-SCREEN snapshot — the visualized state

@@ -22,6 +22,7 @@ private func previewToast(
     let pending = PendingSendService.Pending(
         id: "preview-outbox-id",
         draftId: "preview-draft-id",
+        instanceEpoch: "preview-instance-epoch",
         toSummary: toSummary,
         queuedAt: queuedAt
     )

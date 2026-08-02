@@ -1027,46 +1027,54 @@ extension AccountManager {
             }
             // Gmail/Exchange REST APIs don't support $Forwarded keyword — local state preserved by sync
         case .saveDraft:
-            // messageIds[0] = local Draft table key (draftId)
-            // folderPath = server-side Drafts folder path
-            guard let draftId = op.messageIds.first else { return }
-            try await DraftStore.shared.pushDraftToServer(
+            guard let draftId = op.draftId ?? op.messageIds.first,
+                  let instanceEpoch = op.instanceEpoch,
+                  !instanceEpoch.isEmpty else { return }
+            let disposition = try await DraftStore.shared.pushDraftToServer(
                 draftId: draftId,
+                expectedInstanceEpoch: instanceEpoch,
                 provider: provider,
+                runtimeKind: Self.draftRuntimeIdentityKind(for: provider),
                 draftsFolderPath: op.folderPath
             )
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftQueue] Retiring save producer \(op.id) with disposition \(disposition)")
+            }
         case .deleteDraft:
-            // messageIds[0] = serverDraftId (IMAP UID / Gmail ID)
-            // messageIds[1] = the DRAFT's own rfc822 Message-ID, when the admission site
-            //                 had one (`queueDraftDelete` appends it, deduped against
-            //                 slot 0). Slot 0 is an ADDRESS; slot 1 is an IDENTITY.
-            // draftServerUidValidity = the epoch slot 0 was minted under, when known.
-            // folderPath = server-side Drafts folder path
-            //
-            // All three go to the provider TOGETHER, which is what lets IMAP resolve the
-            // exact message in its exact numbering instead of degrading to a Message-ID
-            // search that cannot tell this draft from a legitimate same-Message-ID
-            // sibling. (Before v72 only slot 0 was passed, so an op that carried a
-            // perfectly good identity in slot 1 was still refused as an address.)
-            guard let serverDraftId = op.messageIds.first else { return }
-            let draftRfc822: String? = op.messageIds.count > 1 ? op.messageIds[1] : nil
-            // ⚑ NO "already gone" STRING MATCH HERE. This arm used to swallow any error
-            // whose `String(describing:)` contained "404", "410", "not found", … as a
-            // successful delete. 404 and 410 are ORDINARY IMAP UID VALUES — and any UID
-            // containing them as a SUBSTRING matches too, so
-            // `actionIdentityResolutionFailed("4041")` and `uidResolutionFailed("410")`
-            // were both read as "the server says it is gone" when nothing had asked the
-            // server: the op was deleted, its typed handling never ran, and the draft
-            // survived. Every provider normalizes authoritative absence itself (Gmail's
-            // `drafts.delete` → `messages.trash` 404 chain, Exchange's 404 arm, IMAP's
-            // absent-FETCH / empty-SEARCH arms), so there is nothing left for the queue
-            // to infer from an error's TEXT. `v2final`'s `.deleteDraft` executor makes
-            // the same call, in the same words: no queue-side string match.
-            try await provider.deleteDraft(
-                draftId: serverDraftId,
-                rfc822MessageId: draftRfc822,
-                uidValidity: op.draftServerUidValidity,
-                draftsFolderPath: op.folderPath)
+            guard let encodedId = op.messageIds.first else { return }
+            let runtimeKind = Self.draftRuntimeIdentityKind(for: provider)
+            let addressKind = op.draftDeleteAddressKind.flatMap(DraftDeleteAddressKind.init(rawValue:))
+            let identity: DraftDeleteIdentity
+            switch runtimeKind {
+            case .imap:
+                guard addressKind == .providerResource,
+                      let uid = Int(encodedId), uid > 0,
+                      let uidValidity = op.draftServerUidValidity,
+                      uidValidity > 0 else {
+                    throw ProviderError.actionIdentityResolutionFailed(encodedId)
+                }
+                identity = .imap(
+                    folder: op.folderPath,
+                    uidValidity: uidValidity,
+                    uid: uid)
+            case .gmail:
+                identity = addressKind == .gmailContainedMessage
+                    ? .gmailContainedMessage(messageId: encodedId)
+                    : .gmail(resourceId: encodedId)
+            case .outlook:
+                guard addressKind == .providerResource else {
+                    throw ProviderError.actionIdentityResolutionFailed(encodedId)
+                }
+                identity = .outlook(graphId: encodedId)
+            case .demo:
+                guard addressKind == .providerResource else {
+                    throw ProviderError.actionIdentityResolutionFailed(encodedId)
+                }
+                identity = .demo(localId: encodedId)
+            case .unknown:
+                throw ProviderError.actionIdentityResolutionFailed(encodedId)
+            }
+            try await provider.deleteDraft(identity: identity)
         case .addUserLabel:
             guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return }
             if let gmail = provider as? GmailProvider {

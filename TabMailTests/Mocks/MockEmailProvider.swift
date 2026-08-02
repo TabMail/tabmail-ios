@@ -13,8 +13,14 @@ actor MockEmailProvider: EmailProvider {
 
     nonisolated let staleWindowMode: StaleWindowMode
 
-    init(staleWindowMode: StaleWindowMode = .date) {
+    init(
+        staleWindowMode: StaleWindowMode = .date,
+        saveDraftResult: DraftSaveOutcome = .created(.outlook(graphId: "mock-draft-id")),
+        saveDraftThrows: Error? = nil
+    ) {
         self.staleWindowMode = staleWindowMode
+        self.saveDraftResult = saveDraftResult
+        self.saveDraftThrows = saveDraftThrows
     }
 
     // MARK: - UIDVALIDITY observation (the epoch test seam)
@@ -214,7 +220,7 @@ actor MockEmailProvider: EmailProvider {
     /// `move` (`AccountManagerQueueDemotionTests`,
     /// `AccountManagerQueueLivenessTests`, `InboxGestureActionTests`) — and to
     /// v3's own signatures, which differ from the reference's on `saveDraft`
-    /// (v3 has no `previousRfc822MessageId` and returns `DraftSaveResult`).
+    /// (v3 returns the typed `DraftSaveOutcome`).
     var markReadHook: (@Sendable () async -> Void)?
     var saveDraftHook: (@Sendable () async -> Void)?
     /// Awaited BEFORE `move()` records or mutates anything — lets a test
@@ -341,28 +347,18 @@ actor MockEmailProvider: EmailProvider {
 
     // MARK: - Draft Operations
 
-    var saveDraftResult: DraftSaveResult = DraftSaveResult(serverId: "mock-draft-id")
-    var saveDraftThrows: Error?
-    var deleteDraftThrows: Error?
-    var savedDrafts: [(draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String)] = []
-    /// Every argument `deleteDraft` was called with — the epoch-safety pair included, so
-    /// a test can assert WHAT the queue handed the provider, not merely that it called.
-    var deletedDraftIds: [(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String)] = []
+    let saveDraftResult: DraftSaveOutcome
+    let saveDraftThrows: Error?
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
-        callLog.append("saveDraft(existingDraftId:\(existingDraftId ?? "nil"),previousRfc822MessageId:\(previousRfc822MessageId ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
-        savedDrafts.append((draft: draft, existingDraftId: existingDraftId, previousRfc822MessageId: previousRfc822MessageId, draftsFolderPath: draftsFolderPath))
+    func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome {
+        callLog.append("saveDraft(existingIdentity:\(String(describing: existingIdentity)),draftsFolderPath:\(draftsFolderPath))")
         if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
         return saveDraftResult
     }
 
-    func deleteDraft(
-        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
-    ) async throws {
-        callLog.append("deleteDraft(draftId:\(draftId),rfc822MessageId:\(rfc822MessageId ?? "nil"),uidValidity:\(uidValidity.map(String.init) ?? "nil"),draftsFolderPath:\(draftsFolderPath))")
-        deletedDraftIds.append((draftId: draftId, rfc822MessageId: rfc822MessageId, uidValidity: uidValidity, draftsFolderPath: draftsFolderPath))
-        if let error = deleteDraftThrows { throw error }
+    func deleteDraft(identity: DraftDeleteIdentity) async throws {
+        callLog.append("deleteDraft(identity:\(identity))")
     }
 
     // MARK: - Test Helpers

@@ -117,6 +117,11 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// including the reference's empty-string placeholders, becomes an id that
     /// can protect an unrelated header that happens to match it.
     var draftServerUidValidity: Int?
+    /// Generation and local owner for draft save/delete operations.
+    var instanceEpoch: String?
+    var draftId: String?
+    /// Namespace discriminator for persisted provider-native delete addresses.
+    var draftDeleteAddressKind: String?
     /// PendingStatus rawValue — stored as String for GRDB compatibility
     var status: String
 
@@ -140,7 +145,10 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         tagValue: String? = nil,
         userLabelId: String? = nil,
         observedUidValidity: Int? = nil,
-        draftServerUidValidity: Int? = nil
+        draftServerUidValidity: Int? = nil,
+        instanceEpoch: String? = nil,
+        draftId: String? = nil,
+        draftDeleteAddressKind: DraftDeleteAddressKind? = nil
     ) {
         self.id = UUID().uuidString
         self.type = type
@@ -155,7 +163,31 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.uidResolutionRetryCount = 0
         self.observedUidValidity = observedUidValidity
         self.draftServerUidValidity = draftServerUidValidity
+        self.instanceEpoch = instanceEpoch
+        self.draftId = draftId
+        self.draftDeleteAddressKind = draftDeleteAddressKind?.rawValue
         self.status = PendingStatus.queued.rawValue
+    }
+
+    enum SaveDraftSlots {
+        static let draftId = 0
+    }
+
+    /// PORT — exact injective generation-bearing placeholder shape from
+    /// v2final `PendingOperation.draftPlaceholderMessageId`.
+    static func draftPlaceholderMessageId(draftId: String, instanceEpoch: String?) -> String {
+        let bare = "draft-\(MessageIdentity.colonSafeMessageIdComponent(draftId))"
+        guard let instanceEpoch, !instanceEpoch.isEmpty else { return bare }
+        return "\(bare):\(instanceEpoch):\(instanceEpoch.utf8.count)"
+    }
+
+    static func draftPlaceholderHeaderPK(
+        accountId: String,
+        draftsFolderPath: String,
+        draftId: String,
+        instanceEpoch: String?
+    ) -> String {
+        "\(accountId):\(draftsFolderPath):\(draftPlaceholderMessageId(draftId: draftId, instanceEpoch: instanceEpoch))"
     }
 }
 

@@ -742,6 +742,330 @@ struct OutboxDrainIntegrationTests {
     }
 }
 
+/// PORT — v2final completed-send top guard (`4651d894b`) and atomic reducer
+/// (`1b8ab1e32`, generation ownership from `97497416b`).
+@Suite("Generation-owned completed-send finalization", .serialized, .processGlobalState)
+@MainActor
+struct OutboxGenerationFinalizationTests {
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("outbox-finalize-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        try pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "owner@example.com", displayName: "Owner", provider: .imap)
+            account.id = "acc1"
+            try account.insert(db)
+            try Folder(
+                name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id
+            ).insert(db)
+        }
+        return (pool, directory, previous)
+    }
+
+    private func finish(_ fixture: (DatabasePool, URL, AppDatabase?)) {
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.2, pool: fixture.0, directory: fixture.1)
+    }
+
+    private func draft(id: String, epoch: String) -> Draft {
+        var value = Draft(
+            id: id, accountId: "acc1", toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: id, body: "body", replyToId: nil, isForward: false,
+            editHistoryJSON: nil, createdAt: 1, updatedAt: 1)
+        value.instanceEpoch = epoch
+        return value
+    }
+
+    private func turn(id: String, draftId: String) -> ChatTurn {
+        ChatTurn(
+            id: id, timestamp: 1, role: "user", content: "compose_edit",
+            userMessage: "edit", type: "normal", chars: 4, renderedContent: nil,
+            sessionId: "compose:\(draftId)",
+            remindersSnapshot: nil, emailContextJSON: nil, thinkingContent: nil)
+    }
+
+    private func outbox(
+        id: String = UUID().uuidString,
+        draftId: String,
+        epoch: String,
+        completed: Bool
+    ) -> OutboxMessage {
+        var value = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "send", body: "body"))
+        value.id = id
+        value.draftId = draftId
+        value.instanceEpoch = epoch
+        value.status = OutboxStatus.sending.rawValue
+        value.sentAt = Date()
+        value.appendedToSent = completed
+        return value
+    }
+
+    private func originalHeader(
+        accountId: String = "acc1",
+        messageId: String,
+        rfc822MessageId: String
+    ) -> MessageHeader {
+        var value = MessageHeader(
+            messageId: messageId,
+            subject: "Original",
+            from: "Sender",
+            fromAddress: "sender@example.com",
+            to: "owner@example.com",
+            date: Date(),
+            snippet: "body",
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"),
+            accountId: accountId,
+            folderPath: "INBOX",
+            isInInbox: true)
+        value.rfc822MessageId = rfc822MessageId
+        value.headerComplete = true
+        return value
+    }
+
+    private func completedReply(
+        accountId: String = "acc1",
+        originalId: String,
+        inReplyTo: String
+    ) -> OutboxMessage {
+        var value = OutboxMessage(
+            accountId: accountId,
+            draft: DraftMessage(
+                to: ["recipient@example.com"],
+                subject: "Re: Original",
+                body: "reply",
+                inReplyTo: inReplyTo),
+            originalMessageHeaderId: originalId,
+            isForward: false)
+        value.status = OutboxStatus.sending.rawValue
+        value.sentAt = Date()
+        value.appendedToSent = true
+        return value
+    }
+
+    @Test("Incomplete send evidence performs no finalization mutation")
+    func incompleteEvidenceRefusesFinalization() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let liveDraft = draft(id: "draft-incomplete", epoch: "E1")
+        let liveTurn = turn(id: "turn-incomplete", draftId: liveDraft.id)
+        let pending = outbox(draftId: liveDraft.id, epoch: "E1", completed: false)
+        try await fixture.0.writeWithoutTransaction { db in
+            try liveDraft.insert(db)
+            try liveTurn.insert(db)
+            try pending.insert(db)
+        }
+
+        await AccountManager.shared.reconcileOutbox()
+
+        let state = try await fixture.0.read { db in
+            (try OutboxMessage.fetchOne(db, key: pending.id),
+             try Draft.fetchOne(db, key: liveDraft.id),
+             try ChatTurn.fetchOne(db, key: liveTurn.id))
+        }
+        #expect(state.0 != nil)
+        #expect(state.1?.instanceEpoch == "E1")
+        #expect(state.2 != nil)
+    }
+
+    @Test("Completed-send finalization atomically removes only the matching generation")
+    func completedFinalizationOwnsExactGeneration() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let sharedId = "draft-shared"
+        let liveE2 = draft(id: sharedId, epoch: "E2")
+        let liveE2Turn = turn(id: "turn-live-e2", draftId: sharedId)
+        let staleE1 = outbox(draftId: sharedId, epoch: "E1", completed: true)
+        let exactE1 = draft(id: "draft-exact-e1", epoch: "E1")
+        let exactE1Turn = turn(id: "turn-exact-e1", draftId: exactE1.id)
+        let completedE1 = outbox(draftId: exactE1.id, epoch: "E1", completed: true)
+        try await fixture.0.writeWithoutTransaction { db in
+            try liveE2.insert(db)
+            try liveE2Turn.insert(db)
+            try staleE1.insert(db)
+            try exactE1.insert(db)
+            try exactE1Turn.insert(db)
+            try completedE1.insert(db)
+        }
+
+        _ = try await fixture.0.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: staleE1.id, db: db)
+        }
+        let mismatch = try await fixture.0.read { db in
+            (try OutboxMessage.fetchOne(db, key: staleE1.id),
+             try Draft.fetchOne(db, key: sharedId),
+             try ChatTurn.fetchOne(db, key: liveE2Turn.id))
+        }
+        #expect(mismatch.0 == nil)
+        #expect(mismatch.1?.instanceEpoch == "E2")
+        #expect(mismatch.2 != nil)
+
+        _ = try await fixture.0.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: completedE1.id, db: db)
+        }
+        let exact = try await fixture.0.read { db in
+            (try OutboxMessage.fetchOne(db, key: completedE1.id),
+             try Draft.fetchOne(db, key: exactE1.id),
+             try ChatTurn.fetchOne(db, key: exactE1Turn.id))
+        }
+        #expect(exact.0 == nil)
+        #expect(exact.1 == nil)
+        #expect(exact.2 == nil)
+    }
+
+    @Test("A forced outbox-delete failure rolls back Draft and ChatTurn deletion")
+    func forcedOutboxDeleteFailureRollsBack() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let owned = draft(id: "draft-rollback", epoch: "E1")
+        let ownedTurn = turn(id: "turn-rollback", draftId: owned.id)
+        let completed = outbox(
+            id: "outbox-forced-failure", draftId: owned.id, epoch: "E1", completed: true)
+        try await fixture.0.writeWithoutTransaction { db in
+            try owned.insert(db)
+            try ownedTurn.insert(db)
+            try completed.insert(db)
+            try db.execute(sql: """
+                CREATE TRIGGER force_outbox_delete_failure
+                BEFORE DELETE ON outboxMessage
+                WHEN OLD.id = 'outbox-forced-failure'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced outbox delete failure');
+                END
+                """)
+        }
+
+        await #expect(throws: (any Error).self) {
+            _ = try await fixture.0.write { db in
+                try AccountManager.deleteCompletedSendAtomic(outboxId: completed.id, db: db)
+            }
+        }
+
+        let state = try await fixture.0.read { db in
+            (try OutboxMessage.fetchOne(db, key: completed.id),
+             try Draft.fetchOne(db, key: owned.id),
+             try ChatTurn.fetchOne(db, key: ownedTurn.id))
+        }
+        #expect(state.0 != nil)
+        #expect(state.1?.instanceEpoch == "E1")
+        #expect(state.2 != nil)
+    }
+
+    @Test(
+        "A send never flags another account through either the direct PK or former global-RFC path",
+        arguments: [true, false])
+    func originalResolutionIsAccountConfined(useForeignPrimaryKey: Bool) async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        var otherAccount = Account(
+            emailAddress: "other@example.com", displayName: "Other", provider: .imap)
+        otherAccount.id = "acc2"
+        let otherFolder = Folder(
+            name: "INBOX", path: "INBOX", role: .inbox, accountId: otherAccount.id)
+        let sharedRfc = "shared-original@example.com"
+        let foreign = originalHeader(
+            accountId: otherAccount.id,
+            messageId: "41",
+            rfc822MessageId: sharedRfc)
+        let completed = completedReply(
+            originalId: useForeignPrimaryKey
+                ? foreign.id
+                : MessageIdentity.headerId(
+                    accountId: "acc1", folderPath: "INBOX", messageId: "vanished"),
+            inReplyTo: "<\(sharedRfc)>")
+        let insertableOtherAccount = otherAccount
+        try await fixture.0.writeWithoutTransaction { db in
+            try insertableOtherAccount.insert(db)
+            try otherFolder.insert(db)
+            try foreign.insert(db)
+            try completed.insert(db)
+        }
+
+        _ = try await fixture.0.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: completed.id, db: db)
+        }
+
+        let state = try await fixture.0.read { db in
+            (try MessageHeader.fetchOne(db, key: foreign.id),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.isReplied == false)
+        #expect(state.0?.isForwarded == false)
+        #expect(state.1.isEmpty)
+    }
+
+    @Test("A reused IMAP UID cannot flag the new occupant at the original composite key")
+    func originalResolutionRejectsReusedUidImpostor() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let impostor = originalHeader(
+            messageId: "77", rfc822MessageId: "new-occupant@example.com")
+        let completed = completedReply(
+            originalId: impostor.id,
+            inReplyTo: "<intended-original@example.com>")
+        try await fixture.0.writeWithoutTransaction { db in
+            try impostor.insert(db)
+            try completed.insert(db)
+        }
+
+        _ = try await fixture.0.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: completed.id, db: db)
+        }
+
+        let state = try await fixture.0.read { db in
+            (try MessageHeader.fetchOne(db, key: impostor.id),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.isReplied == false)
+        #expect(state.0?.isForwarded == false)
+        #expect(state.1.isEmpty)
+    }
+
+    @Test("An exact same-account original with matching RFC evidence is still flagged")
+    func originalResolutionAcceptsCorroboratedSameAccountRow() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let rfc822 = "same-account-original@example.com"
+        let original = originalHeader(messageId: "91", rfc822MessageId: rfc822)
+        let completed = completedReply(
+            originalId: original.id,
+            inReplyTo: "<\(rfc822)>")
+        try await fixture.0.writeWithoutTransaction { db in
+            try original.insert(db)
+            try completed.insert(db)
+        }
+
+        _ = try await fixture.0.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: completed.id, db: db)
+        }
+
+        let state = try await fixture.0.read { db in
+            (try MessageHeader.fetchOne(db, key: original.id),
+             try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.isReplied == true)
+        #expect(state.0?.isForwarded == false)
+        #expect(state.1.count == 1)
+        guard state.1.count == 1 else { return }
+        #expect(state.1[0].type == .markReplied)
+        #expect(state.1[0].accountId == "acc1")
+        #expect(state.1[0].folderPath == "INBOX")
+    }
+}
+
 // MARK: - MockEmailProvider test helper extensions
 
 extension MockEmailProvider {

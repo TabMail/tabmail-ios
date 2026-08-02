@@ -926,18 +926,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             } catch {
                 print("[IMAP] Keepalive failed for action connection — removing")
                 actionServer = nil
-                #if DEBUG
-                // ⚑ NO REFERENCE — INVENTED (RULE R0). The reference's
-                // keepalive action-failure leg (`v2final:TabMail/Providers/
-                // IMAPProvider.swift:2861-2866`) nils `actionServer` with NO
-                // journal line at all, so this event has no counterpart to
-                // port. Added deliberately: this is an action slot mutation
-                // that does NOT bump `generation`, i.e. exactly the class of
-                // event the reference's own Round-9 wedge post-mortem says is
-                // otherwise invisible in the journal. It is a log line only —
-                // no assertion, no behaviour.
-                logMut("keepalive action FAILED — CLEARED")
-                #endif
             }
         }
     }
@@ -2066,7 +2054,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - Drafts
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
+    func saveDraft(
+        _ draft: DraftMessage,
+        existingIdentity: DraftDeleteIdentity?,
+        draftsFolderPath: String
+    ) async throws -> DraftSaveOutcome {
         // Guard: Message-ID is required for IMAP draft tracking (find UID after APPEND).
         // DraftStore.pushDraftToServer generates rfc822MessageId before calling this.
         guard let messageId = draft.messageId, !messageId.isEmpty else {
@@ -2083,249 +2075,88 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // observation — and a UID paired with the wrong epoch is worse than a UID with
         // no epoch, because it makes the delete path's equality check pass vacuously.
         return try await withActionConnectionSelection(folder: draftsFolderPath) { server, selection in
-            // Delete the OLD server copy by its PREVIOUS rfc822 Message-ID, VERIFIED —
-            // and by nothing else. Ported from `v2final`'s `saveDraftOnActionConnection`
-            // (audit #5 + ADR-IOS-061 items D/E), which fixed this exact site.
-            //
-            // The two legs this replaces both destroyed a message they had never
-            // identified:
-            //
-            //  * The NUMERIC leg took `existingDraftId` — `Draft.serverDraftId`, a UID
-            //    persisted at an earlier save — and STORE'd `\Deleted` + EXPUNGEd it
-            //    outright. A UID is a mutable ADDRESS, not an identity: the `Draft` table
-            //    survives a `UIDVALIDITY` reset but the UID it names does NOT, so after a
-            //    renumber that same integer names a DIFFERENT message and this destroyed
-            //    the user's real mail (constraint C3). It bypassed `resolveUID` entirely,
-            //    so none of the identity guards restored by `071b52751` applied. There is
-            //    no verified form of it worth keeping: a Message-ID SEARCH is epoch-IMMUNE
-            //    and finds the old copy wherever the renumber put it, while a
-            //    FETCH-corroborated UID would simply refuse under a new epoch. So the leg
-            //    is GONE — `v2final`'s rule, verbatim: a bare-UID delete stays forbidden.
-            //
-            //  * The SEARCH leg searched for `messageId` — the FRESH id.
-            //    `DraftStore.pushDraftToServer` ROTATES the rfc822 Message-ID on every push
-            //    (`previousRfc822` captured, then `draft.rfc822MessageId = freshRfc822`), so
-            //    the old copy carries the PREVIOUS id and the fresh one is the identity
-            //    about to be APPENDed. Searching by the fresh id MISSES the old copy — a
-            //    stale orphan per re-push — and could match a prior retry's APPEND instead.
-            //    It also STORE-`\Deleted`-ed the whole hit set unverified, and IMAP
-            //    `SEARCH HEADER Message-ID` is RFC 3501 SUBSTRING matching, not equality:
-            //    `xa@example.com` is a hit for `a@example.com`. Hence
-            //    `exactMessageIdMatches` + the cardinality rule below.
-            //
-            // ⚑ DELIBERATE DEVIATION FROM `v2final`, stated rather than hidden — THE
-            // FAIL-SAFE DIRECTION IS INVERTED HERE, AND THAT IS NOT A BUG TO "FIX".
-            // The reference's `deleteDraftStrong`/`deleteDraftLegacy` THROW on a failed
-            // identity check because they serve the user's DELETE gesture, where refusing
-            // is the safe outcome. This is `saveDraft`: a throw here means the APPEND below
-            // never runs. For a TRANSPORT failure that is fine and deliberate (the SEARCH /
-            // FETCH still `try await` — the durable op retries, the local `Draft` row holds
-            // every byte the user typed, and nothing lands, so the next attempt converges).
-            // But for a VERDICT — the identity check completed and says "not this one" (0
-            // exact matches), "which one?" (>1), or "unusable id" — a throw would wedge the
-            // op forever on a state that never changes, so the delete is SKIPPED and the
-            // APPEND PROCEEDS. Worst case is a duplicate draft on the server: visible,
-            // harmless, and reconciled by full sync's draft dedup. The alternatives are
-            // destroyed mail or a lost edit, and "never drop user intention" outranks both.
-            // `v2final`'s own `saveDraft` makes the same call at the same site.
-            if existingDraftId != nil,
-               let previousId = previousRfc822MessageId,
-               !previousId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let found = try await self.searchByMessageId(previousId, server: server)
-                if !found.isEmpty {
-                    let verified = try await self.exactMessageIdMatches(
-                        found, expectedRawMessageId: previousId, server: server,
-                        comparison: .contentKeyStrict)
-                    switch verified.count {
-                    case 0:
-                        // Every hit was substring-only (or `previousId` doesn't
-                        // canonicalize). Nothing here IS the old copy — skip.
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] saveDraft: \(found.count) Message-ID hit(s) for previous rfc822 \(previousId) in \(draftsFolderPath) were all substring-only (none exact) — SKIPPING old-copy delete, proceeding to APPEND")
-                        }
-                    case 1:
-                        // The `try?` swallowing on the destructive pair is PRE-EXISTING
-                        // and preserved (⚑ `v2final` uses `try await` here so a STORE /
-                        // EXPUNGE `NO` aborts before the APPEND; on this branch a failed
-                        // purge leaves a duplicate instead, which draft dedup reconciles —
-                        // the same trade §3.4's polarity already accepts).
-                        // `expungeScopedToTargets` keeps the purge named to this UID.
-                        try? await server.store(flags: [.deleted], on: verified, operation: .add)
-                        try? await self.expungeScopedToTargets(
-                            verified, server: server,
-                            logDescription: "old draft copy (previous rfc822=\(previousId)) in \(draftsFolderPath)")
-                        print("[IMAP] Deleted old draft copy by verified previous Message-ID search in \(draftsFolderPath)")
-                    default:
-                        // FAIL CLOSED, mirroring `deleteDraft`'s >1 guard: 2+ EXACT
-                        // matches are legitimate same-rfc Drafts siblings. Deleting the
-                        // set would destroy one. Refuse the delete, still APPEND.
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] saveDraft: \(verified.count) drafts share the previous rfc822 Message-ID \(previousId) in \(draftsFolderPath) — REFUSING old-copy delete (fail closed, would destroy a sibling), proceeding to APPEND")
-                        }
-                    }
+            // PORT 83205c5's strong tuple. SUBTRACT the reference's RFC old-copy
+            // search: it can wrong-delete the sole surviving same-RFC sibling.
+            // Save-path polarity is fail-closed but intention-preserving: missing,
+            // malformed, mailbox-mismatched or stale prior coordinates simply skip
+            // the old delete and continue to APPEND.
+            if case .imap(let folder, let recordedEpoch, let uid) = existingIdentity,
+               folder == draftsFolderPath,
+               recordedEpoch > 0,
+               uid > 0,
+               selection.uidValidity.value == UInt32(exactly: recordedEpoch),
+               let uidValue = UInt32(exactly: uid) {
+                let target = UIDSet(UID(uidValue))
+                let infos = try await server.fetchMessageInfosBulk(using: target)
+                if infos.contains(where: { $0.uid?.value == uidValue }) {
+                    try await server.store(
+                        flags: [.deleted], on: target, operation: .add)
+                    try await self.expungeScopedToTargets(
+                        target, server: server,
+                        logDescription: "old draft uid=\(uid) from \(draftsFolderPath)")
                 }
-            } else if existingDraftId != nil, DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] saveDraft: update with no usable previous rfc822 Message-ID in \(draftsFolderPath) — SKIPPING old-copy delete (the fresh id is never substituted as a delete target), proceeding to APPEND")
             }
 
-            // APPEND new draft with \Draft + \Seen flags (drafts are never "unread")
+            // APPEND new draft with \Draft + \Seen flags (drafts are never "unread").
+            // PORT 4d34ee864/82c9ce5: APPENDUID is the exact attempt-correlated
+            // identity and always wins over a mailbox search.
             let email = Self.buildEmail(from: draft, senderEmail: senderAddr)
-            _ = try await server.append(email: email, to: draftsFolderPath, flags: [.draft, .seen], internalDate: Date())
-
-            // Find the appended UID by searching for the Message-ID
-            let found = try await self.searchByMessageId(messageId, server: server)
-            // The epoch this SELECT reported. `UIDValidity` is non-optional in SwiftMail
-            // and defaults to 0 when the server omitted the required
-            // `* OK [UIDVALIDITY n]` line, so 0 is mapped back to nil (UNKNOWN) rather
-            // than stored as an epoch — RFC 3501 §2.3.1.1 types UIDVALIDITY as
-            // `nz-number`, and a persisted 0 would compare equal to every other
-            // never-observed 0.
-            let mintedEpoch: Int? = selection.uidValidity.value != 0
-                ? Int(selection.uidValidity.value) : nil
-            if !found.isEmpty {
-                for range in found.ranges {
-                    let uid = range.lowerBound
-                    print("[IMAP] Saved draft to \(draftsFolderPath), uid=\(uid)")
-                    return DraftSaveResult(serverId: String(uid), uidValidity: mintedEpoch)
-                }
+            let appendResult = try await server.append(
+                email: email, to: draftsFolderPath,
+                flags: [.draft, .seen], internalDate: Date())
+            if let appendedUid = appendResult.firstUID,
+               let appendedEpoch = appendResult.uidValidity,
+               appendedUid.value != 0,
+               appendedEpoch.value != 0 {
+                print("[IMAP] Saved draft to \(draftsFolderPath) via APPENDUID uid=\(appendedUid) uidValidity=\(appendedEpoch)")
+                return .created(.imap(
+                    folder: draftsFolderPath,
+                    uidValidity: Int(appendedEpoch.value),
+                    uid: Int(appendedUid.value)))
             }
-            // Should not happen if APPEND succeeded — log warning
-            print("[IMAP] WARNING: Saved draft to \(draftsFolderPath) but could not find UID by Message-ID \(messageId)")
-            return DraftSaveResult(serverId: "unknown")
+
+            // Without APPENDUID, raw SEARCH results are only candidates: RFC 3501
+            // header search may substring-match. Fetch and exact-verify every hit,
+            // then accept only one match under this action selection's positive epoch.
+            let found = try await self.searchByMessageId(messageId, server: server)
+            let verified = try await self.exactMessageIdMatches(
+                found, expectedRawMessageId: messageId, server: server)
+            let mintedEpoch = selection.uidValidity.value
+            if verified.count == 1,
+               let uid = verified.ranges.first?.lowerBound,
+               uid > 0,
+               mintedEpoch != 0 {
+                print("[IMAP] Saved draft to \(draftsFolderPath), uid=\(uid) (immediate verified exactly-one search)")
+                return .created(.imap(
+                    folder: draftsFolderPath,
+                    uidValidity: Int(mintedEpoch),
+                    uid: uid))
+            }
+            print("[IMAP] saveDraft: APPEND succeeded without an exact positive identity (verified=\(verified.count), candidates=\(found.count), uidValidity=\(mintedEpoch))")
+            return .unaddressable
         }
     }
 
-    /// Delete the user's draft from the server's Drafts folder — addressed ONLY by an
-    /// identity this call VERIFIED on the wire, and by nothing else.
-    ///
-    /// TYPED-IDENTITY DISPATCHER, ported from `v2final`'s `deleteDraft`. The STRONG arm
-    /// (`deleteDraftStrong`) runs when the caller supplies BOTH a bare UID and the
-    /// `uidValidity` that UID was MINTED under; it resolves the exact message in its
-    /// exact numbering. Everything else degrades to the LEGACY exact-verified
-    /// Message-ID search (`deleteDraftLegacy`, the arm `v2final` records as PERMANENT —
-    /// "do not remove it"), which is epoch-immune but cannot distinguish this draft
-    /// from a legitimate same-Message-ID SIBLING.
-    ///
-    /// An earlier revision of this comment stated that `deleteDraftStrong` was "NOT
-    /// portable here" because the signature carried no recorded epoch. That was true of
-    /// the signature, not of the tree: the epoch is now threaded from the SELECT that
-    /// minted the UID (`DraftSaveResult.uidValidity` → `Draft.serverDraftUidValidity` →
-    /// `OutboxMessage.draftServerUidValidity` → `PendingOperation.draftServerUidValidity`,
-    /// migration v72), for the reason `v2final`'s own `v85` migration records: WITHOUT
-    /// the epoch, a post-send backstop whose target has already gone finds the sibling
-    /// as the sole remaining exact match and destroys it. Identity alone was never the
-    /// closure.
-    ///
-    /// The three hazards this replaces, all of which destroyed a message this function
-    /// had never identified:
-    ///
-    ///  * **The bare-UID delete.** `resolveUID` SHORT-CIRCUITS an all-digits `draftId`
-    ///    straight to `UIDSet(UID(value))` — no SEARCH, no FETCH, no identity of any
-    ///    kind — and the STORE `\Deleted` + EXPUNGE below then destroyed whatever
-    ///    occupied that integer. A UID is a mutable ADDRESS: the `Draft` row and the
-    ///    `PendingOperation` survive a `UIDVALIDITY` reset, the UID they name does not,
-    ///    so after a renumber that integer names a DIFFERENT message and the user's
-    ///    delete gesture destroyed their real mail (constraint C3). `v2final`'s rule,
-    ///    verbatim: a bare-UID delete stays forbidden; Message-ID SEARCH is epoch-IMMUNE
-    ///    and finds the draft wherever a renumber put it.
-    ///
-    ///  * **The unverified SEARCH hit set.** The non-numeric leg took `searchByMessageId`'s
-    ///    RAW hits and destroyed them as a set. IMAP `SEARCH HEADER Message-ID` is
-    ///    RFC 3501 SUBSTRING matching, not equality: `xa@example.com` is a hit for
-    ///    `a@example.com`, so a bystander died with the target — and two legitimate
-    ///    same-rfc Drafts siblings both died. Hence `exactMessageIdMatches` (each hit's
-    ///    OWN Message-ID FETCHed and compared exactly) plus the cardinality rule below.
-    ///
-    ///  * **The sole-survivor sibling.** The cardinality rule above fails closed on 2+
-    ///    exact matches — but only while both siblings are still there. Once the
-    ///    gesture's own target is gone (another client deleted it, or this send's
-    ///    primary delete already did) the search returns exactly ONE exact match, the
-    ///    SIBLING, and the `case 1` arm destroys it. No renumbering and no UIDVALIDITY
-    ///    change is involved; the identity genuinely matches, it is simply the wrong
-    ///    copy. Only the STRONG arm closes this: it FETCHes the recorded UID inside the
-    ///    recorded epoch, so a target that is already gone is an absent FETCH and a
-    ///    clean no-op, and the sibling is never a candidate at all.
-    ///
-    /// ⚑ THE FAIL-SAFE DIRECTION IS THE OPPOSITE OF `saveDraft`'s, DELIBERATELY, and the
-    /// site says so on both sides. `saveDraft` SKIPS its old-copy delete on a failed
-    /// identity verdict and APPENDs anyway, because refusing there would drop the user's
-    /// edit. This is the user's DELETE gesture: refusing costs the user nothing — the
-    /// draft simply remains, visible, and the gesture can be re-issued — while proceeding
-    /// on an unverified identity risks destroying real mail. So every failed VERDICT
-    /// throws, and the destructive pair keeps `try await` (never `try?`): a `NO` on the
-    /// STORE or EXPUNGE must reach the queue, not be swallowed into a false completion.
-    ///
-    /// ⚑ ONE DELIBERATE DIVERGENCE FROM `v2final`, in the direction of this tree's own
-    /// machinery: the reference treats "SEARCH found nothing" and "no hit was exact" as
-    /// a TERMINAL no-op ("already deleted"), while both throw here. Two reasons, and the
-    /// second is why the first is safe. (1) It is what this branch already does — the
-    /// empty-SEARCH throw is `resolveUID`'s, preserved. (2) `resolveUID`'s documented
-    /// contract on this branch is that a SEARCH miss can be TRANSIENT (server-side
-    /// indexing lag, concurrent renumbering), and `AccountManager.drainPendingQueue`
-    /// implements exactly that: `ProviderError.uidResolutionFailed` is retried up to
-    /// `SyncConfig.maxUidResolutionRetries` on the dedicated `uidResolutionRetryCount`
-    /// and only then dropped as confirmed-stale. `v2final`'s arm had no such budget, so
-    /// its terminal no-op was the only non-wedging option available to it. The error
-    /// TYPE is load-bearing for the same reason: an UNCLASSIFIED throw halts that
-    /// account's lane on every drain, forever, behind an op that can never succeed.
-    ///
-    /// ⚑ WHICH ERROR, AND WHY IT IS NOT ONE ERROR. The two guards ABOVE the wire
-    /// (all-digits id, non-canonicalizing id) throw `actionIdentityResolutionFailed`;
-    /// every verdict BELOW the wire throws `uidResolutionFailed`. That split is the
-    /// whole classification: the pre-wire guards read a string and can NEVER decide
-    /// differently on a retry, so spending the retry budget on them is a lie that ends
-    /// in a "confirmed stale" drop the server never confirmed — the drain terminalizes
-    /// them instead (`v2final:AccountManagerQueue`'s `.deleteDraft` arm does the same).
-    /// The post-wire verdicts genuinely can flip: a SEARCH miss can be server-side
-    /// indexing lag, and a `>1` ambiguity resolves the moment one sibling goes away.
-    func deleteDraft(
-        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
-    ) async throws {
-        // `draftId` is `MessageHeader.stableId` / `Draft.serverDraftId`: for IMAP the
-        // former is the rfc822 Message-ID (`MessageHeader.stableId` prefers it precisely
-        // because it "survives UIDVALIDITY changes and UID remaps"), the latter may
-        // still be the bare UID that `saveDraft` returned.
-        let addressedUid = UInt32(draftId).map(Int.init)
-        // ASYMMETRIC IDENTITY — an epoch with no UID to scope. Never a shape any
-        // admission site produces (`queueDraftDelete` stamps the epoch only when slot 0
-        // is numeric), so it means the payload is corrupt. Refuse TERMINALLY rather than
-        // silently falling through to the Message-ID arm, which would resolve an
-        // impossible identity via the destructive path. Ported from `v2final`'s
-        // round-2 blocker fix on the same dispatcher.
-        if addressedUid == nil, uidValidity != nil {
-            print("[IMAP] deleteDraft: asymmetric identity (uid: nil, uidValidity: \(uidValidity!)) in \(draftsFolderPath) — REFUSING rather than falling to the Message-ID search arm")
-            throw ProviderError.actionIdentityResolutionFailed(draftId)
+    /// Delete only the provider-native `(folder, UIDVALIDITY, UID)` address.
+    /// Unknown, malformed, or stale coordinates fail closed; an absent addressed UID
+    /// is already gone. No RFC identity is accepted as mutation authority.
+    func deleteDraft(identity: DraftDeleteIdentity) async throws {
+        guard case .imap(let folder, let uidValidity, let uid) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed("IMAPProvider received a non-IMAP draft identity")
         }
-        if let addressedUid, let uidValidity {
-            try await deleteDraftStrong(
-                uid: addressedUid, uidValidity: uidValidity,
-                rfc: rfc822MessageId, draftsFolderPath: draftsFolderPath)
-            return
-        }
-        // No trustworthy address: resolve by IDENTITY. The op's own rfc822 slot when it
-        // has one, otherwise `draftId` itself (which is the Message-ID whenever it is
-        // not all-digits). A numeric `draftId` with no epoch and no rfc822 leaves
-        // nothing to resolve and is refused below.
-        let identityCandidate = rfc822MessageId ?? (addressedUid == nil ? draftId : nil)
-        try await deleteDraftLegacy(
-            rfc: identityCandidate, refusedId: draftId, draftsFolderPath: draftsFolderPath)
+        try await deleteDraftStrong(
+            uid: uid, uidValidity: uidValidity, draftsFolderPath: folder)
     }
 
-    /// STRONG arm (`v2final`'s `deleteDraftStrong`): the caller recorded the UID **and**
-    /// the epoch that UID was minted under, so the exact physical message can be named.
-    ///
-    /// On the action connection's own SELECT: the live UIDVALIDITY must EQUAL the
-    /// recorded one — a mismatch means the numbering this address belongs to is gone, so
-    /// it fails closed with a TERMINAL refusal and NEVER rebinds by rfc822 (ADR-IOS-061:
-    /// the surviving copy is the accepted residual). Then FETCH that UID's own
-    /// Message-ID and corroborate it against `rfc` when the caller recorded one. An
-    /// ABSENT UID is a clean no-op: another actor already completed this delete, and —
-    /// the whole reason this arm exists — a legitimate same-Message-ID sibling elsewhere
-    /// in the mailbox is not a candidate for it.
+    /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its exact epoch/UID
+    /// validation and absent-target no-op, but omit optional RFC corroboration because
+    /// v3's typed identity has no RFC leg.
     private func deleteDraftStrong(
-        uid: Int, uidValidity: Int, rfc: String?, draftsFolderPath: String
+        uid: Int, uidValidity: Int, draftsFolderPath: String
     ) async throws {
-        guard let recordedUidValidity = UInt32(exactly: uidValidity),
+        guard uid > 0,
+              uidValidity > 0,
+              let recordedUidValidity = UInt32(exactly: uidValidity),
               let targetUidValue = UInt32(exactly: uid) else {
             print("[IMAP] deleteDraft (strong): out-of-range identity (uid=\(uid), uidValidity=\(uidValidity)) in \(draftsFolderPath) — REFUSING")
             throw ProviderError.actionIdentityResolutionFailed(String(uid))
@@ -2337,87 +2168,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
             let targetSet = UIDSet(UID(targetUidValue))
             let infos = try await server.fetchMessageInfosBulk(using: targetSet)
-            guard let info = infos.first(where: { $0.uid?.value == targetUidValue }) else {
+            guard infos.contains(where: { $0.uid?.value == targetUidValue }) else {
                 // Already gone — expunged by another actor, or by a prior attempt whose
                 // response was lost. Terminal no-op, and NOT an invitation to go looking
                 // for something else that carries the same Message-ID.
                 print("[IMAP] deleteDraft (strong): uid=\(uid) in \(draftsFolderPath) not found on FETCH — treating as already deleted")
                 return
             }
-            if let rfc {
-                let fetchedRaw = IMAPFetchMapping.rfc822MessageId(from: info)
-                // `.identityOnly` semantics, for the same reason `exactMessageIdMatches`
-                // is called with it below: both sides are SERVER-ORIGINATED Message-IDs,
-                // so the content-key `':'` term must not apply.
-                let expected = MessageIdentity.comparableRfc822Identity(rfc)
-                let fetched = fetchedRaw.flatMap { MessageIdentity.comparableRfc822Identity($0) }
-                guard let expected, fetched == expected else {
-                    print("[IMAP] deleteDraft (strong): rfc822 corroboration mismatch for uid=\(uid) in \(draftsFolderPath) (recorded=\(rfc), fetched=\(fetchedRaw ?? "nil")) — REFUSING (fail closed)")
-                    throw ProviderError.actionIdentityResolutionFailed(String(uid))
-                }
-            }
             try await server.store(flags: [.deleted], on: targetSet, operation: .add)
             try await self.expungeScopedToTargets(
                 targetSet, server: server,
                 logDescription: "draft uid=\(uid) from \(draftsFolderPath)")
             print("[IMAP] Deleted draft uid=\(uid) from \(draftsFolderPath)")
-        }
-    }
-
-    /// LEGACY arm (`v2final`'s `deleteDraftLegacy`): resolve by exact-verified rfc822
-    /// Message-ID SEARCH. Epoch-immune — it finds the draft under whatever UID the
-    /// current numbering gave it — and PERMANENT: it is the only thing available to an
-    /// op that never recorded an epoch. `refusedId` is the op's own slot 0, carried only
-    /// so a refusal names what the caller handed in.
-    private func deleteDraftLegacy(
-        rfc: String?, refusedId: String, draftsFolderPath: String
-    ) async throws {
-        // Refuse BEFORE touching the wire. An all-digits value carries no identity to
-        // verify and there is nothing on this arm to corroborate it against, so it is
-        // refused rather than executed — the ONE thing that must never happen is a
-        // destructive command aimed at an address.
-        guard let rfc else {
-            print("[IMAP] deleteDraft: '\(refusedId)' in \(draftsFolderPath) is a bare UID with no recorded epoch and no rfc822 — an ADDRESS, not an identity, and nothing here can corroborate it. REFUSING (fail closed; the draft remains and the gesture can be re-issued)")
-            throw ProviderError.actionIdentityResolutionFailed(refusedId)
-        }
-        let draftId = rfc
-        guard let expectedIdentity = MessageIdentity.comparableRfc822Identity(draftId) else {
-            print("[IMAP] deleteDraft: '\(draftId)' in \(draftsFolderPath) does not canonicalize to an rfc822 Message-ID — REFUSING (fail closed; a malformed identity resolves nothing and must never fall through to a destructive command)")
-            throw ProviderError.actionIdentityResolutionFailed(draftId)
-        }
-        try await withActionConnection(folder: draftsFolderPath) { server in
-            // Epoch-immune: the SEARCH finds the draft under whatever UID the current
-            // numbering gave it, so no epoch needs to be trusted or even known.
-            let hits = try await self.searchByMessageId(expectedIdentity, server: server)
-            guard !hits.isEmpty else {
-                print("[IMAP] deleteDraft: Message-ID search found no draft for \(expectedIdentity) in \(draftsFolderPath) — REFUSING (a SEARCH miss can be transient; the drain retries on its uidResolution budget, then drops)")
-                throw ProviderError.uidResolutionFailed(draftId)
-            }
-            // ⚑ `.identityOnly`: BOTH sides here are SERVER-ORIGINATED Message-IDs, so
-            // the content-key `':'` term must not apply — see `MessageIdComparison`. A
-            // draft whose id legitimately carries a colon (RFC 5322 no-fold-literal
-            // domain) would otherwise never verify, and under the fail-closed rule above
-            // its delete would throw forever.
-            let verified = try await self.exactMessageIdMatches(
-                hits, expectedRawMessageId: expectedIdentity, server: server,
-                comparison: .identityOnly)
-            switch verified.count {
-            case 1:
-                try await server.store(flags: [.deleted], on: verified, operation: .add)
-                try await self.expungeScopedToTargets(verified, server: server,
-                                                      logDescription: "draft \(draftId) from \(draftsFolderPath)")
-                print("[IMAP] Deleted draft \(draftId) from \(draftsFolderPath)")
-            case 0:
-                // Every hit was substring-only. Nothing in this mailbox IS the draft.
-                print("[IMAP] deleteDraft: all \(hits.count) Message-ID hit(s) for \(expectedIdentity) in \(draftsFolderPath) were substring-only (none exact) — REFUSING (destroying a substring hit is a wrong-message delete)")
-                throw ProviderError.uidResolutionFailed(draftId)
-            default:
-                // FAIL CLOSED on ambiguity: 2+ EXACT matches are legitimate same-rfc
-                // Drafts siblings and there is no way to tell which one the gesture
-                // named, so deleting the set would destroy a sibling.
-                print("[IMAP] deleteDraft: \(verified.count) drafts share exact rfc822 Message-ID \(expectedIdentity) in \(draftsFolderPath) — REFUSING destructive STORE (would destroy a legitimate sibling)")
-                throw ProviderError.uidResolutionFailed(draftId)
-            }
         }
     }
 
@@ -3063,8 +2825,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     // MARK: - UID Resolution
 
     /// Verify raw `searchByMessageId` HEADER SEARCH hits against
-    /// `expectedRawMessageId` by an exact, normalized comparison, before a caller
-    /// issues a DESTRUCTIVE command (STORE `\Deleted` + EXPUNGE) against them.
+    /// `expectedRawMessageId` by an exact, normalized identity comparison before a
+    /// caller treats one candidate as the APPEND's strong result.
     ///
     /// IMAP `SEARCH HEADER Message-ID` is RFC 3501 SUBSTRING matching, not equality:
     /// a search for `a@example.com` also returns a message whose id is
@@ -3072,30 +2834,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// caller never identified. This FETCHes each hit's OWN `Message-ID` header and
     /// keeps only the ones that canonicalize to the same value.
     ///
-    /// Returns ALL exact matches; the CALLER owns the cardinality decision. Both
-    /// destructive draft callers refuse a set — `saveDraft`'s old-copy delete skips
-    /// the delete and still APPENDs, `deleteDraft` would refuse outright — because
-    /// 2+ exact matches are legitimate same-rfc Drafts siblings and deleting the set
-    /// destroys one.
+    /// Returns all exact matches; `saveDraft` owns the exactly-one cardinality rule.
+    /// Zero or multiple exact matches never become provider mutation authority.
     ///
     /// Fails to an EMPTY result (never a guess) when `expectedRawMessageId` itself
     /// does not canonicalize, or when a hit's own FETCHed Message-ID does not.
     ///
-    /// Ported from `v2final`'s `exactMessageIdMatches` (ADR-IOS-061 item E). The
-    /// reference normalizes through `MessageIdentity.durableActionRFC822MessageId`
-    /// and offers its callers no choice; on this branch the normalizer is SELECTED
-    /// by `comparison`, because `v3` split that one function into two (see
-    /// `MessageIdComparison`) and the right member differs per call site. The
-    /// argument is deliberately NOT defaulted: which question a destructive
-    /// comparison is asking must be stated at every site, not inherited.
+    /// Ported from `v2final`'s `exactMessageIdMatches` (ADR-IOS-061 item E).
     private func exactMessageIdMatches(
         _ hits: UIDSet,
         expectedRawMessageId: String,
-        server: IMAPServer,
-        comparison: MessageIdComparison
+        server: IMAPServer
     ) async throws -> UIDSet {
         guard !hits.isEmpty else { return hits }
-        guard let expected = comparison.normalize(expectedRawMessageId) else {
+        guard let expected = MessageIdentity.comparableRfc822Identity(expectedRawMessageId) else {
             return UIDSet()
         }
         let hitValues = Set(hits.toArray().map(\.value))
@@ -3103,7 +2855,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         var exact = UIDSet()
         for info in infos {
             guard let uid = info.uid, hitValues.contains(uid.value),
-                  let returned = comparison.normalize(
+                  let returned = MessageIdentity.comparableRfc822Identity(
                       IMAPFetchMapping.rfc822MessageId(from: info)
                   )
             else { continue }
@@ -3112,39 +2864,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
         return exact
-    }
-
-    /// Which QUESTION an `exactMessageIdMatches` comparison is asking — and
-    /// therefore which of `MessageIdentity`'s two RFC 822 normalizers answers it.
-    /// The two differ by exactly one term, the `':'` rejection, which exists for
-    /// CONTENT-KEY folder scoping and has nothing to do with comparing identities.
-    ///
-    /// ⚑ `v2final` has no such distinction — it has ONE normalizer
-    /// (`durableActionRFC822MessageId`, the colon-TOLERANT semantics) and both of
-    /// its destructive draft callers use it. The split is a `v3` artifact
-    /// (`usableRfc822Tail` acquired the `':'` term for content keys), so the port
-    /// has to say which half each site meant.
-    private enum MessageIdComparison {
-        /// Content-key strictness: an id that could not serve as a `headerId` TAIL
-        /// is treated as no identity at all. `saveDraft`'s old-copy delete keeps
-        /// this — its expected id is the TabMail-minted `draft-<UUID>@<domain>`,
-        /// colon-free by construction, so the extra term is unreachable there and
-        /// changing it would be a separate decision (see `68298e534`).
-        case contentKeyStrict
-        /// Pure identity equality, colon TOLERATED — the reference's semantics.
-        /// Required wherever BOTH sides are SERVER-ORIGINATED Message-IDs, since
-        /// RFC 5322 permits a colon inside a `no-fold-literal` domain
-        /// (`<x@[IPv6:2001:db8::1]>`): under `contentKeyStrict` every such id
-        /// normalizes to nil, no hit can ever verify, and a caller that fails
-        /// CLOSED then refuses that draft's delete forever.
-        case identityOnly
-
-        func normalize(_ rawValue: String?) -> String? {
-            switch self {
-            case .contentKeyStrict: return MessageIdentity.usableRfc822Tail(rawValue)
-            case .identityOnly: return MessageIdentity.comparableRfc822Identity(rawValue)
-            }
-        }
     }
 
     /// Search the currently selected mailbox for a message by its RFC 2822 Message-ID.

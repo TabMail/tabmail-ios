@@ -730,25 +730,21 @@ actor SearchIndex {
     /// point for `BodyAssetStore` — "manifest-QUERY delete (never a captured-id
     /// list, P1b F5)".)
     ///
-    /// Shares `removeMessagesForAccount`'s statement shape; the only difference is
-    /// the predicate — a LIKE-escaped `accountId:folderPath:` prefix PLUS the
-    /// no-deeper-colon guard, because an IMAP server may use ':' as its hierarchy
-    /// delimiter and a bare prefix would then also sweep a nested sibling folder.
+    /// PORT (`v2final:SearchIndex.removeMessagesForFolder`): `message_meta.folderId`
+    /// is the authoritative folder relation. It cannot confuse a colon-bearing
+    /// message-id tail with an IMAP child folder, and remains queryable after the
+    /// main-database headers have already been deleted.
     func removeMessagesForFolder(accountId: String, folderPath: String) throws {
         ensureReady()
         guard let dbPool else { return }
-        let likePrefix = MessageIdentity.escapedHeaderIdLikePrefix(accountId: accountId, folderPath: folderPath) + "%"
-        let rawPrefix = MessageIdentity.headerIdPrefix(accountId: accountId, folderPath: folderPath)
-        let noDeeperColon = MessageIdentity.headerIdLikeNoDeeperColonSQLFragment(column: "headerId")
-        let predicate = "headerId LIKE ? ESCAPE '\\' AND \(noDeeperColon)"
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
         try dbPool.write { [self] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT mi.rowid, meta.shardYear
                 FROM message_ids mi
                 JOIN message_meta meta ON mi.rowid = meta.rowid
-                WHERE mi.headerId LIKE ? ESCAPE '\\'
-                  AND \(MessageIdentity.headerIdLikeNoDeeperColonSQLFragment(column: "mi.headerId"))
-                """, arguments: [likePrefix, rawPrefix])
+                WHERE meta.folderId = ?
+                """, arguments: [folderId])
 
             var rowidsByYear: [Int: [Int64]] = [:]
             for row in rows {
@@ -766,11 +762,9 @@ actor SearchIndex {
                 let rowid: Int64 = row["rowid"]
                 try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?", arguments: [rowid])
                 try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?", arguments: [rowid])
-            }
-            if !rows.isEmpty {
                 try db.execute(
-                    sql: "DELETE FROM message_ids WHERE \(predicate)",
-                    arguments: [likePrefix, rawPrefix]
+                    sql: "DELETE FROM message_ids WHERE rowid = ?",
+                    arguments: [rowid]
                 )
             }
         }

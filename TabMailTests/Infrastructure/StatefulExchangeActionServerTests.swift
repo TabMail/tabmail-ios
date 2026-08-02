@@ -111,8 +111,7 @@ struct StatefulExchangeActionServerTests {
     /// separately needs a response script that forces both legs to run:
     /// `deleteDraftRetriesOnTheInjectedSessionAfter401` does that.
     ///
-    /// `previousRfc822MessageId:` is IMAP-only — Exchange PATCHes by the durable
-    /// Graph id and ignores it — so it is passed nil here.
+    /// Exchange PATCHes only by its typed durable Graph resource identity.
     @Test("an opaque Graph draft id stays one path segment for body GET, attachments, and PATCH")
     func opaqueDraftIdStaysOnePathSegment() async throws {
         let opaqueId = "graph-draft+opaque="
@@ -130,8 +129,7 @@ struct StatefulExchangeActionServerTests {
 
         _ = try await provider.saveDraft(
             DraftMessage(subject: "Updated", body: "Updated body"),
-            existingDraftId: opaqueId,
-            previousRfc822MessageId: nil,
+            existingIdentity: .outlook(graphId: opaqueId),
             draftsFolderPath: "Drafts"
         )
 
@@ -154,7 +152,7 @@ struct StatefulExchangeActionServerTests {
 
         // Gap 2's restored leg. `deleteDraft` addresses the same opaque id, and
         // both of its request paths now carry `session: testSession`.
-        try await provider.deleteDraft(draftId: opaqueId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(identity: .outlook(graphId: opaqueId))
         #expect(
             server.snapshot(providerMessageId: opaqueId) == nil,
             "deleteDraft must remove the addressed resource from THIS fixture — a surviving snapshot means the DELETE never reached the injected session"
@@ -648,7 +646,7 @@ struct StatefulExchangeActionServerTests {
             .status(draftDelete.next())
         }
 
-        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(identity: .outlook(graphId: providerMessageId))
 
         #expect(
             draftDelete.served == [401, 204],

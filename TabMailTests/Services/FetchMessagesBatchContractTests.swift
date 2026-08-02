@@ -53,10 +53,10 @@ struct FetchMessagesBatchContractTests {
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
 
-        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
-            DraftSaveResult(serverId: "mock")
+        func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome {
+            .created(.outlook(graphId: "mock"))
         }
-        func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
+        func deleteDraft(identity: DraftDeleteIdentity) async throws {}
     }
 
     private func makeFullMessage(id: String) -> FullMessageInfo {

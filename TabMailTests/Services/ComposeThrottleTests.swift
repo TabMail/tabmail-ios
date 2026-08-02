@@ -215,79 +215,173 @@ struct OutboxThrottleConfigTests {
 
 // MARK: - PendingSendService lifecycle
 
-@Suite("PendingSendService lifecycle")
+@Suite("PendingSendService generation-safe confirmed cancellation",
+       .serialized, .processGlobalState)
 @MainActor
 struct PendingSendServiceLifecycleTests {
+    private enum Refusal: Sendable, Equatable { case sending, sent }
 
     private func makeFreshService() -> PendingSendService {
-        // Reset the shared singleton's current/dismissTask for a clean test.
-        // The service doesn't expose a reset, so we call dismiss() which
-        // clears current and cancels any prior dismissTask.
         PendingSendService.shared.dismiss()
         return PendingSendService.shared
     }
 
-    @Test("present() sets current with the given outboxId + draftId + toSummary")
-    func presentPopulatesCurrent() async {
-        let svc = makeFreshService()
-        svc.present(outboxId: "obx1", draftId: "drft1", toSummary: "To: a@b.com")
-        #expect(svc.current?.id == "obx1")
-        #expect(svc.current?.draftId == "drft1")
-        #expect(svc.current?.toSummary == "To: a@b.com")
-        // queuedAt is "now" — should be within a few ms of Date()
-        if let q = svc.current?.queuedAt {
-            #expect(abs(q.timeIntervalSinceNow) < 1.0)
-        } else {
-            Issue.record("queuedAt is nil")
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pending-send-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
         }
-        svc.dismiss()
+        try pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "owner@example.com", displayName: "Owner", provider: .gmail)
+            account.id = "acc1"
+            try account.insert(db)
+        }
+        return (pool, directory, previous)
     }
 
-    @Test("Second present() replaces current, cancels prior dismissTask")
-    func secondPresentReplaces() async {
+    private func finish(_ fixture: (DatabasePool, URL, AppDatabase?)) {
+        PendingSendService.shared.dismiss()
+        InstalledTestDatabaseLifetime.finish(
+            previous: fixture.2, pool: fixture.0, directory: fixture.1)
+    }
+
+    private func draft(id: String, epoch: String) -> Draft {
+        var value = Draft(
+            id: id, accountId: "acc1", toJSON: "[\"to@example.com\"]",
+            ccJSON: "[\"cc@example.com\"]", bccJSON: "[]",
+            subject: "subject", body: "body", replyToId: nil, isForward: false,
+            editHistoryJSON: nil, createdAt: 1, updatedAt: 1)
+        value.instanceEpoch = epoch
+        return value
+    }
+
+    private func outbox(
+        id: String = UUID().uuidString,
+        draftId: String,
+        epoch: String,
+        status: OutboxStatus = .queued,
+        sentAt: Date? = nil
+    ) -> OutboxMessage {
+        var value = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(to: ["to@example.com"], subject: "subject", body: "body"))
+        value.id = id
+        value.draftId = draftId
+        value.instanceEpoch = epoch
+        value.status = status.rawValue
+        value.sentAt = sentAt
+        return value
+    }
+
+    @Test("Pending Send presents and replaces the exact Draft generation")
+    func presentCarriesExactGeneration() {
         let svc = makeFreshService()
-        svc.present(outboxId: "first", draftId: "d1", toSummary: "first")
-        #expect(svc.current?.id == "first")
-        svc.present(outboxId: "second", draftId: "d2", toSummary: "second")
+        svc.present(
+            outboxId: "first", draftId: "draft-1", instanceEpoch: "E1",
+            toSummary: "first")
+        svc.present(
+            outboxId: "second", draftId: "draft-2", instanceEpoch: "E2",
+            toSummary: "second")
         #expect(svc.current?.id == "second")
-        #expect(svc.current?.draftId == "d2")
+        #expect(svc.current?.draftId == "draft-2")
+        #expect(svc.current?.instanceEpoch == "E2")
         svc.dismiss()
     }
 
-    @Test("dismiss() clears current immediately")
-    func dismissClears() async {
+    @Test("Undo always attempts confirmed cancellation but never reopens a replaced generation")
+    func generationMismatchStillCancels() throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let replacement = draft(id: "draft-1", epoch: "E2")
+        let pending = outbox(draftId: replacement.id, epoch: "E1")
+        try fixture.0.writeWithoutTransaction { db in
+            try replacement.insert(db)
+            try pending.insert(db)
+        }
         let svc = makeFreshService()
-        svc.present(outboxId: "x", draftId: "d", toSummary: "To: x")
-        #expect(svc.current != nil)
-        svc.dismiss()
+        svc.present(
+            outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
+            toSummary: "To: to@example.com")
+
+        #expect(svc.undo() == nil)
+        #expect(try fixture.0.read {
+            try OutboxMessage.fetchOne($0, key: pending.id)
+        } == nil)
+        #expect(try fixture.0.read {
+            try Draft.fetchOne($0, key: replacement.id)
+        }?.instanceEpoch == "E2")
         #expect(svc.current == nil)
     }
 
-    // Auto-dismiss Task duration is undoHold + claimBuffer + postSendConfirm
-    // = 7.5 s. Too long for a unit test to wait on. We verify the Task is
-    // scheduled by cancelling it via dismiss() and observing state matches
-    // what the Task would produce. For real timing, an integration test
-    // could sleep 8+ s; we skip that here to keep the suite fast.
-
-    @Test("undo() returns nil when no Draft row exists (no snapshot to restore)")
-    func undoWithoutDraftRow() async {
-        // Note: this test does NOT seed a Draft row, so undo() can't build a
-        // snapshot — it returns nil. We're exercising the service-level
-        // lifecycle (current cleared, dismissTask cancelled), not the
-        // full Draft/Attachment load path.
+    @Test("Confirmed Undo retains and reopens only the exact Draft generation")
+    func confirmedUndoRetainsExactDraft() throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let retained = draft(id: "draft-retained", epoch: "E1")
+        let pending = outbox(draftId: retained.id, epoch: "E1")
+        try fixture.0.writeWithoutTransaction { db in
+            try retained.insert(db)
+            try pending.insert(db)
+        }
         let svc = makeFreshService()
-        svc.present(outboxId: "nonexistent-id", draftId: "draft-xyz", toSummary: "To: x")
-        let returned = svc.undo()
-        #expect(returned == nil)  // no Draft row → no snapshot
-        #expect(svc.current == nil)  // state cleared either way
+        svc.present(
+            outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
+            toSummary: "To: to@example.com")
+
+        let snapshot = try #require(svc.undo())
+        #expect(snapshot.authority == .init(
+            draftId: retained.id, accountId: "acc1", instanceEpoch: "E1"))
+        #expect(try fixture.0.read {
+            try OutboxMessage.fetchOne($0, key: pending.id)
+        } == nil)
+        #expect(try fixture.0.read {
+            try Draft.fetchOne($0, key: retained.id)
+        }?.instanceEpoch == "E1")
+        let compose = UndoReopenCompose.composeView(for: snapshot)
+        #expect(compose.prefillDraftId == retained.id)
+        #expect(compose.retainedDraftAuthority == snapshot.authority)
+        #expect(svc.current == nil)
     }
 
-    @Test("undo() on empty state returns nil (no crash)")
-    func undoEmpty() async {
+    @Test("Undo refuses sending or sent rows and leaves the toast intact", arguments: [
+        Refusal.sending, .sent,
+    ])
+    private func cancellationRefusals(refusal: Refusal) throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        let retained = draft(id: "draft-refused", epoch: "E1")
+        let status: OutboxStatus = refusal == .sending ? .sending : .queued
+        let pending = outbox(
+            draftId: retained.id, epoch: "E1", status: status,
+            sentAt: refusal == .sent ? Date() : nil)
+        try fixture.0.writeWithoutTransaction { db in
+            try retained.insert(db)
+            try pending.insert(db)
+        }
         let svc = makeFreshService()
-        svc.dismiss()  // ensure clean
-        let returned = svc.undo()
-        #expect(returned == nil)
+        svc.present(
+            outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
+            toSummary: "To: to@example.com")
+
+        #expect(svc.undo() == nil)
+        #expect(try fixture.0.read {
+            try OutboxMessage.fetchOne($0, key: pending.id)
+        } != nil)
+        #expect(try fixture.0.read {
+            try Draft.fetchOne($0, key: retained.id)
+        } != nil)
+        #expect(svc.current?.id == pending.id)
     }
 }
 
@@ -710,33 +804,6 @@ struct DraftSurvivesDiscardTests {
         #expect(draftAfter != nil)
     }
 
-    @Test("Replicates deferred-delete: simulate claim → DraftStore.delete flow")
-    func simulateClaimThenDelete() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-
-        try insertDraftForTest(db, id: "drft-claim")
-        let outbox = makeMessage(
-            holdUntil: Date().addingTimeInterval(-1),  // ready
-            draftId: "drft-claim",
-            status: .queued
-        )
-        try db.write { try outbox.insert($0) }
-
-        // Step 1: atomic claim (queued → sending)
-        let claimed = try runAtomicClaimForTest(db, id: outbox.id)
-        #expect(claimed != nil)
-
-        // Step 2: deferred DraftStore.delete runs after claim (production uses
-        // a Task { try? await DraftStore.shared.delete(id: did) }). Simulate
-        // by deleting directly on the test DB.
-        if let did = claimed?.0.draftId {
-            try db.write { _ = try Draft.deleteOne($0, key: did) }
-        }
-
-        let draftAfter = try db.read { try Draft.fetchOne($0, key: "drft-claim") }
-        #expect(draftAfter == nil)  // Draft cleaned up by deferred-delete
-    }
 }
 
 // MARK: - Post-loop wake-up query

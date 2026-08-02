@@ -63,6 +63,25 @@ private func makeDraft(subject: String = "Hello", body: String = "Body") -> Draf
     DraftMessage(to: ["recipient@example.com"], subject: subject, body: body)
 }
 
+private func insertDraftAuthority(
+    _ pool: DatabasePool,
+    id: String,
+    accountId: String = "acc1",
+    epoch: String = "E1"
+) async throws {
+    try await pool.write { db in
+        var draft = Draft(
+            id: id, accountId: accountId,
+            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Draft", body: "Body", replyToId: nil,
+            isForward: false, editHistoryJSON: nil,
+            createdAt: Date().timeIntervalSince1970,
+            updatedAt: Date().timeIntervalSince1970)
+        draft.instanceEpoch = epoch
+        try draft.insert(db)
+    }
+}
+
 // MARK: - Double-send firewall
 
 @Suite("Outbox double-send firewall", .serialized, .processGlobalState)
@@ -71,6 +90,52 @@ struct OutboxDoubleSendTests {
 
     private func outboxCount(_ pool: DatabasePool) async throws -> Int {
         try await pool.read { db in try OutboxMessage.fetchCount(db) }
+    }
+
+    @Test("Generation-aware dedup rejects E2 over queued E1, while an exact E1 duplicate still dedups")
+    func crossEpochAttemptCannotCollapseIntoExistingPayload() async throws {
+        let (dir, pool, previous) = try makeOutboxTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let draftId = "draft-cross-epoch"
+        try await insertDraftAuthority(pool, id: draftId, epoch: "E1")
+
+        let e1 = try await AccountManager.persistQueuedSend(
+            draft: makeDraft(subject: "E1 payload", body: "body-E1"),
+            accountId: "acc1", replyToHeaderId: nil, isForward: false,
+            serverDraftId: nil, draftId: draftId, instanceEpoch: "E1")
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE draft SET instanceEpoch = ? WHERE id = ?",
+                arguments: ["E2", draftId])
+        }
+
+        await #expect(throws: OutboxAdmissionError.self) {
+            _ = try await AccountManager.persistQueuedSend(
+                draft: makeDraft(subject: "E2 payload", body: "body-E2"),
+                accountId: "acc1", replyToHeaderId: nil, isForward: false,
+                serverDraftId: nil, draftId: draftId, instanceEpoch: "E2")
+        }
+        let afterE2 = try await pool.read { try OutboxMessage.fetchAll($0) }
+        #expect(afterE2.count == 1)
+        #expect(afterE2.first?.id == e1.outboxId)
+        #expect(afterE2.first?.subject == "E1 payload")
+        #expect(afterE2.first?.instanceEpoch == "E1")
+
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE draft SET instanceEpoch = ? WHERE id = ?",
+                arguments: ["E1", draftId])
+        }
+        let exact = try await AccountManager.persistQueuedSend(
+            draft: makeDraft(subject: "E1 payload", body: "body-E1"),
+            accountId: "acc1", replyToHeaderId: nil, isForward: false,
+            serverDraftId: nil, draftId: draftId, instanceEpoch: "E1")
+        #expect(exact.deduped)
+        #expect(exact.outboxId == e1.outboxId)
+        #expect(try await outboxCount(pool) == 1)
     }
 
     /// THE double-tap test: two `persistQueuedSend` calls for the SAME compose
@@ -86,14 +151,15 @@ struct OutboxDoubleSendTests {
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let draft = makeDraft()
+        try await insertDraftAuthority(pool, id: "draft-1")
 
         let first = try await AccountManager.persistQueuedSend(
             draft: draft, accountId: "acc1", replyToHeaderId: nil,
-            isForward: false, serverDraftId: nil, draftId: "draft-1"
+            isForward: false, serverDraftId: nil, draftId: "draft-1", instanceEpoch: "E1"
         )
         let second = try await AccountManager.persistQueuedSend(
             draft: draft, accountId: "acc1", replyToHeaderId: nil,
-            isForward: false, serverDraftId: nil, draftId: "draft-1"
+            isForward: false, serverDraftId: nil, draftId: "draft-1", instanceEpoch: "E1"
         )
 
         #expect(first.deduped == false, "first send should insert a fresh row")
@@ -115,14 +181,15 @@ struct OutboxDoubleSendTests {
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         let draft = makeDraft()
+        try await insertDraftAuthority(pool, id: "draft-concurrent")
 
         async let a = AccountManager.persistQueuedSend(
             draft: draft, accountId: "acc1", replyToHeaderId: nil,
-            isForward: false, serverDraftId: nil, draftId: "draft-concurrent"
+            isForward: false, serverDraftId: nil, draftId: "draft-concurrent", instanceEpoch: "E1"
         )
         async let b = AccountManager.persistQueuedSend(
             draft: draft, accountId: "acc1", replyToHeaderId: nil,
-            isForward: false, serverDraftId: nil, draftId: "draft-concurrent"
+            isForward: false, serverDraftId: nil, draftId: "draft-concurrent", instanceEpoch: "E1"
         )
         let results = try await [a, b]
 
@@ -146,6 +213,7 @@ struct OutboxDoubleSendTests {
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Seed a .failed row for draft "draft-failed".
+        try await insertDraftAuthority(pool, id: "draft-failed")
         try await pool.write { db in
             var failed = OutboxMessage(accountId: "acc1", draft: makeDraft(subject: "Old attempt"))
             failed.draftId = "draft-failed"
@@ -156,7 +224,7 @@ struct OutboxDoubleSendTests {
 
         let result = try await AccountManager.persistQueuedSend(
             draft: makeDraft(subject: "Retry"), accountId: "acc1", replyToHeaderId: nil,
-            isForward: false, serverDraftId: nil, draftId: "draft-failed"
+            isForward: false, serverDraftId: nil, draftId: "draft-failed", instanceEpoch: "E1"
         )
 
         #expect(result.deduped == false, "a .failed row must not dedup a fresh re-send")
@@ -181,27 +249,38 @@ struct OutboxDoubleSendTests {
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         // Seed the original inbox message being replied to.
+        try await insertDraftAuthority(pool, id: "draft-reply")
         let originalId = "acc1:INBOX:orig-1"
+        let originalRfc = "original-reply@example.com"
         try await pool.write { db in
-            let h = MessageHeader(
+            var h = MessageHeader(
                 messageId: "orig-1", subject: "Original", from: "Sender",
                 fromAddress: "sender@example.com", to: "user@example.com",
                 date: Date(), snippet: "snip", folderId: "acc1:INBOX",
                 accountId: "acc1", folderPath: "INBOX", isInInbox: true)
+            h.rfc822MessageId = originalRfc
             #expect(h.id == originalId)
             try h.insert(db)
         }
 
+        let replyDraft = DraftMessage(
+            to: ["recipient@example.com"],
+            subject: "Re: Original",
+            body: "Body",
+            inReplyTo: "<\(originalRfc)>")
+
         let first = try await AccountManager.persistQueuedSend(
-            draft: makeDraft(subject: "Re: Original"), accountId: "acc1",
-            replyToHeaderId: originalId, isForward: false, serverDraftId: nil, draftId: "draft-reply"
+            draft: replyDraft, accountId: "acc1",
+            replyToHeaderId: originalId, isForward: false, serverDraftId: nil,
+            draftId: "draft-reply", instanceEpoch: "E1"
         )
         #expect(first.deduped == false)
         #expect(first.resolvedOriginalId == originalId, "first reply send should resolve the original header")
 
         let second = try await AccountManager.persistQueuedSend(
-            draft: makeDraft(subject: "Re: Original"), accountId: "acc1",
-            replyToHeaderId: originalId, isForward: false, serverDraftId: nil, draftId: "draft-reply"
+            draft: replyDraft, accountId: "acc1",
+            replyToHeaderId: originalId, isForward: false, serverDraftId: nil,
+            draftId: "draft-reply", instanceEpoch: "E1"
         )
         #expect(second.deduped == true, "second reply send (double-tap) must dedup")
         #expect(second.resolvedOriginalId == nil, "deduped send must not re-resolve / re-touch the original")
@@ -214,38 +293,49 @@ struct OutboxDoubleSendTests {
         #expect(isReplied == true, "original message should be flagged isReplied")
     }
 
-    /// Direct unit of the firewall predicate: it matches `.queued`/`.sending` rows
-    /// but not `.failed`, and is scoped to the exact `draftId`.
-    @Test("inFlightOutboxId matches only in-flight rows for the exact draft")
+    @Test("Outbox in-flight census is same-account, exact-draft, bounded to two, and ambiguity fails closed")
     func inFlightPredicateScoping() async throws {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
+        try await insertDraftAuthority(pool, id: "draft-target", epoch: "E1")
         try await pool.write { db in
-            for (draftId, status) in [
-                ("q", OutboxStatus.queued), ("s", .sending), ("f", .failed)
+            var other = Account(
+                emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
+            other.id = "acc2"
+            try other.insert(db)
+
+            for (id, accountId, draftId, status) in [
+                ("target-queued", "acc1", "draft-target", OutboxStatus.queued),
+                ("target-sending", "acc1", "draft-target", .sending),
+                ("target-failed", "acc1", "draft-target", .failed),
+                ("other-account", "acc2", "draft-target", .queued),
+                ("other-draft", "acc1", "draft-other", .queued),
             ] {
-                var m = OutboxMessage(accountId: "acc1", draft: makeDraft())
-                m.draftId = "draft-\(draftId)"
+                var m = OutboxMessage(accountId: accountId, draft: makeDraft())
+                m.id = id
+                m.draftId = draftId
+                m.instanceEpoch = "E1"
                 m.status = status.rawValue
                 try m.insert(db)
             }
         }
-        // Lift `try` out of `#expect` (the macro can't host a throwing expression).
-        let (q, s, f, absent) = try await pool.read { db in
-            (
-                try AccountManager.inFlightOutboxId(forDraftId: "draft-q", db: db),
-                try AccountManager.inFlightOutboxId(forDraftId: "draft-s", db: db),
-                try AccountManager.inFlightOutboxId(forDraftId: "draft-f", db: db),
-                try AccountManager.inFlightOutboxId(forDraftId: "draft-absent", db: db)
-            )
+        let candidates = try await pool.read { db in
+            try AccountManager.inFlightOutboxCandidates(
+                accountId: "acc1", draftId: "draft-target", db: db)
         }
-        #expect(q != nil)
-        #expect(s != nil)
-        #expect(f == nil, ".failed must not count as in-flight")
-        #expect(absent == nil)
+        #expect(candidates.count == 2)
+        #expect(Set(candidates.map(\.id)) == Set(["target-queued", "target-sending"]))
+
+        await #expect(throws: OutboxAdmissionError.self) {
+            _ = try await AccountManager.persistQueuedSend(
+                draft: makeDraft(subject: "must-not-insert"), accountId: "acc1",
+                replyToHeaderId: nil, isForward: false, serverDraftId: nil,
+                draftId: "draft-target", instanceEpoch: "E1")
+        }
+        #expect(try await outboxCount(pool) == 5)
     }
 }
 
@@ -322,6 +412,7 @@ struct OutboxSendMainActorBlockTests {
             AppDatabase.shared.withLock { $0 = previous }
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
+        try await insertDraftAuthority(pool, id: "draft-freeze")
 
         let hb = Heartbeat()
         hb.start()
@@ -338,7 +429,7 @@ struct OutboxSendMainActorBlockTests {
         _ = try await AccountManager.persistQueuedSend(
             draft: DraftMessage(to: ["r@example.com"], subject: "Hi", body: "Body"),
             accountId: "acc1", replyToHeaderId: nil, isForward: false,
-            serverDraftId: nil, draftId: "draft-freeze"
+            serverDraftId: nil, draftId: "draft-freeze", instanceEpoch: "E1"
         )
         let wallMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         let ticksDuring = hb.ticks - ticksBefore

@@ -15,6 +15,7 @@ actor GmailProvider: EmailProvider {
     /// this (and omit `labelIds`) when `folder == archivePath` — the synthetic path
     /// is not a real Gmail label ID and the API rejects it with 400 "Invalid label".
     static let allMailExclusionQuery = "-in:inbox -in:sent -in:trash -in:spam -in:draft"
+    private static let draftResourceLookupPageSize = 500
 
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let userEmail: String
@@ -494,11 +495,19 @@ actor GmailProvider: EmailProvider {
 
     // MARK: - Drafts
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
-        // `previousRfc822MessageId` is IMAP-only (it identifies the epoch-immune old
-        // copy to delete). Gmail updates the draft in place by `existingDraftId`
-        // (`PUT /drafts/{id}`) — a durable resource id, not a reusable address — so it
-        // IGNORES this parameter.
+    func saveDraft(
+        _ draft: DraftMessage,
+        existingIdentity: DraftDeleteIdentity?,
+        draftsFolderPath: String
+    ) async throws -> DraftSaveOutcome {
+        let existingDraftId: String?
+        switch existingIdentity {
+        case .gmail(let resourceId): existingDraftId = resourceId
+        case nil: existingDraftId = nil
+        default:
+            throw ProviderError.actionIdentityResolutionFailed(
+                "GmailProvider received a non-Gmail prior draft identity")
+        }
         let base64 = buildUrlSafeBase64(draft: draft)
         let messagePayload: [String: Any] = ["raw": base64]
 
@@ -521,10 +530,10 @@ actor GmailProvider: EmailProvider {
                 let msgId = (json["message"] as? [String: Any])?["id"] as? String
                 let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
                 if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
-                return DraftSaveResult(serverId: draftId, messageId: msgId)
+                return .created(.gmail(resourceId: draftId, containedMessageId: msgId))
             }
             print("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)")
-            return DraftSaveResult(serverId: existingId)
+            return .created(.gmail(resourceId: existingId, containedMessageId: nil))
         } else {
             // Create new draft
             let body: [String: Any] = ["message": messagePayload]
@@ -536,22 +545,108 @@ actor GmailProvider: EmailProvider {
             let msgId = (json["message"] as? [String: Any])?["id"] as? String
             let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
             if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft CREATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
-            return DraftSaveResult(serverId: draftId, messageId: msgId)
+            return .created(.gmail(resourceId: draftId, containedMessageId: msgId))
         }
     }
 
-    /// `rfc822MessageId` / `uidValidity` are IMAP's epoch-safety pair and carry no
-    /// meaning here: a Gmail draft resource id (or message id) is a durable IDENTITY,
-    /// not an address in a numbering, so there is no epoch to corroborate.
-    func deleteDraft(
-        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
-    ) async throws {
-        // Try DELETE /drafts/{id} first (works when draftId is a draft resource ID).
-        // If 404: either the draft was already auto-deleted after send, or draftId is
-        // actually a Gmail message ID (from synced Drafts folder). Fall back to
-        // POST /messages/{id}/trash which works for both cases.
+    /// PORT — v2final `GmailProvider.resolveDraftResource` and its fully-
+    /// paginated `drafts.list` join. This route never searches RFC headers,
+    /// subjects, or local rows: the selected contained MESSAGE id is the sole
+    /// input and exactly one RESOURCE wrapper is required.
+    func resolveDraftResource(
+        containedMessageId: String,
+        draftsFolderPath: String
+    ) async throws -> DraftCreatedAddress? {
+        _ = draftsFolderPath
+        let trimmed = containedMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed == containedMessageId,
+              !isSyntheticPlaceholderId(containedMessageId) else {
+            throw ProviderError.actionIdentityResolutionFailed(
+                "resolveDraftResource: unusable containedMessageId")
+        }
+
+        let matches = try await draftResources(wrapping: containedMessageId)
+        guard matches.count == 1, let match = matches.first else { return nil }
+        return .gmail(
+            resourceId: match.resourceId,
+            containedMessageId: match.containedMessageId)
+    }
+
+    private func draftResources(
+        wrapping containedMessageId: String
+    ) async throws -> [(resourceId: String, containedMessageId: String)] {
+        var matches: [(resourceId: String, containedMessageId: String)] = []
+        var pageToken: String?
+        repeat {
+            try Task.checkCancellation()
+            var queryItems: [(name: String, value: String)] = [
+                (name: "maxResults", value: String(Self.draftResourceLookupPageSize)),
+                (name: "fields", value: "drafts(id,message/id),nextPageToken"),
+            ]
+            if let pageToken {
+                queryItems.append((name: "pageToken", value: pageToken))
+            }
+            let path = try Self.strictEncodedPath("/drafts", queryItems: queryItems)
+            let data = try await request(path: path)
+            try Task.checkCancellation()
+            let response = try JSONDecoder().decode(GmailDraftListResponse.self, from: data)
+            if let drafts = response.drafts {
+                for draft in drafts where draft.message?.id == containedMessageId {
+                    matches.append((draft.id, containedMessageId))
+                }
+            }
+            pageToken = response.nextPageToken
+        } while pageToken != nil
+        return matches
+    }
+
+    nonisolated private static func strictEncodedPath(
+        _ path: String,
+        queryItems: [(name: String, value: String)]
+    ) throws -> String {
+        let unreserved = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        var encodedItems: [URLQueryItem] = []
+        for item in queryItems {
+            guard let name = item.name.addingPercentEncoding(withAllowedCharacters: unreserved),
+                  let value = item.value.addingPercentEncoding(withAllowedCharacters: unreserved) else {
+                throw ProviderError.invalidURL("Gmail draft resource lookup")
+            }
+            encodedItems.append(URLQueryItem(name: name, value: value))
+        }
+        var components = URLComponents()
+        components.path = path
+        components.percentEncodedQueryItems = encodedItems
+        guard let result = components.string else {
+            throw ProviderError.invalidURL("Gmail draft resource lookup")
+        }
+        return result
+    }
+
+    func deleteDraft(identity: DraftDeleteIdentity) async throws {
+        let draftId: String
+        let containedMessageOnly: Bool
+        switch identity {
+        case .gmail(let resourceId):
+            draftId = resourceId
+            containedMessageOnly = false
+        case .gmailContainedMessage(let messageId):
+            draftId = messageId
+            containedMessageOnly = true
+        default:
+            throw ProviderError.actionIdentityResolutionFailed("GmailProvider received a non-Gmail draft identity")
+        }
+        if containedMessageOnly {
+            let token = try await accessToken(false)
+            try await trashContainedDraftMessage(
+                messageId: draftId, token: token, session: testSession)
+            return
+        }
+        // A resource identity stays in the resource namespace. A 404 means this exact
+        // draft resource is absent; it is never reinterpreted as a contained MESSAGE id.
         var token = try await accessToken(false)
-        // No logLabel — 404 is expected (draftId may be a message ID, not a draft resource ID)
+        // No logLabel — 404 is expected when the exact resource is already absent.
         let result = try await performHTTPRequestWithRetry(
             url: baseURL + "/drafts/\(draftId)", method: "DELETE", body: nil, token: token,
             retryableStatusCodes: [429, 403], session: testSession
@@ -566,27 +661,43 @@ actor GmailProvider: EmailProvider {
             }
         }
         if result.statusCode == 404 || result.statusCode == 401 {
-            // Draft resource not found — try trashing by message ID instead
-            print("[Gmail] deleteDraft: \(draftId) — falling back to messages.trash")
-            // No logLabel — 404 here means already deleted, also handled gracefully
-            let trashResult = try await performHTTPRequestWithRetry(
-                url: baseURL + "/messages/\(draftId)/trash", method: "POST", body: nil, token: token,
-                retryableStatusCodes: [429, 403], session: testSession
-            )
-            if trashResult.data != nil { return }
-            if trashResult.statusCode == 404 {
-                print("[Gmail] deleteDraft: \(draftId) already deleted")
-                return
-            }
-            if trashResult.statusCode == 401 {
-                let freshToken = try await accessToken(true)
-                let retry = try await performHTTPRequest(url: baseURL + "/messages/\(draftId)/trash", method: "POST", body: nil, token: freshToken, session: testSession)
-                if retry.statusCode == 404 || retry.data != nil { return }
-                throw ProviderError.networkError(underlying: NSError(domain: "Gmail", code: retry.statusCode))
-            }
-            throw ProviderError.networkError(underlying: NSError(domain: "Gmail", code: trashResult.statusCode))
+            // A resource identity is never reinterpreted in the contained-message
+            // namespace. 404 is authoritative absence for this exact resource.
+            return
         }
         throw ProviderError.networkError(underlying: NSError(domain: "Gmail", code: result.statusCode))
+    }
+
+    /// PORT — `v2final:GmailProvider.trashContainedDraftMessage`
+    /// (`3486e18a8`). Exact contained-message deletion when the caller already
+    /// knows that address namespace. 404 is idempotent success; 401 refreshes
+    /// once, and both requests use the caller's injected session.
+    private func trashContainedDraftMessage(
+        messageId: String,
+        token: String,
+        session: URLSession?
+    ) async throws {
+        let trashResult = try await performHTTPRequestWithRetry(
+            url: baseURL + "/messages/\(messageId)/trash", method: "POST", body: nil, token: token,
+            retryableStatusCodes: [429, 403], session: session
+        )
+        if trashResult.data != nil { return }
+        if trashResult.statusCode == 404 {
+            print("[Gmail] deleteDraft: \(messageId) already deleted")
+            return
+        }
+        if trashResult.statusCode == 401 {
+            let freshToken = try await accessToken(true)
+            let retry = try await performHTTPRequest(
+                url: baseURL + "/messages/\(messageId)/trash", method: "POST", body: nil,
+                token: freshToken, session: session
+            )
+            if retry.statusCode == 404 || retry.data != nil { return }
+            throw ProviderError.networkError(
+                underlying: NSError(domain: "Gmail", code: retry.statusCode))
+        }
+        throw ProviderError.networkError(
+            underlying: NSError(domain: "Gmail", code: trashResult.statusCode))
     }
 
     // MARK: - Backfill
@@ -1645,6 +1756,20 @@ private struct GmailLabel: Decodable {
 private struct GmailMessageListResponse: Decodable {
     let messages: [GmailMessageRef]?
     let nextPageToken: String?
+}
+
+private struct GmailDraftListResponse: Decodable {
+    let drafts: [GmailDraftRef]?
+    let nextPageToken: String?
+}
+
+private struct GmailDraftRef: Decodable {
+    let id: String
+    let message: GmailDraftMessageRef?
+}
+
+private struct GmailDraftMessageRef: Decodable {
+    let id: String
 }
 
 private struct GmailMessageRef: Decodable {

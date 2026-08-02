@@ -55,6 +55,83 @@ struct DatabaseMigrationTests {
         return db
     }
 
+    private static func makeDatabase(upTo migration: String) throws -> DatabaseQueue {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: migration)
+        return db
+    }
+
+    private static func migrate(_ db: DatabaseQueue, upTo migration: String) throws {
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: migration)
+    }
+
+    private static func insertRawDraft(
+        _ db: DatabaseQueue,
+        id: String,
+        accountId: String,
+        subject: String = "subject",
+        body: String = "body",
+        serverDraftId: String? = "42",
+        serverPushStatus: String? = "pushed",
+        uidValidity: Int? = 7
+    ) throws {
+        try db.write { connection in
+            try connection.execute(sql: """
+                INSERT INTO draft
+                    (id, accountId, toJSON, ccJSON, bccJSON, subject, body,
+                     replyToId, isForward, editHistoryJSON, createdAt, updatedAt,
+                     serverDraftId, serverPushStatus, rfc822MessageId,
+                     attachmentsDirName, serverDraftUidValidity)
+                VALUES (?, ?, '[\"to@example.com\"]', '[\"cc@example.com\"]', '[]', ?, ?,
+                        NULL, 0, '[{\"edit\":\"keep\"}]', 1, 2, ?, ?,
+                        'draft@example.com', 'attachments-keep', ?)
+                """, arguments: [
+                    id, accountId, subject, body, serverDraftId,
+                    serverPushStatus, uidValidity,
+                ])
+        }
+    }
+
+    private static func insertRawOutbox(
+        _ db: DatabaseQueue,
+        id: String,
+        accountId: String,
+        draftId: String? = nil
+    ) throws {
+        try db.write { connection in
+            try connection.execute(sql: """
+                INSERT INTO outboxMessage
+                    (id, accountId, toJSON, ccJSON, bccJSON, subject, body,
+                     createdAt, draftId, serverDraftId, draftRfc822MessageId,
+                     draftServerUidValidity)
+                VALUES (?, ?, '[\"to@example.com\"]', '[]', '[]', 'outbox subject',
+                        'outbox body', datetime('now'), ?, 'resource-1',
+                        'draft@example.com', 7)
+                """, arguments: [id, accountId, draftId])
+        }
+    }
+
+    private static func insertRawPendingOperation(
+        _ db: DatabaseQueue,
+        id: String,
+        accountId: String,
+        type: String = OperationType.deleteDraft.rawValue
+    ) throws {
+        try db.write { connection in
+            try connection.execute(sql: """
+                INSERT INTO pendingOperation
+                    (id, type, messageIdsJSON, accountId, folderPath, createdAt)
+                VALUES (?, ?, '[\"42\"]', ?, 'DRAFT', datetime('now'))
+                """, arguments: [id, type, accountId])
+        }
+    }
+
     /// One line per column — `name|type|notnull|dflt|pk`, in declaration order.
     /// Compared as a whole so a reordered, retyped, renamed or dropped column all
     /// fail the same way.
@@ -230,7 +307,7 @@ struct DatabaseMigrationTests {
         #expect(headersBefore.count == 3)
         #expect(foldersBefore.count == 2)
 
-        try AppDatabase.runMigrations(on: db)
+        try Self.migrate(db, upTo: "v70_dropMessageBodyHeaderFK")
 
         // The cache is gone — the accepted cost, asserted so it cannot silently
         // stop being what this migration does.
@@ -428,6 +505,112 @@ struct DatabaseMigrationTests {
         }
         let fetched = try db.read { db in try PendingOperation.fetchOne(db, key: "op1") }
         #expect(fetched?.uidResolutionRetryCount == 0)
+    }
+
+    @Test("v73 clears legacy IMAP addresses while preserving authored Draft content")
+    func v73ClearsOnlyLegacyImapAddresses() throws {
+        let db = try Self.makeDatabase(upTo: "v72_addDraftServerUidValidity")
+        try TestDatabase.insertAccount(db, id: "imap-account", provider: .imap)
+        try TestDatabase.insertAccount(db, id: "icloud-account", provider: .icloud)
+        try TestDatabase.insertAccount(db, id: "gmail-account", provider: .gmail)
+        try Self.insertRawDraft(
+            db, id: "imap-draft", accountId: "imap-account",
+            subject: "keep imap subject", body: "keep imap body")
+        try Self.insertRawDraft(
+            db, id: "icloud-draft", accountId: "icloud-account",
+            subject: "keep icloud subject", body: "keep icloud body")
+        try Self.insertRawDraft(
+            db, id: "gmail-draft", accountId: "gmail-account",
+            subject: "keep gmail subject", body: "keep gmail body",
+            serverDraftId: "gmail-resource", uidValidity: nil)
+
+        try Self.migrate(db, upTo: "v73_bindDraftUidToMailbox")
+
+        let rows = try db.read { connection in
+            try Row.fetchAll(connection, sql: """
+                SELECT id, subject, body, toJSON, ccJSON, editHistoryJSON,
+                       attachmentsDirName, serverDraftId, serverPushStatus,
+                       serverDraftUidValidity, serverDraftFolderPath
+                FROM draft ORDER BY id
+                """)
+        }
+        #expect(rows.count == 3)
+        guard rows.count == 3 else { return }
+        for row in rows where (row["id"] as String) != "gmail-draft" {
+            #expect((row["serverDraftId"] as String?) == nil)
+            #expect((row["serverPushStatus"] as String?) == nil)
+            #expect((row["serverDraftUidValidity"] as Int?) == nil)
+            #expect((row["serverDraftFolderPath"] as String?) == nil)
+            #expect((row["body"] as String).hasPrefix("keep "))
+            #expect((row["toJSON"] as String) == "[\"to@example.com\"]")
+            #expect((row["ccJSON"] as String) == "[\"cc@example.com\"]")
+            #expect((row["editHistoryJSON"] as String?) != nil)
+            #expect((row["attachmentsDirName"] as String?) == "attachments-keep")
+        }
+        let gmail = try #require(rows.first { ($0["id"] as String) == "gmail-draft" })
+        #expect((gmail["serverDraftId"] as String?) == "gmail-resource")
+        #expect((gmail["serverPushStatus"] as String?) == "pushed")
+        #expect((gmail["body"] as String) == "keep gmail body")
+    }
+
+    @Test("v74 purges only pending operations and preserves Draft and Outbox rows")
+    func v74PurgesOnlyPendingOperations() throws {
+        let db = try Self.makeDatabase(upTo: "v73_bindDraftUidToMailbox")
+        try TestDatabase.insertAccount(db, id: "acc1", provider: .gmail)
+        try Self.insertRawDraft(
+            db, id: "draft-keep", accountId: "acc1", body: "authored draft body",
+            serverDraftId: "gmail-resource", uidValidity: nil)
+        try Self.insertRawOutbox(db, id: "outbox-keep", accountId: "acc1", draftId: "draft-keep")
+        try Self.insertRawPendingOperation(db, id: "op-delete", accountId: "acc1")
+        try Self.insertRawPendingOperation(
+            db, id: "op-read", accountId: "acc1", type: OperationType.markRead.rawValue)
+
+        try Self.migrate(db, upTo: "v74_purgeLegacyPendingOperations")
+
+        try db.read { connection in
+            let pendingOperationCount = try Int.fetchOne(
+                connection, sql: "SELECT COUNT(*) FROM pendingOperation")
+            let draftBody = try String.fetchOne(
+                connection, sql: "SELECT body FROM draft WHERE id = 'draft-keep'")
+            let outboxBody = try String.fetchOne(
+                connection, sql: "SELECT body FROM outboxMessage WHERE id = 'outbox-keep'")
+            #expect(pendingOperationCount == 0)
+            #expect(draftBody == "authored draft body")
+            #expect(outboxBody == "outbox body")
+        }
+    }
+
+    @Test("v75-v76 raw upgrade seeds pushAttemptVersion zero and adds nullable typed authority without backfill")
+    func v75V76UpgradeAddsUnbackfilledGenerationAuthority() throws {
+        let db = try Self.makeDatabase(upTo: "v74_purgeLegacyPendingOperations")
+        try TestDatabase.insertAccount(db, id: "acc1", provider: .gmail)
+        try Self.insertRawDraft(db, id: "draft-existing", accountId: "acc1")
+        try Self.insertRawOutbox(db, id: "outbox-existing", accountId: "acc1", draftId: "draft-existing")
+        try Self.insertRawPendingOperation(db, id: "op-existing", accountId: "acc1")
+
+        try Self.migrate(db, upTo: "v76_addDraftGenerationAndTypedIdentity")
+
+        try db.read { connection in
+            let fetchedDraftRow = try Row.fetchOne(
+                connection,
+                sql: "SELECT pushAttemptVersion, instanceEpoch FROM draft WHERE id = 'draft-existing'")
+            let fetchedOutboxRow = try Row.fetchOne(
+                connection,
+                sql: "SELECT instanceEpoch, serverDraftGmailMessageId FROM outboxMessage WHERE id = 'outbox-existing'")
+            let fetchedOpRow = try Row.fetchOne(
+                connection,
+                sql: "SELECT instanceEpoch, draftId, draftDeleteAddressKind FROM pendingOperation WHERE id = 'op-existing'")
+            let draftRow = try #require(fetchedDraftRow)
+            let outboxRow = try #require(fetchedOutboxRow)
+            let opRow = try #require(fetchedOpRow)
+            #expect((draftRow["pushAttemptVersion"] as Int) == 0)
+            #expect((draftRow["instanceEpoch"] as String?) == nil)
+            #expect((outboxRow["instanceEpoch"] as String?) == nil)
+            #expect((outboxRow["serverDraftGmailMessageId"] as String?) == nil)
+            #expect((opRow["instanceEpoch"] as String?) == nil)
+            #expect((opRow["draftId"] as String?) == nil)
+            #expect((opRow["draftDeleteAddressKind"] as String?) == nil)
+        }
     }
 }
 

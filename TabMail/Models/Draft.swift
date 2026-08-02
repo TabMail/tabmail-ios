@@ -34,9 +34,16 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     var rfc822MessageId: String?  // Stable Message-ID for IMAP dedup
     var attachmentsDirName: String? // Disk directory under draft_attachments/
 
+    /// PORT — compose generation from v2final commit 3f2cc4c34.
+    var instanceEpoch: String? = nil
+    /// PORT — conflict version used by the v2final Stage A/B CAS.
+    var pushAttemptVersion: Int = 0
+    /// Mailbox component of the strong IMAP draft address.
+    var serverDraftFolderPath: String? = nil
+
     /// v72: the IMAP UIDVALIDITY epoch `serverDraftId` was MINTED under — the
     /// value the SELECT that carried the draft's APPEND reported, returned by the
-    /// provider as `DraftSaveResult.uidValidity` and written here in the same
+    /// provider as `DraftCreatedAddress.imap` and written here in the same
     /// statement as `serverDraftId`.
     ///
     /// A bare UID is an ADDRESS scoped to exactly one `(mailbox, UIDVALIDITY)`

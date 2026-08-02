@@ -566,11 +566,19 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Drafts
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
-        // `previousRfc822MessageId` is IMAP-only (it identifies the epoch-immune old
-        // copy to delete). Exchange updates the draft in place by `existingDraftId`
-        // (`PATCH /messages/{id}`) — a durable Graph id, not a reusable address — so it
-        // IGNORES this parameter.
+    func saveDraft(
+        _ draft: DraftMessage,
+        existingIdentity: DraftDeleteIdentity?,
+        draftsFolderPath: String
+    ) async throws -> DraftSaveOutcome {
+        let existingDraftId: String?
+        switch existingIdentity {
+        case .outlook(let graphId): existingDraftId = graphId
+        case nil: existingDraftId = nil
+        default:
+            throw ProviderError.actionIdentityResolutionFailed(
+                "ExchangeProvider received a non-Outlook prior draft identity")
+        }
         let message = buildGraphSendPayload(draft: draft)
 
         if let existingId = existingDraftId {
@@ -579,9 +587,9 @@ actor ExchangeProvider: EmailProvider {
             let response = try await request(path: "/messages/\(existingId)", method: "PATCH", body: jsonData)
             if let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
                let msgId = dict["id"] as? String {
-                return DraftSaveResult(serverId: msgId)
+                return .created(.outlook(graphId: msgId))
             }
-            return DraftSaveResult(serverId: existingId)
+            return .created(.outlook(graphId: existingId))
         } else {
             // Create new draft in Drafts folder
             let jsonData = try JSONSerialization.data(withJSONObject: message)
@@ -590,16 +598,14 @@ actor ExchangeProvider: EmailProvider {
                   let msgId = dict["id"] as? String else {
                 throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
             }
-            return DraftSaveResult(serverId: msgId)
+            return .created(.outlook(graphId: msgId))
         }
     }
 
-    /// `rfc822MessageId` / `uidValidity` are IMAP's epoch-safety pair and carry no
-    /// meaning here: a Graph message id is a durable IDENTITY, not an address in a
-    /// numbering, so there is no epoch to corroborate.
-    func deleteDraft(
-        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
-    ) async throws {
+    func deleteDraft(identity: DraftDeleteIdentity) async throws {
+        guard case .outlook(let draftId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed("ExchangeProvider received a non-Outlook draft identity")
+        }
         // Exchange may auto-delete drafts after send. A 404 means already gone — treat as success.
         let token = try await accessToken(false)
         let result = try await performHTTPRequestWithRetry(

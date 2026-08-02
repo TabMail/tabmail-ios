@@ -118,13 +118,22 @@ struct ActiveAgentTrackerTests {
 
     // MARK: - Compose Draft ID
 
-    @Test("workingComposeDraftId extracts draft ID from compose session key")
+    @Test("Compose session keys include the exact generation and remain injective")
     func workingComposeDraftId() {
         let tracker = ActiveAgentTracker()
         #expect(tracker.workingComposeDraftId == nil)
-        tracker.setWorking("compose:my-draft-uuid")
-        #expect(tracker.workingComposeDraftId == "my-draft-uuid")
-        tracker.clearWorking("compose:my-draft-uuid")
+        let keyA = ActiveAgentTracker.composeSessionKey(
+            draftId: "reply:acct:msg", epoch: "legacy:op:42")
+        let keyB = ActiveAgentTracker.composeSessionKey(
+            draftId: "reply:acct:msg:legacy:op", epoch: "42")
+        #expect(keyA != keyB)
+        #expect(ActiveAgentTracker.parseComposeSession(keyA)?.draftId == "reply:acct:msg")
+        #expect(ActiveAgentTracker.parseComposeSession(keyA)?.epoch == "legacy:op:42")
+        #expect(ActiveAgentTracker.parseComposeSession(keyB)?.draftId == "reply:acct:msg:legacy:op")
+        #expect(ActiveAgentTracker.parseComposeSession(keyB)?.epoch == "42")
+        tracker.setWorking(keyA)
+        #expect(tracker.workingComposeDraftId == "reply:acct:msg")
+        tracker.clearWorking(keyA)
         #expect(tracker.workingComposeDraftId == nil)
     }
 

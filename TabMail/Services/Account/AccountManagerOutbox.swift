@@ -15,11 +15,62 @@ import SwiftMail
 struct ServerDraftCleanup: Sendable, Equatable {
     let accountId: String
     let serverDraftId: String
-    let rfc822MessageId: String?
-    /// The UIDVALIDITY epoch `serverDraftId` was minted under, carried out of the
-    /// crash-recovery transaction beside the address itself so the queued delete can be
-    /// corroborated by `(identity, epoch)` rather than identity alone.
+    let gmailContainedMessageId: String?
+    let folderPath: String?
     let uidValidity: Int?
+}
+
+enum OutboxFinalizeError: Error {
+    case outboxRowVanished(String)
+    case outboxDeleteDidNotLand(String)
+}
+
+/// PORT — v2final `OutboxAdmissionError`, with the reference's absent-Draft
+/// allowance intentionally SUBTRACTED. This forward-port requires a live exact
+/// owner/generation in the same transaction that performs dedup/insert.
+enum OutboxAdmissionError: LocalizedError, Equatable {
+    case invalidInstanceEpoch
+    case draftMissing(String)
+    case draftOwnerMismatch(draftId: String)
+    case draftGenerationMismatch(draftId: String)
+    case inFlightGenerationMismatch(draftId: String)
+    case ambiguousInFlightCandidates(draftId: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidInstanceEpoch:
+            "This compose session has an invalid generation. Close and reopen it before sending."
+        case .draftMissing:
+            "This draft changed while Send was being prepared. Close and reopen it before sending."
+        case .draftOwnerMismatch:
+            "This draft belongs to a different account. Close and reopen it before sending."
+        case .draftGenerationMismatch:
+            "This draft was changed by another compose session. Review the newer draft before sending."
+        case .inFlightGenerationMismatch:
+            "A different version of this draft is already being sent. Close and reopen it before sending."
+        case .ambiguousInFlightCandidates:
+            "More than one send is pending for this draft. Resolve the Outbox entries before sending again."
+        }
+    }
+}
+
+struct InFlightOutboxCandidate: FetchableRecord, Decodable, Equatable, Sendable {
+    let id: String
+    let instanceEpoch: String?
+}
+
+struct DraftSendAuthority: FetchableRecord, Decodable, Equatable, Sendable {
+    let accountId: String
+    let instanceEpoch: String?
+}
+
+struct CompletedSendCleanupDisposition: Sendable {
+    let accountId: String
+    let outboxDir: String?
+    let draftDir: String?
+    let replyDetectHeaderId: String?
+    let serverDraftCleanup: ServerDraftCleanup?
+    let preservedMismatchedDraftId: String?
 }
 
 extension AccountManager {
@@ -44,16 +95,29 @@ extension AccountManager {
     /// existing id is returned. (This is the persistence-layer guarantee; the UI
     /// `isSending` guard in ComposeView is the first line of defense.)
     @discardableResult
-    nonisolated func queueSend(draft: DraftMessage, from account: Account, replyToHeaderId: String? = nil, isForward: Bool = false, serverDraftId: String? = nil, draftRfc822: String? = nil, draftUidValidity: Int? = nil, draftId: String) async throws -> String {
+    nonisolated func queueSend(
+        draft: DraftMessage,
+        from account: Account,
+        replyToHeaderId: String? = nil,
+        isForward: Bool = false,
+        serverDraftId: String? = nil,
+        draftUidValidity: Int? = nil,
+        draftServerFolderPath: String? = nil,
+        serverDraftGmailMessageId: String? = nil,
+        draftId: String,
+        instanceEpoch: String
+    ) async throws -> String {
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
             replyToHeaderId: replyToHeaderId,
             isForward: isForward,
             serverDraftId: serverDraftId,
-            draftRfc822: draftRfc822,
             draftUidValidity: draftUidValidity,
-            draftId: draftId
+            draftServerFolderPath: draftServerFolderPath,
+            serverDraftGmailMessageId: serverDraftGmailMessageId,
+            draftId: draftId,
+            instanceEpoch: instanceEpoch
         )
         if DebugModeManager.isLoggingEnabled() {
             if result.deduped {
@@ -86,12 +150,21 @@ extension AccountManager {
     /// legitimate user intention, not a duplicate. MUST be called inside the same
     /// write transaction as the insert so two concurrent sends can't both pass it
     /// (GRDB serializes writers → the 2nd transaction sees the 1st's row).
-    nonisolated static func inFlightOutboxId(forDraftId draftId: String, db: Database) throws -> String? {
-        try OutboxMessage
-            .filter(Column("draftId") == draftId)
-            .filter([OutboxStatus.queued.rawValue, OutboxStatus.sending.rawValue].contains(Column("status")))
-            .fetchOne(db)?
-            .id
+    nonisolated static func inFlightOutboxCandidates(
+        accountId: String,
+        draftId: String,
+        db: Database
+    ) throws -> [InFlightOutboxCandidate] {
+        try InFlightOutboxCandidate.fetchAll(
+            db,
+            sql: """
+                SELECT id, instanceEpoch
+                FROM outboxMessage
+                WHERE accountId = ? AND draftId = ?
+                  AND status IN ('queued', 'sending')
+                LIMIT 2
+                """,
+            arguments: [accountId, draftId])
     }
 
     /// Pure persistence step of a queued send — the SINGLE SOURCE OF TRUTH for
@@ -110,10 +183,15 @@ extension AccountManager {
         replyToHeaderId: String?,
         isForward: Bool,
         serverDraftId: String?,
-        draftRfc822: String? = nil,
         draftUidValidity: Int? = nil,
-        draftId: String
+        draftServerFolderPath: String? = nil,
+        serverDraftGmailMessageId: String? = nil,
+        draftId: String,
+        instanceEpoch: String
     ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) {
+        guard !instanceEpoch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OutboxAdmissionError.invalidInstanceEpoch
+        }
         var outbox = OutboxMessage(
             accountId: accountId,
             draft: draft,
@@ -121,17 +199,11 @@ extension AccountManager {
             isForward: isForward
         )
         outbox.serverDraftId = serverDraftId
-        // Capture the DRAFT's own server rfc822 so the post-send server-draft
-        // cleanup resolves by the id the Drafts copy actually carries (never
-        // `sentMessageId` — a different message). Paired with `serverDraftId` from
-        // the same caller snapshot. Ported from `v2final:AccountManagerOutbox`.
-        outbox.draftRfc822MessageId = draftRfc822
-        // …and the epoch that `serverDraftId` belongs to, from the same snapshot. The
-        // rfc822 alone lets the backstops NAME the Drafts copy; only the epoch lets them
-        // tell that copy from a legitimate same-Message-ID sibling once their own target
-        // has gone. Ported from `v2final:AccountManagerOutbox` (`v85`).
         outbox.draftServerUidValidity = draftUidValidity
+        outbox.draftServerFolderPath = draftServerFolderPath
+        outbox.serverDraftGmailMessageId = serverDraftGmailMessageId
         outbox.draftId = draftId
+        outbox.instanceEpoch = instanceEpoch
         // Hold the send until `now + undoHold + claimBuffer`. UI Undo button is
         // shown for `undoHold` (5 s); drain claim fires after +1 s claim buffer.
         // The 1 s gap eliminates TOCTOU races between user-taps-Undo and the
@@ -152,17 +224,47 @@ extension AccountManager {
         let hadAttachments = !draft.attachments.isEmpty
         do {
             let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?) in
-                // FIREWALL: an in-flight row for this draft already exists (double
-                // tap / async reentrancy). Do NOT insert a second row.
-                if let existingId = try inFlightOutboxId(forDraftId: draftId, db: db) {
-                    return (existingId, true, nil)
+                // PORT/SUBTRACT — the v2final authority projection and bounded
+                // same-account census, strengthened to require the live Draft.
+                // Replacement or disappearance fails closed before dedup/insert.
+                guard let liveDraft = try DraftSendAuthority.fetchOne(
+                    db,
+                    sql: """
+                        SELECT accountId, instanceEpoch
+                        FROM draft
+                        WHERE id = ?
+                        LIMIT 1
+                        """,
+                    arguments: [draftId]) else {
+                    throw OutboxAdmissionError.draftMissing(draftId)
+                }
+                guard liveDraft.accountId == accountId else {
+                    throw OutboxAdmissionError.draftOwnerMismatch(draftId: draftId)
+                }
+                guard liveDraft.instanceEpoch == instanceEpoch else {
+                    throw OutboxAdmissionError.draftGenerationMismatch(draftId: draftId)
+                }
+
+                let candidates = try inFlightOutboxCandidates(
+                    accountId: accountId, draftId: draftId, db: db)
+                guard candidates.count <= 1 else {
+                    throw OutboxAdmissionError.ambiguousInFlightCandidates(draftId: draftId)
+                }
+                if let existing = candidates.first {
+                    guard existing.instanceEpoch == instanceEpoch else {
+                        throw OutboxAdmissionError.inFlightGenerationMismatch(draftId: draftId)
+                    }
+                    return (existing.id, true, nil)
                 }
                 try outboxToInsert.insert(db)
                 // Optimistic isReplied/isForwarded — matches markRead/archive pattern.
                 // Server state overwrites on next sync (~90s). No rollback needed.
                 guard let originalId = replyToHeaderId else { return (outboxToInsert.id, false, nil) }
                 guard let original = try resolveOriginalMessage(
-                    originalId: originalId, inReplyTo: inReplyTo, db: db
+                    originalId: originalId,
+                    inReplyTo: inReplyTo,
+                    accountId: accountId,
+                    db: db
                 ) else { return (outboxToInsert.id, false, nil) }
                 if isForward {
                     try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
@@ -387,26 +489,11 @@ extension AccountManager {
             }
             print("[Outbox] Send succeeded for \(current.id)")
 
-            // Send succeeded — stamp sentAt FIRST (narrow write, fast). This
-            // is the double-send prevention marker: if the app crashes before
-            // the append/delete below, reconcileOutbox sees sentAt != nil and
-            // retries the append (not re-sends).
-            do {
-                // Outbox rule 2: state transitions retry, never single-shot.
-                // This stamp is the double-send firewall — a transient failure
-                // (busy timeout, suspension abort) that goes unretried leaves
-                // status=sending + sentAt=nil, which reconcileOutbox re-queues
-                // as a full re-send.
-                let sentDate = Date()
-                let outboxId = current.id
-                try await retryWrite(dbPool, retryDelay: .milliseconds(200), label: "Outbox.sentAt") { db in
-                    try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?",
-                                   arguments: [sentDate, outboxId])
-                }
-            } catch {
-                // sentAt write failed — proceed anyway. sentAt is a safety net.
-                print("[Outbox] WARNING: Could not stamp sentAt for \(current.id): \(error)")
-            }
+            // PORT 4651d894b: a send without a truthful durable stamp may not
+            // append or finalize. Reconcile accepts a possible resend, never a drop.
+            guard await stampSentAt(
+                outboxId: current.id, sentDate: Date()
+            ) else { return }
 
             // Optimistic Sent folder header: insert a placeholder MessageHeader so the
             // message appears in the Sent folder immediately (before IMAP APPEND + sync).
@@ -638,6 +725,22 @@ extension AccountManager {
         }
     }
 
+    private func stampSentAt(outboxId: String, sentDate: Date) async -> Bool {
+        do {
+            return try await retryWrite(
+                dbPool, retryDelay: .milliseconds(200), label: "Outbox.sentAt"
+            ) { db in
+                try db.execute(
+                    sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?",
+                    arguments: [sentDate, outboxId])
+                return db.changesCount == 1
+            }
+        } catch {
+            print("[Outbox] WARNING: Could not stamp sentAt for \(outboxId): \(error)")
+            return false
+        }
+    }
+
     // MARK: - Sent Folder Append
 
     /// Attempt to append a sent message to the Sent folder. Returns true if successful.
@@ -667,8 +770,7 @@ extension AccountManager {
             print("[Outbox] WARNING: No Sent folder found for account \(accountId)")
             // No Sent folder configured — can't append. Mark as appended to avoid
             // blocking the outbox forever. The message was sent via SMTP.
-            await markAppendedToSent(outboxId: outboxId)
-            return true
+            return await markAppendedToSent(outboxId: outboxId)
         }
 
         do {
@@ -676,10 +778,8 @@ extension AccountManager {
             let result = try await queue.execute(priority: .userAction) {
                 try await provider.appendToSentFolder(draft: draft, sentFolderPath: sentPath, messageId: messageId)
             }
-            if result {
-                await markAppendedToSent(outboxId: outboxId)
-            }
-            return result
+            guard result else { return false }
+            return await markAppendedToSent(outboxId: outboxId)
         } catch {
             print("[Outbox] WARNING: Failed to append to Sent folder for \(outboxId): \(error)")
             return false
@@ -687,16 +787,19 @@ extension AccountManager {
     }
 
     /// Mark an outbox message as having been appended to the Sent folder.
-    private func markAppendedToSent(outboxId: String) async {
+    @discardableResult
+    private func markAppendedToSent(outboxId: String) async -> Bool {
         do {
-            try await dbPool.write { db in
+            return try await dbPool.write { db in
                 try db.execute(
                     sql: "UPDATE outboxMessage SET appendedToSent = 1 WHERE id = ?",
                     arguments: [outboxId]
                 )
+                return db.changesCount == 1
             }
         } catch {
             print("[Outbox] WARNING: Could not mark \(outboxId) as appended to Sent: \(error)")
+            return false
         }
     }
 
@@ -775,125 +878,199 @@ extension AccountManager {
 
     /// Finalize an outbox message: update reply/forward flags, delete from DB, clean up attachments.
     /// Called only after BOTH send and Sent folder append have succeeded.
-    private func finalizeOutboxMessage(_ msg: OutboxMessage) async {
+    /// PORT — atomic reducer from 1b8ab1e32 with owner/generation rules from
+    /// 476e257a5 and 97497416b. Completion is verified by the caller, not
+    /// duplicated here.
+    nonisolated static func deleteCompletedSendAtomic(
+        outboxId: String,
+        db: Database
+    ) throws -> CompletedSendCleanupDisposition {
+        guard let outbox = try OutboxMessage.fetchOne(db, key: outboxId) else {
+            throw OutboxFinalizeError.outboxRowVanished(outboxId)
+        }
+
         var replyDetectHeaderId: String?
-        var deleted = false
-        do {
-            replyDetectHeaderId = try await retryWrite(dbPool, label: "Outbox") { db -> String? in
-                try OutboxMessage.deleteOne(db, key: msg.id)
-
-                // Update isReplied/isForwarded on original message + queue server flag.
-                // Resolves the original message using the stableId pattern:
-                // 1. PK lookup (originalMessageHeaderId) — works if message hasn't moved
-                // 2. rfc822MessageId lookup (inReplyTo) — survives IMAP folder moves
-                // This is the same resolution pattern used throughout the codebase
-                // (eviction, ChatIdTranslator, PendingOperation).
-                if let originalId = msg.originalMessageHeaderId {
-                    let original: MessageHeader? = try Self.resolveOriginalMessage(
-                        originalId: originalId, inReplyTo: msg.inReplyTo, db: db
-                    )
-                    if msg.isForward {
-                        if let original {
-                            try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
-                            try PendingOperation(
-                                type: .markForwarded,
-                                messageIds: [original.stableId],
-                                accountId: original.accountId,
-                                folderPath: original.folderPath
-                            ).insert(db)
-                        }
-                    } else {
-                        if var original {
-                            original.isReplied = true
-                            // Queue server-side \Answered flag
-                            try PendingOperation(
-                                type: .markReplied,
-                                messageIds: [original.stableId],
-                                accountId: original.accountId,
-                                folderPath: original.folderPath
-                            ).insert(db)
-                            if original.actionTag == .reply {
-                                original.actionTag = ActionTag.none
-                                original.tagSortOrder = ActionTag.none.sortOrder
-                                let tagOp = PendingOperation(
-                                    type: .setTag,
-                                    messageIds: [original.stableId],
-                                    accountId: original.accountId,
-                                    folderPath: original.folderPath,
-                                    tagValue: ActionTag.none.rawValue
-                                )
-                                try tagOp.insert(db)
-                                print("[ReplyDetect] Outbox: reply→none for \(original.messageId) (just replied)")
-                                try original.update(db)
-                                return originalId
-                            }
-                            try original.update(db)
-                        }
-                    }
+        if let originalId = outbox.originalMessageHeaderId,
+           var original = try resolveOriginalMessage(
+                originalId: originalId,
+                inReplyTo: outbox.inReplyTo,
+                accountId: outbox.accountId,
+                db: db
+           ) {
+            if outbox.isForward {
+                original.isForwarded = true
+                try PendingOperation(
+                    type: .markForwarded,
+                    messageIds: [original.stableId],
+                    accountId: original.accountId,
+                    folderPath: original.folderPath).insert(db)
+            } else {
+                original.isReplied = true
+                try PendingOperation(
+                    type: .markReplied,
+                    messageIds: [original.stableId],
+                    accountId: original.accountId,
+                    folderPath: original.folderPath).insert(db)
+                if original.actionTag == .reply {
+                    original.actionTag = ActionTag.none
+                    original.tagSortOrder = ActionTag.none.sortOrder
+                    try PendingOperation(
+                        type: .setTag,
+                        messageIds: [original.stableId],
+                        accountId: original.accountId,
+                        folderPath: original.folderPath,
+                        tagValue: ActionTag.none.rawValue).insert(db)
+                    replyDetectHeaderId = originalId
                 }
-                return nil
             }
-            deleted = true
-        } catch {
-            // retryWrite already logged individual attempts
-        }
-        // ReplyDetect: notify UI immediately so tag badge updates
-        if let replyDetectHeaderId {
-            NotificationCenter.default.post(name: .messageDataDidChange, object: replyDetectHeaderId)
-        }
-        if deleted {
-            NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
-            // Notify inbox list so isReplied/isForwarded/tag changes propagate
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-        } else {
-            print("[Outbox] CRITICAL: Could not delete sent message \(msg.id) after 3 attempts — sentAt is set, reconcile will clean up")
-        }
-        msg.deleteAttachments()
-
-        // Delete the LOCAL draft row now that the send is complete. During the
-        // undo-hold window the Draft stayed alive so Undo could reopen compose
-        // with its exact contents; once SMTP + Sent-append both succeed, it's
-        // safe to remove. Fire-and-forget — non-critical cleanup.
-        if let did = msg.draftId {
-            Task { try? DraftStore.shared.delete(id: did) }
+            try original.update(db)
         }
 
-        // Queue server draft deletion via PendingOperation (crash-safe, retried on failure).
-        // The email has been sent — the draft on the server is now stale.
-        if let serverDraftId = msg.serverDraftId {
-            // Hand over the DRAFT's own rfc822 alongside its server address. On IMAP
-            // `serverDraftId` is a bare UID, which `IMAPProvider.deleteDraft` refuses
-            // to build a destructive command from — without the identity this backstop
-            // could only fail, and the sent draft would stay in Drafts. The snapshot is
-            // read off the OUTBOX row, not the `Draft` row, because the local Draft was
-            // already deleted a few lines above (and, in `reconcileOutbox`, may never
-            // have existed in this process at all).
-            await queueDraftDelete(
+        var draftDir: String?
+        var cleanup: ServerDraftCleanup?
+        var preservedMismatchedDraftId: String?
+        if let draftId = outbox.draftId,
+           let liveDraft = try Draft.fetchOne(db, key: draftId) {
+            if liveDraft.accountId == outbox.accountId,
+               let ownerEpoch = outbox.instanceEpoch,
+               !ownerEpoch.isEmpty,
+               liveDraft.instanceEpoch == ownerEpoch {
+                draftDir = liveDraft.attachmentsDirName
+                if let serverDraftId = liveDraft.serverDraftId ?? outbox.serverDraftId {
+                    cleanup = ServerDraftCleanup(
+                        accountId: outbox.accountId,
+                        serverDraftId: serverDraftId,
+                        gmailContainedMessageId: outbox.serverDraftGmailMessageId,
+                        folderPath:
+                            liveDraft.serverDraftFolderPath
+                            ?? outbox.draftServerFolderPath,
+                        uidValidity:
+                            liveDraft.serverDraftUidValidity
+                            ?? outbox.draftServerUidValidity)
+                }
+                try DraftStore.applyDelete(
+                    id: liveDraft.id,
+                    expectedInstanceEpoch: ownerEpoch,
+                    db: db)
+            } else {
+                preservedMismatchedDraftId = liveDraft.id
+            }
+        } else if let serverDraftId = outbox.serverDraftId {
+            // An absent local Draft leaves the immutable Outbox owner authoritative.
+            cleanup = ServerDraftCleanup(
+                accountId: outbox.accountId,
                 serverDraftId: serverDraftId,
-                accountId: msg.accountId,
-                rfc822MessageId: msg.draftRfc822MessageId,
-                // …with the epoch the address belongs to. This backstop runs
-                // UNCONDITIONALLY, after the primary delete queued at the send gesture
-                // has already had its chance, so by the time it resolves its own target
-                // is frequently gone — which is precisely the state in which a
-                // Message-ID search returns a same-Message-ID SIBLING as the sole
-                // remaining match. With the epoch it FETCHes the recorded UID instead
-                // and finds nothing: a clean no-op, sibling untouched.
-                uidValidity: msg.draftServerUidValidity
-            )
+                gmailContainedMessageId: outbox.serverDraftGmailMessageId,
+                folderPath: outbox.draftServerFolderPath,
+                uidValidity: outbox.draftServerUidValidity)
         }
 
-        // Sync the Sent folder so the sent message appears there immediately.
-        if let queue = workQueues[msg.accountId] {
-            let accountId = msg.accountId
+        let outboxDir = outbox.attachmentsDirName
+        guard try OutboxMessage.deleteOne(db, key: outbox.id) else {
+            throw OutboxFinalizeError.outboxDeleteDidNotLand(outbox.id)
+        }
+        return CompletedSendCleanupDisposition(
+            accountId: outbox.accountId,
+            outboxDir: outboxDir,
+            draftDir: draftDir,
+            replyDetectHeaderId: replyDetectHeaderId,
+            serverDraftCleanup: cleanup,
+            preservedMismatchedDraftId: preservedMismatchedDraftId)
+    }
+
+    private func finalizeOutboxMessage(_ msg: OutboxMessage) async {
+        // PORT 4651d894b: fresh completion verification before any mutation.
+        do {
+            guard let fresh = try await dbPool.read({
+                try OutboxMessage.fetchOne($0, key: msg.id)
+            }), fresh.sentAt != nil, fresh.appendedToSent else {
+                return
+            }
+        } catch {
+            return
+        }
+
+        let disposition: CompletedSendCleanupDisposition
+        do {
+            disposition = try await retryWrite(
+                dbPool, label: "Outbox"
+            ) { db in
+                try Self.deleteCompletedSendAtomic(outboxId: msg.id, db: db)
+            }
+        } catch {
+            print("[Outbox] CRITICAL: atomic finalize failed for \(msg.id); leaving it for reconcile")
+            return
+        }
+
+        if let outboxDir = disposition.outboxDir {
+            let url = OutboxMessage.attachmentsBaseDir
+                .appendingPathComponent(outboxDir, isDirectory: true)
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let draftDir = disposition.draftDir {
+            DraftAttachmentStorage.deleteAttachments(dirName: draftDir)
+        }
+        if let replyId = disposition.replyDetectHeaderId {
+            NotificationCenter.default.post(
+                name: .messageDataDidChange, object: replyId)
+        }
+        NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+
+        if let mismatched = disposition.preservedMismatchedDraftId {
+            print("[Outbox] Preserved owner/generation-mismatched Draft \(mismatched)")
+        }
+
+        if let cleanup = disposition.serverDraftCleanup,
+           let provider = providers[cleanup.accountId] {
+            let kind = Self.draftRuntimeIdentityKind(for: provider)
+            let identity: DraftDeleteIdentity?
+            switch kind {
+            case .gmail:
+                if !cleanup.serverDraftId.isEmpty {
+                    identity = .gmail(resourceId: cleanup.serverDraftId)
+                } else if let contained = cleanup.gmailContainedMessageId {
+                    identity = .gmailContainedMessage(messageId: contained)
+                } else {
+                    identity = nil
+                }
+            case .outlook:
+                identity = .outlook(graphId: cleanup.serverDraftId)
+            case .demo:
+                identity = .demo(localId: cleanup.serverDraftId)
+            case .imap:
+                if let folder = cleanup.folderPath,
+                   let epoch = cleanup.uidValidity,
+                   let uid = Int(cleanup.serverDraftId), uid > 0 {
+                    identity = .imap(
+                        folder: folder, uidValidity: epoch, uid: uid)
+                } else {
+                    identity = nil
+                }
+            case .unknown:
+                identity = nil
+            }
+            if let identity {
+                _ = await queueDraftDelete(
+                    identity: identity,
+                    accountId: cleanup.accountId,
+                    folderPath: cleanup.folderPath)
+            }
+        }
+
+        if let queue = workQueues[disposition.accountId] {
+            let accountId = disposition.accountId
             Task {
                 do {
-                    let sentFolder = try await dbPool.read { db in
-                        try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.sent.rawValue).fetchOne(db)
-                    }
-                    if let folder = sentFolder {
+                    if let folder = try await self.dbPool.read({ db in
+                        try Folder
+                            .filter(Column("accountId") == accountId
+                                && Column("role") == FolderRole.sent.rawValue)
+                            .fetchOne(db)
+                    }) {
                         try await queue.execute(priority: .userAction) {
-                            try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
+                            try await self.syncEngine.syncFolderMessages(
+                                folder: folder, provider: queue.provider)
                         }
                     }
                 } catch {
@@ -902,22 +1079,29 @@ extension AccountManager {
             }
         }
     }
-
     /// Resolve the original message for isReplied/isForwarded updates.
-    /// Uses the stableId resolution pattern: PK lookup first, rfc822MessageId search if stale.
-    /// This is the standard pattern used across the codebase for IMAP MOVE resilience.
-    private nonisolated static func resolveOriginalMessage(originalId: String, inReplyTo: String?, db: Database) throws -> MessageHeader? {
-        // Strategy 1: direct PK lookup (fast, works if message hasn't moved)
-        if let header = try MessageHeader.fetchOne(db, key: originalId) {
-            return header
+    ///
+    /// PORT/SUBTRACT — v2final's ADR-IOS-061 F6/F7 guard, reduced to the
+    /// provider-ID forward-port boundary. The exact local provider key must still
+    /// belong to the sending account, and the outbox's own In-Reply-To must
+    /// corroborate the row's RFC identity. Missing or disagreeing evidence fails
+    /// closed. The reference's RFC candidate search, sibling expansion, and
+    /// reset/redrive machinery are intentionally omitted; sync reconciles a moved
+    /// or otherwise unprovable original without risking a wrong-message mutation.
+    private nonisolated static func resolveOriginalMessage(
+        originalId: String,
+        inReplyTo: String?,
+        accountId: String,
+        db: Database
+    ) throws -> MessageHeader? {
+        guard let header = try MessageHeader.fetchOne(db, key: originalId),
+              header.accountId == accountId,
+              let expectedRfc = MessageIdentity.comparableRfc822Identity(inReplyTo),
+              let headerRfc = MessageIdentity.comparableRfc822Identity(header.rfc822MessageId),
+              expectedRfc == headerRfc else {
+            return nil
         }
-        // Strategy 2: rfc822MessageId search (survives IMAP folder moves)
-        if let rfc822 = inReplyTo.map({ EmailFilter.normalizeMessageId($0) }), !rfc822.isEmpty {
-            return try MessageHeader
-                .filter(Column("rfc822MessageId") == rfc822)
-                .fetchOne(db)
-        }
-        return nil
+        return header
     }
 
     // draftsFolderPath is defined in AccountManagerActions
@@ -944,119 +1128,31 @@ extension AccountManager {
     ///   the case where send succeeded but sentAt write didn't).
     /// - Cleans up orphaned attachment directories that have no matching DB row.
     func reconcileOutbox() async {
-        // Collect cleanup work to do OUTSIDE the DB transaction
-        // (file I/O and network calls inside a write block would roll back on failure).
-        var dirsToClean: [String] = []
-        var serverDraftsToDelete: [ServerDraftCleanup] = []
-
-        var localDraftsToDelete: [String] = []
+        let stale: [OutboxMessage]
         do {
-            let result: (dirs: [String], drafts: [ServerDraftCleanup], localDrafts: [String]) = try await retryWrite(dbPool, retryDelay: .milliseconds(200), label: "Outbox") { db in
-                let stale = try OutboxMessage
+            stale = try await dbPool.read { db in
+                try OutboxMessage
                     .filter(Column("status") == OutboxStatus.sending.rawValue)
                     .fetchAll(db)
-                var dirs: [String] = []
-                var drafts: [ServerDraftCleanup] = []
-                var localDrafts: [String] = []
-                for msg in stale {
-                    if msg.sentAt != nil {
-                        if msg.appendedToSent {
-                            // Fully completed — delete DB row now, clean files after transaction.
-                            // Also set isReplied/isForwarded + queue server flag (crash may have
-                            // occurred before the normal post-send update ran).
-                            print("[Outbox] Crash recovery: deleting fully-completed message \(msg.id)")
-                            // Collect server draft for cleanup (may have been missed on crash)
-                            if let sdi = msg.serverDraftId {
-                                drafts.append(ServerDraftCleanup(
-                                    accountId: msg.accountId,
-                                    serverDraftId: sdi,
-                                    rfc822MessageId: msg.draftRfc822MessageId,
-                                    uidValidity: msg.draftServerUidValidity
-                                ))
-                            }
-                            // Collect local Draft row for cleanup (same — finalizeOutboxMessage
-                            // would have deleted it; this catches the crash-before-finalize case).
-                            if let did = msg.draftId {
-                                localDrafts.append(did)
-                            }
-                            if let originalId = msg.originalMessageHeaderId {
-                                let original: MessageHeader? = try Self.resolveOriginalMessage(
-                                    originalId: originalId, inReplyTo: msg.inReplyTo, db: db
-                                )
-                                if msg.isForward {
-                                    if let original {
-                                        try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
-                                        try PendingOperation(type: .markForwarded, messageIds: [original.stableId], accountId: original.accountId, folderPath: original.folderPath).insert(db)
-                                    }
-                                } else if var original {
-                                    original.isReplied = true
-                                    try PendingOperation(type: .markReplied, messageIds: [original.stableId], accountId: original.accountId, folderPath: original.folderPath).insert(db)
-                                    if original.actionTag == .reply {
-                                        original.actionTag = ActionTag.none
-                                        original.tagSortOrder = ActionTag.none.sortOrder
-                                        try PendingOperation(type: .setTag, messageIds: [original.stableId], accountId: original.accountId, folderPath: original.folderPath, tagValue: ActionTag.none.rawValue).insert(db)
-                                    }
-                                    try original.update(db)
-                                }
-                            }
-                            try OutboxMessage.deleteOne(db, key: msg.id)
-                            if let dirName = msg.attachmentsDirName {
-                                dirs.append(dirName)
-                            }
-                        } else {
-                            // Sent but append incomplete — reset to 'sending' so
-                            // drainPendingSentAppends picks it up. Keep sentAt set
-                            // to prevent double-send.
-                            print("[Outbox] Crash recovery: sent but Sent append pending for \(msg.id)")
-                            // Status stays as 'sending' — drainPendingSentAppends
-                            // queries by sentAt != nil AND appendedToSent == false.
-                        }
-                    } else {
-                        // Was mid-send — reset for retry
-                        print("[Outbox] Crash recovery: resetting sending message \(msg.id) to queued")
-                        try db.execute(sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
-                                       arguments: [OutboxStatus.queued.rawValue, msg.id])
-                    }
-                }
-                return (dirs, drafts, localDrafts)
             }
-            dirsToClean = result.dirs
-            serverDraftsToDelete = result.drafts
-            localDraftsToDelete = result.localDrafts
         } catch {
-            // retryWrite already logged individual attempts
+            return
         }
 
-        // File I/O outside the transaction — safe, idempotent
-        for dirName in dirsToClean {
-            let dir = OutboxMessage.attachmentsBaseDir.appendingPathComponent(dirName, isDirectory: true)
-            try? FileManager.default.removeItem(at: dir)
+        for message in stale {
+            if message.sentAt != nil, message.appendedToSent {
+                await finalizeOutboxMessage(message)
+            } else if message.sentAt == nil {
+                try? await retryWrite(dbPool, label: "Outbox") { db in
+                    try db.execute(
+                        sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
+                        arguments: [OutboxStatus.queued.rawValue, message.id])
+                }
+            }
         }
-
-        // Queue server draft deletion via PendingOperation for crash-recovered messages.
-        // Carries the draft's own rfc822 (see finalizeOutboxMessage) — this path has no
-        // live Draft row at all, so the outbox snapshot is the ONLY identity available.
-        for cleanup in serverDraftsToDelete {
-            await queueDraftDelete(
-                serverDraftId: cleanup.serverDraftId,
-                accountId: cleanup.accountId,
-                rfc822MessageId: cleanup.rfc822MessageId,
-                uidValidity: cleanup.uidValidity
-            )
-        }
-
-        // Delete local Draft rows for fully-completed crash-recovered messages.
-        for did in localDraftsToDelete {
-            try? DraftStore.shared.delete(id: did)
-        }
-
-        // Clean up orphaned attachment directories (crash during queueSend between
-        // saveAttachments and DB insert, or other edge cases)
         await cleanOrphanedAttachmentDirs()
-
         await drainOutbox()
     }
-
     /// Remove attachment directories that have no matching outboxMessage row.
     private func cleanOrphanedAttachmentDirs() async {
         let baseDir = OutboxMessage.attachmentsBaseDir
@@ -1103,33 +1199,38 @@ extension AccountManager {
         }
     }
 
-    /// Discard an outbox message (delete from DB + disk).
-    /// Uses a single write transaction to atomically fetch + delete, preventing a
-    /// TOCTOU race where drainOutbox could pick up the message between read and delete.
-    /// Refuses to discard a message that is currently being sent (status == sending).
-    nonisolated func discardOutboxMessage(_ messageId: String) {
+    /// Cancel one still-queued Outbox row and report whether the delete committed.
+    /// Undo reopens compose only after this exact confirmation. Sending or sent-at
+    /// rows are not cancellation authority; failed-but-unsent rows remain discardable.
+    @discardableResult
+    nonisolated func discardOutboxMessageConfirmed(_ messageId: String) -> Bool {
         do {
-            let attachmentsDirName: String? = try AppDatabase.dbPool.write { db in
-                guard let msg = try OutboxMessage.fetchOne(db, key: messageId) else { return nil }
-                // Don't discard mid-send — the email may have already left the server
-                guard msg.outboxStatus != .sending else {
-                    print("[Outbox] Cannot discard \(messageId) — currently sending")
-                    return nil
+            let outcome: (deleted: Bool, dir: String?) = try AppDatabase.dbPool.write { db in
+                guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
+                      msg.outboxStatus != .sending,
+                      msg.sentAt == nil,
+                      try OutboxMessage.deleteOne(db, key: messageId) else {
+                    return (false, nil)
                 }
-                try OutboxMessage.deleteOne(db, key: messageId)
-                return msg.attachmentsDirName
+                return (true, msg.attachmentsDirName)
             }
-            // Clean up attachments on disk (outside transaction — safe, idempotent)
-            if let dirName = attachmentsDirName {
-                let dir = OutboxMessage.attachmentsBaseDir.appendingPathComponent(dirName, isDirectory: true)
+            guard outcome.deleted else { return false }
+            if let dirName = outcome.dir {
+                let dir = OutboxMessage.attachmentsBaseDir
+                    .appendingPathComponent(dirName, isDirectory: true)
                 try? FileManager.default.removeItem(at: dir)
             }
-            print("[Outbox] Discarded message \(messageId)")
             NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
-            // Trigger drain so remaining queued messages get processed immediately
             Task { await self.drainOutbox() }
+            return true
         } catch {
-            print("[Outbox] ERROR: Failed to discard \(messageId): \(error)")
+            print("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
+            return false
         }
+    }
+
+    /// Void wrapper for callers that do not need confirmation.
+    nonisolated func discardOutboxMessage(_ messageId: String) {
+        _ = discardOutboxMessageConfirmed(messageId)
     }
 }

@@ -20,6 +20,9 @@ struct DynamicIslandChat: View {
     let composeContext: ComposeEditContext?
     let draftId: String?
     let draftReplyToId: String?  // MessageHeader.id of the email being replied to (for draft eviction)
+    let composeGenerationCursor: ComposeGenerationCursor?
+    let composeAgentSendFence: ComposeAgentSendFence?
+    let composeMutationAllowed: Bool
     /// Skip writing LLM results to the `Draft` table — caller persists elsewhere.
     let skipDraftAutoSave: Bool
     @Binding var isExpanded: Bool
@@ -69,7 +72,10 @@ struct DynamicIslandChat: View {
     }
 
     private var sessionKey: String {
-        if composeContext != nil { return "compose:\(draftId ?? "default")" }
+        if composeContext != nil, let cursor = composeGenerationCursor {
+            return ActiveAgentTracker.composeSessionKey(
+                draftId: draftId ?? "default", epoch: cursor.newEpoch)
+        }
         if let key = stableMessageKey { return "msg:\(key)" }
         return "inbox"
     }
@@ -179,6 +185,9 @@ struct DynamicIslandChat: View {
         composeContext: ComposeEditContext? = nil,
         draftId: String? = nil,
         draftReplyToId: String? = nil,
+        composeGenerationCursor: ComposeGenerationCursor? = nil,
+        composeAgentSendFence: ComposeAgentSendFence? = nil,
+        composeMutationAllowed: Bool = true,
         skipDraftAutoSave: Bool = false,
         isExpanded: Binding<Bool>,
         isInputFocused: Binding<Bool> = .constant(false),
@@ -192,6 +201,9 @@ struct DynamicIslandChat: View {
         self.composeContext = composeContext
         self.draftId = draftId
         self.draftReplyToId = draftReplyToId
+        self.composeGenerationCursor = composeGenerationCursor
+        self.composeAgentSendFence = composeAgentSendFence
+        self.composeMutationAllowed = composeMutationAllowed
         self.skipDraftAutoSave = skipDraftAutoSave
         self._isExpanded = isExpanded
         self._isInputFocused = isInputFocused
@@ -1211,12 +1223,22 @@ struct DynamicIslandChat: View {
     // MARK: - Logic
 
     private var canSend: Bool {
-        hasTabMailSession && !inputText.trimmingCharacters(in: .whitespaces).isEmpty && !isWorking
+        hasTabMailSession
+            && !inputText.trimmingCharacters(in: .whitespaces).isEmpty
+            && !isWorking
+            && (!isComposeMode || composeMutationAllowed)
     }
 
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
+        let composeAdmissionAcquired: Bool
+        if isComposeMode {
+            guard acquireComposeEditAdmission() else { return }
+            composeAdmissionAcquired = true
+        } else {
+            composeAdmissionAcquired = false
+        }
         // Dismiss keyboard focus first — stops any in-flight iOS keyboard
         // dictation that could push a final text update after we clear.
         // Then clear text field immediately. Defer remaining state changes to
@@ -1237,7 +1259,7 @@ struct DynamicIslandChat: View {
                 InboxChatCollapseTip.hasStartedInboxChat = true
             }
             if isComposeMode {
-                sendComposeEdit(text)
+                sendComposeEdit(text, agentAdmissionAcquired: composeAdmissionAcquired)
             } else {
                 sendAgentChat(text)
             }
@@ -1246,10 +1268,45 @@ struct DynamicIslandChat: View {
 
     // MARK: - Compose inline edit
 
-    private func sendComposeEdit(_ instruction: String) {
+    private func acquireComposeEditAdmission() -> Bool {
+        guard composeMutationAllowed else {
+            chatMessages.append(ChatMessage(
+                role: .warning,
+                content: "This draft did not finish loading. Close and reopen it before editing.",
+                timestamp: Date()))
+            return false
+        }
         guard let ctx = composeContext else {
             print("[DynamicIslandChat] sendComposeEdit: NO composeContext — aborting")
+            return false
+        }
+        _ = ctx
+        guard composeAgentSendFence?.beginAgent() ?? true else {
+            chatMessages.append(ChatMessage(
+                role: .warning,
+                content: "Send is already in progress.",
+                timestamp: Date()))
+            return false
+        }
+        return true
+    }
+
+    private func sendComposeEdit(_ instruction: String, agentAdmissionAcquired: Bool = false) {
+        guard composeMutationAllowed else {
+            if agentAdmissionAcquired { composeAgentSendFence?.finishAgent() }
+            chatMessages.append(ChatMessage(
+                role: .warning,
+                content: "This draft did not finish loading. Close and reopen it before editing.",
+                timestamp: Date()))
             return
+        }
+        guard let ctx = composeContext else {
+            if agentAdmissionAcquired { composeAgentSendFence?.finishAgent() }
+            print("[DynamicIslandChat] sendComposeEdit: NO composeContext — aborting")
+            return
+        }
+        if !agentAdmissionAcquired {
+            guard acquireComposeEditAdmission() else { return }
         }
 
         // Capture current draft state from parent (values are up-to-date via SwiftUI re-render)
@@ -1286,7 +1343,7 @@ struct DynamicIslandChat: View {
             emailContextJSON: nil,
             thinkingContent: nil
         )
-        Task {
+        let userTurnPersistence = Task {
             do { try await ChatStore.shared.appendTurn(userTurn) }
             catch { print("[DynamicIslandChat] Failed to persist compose edit user turn: \(error)") }
         }
@@ -1313,6 +1370,8 @@ struct DynamicIslandChat: View {
         }
 
         activeChatTask = Task {
+            defer { composeAgentSendFence?.finishAgent() }
+            await userTurnPersistence.value
             do {
                 let result = try await editTask.value
                 timeoutTask.cancel()
@@ -1365,10 +1424,8 @@ struct DynamicIslandChat: View {
                     emailContextJSON: nil,
                     thinkingContent: nil
                 )
-                Task {
-                    do { try await ChatStore.shared.appendTurn(assistantTurn) }
-                    catch { print("[DynamicIslandChat] Failed to persist compose edit assistant turn: \(error)") }
-                }
+                do { try await ChatStore.shared.appendTurn(assistantTurn) }
+                catch { print("[DynamicIslandChat] Failed to persist compose edit assistant turn: \(error)") }
                 sessionTurns.append(assistantTurn)
 
                 // Auto-save draft to GRDB (state after edit applied).
@@ -1378,7 +1435,8 @@ struct DynamicIslandChat: View {
                     if DebugModeManager.isLoggingEnabled() {
                         print("[DynamicIslandChat] sendComposeEdit: autoSaveDraft task fired draftKey=\(did) sessionKey=\(sessionKey)")
                     }
-                    Task { await autoSaveDraft(draftKey: did, subject: updatedSubject, body: updatedBody) }
+                    await autoSaveDraft(
+                        draftKey: did, subject: updatedSubject, body: updatedBody)
                 }
 
                 print("[DynamicIslandChat] Inline edit applied, editHistory=\(editHistory.count) turns")
@@ -1428,7 +1486,9 @@ struct DynamicIslandChat: View {
         if DebugModeManager.isLoggingEnabled() {
             print("[DraftStore] autoSaveDraft: enter draftKey=\(draftKey)")
         }
-        guard let ctx = composeContext else {
+        guard let ctx = composeContext,
+              let cursor = composeGenerationCursor,
+              composeMutationAllowed else {
             if DebugModeManager.isLoggingEnabled() {
                 print("[DraftStore] autoSaveDraft: exit (no composeContext) draftKey=\(draftKey)")
             }
@@ -1443,7 +1503,13 @@ struct DynamicIslandChat: View {
         // Try to load existing draft — mutate in place to preserve all fields
         // (especially v24 server sync: serverDraftId, serverPushStatus, rfc822MessageId, attachmentsDirName)
         let loadStart = Date()
-        let existingLoaded = try? DraftStore.shared.load(id: draftKey)
+        let existingLoaded: Draft?
+        do {
+            existingLoaded = try DraftStore.shared.load(id: draftKey)
+        } catch {
+            print("[DraftStore] Auto-save predecessor read failed: \(error)")
+            return
+        }
         if DebugModeManager.isLoggingEnabled() {
             let loadMs = Int(Date().timeIntervalSince(loadStart) * 1000)
             print("[DraftStore] autoSaveDraft: load took \(loadMs)ms found=\(existingLoaded != nil) draftKey=\(draftKey)")
@@ -1454,9 +1520,16 @@ struct DynamicIslandChat: View {
             existing.editHistoryJSON = editHistJSON
             existing.updatedAt = now
             savedAccountId = existing.accountId
+            let existingToSave = existing
             let saveStart = Date()
             do {
-                try DraftStore.shared.save(existing)
+                let result = try await cursor.admit { newEpoch, predecessor in
+                    try await DraftStore.shared.saveAsync(
+                        existingToSave,
+                        epoch: newEpoch,
+                        expectedPredecessor: predecessor)
+                }
+                guard result == .applied else { return }
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
                     print("[DraftStore] autoSaveDraft: save (existing) took \(saveMs)ms draftKey=\(draftKey)")
@@ -1491,7 +1564,13 @@ struct DynamicIslandChat: View {
             )
             let saveStart = Date()
             do {
-                try DraftStore.shared.save(draft)
+                let result = try await cursor.admit { newEpoch, predecessor in
+                    try await DraftStore.shared.saveAsync(
+                        draft,
+                        epoch: newEpoch,
+                        expectedPredecessor: predecessor)
+                }
+                guard result == .applied else { return }
                 if DebugModeManager.isLoggingEnabled() {
                     let saveMs = Int(Date().timeIntervalSince(saveStart) * 1000)
                     print("[DraftStore] autoSaveDraft: save (first) took \(saveMs)ms draftKey=\(draftKey)")
@@ -2144,19 +2223,21 @@ struct DynamicIslandChat: View {
     /// the draft back to the pre-edit snapshot (if the prior edit succeeded and mutated the
     /// draft) and pops the trailing `editHistory` entry so the LLM history matches state.
     private func resendLastUserComposeEdit(text: String, afterIndex index: Int) {
+        guard acquireComposeEditAdmission() else { return }
         trimForResendLast(atIndex: index)
         if let last = editHistory.last {
             // Recipients are not tracked in editHistory — pass nil to keep current values.
             onDraftUpdate?(last.subjectAtRequest, last.bodyAtRequest, nil, nil, nil)
             editHistory.removeLast()
         }
-        sendComposeEdit(text)
+        sendComposeEdit(text, agentAdmissionAcquired: true)
     }
 
     /// Rewind compose-edit chat to an earlier user message. In addition to the standard trim,
     /// this rolls the draft back to the snapshot captured at that turn and truncates
     /// `editHistory`.
     private func rewindComposeEditToMessage(text: String, atIndex index: Int) {
+        guard acquireComposeEditAdmission() else { return }
         let userMessagesBefore = trimForRewind(atIndex: index)
         // Snapshot on the earliest popped editHistory entry is the pre-edit draft for that turn.
         let editCutoff = min(userMessagesBefore, editHistory.count)
@@ -2166,7 +2247,7 @@ struct DynamicIslandChat: View {
             onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil)
             editHistory = Array(editHistory.prefix(editCutoff))
         }
-        sendComposeEdit(text)
+        sendComposeEdit(text, agentAdmissionAcquired: true)
     }
 
     /// Fork a new session from an earlier user message. Creates a new session on the __new__
@@ -2280,4 +2361,3 @@ private struct ExpandablePillPressStyle: ButtonStyle {
             .animation(.spring(response: 0.25, dampingFraction: 0.6), value: configuration.isPressed)
     }
 }
-

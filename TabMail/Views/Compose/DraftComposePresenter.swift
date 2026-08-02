@@ -5,6 +5,46 @@
 import SwiftUI
 import GRDB
 
+/// PORT/SUBTRACT — the repeated v2final `ServerDraftOpen` handoff check,
+/// narrowed to an already-existing locally-authored Draft. No fresh compose,
+/// RFC adoption, recovery, or compatibility path is authorized here.
+struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
+    enum Address: Sendable, Equatable {
+        case placeholder(messageId: String)
+        case gmail(resourceId: String, containedMessageId: String)
+        case outlook(graphId: String)
+        case demo(localId: String)
+    }
+
+    let draftId: String
+    let accountId: String
+    let instanceEpoch: String
+    let serverPushStatus: String?
+    let runtimeKind: DraftRuntimeIdentityKind
+    let address: Address
+
+    func matches(_ draft: Draft, runtimeKind currentRuntimeKind: DraftRuntimeIdentityKind) -> Bool {
+        guard currentRuntimeKind == runtimeKind,
+              draft.id == draftId,
+              draft.accountId == accountId,
+              draft.instanceEpoch == instanceEpoch,
+              draft.serverPushStatus == serverPushStatus else {
+            return false
+        }
+        switch address {
+        case .placeholder(let messageId):
+            return PendingOperation.draftPlaceholderMessageId(
+                draftId: draft.id, instanceEpoch: draft.instanceEpoch) == messageId
+        case .gmail(let resourceId, _):
+            return currentRuntimeKind == .gmail && draft.serverDraftId == resourceId
+        case .outlook(let graphId):
+            return currentRuntimeKind == .outlook && draft.serverDraftId == graphId
+        case .demo(let localId):
+            return currentRuntimeKind == .demo && draft.serverDraftId == localId
+        }
+    }
+}
+
 /// Loads a Draft from GRDB and resolves all context (reply-to message, account)
 /// before creating ComposeView. This eliminates the black-screen flash that occurs
 /// when ComposeView is created with empty @State and loads data in onAppear.
@@ -13,8 +53,7 @@ import GRDB
 /// Used by ComposeToolbarButton and ServerDraftComposeLoader.
 struct DraftComposePresenter: View {
     let draftId: String
-    /// Server draft header for cleanup on send. Passed through to ComposeView.
-    var serverDraftHeader: MessageHeader?
+    var openAuthority: LocallyAuthoredDraftOpenAuthority? = nil
     @State private var loadResult: LoadResult?
     @State private var isLoading = true
     @Environment(\.dismiss) private var dismiss
@@ -33,7 +72,7 @@ struct DraftComposePresenter: View {
                     account: account,
                     isForward: draft.isForward,
                     prefillDraftId: draftId,
-                    serverDraftHeader: serverDraftHeader
+                    openAuthority: openAuthority
                 )
             case .notFound:
                 // Draft doesn't exist (yet) — auto-dismiss
@@ -44,11 +83,11 @@ struct DraftComposePresenter: View {
                     .overlay { ProgressView("Loading draft...") }
             }
         }
-        .onAppear {
+        .task {
             print("[DraftComposePresenter] onAppear fired, isLoading=\(isLoading)")
             guard isLoading else { return }
             isLoading = false
-            loadResult = loadDraft()
+            loadResult = await loadDraft()
             print("[DraftComposePresenter] loadResult=\(loadResult == nil ? "nil" : "set")")
         }
         // ADR-IOS-030: Track presentation lifecycle so the agent compose FIFO queue
@@ -65,26 +104,34 @@ struct DraftComposePresenter: View {
     }
 
     /// Synchronous load — GRDB reads are fast on DatabasePool.
-    private func loadDraft() -> LoadResult {
+    private func loadDraft() async -> LoadResult {
         print("[DraftComposePresenter] Loading draft: \(draftId)")
-        guard let draft = try? AppDatabase.dbPool.read({ db in
-            try Draft.fetchOne(db, key: draftId)
-        }) else {
-            print("[DraftComposePresenter] Draft NOT FOUND: \(draftId)")
-            #if DEBUG
-            let allDrafts = (try? AppDatabase.dbPool.read { db in try Draft.fetchAll(db) }) ?? []
-            print("[DraftComposePresenter] All drafts in DB: \(allDrafts.map { "\($0.id.prefix(50))" })")
-            #endif
+        let loaded: (Draft, Account?)?
+        do {
+            loaded = try await AppDatabase.dbPool.read { db in
+                guard let draft = try Draft.fetchOne(db, key: draftId) else { return nil }
+                return (draft, try Account.fetchOne(db, key: draft.accountId))
+            }
+        } catch {
             return .notFound
+        }
+        guard let (draft, account) = loaded else {
+            print("[DraftComposePresenter] Draft NOT FOUND: \(draftId)")
+            return .notFound
+        }
+
+        if let openAuthority {
+            guard openAuthority.draftId == draftId,
+                  account?.id == openAuthority.accountId,
+                  let runtimeKind = await AccountManager.shared.draftRuntimeIdentityKind(
+                      accountId: openAuthority.accountId),
+                  openAuthority.matches(draft, runtimeKind: runtimeKind) else {
+                return .notFound
+            }
         }
 
         // Resolve reply-to message (with stableId fallback for stale PKs)
         let replyTo = resolveReplyTo(draft: draft)
-
-        // Resolve account
-        let account = try? AppDatabase.dbPool.read { db in
-            try Account.fetchOne(db, key: draft.accountId)
-        }
 
         print("[DraftComposePresenter] Loaded draft: \(draftId) replyTo=\(replyTo?.id.prefix(20) ?? "nil")")
         return .loaded(draft: draft, replyTo: replyTo, account: account)

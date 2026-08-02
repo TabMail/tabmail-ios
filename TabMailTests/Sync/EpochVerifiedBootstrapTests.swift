@@ -785,9 +785,12 @@ struct EpochVerifiedBootstrapTests {
     /// for the other deleter.
     @Test("INV-7: with a proven, agreeing epoch the walk still deletes genuine ghosts")
     func aProvenEpochStillLetsTheWalkDelete() async throws {
+        // ⚑ NO REFERENCE — INVENTED: this test-only UID block has no v2final
+        // counterpart. It avoids process-global raw-UID action-protection collisions.
+        let localUIDs = Array(4_000_000_001...4_000_000_012)
         // The server serves only the first four of the twelve local UIDs: the other
         // eight were deleted by another client, which is exactly what this walk is for.
-        let survivingUIDs = Array(Self.localUIDs.prefix(4))
+        let survivingUIDs = Array(localUIDs.prefix(4))
         let messages = survivingUIDs.map {
             FakeIMAPServer.makeMessage(uid: $0, rfc822Text: Self.rfc822Text(messageId: Self.localRfc(uid: $0)))
         }
@@ -802,7 +805,9 @@ struct EpochVerifiedBootstrapTests {
         let accountId = "t4s6b-walk-control"
         // Stored epoch is KNOWN and AGREES with the server — the walk's guard is
         // satisfied, so nothing about the epoch may stop it.
-        try Self.seed(pool: pool, accountId: accountId, storedEpoch: Self.intactEpoch)
+        try Self.seed(
+            pool: pool, accountId: accountId,
+            storedEpoch: Self.intactEpoch, uids: localUIDs)
         let folderId = "\(accountId):INBOX"
 
         let provider = Self.provider(for: server)
@@ -815,7 +820,7 @@ struct EpochVerifiedBootstrapTests {
         let folder = try #require(try Self.readFolder(pool: pool, folderId: folderId))
         await engine.reconcileExternallyDeletedMessages(
             folder: folder, provider: provider,
-            expectedGhosts: Self.localUIDs.count - survivingUIDs.count)
+            expectedGhosts: localUIDs.count - survivingUIDs.count)
         try? await provider.disconnect()
 
         #expect(try Self.headerCount(pool: pool, folderId: folderId) == survivingUIDs.count,

@@ -11,31 +11,22 @@ import GRDB
 /// held — including a reply/forward draft's optimistic placeholder header.
 ///
 /// THE INVARIANT (the system end state, not any mint's spelling): after
-/// `(accountId, folderPath)` is purged, no FTS entry and no `chatIdMapping` row
-/// keyed by a header id belonging to that folder survives. The FTS sweep
-/// (`SearchIndex.removeMessagesForFolder`) and the `chatIdMapping` sweep
-/// (`AccountManager.uidValidityResetPurgeTxn`) are PREFIX matches over the full
-/// `headerId` string, because neither sidecar carries a `folderId` column of its
-/// own — so they are paired with `MessageIdentity`'s no-deeper-colon guard, which
-/// EXCLUDES a colon-bearing tail rather than erroring.
+/// `(accountId, folderPath)` is purged, no FTS entry, `messageBody`, or
+/// `chatIdMapping` row owned by a header in that folder survives. FTS carries the
+/// authoritative relation in `message_meta.folderId`; the main database carries
+/// it in `messageHeader.folderId`. Neither purge needs to infer ownership from the
+/// composite header-id grammar.
 ///
 /// 🚨 THE DEFECT THIS PINS. `AccountManager.queueDraftSave` mints the optimistic
-/// header's `messageId` as `draft-<Draft.id>`, and for a reply/forward `Draft.id`
-/// is `Draft.draftKey`'s colon-joined composite `reply:<accountId>:<stableId>`
-/// (`ComposeView` builds `stableKey = "\(accountId):\(stableId)"`; on IMAP
-/// `MessageHeader.stableId` is the rfc822 Message-ID). Interpolated raw, the
-/// header id carried FOUR colons where the format allows exactly two, so BOTH
-/// guards silently skipped the row: the `messageHeader` row was deleted (that
-/// delete is by `folderId` column, colon-blind) while its FTS entry, chat-id
-/// mapping and body assets were left behind, orphaned, with nothing logged.
+/// header's escaped draft component is followed by the canonical
+/// `:<instanceEpoch>:<length>` suffix. That legitimate colon-bearing tail makes a
+/// prefix-plus-no-deeper-colon predicate skip the row: the `messageHeader` was
+/// deleted by `folderId` while its FTS entry, body, and chat mapping survived.
 ///
-/// ⚠ THE FIX IS AT THE MINT, AND THESE TESTS MUST FAIL IF IT EVER MOVES TO THE
-/// GUARDS. `nestedSiblingFolderSurvivesTheParentPurge` is that tripwire: under an
-/// IMAP server whose hierarchy delimiter is ':', `acct:Drafts:Sub:77` is a
-/// DIFFERENT folder's header that shares the `acct:Drafts:` prefix, and relaxing
-/// the no-deeper-colon guard to "fix" the draft orphan would sweep it into the
-/// parent's purge — the mirror image of the bug, and strictly worse than an
-/// orphan (an over-purge destroys another folder's state).
+/// The fix uses each database's exact folder relation, not a grammar exception.
+/// `nestedSiblingFolderSurvivesTheParentPurge` is the tripwire: under an IMAP
+/// server whose hierarchy delimiter is ':', `acct:Drafts:Sub:77` is a DIFFERENT
+/// folder's header that shares the `acct:Drafts:` prefix.
 @Suite("Reply-draft placeholders are purged with their folder", .serialized, .processGlobalState)
 struct DraftPlaceholderFolderPurgeTests {
 
@@ -52,8 +43,8 @@ struct DraftPlaceholderFolderPurgeTests {
     ///
     /// `accountId` is unique per test: `SearchIndex.shared` is a process-global
     /// FTS database shared with every other suite, and the folder purge under
-    /// test is a prefix sweep — a fixed account id would let concurrent suites'
-    /// rows fall inside this test's purge prefix (and vice versa).
+    /// test mutates that shared index — a fixed account id would let concurrent
+    /// suites' rows collide with this fixture (and vice versa).
     @MainActor
     private func makeTestDB(accountId: String) throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -88,13 +79,12 @@ struct DraftPlaceholderFolderPurgeTests {
         InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
     }
 
-    /// A fresh local draft: no `serverDraftId`, so `queueDraftSave` classifies it
-    /// APPEND-only and admits it (the epoch guard is never reached), and no
-    /// `rfc822MessageId`, so production generates one exactly as it does live.
+    /// A fresh local draft with the compose generation that production assigns
+    /// before `queueDraftSave` admits it. There is no server identity yet.
     @MainActor
     private func makeDraftRow(_ pool: DatabasePool, id: String, accountId: String) throws {
         let now = Date().timeIntervalSince1970
-        let draft = Draft(
+        var draft = Draft(
             id: id, accountId: accountId,
             toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
             subject: "Draft \(id.prefix(12))", body: "Zanzibarquixotic body text",
@@ -103,6 +93,7 @@ struct DraftPlaceholderFolderPurgeTests {
             serverDraftId: nil, serverPushStatus: nil,
             rfc822MessageId: nil, attachmentsDirName: nil
         )
+        draft.instanceEpoch = "E-\(UUID().uuidString)"
         try pool.writeWithoutTransaction { db in try draft.insert(db) }
     }
 
@@ -131,6 +122,12 @@ struct DraftPlaceholderFolderPurgeTests {
         } > 0
     }
 
+    private func messageBodyExists(_ pool: DatabasePool, contentKey: String) async throws -> Bool {
+        try await pool.read { db in
+            try MessageBody.fetchOne(db, key: ContentKey(rawValue: contentKey)) != nil
+        }
+    }
+
     private func insertChatMapping(_ pool: DatabasePool, numericId: Int, realId: String) throws {
         try pool.writeWithoutTransaction { db in
             try db.execute(
@@ -140,20 +137,23 @@ struct DraftPlaceholderFolderPurgeTests {
         }
     }
 
-    /// The header `queueDraftSave` actually minted for `draftId`, READ BACK from
-    /// GRDB rather than recomputed. Recomputing the id in the test would pin the
-    /// mint's spelling — the exact mechanism-pinning this suite must avoid.
+    /// The header `queueDraftSave` minted for this exact draft generation. The
+    /// canonical constructor is shared with production, as in v2final's
+    /// `QueueDraftSaveEpochBearingHeaderTests`; RFC identity is not authoritative.
     private func mintedDraftHeader(
         _ pool: DatabasePool, accountId: String, draftId: String
     ) async throws -> MessageHeader? {
-        let rfc822 = try await pool.read { db in
-            try Draft.fetchOne(db, key: draftId)?.rfc822MessageId
+        let instanceEpoch = try await pool.read { db in
+            try Draft.fetchOne(db, key: draftId)?.instanceEpoch
         }
-        guard let rfc822 else { return nil }
+        guard let instanceEpoch, !instanceEpoch.isEmpty else { return nil }
+        let headerId = PendingOperation.draftPlaceholderHeaderPK(
+            accountId: accountId,
+            draftsFolderPath: Self.draftsPath,
+            draftId: draftId,
+            instanceEpoch: instanceEpoch)
         return try await pool.read { db in
-            try MessageHeader
-                .filter(Column("accountId") == accountId && Column("rfc822MessageId") == rfc822)
-                .fetchOne(db)
+            try MessageHeader.fetchOne(db, key: headerId)
         }
     }
 
@@ -188,13 +188,22 @@ struct DraftPlaceholderFolderPurgeTests {
 
         // Mint both optimistic headers through PRODUCTION code — header, body,
         // PendingOperation and FTS entry all come from `queueDraftSave` itself.
-        await AccountManager.shared.queueDraftSave(draftId: replyDraftId, accountId: accountId)
-        await AccountManager.shared.queueDraftSave(draftId: plainDraftId, accountId: accountId)
+        let replyAccepted = await AccountManager.shared.queueDraftSave(
+            draftId: replyDraftId, accountId: accountId)
+        let plainAccepted = await AccountManager.shared.queueDraftSave(
+            draftId: plainDraftId, accountId: accountId)
+        try #require(replyAccepted, "the reply draft save must be admitted")
+        try #require(plainAccepted, "the new-compose draft save must be admitted")
 
         let replyHeader = try await mintedDraftHeader(pool, accountId: accountId, draftId: replyDraftId)
         let plainHeader = try await mintedDraftHeader(pool, accountId: accountId, draftId: plainDraftId)
         let replyHeaderId = try #require(replyHeader?.id, "the reply draft's optimistic header must exist")
         let plainHeaderId = try #require(plainHeader?.id, "the new-compose draft's optimistic header must exist")
+        let draftsPrefix = MessageIdentity.headerIdPrefix(
+            accountId: accountId, folderPath: Self.draftsPath)
+        try #require(replyHeaderId.hasPrefix(draftsPrefix))
+        #expect(replyHeaderId.dropFirst(draftsPrefix.count).contains(":"),
+                "reachability: the canonical epoch-bearing placeholder tail must contain a colon")
 
         // 3. OVER-REFUSAL CONTROL B — an ordinary synced message in the same
         //    folder (numeric IMAP UID, colon-free by construction).
@@ -233,6 +242,8 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(try await chatMappingExists(pool, realId: replyHeaderId))
         #expect(try await chatMappingExists(pool, realId: plainHeaderId))
         #expect(try await chatMappingExists(pool, realId: siblingHeaderId))
+        #expect(try await messageBodyExists(pool, contentKey: replyHeaderId),
+                "precondition: the reply draft body must exist")
 
         let scopedBefore = try await SearchIndex.shared.keywordSearch(
             query: "zanzibarquixotic",
@@ -253,12 +264,14 @@ struct DraftPlaceholderFolderPurgeTests {
         // ---- POST-PURGE END STATE.
 
         // THE DEFECT. Pre-fix the reply draft's `messageHeader` row was deleted
-        // (that delete is by `folderId` column) while these two survived — an
+        // (that delete is by `folderId` column) while these three survived — an
         // orphan with no owning row, and nothing logged.
         #expect(try await isInFTS(replyHeaderId) == false,
                 "a reply draft's FTS entry must not survive its folder's purge")
         #expect(try await chatMappingExists(pool, realId: replyHeaderId) == false,
                 "a reply draft's chat mapping must not survive its folder's purge")
+        #expect(try await messageBodyExists(pool, contentKey: replyHeaderId) == false,
+                "a reply draft's body must not survive its folder's purge")
 
         // OVER-REFUSAL CONTROLS — the purge still purges what it always did.
         #expect(try await isInFTS(plainHeaderId) == false,
@@ -293,12 +306,40 @@ struct DraftPlaceholderFolderPurgeTests {
             accountId: accountId, folderPath: Self.draftsPath, messageId: "10")
         let childHeaderId = MessageIdentity.headerId(
             accountId: accountId, folderPath: Self.siblingPath, messageId: "20")
+        let parentFolderId = MessageIdentity.folderId(
+            accountId: accountId, folderPath: Self.draftsPath)
+        let childFolderId = MessageIdentity.folderId(
+            accountId: accountId, folderPath: Self.siblingPath)
+
+        // PORT adaptation of the reference purge fixture's real ownership shape:
+        // sidecars belong to MessageHeader rows in the exact parent/child folder.
+        // SUBTRACT the former headerless-orphan expectation; C6 does not require
+        // relational deletion to repair manufactured legacy orphans.
+        try await pool.writeWithoutTransaction { db in
+            for (messageId, folderPath, folderId, headerId) in [
+                ("10", Self.draftsPath, parentFolderId, parentHeaderId),
+                ("20", Self.siblingPath, childFolderId, childHeaderId),
+            ] {
+                var header = MessageHeader(
+                    messageId: messageId, subject: "nested purge control",
+                    from: "Sender", fromAddress: "sender@example.com",
+                    to: "recipient@example.com", date: Date(), snippet: "control",
+                    folderId: folderId, accountId: accountId,
+                    folderPath: folderPath, isInInbox: false)
+                header.headerComplete = true
+                try header.insert(db)
+                let body = MessageBody.create(
+                    contentKey: ContentKey(rawValue: headerId),
+                    htmlBody: "<p>nested purge control</p>")
+                try body.insert(db)
+            }
+        }
         try await indexFTS(
             headerId: parentHeaderId, messageId: "10",
-            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: Self.draftsPath))
+            folderId: parentFolderId)
         try await indexFTS(
             headerId: childHeaderId, messageId: "20",
-            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: Self.siblingPath))
+            folderId: childFolderId)
         defer {
             let ids = [parentHeaderId, childHeaderId]
             Task.detached { try? await SearchIndex.shared.removeMessages(contentKeys: ids.map(ContentKey.init(rawValue:))) }
@@ -308,6 +349,8 @@ struct DraftPlaceholderFolderPurgeTests {
 
         #expect(try await isInFTS(parentHeaderId))
         #expect(try await isInFTS(childHeaderId))
+        #expect(try await messageBodyExists(pool, contentKey: parentHeaderId))
+        #expect(try await messageBodyExists(pool, contentKey: childHeaderId))
 
         try await SearchIndex.shared.removeMessagesForFolder(
             accountId: accountId, folderPath: Self.draftsPath)
@@ -319,6 +362,9 @@ struct DraftPlaceholderFolderPurgeTests {
                 "the purged folder's own row must go")
         #expect(try await isInFTS(childHeaderId),
                 "a ':'-delimited CHILD folder's FTS entry must NOT be swept by its parent's purge")
+        #expect(try await messageBodyExists(pool, contentKey: parentHeaderId) == false)
+        #expect(try await messageBodyExists(pool, contentKey: childHeaderId),
+                "a ':'-delimited CHILD folder's body must NOT be swept by its parent's purge")
         #expect(try await chatMappingExists(pool, realId: parentHeaderId) == false)
         #expect(try await chatMappingExists(pool, realId: childHeaderId),
                 "a ':'-delimited CHILD folder's chat mapping must NOT be swept by its parent's purge")

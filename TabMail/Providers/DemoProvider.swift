@@ -180,9 +180,19 @@ actor DemoProvider: EmailProvider {
         true
     }
 
-    func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult {
-        // `previousRfc822MessageId` is IMAP-only. Demo replaces the local row by
-        // `existingDraftId`, so it IGNORES this parameter (behavior unchanged).
+    func saveDraft(
+        _ draft: DraftMessage,
+        existingIdentity: DraftDeleteIdentity?,
+        draftsFolderPath: String
+    ) async throws -> DraftSaveOutcome {
+        let existingDraftId: String?
+        switch existingIdentity {
+        case .demo(let localId): existingDraftId = localId
+        case nil: existingDraftId = nil
+        default:
+            throw ProviderError.actionIdentityResolutionFailed(
+                "DemoProvider received a non-Demo prior draft identity")
+        }
         guard let db = AppDatabase.shared.withLock({ $0 }) else {
             throw DemoError.notInDemo
         }
@@ -211,17 +221,19 @@ actor DemoProvider: EmailProvider {
             try header.insert(conn)
             try MessageBody(contentKey: ContentKey(rawValue: header.id), htmlContent: draft.body).insert(conn)
         }
-        return DraftSaveResult(serverId: serverId, messageId: nil)
+        return .created(.demo(localId: serverId))
     }
 
-    /// `rfc822MessageId` / `uidValidity` are IMAP's epoch-safety pair; the demo store is
-    /// keyed by local id and has no numbering to corroborate against.
-    func deleteDraft(
-        draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String
-    ) async throws {
+    func deleteDraft(identity: DraftDeleteIdentity) async throws {
+        guard case .demo(let draftId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed("DemoProvider received a non-Demo draft identity")
+        }
         guard let db = AppDatabase.shared.withLock({ $0 }) else { return }
         try await db.dbPool.write { conn in
-            let headerId = MessageIdentity.headerId(accountId: self.accountId, folderPath: draftsFolderPath, messageId: draftId)
+            guard let drafts = try Folder
+                .filter(Column("accountId") == self.accountId && Column("role") == FolderRole.drafts.rawValue)
+                .fetchOne(conn) else { return }
+            let headerId = MessageIdentity.headerId(accountId: self.accountId, folderPath: drafts.path, messageId: draftId)
             try MessageHeader.filter(Column("id") == headerId).deleteAll(conn)
             try MessageBody.filter(Column("id") == headerId).deleteAll(conn)
         }

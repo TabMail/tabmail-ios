@@ -545,15 +545,17 @@ struct StatefulGmailActionServerTests {
     // ⚑ NO REFERENCE — INVENTED. Scope marker for the whole section below: the
     // THREE tests that follow (`deleteDraftAndFetchHistoryUseTheInjectedSession`,
     // `deleteDraftRetriesTheDraftDeleteOnTheInjectedSessionAfter401`,
-    // `deleteDraftTrashFallbackAndItsRetryUseTheInjectedSession`) have NO
+    // `deleteDraftContainedMessageAndItsRetryUseTheInjectedSession`) have NO
     // counterpart in `v2final`. Verified: the reference's
     // `StatefulGmailActionServerTests` declares exactly seven tests
     // (`userLabelCatalogAuthority`, `createdUserLabelIsImmediatelyKnown`,
     // `overlappingUserLabelCatalogsKeepNewestKnowledge`, `actionFinalState`,
     // `undoArchiveResolvesSentLabeledSelfSentMessage`, `staleAmbiguousAndTransient`,
     // `ordinaryFolderListings`) and none of them is a session-escape detector.
-    // The reference had no need for one — it never dropped `session:` in the
-    // first place; these exist because `v3` did, and they are what keeps the
+    // The reference's exact `trashContainedDraftMessage` passes `session:` on
+    // both requests; its old resource-404 fallback did not, but that namespace
+    // reinterpretation is SUBTRACTED here. These tests exist because `v3` also
+    // dropped session injection from reachable request legs, and keep that
     // regression from returning silently. The `FakeHTTP.ResponseScript` they
     // are built on is likewise invented (see its own marker).
 
@@ -581,7 +583,7 @@ struct StatefulGmailActionServerTests {
     /// first `/drafts/{id}` DELETE returning 2xx and returning immediately —
     /// plus `fetchHistory`'s `AuthedHTTP` construction. It does NOT pin
     /// `deleteDraft`'s other three request sites, and it structurally cannot:
-    /// a 204 here returns before the 401-retry and the trash fallback are ever
+    /// a 204 here returns before the resource 401 retry or contained-message path is
     /// reached. Worse, this shape cannot even pin the FIRST DELETE on its own —
     /// if that line alone escaped, the live 401 would send control into the
     /// 401-retry, whose request hits the fake with the same method and path and
@@ -592,8 +594,8 @@ struct StatefulGmailActionServerTests {
     /// request observable:
     /// `deleteDraftRetriesTheDraftDeleteOnTheInjectedSessionAfter401` pins the
     /// initial DELETE and its 401 retry;
-    /// `deleteDraftTrashFallbackAndItsRetryUseTheInjectedSession` pins the
-    /// trash fallback and the trash 401 retry. Between the three tests all five
+    /// `deleteDraftContainedMessageAndItsRetryUseTheInjectedSession` pins the
+    /// contained-message POST and its 401 retry. Between the three tests all five
     /// changed Gmail lines have a leg that goes red when that one line loses
     /// its `session:`.
     @Test("GmailProvider.deleteDraft's 2xx path and .fetchHistory route through the injected session")
@@ -617,7 +619,7 @@ struct StatefulGmailActionServerTests {
             response: .json(raw: #"{"historyId":"424242","history":[{"messagesAdded":[{"message":{"id":"gmail-history-added-1","labelIds":["INBOX"]}}]}]}"#)
         )
 
-        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(identity: .gmail(resourceId: providerMessageId))
 
         let history = try await provider.fetchHistory(since: "424241")
         #expect(history != nil, "fetchHistory returned nil — the canned delta never arrived, so the request did not reach the fake")
@@ -674,7 +676,7 @@ struct StatefulGmailActionServerTests {
             .status(draftDelete.next())
         }
 
-        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(identity: .gmail(resourceId: providerMessageId))
 
         #expect(
             draftDelete.served == [401, 204],
@@ -689,13 +691,12 @@ struct StatefulGmailActionServerTests {
         )
     }
 
-    /// Pins `deleteDraft`'s trash fallback and the trash 401 retry — the
+    /// Pins the typed contained-MESSAGE delete and its 401 retry — the
     /// `performHTTPRequestWithRetry` on `/messages/{id}/trash` and the
     /// `performHTTPRequest` that follows its `accessToken(true)`.
     ///
-    /// A 404 on the draft resource is the real trigger for this fallback (the
-    /// id may name a message rather than a draft), so the script answers the
-    /// DELETE with 404 and then scripts the trash POST 401-then-200. Both trash
+    /// The address is explicitly in the contained-message namespace, so no
+    /// resource DELETE or cross-namespace 404 fallback is involved. Both trash
     /// requests must reach the fake or `deleteDraft` throws:
     ///
     /// * trash POST escapes → live Gmail's 401 → the retry takes the script's
@@ -705,8 +706,8 @@ struct StatefulGmailActionServerTests {
     /// The fixture models `/messages/` POST as the `/modify` route, so the
     /// trash registration uses the full `"/messages/{id}/trash"` prefix — the
     /// longest matching prefix wins, which keeps this off the modify handler.
-    @Test("deleteDraft's trash fallback and its 401 retry both route through the injected session")
-    func deleteDraftTrashFallbackAndItsRetryUseTheInjectedSession() async throws {
+    @Test("deleteDraft's contained-message request and 401 retry both route through the injected session")
+    func deleteDraftContainedMessageAndItsRetryUseTheInjectedSession() async throws {
         let providerMessageId = "gmail-session-escape-trash-1"
         let server = StatefulGmailActionServer(messages: [.init(
             rfc822MessageId: "gmail-session-escape-trash@example.com",
@@ -716,29 +717,21 @@ struct StatefulGmailActionServerTests {
         defer { server.close() }
         let provider = server.provider()
 
-        let draftDelete = FakeHTTP.ResponseScript([404])
-        server.http.register(path: "/drafts/\(providerMessageId)", method: "DELETE") { _ in
-            .status(draftDelete.next())
-        }
         let trash = FakeHTTP.ResponseScript([401, 200])
         server.http.register(path: "/messages/\(providerMessageId)/trash", method: "POST") { _ in
             let status = trash.next()
             return status == 200 ? .json(raw: "{}") : .status(status)
         }
 
-        try await provider.deleteDraft(draftId: providerMessageId, rfc822MessageId: nil, uidValidity: nil, draftsFolderPath: "Drafts")
+        try await provider.deleteDraft(
+            identity: .gmailContainedMessage(messageId: providerMessageId))
 
-        #expect(
-            draftDelete.served == [404],
-            "the draft DELETE must have been served exactly once: \(draftDelete.served)"
-        )
         #expect(
             trash.served == [401, 200],
             "both canned trash responses must have been served — a missing one means that POST escaped to the live Gmail endpoint: \(trash.served)"
         )
         #expect(
             server.http.servedCallSequence() == [
-                "DELETE /gmail/v1/users/me/drafts/\(providerMessageId)",
                 "POST /gmail/v1/users/me/messages/\(providerMessageId)/trash",
                 "POST /gmail/v1/users/me/messages/\(providerMessageId)/trash",
             ],

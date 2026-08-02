@@ -10,40 +10,115 @@ import GRDB
 actor DraftStore {
     static let shared = DraftStore()
 
+    enum SaveResult: Sendable, Equatable {
+        case applied
+        case notApplied
+    }
+
+    enum PushDisposition: Sendable, Equatable {
+        case completed
+        /// The provider threw after Stage A, so the attempt may have landed.
+        /// The producer is deliberately retired once; sync reconciles.
+        case terminalUnconfirmed
+        /// A replacement/edit won the exact Stage A/B CAS. This producer is stale.
+        case notApplied
+    }
+
+    enum DraftEpochAdmissionError: Error, LocalizedError {
+        case staleOrReserved
+
+        var errorDescription: String? {
+            "This draft was changed by another compose session and can't be saved from here."
+        }
+    }
+
     // MARK: - Save
 
-    /// Save or update a draft. Creates if not exists, updates if exists.
-    /// Marks serverPushStatus as "dirty" if the draft was previously pushed.
-    ///
-    /// Nonisolated: the body doesn't touch any actor-local state (DraftStore
-    /// itself is a stateless namespace). This lets sync call sites like
-    /// ComposeView.send() persist the draft without an async hop, while
-    /// existing `await DraftStore.shared.save(...)` call sites keep working
-    /// (await on a nonisolated throwing func is a no-op).
-    nonisolated func save(_ draft: Draft) throws {
-        try AppDatabase.dbPool.write { db in try Self.applySave(draft, db: db) }
-        print("[DraftStore] Saved draft id=\(draft.id)")
-    }
-
-    /// Async sibling of `save` — routes through the ASYNC `dbPool.write` overload
-    /// so a `@MainActor` caller (ComposeView.send / saveDraftAndDismiss) is
-    /// suspended, not blocked, while the single serialized writer is busy. Same
-    /// transaction body as `save` (shared via `applySave`). See the compose-dismiss
-    /// freeze note in PROJECT_MEMORY ("Foreground-return UI freeze").
-    nonisolated func saveAsync(_ draft: Draft) async throws {
-        try await AppDatabase.dbPool.write { db in try Self.applySave(draft, db: db) }
-        print("[DraftStore] Saved draft (async) id=\(draft.id)")
-    }
-
-    /// The save transaction body, shared by the sync + async overloads so they
-    /// can never drift. Marks the draft dirty if it was previously pushed.
-    private static func applySave(_ draft: Draft, db: Database) throws {
-        var d = draft
-        // Mark dirty if previously pushed (needs re-push to server)
-        if d.serverPushStatus == "pushed" {
-            d.serverPushStatus = "dirty"
+    /// PORT — v2final observed-predecessor generation CAS (3f2cc4c34).
+    @discardableResult
+    static func admitSave(
+        _ draft: Draft,
+        newEpoch: String,
+        expectedPredecessor: String?,
+        db: Database
+    ) throws -> SaveResult {
+        let observed = try Draft.fetchOne(db, key: draft.id)
+        guard let observed else {
+            guard expectedPredecessor == nil else {
+                throw DraftEpochAdmissionError.staleOrReserved
+            }
+            var inserted = draft
+            inserted.instanceEpoch = newEpoch
+            return try applySave(inserted, db: db)
         }
-        try d.save(db)
+        if observed.instanceEpoch != newEpoch {
+            guard observed.instanceEpoch == expectedPredecessor else {
+                throw DraftEpochAdmissionError.staleOrReserved
+            }
+        }
+        var admitted = draft
+        admitted.instanceEpoch = newEpoch
+        let result = try applySave(admitted, db: db)
+        if result == .applied {
+            try db.execute(
+                sql: "UPDATE draft SET instanceEpoch = ? WHERE id = ?",
+                arguments: [newEpoch, draft.id])
+        }
+        return result
+    }
+
+    @discardableResult
+    nonisolated func save(
+        _ draft: Draft,
+        epoch newEpoch: String,
+        expectedPredecessor: String?
+    ) throws -> SaveResult {
+        try AppDatabase.dbPool.write {
+            try Self.admitSave(
+                draft, newEpoch: newEpoch,
+                expectedPredecessor: expectedPredecessor, db: $0)
+        }
+    }
+
+    @discardableResult
+    nonisolated func saveAsync(
+        _ draft: Draft,
+        epoch newEpoch: String,
+        expectedPredecessor: String?
+    ) async throws -> SaveResult {
+        try await AppDatabase.dbPool.write {
+            try Self.admitSave(
+                draft, newEpoch: newEpoch,
+                expectedPredecessor: expectedPredecessor, db: $0)
+        }
+    }
+
+    /// PORT — merge authored fields only and bump the Stage A/B conflict version.
+    @discardableResult
+    static func applySave(_ draft: Draft, db: Database) throws -> SaveResult {
+        guard let current = try Draft.fetchOne(db, key: draft.id) else {
+            var inserted = draft
+            if inserted.serverPushStatus == "pushed" { inserted.serverPushStatus = "dirty" }
+            try inserted.insert(db)
+            return .applied
+        }
+        guard draft.updatedAt >= current.updatedAt else { return .notApplied }
+        var merged = current
+        merged.toJSON = draft.toJSON
+        merged.ccJSON = draft.ccJSON
+        merged.bccJSON = draft.bccJSON
+        merged.subject = draft.subject
+        merged.body = draft.body
+        merged.editHistoryJSON = draft.editHistoryJSON
+        merged.updatedAt = draft.updatedAt
+        merged.attachmentsDirName = draft.attachmentsDirName
+        merged.pushAttemptVersion = current.pushAttemptVersion + 1
+        if current.serverPushStatus == "pushed" || current.serverPushStatus == "pushing"
+            || current.serverPushStatus == "unconfirmed" {
+            merged.serverPushStatus = "dirty"
+        }
+        try merged.update(db)
+        return .applied
     }
 
     // MARK: - Load
@@ -61,31 +136,41 @@ actor DraftStore {
 
     /// Delete a draft and its associated chat turns.
     /// Nonisolated: same rationale as `save` and `load`.
-    nonisolated func delete(id: String) throws {
-        try AppDatabase.dbPool.write { db in try Self.applyDelete(id: id, db: db) }
-        // Also clean up attachments on disk if any were saved under draftId.
-        DraftAttachmentStorage.deleteAttachments(dirName: id)
-        print("[DraftStore] Deleted draft + turns for id=\(id)")
-    }
-
-    /// Async sibling of `delete` — routes through the ASYNC `dbPool.write` overload
-    /// so a `@MainActor` caller (ComposeView discard/close) is suspended, not
-    /// blocked, while the single serialized writer is busy. Same transaction body
-    /// as `delete` (shared via `applyDelete`).
-    nonisolated func deleteAsync(id: String) async throws {
-        try await AppDatabase.dbPool.write { db in try Self.applyDelete(id: id, db: db) }
-        DraftAttachmentStorage.deleteAttachments(dirName: id)
-        print("[DraftStore] Deleted draft + turns (async) for id=\(id)")
+    /// PORT — generation-owned delete. A stale compose instance cannot erase a
+    /// successor that has taken the same logical draft key.
+    @discardableResult
+    nonisolated func deleteAsync(
+        id: String,
+        expectedInstanceEpoch: String
+    ) async throws -> Bool {
+        let deleted = try await AppDatabase.dbPool.write { db -> Bool in
+            guard let current = try Draft.fetchOne(db, key: id),
+                  current.instanceEpoch == expectedInstanceEpoch else {
+                return false
+            }
+            try Self.applyDelete(
+                id: id, expectedInstanceEpoch: expectedInstanceEpoch, db: db)
+            return true
+        }
+        if deleted {
+            DraftAttachmentStorage.deleteAttachments(dirName: id)
+            print("[DraftStore] Deleted owned draft + turns (async) for id=\(id)")
+        }
+        return deleted
     }
 
     /// The delete transaction body, shared by the sync + async overloads.
-    private static func applyDelete(id: String, db: Database) throws {
+    static func applyDelete(
+        id: String,
+        expectedInstanceEpoch: String,
+        db: Database
+    ) throws {
+        guard let current = try Draft.fetchOne(db, key: id),
+              current.instanceEpoch == expectedInstanceEpoch else {
+            throw DraftEpochAdmissionError.staleOrReserved
+        }
         // Delete the draft record
         _ = try Draft.deleteOne(db, key: id)
-        // Delete associated chat turns (sessionId = "compose:{draftKey}", or
-        // "demo:compose:{draftKey}" when the draft was edited in demo mode).
-        // Both variants are targeted unconditionally so the delete is correct
-        // regardless of the current demo state.
         let sessionIds = ["compose:\(id)", "demo:compose:\(id)"]
         _ = try ChatTurn.filter(sessionIds.contains(Column("sessionId"))).deleteAll(db)
     }
@@ -118,282 +203,304 @@ actor DraftStore {
     /// Push a local draft to the server's Drafts folder.
     /// Builds a DraftMessage from the local Draft, calls provider.saveDraft(),
     /// and stores the returned server draft ID.
-    func pushDraftToServer(draftId: String, provider: any EmailProvider, draftsFolderPath: String) async throws {
-        guard var draft = try load(id: draftId) else {
-            print("[DraftStore] pushDraftToServer: draft \(draftId) not found — skipping")
-            return
-        }
-        guard draft.serverPushStatus == nil || draft.serverPushStatus == "dirty" else {
-            print("[DraftStore] pushDraftToServer: skipping \(draftId) — serverPushStatus=\(draft.serverPushStatus ?? "nil") (must be nil or 'dirty')")
-            return
-        }
-
-        // T1.3 — RE-CLASSIFY AT EXECUTION TIME, from the value actually about to be
-        // sent. `AccountManager.queueDraftSave` classifies the same three cases at
-        // ENQUEUE time (nil ⇒ pure APPEND, non-numeric ⇒ Message-ID SEARCH, numeric ⇒
-        // literal-UID STORE+EXPUNGE) and only guards the numeric one, which is right
-        // for the op it is admitting and WRONG for the op that eventually runs:
-        // `PendingOperation` has a UUID primary key and no save-draft dedupe, so two
-        // saves can both be admitted while `serverDraftId` is still nil, the first
-        // APPENDs and stores the returned numeric UID, and the second — already
-        // admitted — reaches this function, reloads the LIVE row, and hands that
-        // numeric id to `IMAPProvider.saveDraft`'s `existingDraftId` branch:
-        // `store(flags: [.deleted])` + `expunge()` on a literal UID, both
-        // `try?`-swallowed. Under an unknown epoch that deletes whatever occupies the
-        // reused UID — constraint C3, the one hard invariant.
-        //
-        // The check is exact rather than another TOCTOU because it is made against
-        // `draft.serverDraftId` — the SAME value passed as `existingDraftId` below,
-        // from the same snapshot. Refusing an already-admitted op HERE is the
-        // sanctioned trade (C5: dropping at an id-reset boundary is correct): the
-        // local `Draft` row keeps every byte of the user's content, so nothing of the
-        // user's is lost — only the SERVER copy stays stale until the epoch is known
-        // and the next save runs.
-        if let existingId = draft.serverDraftId, UInt32(existingId) != nil {
-            // Copied out of the `var draft` before the closure: capturing the mutable
-            // binding itself is a data race the compiler rejects.
-            let guardedAccountId = draft.accountId
-            let refused = try await AppDatabase.dbPool.read { db in
-                try AccountManager.newGestureRefusedForUnknownEpoch(
-                    accountId: guardedAccountId, folderPath: draftsFolderPath, db: db)
-            }
-            if refused {
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[DraftStore] pushDraftToServer: refusing \(draftId) — UID-addressed save into '\(draftsFolderPath)' with no known epoch (T1.3, re-checked at execution)")
-                }
-                return
-            }
-        }
-
-        if DebugModeManager.isLoggingEnabled() { print("[DraftStore] pushDraftToServer: BEGIN id=\(draftId) status=\(draft.serverPushStatus ?? "nil") serverDraftId=\(draft.serverDraftId ?? "nil") subjectPrefix=\(String(draft.subject.prefix(60))) bodyPrefix=\(String(draft.body.prefix(80)))") }
-
-        // Generate a FRESH Message-ID on every push.
-        //
-        // WHY: Gmail treats same-Message-ID as duplicate. Quoting Google's docs
-        // (https://developers.google.com/workspace/gmail/api/guides/drafts):
-        //   "Because messages cannot be updated, the message contained in the
-        //    draft is destroyed and replaced by the new MIME message supplied
-        //    in the update request."
-        // Each update should mint a new message.id on Gmail's side. If we
-        // send the same Message-ID header repeatedly, Gmail dedupes — keeps
-        // the old message, returns the same message.id, and the update is a
-        // no-op (confirmed via the "messageId=... unchanged across saves"
-        // pattern in logmain.log + responseSnippet showing old content).
-        //
-        // A fresh Message-ID every push is safe for all providers:
-        //  - IMAP saveDraft APPENDs and finds the new UID via Message-ID
-        //    search — any unique Message-ID works.
-        //  - Our sync-dedup (rfc822-based) keys off the current
-        //    Draft.rfc822MessageId, which we persist below after the push.
-        //    The post-push migration uses the OLD rfc822 (captured here as
-        //    `previousRfc822`) to locate local MessageHeaders that still
-        //    carry the prior Message-ID, then rewrites both their PK and
-        //    rfc822 to the new values.
-        let domain = draft.accountId.contains("@") ? String(draft.accountId.split(separator: "@").last ?? "tabmail.local") : "tabmail.local"
-        let previousRfc822 = draft.rfc822MessageId
-        let freshRfc822 = "draft-\(UUID().uuidString)@\(domain)"
-        draft.rfc822MessageId = freshRfc822
-        print("[DraftStore] pushDraftToServer: rotating Message-ID \(previousRfc822 ?? "nil") → \(freshRfc822)")
-
-        // Build DraftMessage from local Draft state.
-        // Draft body is plain text (from TextEditor) — convert to HTML for IMAP storage.
-        // HTML is the standard format for email drafts and what other clients expect.
-        let htmlBody = MessageBody.plainTextToHTML(draft.body)
-        var draftMessage = DraftMessage(
-            to: draft.toArray,
-            cc: draft.ccArray,
-            bcc: draft.bccArray,
-            subject: draft.subject,
-            body: htmlBody,
-            isHTML: true,
-            inReplyTo: nil,
-            attachments: []
-        )
-        draftMessage.messageId = draft.rfc822MessageId
-
-        // Load attachments from disk if present
-        if let dirName = draft.attachmentsDirName {
-            let attachments = DraftAttachmentStorage.loadAttachments(dirName: dirName)
-            draftMessage.attachments = attachments
-        }
-
-        // Push to server.
-        //
-        // `previousRfc822MessageId:` is `previousRfc822` — the id captured ABOVE, before
-        // the rotation two lines later — and NOT `draft.rfc822MessageId`, which by this
-        // point IS `freshRfc822`. The old server copy carries the PREVIOUS id; the fresh
-        // one is the identity about to be APPENDed and no server message holds it yet.
-        // Passing the fresh id would make IMAP's old-copy delete verify against a value
-        // nothing can match — silently disabling the guard and orphaning a stale copy per
-        // re-push. nil (first push) is correct and means "no old copy to delete".
-        let result = try await provider.saveDraft(
-            draftMessage,
-            existingDraftId: draft.serverDraftId,
-            previousRfc822MessageId: previousRfc822,
-            draftsFolderPath: draftsFolderPath)
-
-        // Update ONLY the server-sync columns — NOT user content (subject/body/editHistory).
-        // The user may have edited the draft during the network await. A full save() would
-        // overwrite those edits with the stale snapshot captured before the push.
-        let rfc822 = draft.rfc822MessageId
-        let draftIdForUpdate = draft.id
-        let accountId = draft.accountId
-        // FTS ops collected inside the write, applied after commit (SearchIndex is
-        // a separate actor/DB). A draft placeholder header's id is folder+messageId
-        // based; migrating it to the server id re-keys the GRDB row, so FTS must
-        // follow or the entry orphans. (No-ops harmlessly if the draft was never indexed.)
-        let draftFtsOps: (removals: [String], rekeys: [(oldId: String, newId: String, newMessageId: String?)])
-        draftFtsOps = try await AppDatabase.dbPool.write { db in
-            var draftFtsRemovals: [String] = []
-            var draftFtsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
-            // `serverDraftUidValidity` is written in the SAME statement as
-            // `serverDraftId`, because it is not a separate fact — it is the numbering
-            // that address is scoped to, and the two are only meaningful together. It
-            // is also written UNCONDITIONALLY (including to nil): a re-push mints a new
-            // UID under whatever epoch this save observed, so carrying the previous
-            // save's epoch forward would pair a fresh address with a stale numbering,
-            // which is the exact shape that makes the delete path's equality check pass
-            // vacuously.
-            try db.execute(
-                sql: """
-                    UPDATE draft SET serverDraftId = ?, serverPushStatus = ?, rfc822MessageId = ?,
-                                     serverDraftUidValidity = ?
-                    WHERE id = ?
-                    """,
-                arguments: [result.serverId, "pushed", rfc822, result.uidValidity, draftIdForUpdate]
-            )
-
-            // If the server returned a real messageId (Gmail/IMAP: message.id
-            // may differ from the draft resource id), migrate any local
-            // MessageHeader pointing at this draft to the new messageId-based
-            // PK so sync's stale-check doesn't delete it as "onlyLocal".
-            //
-            // Strategy: match by PREVIOUS rfc822MessageId (what local headers
-            // still carry). We just rotated Draft.rfc822MessageId above to a
-            // fresh value for the push; local headers still have the OLD
-            // rfc822 until this migration rewrites it. Update BOTH the PK
-            // (to new messageId) and the rfc822 (to fresh) on migrated
-            // headers so subsequent queueDraftSave rfc822 lookups resolve to
-            // the right row.
-            //
-            // Covers all cases:
-            //   - optimistic placeholder (messageId = "draft-<uuid>",
-            //     rfc822 = previousRfc822)
-            //   - server-synced header from a previous push (messageId =
-            //     previous Gmail message.id / IMAP UID, rfc822 = previousRfc822)
-            if let realMessageId = result.messageId {
-                let folderId = "\(accountId):\(draftsFolderPath)"
-                let newHeaderId = "\(accountId):\(draftsFolderPath):\(realMessageId)"
-
-                // Collect candidate local headers to migrate. Prioritize
-                // match-by-previousRfc822 (precise). If previousRfc822 is nil
-                // (first push for a brand-new draft), fall back to match-by-
-                // current-Draft-rfc822 (the fresh one, which matches the
-                // placeholder queueDraftSave just created).
-                var headers: [MessageHeader] = []
-                if let prev = previousRfc822, !prev.isEmpty {
-                    headers = try MessageHeader
-                        .filter(Column("folderId") == folderId && Column("rfc822MessageId") == prev)
-                        .fetchAll(db)
-                }
-                if headers.isEmpty {
-                    headers = try MessageHeader
-                        .filter(Column("folderId") == folderId && Column("rfc822MessageId") == freshRfc822)
-                        .fetchAll(db)
-                }
-                print("[DraftStore] pushDraftToServer migration: found \(headers.count) header(s) matching rfc822=\(previousRfc822 ?? freshRfc822) in folder \(draftsFolderPath). Target messageId=\(realMessageId), new rfc822=\(freshRfc822)")
-
-                for header in headers {
-                    guard header.id != newHeaderId else {
-                        // Already at target PK — just refresh rfc822 to the new one.
-                        var same = header
-                        same.rfc822MessageId = freshRfc822
-                        try same.update(db)
-                        print("[DraftStore] Migration: header \(header.id) already at target PK — refreshed rfc822 to \(freshRfc822)")
-                        continue
-                    }
-
-                    // If a header at the target PK already exists (sync raced
-                    // ahead and inserted the new server row from Gmail's
-                    // drafts.list BEFORE our push completed), MERGE:
-                    //   - keep target's PK / messageId (matches server)
-                    //   - overwrite content from our row (user's fresh save
-                    //     always wins; Gmail's drafts.list snippet can lag)
-                    //   - overwrite rfc822 with freshRfc822 so the row reflects
-                    //     the Message-ID we just sent (subsequent syncs and
-                    //     local queueDraftSave will find it via the fresh id).
-                    if let existingTarget = try MessageHeader.fetchOne(db, key: newHeaderId) {
-                        var merged = existingTarget
-                        merged.subject = header.subject
-                        merged.to = header.to
-                        merged.cc = header.cc
-                        merged.bcc = header.bcc
-                        merged.snippet = header.snippet
-                        merged.date = header.date
-                        merged.rfc822MessageId = freshRfc822
-                        try merged.update(db)
-
-                        // Body too: user's fresh body wins over sync's lagged copy.
-                        if let freshBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: header.id)) {
-                            _ = try? MessageBody.deleteOne(db, key: ContentKey(rawValue: newHeaderId))
-                            var newBody = freshBody
-                            newBody.id = ContentKey(rawValue: newHeaderId)
-                            try newBody.insert(db)
-                        }
-                        _ = try? MessageBody.deleteOne(db, key: ContentKey(rawValue: header.id))
-                        draftFtsRemovals.append(header.id)
-                        try header.delete(db)
-                        if DebugModeManager.isLoggingEnabled() { print("[DraftStore] Migration: MERGED fresh content from \(header.id) onto existing \(newHeaderId) (snippet=\(String(header.snippet.prefix(60))))") }
-                        continue
-                    }
-
-                    draftFtsRekeys.append((oldId: header.id, newId: newHeaderId, newMessageId: realMessageId))
-                    try header.delete(db)
-                    var migrated = header
-                    migrated.id = newHeaderId
-                    migrated.messageId = realMessageId
-                    // Bump rfc822 to the fresh Message-ID we just pushed so
-                    // local lookups (sync dedup, queueDraftSave) resolve the
-                    // updated identity on the next save cycle.
-                    migrated.rfc822MessageId = freshRfc822
-                    try migrated.insert(db)
-                    if var body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: header.id)) {
-                        try body.delete(db)
-                        body.id = ContentKey(rawValue: newHeaderId)
-                        try body.insert(db)
-                    }
-                    print("[DraftStore] Migrated header \(header.id) → \(newHeaderId) (messageId \(header.messageId) → \(realMessageId), rfc822 \(header.rfc822MessageId ?? "nil") → \(freshRfc822))")
-                }
-            }
-            return (draftFtsRemovals, draftFtsRekeys)
-        }
-        // Keep FTS aligned with the migrated GRDB ids: re-key migrated placeholders
-        // (preserves the indexed body), remove merged-away ones. After the write.
-        // 🚨 ORDERING CONTRACT (`MessageContentStore`): the merged-away header is
-        // deleted inside the write above; this release runs AFTER that transaction
-        // commits, so the owner count sees the post-merge world. The merge branch is
-        // also the site where N > 1 first becomes real — it writes the SAME fresh
-        // rfc822 onto both the merged-away row and the surviving target row, so at
-        // Stage E1 both mint one content key and releasing the merged-away one must
-        // NOT evict the survivor's indexed body.
-        if !draftFtsOps.removals.isEmpty {
-            await MessageContentStore.releaseUnowned(
-                draftFtsOps.removals.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body])
-        }
-        if !draftFtsOps.rekeys.isEmpty {
-            try? await SearchIndex.shared.rekeyHeaders(draftFtsOps.rekeys.map {
-                (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId),
-                 newMessageId: $0.newMessageId)
-            })
-        }
-        // Notify list to reload after header migration so the snapshot PK is current.
-        // Without this, the list has the old placeholder PK which no longer resolves.
-        if result.messageId != nil {
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-        }
-        print("[DraftStore] Pushed draft \(draftId) to server, serverDraftId=\(result.serverId)\(result.messageId.map { " messageId=\($0)" } ?? "")")
+    struct StageAContext: Sendable {
+        let draftId: String
+        let accountId: String
+        let instanceEpoch: String
+        let postAPushAttemptVersion: Int
+        let freshRfc: String
+        let previousIdentity: DraftDeleteIdentity?
     }
 
+    private struct HeaderMigration: Sendable {
+        let oldHeaderId: String
+        let newHeaderId: String
+        let newMessageId: String
+    }
+
+    /// PORT — reduced v2final `PushCompletion.advanced` plus its independent
+    /// migration payload. A successful completion may legitimately have no
+    /// header to migrate; a rejected Stage-B CAS is a different outcome.
+    private struct PushCompletion: Sendable {
+        let applied: Bool
+        let migration: HeaderMigration?
+    }
+
+    /// PORT — reduced v2final DraftStoreStageAB.performStageA.
+    static func performStageA(
+        initialDraft: Draft,
+        expectedInstanceEpoch: String,
+        previousIdentity: DraftDeleteIdentity?,
+        freshRfc: String,
+        db: Database
+    ) throws -> StageAContext? {
+        guard var current = try Draft.fetchOne(db, key: initialDraft.id),
+              current.accountId == initialDraft.accountId,
+              current.instanceEpoch == expectedInstanceEpoch,
+              current.serverPushStatus == nil || current.serverPushStatus == "dirty",
+              current.pushAttemptVersion == initialDraft.pushAttemptVersion else {
+            return nil
+        }
+        let postAVersion = current.pushAttemptVersion + 1
+        current.rfc822MessageId = freshRfc
+        current.serverPushStatus = "pushing"
+        current.pushAttemptVersion = postAVersion
+        try current.update(db)
+        return StageAContext(
+            draftId: current.id,
+            accountId: current.accountId,
+            instanceEpoch: expectedInstanceEpoch,
+            postAPushAttemptVersion: postAVersion,
+            freshRfc: freshRfc,
+            previousIdentity: previousIdentity)
+    }
+
+    private static func priorIdentity(
+        for draft: Draft,
+        runtimeKind: DraftRuntimeIdentityKind
+    ) -> DraftDeleteIdentity? {
+        guard let serverId = draft.serverDraftId, !serverId.isEmpty else {
+            return nil
+        }
+        switch runtimeKind {
+        case .gmail:
+            return .gmail(resourceId: serverId)
+        case .outlook:
+            return .outlook(graphId: serverId)
+        case .demo:
+            return .demo(localId: serverId)
+        case .imap:
+            guard let folder = draft.serverDraftFolderPath,
+                  let epoch = draft.serverDraftUidValidity,
+                  let uid = Int(serverId), uid > 0 else { return nil }
+            return .imap(folder: folder, uidValidity: epoch, uid: uid)
+        case .unknown:
+            return nil
+        }
+    }
+
+    /// PORT — reduced normal-completion arm of v2final applyPushCompletion.
+    /// SUBTRACT: lineage, receipts, recovery, ghost, S3 and redrive.
+    private static func applyPushCompletion(
+        context: StageAContext,
+        outcome: DraftSaveOutcome,
+        runtimeKind: DraftRuntimeIdentityKind,
+        draftsFolderPath: String,
+        db: Database
+    ) throws -> PushCompletion {
+        guard var draft = try Draft.fetchOne(db, key: context.draftId),
+              draft.accountId == context.accountId,
+              draft.instanceEpoch == context.instanceEpoch,
+              draft.pushAttemptVersion == context.postAPushAttemptVersion,
+              draft.serverPushStatus == "pushing",
+              draft.rfc822MessageId == context.freshRfc else {
+            return PushCompletion(applied: false, migration: nil)
+        }
+
+        switch outcome {
+        case .unaddressable:
+            // Terminal for this attempt, without persistent lifecycle state.
+            draft.serverDraftId = nil
+            draft.serverDraftUidValidity = nil
+            draft.serverDraftFolderPath = nil
+            draft.serverPushStatus = nil
+            try draft.update(db)
+            return PushCompletion(applied: true, migration: nil)
+
+        case .created(let address):
+            let realMessageId: String?
+            switch (runtimeKind, address) {
+            case (.gmail, .gmail(let resourceId, let containedMessageId)):
+                draft.serverDraftId = resourceId
+                draft.serverDraftUidValidity = nil
+                draft.serverDraftFolderPath = nil
+                // SUBTRACT — the contained MESSAGE id is display bookkeeping,
+                // not Draft mutation authority. If Gmail did not return it for
+                // this exact attempt, let sync create the provider header.
+                realMessageId = containedMessageId
+            case (.outlook, .outlook(let graphId)):
+                draft.serverDraftId = graphId
+                draft.serverDraftUidValidity = nil
+                draft.serverDraftFolderPath = nil
+                realMessageId = graphId
+            case (.imap, .imap(let folder, let uidValidity, let uid)):
+                guard folder == draftsFolderPath else {
+                    throw ProviderError.actionIdentityResolutionFailed(
+                        "IMAP draft address returned for a different mailbox")
+                }
+                draft.serverDraftId = String(uid)
+                draft.serverDraftUidValidity = uidValidity
+                draft.serverDraftFolderPath = folder
+                realMessageId = String(uid)
+            case (.demo, .demo(let localId)):
+                draft.serverDraftId = localId
+                draft.serverDraftUidValidity = nil
+                draft.serverDraftFolderPath = nil
+                realMessageId = localId
+            default:
+                throw ProviderError.actionIdentityResolutionFailed(
+                    "draft provider returned an address from the wrong namespace")
+            }
+            draft.serverPushStatus = "pushed"
+            try draft.update(db)
+
+            guard let realMessageId else {
+                return PushCompletion(applied: true, migration: nil)
+            }
+            let oldHeaderId = PendingOperation.draftPlaceholderHeaderPK(
+                accountId: context.accountId,
+                draftsFolderPath: draftsFolderPath,
+                draftId: context.draftId,
+                instanceEpoch: context.instanceEpoch)
+            return PushCompletion(
+                applied: true,
+                migration: HeaderMigration(
+                    oldHeaderId: oldHeaderId,
+                    newHeaderId: "\(context.accountId):\(draftsFolderPath):\(realMessageId)",
+                    newMessageId: realMessageId))
+        }
+    }
+
+    /// SUBTRACT — no v2final recovery/ghost/redrive machinery. A provider throw
+    /// is terminalized only when the exact Stage A attempt still owns the row.
+    /// Authored fields and the prior provider-native linkage stay untouched;
+    /// `unconfirmed` grants no new mutation authority and a later authored save
+    /// moves it to `dirty` for a fresh producer.
+    @discardableResult
+    private static func applyTerminalPushFailure(
+        context: StageAContext,
+        db: Database
+    ) throws -> Bool {
+        guard var draft = try Draft.fetchOne(db, key: context.draftId),
+              draft.accountId == context.accountId,
+              draft.instanceEpoch == context.instanceEpoch,
+              draft.pushAttemptVersion == context.postAPushAttemptVersion,
+              draft.serverPushStatus == "pushing",
+              draft.rfc822MessageId == context.freshRfc else {
+            return false
+        }
+        draft.serverPushStatus = "unconfirmed"
+        try draft.update(db)
+        return true
+    }
+
+    private static func migrateExactPlaceholder(
+        _ migration: HeaderMigration,
+        freshRfc: String,
+        db: Database
+    ) throws -> Bool {
+        guard var placeholder = try MessageHeader.fetchOne(db, key: migration.oldHeaderId) else {
+            return false
+        }
+        if try MessageHeader.fetchOne(db, key: migration.newHeaderId) != nil {
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: placeholder.id))
+            try placeholder.delete(db)
+            return false
+        }
+        try placeholder.delete(db)
+        placeholder.id = migration.newHeaderId
+        placeholder.messageId = migration.newMessageId
+        placeholder.rfc822MessageId = freshRfc
+        try placeholder.insert(db)
+        if var body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: migration.oldHeaderId)) {
+            try body.delete(db)
+            body.id = ContentKey(rawValue: migration.newHeaderId)
+            try body.insert(db)
+        }
+        return true
+    }
+
+    /// PORT — exact pre-A initialDraft/payload + StageAContext shape. Stage A
+    /// revalidates generation/version/status before provider I/O; Stage B applies
+    /// only the exact post-A version/status/generation/fresh-RFC completion.
+    func pushDraftToServer(
+        draftId: String,
+        expectedInstanceEpoch: String,
+        provider: any EmailProvider,
+        runtimeKind: DraftRuntimeIdentityKind,
+        draftsFolderPath: String
+    ) async throws -> PushDisposition {
+        guard runtimeKind != .unknown,
+              let initialDraft = try load(id: draftId),
+              initialDraft.instanceEpoch == expectedInstanceEpoch,
+              initialDraft.serverPushStatus == nil || initialDraft.serverPushStatus == "dirty" else {
+            return .notApplied
+        }
+
+        let domain = initialDraft.accountId.contains("@")
+            ? String(initialDraft.accountId.split(separator: "@").last ?? "tabmail.local")
+            : "tabmail.local"
+        let freshRfc = "draft-\(UUID().uuidString)@\(domain)"
+
+        // Build every provider payload field from the exact pre-A snapshot.
+        var payload = DraftMessage(
+            to: initialDraft.toArray,
+            cc: initialDraft.ccArray,
+            bcc: initialDraft.bccArray,
+            subject: initialDraft.subject,
+            body: MessageBody.plainTextToHTML(initialDraft.body),
+            isHTML: true,
+            inReplyTo: nil,
+            attachments: initialDraft.attachmentsDirName.map {
+                DraftAttachmentStorage.loadAttachments(dirName: $0)
+            } ?? [])
+        payload.messageId = freshRfc
+
+        guard let context = try await AppDatabase.dbPool.write({ db in
+            try Self.performStageA(
+                initialDraft: initialDraft,
+                expectedInstanceEpoch: expectedInstanceEpoch,
+                previousIdentity: Self.priorIdentity(
+                    for: initialDraft, runtimeKind: runtimeKind),
+                freshRfc: freshRfc,
+                db: db)
+        }) else {
+            return .notApplied
+        }
+
+        let outcome: DraftSaveOutcome
+        do {
+            outcome = try await provider.saveDraft(
+                payload,
+                existingIdentity: context.previousIdentity,
+                draftsFolderPath: draftsFolderPath)
+        } catch {
+            let terminalized = try await AppDatabase.dbPool.write { db in
+                try Self.applyTerminalPushFailure(context: context, db: db)
+            }
+            return terminalized ? .terminalUnconfirmed : .notApplied
+        }
+
+        let completion = try await AppDatabase.dbPool.write { db in
+            try Self.applyPushCompletion(
+                context: context,
+                outcome: outcome,
+                runtimeKind: runtimeKind,
+                draftsFolderPath: draftsFolderPath,
+                db: db)
+        }
+
+        guard completion.applied else { return .notApplied }
+
+        if let migration = completion.migration {
+            let rekeyed = try await AppDatabase.dbPool.write { db in
+                try Self.migrateExactPlaceholder(
+                    migration, freshRfc: context.freshRfc, db: db)
+            }
+            if rekeyed {
+                try? await SearchIndex.shared.rekeyHeaders([(
+                    oldKey: ContentKey(rawValue: migration.oldHeaderId),
+                    newKey: ContentKey(rawValue: migration.newHeaderId),
+                    newMessageId: migration.newMessageId)])
+            } else {
+                await MessageContentStore.releaseUnowned(
+                    [ContentKey(rawValue: migration.oldHeaderId)],
+                    stores: [.searchIndex, .body])
+            }
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+        }
+        return .completed
+    }
     /// Update serverPushStatus to "dirty" (needs re-push) for a draft.
     func markDirty(id: String) throws {
         try AppDatabase.dbPool.write { db in

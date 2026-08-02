@@ -44,8 +44,8 @@ struct HandleMissedItemsTests {
         func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
-        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
-        func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
+        func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome { .created(.outlook(graphId: "mock")) }
+        func deleteDraft(identity: DraftDeleteIdentity) async throws {}
     }
 
     actor ProbingProvider: EmailProvider, MessageExistenceProbe {
@@ -84,8 +84,8 @@ struct HandleMissedItemsTests {
         func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
-        func saveDraft(_ draft: DraftMessage, existingDraftId: String?, previousRfc822MessageId: String?, draftsFolderPath: String) async throws -> DraftSaveResult { DraftSaveResult(serverId: "mock") }
-        func deleteDraft(draftId: String, rfc822MessageId: String?, uidValidity: Int?, draftsFolderPath: String) async throws {}
+        func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome { .created(.outlook(graphId: "mock")) }
+        func deleteDraft(identity: DraftDeleteIdentity) async throws {}
     }
 
     struct ProbeError: Error { let reason: String }

@@ -1116,12 +1116,12 @@ private struct PushedMessageDestination: View {
     }
 }
 
-/// Loads the body for a server draft message (fetching from server if not cached),
-/// then presents ComposeView with the full content. Shows a loading indicator while fetching.
+/// Reopens only a locally-authored draft whose generation placeholder or exact
+/// provider-native address matches the selected Drafts header. Arbitrary
+/// server-origin drafts intentionally fail closed; sync remains authoritative.
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
-    @State private var bodyText: String?
-    @State private var matchedDraftId: String?
+    @State private var openAuthority: LocallyAuthoredDraftOpenAuthority?
     @State private var isLoading = true
 
     var body: some View {
@@ -1129,121 +1129,175 @@ struct ServerDraftComposeLoader: View {
             if isLoading {
                 ProgressView("Loading draft...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let openAuthority {
+                DraftComposePresenter(
+                    draftId: openAuthority.draftId,
+                    openAuthority: openAuthority)
             } else {
-                composeView
+                ContentUnavailableView(
+                    "Draft unavailable",
+                    systemImage: "exclamationmark.shield",
+                    description: Text("Sync the Drafts folder and try again."))
             }
         }
         .task {
-            await loadBody()
+            await resolveLocallyAuthoredDraft()
         }
     }
 
-    /// Resolve the reply-to original message and deterministic draftKey for a draft message.
-    /// Uses inReplyTo header to find the original. If not found, falls back to computing
-    /// the draftKey from accountId + inReplyTo (which is the parent's rfc822MessageId).
-    private func resolveReplyDraft(header: MessageHeader, matchedDraftId: String?) -> (original: MessageHeader?, draftKey: String?) {
-        guard let inReplyTo = header.inReplyTo.map({ EmailFilter.normalizeMessageId($0) }), !inReplyTo.isEmpty else {
-            return (nil, matchedDraftId)
-        }
-        let original = try? AppDatabase.dbPool.read { db in
-            try MessageHeader.filter(Column("rfc822MessageId") == inReplyTo).fetchOne(db)
-        }
-        let stableKey: String
-        if let original {
-            stableKey = "\(original.accountId):\(original.stableId)"
-        } else {
-            // Original gone — use draft's accountId + inReplyTo as stableKey.
-            // inReplyTo IS the parent's rfc822MessageId (same as stableId for IMAP).
-            stableKey = "\(header.accountId):\(inReplyTo)"
-        }
-        let draftKey = matchedDraftId ?? Draft.draftKey(replyTo: stableKey, isForward: false, newId: nil)
-        return (original, draftKey)
-    }
-
-    private func loadBody() async {
-        // Look up matching Draft record — try multiple strategies to link
-        // the IMAP draft message back to the local Draft record.
-        matchedDraftId = try? await AppDatabase.dbPool.read { db -> String? in
-            // Strategy 1: rfc822MessageId match (set by server draft push)
-            if let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
-               let draft = try Draft.filter(Column("rfc822MessageId") == rfc822).fetchOne(db) {
-                print("[ServerDraftCompose] Matched draft by rfc822MessageId: \(draft.id.prefix(40))")
-                return draft.id
-            }
-            // Strategy 2: serverDraftId match (Gmail/Exchange draft ID stored as messageId)
-            let sid = header.messageId
-            if let draft = try Draft.filter(Column("serverDraftId") == sid).fetchOne(db) {
-                print("[ServerDraftCompose] Matched draft by serverDraftId: \(draft.id.prefix(40))")
-                return draft.id
-            }
-            // Strategy 3: subject + accountId match (fallback when no IMAP headers link)
-            // Use exact subject match — draft subject should be identical to IMAP draft.
-            if !header.subject.isEmpty,
-               let draft = try Draft
-                .filter(Column("accountId") == header.accountId)
-                .filter(Column("subject") == header.subject)
-                .order(Column("updatedAt").desc)
-                .fetchOne(db) {
-                print("[ServerDraftCompose] Matched draft by subject+account: \(draft.id.prefix(40))")
-                return draft.id
-            }
-            print("[ServerDraftCompose] No draft match found for: subject=\(header.subject.prefix(40)) account=\(header.accountId.prefix(20))")
-            return nil
-        }
-
-        // Try cached body first
-        let cached = try? await AppDatabase.dbPool.read { db in
-            try MessageBody.fetchOne(db, key: header.id)?.htmlContent
-        }
-        if let cached, !cached.isEmpty {
-            bodyText = EmailFilter.htmlToPlainText(cached)
-            isLoading = false
-            return
-        }
-
-        // Not cached — fetch from server
+    private func resolveLocallyAuthoredDraft() async {
         do {
-            try await AccountManager.shared.fetchBody(for: header)
-            let fetched = try? await AppDatabase.dbPool.read { db in
-                try MessageBody.fetchOne(db, key: header.id)?.htmlContent
+            guard let runtimeKind = await AccountManager.shared
+                .draftRuntimeIdentityKind(accountId: header.accountId),
+                  runtimeKind != .unknown else {
+                openAuthority = nil
+                isLoading = false
+                return
             }
-            bodyText = fetched.map { EmailFilter.htmlToPlainText($0) } ?? ""
+
+            if runtimeKind == .gmail {
+                openAuthority = try await resolveGmailDraft()
+                isLoading = false
+                return
+            }
+
+            let candidate = try await AppDatabase.dbPool.read { db -> LocallyAuthoredDraftOpenAuthority? in
+                guard let current = try MessageHeader.fetchOne(db, key: header.id),
+                      current.accountId == header.accountId,
+                      current.folderId == header.folderId,
+                      current.folderPath == header.folderPath,
+                      current.messageId == header.messageId,
+                      current.rfc822MessageId == header.rfc822MessageId,
+                      try Folder.fetchOne(db, key: current.folderId)?.role == .drafts else {
+                    return nil
+                }
+                let drafts = try Draft
+                    .filter(Column("accountId") == current.accountId)
+                    .fetchAll(db)
+                let matches = drafts.compactMap { draft -> LocallyAuthoredDraftOpenAuthority? in
+                    guard let instanceEpoch = draft.instanceEpoch,
+                          !instanceEpoch.isEmpty else { return nil }
+                    if PendingOperation.draftPlaceholderMessageId(
+                        draftId: draft.id,
+                        instanceEpoch: draft.instanceEpoch) == current.messageId {
+                        return LocallyAuthoredDraftOpenAuthority(
+                            draftId: draft.id,
+                            accountId: draft.accountId,
+                            instanceEpoch: instanceEpoch,
+                            serverPushStatus: draft.serverPushStatus,
+                            runtimeKind: runtimeKind,
+                            address: .placeholder(messageId: current.messageId))
+                    }
+                    guard let serverId = draft.serverDraftId, !serverId.isEmpty else {
+                        return nil
+                    }
+                    switch runtimeKind {
+                    case .outlook where serverId == current.messageId:
+                        return LocallyAuthoredDraftOpenAuthority(
+                            draftId: draft.id, accountId: draft.accountId,
+                            instanceEpoch: instanceEpoch,
+                            serverPushStatus: draft.serverPushStatus,
+                            runtimeKind: runtimeKind,
+                            address: .outlook(graphId: serverId))
+                    case .demo where serverId == current.messageId:
+                        return LocallyAuthoredDraftOpenAuthority(
+                            draftId: draft.id, accountId: draft.accountId,
+                            instanceEpoch: instanceEpoch,
+                            serverPushStatus: draft.serverPushStatus,
+                            runtimeKind: runtimeKind,
+                            address: .demo(localId: serverId))
+                    default:
+                        return nil
+                    }
+                }
+                return matches.count == 1 ? matches.first : nil
+            }
+            guard let candidate,
+                  await AccountManager.shared.draftRuntimeIdentityKind(
+                      accountId: candidate.accountId) == candidate.runtimeKind else {
+                openAuthority = nil
+                isLoading = false
+                return
+            }
+            openAuthority = candidate
         } catch {
-            print("[ServerDraftCompose] Failed to fetch body: \(error)")
-            bodyText = ""
+            openAuthority = nil
         }
         isLoading = false
     }
 
-    @ViewBuilder
-    private var composeView: some View {
-        let text = bodyText ?? ""
-        let recipients = Draft.parseRecipients(header.to)
-        let resolved = resolveReplyDraft(header: header, matchedDraftId: matchedDraftId)
-        let _ = print("[ServerDraftCompose] matchedDraftId=\(matchedDraftId ?? "nil") resolved.draftKey=\(resolved.draftKey ?? "nil") resolved.original=\(resolved.original?.id.prefix(30) ?? "nil") inReplyTo=\(header.inReplyTo ?? "nil")")
-
-        // If a Draft record exists, use DraftComposePresenter which loads all context
-        // (reply-to, account, edit history) before creating ComposeView — no black screen.
-        if let draftKey = resolved.draftKey ?? matchedDraftId {
-            let _ = print("[ServerDraftCompose] Using DraftComposePresenter with key: \(draftKey)")
-            DraftComposePresenter(draftId: draftKey, serverDraftHeader: header)
-        } else if let original = resolved.original {
-            // No Draft record but original message found — fresh compose with reply context
-            ComposeView(
-                replyTo: original,
-                prefillSubject: header.subject,
-                prefillBody: text,
-                serverDraftHeader: header
-            )
-        } else {
-            // No Draft, no original — fresh compose with prefills from IMAP header
-            ComposeView(
-                prefillTo: recipients,
-                prefillSubject: header.subject,
-                prefillBody: text,
-                serverDraftHeader: header
-            )
+    /// PORT — narrow v2final Gmail contained-MESSAGE → RESOURCE lookup. The
+    /// provider await is followed by a fresh header/folder/account/local-owner
+    /// census; nothing captured before the await authorizes the handoff.
+    private func resolveGmailDraft() async throws -> LocallyAuthoredDraftOpenAuthority? {
+        let preflight = try await AppDatabase.dbPool.read { db -> (Account, String)? in
+            guard let current = try MessageHeader.fetchOne(db, key: header.id),
+                  current.accountId == header.accountId,
+                  current.folderId == header.folderId,
+                  current.folderPath == header.folderPath,
+                  current.messageId == header.messageId,
+                  current.rfc822MessageId == header.rfc822MessageId,
+                  let folder = try Folder.fetchOne(db, key: current.folderId),
+                  folder.accountId == current.accountId,
+                  folder.path == current.folderPath,
+                  folder.role == .drafts,
+                  let account = try Account.fetchOne(db, key: current.accountId) else {
+                return nil
+            }
+            return (account, folder.path)
         }
+        guard let (account, folderPath) = preflight,
+              let provider = await AccountManager.shared.provider(for: account),
+              AccountManager.draftRuntimeIdentityKind(for: provider) == .gmail,
+              case .gmail(let resourceId, let returnedContainedId)? = try await provider
+                  .resolveDraftResource(
+                      containedMessageId: header.messageId,
+                      draftsFolderPath: folderPath),
+              returnedContainedId == header.messageId else {
+            return nil
+        }
+
+        let candidate = try await AppDatabase.dbPool.read { db -> LocallyAuthoredDraftOpenAuthority? in
+            guard let current = try MessageHeader.fetchOne(db, key: header.id),
+                  current.accountId == account.id,
+                  current.folderId == header.folderId,
+                  current.folderPath == folderPath,
+                  current.messageId == header.messageId,
+                  current.rfc822MessageId == header.rfc822MessageId,
+                  let folder = try Folder.fetchOne(db, key: current.folderId),
+                  folder.accountId == account.id,
+                  folder.path == folderPath,
+                  folder.role == .drafts else {
+                return nil
+            }
+            let matches = try Draft
+                .filter(Column("accountId") == account.id)
+                .filter(Column("serverDraftId") == resourceId)
+                .filter(["pushed", "dirty"].contains(Column("serverPushStatus")))
+                .limit(2)
+                .fetchAll(db)
+            guard matches.count == 1,
+                  let draft = matches.first,
+                  let instanceEpoch = draft.instanceEpoch,
+                  !instanceEpoch.isEmpty else {
+                return nil
+            }
+            return LocallyAuthoredDraftOpenAuthority(
+                draftId: draft.id,
+                accountId: draft.accountId,
+                instanceEpoch: instanceEpoch,
+                serverPushStatus: draft.serverPushStatus,
+                runtimeKind: .gmail,
+                address: .gmail(
+                    resourceId: resourceId,
+                    containedMessageId: header.messageId))
+        }
+        guard let candidate,
+              await AccountManager.shared.draftRuntimeIdentityKind(
+                  accountId: candidate.accountId) == .gmail else {
+            return nil
+        }
+        return candidate
     }
 }
 

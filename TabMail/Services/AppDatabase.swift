@@ -2166,8 +2166,8 @@ final class AppDatabase: Sendable {
             // aliasing.
             //
             // All three nullable, no default, no backfill: a pre-migration row simply has
-            // no recorded epoch, which reads as "unknown" and keeps that row on the
-            // unchanged legacy rfc822-search arm. Never "0" — RFC 3501 §2.3.1.1 types
+            // no recorded epoch and cannot authorize a destructive IMAP operation.
+            // Never "0" — RFC 3501 §2.3.1.1 types
             // UIDVALIDITY as `nz-number`, so a synthesised zero would be an epoch that
             // compares equal to another synthesised zero.
             try db.alter(table: "draft") { t in
@@ -2178,6 +2178,62 @@ final class AppDatabase: Sendable {
             }
             try db.alter(table: "pendingOperation") { t in
                 t.add(column: "draftServerUidValidity", .integer)
+            }
+        }
+
+        migrator.registerMigration("v73_bindDraftUidToMailbox") { db in
+            try db.alter(table: "draft") { t in
+                t.add(column: "serverDraftFolderPath", .text)
+            }
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "draftServerFolderPath", .text)
+            }
+
+            // SUBTRACT — no migration compatibility for old IMAP addresses.
+            // Preserve authored content while clearing incomplete tuples so the
+            // next admitted save takes the safe fresh-APPEND path.
+            try db.execute(sql: """
+                UPDATE draft
+                SET serverDraftId = NULL,
+                    serverPushStatus = NULL,
+                    serverDraftUidValidity = NULL,
+                    serverDraftFolderPath = NULL
+                WHERE accountId IN (
+                    SELECT id FROM account WHERE provider IN ('imap', 'icloud')
+                )
+                  AND serverDraftId IS NOT NULL
+                """)
+        }
+
+        migrator.registerMigration("v74_purgeLegacyPendingOperations") { db in
+            // ⚑ NO REFERENCE — INVENTED. Owner-approved C6 upgrade boundary:
+            // superseded in-flight operations are discarded without decoding.
+            // Draft, Outbox, authored content and attachments remain untouched.
+            try db.execute(sql: "DELETE FROM pendingOperation")
+        }
+
+        migrator.registerMigration("v75_addDraftPushAttemptVersion") { db in
+            // PORT — v2final v81 conflict version, with recovery fields omitted.
+            try db.alter(table: "draft") { t in
+                t.add(column: "pushAttemptVersion", .integer).notNull().defaults(to: 0)
+            }
+        }
+
+        migrator.registerMigration("v76_addDraftGenerationAndTypedIdentity") { db in
+            // PORT — reduced generation/provider-native schema. No backfill and
+            // no pending/outbox compatibility: nil generations fail closed until
+            // an ordinary compose admission acquires the existing Draft.
+            try db.alter(table: "draft") { t in
+                t.add(column: "instanceEpoch", .text)
+            }
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "instanceEpoch", .text)
+                t.add(column: "serverDraftGmailMessageId", .text)
+            }
+            try db.alter(table: "pendingOperation") { t in
+                t.add(column: "instanceEpoch", .text)
+                t.add(column: "draftId", .text)
+                t.add(column: "draftDeleteAddressKind", .text)
             }
         }
     }

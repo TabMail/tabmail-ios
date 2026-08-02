@@ -645,6 +645,61 @@ struct GmailProviderMockTests {
     }
 }
 
+@Suite("GmailProvider exact contained-MESSAGE draft RESOURCE resolution")
+struct GmailProviderExactDraftResourceTests {
+
+    @Test("Gmail exact resolver finds a unique contained-message wrapper on a later page")
+    func exactContainedMessageLookupIsPaginatedAndNarrow() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+
+        http.register(path: "/drafts", method: "GET") { request in
+            if request.url.absoluteString.contains("pageToken") {
+                return .json(raw: #"{"drafts":[{"id":"resource-exact","message":{"id":"contained-exact"}}]}"#)
+            }
+            return .json(raw: #"{"drafts":[{"id":"resource-other","message":{"id":"contained-other"}}],"nextPageToken":"page-2"}"#)
+        }
+        let provider: any EmailProvider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        let result = try await provider.resolveDraftResource(
+            containedMessageId: "contained-exact",
+            draftsFolderPath: "DRAFT"
+        )
+        #expect(result == .gmail(
+            resourceId: "resource-exact",
+            containedMessageId: "contained-exact"
+        ))
+        let calls = http.recordedCalls()
+        #expect(calls.filter { $0.url.contains("/drafts?") }.count == 2)
+        #expect(!calls.contains { $0.url.contains("/messages?") })
+    }
+
+    @Test("Gmail exact resolver returns no authority for zero or duplicate wrappers", arguments: [
+        #"{"drafts":[]}"#,
+        #"{"drafts":[{"id":"resource-1","message":{"id":"contained-exact"}},{"id":"resource-2","message":{"id":"contained-exact"}}]}"#,
+    ])
+    func exactContainedMessageLookupPreservesCardinality(response: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/drafts", method: "GET", response: .json(raw: response))
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: http.session
+        )
+
+        let result = try await provider.resolveDraftResource(
+            containedMessageId: "contained-exact",
+            draftsFolderPath: "DRAFT"
+        )
+        #expect(result == nil)
+    }
+}
+
 // MARK: - Fixture builder
 
 /// A Gmail MIME part spec used by the test helper. Each case corresponds to a
@@ -730,4 +785,3 @@ private func headersArrayJSON(_ headers: [(String, String)]) -> String {
     let entries = headers.map { "{\"name\": \"\($0.0)\", \"value\": \"\($0.1)\"}" }
     return "[\(entries.joined(separator: ","))]"
 }
-

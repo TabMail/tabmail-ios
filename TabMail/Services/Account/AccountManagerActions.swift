@@ -919,195 +919,37 @@ extension AccountManager {
     /// Queue a draft save to the server's Drafts folder via PendingOperation.
     /// Creates/updates an optimistic MessageHeader in the Drafts folder so the draft
     /// appears immediately in the UI (before IMAP APPEND completes).
-    func queueDraftSave(draftId: String, accountId: String) async {
+    @discardableResult
+    func queueDraftSave(draftId: String, accountId: String) async -> Bool {
         do {
             let folderPath = try await draftsFolderPath(accountId: accountId)
-
-            // Write transaction returns FTS data for post-transaction indexing.
-            let ftsInfo: (record: FTSHeaderRecord, bodyText: String)? = try await dbPool.write { db -> (FTSHeaderRecord, String)? in
-                // Optimistic MessageHeader — draft appears in Drafts folder immediately.
-                // Uses rfc822MessageId for dedup when sync brings in the real IMAP UID.
-                guard let draft = try Draft.fetchOne(db, key: draftId) else {
-                    print("[Queue] WARNING: Draft \(draftId) not found in DB, skipping queueDraftSave")
-                    return nil
-                }
-
-                // T1.3 — a draft save IS epoch-sensitive whenever it will resolve an
-                // EXISTING UID. The original census exempted this site wholesale as
-                // "APPEND-shaped, resolves no existing UID"; that is wrong for the
-                // normal case. `IMAPProvider.saveDraft` runs a delete-then-APPEND, and
-                // its `existingDraftId` branch does `store(flags: [.deleted])` +
-                // `expunge()` on `MessageIdentifierSet<UID>(UID(uid))` — a LITERAL UID,
-                // both calls `try?`-swallowed, so a wrong-message expunge is silent.
-                // `saveDraft` itself returns `DraftSaveResult(serverId: String(uid))`,
-                // so `Draft.serverDraftId` IS the IMAP UID and the numeric branch is the
-                // normal path for every save after the first. Byte-for-byte the same
-                // shape already acknowledged as a C3 vector for `queueDraftDelete`.
-                //
-                // Classified by what the provider DOES with the id, not by the op's
-                // name — the three cases are distinct and only one is a hazard:
-                //   • `serverDraftId == nil`  → pure APPEND, no id to resolve → admit.
-                //     (This is the ONLY case the old census description actually fit.)
-                //   • non-numeric             → Message-ID SEARCH, epoch-IMMUNE → admit.
-                //   • numeric                 → literal UID STORE+EXPUNGE → GUARD.
-                // ⚠ THIS CLASSIFICATION IS MADE AT ENQUEUE TIME AND IS NOT THE LAST WORD.
-                // `PendingOperation` has a UUID primary key and no save-draft dedupe, so
-                // two saves queued while `serverDraftId` is still nil are BOTH admitted as
-                // APPEND-only; the first stores the numeric UID the APPEND returned, and
-                // the second then executes against a LIVE snapshot that has become the
-                // numeric case. The re-classification that actually protects the
-                // literal-UID branch therefore lives at execution time, in
-                // `DraftStore.pushDraftToServer`, immediately before the value is handed
-                // to the provider. Do not delete this enqueue-time check in favour of it —
-                // refusing early avoids writing an op that would only be dropped later —
-                // but do not mistake it for the guard either.
-                //
-                // Scoping to the numeric case is what keeps the missing-`Folder`-row
-                // refusal from bricking draft saves: `draftsFolderPath` falls back to a
-                // guessed "Drafts" when the account has no drafts-role row, that guess
-                // matches no `Folder` row, and a missing row fails CLOSED. A first save
-                // (`serverDraftId == nil`) is classified APPEND-only, never reaches the
-                // guard, and so is always admitted.
-                //
-                // ⚠ AN EARLIER VERSION OF THIS COMMENT CLAIMED THE ABSOLUTE — that "an
-                // account that has never had a drafts folder row cannot have produced a
-                // numeric `serverDraftId`". That is FALSE and was removed. A fresh account
-                // can use the guessed "Drafts" path, SELECT/APPEND into a real server
-                // mailbox of that name, have the new message located by Message-ID, and
-                // persist the numeric UID `IMAPProvider.saveDraft` returns — none of which
-                // creates a `Folder` row (only `SyncEngine.fullSync`'s folder-list upsert
-                // does). So the guessed path CAN reach the guard on a later save. The
-                // conclusion still holds and is what matters: such a save is refused, the
-                // local `Draft` row keeps the user's content, and the refusal lifts as
-                // soon as a folder list has been synced — transient and fail-closed, not a
-                // brick.
-                if let existingId = draft.serverDraftId, UInt32(existingId) != nil,
-                   try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
+            let ftsInfo = try await dbPool.write {
+                db -> (record: FTSHeaderRecord, bodyText: String)? in
+                guard let draft = try Draft.fetchOne(db, key: draftId),
+                      draft.accountId == accountId,
+                      let instanceEpoch = draft.instanceEpoch,
+                      !instanceEpoch.isEmpty else {
                     return nil
                 }
 
                 let folderId = "\(accountId):\(folderPath)"
-                var rfc822 = draft.rfc822MessageId
-
-                // Adopt the server-synced header if present. This catches the
-                // ServerDraftCompose case: a draft was created by server sync
-                // with its own rfc822MessageId (from the IMAP/Gmail header)
-                // and a server-assigned messageId. Draft.rfc822MessageId on
-                // the matched local Draft row is nil, so a naive
-                // "generate new rfc822 + create optimistic header" path
-                // produces an orphan next to the server-synced header. The
-                // sync stale-check then deletes our optimistic orphan, the
-                // list reverts to the pre-edit server-synced header, and the
-                // user sees stale content.
-                //
-                // ⚑ NO ADOPTION HERE, EITHER — the same rule, and for the same reason,
-                // as `queueDraftDelete` below. What used to stand here read the header
-                // at the PK `accountId:folderPath:<serverDraftId>` and, when the `Draft`
-                // row had no rfc822 of its own, ADOPTED that header's identity and
-                // PERSISTED it (`UPDATE draft SET rfc822MessageId = …`).
-                //
-                // `serverDraftId` is an IMAP UID — an ADDRESS. When it is stale (the
-                // `Draft` table survives a UIDVALIDITY renumber; the UID it names does
-                // not) the PK names a DIFFERENT message, so the adopted id belongs to a
-                // stranger. And unlike the delete site's transient version, this one
-                // STUCK: `DraftStore.pushDraftToServer` later reads it back as
-                // `previousRfc822` and hands it to `saveDraft(…​previousRfc822MessageId:)`,
-                // whose old-copy leg SEARCHes for it, finds exactly one exact match —
-                // the stranger — and STOREs `\Deleted` + EXPUNGEs it. A persisted wrong
-                // identity is worse than a transient one precisely because every
-                // subsequent push re-aims at the same stranger.
-                //
-                // `exactMessageIdMatches` is NOT a mitigation: it proves the message
-                // found carries the ADOPTED id, which it does — the id is wrong at the
-                // source, so verifying against it proves nothing. Nor is the T1.3 guard
-                // above: that refuses when the epoch is UNKNOWN, and after a completed
-                // reset the epoch is perfectly well known — just not the one the UID was
-                // minted under.
-                //
-                // Nothing is lost by removing it. The ServerDraftCompose case it was
-                // written for — reuse the server-synced display row instead of orphaning
-                // a second one next to it — is handled by the `lookedUp` PK fallback
-                // below, which is not gated on `rfc822 == nil` and which writes only
-                // INTO the header (never back into the `Draft` row), so it cannot carry a
-                // stranger's identity into the push path.
-                //
-                // ⚑ DELIBERATE DEVIATION FROM `v2final`, which still carries this block
-                // verbatim (`v2final:TabMail/Services/Account/AccountManagerActions.swift`
-                // `queueDraftSave`) together with the same destructive `saveDraft` leg.
-                // The reference has not closed this one; it is not a shape to port.
-
-                // Generate stable rfc822MessageId if still not assigned (fresh local draft).
-                if rfc822 == nil {
-                    let domain = accountId.contains("@") ? String(accountId.split(separator: "@").last ?? "tabmail.local") : "tabmail.local"
-                    rfc822 = "draft-\(UUID().uuidString)@\(domain)"
-                    // Persist to Draft table so pushDraftToServer reuses it
-                    try db.execute(sql: "UPDATE draft SET rfc822MessageId = ? WHERE id = ?", arguments: [rfc822, draftId])
-                }
-                // Placeholder messageId — will be replaced by real IMAP UID via rfc822MessageId dedup in sync
-                //
-                // ⚑ `draftId` is a `Draft.id`, and for a reply/forward that is
-                // `Draft.draftKey`'s COLON-JOINED composite `reply:<accountId>:<stableId>`
-                // (`ComposeView` builds `stableKey = "\(accountId):\(stableId)"`; on IMAP
-                // `MessageHeader.stableId` is the rfc822 Message-ID). Interpolated raw, the
-                // resulting `headerId` carried FOUR colons where the key format allows
-                // exactly two — and every headerId-prefix purge silently SKIPS such a row
-                // (`MessageIdentity.headerIdBelongsToFolder` /
-                // `headerIdLikeNoDeeperColonSQLFragment` exclude a colon-bearing tail rather
-                // than erroring), orphaning the draft's FTS entry, chat-id mapping and body
-                // assets on a folder purge or a UIDVALIDITY reset. Escaped AT THE MINT — the
-                // guards themselves must never be relaxed; see
-                // `MessageIdentity.colonSafeMessageIdComponent`. Colon-free draft ids (a
-                // plain-`UUID` new compose) are unchanged byte-for-byte.
-                let placeholderMsgId = "draft-\(MessageIdentity.colonSafeMessageIdComponent(draftId))"
-                let headerId = MessageIdentity.headerId(
-                    accountId: accountId, folderPath: folderPath, messageId: placeholderMsgId)
-                let senderAccount = try Account.fetchOne(db, key: accountId)
-                let senderEmail = senderAccount?.emailAddress ?? accountId
-                let senderDisplayName = senderAccount?.displayName ?? senderEmail
+                let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
+                    draftId: draft.id, instanceEpoch: instanceEpoch)
+                let placeholderHeaderId = PendingOperation.draftPlaceholderHeaderPK(
+                    accountId: accountId,
+                    draftsFolderPath: folderPath,
+                    draftId: draft.id,
+                    instanceEpoch: instanceEpoch)
+                let account = try Account.fetchOne(db, key: accountId)
+                let senderEmail = account?.emailAddress ?? accountId
+                let senderName = account?.displayName ?? senderEmail
                 let snippet = EmailFilter.snippetFromPlainText(draft.body)
-                let dateMs = Int64(draft.updatedAt * 1000)
 
-                var capturedHeaderId: String
-                var capturedMessageId: String
-
-                // Lookup strategy:
-                //   1. By rfc822MessageId — the primary dedup key across sync/optimistic paths.
-                //   2. By serverDraftId (constructed PK) — catches the ServerDraftCompose
-                //      case where a local Draft row exists but its rfc822MessageId wasn't
-                //      adopted above (e.g. server header was deleted but Draft persisted).
-                var lookedUp = try MessageHeader
-                    .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822)
-                    .fetchOne(db)
-                if lookedUp == nil, let sid = draft.serverDraftId {
-                    lookedUp = try MessageHeader.fetchOne(
-                        db, key: "\(accountId):\(folderPath):\(sid)"
-                    )
-                }
-                if var existing = lookedUp {
-                    // Update existing header (either optimistic or server-synced) in place —
-                    // this is the snippet/subject/recipient refresh path. No orphan created.
-                    print("[Queue] queueDraftSave: updating existing header id=\(existing.id) msgId=\(existing.messageId) rfc822=\(existing.rfc822MessageId ?? "nil") → newSnippet=\(String(snippet.prefix(60)))")
-                    existing.subject = draft.subject
-                    existing.to = draft.toArray.joined(separator: ", ")
-                    existing.snippet = snippet
-                    existing.date = Date(timeIntervalSince1970: draft.updatedAt)
-                    // Ensure rfc822MessageId is populated so subsequent syncs can dedup.
-                    if existing.rfc822MessageId == nil || existing.rfc822MessageId?.isEmpty == true {
-                        existing.rfc822MessageId = rfc822
-                    }
-                    try existing.update(db)
-                    // Update body so draft content is viewable immediately
-                    let htmlBody = MessageBody.plainTextToHTML(draft.body)
-                    let body = MessageBody(contentKey: ContentKey(rawValue: existing.id), htmlContent: htmlBody)
-                    try body.save(db)
-                    capturedHeaderId = existing.id
-                    capturedMessageId = existing.messageId
-                } else {
-                    print("[Queue] queueDraftSave: no existing header found — creating optimistic with placeholder=\(placeholderMsgId) rfc822=\(rfc822 ?? "nil") serverDraftId=\(draft.serverDraftId ?? "nil")")
-                    var header = MessageHeader(
-                        messageId: placeholderMsgId,
+                var header = try MessageHeader.fetchOne(db, key: placeholderHeaderId)
+                    ?? MessageHeader(
+                        messageId: placeholderMessageId,
                         subject: draft.subject,
-                        from: senderDisplayName,
+                        from: senderName,
                         fromAddress: senderEmail,
                         to: draft.toArray.joined(separator: ", "),
                         date: Date(timeIntervalSince1970: draft.updatedAt),
@@ -1115,103 +957,68 @@ extension AccountManager {
                         folderId: folderId,
                         accountId: accountId,
                         folderPath: folderPath,
-                        isInInbox: false
-                    )
-                    header.rfc822MessageId = rfc822
-                    header.cc = draft.ccArray.joined(separator: ", ")
-                    header.bcc = draft.bccArray.joined(separator: ", ")
-                    header.isRead = true // Drafts are always read
-                    try header.insert(db)
+                        isInInbox: false)
+                header.subject = draft.subject
+                header.to = draft.toArray.joined(separator: ", ")
+                header.cc = draft.ccArray.joined(separator: ", ")
+                header.bcc = draft.bccArray.joined(separator: ", ")
+                header.snippet = snippet
+                header.date = Date(timeIntervalSince1970: draft.updatedAt)
+                header.isRead = true
+                try header.save(db)
+                try MessageBody(
+                    contentKey: ContentKey(rawValue: placeholderHeaderId),
+                    htmlContent: MessageBody.plainTextToHTML(draft.body)
+                ).save(db)
 
-                    // Also create MessageBody so draft content is viewable
-                    let htmlBody = MessageBody.plainTextToHTML(draft.body)
-                    let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: htmlBody)
-                    try body.save(db)
-                    capturedHeaderId = headerId
-                    capturedMessageId = placeholderMsgId
-                }
-
-                // Include both draftId (for drain execution) and placeholder messageId
-                // (for pendingAllIds protection). The stale check uses pendingAllIds to
-                // protect optimistic headers from deletion while the push is pending.
-                // This is critical for offline support — the drain can't run until
-                // back online, but sync might try to clean up the placeholder.
-                //
-                // REUSES the `placeholderMsgId` local rather than re-deriving the string:
-                // pendingAllIds protection is an EXACT match against the header's
-                // `messageId`, so any drift between the two mints silently disarms it.
-                var opMsgIds = [draftId, placeholderMsgId]
-                // Transition safety for headers minted BEFORE the colon escaping above: an
-                // existing optimistic row still carries the raw form, and the stale sweep
-                // matches this set against that row's `messageId`. Protection is
-                // fail-SAFE in the over-inclusive direction (an extra entry keeps a row
-                // alive; a missing one deletes a draft the user has not pushed yet), and
-                // no server-assigned id can ever equal a `draft-`-prefixed string.
-                let legacyRawPlaceholder = "draft-\(draftId)"
-                if legacyRawPlaceholder != placeholderMsgId { opMsgIds.append(legacyRawPlaceholder) }
-                // Also include rfc822MessageId for rfc822-based protection matching
-                // (rfc822 is guaranteed non-nil here — either from draft or freshly generated)
-                if let rfc822Id = rfc822 {
-                    opMsgIds.append(rfc822Id)
-                }
                 try PendingOperation(
                     type: .saveDraft,
-                    messageIds: opMsgIds,
+                    messageIds: [draft.id, placeholderMessageId],
                     accountId: accountId,
-                    folderPath: folderPath
+                    folderPath: folderPath,
+                    instanceEpoch: instanceEpoch,
+                    draftId: draft.id
                 ).insert(db)
 
-                return (FTSHeaderRecord(
-                    contentKey: ContentKey(rawValue: capturedHeaderId),
-                    headerId: capturedHeaderId,
-                    messageId: capturedMessageId,
-                    subject: draft.subject,
-                    from: "\(senderDisplayName) <\(senderEmail)>",
-                    to: draft.toArray.joined(separator: ", "),
-                    cc: draft.ccArray.joined(separator: ", "),
-                    bcc: draft.bccArray.joined(separator: ", "),
-                    dateMs: dateMs,
-                    folderId: folderId
-                ), draft.body)
+                return (
+                    FTSHeaderRecord(
+                        contentKey: ContentKey(rawValue: placeholderHeaderId),
+                        headerId: placeholderHeaderId,
+                        messageId: placeholderMessageId,
+                        subject: draft.subject,
+                        from: "\(senderName) <\(senderEmail)>",
+                        to: draft.toArray.joined(separator: ", "),
+                        cc: draft.ccArray.joined(separator: ", "),
+                        bcc: draft.bccArray.joined(separator: ", "),
+                        dateMs: Int64(draft.updatedAt * 1000),
+                        folderId: folderId),
+                    draft.body)
             }
 
-            // FTS indexing + headerComplete — runs after GRDB write succeeds.
-            // Each step is independently caught so a failure in one doesn't block the others.
-            // Priority: headerComplete=1 (visibility) > FTS body (searchability) > FTS header.
-            if let ftsInfo {
-                do {
-                    _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
-                    if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        _ = try await SearchIndex.shared.updateBodies([(contentKey: ftsInfo.record.contentKey, body: ftsInfo.bodyText)])
-                    }
-                } catch {
-                    print("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
+            guard let ftsInfo else { return false }
+            do {
+                _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
+                if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    _ = try await SearchIndex.shared.updateBodies([(
+                        contentKey: ftsInfo.record.contentKey,
+                        body: ftsInfo.bodyText)])
                 }
-                // Always set headerComplete=1 so the draft appears in folder queries,
-                // regardless of whether FTS succeeded. Caught separately so notification
-                // still fires even if this write fails (draft stays at headerComplete=0
-                // but user gets the reload signal).
-                do {
-                    try await dbPool.write { db in
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
-                            arguments: [ftsInfo.record.headerId]
-                        )
-                    }
-                } catch {
-                    print("[Queue] WARNING: headerComplete write failed for draft \(ftsInfo.record.headerId): \(error)")
-                }
+            } catch {
+                print("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
             }
-
-            // Always post reload notification — even if FTS or headerComplete failed,
-            // the GRDB header + body exist and may become visible on retry.
+            try? await dbPool.write { db in
+                try db.execute(
+                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
+                    arguments: [ftsInfo.record.headerId])
+            }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+            Task { await drainPendingQueue() }
+            return true
         } catch {
             print("[Queue] ERROR: queueDraftSave failed: \(error)")
+            return false
         }
-        Task { await drainPendingQueue() }
     }
-
     /// Queue a draft delete from the server's Drafts folder via PendingOperation.
     /// Optimistically removes the MessageHeader from the Drafts folder immediately.
     /// Requires the serverDraftId (IMAP UID / Gmail ID) from the Draft record.
@@ -1222,157 +1029,124 @@ extension AccountManager {
     ///   its epoch-corroborated STRONG arm instead of a Message-ID search that cannot
     ///   tell this draft from a legitimate same-Message-ID sibling. nil (no Draft/outbox
     ///   row in hand, non-IMAP, or a pre-v72 row) keeps the op on the unchanged arm.
+    @discardableResult
     func queueDraftDelete(
-        serverDraftId: String, accountId: String, rfc822MessageId: String? = nil,
-        uidValidity: Int? = nil
-    ) async {
+        identity: DraftDeleteIdentity,
+        accountId: String,
+        folderPath explicitFolderPath: String? = nil,
+        draftId: String? = nil,
+        instanceEpoch: String? = nil,
+        deleteOwnedLocalDraft: Bool = false
+    ) async -> Bool {
         do {
-            let folderPath = try await draftsFolderPath(accountId: accountId)
-            try await dbPool.write { db in
-                // T1.3 — same classification as `queueDraftSave`, by what the provider
-                // DOES with the id rather than by the op's name. `.deleteDraft` drains to
-                // `IMAPProvider.deleteDraft`, which USED TO call `resolveUID(draftId)`: a
-                // numeric id short-circuited straight to `UIDSet(UID(uidValue))` with no
-                // SEARCH, so the following `store(flags: [.deleted])` + `expunge()` was
-                // addressed by a LITERAL UID and mutated whatever occupied it in the
-                // CURRENT epoch. A non-numeric id goes to `searchByMessageId` and is
-                // epoch-immune. This was already acknowledged as a residual C3 vector;
-                // it is now guarded HERE and, since 2026-08-01, at the provider too —
-                // `IMAPProvider.deleteDraft` verifies an rfc822 identity on the wire and
-                // REFUSES an all-digits id. This admission guard stays: it is
-                // provider-agnostic, and refusing to record an unresolvable gesture beats
-                // recording one that can only fail its retry budget and drop.
-                if UInt32(serverDraftId) != nil,
-                   try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
-                    return
-                }
-                // Optimistic removal — draft disappears from UI immediately
+            let folderPath: String
+            if let explicitFolderPath {
+                folderPath = explicitFolderPath
+            } else {
+                folderPath = try await draftsFolderPath(accountId: accountId)
+            }
+            let deletedAttachmentDir = try await dbPool.write { db -> String? in
                 let folderId = "\(accountId):\(folderPath)"
-                // Remove by server UID (synced header)
-                let serverId = "\(accountId):\(folderPath):\(serverDraftId)"
-
-                // ⚑ NO ADOPTION HERE, EVER. A revision of this function read the
-                // `MessageHeader` sitting at `serverId` and, when the caller had no
-                // rfc822 of its own, ADOPTED that row's Message-ID as the delete's
-                // identity — recording it on the op, which the provider then resolved
-                // by SEARCH and EXPUNGED.
-                //
-                // `serverDraftId` is, on IMAP, a bare UID: an address scoped to one
-                // `(folderPath, UIDVALIDITY)` pair. When the epoch it was minted under
-                // is not the epoch in force now — after a reset (`uidValidityResetPurgeTxn`
-                // purges headers but deliberately PRESERVES `draft`/`outboxMessage`
-                // rows, so a delayed cleanup can still name an address from the
-                // discarded numbering), or when `draftsFolderPath`'s literal `"Drafts"`
-                // fallback resolved to a real mailbox before folder-list sync assigned
-                // the role elsewhere — this PK names a DIFFERENT message, and adopting
-                // its identity aims the delete at a stranger. Refusing costs the user a
-                // draft that stays visible and re-deletable; adopting costs them mail
-                // they never asked to delete (C3).
-                //
-                // The reference agrees by construction: `v2final`'s `queueDraftDelete`
-                // reads the row at the PK ONLY as a corroboration INPUT to
-                // `DraftHeaderDeleteGate.rawPKDeleteAllowed` (which must ALSO see the
-                // caller's own rfc, equal to the row's, and a canonical group of exactly
-                // one) — and the op it records carries nothing but CALLER-SUPPLIED ids.
-                if try MessageHeader.deleteOne(db, key: serverId) {
-                    _ = try? MessageBody.deleteOne(db, key: serverId)
+                let encodedId: String
+                let addressKind: DraftDeleteAddressKind
+                let mintedUidValidity: Int?
+                switch identity {
+                case .imap(let addressFolder, let uidValidity, let uid):
+                    guard addressFolder == folderPath,
+                          uid > 0,
+                          uidValidity > 0,
+                          let folder = try Folder.fetchOne(db, key: folderId),
+                          folder.lastKnownUidValidity == uidValidity else {
+                        throw ProviderError.actionIdentityResolutionFailed(String(uid))
+                    }
+                    encodedId = String(uid)
+                    addressKind = .providerResource
+                    mintedUidValidity = uidValidity
+                case .gmail(let resourceId):
+                    guard !resourceId.isEmpty else {
+                        throw ProviderError.actionIdentityResolutionFailed(resourceId)
+                    }
+                    encodedId = resourceId
+                    addressKind = .providerResource
+                    mintedUidValidity = nil
+                case .gmailContainedMessage(let messageId):
+                    guard !messageId.isEmpty else {
+                        throw ProviderError.actionIdentityResolutionFailed(messageId)
+                    }
+                    encodedId = messageId
+                    addressKind = .gmailContainedMessage
+                    mintedUidValidity = nil
+                case .outlook(let graphId):
+                    guard !graphId.isEmpty else {
+                        throw ProviderError.actionIdentityResolutionFailed(graphId)
+                    }
+                    encodedId = graphId
+                    addressKind = .providerResource
+                    mintedUidValidity = nil
+                case .demo(let localId):
+                    guard !localId.isEmpty else {
+                        throw ProviderError.actionIdentityResolutionFailed(localId)
+                    }
+                    encodedId = localId
+                    addressKind = .providerResource
+                    mintedUidValidity = nil
                 }
-                // Also remove optimistic header by rfc822MessageId (placeholder UID)
-                if let rfc822 = rfc822MessageId {
-                    let optimistic = try MessageHeader
-                        .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822)
-                        .fetchAll(db)
-                    for header in optimistic {
-                        _ = try? MessageBody.deleteOne(db, key: header.id)
-                        try header.delete(db)
+
+                // Display removal follows only an exact provider-native header id.
+                let exactHeaderId = "\(accountId):\(folderPath):\(encodedId)"
+                if try MessageHeader.deleteOne(db, key: exactHeaderId) {
+                    _ = try MessageBody.deleteOne(
+                        db, key: ContentKey(rawValue: exactHeaderId))
+                }
+                if let draftId, let instanceEpoch {
+                    let placeholder = PendingOperation.draftPlaceholderHeaderPK(
+                        accountId: accountId,
+                        draftsFolderPath: folderPath,
+                        draftId: draftId,
+                        instanceEpoch: instanceEpoch)
+                    if try MessageHeader.deleteOne(db, key: placeholder) {
+                        _ = try MessageBody.deleteOne(
+                            db, key: ContentKey(rawValue: placeholder))
                     }
                 }
 
-                // Include rfc822MessageId in the PendingOperation messageIds so
-                // sync protection (pendingAllIds) prevents re-inserting a stale draft
-                // from the server during the brief window before .deleteDraft drains.
-                // Matches the protection pattern in queueDraftSave.
-                var opMsgIds = [serverDraftId]
-                if let rfc822 = rfc822MessageId, rfc822 != serverDraftId {
-                    opMsgIds.append(rfc822)
-                }
-                // T4.S6 follow-up — RECORD THE EPOCH THIS OP'S ADDRESS BELONGS TO.
-                //
-                // Slot 1's rfc822 is carried for the SYNC FILTER (`pendingAllIds`) AND,
-                // since v72, handed to `provider.deleteDraft` as the identity to
-                // corroborate — `executeOperation` passes slot 0 as the address and slot
-                // 1 as the identity, rather than resolving whatever `messageIds.first`
-                // happened to be. `AccountManager.opIsAddressOnly` therefore still
-                // returns false for such an op and the reaction's step-5 sweep leaves it
-                // alone; post-reaction it would otherwise unpark and expunge whichever
-                // message the NEW numbering put at that UID — C3, the one hard
-                // invariant. (⚑ Since 2026-08-01 `IMAPProvider.deleteDraft` refuses a
-                // bare UID rather than expunging it, so the C3 outcome described here is
-                // closed at the provider as well. The stamp is still what keeps the op
-                // from being executed — and re-executed — under a numbering it was never
-                // recorded under.)
-                //
-                // Stamping the folder's epoch INSIDE this same transaction (the write is
-                // already gated by the refusal above, so the row exists and its epoch is
-                // non-nil for any numeric id on an IMAP-family account) makes the op
-                // self-describing: the claim transaction in `drainPendingQueue` compares
-                // the stamp against the folder's CURRENT epoch and drops the op rather
-                // than executing it under a numbering it was never recorded under.
-                //
-                // ONLY for a numeric id. A non-numeric `serverDraftId` resolves through
-                // `searchByMessageId` and survives any epoch change intact — stamping it
-                // would manufacture a permanent refusal out of a safe op.
-                let observedUidValidity: Int? = UInt32(serverDraftId) != nil
-                    ? try Folder.fetchOne(db, key: folderId)?.lastKnownUidValidity
-                    : nil
-                // …and, separately, THE EPOCH THE ADDRESS ITSELF WAS MINTED IN. The two
-                // are different questions and only this one can be wrong at admission:
-                // `observedUidValidity` reads the folder's epoch NOW, so it agrees with
-                // itself by construction and can never reveal that `serverDraftId` was
-                // already an address from a discarded numbering when the caller handed
-                // it over. `uidValidity` comes from the row that owns the address
-                // (`Draft.serverDraftUidValidity`, itself the epoch of the SELECT that
-                // minted the UID), so a disagreement is detectable — the provider's
-                // STRONG arm compares it against the live SELECT and fails closed.
-                //
-                // ONLY for a numeric id, for the same reason the stamp above is: an
-                // epoch beside a non-numeric (rfc822) address is an asymmetric identity
-                // that names nothing, and the provider refuses it outright.
-                let mintedUidValidity: Int? = UInt32(serverDraftId) != nil ? uidValidity : nil
                 try PendingOperation(
                     type: .deleteDraft,
-                    messageIds: opMsgIds,
+                    messageIds: [encodedId],
                     accountId: accountId,
                     folderPath: folderPath,
-                    observedUidValidity: observedUidValidity,
-                    draftServerUidValidity: mintedUidValidity
+                    observedUidValidity: mintedUidValidity,
+                    draftServerUidValidity: mintedUidValidity,
+                    instanceEpoch: instanceEpoch,
+                    draftId: draftId,
+                    draftDeleteAddressKind: addressKind
                 ).insert(db)
+                if deleteOwnedLocalDraft {
+                    guard let draftId,
+                          let instanceEpoch,
+                          let owned = try Draft.fetchOne(db, key: draftId),
+                          owned.accountId == accountId,
+                          owned.instanceEpoch == instanceEpoch else {
+                        throw DraftStore.DraftEpochAdmissionError.staleOrReserved
+                    }
+                    let dir = owned.attachmentsDirName
+                    try DraftStore.applyDelete(
+                        id: draftId,
+                        expectedInstanceEpoch: instanceEpoch,
+                        db: db)
+                    return dir
+                }
+                return nil
             }
-            // Refresh UI so the optimistic removal is visible immediately.
+            if let deletedAttachmentDir {
+                DraftAttachmentStorage.deleteAttachments(dirName: deletedAttachmentDir)
+            }
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+            Task { await drainPendingQueue() }
+            return true
         } catch {
             print("[Queue] ERROR: queueDraftDelete failed: \(error)")
-        }
-        Task { await drainPendingQueue() }
-    }
-
-    /// Remove optimistic draft MessageHeader (no server op needed — draft was never pushed).
-    func removeOptimisticDraftHeader(accountId: String, rfc822MessageId: String) async {
-        do {
-            let folderPath = try await draftsFolderPath(accountId: accountId)
-            let folderId = "\(accountId):\(folderPath)"
-            try await dbPool.write { db in
-                let headers = try MessageHeader
-                    .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822MessageId)
-                    .fetchAll(db)
-                for header in headers {
-                    _ = try? MessageBody.deleteOne(db, key: header.id)
-                    try header.delete(db)
-                }
-            }
-        } catch {
-            print("[Queue] ERROR: removeOptimisticDraftHeader failed: \(error)")
+            return false
         }
     }
-
 }

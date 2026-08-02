@@ -70,3 +70,71 @@ struct DraftKeyParsingTests {
         #expect(result?.stableId == "rfc822@example.com")
     }
 }
+
+@Suite("Locally authored draft reopen authority")
+struct LocallyAuthoredDraftOpenAuthorityTests {
+    private func draft(
+        accountId: String = "acc1",
+        epoch: String = "E1",
+        serverId: String? = nil,
+        status: String? = "pushed"
+    ) -> Draft {
+        var value = Draft(
+            id: "draft-1", accountId: accountId,
+            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "subject", body: "body", replyToId: nil,
+            isForward: false, editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+            serverDraftId: serverId, serverPushStatus: status,
+            rfc822MessageId: "draft@example.com", attachmentsDirName: nil)
+        value.instanceEpoch = epoch
+        return value
+    }
+
+    @Test("Every locally-authored draft handoff rejects an owner, generation, status, runtime, or native-address replacement")
+    func exactHandoffAuthority() {
+        let placeholder = PendingOperation.draftPlaceholderMessageId(
+            draftId: "draft-1", instanceEpoch: "E1")
+        let cases: [(LocallyAuthoredDraftOpenAuthority, Draft)] = [
+            (.init(
+                draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+                serverPushStatus: "pushed", runtimeKind: .imap,
+                address: .placeholder(messageId: placeholder)),
+             draft()),
+            (.init(
+                draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+                serverPushStatus: "pushed", runtimeKind: .gmail,
+                address: .gmail(resourceId: "gmail-1", containedMessageId: "message-1")),
+             draft(serverId: "gmail-1")),
+            (.init(
+                draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+                serverPushStatus: "pushed", runtimeKind: .outlook,
+                address: .outlook(graphId: "graph-1")),
+             draft(serverId: "graph-1")),
+            (.init(
+                draftId: "draft-1", accountId: "acc1", instanceEpoch: "E1",
+                serverPushStatus: "pushed", runtimeKind: .demo,
+                address: .demo(localId: "demo-1")),
+             draft(serverId: "demo-1")),
+        ]
+
+        for (authority, original) in cases {
+            #expect(authority.matches(original, runtimeKind: authority.runtimeKind))
+            #expect(!authority.matches(
+                draft(accountId: "acc2", serverId: original.serverDraftId),
+                runtimeKind: authority.runtimeKind))
+            #expect(!authority.matches(
+                draft(epoch: "E2", serverId: original.serverDraftId),
+                runtimeKind: authority.runtimeKind))
+            #expect(!authority.matches(
+                draft(serverId: original.serverDraftId, status: "dirty"),
+                runtimeKind: authority.runtimeKind))
+            #expect(!authority.matches(original, runtimeKind: .unknown))
+            // SUBTRACT — v2final's placeholder authority is the local
+            // draftId+instanceEpoch owner, not a provider-native address.
+            if case .placeholder = authority.address { continue }
+            #expect(!authority.matches(
+                draft(serverId: original.serverDraftId == nil ? "unexpected" : "replacement"),
+                runtimeKind: authority.runtimeKind))
+        }
+    }
+}
