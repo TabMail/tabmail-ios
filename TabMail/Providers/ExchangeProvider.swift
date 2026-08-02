@@ -913,6 +913,16 @@ actor ExchangeProvider: EmailProvider {
 
     /// Used by delta pagination — the next/delta links are absolute URLs.
     private func requestAbsolute(url: String) async throws -> Data {
+        guard let components = URLComponents(string: url),
+              components.scheme == "https",
+              components.host?.lowercased() == "graph.microsoft.com",
+              components.user == nil,
+              components.password == nil,
+              components.port == nil || components.port == 443
+        else {
+            throw ProviderError.invalidURL("Graph pagination")
+        }
+
         do {
             return try await authedHTTP.get(url)
         } catch let e as HTTPError {

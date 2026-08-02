@@ -32,6 +32,32 @@ import Foundation
 @Suite("ExchangeProvider — HTTP-level integration", .serialized, .processGlobalState)
 struct ExchangeProviderMockTests {
 
+    @Test("A foreign-host Graph nextLink is refused before any authenticated request")
+    func foreignHostNextLinkIsRefusedBeforeRequest() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+
+        let provider = ExchangeProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-graph-token" },
+            session: http.session
+        )
+
+        do {
+            _ = try await provider.listMessageIdsPage(
+                folder: "inbox",
+                pageToken: "https://example.com/v1.0/me/messages?$skiptoken=foreign"
+            )
+            Issue.record("a foreign-host Graph nextLink must be rejected")
+        } catch ProviderError.invalidURL {
+            // Expected: reject the untrusted absolute URL before authentication or I/O.
+        } catch {
+            Issue.record("expected ProviderError.invalidURL, got \(error)")
+        }
+
+        #expect(http.recordedCalls().isEmpty)
+    }
+
     // MARK: - Test 1: itemAttachment expand + nested-list fallback + marker
 
     @Test("fetchMessage expands itemAttachment, lists nested children, emits marker")
