@@ -109,6 +109,13 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     // updates to seed() and the post-commit SELECT.
     var isInInbox: Bool
     var messageId: String
+    /// UIDVALIDITY observed by the exact IMAP SELECT/FETCH that supplied this
+    /// row's current mailbox-local UID. Nil means the address is unproven (or
+    /// the provider has stable ids). Never synthesize this from Folder state.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final` has no persisted header/snapshot
+    /// observation epoch; commit 486bafd4b explicitly deferred this transport.
+    var observedUidValidity: Int? = nil
     var rfc822MessageId: String? // RFC 2822 Message-ID header (device-independent, for cross-device AI cache probe)
     var inReplyTo: String? // RFC 2822 In-Reply-To header (parent message ID for thread chain walking)
     var referencesJSON: String? // RFC 2822 References header as JSON array of normalized message IDs

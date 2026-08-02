@@ -7,6 +7,17 @@ import GRDB
 
 extension SyncEngine {
 
+    /// One stored epoch may describe a combined primary+retry result only when
+    /// every contributing fetch reported the same nonzero value. Any missing or
+    /// mixed observation collapses to nil (fail closed; never borrow Folder state).
+    nonisolated static func commonObservedUidValidity(_ epochs: [UInt32?]) -> UInt32? {
+        guard !epochs.isEmpty,
+              epochs.allSatisfy({ epoch in epoch.map { $0 > 0 } == true })
+        else { return nil }
+        let values = Set(epochs.compactMap { $0 })
+        return values.count == 1 ? values.first : nil
+    }
+
     // MARK: - Backfill Window (shared by both workers via header crawl)
 
     /// Fetch and insert one window of backfill messages in chunks.
@@ -67,11 +78,13 @@ extension SyncEngine {
                 try Task.checkCancellation()
                 let end = min(start + chunkSize, missingUIDs.count)
                 let chunk = Array(missingUIDs[start..<end])
-                var headers = try await workQueue.execute(priority: .headerFetch) {
-                    try await provider.fetchMessageHeaders(
+                let primaryFetch = try await workQueue.execute(priority: .headerFetch) {
+                    try await provider.fetchMessageHeadersWithObservedEpoch(
                         folder: folder.path, uids: chunk, batchSize: imapBatchSize, interBatchDelay: imapDelay
                     )
                 }
+                var headers = primaryFetch.messages
+                var contributingEpochs: [UInt32?] = [primaryFetch.observedEpoch]
                 // Retry silently dropped UIDs — IMAP FETCH can return fewer results
                 // than requested without an error. One retry catches transient issues.
                 if headers.count < chunk.count {
@@ -79,11 +92,13 @@ extension SyncEngine {
                     let droppedUIDs = chunk.filter { !returnedIds.contains("\($0)") }
                     print("[Backfill-FETCH-GAP] \(folder.path): requested \(chunk.count) UIDs, got \(headers.count). Retrying \(droppedUIDs.count) dropped UIDs: \(droppedUIDs.sorted().prefix(20))")
                     if !droppedUIDs.isEmpty {
-                        let retryHeaders = try await workQueue.execute(priority: .headerFetch) {
-                            try await provider.fetchMessageHeaders(
+                        let retryFetch = try await workQueue.execute(priority: .headerFetch) {
+                            try await provider.fetchMessageHeadersWithObservedEpoch(
                                 folder: folder.path, uids: droppedUIDs, batchSize: imapBatchSize, interBatchDelay: imapDelay
                             )
                         }
+                        let retryHeaders = retryFetch.messages
+                        contributingEpochs.append(retryFetch.observedEpoch)
                         if !retryHeaders.isEmpty {
                             print("[Backfill-FETCH-GAP] \(folder.path): retry recovered \(retryHeaders.count)/\(droppedUIDs.count)")
                             headers.append(contentsOf: retryHeaders)
@@ -94,7 +109,8 @@ extension SyncEngine {
                 }
                 let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
-                    folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
+                    folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                    observedEpoch: Self.commonObservedUidValidity(contributingEpochs)
                 )
                 totalInserted += inserted
                 allFTSRecords.append(contentsOf: ftsRecords)
@@ -151,7 +167,8 @@ extension SyncEngine {
                 }
                 let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
-                    folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
+                    folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                    observedEpoch: nil
                 )
                 totalInserted += inserted
                 allFTSRecords.append(contentsOf: ftsRecords)
@@ -207,7 +224,8 @@ extension SyncEngine {
                 }
                 let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                     headers, folderId: folderId, accountId: folder.accountId,
-                    folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
+                    folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                    observedEpoch: nil
                 )
                 totalInserted += inserted
                 allFTSRecords.append(contentsOf: ftsRecords)
@@ -339,11 +357,13 @@ extension SyncEngine {
         folderPath: String,
         folderRole: FolderRole,
         isInInbox: Bool,
-        epochPremise: SyncEngine.CrawlEpochPremise
+        epochPremise: SyncEngine.CrawlEpochPremise,
+        observedEpoch: UInt32?
     ) async -> SyncEngine.BackfillBatchOutcome {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
-            folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise
+            folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise,
+            observedEpoch: observedEpoch
         )
         guard !result.refused else { return .refused }
         return .landed(
@@ -368,11 +388,13 @@ extension SyncEngine {
         accountId: String,
         folderPath: String,
         folderRole: FolderRole,
-        isInInbox: Bool
+        isInInbox: Bool,
+        observedEpoch: UInt32?
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)]) {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
-            folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil
+            folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil,
+            observedEpoch: observedEpoch
         )
         return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates)
     }
@@ -384,10 +406,14 @@ extension SyncEngine {
         folderPath: String,
         folderRole: FolderRole,
         isInInbox: Bool,
-        epochPremise: SyncEngine.CrawlEpochPremise?
+        epochPremise: SyncEngine.CrawlEpochPremise?,
+        observedEpoch: UInt32?
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool) {
         guard !headers.isEmpty else { return (0, [], [], false) }
 
+        let sourceBoundEpoch = observedEpoch.flatMap { epoch in
+            epoch > 0 ? Int(exactly: epoch) : nil
+        }
         var ftsRecords: [FTSHeaderRecord] = []
         var count = 0
         var unreadInserted = 0
@@ -480,6 +506,7 @@ extension SyncEngine {
                                 isInInbox: isInInbox
                             )
                             header.rfc822MessageId = info.rfc822MessageId
+                            header.observedUidValidity = sourceBoundEpoch
                             header.inReplyTo = info.inReplyTo
                             header.referencesJSON = MessageHeader.encodeReferences(info.references)
                             header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: accountId, subject: header.subject)
@@ -664,4 +691,3 @@ extension SyncEngine {
         }
     }
 }
-

@@ -73,7 +73,7 @@ struct HeaderCanonicalizeTests {
         _ db: DatabaseQueue,
         messageId: String,
         incomingRfc822: String? = nil
-    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool) {
         try db.write { dbConn in
             try SyncEngine.canonicalizeLocalRows(
                 accountId: "acc1", folderPath: trashPath,

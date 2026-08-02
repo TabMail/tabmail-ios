@@ -2792,6 +2792,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Widens the search window progressively if no results found.
     /// Delegates SEARCH to searchDateRange which handles PayloadTooLargeError via binary-split.
     func fetchOlderMessages(folder: String, before: Date, limit: Int) async throws -> [MessageHeaderInfo] {
+        try await fetchOlderMessagesWithObservedEpoch(
+            folder: folder, before: before, limit: limit).messages
+    }
+
+    /// Infinite-scroll headers paired with the SELECT that immediately served
+    /// their UID FETCH. A search-window premise is not promoted into authority.
+    func fetchOlderMessagesWithObservedEpoch(
+        folder: String, before: Date, limit: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) {
         try await withActionConnection(folder: folder) { server in
             var windowDays = 90
             let maxWindowDays = 365 * 10
@@ -2810,15 +2819,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         uidSet.insert(uid)
                     }
 
-                    _ = try await server.selectMailbox(folder)
+                    let selection = try await self.selectMailboxTracked(server, folder: folder)
                     let infos = try await server.fetchMessageInfosBulk(using: uidSet)
-                    return infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }
+                    let observed = selection.uidValidity.value
+                    return (
+                        infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date },
+                        observed != 0 ? observed : nil
+                    )
                 }
 
                 windowDays *= 2
             }
 
-            return []
+            return ([], nil)
         }
     }
 

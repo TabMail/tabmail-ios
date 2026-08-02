@@ -2236,5 +2236,15 @@ final class AppDatabase: Sendable {
                 t.add(column: "draftDeleteAddressKind", .text)
             }
         }
+
+        migrator.registerMigration("v77_addMessageHeaderObservedUidValidity") { db in
+            // ⚑ NO REFERENCE — INVENTED. Source-bound IMAP epoch transport,
+            // explicitly deferred by v2final commit 486bafd4b. Nullable, with no
+            // default and no backfill: existing rows remain unproven rather than
+            // adopting the Folder's current epoch by assertion.
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "observedUidValidity", .integer)
+            }
+        }
     }
 }

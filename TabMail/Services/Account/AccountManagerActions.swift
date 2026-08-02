@@ -468,6 +468,7 @@ extension AccountManager {
                 Column("folderId").set(to: destFolderId),
                 Column("folderPath").set(to: destinationPath),
                 Column("isInInbox").set(to: destIsInbox),
+                Column("observedUidValidity").set(to: nil as Int?),
                 Column("actionTag").set(to: nil as String?),
                 Column("tagSortOrder").set(to: 99)
             )
@@ -475,7 +476,8 @@ extension AccountManager {
             try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db,
                 Column("folderId").set(to: destFolderId),
                 Column("folderPath").set(to: destinationPath),
-                Column("isInInbox").set(to: destIsInbox)
+                Column("isInInbox").set(to: destIsInbox),
+                Column("observedUidValidity").set(to: nil as Int?)
             )
         }
 
@@ -848,6 +850,7 @@ extension AccountManager {
                     print("[UndoStack] undo\(label) — restore msg id=\(msg.id) existing=\(existing == nil ? "nil(deleted)" : "folderId=\(existing!.folderId)") → setting folderId=\(toFolderId)")
                     var restored = msg
                     restored.folderId = toFolderId
+                    restored.observedUidValidity = nil
                     try restored.save(db)
                 }
 
@@ -965,6 +968,7 @@ extension AccountManager {
                 header.snippet = snippet
                 header.date = Date(timeIntervalSince1970: draft.updatedAt)
                 header.isRead = true
+                header.observedUidValidity = nil
                 try header.save(db)
                 try MessageBody(
                     contentKey: ContentKey(rawValue: placeholderHeaderId),

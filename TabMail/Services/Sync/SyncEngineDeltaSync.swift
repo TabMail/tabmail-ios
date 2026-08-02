@@ -276,6 +276,7 @@ extension SyncEngine {
                                 print("[Sync] deltaSync reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
                                 orphaned.folderId = folder.id
                                 orphaned.folderPath = folder.path
+                                orphaned.observedUidValidity = nil
                                 orphaned.isInInbox = folder.role == .inbox
                                 orphaned.messageId = header.messageId
                                 orphaned.isRead = header.isRead
@@ -351,6 +352,7 @@ extension SyncEngine {
                         } else if existsLocally && belongsInFolder {
                             // Update flags on existing message.
                             if var existing {
+                                existing.observedUidValidity = nil
                                 let isPendingFlag = snapshot.flag.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
                                 if !isPendingFlag && recentlyCompletedSnapshot[info.messageId] == nil {
                                     existing.isRead = info.isRead
@@ -541,6 +543,7 @@ extension SyncEngine {
                     if existsLocally && (isPendingFlag || isRecentlyDone) {
                         // Has pending or recently completed flag ops — only update non-flag fields
                         if var existing {
+                            existing.observedUidValidity = nil
                             existing.rfc822MessageId = info.rfc822MessageId
                             existing.referencesJSON = MessageHeader.encodeReferences(info.references)
                             try existing.update(db)
@@ -548,6 +551,7 @@ extension SyncEngine {
                     } else if existsLocally {
                         // Update flags on existing message
                         if var existing {
+                            existing.observedUidValidity = nil
                             existing.isRead = info.isRead
                             existing.isFlagged = info.isFlagged
                             if let serverTag = info.actionTag {
@@ -633,6 +637,7 @@ extension SyncEngine {
                             print("[Sync] exchangeDelta reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
                             orphaned.folderId = folder.id
                             orphaned.folderPath = folder.path
+                            orphaned.observedUidValidity = nil
                             orphaned.isInInbox = folder.role == .inbox
                             orphaned.messageId = header.messageId
                             orphaned.isRead = header.isRead

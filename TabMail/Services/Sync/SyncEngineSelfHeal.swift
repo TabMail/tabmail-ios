@@ -289,7 +289,8 @@ extension SyncEngine {
             folderPath: folder.path,
             folderRole: folder.role,
             isInInbox: folder.role == .inbox,
-            epochPremise: .init(storedEpoch)
+            epochPremise: .init(storedEpoch),
+            observedEpoch: fetchEpoch
         ) {
         case .refused:
             // TRANSIENT — the next hourly run reads whatever premise now holds.

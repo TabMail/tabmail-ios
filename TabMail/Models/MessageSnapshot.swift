@@ -12,6 +12,7 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
     let id: String
     let accountId: String
     let messageId: String
+    let observedUidValidity: Int?
     let threadId: String?
     // var (not let): reloadMessages' Pass-1 retains an existing NON-EMPTY
     // computedThreadId when a same-identity fresh row arrives with an EMPTY
@@ -51,6 +52,7 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
         self.id = header.id
         self.accountId = header.accountId
         self.messageId = header.messageId
+        self.observedUidValidity = header.observedUidValidity
         self.threadId = header.threadId
         self.computedThreadId = header.computedThreadId
         self.rfc822MessageId = header.rfc822MessageId

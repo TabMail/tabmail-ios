@@ -550,17 +550,19 @@ actor SyncEngine {
                     .fetchOne(db)?.date ?? Date()
             }
 
-            let headers: [MessageHeaderInfo]
+            let fetched: (headers: [MessageHeaderInfo], observedEpoch: UInt32?)
             do {
-                headers = try await queue.execute(priority: .userAction) {
+                fetched = try await queue.execute(priority: .userAction) {
                     if let imapProvider = provider as? IMAPProvider {
-                        return try await imapProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25)
+                        let result = try await imapProvider.fetchOlderMessagesWithObservedEpoch(
+                            folder: folder.path, before: oldestDate, limit: 25)
+                        return (result.messages, result.observedEpoch)
                     } else if let gmailProvider = provider as? GmailProvider {
-                        return try await gmailProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25)
+                        return (try await gmailProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25), nil)
                     } else if let exchangeProvider = provider as? ExchangeProvider {
-                        return try await exchangeProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25)
+                        return (try await exchangeProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25), nil)
                     }
-                    return []
+                    return ([], nil)
                 }
             } catch {
                 if SyncEngine.isSelectFailedError(error) {
@@ -569,6 +571,10 @@ actor SyncEngine {
                     continue
                 }
                 throw error
+            }
+            let headers = fetched.headers
+            let sourceBoundEpoch = fetched.observedEpoch.flatMap { epoch in
+                epoch > 0 ? Int(exactly: epoch) : nil
             }
 
             // Deduplicate and insert
@@ -594,6 +600,7 @@ actor SyncEngine {
                         isInInbox: folder.role == .inbox
                     )
                     header.rfc822MessageId = info.rfc822MessageId
+                    header.observedUidValidity = sourceBoundEpoch
                     header.inReplyTo = info.inReplyTo
                     header.referencesJSON = MessageHeader.encodeReferences(info.references)
                     header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: folder.accountId, subject: header.subject)

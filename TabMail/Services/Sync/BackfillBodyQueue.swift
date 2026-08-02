@@ -683,6 +683,9 @@ actor BackfillBodyQueue {
                 header.id = newHeaderId
                 header.messageId = newUID
                 header.missFetchCount = 0
+                // This unbound body-queue re-key did not observe the replacement
+                // UID beside a UIDVALIDITY. Sync must prove it before admission.
+                header.observedUidValidity = nil
                 try header.insert(db)
                 if var body = oldBody {
                     body.id = ContentKey(rawValue: newHeaderId)

@@ -10,6 +10,21 @@ import GRDB
 @Suite("MessageSnapshot")
 struct MessageSnapshotTests {
 
+    @Test("MessageSnapshot preserves the header's E1 epoch after the Folder advances to E2")
+    func preservesCapturedObservationEpoch() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, provider: .imap)
+        var folder = try TestDatabase.insertFolder(db)
+        var header = try TestDatabase.insertMessageHeader(db, messageId: "21")
+        header.observedUidValidity = 101
+        try db.write { try header.update($0) }
+        let snapshot = MessageSnapshot(from: header)
+        folder.lastKnownUidValidity = 202
+        try db.write { try folder.update($0) }
+
+        #expect(snapshot.observedUidValidity == 101)
+    }
+
     @Test("Init from MessageHeader copies all fields")
     func initFromHeader() throws {
         let db = try TestDatabase.make()

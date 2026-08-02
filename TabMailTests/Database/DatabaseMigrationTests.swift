@@ -11,6 +11,33 @@ import Foundation
 import GRDB
 @testable import TabMail
 
+private func insertPreV77Header(
+    _ db: DatabaseQueue,
+    messageId: String,
+    accountId: String = "acc1",
+    folderPath: String = "INBOX",
+    isRead: Bool = false,
+    actionTag: ActionTag? = nil
+) throws -> String {
+    let id = "\(accountId):\(folderPath):\(messageId)"
+    try db.write { connection in
+        try connection.execute(sql: """
+            INSERT INTO messageHeader
+                (id, folderId, accountId, folderPath, isInInbox, messageId,
+                 subject, `from`, fromAddress, `to`, date, snippet, isRead,
+                 actionTag, tagSortOrder)
+            VALUES (?, ?, ?, ?, ?, ?, 'subject', 'sender@example.com',
+                    'sender@example.com', 'recipient@example.com', 1, 'snippet',
+                    ?, ?, ?)
+            """, arguments: [
+                id, "\(accountId):\(folderPath)", accountId, folderPath,
+                folderPath == "INBOX", messageId, isRead,
+                actionTag?.rawValue, actionTag?.sortOrder ?? 99,
+            ])
+    }
+    return id
+}
+
 @Suite("Database Migrations")
 struct DatabaseMigrationTests {
 
@@ -279,10 +306,9 @@ struct DatabaseMigrationTests {
         try TestDatabase.insertAccount(db, id: "acc2", email: "two@example.com")
         try TestDatabase.insertFolder(db, accountId: "acc2")
 
-        let read = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isRead: true, actionTag: .reply)
-        try TestDatabase.insertMessageHeader(db, messageId: "2")
-        try TestDatabase.insertMessageHeader(db, messageId: "9", folderId: "acc2:INBOX", accountId: "acc2")
+        let readId = try insertPreV77Header(db, messageId: "1", isRead: true, actionTag: .reply)
+        _ = try insertPreV77Header(db, messageId: "2")
+        _ = try insertPreV77Header(db, messageId: "9", accountId: "acc2")
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:1")
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:2")
         try TestDatabase.insertMessageBody(db, headerId: "acc2:INBOX:9")
@@ -325,7 +351,7 @@ struct DatabaseMigrationTests {
         #expect(try db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM pendingOperation") } == 1)
         // Flags survive verbatim, including the AI tag — a body-cache drop is not a
         // reason to lose a message's triage state.
-        let after = try db.read { try MessageHeader.fetchOne($0, key: read.id) }
+        let after = try db.read { try MessageHeader.fetchOne($0, key: readId) }
         #expect(after?.isRead == true)
         #expect(after?.actionTag == .reply)
     }
@@ -348,8 +374,8 @@ struct DatabaseMigrationTests {
         let db = try Self.makeV69Database()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        try TestDatabase.insertMessageHeader(db, messageId: "1")
-        try TestDatabase.insertMessageHeader(db, messageId: "2")
+        _ = try insertPreV77Header(db, messageId: "1")
+        _ = try insertPreV77Header(db, messageId: "2")
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:1")
         try db.write { conn in
             try conn.execute(sql: """
@@ -388,7 +414,7 @@ struct DatabaseMigrationTests {
         let db = try Self.makeV69Database()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        try TestDatabase.insertMessageHeader(db, messageId: "1")
+        _ = try insertPreV77Header(db, messageId: "1")
 
         try AppDatabase.runMigrations(on: db)
         #expect(try db.read { try MessageBody.fetchCount($0) } == 0)
@@ -674,7 +700,7 @@ struct V70CrossStoreInvariantTests {
         let db = try Self.makeV69Database()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        try TestDatabase.insertMessageHeader(db, messageId: "1")
+        _ = try insertPreV77Header(db, messageId: "1")
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:1")
 
         let key = ContentKey(rawValue: "acc1:INBOX:1")
@@ -753,5 +779,40 @@ struct V70CrossStoreInvariantTests {
         // `SearchIndex.shared` is process-global — the unique key above plus this
         // cleanup keep the suite from leaking rows into its neighbours.
         try await index.removeMessages(contentKeys: [key])
+    }
+
+    @Test("v77 adds nullable observedUidValidity without backfilling existing headers")
+    func v77AddsNullableObservationEpochWithoutBackfill() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var beforeMigrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &beforeMigrator)
+        try beforeMigrator.migrate(db, upTo: "v76_addDraftGenerationAndTypedIdentity")
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let headerId = "acc1:INBOX:77"
+        try db.write { connection in
+            try connection.execute(sql: """
+                INSERT INTO messageHeader
+                    (id, folderId, accountId, folderPath, isInInbox, messageId,
+                     subject, `from`, fromAddress, `to`, date, snippet)
+                VALUES (?, 'acc1:INBOX', 'acc1', 'INBOX', 1, '77',
+                        'subject', 'sender@example.com', 'sender@example.com',
+                        'recipient@example.com', 1, 'snippet')
+                """, arguments: [headerId])
+        }
+
+        var afterMigrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &afterMigrator)
+        try afterMigrator.migrate(db, upTo: "v77_addMessageHeaderObservedUidValidity")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(messageHeader)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "observedUidValidity" })
+        #expect((column["notnull"] as Int) == 0)
+        let value: Int? = try db.read {
+            try Int.fetchOne($0, sql: "SELECT observedUidValidity FROM messageHeader WHERE id = ?", arguments: [headerId])
+        }
+        #expect(value == nil)
     }
 }

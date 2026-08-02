@@ -1308,10 +1308,10 @@ extension SyncEngine {
                                     print("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to)")
 
                                     // FETCH only the existing UIDs
-                                    let fetchedHeaders: [MessageHeaderInfo]
+                                    let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
                                     do {
-                                        fetchedHeaders = try await workQueue.execute(priority: .headerFetch) {
-                                            try await imapProvider.fetchMessageHeaders(
+                                        fetched = try await workQueue.execute(priority: .headerFetch) {
+                                            try await imapProvider.fetchMessageHeadersWithObservedEpoch(
                                                 folder: folderCaptured.path, uids: existingUIDs,
                                                 batchSize: batchSize, interBatchDelay: interBatchDelay
                                             )
@@ -1348,6 +1348,7 @@ extension SyncEngine {
                                             break
                                         }
                                     }
+                                    let fetchedHeaders = fetched.messages
 
                                     // Capture-at-fetch again, and BEFORE the insert.
                                     // `fetchMessageHeaders` re-SELECTs (tracked) per
@@ -1396,7 +1397,8 @@ extension SyncEngine {
                                             await self.insertBackfillBatch(
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
-                                                epochPremise: .init(walkWritePremise)
+                                                epochPremise: .init(walkWritePremise),
+                                                observedEpoch: fetched.observedEpoch
                                             )
                                         else {
                                             await cursor.failRange(from: range.from, to: range.to)
@@ -1708,7 +1710,8 @@ extension SyncEngine {
                         // so this call site cannot silently swallow one.
                         let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
                             headers, folderId: folder.id, accountId: folder.accountId,
-                            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox
+                            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                            observedEpoch: nil
                         )
                         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
                         if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }

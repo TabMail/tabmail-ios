@@ -621,11 +621,11 @@ extension SyncEngine {
         isInInbox: Bool,
         incomingNormalizedRfc822: String?,
         db: Database
-    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?) {
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool) {
         let allRows = try MessageHeader
             .filter(Column("messageId") == messageId && Column("folderId") == folderId)
             .fetchAll(db)
-        guard !allRows.isEmpty else { return (nil, [], nil) }
+        guard !allRows.isEmpty else { return (nil, [], nil, false) }
 
         let canonicalId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
 
@@ -649,12 +649,12 @@ extension SyncEngine {
                 // production observability needs it.
                 BackgroundSyncLogger.log("[Sync] ERROR: canonicalize identity gate at (folderId=\(folderId), msgId=\(messageId)) excluded \(allRows.count - rows.count) row(s) whose stored rfc822MessageId differs from the incoming identity — address match is not an identity proof (R15-F1)")
             }
-            guard !rows.isEmpty else { return (nil, [], nil) }
+            guard !rows.isEmpty else { return (nil, [], nil, false) }
         } else {
             let distinctNonNil = Set(allRows.compactMap { normalizedRfc822Identity($0.rfc822MessageId) })
             if distinctNonNil.count > 1 {
                 BackgroundSyncLogger.log("[Sync] ERROR: canonicalize identity conflict at (folderId=\(folderId), msgId=\(messageId)) with a NIL incoming identity — \(distinctNonNil.count) distinct stored identities among \(allRows.count) rows; refusing to merge/re-key anything (R15-F1)")
-                return (allRows.first(where: { $0.id == canonicalId }), [], nil)
+                return (allRows.first(where: { $0.id == canonicalId }), [], nil, false)
             }
             rows = allRows
         }
@@ -663,10 +663,15 @@ extension SyncEngine {
         // per-message cost of the upsert loop is identical to the plain
         // fetchOne this replaced (ADR-IOS-029 hot-path discipline).
         if rows.count == 1 && rows[0].id == canonicalId {
-            return (rows[0], [], nil)
+            return (rows[0], [], nil, true)
         }
 
         var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
+        let survivorHadObservedEpoch = survivor.observedUidValidity != nil
+        // T2.5/T5.4: duplicate merging and re-keying do not prove that the
+        // survivor belongs to this provider address space. T5.11 owns that
+        // proof; until then canonicalization always clears source authority.
+        survivor.observedUidValidity = nil
         var removedIds: [String] = []
 
         // Preserve the richest cached body across all rows BEFORE any delete. Each
@@ -720,8 +725,8 @@ extension SyncEngine {
             // later sync once that row has been canonicalized in its own folder.
             guard try MessageHeader.fetchOne(db, key: canonicalId) == nil else {
                 print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
-                if !removedIds.isEmpty { try survivor.update(db) }
-                return (survivor, removedIds, nil)
+                if !removedIds.isEmpty || survivorHadObservedEpoch { try survivor.update(db) }
+                return (survivor, removedIds, nil, false)
             }
             // Re-key the optimistic-move remnant to the canonical PK, by delete +
             // reinsert with the body reattached below. (The FK that used to FORBID a
@@ -750,7 +755,7 @@ extension SyncEngine {
             try rekeyedBody.insert(db)
         }
 
-        return (survivor, removedIds, ftsRekey)
+        return (survivor, removedIds, ftsRekey, false)
     }
 
     /// SINGLE SOURCE OF TRUTH for "which local rows may be stale-deleted after a
@@ -951,6 +956,9 @@ extension SyncEngine {
             folder: folder.path, limit: limit, offset: 0)
         let messages = fetched.messages
         let observedEpochAtFetch = fetched.observedEpoch
+        let sourceBoundEpoch = observedEpochAtFetch.flatMap { epoch in
+            epoch > 0 ? Int(exactly: epoch) : nil
+        }
         let folderPath = folder.path
         let folderId = folder.id
         let accountId = folder.accountId
@@ -1251,6 +1259,9 @@ extension SyncEngine {
                 var migrated = staleMsg
                 migrated.id = newId
                 migrated.messageId = newMsgId
+                // RFC-only UID remap is corroboration, not provider-address
+                // ownership. T5.11 may prove a later canonical adoption.
+                migrated.observedUidValidity = nil
                 // If the remote match has a broken (epoch 0) date from IMAP parse
                 // failure, the entire remote record can't be trusted — preserve all
                 // local fields (isRead, isFlagged, date). The UID remap still happens
@@ -1349,11 +1360,14 @@ extension SyncEngine {
                 // classifications below, so every §5 decision in this pass is
                 // made against ONE value.
                 let normalizedIncomingRfc822 = Self.normalizedRfc822Identity(info.rfc822MessageId)
-                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?)
+                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool)
                 if folder.role == .drafts || folder.role == .sent {
-                    recon = (try MessageHeader
+                    let row = try MessageHeader
                         .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
-                        .fetchOne(db), [], nil)
+                        .fetchOne(db)
+                    let canonicalId = MessageIdentity.headerId(
+                        accountId: accountId, folderPath: folderPath, messageId: info.messageId)
+                    recon = (row, [], nil, row?.id == canonicalId)
                 } else {
                     recon = try Self.canonicalizeLocalRows(
                         accountId: accountId, folderPath: folderPath,
@@ -1398,6 +1412,10 @@ extension SyncEngine {
                         // single GRDB writer held per Sent sync, plus hundreds of piled log
                         // lines. The aggregate count is the diagnostic; the per-id detail
                         // isn't worth holding the writer.
+                        existing.observedUidValidity = recon.sourceAddressProven ? sourceBoundEpoch : nil
+                        if try existing.updateChanges(db, from: original) {
+                            upsUpdated += 1
+                        }
                         upsDraftSentSkip += 1
                         continue
                     }
@@ -1454,12 +1472,20 @@ extension SyncEngine {
                         storedNormalized: normalizedStoredRfc822,
                         incomingNormalized: normalizedIncomingRfc822
                     ) == .collision {
+                        // A positive RFC collision proves this fetch does not
+                        // own the stored row. Clear any previously usable epoch.
+                        existing.observedUidValidity = nil
+                        _ = try existing.updateChanges(db, from: original)
                         // Ungated per CLAUDE.md rule 12 exception (b): production
                         // observability needs this.
-                        BackgroundSyncLogger.log("[Sync] ERROR: rfc822MessageId collision at \(existing.id) (folder=\(folderPath)) — stored=\(normalizedStoredRfc822 ?? "nil") incoming=\(normalizedIncomingRfc822 ?? "nil") — refusing the whole merge, the stored row is left untouched")
+                        BackgroundSyncLogger.log("[Sync] ERROR: rfc822MessageId collision at \(existing.id) (folder=\(folderPath)) — stored=\(normalizedStoredRfc822 ?? "nil") incoming=\(normalizedIncomingRfc822 ?? "nil") — refusing the whole merge; message fields stay untouched and the source observation stamp is cleared")
                         upsNoop += 1
                         continue
                     }
+
+                    // Only the fast, exact canonical-PK hit may adopt this
+                    // fetch's bound epoch. Merge/rekey paths stay nil.
+                    existing.observedUidValidity = recon.sourceAddressProven ? sourceBoundEpoch : nil
 
                     // Update existing message with latest data from server.
                     // Skip flag/tag overwrites if message has pending queue ops OR
@@ -1550,6 +1576,7 @@ extension SyncEngine {
                     isInInbox: isInInbox
                 )
                 header.rfc822MessageId = info.rfc822MessageId
+                header.observedUidValidity = sourceBoundEpoch
                 header.inReplyTo = info.inReplyTo
                 header.referencesJSON = MessageHeader.encodeReferences(info.references)
                 header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: accountId, subject: header.subject)
@@ -1597,8 +1624,10 @@ extension SyncEngine {
                    let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
                    let optimistic = try MessageHeader
                     .filter(Column("folderId") == folderId && Column("rfc822MessageId") == rfc822 && Column("messageId") != header.messageId)
-                    .fetchOne(db) {
+                   .fetchOne(db) {
                     let oldId = optimistic.id
+                    // RFC-only placeholder adoption is not native ownership.
+                    header.observedUidValidity = nil
                     // Capture body for migration — defer insert until after header (FK constraint)
                     var deferredBody: MessageBody?
                     if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
@@ -1714,6 +1743,8 @@ extension SyncEngine {
                     }
                     if let preSync = preSyncRows.first {
                     let oldId = preSync.id
+                    // Account/message reclaim is not a folder-native PK proof.
+                    header.observedUidValidity = nil
                     // Preserve locally-computed AI work — sync has no actionTag
                     // / summaryBlurb / reminder fields for Outlook (Graph does
                     // not store them) and for Gmail they arrive via provider
@@ -1879,6 +1910,9 @@ extension SyncEngine {
                     print("[Sync] Reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folderId)")
                     orphaned.folderId = folderId
                     orphaned.folderPath = folderPath
+                    // Cross-mailbox optimistic ownership is ambiguous until
+                    // the destination sync proves a native address (T5.11).
+                    orphaned.observedUidValidity = nil
                     orphaned.isInInbox = isInInbox
                     orphaned.messageId = header.messageId
                     orphaned.isRead = header.isRead

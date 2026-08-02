@@ -196,7 +196,8 @@ struct EpochGuardRefusalTests {
             folderPath: "Receipts",
             folderRole: .custom,
             isInInbox: false,
-            epochPremise: .init(nil)
+            epochPremise: .init(nil),
+            observedEpoch: nil
         )
 
         #expect(!Self.landed(outcome),
@@ -243,7 +244,8 @@ struct EpochGuardRefusalTests {
             folderPath: "Receipts",
             folderRole: .custom,
             isInInbox: false,
-            epochPremise: .init(nil)
+            epochPremise: .init(nil),
+            observedEpoch: nil
         )
 
         #expect(Self.landed(outcome),
