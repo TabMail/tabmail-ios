@@ -39,6 +39,7 @@ struct PendingOperationPersistenceTests {
         #expect(fetched?.destinationPath == "Archive")
         #expect(fetched?.tagValue == nil)
         #expect(fetched?.retryCount == 0)
+        #expect(fetched?.everAttempted == false)
         #expect(fetched?.status == PendingStatus.queued.rawValue)
     }
 
@@ -343,6 +344,26 @@ struct PendingOperationPersistenceTests {
 
         let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
         #expect(fetched?.retryCount == 3)
+    }
+
+    @Test("everAttempted defaults false and persists independently of retry status")
+    func everAttemptedDefaultsAndPersists() throws {
+        let db = try TestDatabase.make()
+        var op = PendingOperation(
+            type: .move, messageIds: ["msg-1"], accountId: "acc1",
+            folderPath: "INBOX", destinationPath: "Archive")
+        try db.write { try op.insert($0) }
+
+        let inserted = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
+        #expect(inserted?.everAttempted == false)
+
+        op.everAttempted = true
+        op.status = PendingStatus.queued.rawValue
+        try db.write { try op.save($0) }
+
+        let fetched = try db.read { try PendingOperation.fetchOne($0, key: op.id) }
+        #expect(fetched?.everAttempted == true)
+        #expect(fetched?.status == PendingStatus.queued.rawValue)
     }
 
     // MARK: - uidResolutionRetryCount (dedicated budget, separate from retryCount)

@@ -45,6 +45,12 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     var userLabelId: String?
     var createdAt: Date
     var retryCount: Int
+    /// PORT — v2final's explicit persisted proof that provider I/O may have
+    /// started. Existing rows are conservatively backfilled true by v78;
+    /// newly admitted rows start false and the queue claim flips this true
+    /// atomically with `.inFlight`, before any provider call. Undo may only
+    /// annihilate an exact move bundle while this remains false.
+    var everAttempted: Bool
     /// Dormant compatibility field retained because v67 already shipped this
     /// non-null column. Provider-ID actions no longer run an RFC resolution
     /// retry ladder; no migration rewrite is required.
@@ -149,6 +155,7 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
         self.userLabelId = userLabelId
         self.createdAt = Date()
         self.retryCount = 0
+        self.everAttempted = false
         self.uidResolutionRetryCount = 0
         self.observedUidValidity = observedUidValidity
         self.draftServerUidValidity = draftServerUidValidity

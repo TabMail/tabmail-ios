@@ -795,9 +795,16 @@ extension AccountManager {
 
     // MARK: - Undo Support
 
-    /// Unified undo for archive, delete, and move. Cancels queued ops if still pending,
-    /// otherwise queues a move-back. Restores messages to original folder and adjusts
-    /// unread counts on both source (current) and destination (original) folders.
+    private struct UndoMoveWriteResult: Sendable {
+        var restoredOriginalHeaderIds: [String] = []
+        var affectedFolderIds: Set<String> = []
+        var queuedInverse = false
+    }
+
+    /// Compatibility entry point for the existing UI/test call shape. Execution
+    /// immediately collapses each captured header to the PORTed command/member
+    /// payload; the full row is never saved or resurrected.
+    @discardableResult
     func undoDestructiveAction(
         _ messages: [MessageHeader],
         accountId: String,
@@ -805,114 +812,180 @@ extension AccountManager {
         fromFolderPath: String,
         toFolderPath: String,
         toFolderId: String
-    ) async {
-        let ids = messages.map(\.messageId)
-        let idsSet = Set(ids)
-        let stableIdsSet = Set(messages.map(\.stableId))
-        let label = originalOpType.rawValue
-        print("[UndoStack] undo\(label) ENTER — msgIds=\(ids) from=\(fromFolderPath) restoreTo=\(toFolderPath) restoreFolderId=\(toFolderId)")
+    ) async -> [String] {
+        guard originalOpType == .move else {
+            // SUBTRACT — archive/delete compatibility rows and removeTag
+            // cancellation. T2.4 emits every destructive gesture as `.move`.
+            return []
+        }
+        return await undoMove(
+            accountId: accountId,
+            forwardDestinationPath: fromFolderPath,
+            members: messages.map(UndoMember.init(header:))
+        )
+    }
+
+    /// PORT — v2final's ordinary inverse plus exact whole-bundle
+    /// annihilation, narrowed to provider-native identity. No RFC lookup,
+    /// full-row resurrection, receipt, alias, or recovery lifecycle exists.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED: an IMAP move that has already reached the
+    /// provider cannot be reversed until a destination UID and positive
+    /// UIDVALIDITY are independently proven. v3 has no COPYUID/destination
+    /// receipt, so this path fails closed with no local or durable mutation;
+    /// sync/delta-sync reconciles server truth.
+    @discardableResult
+    func undoMove(
+        accountId: String,
+        forwardDestinationPath: String,
+        members: [UndoMember]
+    ) async -> [String] {
+        guard !members.isEmpty,
+              !forwardDestinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return [] }
+
+        let providerIds = members.map(\.providerMessageId)
+        let providerIdSet = Set(providerIds)
+        let sourcePaths = Set(members.map(\.sourceFolderPath))
+        let sourceFolderIds = Set(members.map(\.sourceFolderId))
+        let sourceEpochs = Set(members.map(\.sourceObservedUidValidity))
+        guard providerIdSet.count == members.count,
+              providerIds.allSatisfy({ !$0.isEmpty }),
+              sourcePaths.count == 1,
+              sourceFolderIds.count == 1,
+              sourceEpochs.count == 1,
+              let sourcePath = sourcePaths.first,
+              let sourceFolderId = sourceFolderIds.first
+        else {
+            print("[UndoStack] undoMove refused heterogeneous/duplicate command for account \(accountId)")
+            return []
+        }
+        let sourceEpoch = members[0].sourceObservedUidValidity
+
+        let result: UndoMoveWriteResult
         do {
-            try await dbPool.write { db in
-                let queuedOps = try PendingOperation
+            result = try await dbPool.write { db -> UndoMoveWriteResult in
+                guard let account = try Account.fetchOne(db, key: accountId) else { return UndoMoveWriteResult() }
+                let isIMAP = accountId != DemoSeed.demoAccountId
+                    && (account.provider == .imap || account.provider == .icloud)
+
+                // Authenticate every exact local member before touching any
+                // row or operation. A vanished/re-keyed row is a whole-command
+                // refusal; there is no upsert/resurrection fallback.
+                var currentRows: [MessageHeader] = []
+                for member in members {
+                    guard let row = try MessageHeader.fetchOne(db, key: member.originalHeaderId),
+                          row.accountId == accountId,
+                          row.messageId == member.providerMessageId,
+                          row.folderPath == forwardDestinationPath,
+                          row.folderId == MessageIdentity.folderId(
+                              accountId: accountId, folderPath: forwardDestinationPath)
+                    else { return UndoMoveWriteResult() }
+                    currentRows.append(row)
+                }
+
+                let activeMoves = try PendingOperation
                     .filter(Column("accountId") == accountId)
-                    .filter(Column("status") == PendingStatus.queued.rawValue)
+                    .filter(Column("type") == OperationType.move.rawValue)
+                    .filter(Column("status") != PendingStatus.cancelled.rawValue)
                     .fetchAll(db)
-                print("[UndoStack] undo\(label) — found \(queuedOps.count) queued ops for account")
-                for op in queuedOps {
-                    print("[UndoStack] undo\(label) — queued op: id=\(op.id.prefix(8)) type=\(op.type.rawValue) msgIds=\(op.messageIds) status=\(op.status)")
+
+                let related = activeMoves.filter {
+                    !Set($0.messageIds).isDisjoint(with: providerIdSet)
+                }
+                func exactPayload(_ op: PendingOperation) -> Bool {
+                    let ids = op.messageIds
+                    return ids.count == providerIds.count
+                        && Set(ids) == providerIdSet
+                        && op.folderPath == sourcePath
+                        && op.destinationPath == forwardDestinationPath
+                        && op.observedUidValidity == sourceEpoch
                 }
 
-                let inFlightOps = try PendingOperation
-                    .filter(Column("accountId") == accountId)
-                    .filter(Column("status") == PendingStatus.inFlight.rawValue)
-                    .fetchAll(db)
-                if !inFlightOps.isEmpty {
-                    print("[UndoStack] undo\(label) — WARNING: \(inFlightOps.count) inFlight ops:")
-                    for op in inFlightOps {
-                        print("[UndoStack]   inFlight: id=\(op.id.prefix(8)) type=\(op.type.rawValue) msgIds=\(op.messageIds)")
-                    }
+                let annihilable = related.filter {
+                    $0.status == PendingStatus.queued.rawValue
+                        && !$0.everAttempted
+                        && exactPayload($0)
                 }
+                let annihilate = related.count == 1 && annihilable.count == 1
 
-                var cancelledOriginal = false
-                for op in queuedOps {
-                    let opMsgIds = Set(op.messageIds)
-                    // Match by both numeric UIDs and stable IDs (rfc822MessageId)
-                    // since pending ops may contain either format.
-                    if (!opMsgIds.isDisjoint(with: idsSet) || !opMsgIds.isDisjoint(with: stableIdsSet)) &&
-                       (op.type == originalOpType || op.type == .removeTag) {
-                        var cancelled = op
-                        cancelled.status = PendingStatus.cancelled.rawValue
-                        try cancelled.save(db)
-                        print("[UndoStack] undo\(label) — CANCELLED op id=\(op.id.prefix(8)) type=\(op.type.rawValue)")
-                        if op.type == originalOpType { cancelledOriginal = true }
+                if annihilate {
+                    if isIMAP {
+                        guard let epoch = sourceEpoch,
+                              let positive = UInt32(exactly: epoch), positive > 0,
+                              providerIds.allSatisfy({ id in
+                                  guard let uid = UInt32(id), uid > 0 else { return false }
+                                  return id == String(uid)
+                              })
+                        else { return UndoMoveWriteResult() }
                     }
-                }
-
-                // Restore messages — use save() (upsert) in case drain cleanup already deleted the row.
-                // The snapshot's folderPath/isInInbox are from the original source folder — save() restores all columns.
-                for msg in messages {
-                    let existing = try MessageHeader.fetchOne(db, key: msg.id)
-                    print("[UndoStack] undo\(label) — restore msg id=\(msg.id) existing=\(existing == nil ? "nil(deleted)" : "folderId=\(existing!.folderId)") → setting folderId=\(toFolderId)")
-                    var restored = msg
-                    restored.folderId = toFolderId
-                    restored.observedUidValidity = nil
-                    try restored.save(db)
-                }
-
-                // Inline unread count update — fresh DB read after restore.
-                // Messages were just restored via save(db) above, so re-read their
-                // current isRead state from DB rather than trusting the caller snapshot.
-                let restoredMsgIds = messages.map(\.id)
-                let unreadRestored = try Self.countCurrentlyUnread(msgIds: restoredMsgIds, db: db)
-                if unreadRestored > 0 {
-                    let fromFolderId = "\(accountId):\(fromFolderPath)"
-                    if !fromFolderPath.isEmpty {
-                        try db.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [unreadRestored, fromFolderId])
-                    }
-                    try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadRestored, toFolderId])
-                }
-
-                if !cancelledOriginal {
-                    // IMAP MOVE changes UIDs. This legacy move-back still records RFC
-                    // identities; the IMAP action checkpoint deliberately refuses them.
-                    // T2.9 owns re-keying undo protection to native destination UIDs.
-                    // Gmail/Exchange use stable IDs that don't change on move.
-                    let account = try Account.fetchOne(db, key: accountId)
-                    let moveBackIds: [String]
-                    if account?.provider == .imap || account?.provider == .icloud {
-                        moveBackIds = messages.compactMap(\.rfc822MessageId)
-                        if moveBackIds.count != messages.count {
-                            print("[UndoStack] undo\(label) — WARNING: \(messages.count - moveBackIds.count) messages missing rfc822MessageId for move-back")
-                        }
-                    } else {
-                        moveBackIds = ids
-                    }
-                    if !moveBackIds.isEmpty {
-                        let moveBack = PendingOperation(type: .move, messageIds: moveBackIds, accountId: accountId, folderPath: fromFolderPath, destinationPath: toFolderPath)
-                        try moveBack.insert(db)
-                        print("[UndoStack] undo\(label) — original already executed/inFlight, queued MOVE-BACK id=\(moveBack.id.prefix(8)) from=\(fromFolderPath) to=\(toFolderPath) moveBackIds=\(moveBackIds)")
-                    } else {
-                        print("[UndoStack] undo\(label) — ERROR: no valid IDs for move-back (missing rfc822MessageId)")
-                    }
+                    _ = try PendingOperation.deleteOne(db, key: annihilable[0].id)
                 } else {
-                    print("[UndoStack] undo\(label) — CANCELLED original \(label) op, no move-back needed")
+                    // A related but non-exact bundle is not evidence the
+                    // forward completed. Refuse partial/cross-mailbox/
+                    // cross-epoch cancellation whole.
+                    if !related.isEmpty && !(related.count == 1 && exactPayload(related[0])) {
+                        return UndoMoveWriteResult()
+                    }
+                    // Stable providers retain one native id across a move,
+                    // so an exact ordinary inverse is safe. IMAP changes the
+                    // address and v3 has no destination receipt: fail closed.
+                    guard !isIMAP else { return UndoMoveWriteResult() }
+                    try PendingOperation(
+                        type: .move,
+                        messageIds: providerIds,
+                        accountId: accountId,
+                        folderPath: forwardDestinationPath,
+                        destinationPath: sourcePath
+                    ).insert(db)
                 }
+
+                // ⚑ NO REFERENCE — INVENTED: smallest field-level restoration
+                // for v3's exact authenticated row. Preserve every unrelated
+                // field (notably current read/flag state); never `save` a stale
+                // snapshot or recreate a missing row.
+                for member in members {
+                    try MessageHeader.filter(Column("id") == member.originalHeaderId).updateAll(
+                        db,
+                        Column("folderId").set(to: member.sourceFolderId),
+                        Column("folderPath").set(to: member.sourceFolderPath),
+                        Column("isInInbox").set(to: member.sourceIsInInbox),
+                        Column("observedUidValidity").set(to: member.sourceObservedUidValidity),
+                        Column("actionTag").set(to: member.sourceActionTag?.rawValue),
+                        Column("tagSortOrder").set(to: member.sourceTagSortOrder)
+                    )
+                }
+
+                let restoredIds = members.map(\.originalHeaderId)
+                let unreadRestored = currentRows.filter { !$0.isRead }.count
+                let destinationFolderId = MessageIdentity.folderId(
+                    accountId: accountId, folderPath: forwardDestinationPath)
+                if unreadRestored > 0 {
+                    try db.execute(
+                        sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?",
+                        arguments: [unreadRestored, destinationFolderId])
+                    try db.execute(
+                        sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?",
+                        arguments: [unreadRestored, sourceFolderId])
+                }
+                return UndoMoveWriteResult(
+                    restoredOriginalHeaderIds: restoredIds,
+                    affectedFolderIds: [sourceFolderId, destinationFolderId],
+                    queuedInverse: !annihilate
+                )
             }
         } catch {
-            print("[UndoStack] ERROR: undo\(label) write failed: \(error)")
+            print("[UndoStack] ERROR: undoMove write failed: \(error)")
+            return []
         }
-        // Undo-restored messages are protected by their PendingOp(move-back) in the sync engine.
-        // No separate undoProtectedIds needed — the pending-op check handles it.
-        let fromFolderId = "\(accountId):\(fromFolderPath)"
-        var affectedFolderIds: Set<String> = [toFolderId]
-        if !fromFolderPath.isEmpty { affectedFolderIds.insert(fromFolderId) }
-        // Post immediately from actor for responsive sidebar badges, then async recount for accuracy
-        Task { @MainActor in NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil) }
-        Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds) }
-        Task {
-            print("[UndoStack] undo\(label) — triggering drainPendingQueue (isDraining=\(isDraining))")
-            await drainPendingQueue()
+        guard !result.restoredOriginalHeaderIds.isEmpty else { return [] }
+        Task { @MainActor in
+            NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: result.restoredOriginalHeaderIds)
         }
+        Task { await UnreadCountManager.shared.requestRecount(folderIds: result.affectedFolderIds) }
+        if result.queuedInverse { Task { await drainPendingQueue() } }
+        return result.restoredOriginalHeaderIds
     }
 
     // MARK: - Draft Queue (persistent save/delete)

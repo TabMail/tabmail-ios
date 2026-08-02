@@ -332,6 +332,9 @@ struct AccountManagerQueueDrainTests {
         #expect(remaining.count == 2, "both ops must still exist — requeued, not executed or dropped")
         guard remaining.count == 2 else { return }
         #expect(remaining.allSatisfy { $0.status == PendingStatus.queued.rawValue })
+        let everyClaimIsConservative = remaining.allSatisfy(\.everAttempted)
+        #expect(everyClaimIsConservative,
+                "every row claimed in the drain snapshot must be durably conservative before any scheduled provider I/O; a later lane halt does not erase that evidence")
 
         let flagged = await provider.markedFlaggedIds
         #expect(flagged.isEmpty, "the later same-lane op must never have reached the provider — failedAccounts gates the rest of the lane")

@@ -638,6 +638,34 @@ struct DatabaseMigrationTests {
             #expect((opRow["draftDeleteAddressKind"] as String?) == nil)
         }
     }
+
+    @Test("v78 conservatively marks every pre-existing pending operation attempted")
+    func v78BackfillsExistingOperationsAttemptedAndDefaultsNewRowsFalse() throws {
+        let db = try Self.makeDatabase(upTo: "v77_addMessageHeaderObservedUidValidity")
+        try TestDatabase.insertAccount(db, id: "acc1", provider: .gmail)
+        try Self.insertRawPendingOperation(db, id: "op-existing", accountId: "acc1")
+
+        try Self.migrate(db, upTo: "v78_addPendingOperationEverAttempted")
+
+        let columns = try db.read {
+            try Row.fetchAll($0, sql: "PRAGMA table_info(pendingOperation)")
+        }
+        let column = try #require(columns.first { ($0["name"] as String) == "everAttempted" })
+        #expect((column["notnull"] as Int) == 1)
+        #expect((column["dflt_value"] as String?) == "0")
+
+        let existing = try db.read {
+            try PendingOperation.fetchOne($0, key: "op-existing")
+        }
+        #expect(existing?.everAttempted == true)
+
+        let fresh = PendingOperation(
+            type: .markRead, messageIds: ["msg-new"],
+            accountId: "acc1", folderPath: "INBOX")
+        try db.write { try fresh.insert($0) }
+        let inserted = try db.read { try PendingOperation.fetchOne($0, key: fresh.id) }
+        #expect(inserted?.everAttempted == false)
+    }
 }
 
 /// `v70` drops and recreates a table in the MAIN database. The two other stores a

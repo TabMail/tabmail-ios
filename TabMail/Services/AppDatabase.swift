@@ -2242,5 +2242,17 @@ final class AppDatabase: Sendable {
                 t.add(column: "observedUidValidity", .integer)
             }
         }
+
+        migrator.registerMigration("v78_addPendingOperationEverAttempted") { db in
+            // PORT — v2final v73 (`d1d4f01ce`). Annihilation is only an
+            // optimization, so pre-existing rows take the conservative TRUE
+            // backfill: a false positive costs one inverse provider call;
+            // a false negative could erase the only compensation for an
+            // already-started move.
+            try db.alter(table: "pendingOperation") { t in
+                t.add(column: "everAttempted", .boolean).notNull().defaults(to: false)
+            }
+            try db.execute(sql: "UPDATE pendingOperation SET everAttempted = 1")
+        }
     }
 }

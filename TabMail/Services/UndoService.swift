@@ -12,6 +12,38 @@ enum UndoableActionType {
     case move(fromPath: String, toPath: String)
 }
 
+/// PORT — the reference's command/member Undo shape, adapted from hybrid
+/// identity to the one native provider address plus its source epoch.
+struct UndoMember: Sendable, Equatable {
+    let providerMessageId: String
+    let sourceFolderId: String
+    let sourceFolderPath: String
+    let sourceObservedUidValidity: Int?
+    let sourceIsInInbox: Bool
+    let sourceActionTag: ActionTag?
+    let sourceTagSortOrder: Int
+    /// UI-local only. It authenticates the exact still-present optimistic row;
+    /// it is never used as provider identity and is never resurrected.
+    let originalHeaderId: String
+
+    init(header: MessageHeader) {
+        providerMessageId = header.messageId
+        sourceFolderId = header.folderId
+        sourceFolderPath = header.folderPath
+        sourceObservedUidValidity = header.observedUidValidity
+        sourceIsInInbox = header.isInInbox
+        sourceActionTag = header.actionTag
+        sourceTagSortOrder = header.tagSortOrder
+        originalHeaderId = header.id
+    }
+}
+
+struct UndoAccountCommand: Sendable, Equatable {
+    let accountId: String
+    let forwardDestinationPath: String
+    let members: [UndoMember]
+}
+
 struct UndoableAction {
     let type: UndoableActionType
     let messages: [MessageHeader]
@@ -19,6 +51,31 @@ struct UndoableAction {
     let originalFolderPath: String
     let accountId: String
     let timestamp: Date
+    let commands: [UndoAccountCommand]
+
+    init(
+        type: UndoableActionType,
+        messages: [MessageHeader],
+        originalFolderId: String,
+        originalFolderPath: String,
+        accountId: String,
+        timestamp: Date
+    ) {
+        self.type = type
+        self.messages = messages
+        self.originalFolderId = originalFolderId
+        self.originalFolderPath = originalFolderPath
+        self.accountId = accountId
+        self.timestamp = timestamp
+        switch type {
+        case .move(_, let destinationPath):
+            self.commands = [UndoAccountCommand(
+                accountId: accountId,
+                forwardDestinationPath: destinationPath,
+                members: messages.map(UndoMember.init(header:))
+            )]
+        }
+    }
 
     var label: String {
         let count = messages.count
@@ -94,8 +151,8 @@ final class UndoService {
         }
 
         let manager = AccountManager.shared
-        let msgIds = action.messages.map(\.messageId)
-        let compositeIds = action.messages.map(\.id)
+        let msgIds = action.commands.flatMap { $0.members.map(\.providerMessageId) }
+        let compositeIds = action.commands.flatMap { $0.members.map(\.originalHeaderId) }
         print("[UndoStack] UNDO type=\(action.type) msgIds=\(msgIds) compositeIds=\(compositeIds) originalFolderId=\(action.originalFolderId) originalFolderPath=\(action.originalFolderPath) stackSize=\(undoStack.count + 1)→\(undoStack.count)")
         // Dump DB state BEFORE undo
         for msgId in msgIds {
@@ -115,41 +172,47 @@ final class UndoService {
         let pendingBeforeSummary = pendingBefore?.map { "id=\($0.id.prefix(8)) type=\($0.type.rawValue) status=\($0.status) msgIds=\($0.messageIds) dest=\($0.destinationPath ?? "nil")" } ?? ["<fetch failed>"]
         print("[UndoStack] PendingOps BEFORE undo — [\(pendingBeforeSummary.joined(separator: ", "))]")
 
-        // Undo cancels queued ops via .cancelled status flag (safe — atomic with drain's
-        // re-read+claim transaction). If the original op was already inFlight/executed,
-        // the undo methods queue a reverse move-back operation instead.
-
-        // Register overlay BEFORE the actor call for instant visual feedback.
-        // The actor may be busy during heavy sync — overlay ensures the UI updates immediately.
-        switch action.type {
-        case .move(let fromPath, let toPath):
-            // Each captured MessageHeader carries the pre-move isInInbox value,
-            // so per-message mirroring is exact even if the action spans folders.
-            // actionTag must be restored too: the archive/delete gesture registered
-            // an overlay tag-clear (.some(nil)) for inbox-leaving moves, and the
-            // registerMutation merge only overwrites fields the new mutation SETS —
-            // leaving actionTag untouched here would keep hiding the restored chip
-            // until every retain releases, even though undoDestructiveAction's
-            // full-row save already restored the tag in the DB.
-            for msg in action.messages {
-                manager.retainOverlayEntry(id: msg.id)
-                manager.registerMutation(id: msg.id, mutation: .init(
-                    folderId: action.originalFolderId,
-                    folderPath: action.originalFolderPath,
-                    isInInbox: msg.isInInbox,
-                    actionTag: .some(msg.actionTag)
-                ))
-            }
-            await manager.enqueueWrite { [manager] in
-                await manager.undoDestructiveAction(
-                    action.messages,
-                    accountId: action.accountId,
-                    originalOpType: .move,
-                    fromFolderPath: toPath,
-                    toFolderPath: fromPath,
-                    toFolderId: action.originalFolderId
+        // PORT — as in v2final's ordinary inverse flow, Undo joins the same
+        // FIFO as the forward gesture instead of racing its not-yet-durable
+        // optimistic write. Register the inverse display immediately, then
+        // authenticate and commit it when its FIFO turn arrives.
+        let originalIds = action.commands.flatMap { $0.members.map(\.originalHeaderId) }
+        for command in action.commands {
+            for member in command.members {
+                manager.retainOverlayEntry(id: member.originalHeaderId)
+                manager.registerMutation(
+                    id: member.originalHeaderId,
+                    mutation: .init(
+                        folderId: member.sourceFolderId,
+                        folderPath: member.sourceFolderPath,
+                        isInInbox: member.sourceIsInInbox,
+                        actionTag: .some(member.sourceActionTag)
+                    )
                 )
-                for msg in action.messages { manager.releaseOverlayEntry(id: msg.id) }
+            }
+        }
+        if !originalIds.isEmpty {
+            NotificationCenter.default.post(name: .messagesUndone, object: originalIds)
+        }
+
+        for command in action.commands {
+            await manager.enqueueWrite { [manager, command] in
+                let restoredOriginalIds = await manager.undoMove(
+                    accountId: command.accountId,
+                    forwardDestinationPath: command.forwardDestinationPath,
+                    members: command.members
+                )
+                for member in command.members {
+                    manager.releaseOverlayEntry(id: member.originalHeaderId)
+                }
+                if restoredOriginalIds.isEmpty {
+                    await MainActor.run {
+                        NotificationCenter.default.post(
+                            name: .inboxDataDidChange,
+                            object: command.members.map(\.originalHeaderId)
+                        )
+                    }
+                }
             }
         }
 
@@ -171,10 +234,7 @@ final class UndoService {
         let pendingAfterSummary = pendingAfter?.map { "id=\($0.id.prefix(8)) type=\($0.type.rawValue) status=\($0.status) msgIds=\($0.messageIds) dest=\($0.destinationPath ?? "nil")" } ?? ["<fetch failed>"]
         print("[UndoStack] PendingOps AFTER undo — [\(pendingAfterSummary.joined(separator: ", "))]")
 
-        // Notify InboxView to un-dismiss these messages so they reappear in the list.
-        // Use header.id (composite key "accountId:path:messageId") to match dismissedMessages entries.
-        print("[UndoStack] posting .messagesUndone for compositeIds=\(compositeIds) remainingStack=\(undoStack.count)")
-        NotificationCenter.default.post(name: .messagesUndone, object: compositeIds)
+        print("[UndoStack] posted .messagesUndone for originalIds=\(originalIds) remainingStack=\(undoStack.count)")
 
         // If more items on the stack, refresh the toast timer
         if !undoStack.isEmpty {

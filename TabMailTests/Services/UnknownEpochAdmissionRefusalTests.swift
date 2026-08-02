@@ -309,15 +309,15 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(try await header(pool, msg.id)?.folderId == "acc1:Archive")
     }
 
-    // MARK: - 5. System-generated ops are NOT governed by T1.3 — still admitted
+    // MARK: - 5. Completed IMAP Undo has no destination address proof
 
-    @Test("System op: undo's compensating move-back is admitted under a nil epoch")
+    @Test("Completed IMAP Undo without a destination UID and epoch fails closed")
     @MainActor
-    func imapNilEpochStillAdmitsUndoMoveBack() async throws {
-        // Owner decision §9 D6: T1.3 governs only NEW gestures. The move-back is a
-        // compensating op for work the server has already done, and on IMAP it is
-        // addressed by rfc822MessageId — a Message-ID SEARCH, which is immune to a
-        // UIDVALIDITY change. Refusing it would strand the message, not protect it.
+    func imapNilEpochRefusesUnprovenUndoMoveBack() async throws {
+        // SUBTRACT — v2final's RFC-addressed compensating move is intentionally
+        // omitted. The provider-ID port has no COPYUID/destination receipt, so
+        // the numeric destination UID and its epoch are both unproven. C3 wins:
+        // fail closed and let sync reconcile instead of manufacturing authority.
         let (pool, dir, previous) = try makeTestDB(provider: .imap, inboxEpoch: nil)
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
@@ -334,10 +334,9 @@ struct UnknownEpochAdmissionRefusalTests {
         )
 
         let rows = try await ops(pool)
-        #expect(rows.count == 1, "a system-generated compensating move must still be admitted")
-        guard rows.count == 1 else { return }
-        #expect(rows[0].type == .move)
-        #expect(rows[0].messageIds == ["rfc-501@example.com"])
+        #expect(rows.isEmpty, "an unproven completed IMAP move must not manufacture an RFC inverse")
+        let unchanged = try await header(pool, msg.id)
+        #expect(unchanged?.folderPath == "Archive")
     }
 
     // MARK: - 6. ANTI-BRICK — the demo account is `.imap` but is not IMAP-BACKED

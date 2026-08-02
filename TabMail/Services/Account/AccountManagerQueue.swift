@@ -281,6 +281,12 @@ extension AccountManager {
                             return nil
                         }
                         fetched.status = PendingStatus.inFlight.rawValue
+                        // PORT — v2final's persisted attempted-row proof,
+                        // adapted to v3's lane claim. v3 has no post-claim
+                        // zombie/demotion stage, so status and proof change in
+                        // this same transaction before provider I/O. Never
+                        // infer this bit from status or retryCount.
+                        fetched.everAttempted = true
                         try fetched.save(db)
                         return fetched
                     }
