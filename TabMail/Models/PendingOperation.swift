@@ -61,8 +61,8 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// the SAME write transaction as the insert so the stamp and the row observe
     /// one consistent epoch.
     ///
-    /// It exists for ONE class of op: one the executor addresses by a BARE
-    /// NUMERIC UID rather than by a durable identity. A UID means nothing outside
+    /// It exists for every IMAP op the executor addresses by a BARE NUMERIC UID.
+    /// A UID means nothing outside
     /// the numbering it was observed in — after a UIDVALIDITY change the same
     /// number names a DIFFERENT message — so such an op must not survive into a
     /// numbering it was not recorded under (owner directive, 2026-07-31: *"the
@@ -74,16 +74,12 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     /// the blessed resolution (constraint C5): sync reconciles and the user redoes
     /// the gesture — the alternative is mutating an unrelated message (C3).
     ///
-    /// **`nil` is the fail-open default and MUST stay the common case.** Only
-    /// `AccountManager.queueDraftDelete` stamps today, and only when its
-    /// `serverDraftId` is numeric — the same discriminator `newGestureRefusedForUnknownEpoch`
-    /// already uses, because `IMAPProvider.resolveUID` short-circuits a numeric id
-    /// to a literal `UIDSet` with no SEARCH while a non-numeric one goes to
-    /// `searchByMessageId` and is epoch-IMMUNE. Stamping an rfc822-addressed op
-    /// would let the claim-time compare drop intention that is still perfectly
-    /// resolvable — the mirror-image bug, a permanent refusal. Non-IMAP accounts
-    /// stamp `nil` for free: Gmail and Graph never populate
-    /// `Folder.lastKnownUidValidity`.
+    /// `nil` remains correct for stable-provider operations and for typed draft
+    /// operations that carry their own identity proof. T2.4 stamps every ordinary
+    /// IMAP move/read/unread/flag operation from the source header's proven epoch;
+    /// T2.6 fails those ordinary operations closed when the stamp is absent, zero,
+    /// or disagrees with the current source Folder. Gmail, Graph, and Demo remain
+    /// epochless.
     ///
     /// Typed `Int?` to mirror `Folder.lastKnownUidValidity`'s established storage
     /// convention for this exact value (same choice, same reasoning, as the

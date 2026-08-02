@@ -10,28 +10,6 @@ extension AccountManager {
 
     // MARK: - Persistent Action Queue
 
-    /// Queue an action tag write for async execution.
-    /// Called from AI processing and manual tag application.
-    /// Static + nonisolated: the GRDB write is thread-safe and doesn't need MainActor.
-    /// Callers can call directly without `await MainActor.run { ... }`.
-    nonisolated static func queueTagWrite(accountId: String, messageId: String, rfc822MessageId: String? = nil, tag: ActionTag?, folder: String) {
-        // Prefer rfc822MessageId for IMAP messages (numeric UIDs) — survives UIDVALIDITY changes
-        let stableId: String
-        if UInt32(messageId) != nil, let rfc822 = rfc822MessageId, !rfc822.isEmpty {
-            stableId = rfc822
-        } else {
-            stableId = messageId
-        }
-        let opType: OperationType = tag != nil ? .setTag : .removeTag
-        let op = PendingOperation(type: opType, messageIds: [stableId], accountId: accountId, folderPath: folder, tagValue: tag?.rawValue)
-        do {
-            try AppDatabase.dbPool.write { db in try op.insert(db) }
-        } catch {
-            print("[Queue] ERROR: queueTagWrite failed: \(error)")
-        }
-        Task { @MainActor in await AccountManager.shared.drainPendingQueue() }
-    }
-
     /// Shared mutable state for parallel drain tasks. Reference type so concurrent
     /// lane Tasks (launched from the `AccountManager` actor) see each other's updates
     /// at await points. `internal` (not `private`) so tests can construct it directly
@@ -253,27 +231,51 @@ extension AccountManager {
                             }
                             return nil
                         }
-                        // T4.S6 follow-up — an op RECORDED under a numbering the server
-                        // has since discarded NEVER EXECUTES. It is deleted here, not
-                        // parked: parking would be a permanent wedge (the old epoch never
-                        // comes back), and executing it would address a UID whose referent
-                        // changed underneath it — C3. Constraint C5 blesses dropping
-                        // intention at an identity-reset boundary: sync reconciles the
-                        // surviving server draft and the user redoes the delete.
-                        //
-                        // Ordered AFTER the park on purpose: during quarantine the folder
-                        // still holds the OLD epoch (step 5 owns advancing it), so the
-                        // stamp still AGREES and this would not fire anyway — but reading
-                        // the park first keeps "mid-reset" a single, unambiguous outcome.
-                        //
-                        // FAILS OPEN on a nil live epoch (a vanished `Folder` row, or one
-                        // `SyncEngine.resetEmptyFolderCrawlEpoch` cleared back to nil):
-                        // "unknown" is not "different", and refusing on it would drop
-                        // intention for a folder that is merely un-bootstrapped. Same
-                        // polarity as the reference's claim-time check.
-                        if let stamped = fetched.observedUidValidity,
-                           let live = sourceFolder?.lastKnownUidValidity,
-                           live != stamped {
+                        // T2.6 checkpoint A. PORT: v2final's A4 compare/delete
+                        // inside the claim transaction. SUBTRACT: RFC/hybrid
+                        // compatibility, nil fail-open, claimFrontier/global FIFO,
+                        // and demotion machinery. ⚑ NO REFERENCE — INVENTED: v3's
+                        // DB provider classification and fail-closed shape.
+                        let nonDraftTypes: Set<OperationType> = [
+                            .archive, .delete, .move,
+                            .markRead, .markUnread, .markFlagged, .markUnflagged,
+                            .setTag, .removeTag, .markReplied, .markForwarded,
+                            .addUserLabel, .removeUserLabel,
+                        ]
+                        if nonDraftTypes.contains(fetched.type) {
+                            guard let account = try Account.fetchOne(db, key: fetched.accountId) else {
+                                _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                                return nil
+                            }
+                            let isDemo = fetched.accountId == DemoSeed.demoAccountId
+                            let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
+                            if isIMAP {
+                                let idsAreCanonicalUIDs = !fetched.messageIds.isEmpty && fetched.messageIds.allSatisfy { id in
+                                    guard let uid = UInt32(id), uid > 0 else { return false }
+                                    return id == String(uid)
+                                }
+                                guard idsAreCanonicalUIDs,
+                                      let stamped = fetched.observedUidValidity,
+                                      let stampedUInt = UInt32(exactly: stamped), stampedUInt > 0,
+                                      let sourceFolder,
+                                      sourceFolder.uidValidityResetPendingAt == nil,
+                                      let live = sourceFolder.lastKnownUidValidity,
+                                      let liveUInt = UInt32(exactly: live), liveUInt > 0,
+                                      live == stamped else {
+                                    _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                                    BackgroundSyncLogger.log(
+                                        "[Queue] Checkpoint A refused \(fetched.id.prefix(8)) " +
+                                        "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
+                                        "invalid provider address or UIDVALIDITY; dropped whole before provider I/O")
+                                    return nil
+                                }
+                            }
+                        } else if let stamped = fetched.observedUidValidity,
+                                  let live = sourceFolder?.lastKnownUidValidity,
+                                  live != stamped {
+                            // Preserve the already-landed draft/reset safeguard.
+                            // Draft operations remain outside generic checkpoint A
+                            // and continue through their typed execution gates.
                             _ = try PendingOperation.deleteOne(db, key: fetched.id)
                             BackgroundSyncLogger.log("[Queue] UIDVALIDITY changed under op \(fetched.id.prefix(8)) (\(fetched.type.rawValue), \(fetched.folderPath)): recorded under \(stamped), folder now \(live) — dropped without executing (C5)")
                             return nil
@@ -496,6 +498,28 @@ extension AccountManager {
             context.executedAny = true
             return .proceed
         } catch {
+            // T2.7 checkpoint B refusal is typed and precedes every generic
+            // message-not-found / UID-resolution split arm. The epoch scopes
+            // the whole provider-address bundle, so no member may be retried as
+            // a child under a different attempt.
+            if case ProviderError.uidValidityChanged = error {
+                do {
+                    try await retryWrite(dbPool, label: "Queue") { db in
+                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    }
+                    context.executedAny = true
+                    return .proceed
+                } catch {
+                    // The provider wrote nothing. If retiring the refused op
+                    // fails, preserve the exact original bundle for retry.
+                    try? await retryWrite(dbPool, label: "Queue") { db in
+                        var queued = currentOp
+                        queued.status = PendingStatus.queued.rawValue
+                        try queued.save(db)
+                    }
+                    return .haltLane
+                }
+            }
             // UID resolution failed on tag ops — skip (best-effort).
             // Tag removal is queued before move to prevent flag copying on IMAP MOVE.
             // If we can't resolve the UID, skipping the tag op is far better than
@@ -1001,16 +1025,56 @@ extension AccountManager {
             }
             let opAgeMin = Date().timeIntervalSince(op.createdAt) / 60
             print("[MoveTrace] executeOperation.move — msgIds=\(op.messageIds) from=\(op.folderPath) to=\(dest) provider=\(type(of: provider)) accountId=\(op.accountId) opId=\(op.id) retryCount=\(op.retryCount) ageMin=\(String(format: "%.1f", opAgeMin))")
-            try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.move(
+                    ids: op.messageIds, from: op.folderPath, to: dest,
+                    admittedUidValidity: admittedUInt)
+            } else {
+                try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
+            }
             print("[MoveTrace] executeOperation.move — completed successfully")
         case .markRead:
-            try await provider.markRead(ids: op.messageIds, folder: op.folderPath)
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.markRead(
+                    ids: op.messageIds, folder: op.folderPath,
+                    admittedUidValidity: admittedUInt)
+            } else {
+                try await provider.markRead(ids: op.messageIds, folder: op.folderPath)
+            }
         case .markUnread:
-            try await provider.markUnread(ids: op.messageIds, folder: op.folderPath)
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.markUnread(
+                    ids: op.messageIds, folder: op.folderPath,
+                    admittedUidValidity: admittedUInt)
+            } else {
+                try await provider.markUnread(ids: op.messageIds, folder: op.folderPath)
+            }
         case .markFlagged:
-            try await provider.markFlagged(ids: op.messageIds, flagged: true, folder: op.folderPath)
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.markFlagged(
+                    ids: op.messageIds, flagged: true, folder: op.folderPath,
+                    admittedUidValidity: admittedUInt)
+            } else {
+                try await provider.markFlagged(ids: op.messageIds, flagged: true, folder: op.folderPath)
+            }
         case .markUnflagged:
-            try await provider.markFlagged(ids: op.messageIds, flagged: false, folder: op.folderPath)
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.markFlagged(
+                    ids: op.messageIds, flagged: false, folder: op.folderPath,
+                    admittedUidValidity: admittedUInt)
+            } else {
+                try await provider.markFlagged(ids: op.messageIds, flagged: false, folder: op.folderPath)
+            }
         case .setTag, .removeTag:
             // Action tags are local-only (ADR-IOS-036). Local state is already
             // applied at the call site; the op drains to a no-op so legacy

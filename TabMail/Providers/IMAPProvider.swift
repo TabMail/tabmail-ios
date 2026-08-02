@@ -717,23 +717,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    #if DEBUG
-    /// Test seam for T1.1 (lands with the production item it enables, per the
-    /// plan's §4 T0.10 rule). `withActionConnectionSelection` is `private`, and
-    /// at this item it deliberately has no production caller that reads the
-    /// selection — checkpoint B, the move path and the draft paths all land
-    /// later. Without a seam the property "an action body observes the live
-    /// UIDVALIDITY" is unobservable, so it could not be proven red-first.
-    ///
-    /// Runs a real action body on the real action connection and returns the
-    /// `uidValidity` that body was handed. Stripped from Release builds.
-    func actionConnectionSelectionUidValidityForTesting(folder: String) async throws -> UInt32 {
-        try await withActionConnectionSelection(folder: folder) { _, selection in
-            selection.uidValidity.value
-        }
-    }
-    #endif
-
     /// Execute on the action connection without folder SELECT (for LIST, STATUS, etc.).
     private func withActionConnectionNoSelect<T>(
         _ body: (IMAPServer) async throws -> T
@@ -1785,6 +1768,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// T2.7 checkpoint-B overload for a T2.4 provider-native queue op.
+    func markRead(
+        ids: [String], folder: String, admittedUidValidity: UInt32
+    ) async throws {
+        try await mutateAdmittedUIDs(
+            ids: ids, folder: folder, admittedUidValidity: admittedUidValidity,
+            flags: [.seen], add: true)
+    }
+
     func markUnread(ids: [String], folder: String) async throws {
         try await withActionConnection(folder: folder) { server in
             _ = try await server.selectMailbox(folder)
@@ -1795,6 +1787,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
             }
         }
+    }
+    func markUnread(
+        ids: [String], folder: String, admittedUidValidity: UInt32
+    ) async throws {
+        try await mutateAdmittedUIDs(
+            ids: ids, folder: folder, admittedUidValidity: admittedUidValidity,
+            flags: [.seen], add: false)
     }
 
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {
@@ -1810,6 +1809,67 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     }
                 }
             }
+        }
+    }
+
+    func markFlagged(
+        ids: [String], flagged: Bool, folder: String,
+        admittedUidValidity: UInt32
+    ) async throws {
+        try await mutateAdmittedUIDs(
+            ids: ids, folder: folder, admittedUidValidity: admittedUidValidity,
+            flags: [.flagged], add: flagged)
+    }
+
+    /// PORT of v2final `mutateActionMessages`' one-UIDSet/one-STORE shape,
+    /// adapted to v3's native-only queue. RFC resolution and partial-member
+    /// success are deliberately subtracted: the full batch parses before any
+    /// connection or mutation, then both the wrapper SELECT and the later
+    /// source re-SELECT must equal the explicit per-call admitted epoch.
+    private func mutateAdmittedUIDs(
+        ids: [String],
+        folder: String,
+        admittedUidValidity: UInt32,
+        flags: [Flag],
+        add: Bool
+    ) async throws {
+        let uidSet = try nativeUIDSet(ids)
+        try await withActionConnectionSelection(folder: folder) { server, wrapperSelection in
+            try self.requireUidValidity(
+                wrapperSelection, expected: admittedUidValidity, folder: folder)
+            let mutationSelection = try await self.selectMailboxTracked(server, folder: folder)
+            try self.requireUidValidity(
+                mutationSelection, expected: admittedUidValidity, folder: folder)
+            try await server.store(
+                flags: flags, on: uidSet, operation: add ? .add : .remove)
+        }
+    }
+
+    private func nativeUIDSet(_ ids: [String]) throws -> UIDSet {
+        guard !ids.isEmpty else {
+            throw ProviderError.actionIdentityResolutionFailed("")
+        }
+        var result = UIDSet()
+        for id in ids {
+            guard let value = UInt32(id), value > 0, id == String(value) else {
+                throw ProviderError.actionIdentityResolutionFailed(id)
+            }
+            result.insert(UID(value))
+        }
+        return result
+    }
+
+    /// PORT — v2final `requireSameUidValidity`, with the queue's explicit
+    /// admitted epoch as authority rather than an ambient/shared value.
+    private func requireUidValidity(
+        _ selection: Mailbox.Selection,
+        expected: UInt32,
+        folder: String
+    ) throws {
+        let live = selection.uidValidity.value
+        guard expected > 0, live > 0, live == expected else {
+            throw ProviderError.uidValidityChanged(
+                folderPath: folder, stored: expected, live: live)
         }
     }
 
@@ -1863,6 +1923,55 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try await withActionConnection(folder: source) { server in
             for id in ids {
                 try await self.idempotentMove(id: id, from: source, to: destination, server: server)
+            }
+        }
+    }
+
+    /// T2.7 provider-native move. The native source UID has no cross-mailbox
+    /// identity, so v2final's RFC destination recovery/probe is SUBTRACTED.
+    /// Source selections are attempt-local and reasserted before every
+    /// source mutation; non-UIDPLUS falls back to COPY + scoped soft-delete,
+    /// never mailbox-wide EXPUNGE.
+    func move(
+        ids: [String],
+        from source: String,
+        to destination: String,
+        admittedUidValidity: UInt32
+    ) async throws {
+        let sourceUIDs = try nativeUIDSet(ids)
+        try await withActionConnectionSelection(folder: source) { server, wrapperSelection in
+            try self.requireUidValidity(
+                wrapperSelection, expected: admittedUidValidity, folder: source)
+
+            let preMutation = try await self.selectMailboxTracked(server, folder: source)
+            try self.requireUidValidity(
+                preMutation, expected: admittedUidValidity, folder: source)
+
+            if source.uppercased() == "INBOX" {
+                let legacyFlags: [Flag] = [
+                    .custom("tm_reply"), .custom("tm_archive"),
+                    .custom("tm_delete"), .custom("tm_none"),
+                ]
+                do {
+                    try await server.store(flags: legacyFlags, on: sourceUIDs, operation: .remove)
+                } catch {
+                    print("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
+                }
+            }
+
+            let finalSourceSelection = try await self.selectMailboxTracked(server, folder: source)
+            try self.requireUidValidity(
+                finalSourceSelection, expected: admittedUidValidity, folder: source)
+
+            if await server.supportsUIDPlus {
+                try await server.move(messages: sourceUIDs, to: destination)
+            } else {
+                try await server.copy(messages: sourceUIDs, to: destination)
+                try Task.checkCancellation()
+                let preDelete = try await self.selectMailboxTracked(server, folder: source)
+                try self.requireUidValidity(
+                    preDelete, expected: admittedUidValidity, folder: source)
+                try await server.store(flags: [.deleted], on: sourceUIDs, operation: .add)
             }
         }
     }

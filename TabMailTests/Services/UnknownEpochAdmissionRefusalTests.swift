@@ -104,6 +104,9 @@ struct UnknownEpochAdmissionRefusalTests {
         )
         header.headerComplete = true
         header.rfc822MessageId = rfc822MessageId
+        header.observedUidValidity = try pool.read { db in
+            try Folder.fetchOne(db, key: "acc1:\(folderPath)")?.lastKnownUidValidity
+        }
         try pool.writeWithoutTransaction { db in try header.insert(db) }
         let stored = try pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
         return try #require(stored)
@@ -199,7 +202,8 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(rows.count == 1)
         guard rows.count == 1 else { return }
         #expect(rows[0].type == .markRead)
-        #expect(rows[0].messageIds == [msg.stableId])
+        #expect(rows[0].messageIds == [msg.messageId])
+        #expect(rows[0].observedUidValidity == 12345)
         #expect(rows[0].folderPath == "INBOX")
         #expect(try await header(pool, msg.id)?.isRead == true)
     }
@@ -502,7 +506,7 @@ struct UnknownEpochAdmissionRefusalTests {
                 "the label disappeared from the visualized row although nothing was removed — phantom success")
     }
 
-    @Test("System op: a local-only tag write is admitted under a nil epoch")
+    @Test("System op: a local-only tag write needs no pending operation under a nil epoch")
     @MainActor
     func imapNilEpochStillAdmitsTagWrite() async throws {
         // Action tags are local-only (ADR-IOS-036) and `.setTag` drains to a
@@ -514,18 +518,11 @@ struct UnknownEpochAdmissionRefusalTests {
 
         let msg = try insertMessage(pool, messageId: "502", rfc822MessageId: "rfc-502@example.com")
 
-        AccountManager.queueTagWrite(
-            accountId: "acc1",
-            messageId: msg.messageId,
-            rfc822MessageId: msg.rfc822MessageId,
-            tag: ActionTag.reply,
-            folder: "INBOX"
-        )
+        await AccountManager.shared.applyManualTag(msg, tag: .reply)
 
         let rows = try await ops(pool)
-        #expect(rows.count == 1, "a local-only tag write is not an epoch-sensitive action")
-        guard rows.count == 1 else { return }
-        #expect(rows[0].type == .setTag)
+        #expect(rows.isEmpty, "a local-only tag must never create a durable server operation")
+        #expect(try await header(pool, msg.id)?.actionTag == .reply)
     }
 
     // MARK: - 11. A refusal reconciles the presentation state FROM THE DATABASE

@@ -253,31 +253,83 @@ extension AccountManager {
         return true
     }
 
+    /// T2.4 provider-address admission. This is the v3 provider-ID adaptation
+    /// of the inverse re-key in v2final commit `a75196398`: ordinary actions
+    /// persist the provider's native address, while IMAP additionally proves
+    /// that every admitted UID belongs to the source folder's current epoch.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED adaptation after the direct-constructor,
+    /// call-site, and history census. v2final has no provider-ID admission
+    /// helper because it deliberately re-keyed in the opposite direction.
+    private nonisolated static func admittedOrdinaryActionTargets(
+        _ messages: [MessageHeader],
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> (messages: [MessageHeader], providerIds: [String], observedUidValidity: Int?)? {
+        guard let account = try Account.fetchOne(db, key: accountId) else { return nil }
+
+        // Demo is stored as IMAP but is backed by DemoProvider: its local ids are
+        // stable and it will never observe a mailbox epoch.
+        let isDemo = accountId == DemoSeed.demoAccountId
+        let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
+        if !isIMAP {
+            let admitted = messages.filter { !$0.messageId.isEmpty }
+            guard !admitted.isEmpty else { return nil }
+            return (admitted, admitted.map(\.messageId), nil)
+        }
+
+        guard let folder = try Folder.fetchOne(
+            db, key: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)),
+              folder.uidValidityResetPendingAt == nil,
+              let liveEpoch = folder.lastKnownUidValidity,
+              let liveUInt = UInt32(exactly: liveEpoch), liveUInt > 0 else {
+            return nil
+        }
+
+        // Fail each unproven on-screen address closed before local mutation.
+        // A valid sibling in the same gesture remains actionable; the stale
+        // member is omitted rather than contaminating the operation's epoch.
+        let admitted = messages.filter { message in
+            guard message.observedUidValidity == liveEpoch,
+                  let observed = message.observedUidValidity,
+                  let observedUInt = UInt32(exactly: observed), observedUInt > 0,
+                  let uid = UInt32(message.messageId), uid > 0,
+                  message.messageId == String(uid) else {
+                return false
+            }
+            return true
+        }
+        guard !admitted.isEmpty else { return nil }
+        return (admitted, admitted.map(\.messageId), liveEpoch)
+    }
+
     func markRead(_ messages: [MessageHeader]) async {
         await ensureDurable(messages)
 
         let affectedFolderIds: Set<String>
         do {
             affectedFolderIds = try await dbPool.write { db in
-                let expanded = try Self.expandWithSiblingsByRfc822(messages: messages, db: db)
-                let grouped = Dictionary(grouping: expanded) { "\($0.accountId)|\($0.folderPath)" }
+                let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
                 var folderIds: Set<String> = []
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
-                    // T1.3 — refuse before ANY mutation so the local flip and the op
-                    // row are precluded together, atomically.
-                    if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) { continue }
-                    let stableIds = msgs.map(\.stableId)
-                    let msgIds = msgs.map(\.id)
-                    let folderId = msgs[0].folderId
+                    guard let admission = try Self.admittedOrdinaryActionTargets(
+                        msgs, accountId: accountId, folderPath: folderPath, db: db) else { continue }
+                    let admitted = admission.messages
+                    let msgIds = admitted.map(\.id)
+                    let folderId = admitted[0].folderId
                     folderIds.insert(folderId)
                     let newlyRead = try Self.countCurrentlyUnread(msgIds: msgIds, db: db)
                     try MessageHeader.filter(msgIds.contains(Column("id"))).updateAll(db, Column("isRead").set(to: true))
                     if newlyRead > 0 {
                         try db.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [newlyRead, folderId])
                     }
-                    try PendingOperation(type: .markRead, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(db)
+                    try PendingOperation(
+                        type: .markRead, messageIds: admission.providerIds,
+                        accountId: accountId, folderPath: folderPath,
+                        observedUidValidity: admission.observedUidValidity).insert(db)
                 }
                 return folderIds
             }
@@ -308,20 +360,17 @@ extension AccountManager {
         let affectedFolderIds: Set<String>
         do {
             affectedFolderIds = try await dbPool.write { db in
-                // Mirror of markRead: expand to sibling rows in other folders so an
-                // unread mark on the inbox copy of a self-send also flips the Sent copy.
-                let expanded = try Self.expandWithSiblingsByRfc822(messages: messages, db: db)
-                let grouped = Dictionary(grouping: expanded) { "\($0.accountId)|\($0.folderPath)" }
+                let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
                 var folderIds: Set<String> = []
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
-                    // T1.3 — refuse before ANY mutation (see markRead).
-                    if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) { continue }
-                    let stableIds = msgs.map(\.stableId)
-                    let msgIds = msgs.map(\.id)
+                    guard let admission = try Self.admittedOrdinaryActionTargets(
+                        msgs, accountId: accountId, folderPath: folderPath, db: db) else { continue }
+                    let admitted = admission.messages
+                    let msgIds = admitted.map(\.id)
                     // Count unread BEFORE marking unread — fresh DB read to compute delta
-                    let folderId = msgs[0].folderId
+                    let folderId = admitted[0].folderId
                     folderIds.insert(folderId)
                     let alreadyUnread = try Self.countCurrentlyUnread(msgIds: msgIds, db: db)
                     let newlyUnread = msgIds.count - alreadyUnread
@@ -329,7 +378,10 @@ extension AccountManager {
                     if newlyUnread > 0 {
                         try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [newlyUnread, folderId])
                     }
-                    try PendingOperation(type: .markUnread, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(db)
+                    try PendingOperation(
+                        type: .markUnread, messageIds: admission.providerIds,
+                        accountId: accountId, folderPath: folderPath,
+                        observedUidValidity: admission.observedUidValidity).insert(db)
                 }
                 return folderIds
             }
@@ -361,54 +413,6 @@ extension AccountManager {
             arguments: StatementArguments(msgIds)) ?? 0
     }
 
-    /// Expand a list of messages to also include sibling rows that share the same
-    /// `(accountId, rfc822MessageId)` but live in a different folder.
-    ///
-    /// Why: Gmail (and any IMAP server with shared message storage) represents a
-    /// "send to self" as one underlying message that lives in both INBOX and Sent.
-    /// On iOS we materialize that as two `MessageHeader` rows (keyed by folderId).
-    /// When the user marks one row read, the other row should optimistically flip
-    /// too — otherwise the Sent copy looks unread until the next delta sync.
-    ///
-    /// This is also correct for non-Gmail IMAP servers where self-send creates two
-    /// independent UIDs: each sibling becomes its own per-folder group, so the
-    /// caller's grouping logic emits a separate `PendingOperation` per folder, and
-    /// the drain loop issues the appropriate STORE / API call against each.
-    ///
-    /// Sync acts as the safety net — if a sibling is missed (e.g., null or stale
-    /// `rfc822MessageId`), the next delta sync reconciles it.
-    nonisolated static func expandWithSiblingsByRfc822(
-        messages: [MessageHeader],
-        db: Database
-    ) throws -> [MessageHeader] {
-        // Group rfc822MessageIds by accountId (sibling lookups never cross accounts).
-        var lookups: [String: Set<String>] = [:]
-        for msg in messages {
-            guard let rfc = msg.rfc822MessageId, !rfc.isEmpty else { continue }
-            lookups[msg.accountId, default: []].insert(rfc)
-        }
-        if lookups.isEmpty { return messages }
-
-        var seenIds = Set(messages.map(\.id))
-        var result = messages
-        for (accountId, rfcSet) in lookups {
-            let rfcArray = Array(rfcSet)
-            let placeholders = rfcArray.map { _ in "?" }.joined(separator: ",")
-            var args: [DatabaseValueConvertible] = [accountId]
-            args.append(contentsOf: rfcArray)
-            let siblings = try MessageHeader.fetchAll(
-                db,
-                sql: "SELECT * FROM messageHeader WHERE accountId = ? AND rfc822MessageId IN (\(placeholders))",
-                arguments: StatementArguments(args)
-            )
-            for sibling in siblings where !seenIds.contains(sibling.id) {
-                result.append(sibling)
-                seenIds.insert(sibling.id)
-            }
-        }
-        return result
-    }
-
     // MARK: - Optimistic Move (shared by archive, delete, move)
 
     /// Core optimistic move: reassigns messages to the destination folder in GRDB,
@@ -437,16 +441,12 @@ extension AccountManager {
             print("[Queue] Skipping no-op move (source==dest): \(folderPath)")
             return []
         }
-        // T1.3 — refuse before ANY mutation. This is the single chokepoint for
-        // archive/delete/move from every surface, so the guard covers them all.
-        // Scoped to the SOURCE folder: UID resolution for a move happens in the
-        // source mailbox (`withActionConnection(folder: source)`), so an unknown
-        // DESTINATION epoch is irrelevant and must not refuse the gesture.
-        if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) {
-            return []
-        }
-        let stableIds = msgs.map(\.stableId)
-        let leavingInbox = msgs[0].isInInbox
+        // Capture the source-native ids and epoch before the optimistic move
+        // clears `observedUidValidity` on the destination row.
+        guard let admission = try Self.admittedOrdinaryActionTargets(
+            msgs, accountId: accountId, folderPath: folderPath, db: db) else { return [] }
+        let admitted = admission.messages
+        let leavingInbox = admitted[0].isInInbox
 
         // Optimistic local update — move to destination folder immediately.
         // Message appears in destination right away; post-drain sync reconciles UIDs.
@@ -454,7 +454,7 @@ extension AccountManager {
         let destFolder = try Folder.fetchOne(db, key: destFolderId)
         let destIsInbox = destFolder?.role == .inbox
 
-        let msgIds = msgs.map(\.id)
+        let msgIds = admitted.map(\.id)
         // Tags are local-only (ADR-IOS-036) — there is no server-side keyword
         // to remove, so leaving the inbox clears `actionTag` in THIS write
         // (same statement as the folder move) instead of queuing a
@@ -485,14 +485,18 @@ extension AccountManager {
         // Re-read isRead from DB to avoid double-decrement when markRead + move race.
         let unreadMoving = try Self.countCurrentlyUnread(msgIds: msgIds, db: db)
         if unreadMoving > 0 {
-            let sourceFolderId = msgs[0].folderId
+            let sourceFolderId = admitted[0].folderId
             try db.execute(sql: "UPDATE folder SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?", arguments: [unreadMoving, sourceFolderId])
             try db.execute(sql: "UPDATE folder SET unreadCount = unreadCount + ? WHERE id = ?", arguments: [unreadMoving, destFolderId])
         }
 
-        try PendingOperation(type: opType, messageIds: stableIds, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath).insert(db)
-        print("[Queue] Queued \(opType.rawValue) for \(stableIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
-        return [msgs[0].folderId, destFolderId]
+        try PendingOperation(
+            type: opType, messageIds: admission.providerIds,
+            accountId: accountId, folderPath: folderPath,
+            destinationPath: destinationPath,
+            observedUidValidity: admission.observedUidValidity).insert(db)
+        print("[Queue] Queued \(opType.rawValue) for \(admission.providerIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
+        return [admitted[0].folderId, destFolderId]
     }
 
     func move(_ messages: [MessageHeader], to destinationPath: String) async {
@@ -563,14 +567,16 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
-                    // T1.3 — refuse before ANY mutation (see markRead).
-                    if try Self.newGestureRefusedForUnknownEpoch(accountId: accountId, folderPath: folderPath, db: db) { continue }
-                    let stableIds = msgs.map(\.stableId)
-                    for msg in msgs {
+                    guard let admission = try Self.admittedOrdinaryActionTargets(
+                        msgs, accountId: accountId, folderPath: folderPath, db: db) else { continue }
+                    for msg in admission.messages {
                         try db.execute(sql: "UPDATE messageHeader SET isFlagged = ? WHERE id = ?", arguments: [flagged, msg.id])
                     }
                     let opType: OperationType = flagged ? .markFlagged : .markUnflagged
-                    try PendingOperation(type: opType, messageIds: stableIds, accountId: accountId, folderPath: folderPath).insert(db)
+                    try PendingOperation(
+                        type: opType, messageIds: admission.providerIds,
+                        accountId: accountId, folderPath: folderPath,
+                        observedUidValidity: admission.observedUidValidity).insert(db)
                 }
             }
         } catch {

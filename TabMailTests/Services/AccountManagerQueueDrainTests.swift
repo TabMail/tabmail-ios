@@ -67,6 +67,19 @@ struct AccountManagerQueueDrainTests {
         try pool.read { db in try PendingOperation.fetchOne(db, key: id) }
     }
 
+    /// The GAP3 cases exercise lane mechanics with opaque ids. Make their
+    /// account explicitly stable-provider-backed so T2.6's IMAP UID/epoch
+    /// checkpoint is correctly inapplicable.
+    private func insertStableProviderFixture(accountId: String, pool: DatabasePool) throws {
+        try pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "\(accountId)@example.com", displayName: "GAP3", provider: .gmail)
+            account.id = accountId
+            try account.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId).insert(db)
+        }
+    }
+
     // MARK: - 1. Non-move, non-tag op: first uidResolutionFailed retries (haltLane)
 
     @Test(".markRead + uidResolutionFailed, uidResolutionRetryCount 0: op reset to queued, uidResolutionRetryCount bumped (retryCount untouched), outcome .haltLane")
@@ -542,6 +555,7 @@ struct AccountManagerQueueDrainTests {
 
         let provider = MockEmailProvider()
         await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
 
         // Dynamic (repo rule: no hardcoded dates); whole-second so the GRDB
         // date round-trip compares exactly.
@@ -588,6 +602,7 @@ struct AccountManagerQueueDrainTests {
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.notConnected)
         await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
 
         let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
         var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
@@ -621,6 +636,7 @@ struct AccountManagerQueueDrainTests {
 
         let provider = MockEmailProvider()
         await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
 
         let op = PendingOperation(type: .markRead, messageIds: ["msg-reentrant"], accountId: accountId, folderPath: "INBOX")
         try insertOp(op, pool: pool)

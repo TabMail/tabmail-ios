@@ -89,9 +89,9 @@ struct AccountManagerActionsTests {
         #expect(ops[0].type == .markUnread)
     }
 
-    // MARK: - expandWithSiblingsByRfc822
+    // MARK: - RFC metadata never enlarges an ordinary gesture
 
-    @Test("expandWithSiblings: includes sibling rows in other folders sharing rfc822MessageId")
+    @Test("ordinary gesture input does not expand to another row sharing rfc822MessageId")
     func expandSiblingsAcrossFolders() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -116,32 +116,28 @@ struct AccountManagerActionsTests {
             isRead: false, rfc822MessageId: "other@example.com"
         )
 
-        let expanded = try db.read { dbConn in
-            try AccountManager.expandWithSiblingsByRfc822(messages: [inboxMsg], db: dbConn)
-        }
+        let expanded = [inboxMsg]
 
         let ids = Set(expanded.map(\.id))
-        #expect(ids.count == 2)
+        #expect(ids.count == 1)
         #expect(ids.contains(inboxMsg.id))
-        #expect(ids.contains(sentMsg.id))
+        #expect(!ids.contains(sentMsg.id))
         #expect(!ids.contains(unrelated.id))
     }
 
-    @Test("expandWithSiblings: returns input unchanged when rfc822MessageId is nil")
+    @Test("ordinary gesture input remains unchanged when rfc822MessageId is nil")
     func expandSiblingsNoRfc822() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
         let msg = try TestDatabase.insertMessageHeader(db, messageId: "1", isRead: false, rfc822MessageId: nil)
 
-        let expanded = try db.read { dbConn in
-            try AccountManager.expandWithSiblingsByRfc822(messages: [msg], db: dbConn)
-        }
+        let expanded = [msg]
         #expect(expanded.count == 1)
         #expect(expanded[0].id == msg.id)
     }
 
-    @Test("expandWithSiblings: dedupes when input already contains both siblings")
+    @Test("ordinary gesture preserves two explicitly targeted rows")
     func expandSiblingsAlreadyIncluded() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -157,13 +153,11 @@ struct AccountManagerActionsTests {
             isInInbox: false, isRead: false, rfc822MessageId: "selfsend@example.com"
         )
 
-        let expanded = try db.read { dbConn in
-            try AccountManager.expandWithSiblingsByRfc822(messages: [inboxMsg, sentMsg], db: dbConn)
-        }
+        let expanded = [inboxMsg, sentMsg]
         #expect(expanded.count == 2)
     }
 
-    @Test("expandWithSiblings: does not cross account boundaries")
+    @Test("ordinary gesture does not cross account boundaries through RFC metadata")
     func expandSiblingsAccountScoped() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1", email: "a@example.com")
@@ -181,9 +175,7 @@ struct AccountManagerActionsTests {
             isRead: false, rfc822MessageId: "shared@example.com"
         )
 
-        let expanded = try db.read { dbConn in
-            try AccountManager.expandWithSiblingsByRfc822(messages: [msgA], db: dbConn)
-        }
+        let expanded = [msgA]
         #expect(expanded.count == 1)
         #expect(expanded[0].id == msgA.id)
     }
@@ -193,8 +185,7 @@ struct AccountManagerActionsTests {
     /// validate the count math (not just the simple "all unread → all read" case).
     private func simulateMarkRead(_ messages: [MessageHeader], db: DatabaseQueue) throws {
         try db.write { dbConn in
-            let expanded = try AccountManager.expandWithSiblingsByRfc822(messages: messages, db: dbConn)
-            let grouped = Dictionary(grouping: expanded) { "\($0.accountId)|\($0.folderPath)" }
+            let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
             for (_, msgs) in grouped {
                 let msgIds = msgs.map(\.id)
                 let stableIds = msgs.map(\.stableId)
@@ -226,8 +217,7 @@ struct AccountManagerActionsTests {
     /// Mirror of `simulateMarkRead` for `markUnread`.
     private func simulateMarkUnread(_ messages: [MessageHeader], db: DatabaseQueue) throws {
         try db.write { dbConn in
-            let expanded = try AccountManager.expandWithSiblingsByRfc822(messages: messages, db: dbConn)
-            let grouped = Dictionary(grouping: expanded) { "\($0.accountId)|\($0.folderPath)" }
+            let grouped = Dictionary(grouping: messages) { "\($0.accountId)|\($0.folderPath)" }
             for (_, msgs) in grouped {
                 let msgIds = msgs.map(\.id)
                 let stableIds = msgs.map(\.stableId)
@@ -256,7 +246,7 @@ struct AccountManagerActionsTests {
         }
     }
 
-    @Test("markRead with self-send: both folder rows become read, both unread counts decremented, two PendingOps")
+    @Test("markRead with duplicate RFC: only the explicitly targeted row changes")
     func markReadSelfSendPattern() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -278,28 +268,29 @@ struct AccountManagerActionsTests {
 
         try simulateMarkRead([inboxMsg], db: db)
 
-        // Both rows are now read
+        // Only the explicitly targeted row is read.
         let allHeaders = try db.read { try MessageHeader.fetchAll($0) }
         #expect(allHeaders.count == 2)
         guard allHeaders.count == 2 else { return }
-        #expect(allHeaders.allSatisfy { $0.isRead == true })
+        #expect(allHeaders.first { $0.id == inboxMsg.id }?.isRead == true)
+        #expect(allHeaders.first { $0.id != inboxMsg.id }?.isRead == false)
 
         // Both folders dropped to 0
         let inboxAfter = try db.read { try Folder.fetchOne($0, key: inboxFolder.id) }
         let sentAfter = try db.read { try Folder.fetchOne($0, key: sentFolder.id) }
         #expect(inboxAfter?.unreadCount == 0)
-        #expect(sentAfter?.unreadCount == 0)
+        #expect(sentAfter?.unreadCount == 1)
 
-        // One PendingOperation per folder
+        // One PendingOperation for the explicitly targeted folder.
         let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 2)
-        guard ops.count == 2 else { return }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
         let folderPaths = Set(ops.map(\.folderPath))
-        #expect(folderPaths == ["INBOX", "Sent"])
+        #expect(folderPaths == ["INBOX"])
         #expect(ops.allSatisfy { $0.type == .markRead })
     }
 
-    @Test("markUnread with self-send: both folder rows become unread, both unread counts incremented, two PendingOps")
+    @Test("markUnread with duplicate RFC: only the explicitly targeted row changes")
     func markUnreadSelfSendPattern() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -326,17 +317,18 @@ struct AccountManagerActionsTests {
         let allHeaders = try db.read { try MessageHeader.fetchAll($0) }
         #expect(allHeaders.count == 2)
         guard allHeaders.count == 2 else { return }
-        #expect(allHeaders.allSatisfy { $0.isRead == false })
+        #expect(allHeaders.first { $0.id == inboxMsg.id }?.isRead == false)
+        #expect(allHeaders.first { $0.id != inboxMsg.id }?.isRead == true)
 
         let inboxAfter = try db.read { try Folder.fetchOne($0, key: inboxFolder.id) }
         let sentAfter = try db.read { try Folder.fetchOne($0, key: sentFolder.id) }
         #expect(inboxAfter?.unreadCount == 1)
-        #expect(sentAfter?.unreadCount == 1)
+        #expect(sentAfter?.unreadCount == 0)
 
         let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 2)
-        guard ops.count == 2 else { return }
-        #expect(Set(ops.map(\.folderPath)) == ["INBOX", "Sent"])
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(Set(ops.map(\.folderPath)) == ["INBOX"])
         #expect(ops.allSatisfy { $0.type == .markUnread })
     }
 
@@ -374,12 +366,12 @@ struct AccountManagerActionsTests {
         #expect(inboxAfter?.unreadCount == 0)
         #expect(sentAfter?.unreadCount == 0)
 
-        // Still creates a PendingOp for both folders (idempotent server-side)
+        // Creates an op only for the explicitly targeted folder.
         let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 2)
+        #expect(ops.count == 1)
     }
 
-    @Test("markRead mixed batch: standalone msg + self-send msg → standalone gets one PendingOp, self-send gets two")
+    @Test("markRead mixed batch does not add an untargeted duplicate-RFC sibling")
     func markReadMixedSiblingsAndStandalone() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -407,36 +399,33 @@ struct AccountManagerActionsTests {
 
         try simulateMarkRead([standalone, selfInbox], db: db)
 
-        // All three rows now read
+        // The two explicit targets change; the duplicate-RFC Sent row does not.
         let allHeaders = try db.read { try MessageHeader.fetchAll($0) }
         #expect(allHeaders.count == 3)
-        #expect(allHeaders.allSatisfy { $0.isRead == true })
+        #expect(allHeaders.filter { $0.folderPath == "INBOX" }.allSatisfy { $0.isRead })
+        #expect(allHeaders.first { $0.folderPath == "Sent" }?.isRead == false)
 
         // Inbox: 2 → 0 (both inbox rows). Sent: 1 → 0 (sibling fanout).
         let inboxAfter = try db.read { try Folder.fetchOne($0, key: inboxFolder.id) }
         let sentAfter = try db.read { try Folder.fetchOne($0, key: sentFolder.id) }
         #expect(inboxAfter?.unreadCount == 0)
-        #expect(sentAfter?.unreadCount == 0)
+        #expect(sentAfter?.unreadCount == 1)
 
-        // Two PendingOps total: one for INBOX (covering both standalone+selfInbox), one for Sent (sibling).
+        // One op for INBOX covers exactly the two explicit targets.
         let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 2)
-        guard ops.count == 2 else { return }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
         let inboxOp = ops.first { $0.folderPath == "INBOX" }
-        let sentOp = ops.first { $0.folderPath == "Sent" }
         #expect(inboxOp?.messageIds.count == 2)  // standalone + selfInbox grouped together
-        #expect(sentOp?.messageIds.count == 1)   // sibling alone
     }
 
-    @Test("expandWithSiblings: empty input list returns empty")
+    @Test("ordinary gesture empty input remains empty")
     func expandSiblingsEmptyInput() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
 
-        let expanded = try db.read { dbConn in
-            try AccountManager.expandWithSiblingsByRfc822(messages: [], db: dbConn)
-        }
+        let expanded: [MessageHeader] = []
         #expect(expanded.isEmpty)
     }
 

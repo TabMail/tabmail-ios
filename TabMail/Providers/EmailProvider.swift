@@ -583,6 +583,10 @@ enum ProviderError: LocalizedError {
     /// confirmed. The drain terminalizes it instead — see `AccountManager
     /// .drainPendingQueue`.
     case actionIdentityResolutionFailed(String)
+    /// PORT — exact typed reset signal from v2final `ProviderError`.
+    /// `stored` is the per-operation admitted epoch; `live` is from the
+    /// uninterrupted SELECT that immediately precedes the IMAP mutation.
+    case uidValidityChanged(folderPath: String, stored: UInt32, live: UInt32)
     /// One or more ids handed to `fetchMessagesBatch` are TabMail-internal synthetic
     /// placeholder ids (`sent-<UUID>` / `draft-<UUID>`) that should never reach a
     /// remote provider. Means an upstream queue picked up a row it shouldn't have.
@@ -607,6 +611,8 @@ enum ProviderError: LocalizedError {
         case .invalidURL(let url): return "Invalid URL: \(url)"
         case .uidResolutionFailed(let id): return "Could not resolve Message-ID '\(id)' to UID."
         case .actionIdentityResolutionFailed(let id): return "'\(id)' is not a verifiable message identity; refusing the operation."
+        case .uidValidityChanged(let folderPath, let stored, let live):
+            return "UIDVALIDITY changed for \(folderPath): stored=\(stored) live=\(live)"
         case .syntheticPlaceholderId(let ids): return "Synthetic placeholder id(s) leaked into provider fetch: \(ids.prefix(3))"
         case .syntheticFolderPath(let path): return "Synthetic folder path leaked into provider request: \(path)"
         }

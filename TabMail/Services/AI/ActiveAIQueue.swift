@@ -1014,11 +1014,6 @@ actor ActiveAIQueue {
                 if effectiveAction != action {
                     print("[ReplyDetect] ActiveAI action: reply→none for \(message.messageId)")
                 }
-                AccountManager.queueTagWrite(
-                    accountId: account.id, messageId: message.messageId,
-                    rfc822MessageId: message.rfc822MessageId,
-                    tag: effectiveAction, folder: message.folderPath
-                )
                 NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                 let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 print("[ActiveAI] Action for \(message.messageId): \(effectiveAction.displayName) in \(elapsed)ms")

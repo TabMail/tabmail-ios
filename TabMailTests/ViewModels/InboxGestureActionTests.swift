@@ -1209,7 +1209,7 @@ struct InboxGestureActionTests {
         #expect(AccountManager.shared.pendingIntentCyclesForTesting()[id] == nil)
     }
 
-    @Test("toggleRead (net flip) + toggleFlag×2 (cancel-out) + applyManualTag (net change) on the same id, via InboxViewModel, all fold into ONE IntentCycle (refcount 1) — drain lands exactly the two net writes (isRead + tag); the flag stays untouched, with no markFlagged/markUnflagged PendingOperation")
+    @Test("toggleRead (net flip) + toggleFlag×2 (cancel-out) + applyManualTag (local net change) on the same id, via InboxViewModel, all fold into ONE IntentCycle (refcount 1) — drain lands one provider write (isRead); flag stays untouched and tag stays local")
     func threeFieldsCoalesceInOneCycle() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
         defer {
@@ -1257,8 +1257,8 @@ struct InboxGestureActionTests {
         #expect(!opTypes.contains(.markFlagged), "a perfect flag cancel-out must never write markFlagged")
         #expect(!opTypes.contains(.markUnflagged), "a perfect flag cancel-out must never write markUnflagged")
         #expect(opTypes.contains(.markRead), "the net isRead flip must produce a markRead op")
-        #expect(opTypes.contains(.setTag), "the net tag change must produce a setTag op")
-        #expect(pendingOps.count == 2, "exactly the two net writes — isRead + tag — must land, nothing for the cancelled-out flag")
+        #expect(!opTypes.contains(.setTag), "manual tags are local-only and must not create a provider op")
+        #expect(pendingOps.count == 1, "only the provider-backed isRead change must enqueue; tag stays local and flag cancelled out")
 
         #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil)
