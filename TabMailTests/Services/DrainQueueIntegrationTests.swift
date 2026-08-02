@@ -5,8 +5,7 @@
 // REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): simulateDrainPass/simulateExecuteOperation are a
 // hand-copy of executeOperation's dispatch switch, NOT production code — they pin the
 // OperationType -> provider-call contract only and give ZERO signal on fold-at-drain
-// correctness; only uidResolutionFailedTagOp/uidResolutionFailedNonTagOp exercise the real
-// executeSingleOp (seam-coupled; dissolves per PLAN_INTENTION_QUEUE.md section 1a).
+// correctness.
 
 import Testing
 import Foundation
@@ -17,11 +16,6 @@ import GRDB
 /// Simulates what `AccountManager.drainPendingQueue()` does but against
 /// TestDatabase + MockEmailProvider, testing the interaction between
 /// PendingOperation persistence and provider execution.
-///
-/// `.serialized`: two tests (`uidResolutionFailedTagOp`, `uidResolutionFailedNonTagOp`)
-/// call the REAL `AccountManager.shared.executeSingleOp`, which reads/writes via
-/// `AppDatabase.shared` — they swap the process-wide singleton (mirrors
-/// `InboxGestureActionTests` / `AccountManagerQueueDrainTests`).
 ///
 /// ⚑ NO REFERENCE — INVENTED (RULE R0). This file does not exist at `v2final`,
 /// so unlike the other 40 files in the 2026-07-30 `.processGlobalState` port
@@ -45,41 +39,6 @@ struct DrainQueueIntegrationTests {
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
         try TestDatabase.insertFolder(db, name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
-    }
-
-    // MARK: - AppDatabase.shared swap harness (for tests calling the real executeSingleOp)
-    //
-    // executeSingleOp reads/writes PendingOperation via `self.dbPool` == `AppDatabase.dbPool`
-    // == `AppDatabase.shared` — NOT the `db: DatabaseQueue` fixture above (which is a
-    // standalone GRDB queue used by the hand-simulated `simulateDrainPass` tests elsewhere
-    // in this file). Mirrors `InboxGestureActionTests.makeTestDB()`/`restoreTestDB()`.
-
-    private func makeRealDrainTestDB() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var config = Configuration()
-        config.foreignKeysEnabled = true
-        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
-        let appDb = try AppDatabase(dbPool: pool)
-        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
-            let prev = current
-            current = appDb
-            return prev
-        }
-        return (pool, dir, previous)
-    }
-
-    /// See `InboxGestureActionTests.restoreTestDB`: the REAL `executeSingleOp`
-    /// driven here fires unstructured background Tasks that can outlive the test
-    /// body, so no earlier boundary can safely close the pool. Restore a real
-    /// predecessor when present, and retain this installed fixture until process
-    /// exit in either case.
-    private func restoreRealDrainTestDB(pool: DatabasePool, previous: AppDatabase?, dir: URL) {
-        InstalledTestDatabaseLifetime.finish(
-            previous: previous,
-            pool: pool,
-            directory: dir
-        )
     }
 
     // MARK: - Helpers
@@ -162,15 +121,6 @@ struct DrainQueueIntegrationTests {
                 }
                 executedCount += 1
             } catch {
-                // UID resolution on tag ops: delete (best-effort)
-                if case ProviderError.uidResolutionFailed = error,
-                   [.setTag, .removeTag].contains(currentOp.type) {
-                    try await db.write { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    }
-                    executedCount += 1
-                    continue
-                }
                 // Message not found
                 if isMessageNotFoundError(error) {
                     if currentOp.messageIds.count > 1 {
@@ -196,15 +146,6 @@ struct DrainQueueIntegrationTests {
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                     executedCount += 1
-                    continue
-                }
-                // UID resolution on non-tag ops: reset to queued, NOT add to failedAccounts
-                if case ProviderError.uidResolutionFailed = error {
-                    try await db.write { db in
-                        var updated = currentOp
-                        updated.status = PendingStatus.queued.rawValue
-                        try updated.save(db)
-                    }
                     continue
                 }
                 // Connection/transient error: reset to queued, skip this account
@@ -461,76 +402,6 @@ struct DrainQueueIntegrationTests {
 
         // Account should be in failedAccounts (skip remaining ops for this account)
         #expect(failedAccounts.contains("acc1"))
-    }
-
-    // MARK: - 9. UID resolution failure on tag ops
-
-    @Test("uidResolutionFailed on setTag: op deleted (best-effort)")
-    func uidResolutionFailedTagOp() async throws {
-        // Calls the REAL AccountManager.shared.executeSingleOp (not a hand-copy of
-        // the drain logic) — requires AppDatabase.shared to point at a real
-        // DatabasePool since executeSingleOp reads/writes via self.dbPool.
-        //
-        // NOTE: executeOperation's `.setTag`/`.removeTag` case is a local-only
-        // no-op (ADR-IOS-036) — it never calls the provider and so can never
-        // actually throw `uidResolutionFailed` through the real dispatch path.
-        // The `uidResolutionFailed` + tag-op catch branch in `executeSingleOp` is
-        // kept verbatim (best-effort drop) per the ADR-IOS-018 amendment (2026-07-10), but is
-        // legacy/defensive code unreachable via `executeOperation` today. What's
-        // real and testable is the spec's observable claim — "deleted
-        // immediately, best-effort" — which a `.setTag` op reaches via the
-        // SUCCESS path (executeOperation no-ops → op deletes normally).
-        let (pool, dir, previous) = try makeRealDrainTestDB()
-        defer { restoreRealDrainTestDB(pool: pool, previous: previous, dir: dir) }
-
-        let op = PendingOperation(
-            type: .setTag,
-            messageIds: ["msg-1"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            tagValue: "archive"
-        )
-        try await pool.writeWithoutTransaction { db in try op.insert(db) }
-
-        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: AccountManager.DrainContext())
-
-        #expect(outcome == .proceed)
-        let after = try await pool.read { db in try PendingOperation.fetchOne(db, key: op.id) }
-        #expect(after == nil)
-        let callLog = await provider.callLog
-        #expect(callLog.isEmpty)
-    }
-
-    // MARK: - 10. UID resolution failure on non-tag ops
-
-    @Test("uidResolutionFailed on move: op reset to queued, NOT deleted")
-    func uidResolutionFailedNonTagOp() async throws {
-        // Calls the REAL AccountManager.shared.executeSingleOp. `.move` with a
-        // non-IMAP provider (MockEmailProvider isn't an IMAPProvider) can't run
-        // the destination-existence confirmation, so it falls through to retry —
-        // matching production behavior for fresh ops (retryCount 0 < the cap).
-        let (pool, dir, previous) = try makeRealDrainTestDB()
-        defer { restoreRealDrainTestDB(pool: pool, previous: previous, dir: dir) }
-
-        await provider.setMoveThrows(ProviderError.uidResolutionFailed("msg-1"))
-
-        let op = PendingOperation(
-            type: .move,
-            messageIds: ["msg-1"],
-            accountId: "acc1",
-            folderPath: "INBOX",
-            destinationPath: "Archive"
-        )
-        try await pool.writeWithoutTransaction { db in try op.insert(db) }
-
-        let outcome = await AccountManager.shared.executeSingleOp(op, provider: provider, context: AccountManager.DrainContext())
-
-        #expect(outcome == .haltLane)
-        let afterOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(afterOps.count == 1)
-        guard afterOps.count == 1 else { return }
-        #expect(afterOps[0].status == PendingStatus.queued.rawValue)
-        #expect(afterOps[0].id == op.id)
     }
 
     // MARK: - 11. Multi-account isolation
@@ -964,4 +835,3 @@ struct DrainQueueIntegrationTests {
         )))
     }
 }
-

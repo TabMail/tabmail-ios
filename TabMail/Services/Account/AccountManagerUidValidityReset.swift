@@ -494,14 +494,14 @@ extension AccountManager {
     /// against whichever message now occupies it — C3, reintroduced by the fix.
     ///
     /// WHAT SURVIVES AND WHAT DOES NOT (Law 5 / project constraint C5):
-    ///  - an op whose `messageIds` carry a durable rfc822 identity SURVIVES
-    ///    untouched. `IMAPProvider.idempotentMove` and its siblings resolve a
-    ///    non-numeric id by SEARCH, so the user's intention lands on the RIGHT
-    ///    message under the new numbering. This is the common case;
+    ///  - a legacy op whose `messageIds` carry an RFC identity may survive this
+    ///    address-only classifier, but it is not executable mutation authority:
+    ///    Checkpoint A drops unstamped or stale IMAP action rows before provider
+    ///    I/O. No action executor resolves it by SEARCH;
     ///    ⚠ SURVIVING THIS SWEEP IS NOT THE SAME AS BEING SAFE TO EXECUTE, and
     ///    reading it that way was a confirmed C3 defect (2026-07-31). "Carries a
-    ///    non-numeric id" is a property of the ROW; "resolves by SEARCH" is a
-    ///    property of the EXECUTOR, and `.deleteDraft` breaks the correspondence:
+    ///    non-numeric id" is a property of the ROW, not authority. `.deleteDraft`
+    ///    also needs its typed address/identity bundle:
     ///    `AccountManager.queueDraftDelete` records `[uid, rfc822]` while
     ///    `executeOperation` used to pass `messageIds.first`, the UID, alone to
     ///    `provider.deleteDraft`. Such an op is NOT address-only, survives here,

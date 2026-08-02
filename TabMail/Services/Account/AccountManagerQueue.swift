@@ -53,8 +53,8 @@ extension AccountManager {
     /// on B (e.g. a flag change) landed in a SEPARATE lane keyed by B — even though
     /// B is a member of both. The two lanes then ran concurrently, racing on the
     /// wire: a flag STORE on B could race the batch MOVE of B, silently losing the
-    /// flag on the MOVE's EXPUNGE, or getting wrongly confirmed-stale by the
-    /// `uidResolutionFailed` handling mid-move. Connected-component lanes guarantee
+    /// flag on the MOVE's source cleanup, or running against the old location
+    /// before the move finishes. Connected-component lanes guarantee
     /// any op sharing a member id with an in-flight op serializes AFTER it.
     ///
     /// Pure and side-effect free (no DB/IO) — `nonisolated static` so it's directly
@@ -520,19 +520,6 @@ extension AccountManager {
                     return .haltLane
                 }
             }
-            // UID resolution failed on tag ops — skip (best-effort).
-            // Tag removal is queued before move to prevent flag copying on IMAP MOVE.
-            // If we can't resolve the UID, skipping the tag op is far better than
-            // blocking the entire account's drain (including the actual archive/move).
-            if case ProviderError.uidResolutionFailed = error,
-               [.setTag, .removeTag].contains(currentOp.type) {
-                print("[Queue] Tag op UID resolution failed for \(currentOp.messageIds.first ?? "?") — skipping (best-effort)")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                }
-                context.executedAny = true
-                return .proceed
-            }
             if isMessageNotFoundError(error) {
                 if currentOp.messageIds.count > 1 {
                     // Batch op hit messageNotFound — one message is gone but others
@@ -564,9 +551,7 @@ extension AccountManager {
                     // sharing a member id (e.g. a chained move of one of the split
                     // messages) must never run ahead of them this pass — that would
                     // race/misread state the split children haven't written yet and
-                    // could get itself wrongly confirmed-stale and dropped. Same
-                    // never-run-ahead invariant as the uidResolutionFailed retry
-                    // path below; the lane loop requeues the rest of the lane back
+                    // could act on stale row state. The lane loop requeues the rest back
                     // to `.queued` so it serializes behind the split ops on a later
                     // pass/drain.
                     return .haltLane
@@ -645,113 +630,9 @@ extension AccountManager {
                 context.executedAny = true
                 return .proceed
             }
-            // UID resolution failed — message not found in source folder via IMAP SEARCH.
-            // Confirm staleness by checking destination (for move ops) or drop (for flag ops).
-            if case ProviderError.uidResolutionFailed(let failedId) = error {
-                // Batch ops: split into singles so each can be confirmed independently.
-                if currentOp.messageIds.count > 1 {
-                    print("[Queue] UID resolution failed in batch \(opType) (\(opMsgCount) msgs) — splitting into individual ops")
-                    do {
-                        try await dbPool.write { db in
-                            for msgId in currentOp.messageIds {
-                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
-                                // Split ops inherit the batch's queue position — they are
-                                // the SAME user intention, re-shaped. See the identical
-                                // comment in the messageNotFound split above.
-                                splitOp.createdAt = currentOp.createdAt
-                                try splitOp.insert(db)
-                            }
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                    } catch {
-                        print("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
-                    }
-                    context.executedAny = true
-                    // Halt the lane rather than .proceed — see the identical
-                    // never-run-ahead comment on the messageNotFound split above.
-                    // A later same-lane op (e.g. a chained move of one of the
-                    // split messages) must serialize BEHIND the freshly-queued
-                    // split singles, not run ahead of them this pass.
-                    return .haltLane
-                }
-
-                // Single-message op: confirm staleness.
-                if let dest = currentOp.destinationPath, currentOp.type == .move,
-                   let imapProvider = provider as? IMAPProvider {
-                    // Move op on IMAP: check if message is in destination folder.
-                    // Found → confirmed done. Not found → confirmed stale (can't recover). Either way, drop.
-                    // Connection error → can't confirm, fall through to retry.
-                    do {
-                        let existsInDest = try await imapProvider.messageExistsInFolder(rfc822MessageId: failedId, folderPath: dest)
-                        if existsInDest {
-                            print("[Queue] Confirmed done: \(opType) \(failedId) — already in destination \(dest), dropping")
-                        } else {
-                            print("[Queue] Confirmed stale: \(opType) \(failedId) — not in source \(currentOp.folderPath) or destination \(dest), dropping")
-                        }
-                        try? await retryWrite(dbPool, label: "Queue") { db in
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                        context.executedAny = true
-                        return .proceed
-                    } catch {
-                        // If destination folder itself doesn't exist (NONEXISTENT, etc.),
-                        // the message can't be in it — confirmed stale.
-                        let destCheckDesc = "\(error)"
-                        if destCheckDesc.contains("NONEXISTENT") || destCheckDesc.contains("does not exist") || destCheckDesc.contains("Mailbox doesn't exist") {
-                            print("[Queue] Confirmed stale: \(opType) \(failedId) — not in source \(currentOp.folderPath), destination \(dest) no longer exists, dropping")
-                            try? await retryWrite(dbPool, label: "Queue") { db in
-                                _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                            }
-                            context.executedAny = true
-                            return .proceed
-                        }
-                        print("[Queue] UID resolution failed for \(opType) \(failedId), destination check failed: \(error) — will retry")
-                    }
-                } else if currentOp.type != .move {
-                    // Flag/mark op: message not in folder via SEARCH. Per resolveUID's
-                    // documented contract (IMAPProvider.swift) a SEARCH miss can be
-                    // transient (server-side indexing lag, concurrent UID renumbering) —
-                    // so retry with a cap (matching move ops' destination-check treatment)
-                    // instead of an unconditional drop, so we don't discard user intention
-                    // on a false-negative SEARCH.
-                    //
-                    // Caps on the DEDICATED uidResolutionRetryCount, NOT the shared
-                    // retryCount (bumped below by the generic transient-error branch on
-                    // every ordinary connection blip). Reading the shared counter here
-                    // let a few unrelated blips pre-exhaust this budget before the op's
-                    // first real SEARCH miss, causing a false "confirmed stale" drop —
-                    // dropping user intention, the exact bug this cap exists to prevent.
-                    if currentOp.uidResolutionRetryCount >= SyncConfig.maxUidResolutionRetries {
-                        print("[Queue] Confirmed stale: \(opType) \(failedId) — message not in folder \(currentOp.folderPath) after \(currentOp.uidResolutionRetryCount) uidResolution retries, dropping")
-                        try? await retryWrite(dbPool, label: "Queue") { db in
-                            _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                        }
-                        context.executedAny = true
-                        return .proceed
-                    }
-                    print("[Queue] UID resolution failed for \(opType) \(failedId) — message not in folder \(currentOp.folderPath), uidResolution retry \(currentOp.uidResolutionRetryCount + 1)/\(SyncConfig.maxUidResolutionRetries) (not blocking account)")
-                    try? await retryWrite(dbPool, label: "Queue") { db in
-                        var updated = currentOp
-                        updated.status = PendingStatus.queued.rawValue
-                        updated.uidResolutionRetryCount += 1
-                        try updated.save(db)
-                    }
-                    return .haltLane
-                }
-
-                // Fall through: retry (destination check failed or non-IMAP move provider)
-                print("[Queue] UID resolution failed for \(opType) \(currentOp.messageIds.first ?? "?") — will retry (not blocking account)")
-                try? await retryWrite(dbPool, label: "Queue") { db in
-                    var updated = currentOp
-                    updated.status = PendingStatus.queued.rawValue
-                    try updated.save(db)
-                }
-                return .haltLane
-            }
             // Connection/transient error — reset op to queued and mark account failed.
             // NEVER drop on age alone — transient errors don't confirm the op is stale.
-            // Staleness is confirmed by: messageNotFound (server says gone), or
-            // uidResolutionFailed + destination check (not in source or destination).
+            // Staleness is confirmed only by messageNotFound (server says gone).
             // failedAccounts prevents hammering within a single drain.
             let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
             print("[Queue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")

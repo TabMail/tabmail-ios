@@ -96,9 +96,9 @@ extension AccountManager {
     /// authorised the trade (§9 D6, 2026-07-30): failing closed is always acceptable,
     /// and constraint C3 — *never mutate the wrong message* — is the one hard
     /// invariant. `MessageHeader.stableId` falls back to the bare numeric UID for any
-    /// header with no `rfc822MessageId`, and `IMAPProvider.resolveUID` treats a
-    /// numeric id as a literal UID. Admitting against a folder whose epoch is unknown
-    /// can therefore resolve that UID under a DIFFERENT epoch and STORE/COPY over an
+    /// header with no `rfc822MessageId`, and native IMAP actions address that
+    /// numeric UID directly. Admitting against a folder whose epoch is unknown
+    /// can therefore apply that UID under a DIFFERENT epoch and STORE/COPY over an
     /// unrelated message — exactly C3.
     ///
     /// What makes the trade acceptable is that the window is **BOUNDED to the first
@@ -506,8 +506,7 @@ extension AccountManager {
         // them into queued closures; a second destination-changing gesture on
         // the same message before the first closure commits would otherwise
         // record a PendingOperation against the STALE source folderPath (on
-        // IMAP the drain then SEARCHes the wrong folder, uidResolutionFailed,
-        // and the destination-check wrongly confirms it stale and drops it).
+        // IMAP the drain would otherwise carry the prior source observation.
         // The write acts on row truth at execution time — same doctrine as
         // `performCoordinatedRoleMove`'s in-closure re-resolve, which stays
         // as-is (its double resolve is harmless). Ids that no longer resolve
@@ -874,8 +873,9 @@ extension AccountManager {
                 }
 
                 if !cancelledOriginal {
-                    // IMAP MOVE changes UIDs — use rfc822MessageId for move-back so resolveUID
-                    // does a Message-ID header search in the destination folder (finds correct UID).
+                    // IMAP MOVE changes UIDs. This legacy move-back still records RFC
+                    // identities; the IMAP action checkpoint deliberately refuses them.
+                    // T2.9 owns re-keying undo protection to native destination UIDs.
                     // Gmail/Exchange use stable IDs that don't change on move.
                     let account = try Account.fetchOne(db, key: accountId)
                     let moveBackIds: [String]

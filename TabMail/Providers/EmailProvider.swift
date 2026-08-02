@@ -564,24 +564,14 @@ enum ProviderError: LocalizedError {
     case authenticationFailed
     case networkError(underlying: Error)
     case invalidURL(String)
-    /// IMAP SEARCH by Message-ID header returned no results. The message likely exists
-    /// but the server couldn't match it (substring vs exact match, timing, etc.).
-    /// Distinct from `messageNotFound` — drain queue should retry, not drop.
-    case uidResolutionFailed(String)
     /// The provider inspected the id it was handed and REFUSED to build a
     /// destructive command from it — the id is not an identity it can verify
     /// (a bare numeric UID, which is a mutable ADDRESS; or a value that does not
     /// canonicalize to an RFC 822 Message-ID). Ported from `v2final`'s case of
     /// the same name.
     ///
-    /// DETERMINISTIC and PRE-WIRE, which is the whole point of it being distinct
-    /// from `uidResolutionFailed`: that one means "the SEARCH ran and matched
-    /// nothing", which can be a transient server-side indexing lag and therefore
-    /// earns the drain's dedicated `uidResolutionRetryCount` budget. This one
-    /// never touched the wire and cannot change on retry, so spending that budget
-    /// on it is a lie that ends in a "confirmed stale" drop the server never
-    /// confirmed. The drain terminalizes it instead — see `AccountManager
-    /// .drainPendingQueue`.
+    /// DETERMINISTIC and PRE-WIRE: it cannot change on retry. The drain
+    /// terminalizes it instead — see `AccountManager.drainPendingQueue`.
     case actionIdentityResolutionFailed(String)
     /// PORT — exact typed reset signal from v2final `ProviderError`.
     /// `stored` is the per-operation admitted epoch; `live` is from the
@@ -609,7 +599,6 @@ enum ProviderError: LocalizedError {
         case .authenticationFailed: return "Authentication failed. Please check your credentials."
         case .networkError(let error): return "Network error: \(error.localizedDescription)"
         case .invalidURL(let url): return "Invalid URL: \(url)"
-        case .uidResolutionFailed(let id): return "Could not resolve Message-ID '\(id)' to UID."
         case .actionIdentityResolutionFailed(let id): return "'\(id)' is not a verifiable message identity; refusing the operation."
         case .uidValidityChanged(let folderPath, let stored, let live):
             return "UIDVALIDITY changed for \(folderPath): stored=\(stored) live=\(live)"

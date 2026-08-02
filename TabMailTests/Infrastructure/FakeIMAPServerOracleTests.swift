@@ -489,9 +489,9 @@ struct FakeIMAPServerOracleTests {
 
     /// Closes the loop between the two halves above: the oracle is not a
     /// property of the raw-wire tests, it hooks whatever reaches the fake —
-    /// including a mutation issued by the real `IMAPProvider`. `markRead`
-    /// resolves its target by SEARCH and STOREs the resulting UID; the test
-    /// declares a DIFFERENT message, so the STORE that lands is by
+    /// including a mutation issued by the real `IMAPProvider`. The explicit-
+    /// epoch `markRead` overload STOREs its native UID; the test declares a
+    /// DIFFERENT message, so the STORE that lands is by
     /// construction a wrong-message mutation, and no future production change
     /// can make that declaration correct.
     @Test("oracle observes a UID STORE issued by the real IMAPProvider")
@@ -519,7 +519,7 @@ struct FakeIMAPServerOracleTests {
             useTLS: false
         )
         try await provider.connect()
-        try await provider.markRead(ids: [occupantId], folder: "INBOX")
+        try await provider.markRead(ids: [String(occupantUID)], folder: "INBOX", admittedUidValidity: 1)
         try? await provider.disconnect()
 
         let violations = server.wrongMessageViolations()

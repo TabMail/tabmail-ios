@@ -111,12 +111,6 @@ struct ProviderTypesTests {
         #expect(error.errorDescription == "Invalid URL: https://bad-url")
     }
 
-    @Test("ProviderError.uidResolutionFailed includes the message ID")
-    func uidResolutionFailedDescription() {
-        let error = ProviderError.uidResolutionFailed("<msg-123@example.com>")
-        #expect(error.errorDescription?.contains("<msg-123@example.com>") == true)
-    }
-
     @Test("ProviderError.networkError wraps underlying error description")
     func networkErrorDescription() {
         struct TestError: LocalizedError {

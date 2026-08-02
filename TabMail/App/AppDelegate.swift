@@ -97,13 +97,9 @@ enum PendingConsentErrorStore {
 /// account's archive-/trash-role folder (`.archive`/`.delete` are legacy
 /// no-op `OperationType`s in the drain — see `AccountManagerQueue
 /// .executeOperation` — so the cold path must never queue those). That
-/// queued `.move` carries a raw numeric UID and skips rfc822 verification
-/// (`resolveUID` short-circuits on a numeric id) — an accepted residual:
-/// (a) within a UIDVALIDITY generation UIDs are never reused, so a stale UID
-/// no-ops via the confirmed-stale path rather than hitting a wrong message;
-/// (b) the wrong-target window requires a UIDVALIDITY change between push
-/// and drain — rare, and that event triggers a full resync anyway; (c) the
-/// alternative (dropping the tap) violates never-drop-user-intention.
+/// queued `.move` carries a raw numeric UID plus the source folder's admitted
+/// UIDVALIDITY. The drain applies it only while that epoch still matches; an
+/// absent or changed epoch fails closed and sync reconciles the local state.
 enum NotificationActionRouter {
     /// Durable lookup scoped to the account's inbox — see the enum doc for why.
     private static func resolveDurableInboxHeader(messageId: String, accountId: String) async -> MessageHeader? {
@@ -162,7 +158,7 @@ enum NotificationActionRouter {
         // No header anywhere — even after the merge retry above (header not
         // local yet — push arrived but sync hasn't landed). Queue a
         // correctly-shaped PendingOperation so sync reconciles local state
-        // when the message arrives. See the enum doc for the raw-UID residual.
+        // when the message arrives. See the enum doc for the epoch guard.
         await queueColdPendingOperation(actionId: actionId, messageId: messageId, accountId: accountId)
     }
 

@@ -161,8 +161,8 @@ extension SyncEngine {
     /// — it never compares stored against live — so stamping ANY value, right or
     /// wrong, unlocks every gesture on every header in that folder. A header with
     /// no `rfc822MessageId` has `MessageHeader.stableId` fall back to its bare
-    /// numeric UID, and `IMAPProvider.resolveUID` treats a numeric id as a LITERAL
-    /// UID. Stamp an epoch the local rows do not belong to and the next gesture
+    /// numeric UID, and native IMAP actions address that UID directly. Stamp an
+    /// epoch the local rows do not belong to and the next gesture
     /// mutates whatever message now occupies that number — constraint C3, the one
     /// hard invariant.
     ///

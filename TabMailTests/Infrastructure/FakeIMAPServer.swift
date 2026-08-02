@@ -107,35 +107,6 @@ final class FakeIMAPServer: @unchecked Sendable {
         var commandLog: [String] = []
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
-        /// Identity-resolution fault seam (Testing Rule 11) — bare (angle-
-        /// bracket-stripped) Message-ID → how many further whole RESOLUTIONS
-        /// of it must answer SUCCESSFULLY with zero UIDs. Unlike
-        /// `injectedFailureCountdowns` above this is consumed inside the SEARCH
-        /// handler, not in the pre-dispatch failure check, because the whole
-        /// point is that the command SUCCEEDS. The unit is a resolution and not
-        /// a command; see `returnEmptySearch(forMessageId:resolutionCount:)`
-        /// for why that distinction is load-bearing rather than cosmetic.
-        var emptySearchResolutionCountdowns: [String: Int] = [:]
-        /// Whole resolutions this fake has actually driven to empty — i.e. the
-        /// number of times it served the BARE half of a bracketed-then-bare
-        /// pair with zero UIDs.
-        ///
-        /// ⚠ That is a statement about the WIRE, not about
-        /// `uidResolutionFailed`. `IMAPProvider.searchByMessageId` has several
-        /// direct callers besides `IMAPProvider.resolveUID` — `move`'s
-        /// destination probe, `currentUIDs`, `appendToSentFolder`'s dedup
-        /// check, and the draft-save/stale-draft legs — and NONE of those
-        /// throws `uidResolutionFailed` on an empty result. Only `resolveUID`
-        /// does. So a served empty resolution is a NECESSARY, not a sufficient,
-        /// condition for the throw, and the count is an upper bound on the
-        /// throws it can have caused.
-        var consumedEmptySearchResolutionCount = 0
-        /// The same events keyed by bare Message-ID. The aggregate above is
-        /// unjoinable: it cannot say WHICH message was driven empty, so pairing
-        /// it with a durable side effect recorded against some message proves
-        /// only that both numbers are non-zero, never that they describe the
-        /// same message. Every consumer that needs a two-sided proof reads this.
-        var consumedEmptySearchResolutionsByMessageId: [String: Int] = [:]
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
         /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
@@ -554,129 +525,6 @@ final class FakeIMAPServer: @unchecked Sendable {
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
                 .append(InjectedFailure(skip: 0, message: "", killConnection: true))
         }
-    }
-
-    /// Two-tier fuzzer (Testing Rule 11) seam — the IDENTITY-RESOLUTION fault,
-    /// and the only one of this fake's three that a *successful* command
-    /// carries. The next `resolutionCount` whole RESOLUTIONS of `messageId`
-    /// answer `* SEARCH` with an EMPTY UID list and a tagged `OK`, while the
-    /// message itself stays exactly where it is.
-    ///
-    /// ⚑ NO REFERENCE — INVENTED (RULE R0). `v2final`'s `FakeIMAPServer` has no
-    /// successful-but-empty SEARCH seam and no state field of this shape: the
-    /// reference's only injected faults are the tagged-`NO` and socket-kill
-    /// pair above, because it never fuzzed identity resolution at all (its
-    /// tier-2 adversarial dimension is the epoch reset, and a renumber
-    /// PRESERVES every Message-ID, so an RFC-keyed SEARCH still resolves).
-    /// There was therefore no reference seam to port and no reference
-    /// consumption-accounting shape to match.
-    ///
-    /// **Why neither existing fault can express this.** `failNextCommand` sends
-    /// a tagged `NO`; `killConnectionOnNextCommand` closes the socket with no
-    /// response at all. Both are consumed in the dispatch loop BEFORE
-    /// `handleCommand` runs, so both surface at the client as a THROWN error.
-    /// `IMAPProvider.resolveUID` throws `ProviderError.uidResolutionFailed`
-    /// only when a search that SUCCEEDED resolved to zero UIDs — an outcome
-    /// neither can produce. Without this seam the drain's entire
-    /// identity-resolution phase is unreachable from any wire-level test.
-    ///
-    /// **Fidelity.** The reply is byte-identical to the one a genuine miss
-    /// produces — same `* SEARCH ` line, same tagged OK, emitted from the same
-    /// `return` as the ordinary no-match case — so nothing downstream can tell
-    /// an armed miss from a real one. That is what makes it a faithful model of
-    /// the transient false negative `resolveUID`'s own contract names ("the
-    /// message likely exists but SEARCH couldn't find it (server quirk, timing
-    /// issue)").
-    ///
-    /// **The unit is a RESOLUTION, not a command — and that is the whole
-    /// point.** `IMAPProvider.searchByMessageId` issues up to TWO searches for
-    /// one resolution: the bracketed form first, then the bare form only when
-    /// the bracketed one came back empty. An earlier version of this seam
-    /// counted COMMANDS, and that made the fault splittable: the bracketed
-    /// half could consume one armed miss, a concurrent teardown could break the
-    /// connection before the bare half, and a LATER attempt could then spend
-    /// the leftover on ITS bracketed half and succeed on its bare one — two
-    /// armed misses served, ZERO resolutions failed, `uidResolutionFailed`
-    /// never thrown. A fuzzer's non-vacuity guard counting those commands would
-    /// green with the dimension it exists to exercise entirely unexercised.
-    ///
-    /// So the credit is consumed on the BARE half only. The bracketed half is
-    /// served empty while a credit is outstanding but spends nothing, which
-    /// makes the pair ATOMIC with respect to teardown: a connection that dies
-    /// mid-pair leaves the credit intact and the next attempt is dealt a whole
-    /// fresh pair. One credit therefore buys exactly one whole EMPTY RESOLUTION
-    /// — one indivisible wire event — which is what both the injected-fault
-    /// budget and `consumedEmptySearchResolutions()` count.
-    ///
-    /// **⚠ A whole empty resolution is not the same thing as a thrown
-    /// `ProviderError.uidResolutionFailed`, and this comment used to say it
-    /// was.** `IMAPProvider.resolveUID` is the only site in the app target that
-    /// throws it, but it is NOT `IMAPProvider.searchByMessageId`'s only caller:
-    /// `move`'s destination probe (which wraps the call in `try?` and reads
-    /// empty as "not yet copied"), `currentUIDs`, `appendToSentFolder`'s dedup
-    /// check and the draft-save/stale-draft legs all call it directly, and every
-    /// one of them treats an empty result as an ordinary answer rather than a
-    /// failure. A credit is therefore consumed by whichever caller reaches the
-    /// bare half first, and only the `resolveUID` ones become
-    /// `uidResolutionFailed`. Consumption BOUNDS the throws from above; it does
-    /// not equal them. A test that needs the throw itself must observe the
-    /// throw's own durable side effect and join it to this seam BY IDENTITY.
-    ///
-    /// `messageId` is matched with angle brackets stripped from both sides, so
-    /// either form may be passed.
-    ///
-    /// Symbol-level citations on purpose: `IMAPProvider.swift` is under active
-    /// growth on this branch, so a line range written here is a latent false
-    /// claim (this doc comment previously carried three of them). The symbols
-    /// are `IMAPProvider.searchByMessageId` (the bracketed-then-bare pair) and
-    /// `IMAPProvider.resolveUID` (the sole `uidResolutionFailed` throw site in
-    /// the whole app target).
-    func returnEmptySearch(forMessageId messageId: String, resolutionCount: Int) {
-        let bare = messageId.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-        withState { $0.emptySearchResolutionCountdowns[bare, default: 0] += max(0, resolutionCount) }
-    }
-
-    /// How many whole armed resolutions this fake has actually driven to empty
-    /// — i.e. how many times it served the BARE half of a bracketed-then-bare
-    /// pair with zero UIDs. A fuzzer asserts this is non-zero so that an arming
-    /// path which silently stopped firing cannot leave the suite a green-always
-    /// control.
-    ///
-    /// ⚠ Two things this does NOT say.
-    ///
-    /// 1. It is a WIRE-side observation and proves only that the fake did its
-    ///    job — never that the drain's failure branch ran. That needs a durable,
-    ///    production-written observation, which is why `ProviderIdQueueFuzzTests`
-    ///    pairs it with the queue's own `uidResolutionRetryCount` side effect
-    ///    rather than resting on it alone.
-    /// 2. A served empty bare search is NOT equivalent to a thrown
-    ///    `ProviderError.uidResolutionFailed`. `IMAPProvider.resolveUID` is the
-    ///    only throw site, but it is not `IMAPProvider.searchByMessageId`'s only
-    ///    caller — `move`'s destination probe, `currentUIDs`,
-    ///    `appendToSentFolder` and the draft-save legs all call it directly and
-    ///    all treat empty as an ordinary answer. So this counts the wire event
-    ///    that ENABLES the throw, and bounds the throws from above; it does not
-    ///    count throws.
-    ///
-    /// Use `consumedEmptySearchResolutions()` when the two sides have to be
-    /// joined by identity rather than merely both being non-zero.
-    func consumedEmptySearchResolutionCount() -> Int {
-        withState { $0.consumedEmptySearchResolutionCount }
-    }
-
-    /// The same consumption, keyed by bare Message-ID: identity → how many whole
-    /// armed resolutions of THAT message this fake drove empty.
-    ///
-    /// This is what makes a two-sided non-vacuity proof actually two-sided. An
-    /// aggregate wire count paired with a durable failure recorded against some
-    /// message establishes only that each side is non-zero — the durable failure
-    /// may belong to a message whose resolution was never armed, and the served
-    /// resolution may belong to a message that never failed durably. Comparing
-    /// per identity closes that gap, and gives a per-message upper bound
-    /// (see this type's `consumedEmptySearchResolutionCount()` caveat 2 for why
-    /// it is a bound and not an equality).
-    func consumedEmptySearchResolutions() -> [String: Int] {
-        withState { $0.consumedEmptySearchResolutionsByMessageId }
     }
 
     /// Owner-directed adversarial fuzzer addendum — see `State
@@ -1617,7 +1465,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "SEARCH":
             // Honor HEADER "Message-ID" "<...>" criterion when present; otherwise
             // return all UIDs (legacy behavior). Minimal filter to support
-            // IMAPProvider's messageExistsInFolder / idempotentMove probe path.
+            // IMAPProvider's remaining exact-identity probe paths.
             let upper = subargs.uppercased()
             if let range = upper.range(of: "HEADER \"MESSAGE-ID\"") {
                 // Next quoted string after the criterion is the Message-ID pattern.
@@ -1627,56 +1475,11 @@ final class FakeIMAPServer: @unchecked Sendable {
                 // from the raw header value and typically includes "<...>".
                 let bracketSet = CharacterSet(charactersIn: "<>")
                 let bareQuery = quoted.trimmingCharacters(in: bracketSet)
-                // `IMAPProvider.searchByMessageId` asks the bracketed form
-                // (`"<id>"`) first and the bare form (`"id"`) only when that
-                // came back empty, so the presence of the angle brackets IS
-                // which half of the resolution pair this command is.
-                let isBracketedHalf = quoted.hasPrefix("<")
-                // Identity-resolution fault seam — see
-                // `returnEmptySearch(forMessageId:resolutionCount:)`. Consumed
-                // HERE rather than in the pre-dispatch injected-failure check
-                // because this fault's defining property is that the command
-                // SUCCEEDS: it takes the same `return` below as a genuine miss,
-                // so the two are indistinguishable on the wire.
-                //
-                // Both halves are answered empty while a credit is outstanding,
-                // but only the BARE half SPENDS it. That keeps the pair atomic
-                // against a teardown landing between the two commands: the
-                // credit survives, the next attempt is dealt a whole fresh
-                // pair, and one credit still means exactly one thrown
-                // `uidResolutionFailed`. Spending on the bracketed half instead
-                // would let a broken pair strand a half-credit that a later
-                // attempt consumes without ever failing a resolution — see the
-                // seam's doc comment.
-                let armedEmpty = withState { state -> Bool in
-                    guard let remaining = state.emptySearchResolutionCountdowns[bareQuery], remaining > 0 else {
-                        return false
+                let matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
+                    .filter {
+                        $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
                     }
-                    if !isBracketedHalf {
-                        state.emptySearchResolutionCountdowns[bareQuery] = remaining - 1
-                        state.consumedEmptySearchResolutionCount += 1
-                        // Same event, recorded WITH its identity. The aggregate
-                        // counter above cannot be joined to anything: a durable
-                        // side effect attributed to message A is not evidence
-                        // that A's resolution was the one driven empty when the
-                        // only wire figure available is a total across all
-                        // messages. Keyed, the two halves of a non-vacuity proof
-                        // can be compared per identity instead of merely both
-                        // being non-zero.
-                        state.consumedEmptySearchResolutionsByMessageId[bareQuery, default: 0] += 1
-                    }
-                    return true
-                }
-                let matched: [String]
-                if armedEmpty {
-                    matched = []
-                } else {
-                    matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
-                        .filter {
-                            $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
-                        }
-                        .map { String($0.uid) }
-                }
+                    .map { String($0.uid) }
                 return "* SEARCH \(matched.joined(separator: " "))\r\n\(tag) OK UID SEARCH completed\r\n"
             }
             let uids = withState { $0.messagesByMailbox[mailbox] ?? [] }

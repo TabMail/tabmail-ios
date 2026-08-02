@@ -96,8 +96,8 @@ extension SyncEngine {
     /// only `lastKnownUidValidity == nil`, that non-nil-but-wrong stamp ADMITS
     /// every bare-UID gesture on all of those rows, and `MessageHeader.stableId`
     /// falls back to the bare UID whenever a header has no `rfc822MessageId` —
-    /// which `IMAPProvider.resolveUID` resolves as a LITERAL UID in the live
-    /// mailbox. That is constraint C3, the one hard invariant, reached here by a
+    /// which native IMAP actions address directly in the live mailbox. That is
+    /// constraint C3, the one hard invariant, reached here by a
     /// pass that is UNBOUNDED in size: the diff inserts as many headers as the
     /// window returns, so one mis-epoched run mis-stamps an arbitrarily large
     /// slice of the folder in a single pass.

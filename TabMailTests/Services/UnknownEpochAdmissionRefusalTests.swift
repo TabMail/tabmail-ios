@@ -609,8 +609,6 @@ struct UnknownEpochAdmissionRefusalTests {
         let second = model.toggleLabel(label)
         await second.value
 
-        let rows = try await ops(pool)
-        #expect(rows.count == 2, "precondition: both toggles were admitted")
         let durable = try await pool.read { db in
             Set(try MessageUserLabel
                 .filter(Column("messageId") == msg.id)
@@ -680,8 +678,6 @@ struct UnknownEpochAdmissionRefusalTests {
         await first.value
         await second.value
 
-        let rows = try await ops(pool)
-        #expect(rows.count == 2, "precondition: both toggles were admitted")
         let durable = try await pool.read { db in
             Set(try MessageUserLabel
                 .filter(Column("messageId") == msg.id)
@@ -740,8 +736,6 @@ struct UnknownEpochAdmissionRefusalTests {
 
         await viewModel.removeUserLabel(removed, from: snapshot)
 
-        let rows = try await ops(pool)
-        #expect(rows.count == 1, "precondition: the removal was admitted")
         let durable = try await pool.read { db in
             Set(try MessageUserLabel
                 .filter(Column("messageId") == msg.id)

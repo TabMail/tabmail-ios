@@ -1934,12 +1934,8 @@ final class AppDatabase: Sendable {
         }
 
         migrator.registerMigration("v67_addUidResolutionRetryCount") { db in
-            // Dedicated retry budget for uidResolutionFailed (IMAP SEARCH-by-Message-ID
-            // miss) on non-move, non-tag ops. Previously this cap read the SHARED
-            // retryCount, which the generic transient-error branch ALSO increments —
-            // a few ordinary connection blips could pre-exhaust the budget before the
-            // op's first real SEARCH miss, causing a false "confirmed stale" drop
-            // (dropping user intention). See SyncConfig.maxUidResolutionRetries.
+            // Historical RFC-resolution retry budget. The column remains because
+            // this migration shipped; provider-ID actions leave it dormant.
             try db.alter(table: "pendingOperation") { t in
                 t.add(column: "uidResolutionRetryCount", .integer).notNull().defaults(to: 0)
             }

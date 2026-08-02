@@ -240,23 +240,6 @@ enum SyncConfig {
     /// Failed items move to back of FIFO, yielding to others. After max retries,
     /// item is removed from in-memory queue; repopulateFromDatabase catches it on next foreground.
     static let maxQueueRetries = 3
-    /// Max retries for a non-move, non-tag `PendingOperation` that hits
-    /// `ProviderError.uidResolutionFailed` (IMAP SEARCH-by-Message-ID miss) before
-    /// confirming it stale and dropping it. `IMAPProvider.resolveUID`'s documented
-    /// contract (IMAPProvider.swift) is that a SEARCH miss "likely" means the message
-    /// exists but SEARCH couldn't find it — a transient signal (server-side indexing
-    /// lag, concurrent UID renumbering), not a confirmed absence. Move ops get a
-    /// stronger signal (destination-folder existence check) so they don't need this
-    /// cap. Tag ops (.setTag/.removeTag) are local-only (ADR-IOS-036) and keep their
-    /// immediate best-effort drop regardless of this cap.
-    ///
-    /// This is a genuinely DEDICATED budget: tracked via
-    /// `PendingOperation.uidResolutionRetryCount`, a counter separate from the
-    /// generic `retryCount` (bumped by the transient connection-error branch on
-    /// every ordinary blip). Reading the shared `retryCount` here would let
-    /// unrelated blips pre-exhaust this cap before the op's first real SEARCH
-    /// miss — a v66-era bug fixed by the v67 migration.
-    static let maxUidResolutionRetries = 3
     /// FTS orphan prune (one-time sweep): entries paged per FTS read.
     static let ftsOrphanPruneChunk = 500
     /// FTS orphan prune: delay before re-verifying candidates against GRDB —

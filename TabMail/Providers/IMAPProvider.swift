@@ -1418,7 +1418,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     private func fetchMessageOnConnection(id: String, folder: String, server: IMAPServer) async throws -> FullMessageInfo {
         _ = try await server.selectMailbox(folder)
 
-        let results = try await resolveUID(id, server: server)
+        let results = try nativeUIDSet([id])
         guard !results.isEmpty else {
             throw ProviderError.messageNotFound
         }
@@ -1757,15 +1757,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     func markRead(ids: [String], folder: String) async throws {
-        try await withActionConnection(folder: folder) { server in
-            _ = try await server.selectMailbox(folder)
-            for id in ids {
-                let results = try await self.resolveUID(id, server: server)
-                if !results.isEmpty {
-                    try await server.store(flags: [.seen], on: results, operation: .add)
-                }
-            }
-        }
+        throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
     /// T2.7 checkpoint-B overload for a T2.4 provider-native queue op.
@@ -1778,15 +1770,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     func markUnread(ids: [String], folder: String) async throws {
-        try await withActionConnection(folder: folder) { server in
-            _ = try await server.selectMailbox(folder)
-            for id in ids {
-                let results = try await self.resolveUID(id, server: server)
-                if !results.isEmpty {
-                    try await server.store(flags: [.seen], on: results, operation: .remove)
-                }
-            }
-        }
+        throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
     func markUnread(
         ids: [String], folder: String, admittedUidValidity: UInt32
@@ -1797,19 +1781,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {
-        try await withActionConnection(folder: folder) { server in
-            _ = try await server.selectMailbox(folder)
-            for id in ids {
-                let results = try await self.resolveUID(id, server: server)
-                if !results.isEmpty {
-                    if flagged {
-                        try await server.store(flags: [.flagged], on: results, operation: .add)
-                    } else {
-                        try await server.store(flags: [.flagged], on: results, operation: .remove)
-                    }
-                }
-            }
-        }
+        throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
     func markFlagged(
@@ -1875,28 +1847,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Set \Answered flag on IMAP messages (called after sending a reply).
     func markReplied(ids: [String], folder: String) async throws {
-        try await withActionConnection(folder: folder) { server in
-            _ = try await server.selectMailbox(folder)
-            for id in ids {
-                let results = try await self.resolveUID(id, server: server)
-                if !results.isEmpty {
-                    try await server.store(flags: [.answered], on: results, operation: .add)
-                }
-            }
-        }
+        throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
     /// Set $Forwarded keyword on IMAP messages (called after forwarding).
     func markForwarded(ids: [String], folder: String) async throws {
-        try await withActionConnection(folder: folder) { server in
-            _ = try await server.selectMailbox(folder)
-            for id in ids {
-                let results = try await self.resolveUID(id, server: server)
-                if !results.isEmpty {
-                    try await server.store(flags: [.custom("$Forwarded")], on: results, operation: .add)
-                }
-            }
-        }
+        throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
     /// Action tags are local-only (see ADR-IOS-036). No IMAP STORE.
@@ -1907,24 +1863,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Add or remove a user label (IMAP custom keyword) on a message.
-    /// Pattern: acquireLock → selectMailbox → resolveUID → store.
     func setUserLabel(messageId: String, keyword: String, add: Bool, folder: String) async throws {
-        try await withActionConnection(folder: folder) { server in
-            _ = try await server.selectMailbox(folder)
-            let results = try await self.resolveUID(messageId, server: server)
-            guard !results.isEmpty else { return }
-            let flag: Flag = .custom(keyword)
-            try await server.store(flags: [flag], on: results, operation: add ? .add : .remove)
-        }
+        throw ProviderError.actionIdentityResolutionFailed(messageId)
     }
 
     func move(ids: [String], from source: String, to destination: String) async throws {
-        print("[MoveTrace] IMAPProvider.move — ids=\(ids) source=\(source) dest=\(destination)")
-        try await withActionConnection(folder: source) { server in
-            for id in ids {
-                try await self.idempotentMove(id: id, from: source, to: destination, server: server)
-            }
-        }
+        throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
     /// T2.7 provider-native move. The native source UID has no cross-mailbox
@@ -1976,103 +1920,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Idempotent per-message move. Costs extra SEARCH round-trips but eliminates
-    /// the retry-after-partial-failure duplicate class:
-    ///
-    /// SwiftMail's fallback path (COPY + STORE \Deleted + UID EXPUNGE) is not
-    /// atomic. If COPY succeeds and either STORE or EXPUNGE fails, the op stays
-    /// `queued` — but no marker is recorded for the partial-copy state. A retry
-    /// would re-run COPY from scratch and leave two copies in the destination.
-    /// Two copies with the same Message-ID trip the push server's move-detection,
-    /// which fires a phantom "new mail" notification.
-    ///
-    /// Strategy: always probe the destination for the rfc822 Message-ID before
-    /// calling `server.move`. If the destination already has it, a prior attempt
-    /// COPIED successfully — skip COPY and just finish the source-side cleanup.
-    /// Verify the destination has the message after the operation; throw otherwise
-    /// so the op stays queued for another (idempotent) retry.
-    ///
-    /// Note: `id` is the PendingOperation message identifier, which for IMAP is
-    /// `MessageHeader.stableId` (rfc822MessageId when available). Numeric UIDs
-    /// skip the probe gracefully and fall through to `server.move`.
-    private func idempotentMove(id: String, from source: String, to destination: String, server: IMAPServer) async throws {
-        _ = try await server.selectMailbox(source)
-        let srcUIDs = try await self.resolveUID(id, server: server)
-        if srcUIDs.isEmpty {
-            print("[MoveTrace] IMAPProvider.move — \(id): src empty (already moved), skip")
-            return
-        }
-
-        // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip any residual
-        // tm_* keywords from the source UID(s) before the MOVE. Keywords
-        // follow the message to the destination, so stripping beforehand
-        // leaves the moved copy clean. Best-effort — a STORE failure must
-        // NOT block the move itself.
-        if source.uppercased() == "INBOX" {
-            let legacyFlags: [Flag] = [
-                .custom("tm_reply"), .custom("tm_archive"),
-                .custom("tm_delete"), .custom("tm_none"),
-            ]
-            do {
-                try await server.store(flags: legacyFlags, on: srcUIDs, operation: .remove)
-            } catch {
-                print("[IMAP] Legacy tm_* strip failed for \(id) (continuing): \(error)")
-            }
-        }
-
-        // Probe destination by rfc822 Message-ID. Only meaningful when `id` is rfc822
-        // (not a bare numeric UID). searchByMessageId returns empty for numeric ids.
-        _ = try await server.selectMailbox(destination)
-        let dstHitsBefore = (try? await self.searchByMessageId(id, server: server)) ?? UIDSet()
-        print("[MoveTrace] IMAPProvider.move — \(id): probe dst=\(dstHitsBefore.isEmpty ? "empty" : "\(dstHitsBefore.count) UIDs")")
-
-        if !dstHitsBefore.isEmpty {
-            // Recovery path: a prior attempt already COPIED. Just finish source-side
-            // cleanup — don't COPY again.
-            print("[MoveTrace] IMAPProvider.move — \(id): recovery path (STORE \\Deleted + EXPUNGE only)")
-            _ = try await server.selectMailbox(source)
-            try await server.store(flags: [.deleted], on: srcUIDs, operation: .add)
-            if await server.supportsUIDPlus {
-                try await server.expunge(messages: srcUIDs)
-            } else {
-                // No UIDPLUS: FAIL CLOSED. A folder-wide EXPUNGE removes EVERY
-                // `\Deleted` message in this mailbox, not just `srcUIDs` — another
-                // client's soft-deleted mail, or a copy an interrupted earlier
-                // attempt left marked-but-unexpunged. The `\Deleted` STORE above
-                // already recorded this copy's removal (soft delete) and the
-                // destination copy is confirmed present, so the move's user-visible
-                // outcome is complete; a UIDPLUS-capable client or the server's own
-                // policy reclaims the source. Matches `v2final`'s `deleteActionSource`
-                // and `expungeScopedToTargets` below — "never wrong-delete" is
-                // unconditional, not UIDPLUS-gated.
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[MoveTrace] IMAPProvider.move — \(id): server lacks UIDPLUS — source marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
-                }
-            }
-        } else {
-            _ = try await server.selectMailbox(source)
-            try await server.move(messages: srcUIDs, to: destination)
-        }
-
-        // Post-verify: confirm destination has the message by rfc822. If verification
-        // fails (e.g. atomic MOVE silently dropped, or fallback partial failure we didn't
-        // catch), throw so the op stays queued for retry — the next pass's probe will
-        // handle the partial state idempotently.
-        _ = try await server.selectMailbox(destination)
-        let dstHitsAfter = (try? await self.searchByMessageId(id, server: server)) ?? UIDSet()
-        if dstHitsAfter.isEmpty && UInt32(id) == nil {
-            // Only treat rfc822-based verification as authoritative. Numeric-UID ids
-            // can't be probed, so we trust `server.move` didn't throw.
-            print("[MoveTrace] IMAPProvider.move — \(id): VERIFY FAILED (not in dst after move) — will retry")
-            throw ProviderError.messageNotFound
-        }
-        print("[MoveTrace] IMAPProvider.move — \(id): completed (dst has \(dstHitsAfter.count) UIDs)")
-    }
-
     /// Check if a message exists in a folder by rfc822 Message-ID.
-    /// Used by the drain queue to confirm staleness: if a message isn't in the source folder
-    /// (uidResolutionFailed) AND isn't in the destination folder, the op is confirmed stale.
-    /// Returns true if found, false if confirmed not found. Throws on connection error.
+    /// Used by backfill to distinguish a UID remap from a genuinely gone message.
     func messageExistsInFolder(rfc822MessageId: String, folderPath: String) async throws -> Bool {
         let uids = try await currentUIDs(rfc822MessageId: rfc822MessageId, folderPath: folderPath)
         return !uids.isEmpty
@@ -2107,7 +1956,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return try await withActionConnection(folder: folder) { server in
             _ = try await server.selectMailbox(folder)
 
-            let results = try await self.resolveUID(messageId, server: server)
+            let results = try self.nativeUIDSet([messageId])
             guard let uid = results.toArray().first else { throw ProviderError.messageNotFound }
 
             let mimeSection = Section(section)
@@ -3003,23 +2852,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             results = ext.asSet
         }
         print("[IMAP] searchByMessageId — '\(normalizedId)' → \(results.isEmpty ? "NOT FOUND" : "\(results.count) UIDs")")
-        return results
-    }
-
-    /// Resolve a stored messageId to a UIDSet for IMAP operations.
-    /// If the messageId looks like a UID (all digits), construct a UIDSet directly.
-    /// Otherwise, search by Message-ID header via `searchByMessageId`.
-    /// Throws `uidResolutionFailed` if a non-numeric ID resolves to no UIDs.
-    /// This is distinct from `messageNotFound` — the message likely exists but SEARCH
-    /// couldn't find it (server quirk, timing issue). Drain queue treats this as transient.
-    private func resolveUID(_ id: String, server: IMAPServer) async throws -> UIDSet {
-        if let uidValue = UInt32(id) {
-            return UIDSet(UID(uidValue))
-        }
-        let results = try await searchByMessageId(id, server: server)
-        guard !results.isEmpty else {
-            throw ProviderError.uidResolutionFailed(id)
-        }
         return results
     }
 

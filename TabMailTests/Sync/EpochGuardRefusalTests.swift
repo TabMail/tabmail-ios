@@ -14,8 +14,8 @@ import GRDB
 /// **no row whose bare UID belongs to one numbering may end up under a stamp
 /// describing another** (constraint C3). `MessageHeader.stableId` falls back to
 /// the bare numeric `messageId` — the IMAP UID — whenever a header carries no
-/// `rfc822MessageId`, `IMAPProvider.resolveUID` treats a numeric id as a LITERAL
-/// UID, and `AccountManager.newGestureRefusedForUnknownEpoch` tests only
+/// `rfc822MessageId`, native IMAP actions address that UID directly, and
+/// `AccountManager.newGestureRefusedForUnknownEpoch` tests only
 /// `lastKnownUidValidity == nil`. So a stamp that is non-nil but WRONG admits
 /// every gesture on every such row and resolves it against whatever message now
 /// occupies that number.

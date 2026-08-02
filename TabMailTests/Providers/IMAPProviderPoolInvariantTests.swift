@@ -486,7 +486,9 @@ struct IMAPProviderPoolInvariantTests {
                 actionPark.withLock { $0 = cont }
             }
         }
-        let actionHolder = Task { try? await provider.markRead(ids: ["21"], folder: "INBOX") }
+        let actionHolder = Task {
+            try? await provider.markRead(ids: ["21"], folder: "INBOX", admittedUidValidity: 1)
+        }
         let actionHeld = await waitUntil { actionPark.withLock { $0 } != nil }
         #expect(actionHeld, "setup: no task ever parked holding the action connection")
         guard actionHeld else { return }
@@ -508,7 +510,7 @@ struct IMAPProviderPoolInvariantTests {
         let actionWaiterResult = Mutex<Result<Void, Error>?>(nil)
         let actionWaiter = Task {
             do {
-                try await provider.markRead(ids: ["22"], folder: "INBOX")
+                try await provider.markRead(ids: ["22"], folder: "INBOX", admittedUidValidity: 1)
                 actionWaiterResult.withLock { $0 = .success(()) }
             } catch {
                 actionWaiterResult.withLock { $0 = .failure(error) }
@@ -610,7 +612,9 @@ struct IMAPProviderPoolInvariantTests {
                 actionPark.withLock { $0 = cont }
             }
         }
-        let actionHolder = Task { try? await provider.markRead(ids: ["31"], folder: "INBOX") }
+        let actionHolder = Task {
+            try? await provider.markRead(ids: ["31"], folder: "INBOX", admittedUidValidity: 1)
+        }
         let actionHeld = await waitUntil { actionPark.withLock { $0 } != nil }
         #expect(actionHeld, "setup: no task ever parked holding the action connection")
         guard actionHeld else { return }
@@ -631,7 +635,7 @@ struct IMAPProviderPoolInvariantTests {
         let actionWaiterResult = Mutex<Result<Void, Error>?>(nil)
         let actionWaiter = Task {
             do {
-                try await provider.markRead(ids: ["32"], folder: "INBOX")
+                try await provider.markRead(ids: ["32"], folder: "INBOX", admittedUidValidity: 1)
                 actionWaiterResult.withLock { $0 = .success(()) }
             } catch {
                 actionWaiterResult.withLock { $0 = .failure(error) }

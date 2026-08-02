@@ -277,28 +277,11 @@ struct DrainQueueResilienceTests {
                 }
                 executedCount += 1
             } catch {
-                if case ProviderError.uidResolutionFailed = error,
-                   [.setTag, .removeTag].contains(currentOp.type) {
-                    try await db.write { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    }
-                    executedCount += 1
-                    continue
-                }
                 if isMessageNotFoundError(error) {
                     try await db.write { db in
                         _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                     }
                     executedCount += 1
-                    continue
-                }
-                if case ProviderError.uidResolutionFailed = error {
-                    // Non-tag UID resolution failure: reset to queued but do NOT add to failedAccounts
-                    try await db.write { db in
-                        var updated = currentOp
-                        updated.status = PendingStatus.queued.rawValue
-                        try updated.save(db)
-                    }
                     continue
                 }
                 // Connection/transient error: reset to queued, skip this account
@@ -420,24 +403,6 @@ struct DrainQueueResilienceTests {
         #expect(afterThird == nil) // Deleted on success
     }
 
-    @Test("uidResolutionFailed on non-tag op resets to queued, NOT added to failedAccounts")
-    func uidResolutionNotAddedToFailedAccounts() async throws {
-        let op = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
-        try await db.write { db in try op.insert(db) }
-
-        await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("msg-1"))
-
-        var failedAccounts: Set<String> = []
-        try await simulateDrainPass(failedAccounts: &failedAccounts)
-
-        // Per-message issue, NOT a connection problem
-        #expect(!failedAccounts.contains("acc1"))
-
-        // Op stays queued for retry
-        let remaining = try await db.read { db in try PendingOperation.fetchOne(db, key: op.id) }
-        #expect(remaining != nil)
-        #expect(remaining?.status == PendingStatus.queued.rawValue)
-    }
 }
 
 // MARK: - Suite 3: Backfill Connection Backoff

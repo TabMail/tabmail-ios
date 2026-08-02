@@ -216,7 +216,7 @@ struct UndoMoveBackTests {
 
         let ops = try db.read { try PendingOperation.filter(Column("type") == OperationType.move.rawValue).fetchAll($0) }
         #expect(ops.count == 1)
-        #expect(ops[0].messageIds == ["<unique-msg@example.com>"], "IMAP undo should use rfc822MessageId for resolveUID")
+        #expect(ops[0].messageIds == ["<unique-msg@example.com>"], "IMAP undo still records its historical RFC identity pending T2.9 native re-keying")
     }
 
     @Test("Gmail move-back uses stable messageId")

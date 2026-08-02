@@ -351,12 +351,6 @@ struct IsMessageNotFoundErrorTests {
         #expect(isMessageNotFoundError(error) == false)
     }
 
-    @Test("ProviderError.uidResolutionFailed returns false (transient — retry, don't drop)")
-    func uidResolutionFailed() {
-        let error = ProviderError.uidResolutionFailed("<msg-123@example.com>")
-        #expect(isMessageNotFoundError(error) == false)
-    }
-
     // MARK: - Standalone reimplementation matching AccountManager.isMessageNotFoundError
 
     /// Standalone version of the logic for testing without AccountManager instance.
@@ -368,58 +362,5 @@ struct IsMessageNotFoundErrorTests {
         if desc.contains("no such message") || desc.contains("UID not found") ||
            desc.contains("Message not found") || desc.contains("NONEXISTENT") { return true }
         return false
-    }
-}
-
-// MARK: - uidResolutionFailed Drain Behavior
-
-@Suite("uidResolutionFailed drain behavior")
-struct UidResolutionFailedDrainTests {
-
-    @Test("uidResolutionFailed is NOT treated as messageNotFound")
-    func notMessageNotFound() {
-        let error = ProviderError.uidResolutionFailed("<msg@example.com>")
-        // Standalone reimplementation of isMessageNotFoundError
-        let desc = "\(error)"
-        var isNotFound = false
-        if case ProviderError.messageNotFound = error { isNotFound = true }
-        if case ProviderError.networkError(let underlying) = error,
-           (underlying as NSError).code == 404 { isNotFound = true }
-        if desc.contains("no such message") || desc.contains("UID not found") ||
-           desc.contains("Message not found") || desc.contains("NONEXISTENT") { isNotFound = true }
-        #expect(isNotFound == false)
-    }
-
-    @Test("uidResolutionFailed is distinguishable from messageNotFound via pattern match")
-    func patternMatchDistinguishable() {
-        let uidError = ProviderError.uidResolutionFailed("<msg@example.com>")
-        let notFoundError = ProviderError.messageNotFound
-
-        // Drain uses pattern match to handle uidResolutionFailed specially for tag ops
-        var isUidResolution = false
-        if case ProviderError.uidResolutionFailed = uidError { isUidResolution = true }
-        #expect(isUidResolution == true)
-
-        var isUidResolution2 = false
-        if case ProviderError.uidResolutionFailed = notFoundError { isUidResolution2 = true }
-        #expect(isUidResolution2 == false)
-    }
-
-    @Test("uidResolutionFailed on tag ops should be skippable (best-effort)")
-    func tagOpsSkippable() {
-        // Tag ops (.setTag, .removeTag) are best-effort metadata operations.
-        // When uidResolutionFailed occurs, the drain should skip the tag op
-        // rather than adding the account to failedAccounts and blocking subsequent ops.
-        let tagOpTypes: [OperationType] = [.setTag, .removeTag]
-        let nonTagOpTypes: [OperationType] = [.move, .markRead, .markUnread]
-
-        for opType in tagOpTypes {
-            #expect([OperationType.setTag, .removeTag].contains(opType),
-                    "Tag op \(opType) should be in the skippable set")
-        }
-        for opType in nonTagOpTypes {
-            #expect(![OperationType.setTag, .removeTag].contains(opType) || opType == .move,
-                    "Non-tag op \(opType) should NOT be in the skippable set")
-        }
     }
 }

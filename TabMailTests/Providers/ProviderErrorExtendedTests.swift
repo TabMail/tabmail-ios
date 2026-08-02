@@ -37,7 +37,6 @@ struct ProviderErrorExtendedTests {
             .authenticationFailed,
             .networkError(underlying: NSError(domain: "test", code: 1)),
             .invalidURL("http://bad"),
-            .uidResolutionFailed("<test@id>"),
             .syntheticPlaceholderId(["sent-abc"]),
         ]
         for error in errors {
@@ -191,13 +190,6 @@ struct ProviderErrorExtendedTests {
         #expect(error.errorDescription?.contains(urlString) == true)
     }
 
-    @Test("uidResolutionFailed description contains the message ID")
-    func uidResolutionContainsId() {
-        let msgId = "<CAG+unique123@mail.gmail.com>"
-        let error = ProviderError.uidResolutionFailed(msgId)
-        #expect(error.errorDescription?.contains(msgId) == true)
-    }
-
     @Test("networkError description contains 'Network error' prefix")
     func networkErrorPrefix() {
         let error = ProviderError.networkError(underlying: NSError(domain: "test", code: 0))
@@ -229,17 +221,6 @@ struct ProviderErrorExtendedTests {
         }
     }
 
-    @Test("Pattern matching extracts associated value from uidResolutionFailed")
-    func patternMatchUidResolution() {
-        let error = ProviderError.uidResolutionFailed("<test@example.com>")
-        switch error {
-        case .uidResolutionFailed(let id):
-            #expect(id == "<test@example.com>")
-        default:
-            Issue.record("Should match .uidResolutionFailed")
-        }
-    }
-
     @Test("Pattern matching extracts underlying error from networkError")
     func patternMatchNetworkError() {
         let underlying = NSError(domain: "TestDomain", code: 42)
@@ -262,22 +243,10 @@ struct ProviderErrorExtendedTests {
         #expect(error.errorDescription?.contains("Invalid URL") == true)
     }
 
-    @Test("uidResolutionFailed with empty string")
-    func uidResolutionEmptyString() {
-        let error = ProviderError.uidResolutionFailed("")
-        #expect(error.errorDescription != nil)
-    }
-
     @Test("invalidURL with special characters")
     func invalidURLSpecialChars() {
         let error = ProviderError.invalidURL("http://example.com/path?q=a&b=c#fragment")
         #expect(error.errorDescription?.contains("q=a&b=c") == true)
-    }
-
-    @Test("uidResolutionFailed with unicode message ID")
-    func uidResolutionUnicode() {
-        let error = ProviderError.uidResolutionFailed("<msg@example.com>")
-        #expect(error.errorDescription?.contains("msg@example.com") == true)
     }
 
     // MARK: - Multiple networkError wrapping
@@ -319,10 +288,4 @@ struct ProviderErrorExtendedTests {
         #expect(error1.errorDescription != error2.errorDescription)
     }
 
-    @Test("Two uidResolutionFailed with different IDs have different descriptions")
-    func differentIdsDifferentDescriptions() {
-        let error1 = ProviderError.uidResolutionFailed("<id1@test.com>")
-        let error2 = ProviderError.uidResolutionFailed("<id2@test.com>")
-        #expect(error1.errorDescription != error2.errorDescription)
-    }
 }

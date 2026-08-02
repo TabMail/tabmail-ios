@@ -258,7 +258,7 @@ struct HandleMissedItemsTests {
         await cleanup(headerId: headerId)
     }
 
-    @Test("Threshold + probe finds NEW UID → header re-keyed in place (old id gone, new id present, counter 0)")
+    @Test("A backfill miss on a remapped UID re-keys and never deletes")
     func thresholdRemapRekeysHeader() async throws {
         // The UIDVALIDITY-rotation / cross-client-move case. rfc822 SEARCH finds
         // the message under a NEW UID. The header is re-keyed in place so the

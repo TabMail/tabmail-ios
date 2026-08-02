@@ -26,7 +26,7 @@ import GRDB
 /// `reconcileOutbox`) had nothing BUT that UID to hand `queueDraftDelete`: the
 /// local `Draft` row is deleted before the first one runs, and the second runs
 /// in a process where it never existed. So the durable `.deleteDraft` they
-/// queued could only be refused, burn `SyncConfig.maxUidResolutionRetries`, and
+/// queued could only be refused and
 /// be deleted as "confirmed stale" — a confirmation no server ever gave. The
 /// optimistic local removal had already happened, so the next Drafts sync
 /// re-fetched the draft and it came back as a permanent duplicate of the message

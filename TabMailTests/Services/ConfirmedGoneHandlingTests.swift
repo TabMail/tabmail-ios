@@ -99,12 +99,6 @@ struct IsMessageNotFoundHTTPErrorTests {
         #expect(AccountManager.shared.isMessageNotFoundError(ProviderError.authenticationFailed) == false)
     }
 
-    @Test("ProviderError.uidResolutionFailed is NOT messageNotFound — retries by design")
-    @MainActor
-    func uidResolutionFailed() {
-        #expect(AccountManager.shared.isMessageNotFoundError(ProviderError.uidResolutionFailed("<abc@x.com>")) == false)
-    }
-
     @Test("Plain 500 NSError is NOT messageNotFound")
     @MainActor
     func nsError500() {

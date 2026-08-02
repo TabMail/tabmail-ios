@@ -121,10 +121,10 @@ struct UidValidityResetReactionTests {
     ///  - **the stored epoch IS the fresh one and the quarantine is gone** — the
     ///    two are written by one transaction, so observing the second without the
     ///    first is impossible by construction;
-    ///  - **the identity-carrying op is still queued** — `IMAPProvider.resolveUID`
-    ///    re-resolves a non-numeric id by SEARCH, so the user's intention lands on
-    ///    the right message under the new numbering. Dropping it would be the
-    ///    NEVER-DROP-USER-INTENTION violation;
+    ///  - **the identity-carrying op is still queued** — reset cleanup does not
+    ///    reinterpret or split it. T2.8's action checkpoint later refuses this
+    ///    legacy RFC payload whole; T2.9 owns replacing undo's producer with a
+    ///    native destination identity;
     ///  - **the address-only op is gone** — its every id is a bare UID in the
     ///    discarded numbering, so executing it would mutate whichever message the
     ///    new epoch put there (C3). Constraint C5 makes dropping it the correct
@@ -200,9 +200,9 @@ struct UidValidityResetReactionTests {
         let remaining = try Self.opIds(pool)
         #expect(remaining.contains("op-identity"),
                 """
-                a queued op carrying a durable rfc822 identity was DROPPED by the reaction. It is \
-                still resolvable — `IMAPProvider.resolveUID` SEARCHes a non-numeric id — so the \
-                user's intention must survive (NEVER DROP USER INTENTION, Law 5).
+                reset cleanup dropped a queued RFC identity instead of leaving its disposition \
+                to the action checkpoint. T2.8 refuses it whole; T2.9 owns replacing undo's \
+                producer with a native destination identity.
                 """)
         #expect(!remaining.contains("op-address-only"),
                 """

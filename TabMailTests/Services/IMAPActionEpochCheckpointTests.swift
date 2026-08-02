@@ -378,7 +378,6 @@ struct IMAPActionEpochCheckpointTests {
     func refusalNeverSplits() async throws {
         let f = try fixture()
         let provider = MockEmailProvider(staleWindowMode: .uid)
-        await provider.setMarkReadThrows(ProviderError.uidResolutionFailed("rfc@example.com"))
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: provider)
         let op = PendingOperation(
             type: .markRead, messageIds: ["1", "rfc@example.com"],

@@ -39,8 +39,8 @@ import Synchronization
 ///    `AccountManager.newGestureRefusedForUnknownEpoch` tests only for nil; it
 ///    never compares stored against live. So ANY value unlocks everything, and
 ///    `MessageHeader.stableId` falls back to a bare numeric UID whenever a
-///    header has no `rfc822MessageId` — which `IMAPProvider.resolveUID` treats
-///    as a literal UID. Stamp an epoch the local rows do not belong to and the
+///    header has no `rfc822MessageId` — which native IMAP actions address
+///    directly. Stamp an epoch the local rows do not belong to and the
 ///    next gesture mutates whatever message now occupies that number.
 ///    Constraint C3, the one hard invariant.
 ///
@@ -362,7 +362,7 @@ struct BackfillOnlyFolderEpochTests {
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try Self.insertBackfillOnlyFolder(accountId: accountId, path: "Receipts", pool: pool, cursor: 60)
         // The E1 leftover: bare UID 42, NO rfc822MessageId, so `stableId` is "42"
-        // and `IMAPProvider.resolveUID` will treat it as a literal UID.
+        // and native IMAP actions will address it directly.
         let victim = try Self.insertHeader(
             accountId: accountId, path: "Receipts", uid: "42", pool: pool, rfc822MessageId: nil)
         #expect(victim.stableId == "42",

@@ -45,16 +45,9 @@ struct PendingOperation: Codable, FetchableRecord, PersistableRecord, Identifiab
     var userLabelId: String?
     var createdAt: Date
     var retryCount: Int
-    /// Dedicated retry budget for `ProviderError.uidResolutionFailed` (IMAP
-    /// SEARCH-by-Message-ID miss) on non-move, non-tag ops — separate from
-    /// `retryCount`, which the generic transient-error branch also increments
-    /// on every ordinary connection blip. Without a dedicated counter, a few
-    /// unrelated blips could pre-exhaust `SyncConfig.maxUidResolutionRetries`
-    /// before the op ever hit a real SEARCH miss, causing a false "confirmed
-    /// stale" drop on the FIRST uidResolutionFailed — dropping user intention.
-    /// Default 0 backed by the v67 migration's `DEFAULT 0` column (existing
-    /// rows are backfilled by the ALTER TABLE, so decode never sees a missing
-    /// column post-migration).
+    /// Dormant compatibility field retained because v67 already shipped this
+    /// non-null column. Provider-ID actions no longer run an RFC resolution
+    /// retry ladder; no migration rewrite is required.
     var uidResolutionRetryCount: Int = 0
     /// UIDVALIDITY admission stamp — the value of `Folder.lastKnownUidValidity`
     /// for this op's `folderPath` at the instant the op was inserted, read inside

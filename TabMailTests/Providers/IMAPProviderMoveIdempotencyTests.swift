@@ -6,22 +6,12 @@ import Testing
 import Foundation
 @testable import TabMail
 
-/// Regression coverage for commit bbdc4f3 — "Make IMAP move idempotent on
-/// partial-failure retry". The full idempotent-move pipeline (COPY → STORE
-/// \Deleted → UID EXPUNGE with a destination-probe short-circuit) is an
-/// internal implementation detail of `IMAPProvider.idempotentMove`. The
-/// `FakeIMAPServer` infrastructure only supports SEARCH/FETCH today, so we
-/// can't end-to-end-exercise the MOVE path against it.
-///
-/// What we CAN test end-to-end is the destination probe itself — the SEARCH
-/// HEADER "Message-ID" that the idempotent path runs before deciding whether
-/// to re-issue COPY or short-circuit to source-side cleanup. If the probe
-/// returns the wrong answer, every downstream branch is wrong. Covering the
-/// probe locks in the commit's correctness floor.
+/// Keeper coverage for `MessageExistenceProbe`, the RFC corroboration surface
+/// used by backfill UID-remap handling after RFC action resolution is removed.
 ///
 /// `.serialized` — the fake binds a listening socket; parallel tests would
 /// contend on ephemeral port allocation.
-@Suite("IMAPProvider move idempotency — destination probe", .serialized)
+@Suite("IMAPProvider MessageExistenceProbe", .serialized)
 struct IMAPProviderMoveIdempotencyTests {
 
     private func rfc822(messageId: String, subject: String = "probe-test") -> String {
@@ -67,8 +57,7 @@ struct IMAPProviderMoveIdempotencyTests {
     @Test("messageExistsInFolder returns false when destination does NOT have the Message-ID")
     func probeMiss() async throws {
         // Same server but searching for a Message-ID that doesn't exist.
-        // This is the "dstHitsBefore is empty → take normal MOVE branch" case
-        // from idempotentMove.
+        // A clean miss remains the backfill probe's confirmed-absent signal.
         let msg = FakeIMAPServer.makeMessage(uid: 1, rfc822Text: rfc822(messageId: "someone-else@example.com"))
         let server = FakeIMAPServer(messages: [msg])
         try server.start()
@@ -95,8 +84,7 @@ struct IMAPProviderMoveIdempotencyTests {
 
     @Test("messageExistsInFolder normalizes Message-ID (caller passes bare, server stores bare)")
     func probeNormalized() async throws {
-        // Commit bbdc4f3 passes the PendingOperation message id straight through
-        // to searchByMessageId, which normalizes via EmailFilter.normalizeMessageId.
+        // currentUIDs normalizes through searchByMessageId.
         // The fake's header matcher strips angle brackets off the quoted SEARCH
         // value. This test proves caller-side formatting (whether or not the
         // caller included "<...>") doesn't change the result.
@@ -132,11 +120,10 @@ struct IMAPProviderMoveIdempotencyTests {
         #expect(existsBare == true)
     }
 
-    @Test("IMAPProvider conforms to MessageExistenceProbe (compile-time guard)")
+    @Test("IMAPProvider remains a MessageExistenceProbe after action RFC resolution is removed")
     func conformanceGuard() {
-        // The idempotentMove recovery path depends on IMAPProvider being a
-        // MessageExistenceProbe. If a refactor drops the conformance, this
-        // test's type assertion stops compiling.
+        // Backfill UID-remap recovery depends on this conformance. If a
+        // refactor drops it, this test stops compiling.
         let provider = IMAPProvider(
             host: "127.0.0.1",
             port: 1,

@@ -17,8 +17,8 @@ import Foundation
 /// ops. Since `ProviderWorkQueue` runs each lane concurrently (bounded
 /// concurrency > 1, separate IMAP connections), the two ops could execute out
 /// of order relative to each other, causing a real remote race (flag STORE on
-/// B racing the batch MOVE of B — flag lost on EXPUNGE, or `uidResolutionFailed`
-/// wrongly confirming the flag op stale mid-move). `buildLanes` fixes this via
+/// B racing the batch MOVE of B, with the flag lost on EXPUNGE). `buildLanes`
+/// fixes this via
 /// union-find: any two ops sharing ANY member message id land in the same lane
 /// (connected component), scoped per-account so unrelated accounts never merge.
 @Suite("PendingOperation lane keying (buildLanes)")
