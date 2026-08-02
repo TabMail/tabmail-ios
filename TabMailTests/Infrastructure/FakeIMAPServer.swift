@@ -756,6 +756,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.uidValidityByMailbox[mailbox] = value }
     }
 
+    /// Test-only authority read for id-reset disposition witnesses. The
+    /// production parser observes the same default (`1`) when a fixture has
+    /// not overridden a mailbox, and the state lock makes the read atomic
+    /// with `setUidValidity` and post-response mailbox replacement.
+    func uidValidity(for mailbox: String) -> Int {
+        withState { $0.uidValidityByMailbox[mailbox] ?? 1 }
+    }
+
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
     /// `* OK [UIDVALIDITY n]` untagged response entirely.
     ///

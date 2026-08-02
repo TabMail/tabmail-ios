@@ -728,4 +728,217 @@ struct ProviderIdQueueFuzzTests {
             try? await provider.disconnect()
         }
     }
+
+    // MARK: - T0.7 epoch-reset extension
+
+    private struct RecycledDecoy: Sendable {
+        let mailbox: String
+        let uid: Int
+        let rfc: String
+        let flags: Set<String>
+    }
+
+    /// PORT of v2final `systemFuzz`'s single seeded reset trigger: snapshot
+    /// every current message with flags, renumber every real message, and
+    /// carry its flags forward. The added decoy at EVERY recycled old UID is
+    /// the plan-recorded closure that makes a stale native UID observable to
+    /// FakeIMAPServer's wire oracle rather than a vacuous absent-UID no-op.
+    private func performEpochReset(
+        server: FakeIMAPServer,
+        mailboxes: [String],
+        newEpoch: Int,
+        rng: inout SplitMix64
+    ) -> [RecycledDecoy] {
+        let renumberBase = 700_000 + rng.pick(10_001)
+        var decoys: [RecycledDecoy] = []
+        var nextOffset = 0
+        for mailbox in mailboxes {
+            let existing = server.snapshotMessagesWithFlags(in: mailbox)
+            var replacements: [FakeIMAPServer.Message] = []
+            var replacementFlags: [(Int, Set<String>)] = []
+            for entry in existing {
+                nextOffset += 1
+                let newUid = renumberBase + nextOffset
+                replacements.append(entry.message.replacingUID(newUid))
+                replacementFlags.append((newUid, entry.flags))
+
+                let decoyRfc = "queuefuzz-reset-decoy-\(mailbox)-\(entry.message.uid)-\(UUID().uuidString)@example.com"
+                let decoy = FakeIMAPServer.makeMessage(
+                    uid: entry.message.uid,
+                    rfc822Text: rfc822(messageId: decoyRfc, subject: "Recycled UID decoy"))
+                let flags: Set<String> = ["\\Seen", "\\Flagged", "$Decoy"]
+                replacements.append(decoy)
+                replacementFlags.append((entry.message.uid, flags))
+                decoys.append(RecycledDecoy(
+                    mailbox: mailbox, uid: entry.message.uid, rfc: decoyRfc, flags: flags))
+            }
+            server.setUidValidity(newEpoch, for: mailbox)
+            server.setMessages(replacements, in: mailbox)
+            for (uid, flags) in replacementFlags {
+                server.setFlags(flags, in: mailbox, uid: uid)
+            }
+        }
+        return decoys
+    }
+
+    /// T0.7's minimal provider-ID reset scenario. PORT: seed/replay/reset,
+    /// faithful renumber-with-flags, ledger, oracle, fixture lifetime,
+    /// `.processGlobalState`, and the exact check-first drain barrier.
+    /// SUBTRACT: v2final quarantine/reaction/journal/F9/demotion/recovery,
+    /// labels/drafts/outbox/Undo, RFC compatibility, and resync machinery.
+    /// ⚑ NO REFERENCE — INVENTED: native-UID `durableIdentity` adaptation and
+    /// compact no-quarantine A/B/producer disposition mapping; the exact
+    /// v2final subsystem/call-site/history census contains no provider-ID
+    /// counterpart.
+    @Test(
+        "Provider-ID queue fuzzer drops old-epoch IMAP actions without wrong-message mutation",
+        arguments: FuzzConfig.seeds)
+    @MainActor
+    func providerIdQueueEpochReset(seed: UInt64) async throws {
+        var rng = SplitMix64(seed: seed ^ 0x5157_0000_0000_0001)
+        let accountId = "queuefuzz-reset-\(String(seed, radix: 16))-\(UUID().uuidString)"
+        let oldEpoch = 30_000 + rng.pick(20_000)
+        let newEpoch = oldEpoch + 1 + rng.pick(1_000)
+        let uidBase = 10_000 + rng.pick(20_000)
+
+        let checkpointARfc = "queuefuzz-reset-a-\(UUID().uuidString)@example.com"
+        let checkpointBRfc = "queuefuzz-reset-b-\(UUID().uuidString)@example.com"
+        let producerRfc = "queuefuzz-reset-producer-\(UUID().uuidString)@example.com"
+        let checkpointAUid = uidBase + 1
+        let checkpointBUid = uidBase + 2
+        let producerUid = uidBase + 3
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [
+                FakeIMAPServer.makeMessage(
+                    uid: checkpointAUid,
+                    rfc822Text: rfc822(messageId: checkpointARfc, subject: "Checkpoint A")),
+                FakeIMAPServer.makeMessage(
+                    uid: producerUid,
+                    rfc822Text: rfc822(messageId: producerRfc, subject: "Producer refusal")),
+            ],
+            "Archive": [
+                FakeIMAPServer.makeMessage(
+                    uid: checkpointBUid,
+                    rfc822Text: rfc822(messageId: checkpointBRfc, subject: "Checkpoint B")),
+            ],
+        ])
+        server.setUidValidity(oldEpoch, for: "INBOX")
+        server.setUidValidity(oldEpoch, for: "Archive")
+        server.setFlags(["\\Seen"], in: "Archive", uid: checkpointBUid)
+        server.expectMutations([checkpointARfc, checkpointBRfc, producerRfc])
+        try server.start()
+        defer { server.stop() }
+
+        let fixture = try makeFixture(accountId: accountId)
+        defer { restore(fixture) }
+        var configuredInbox = fixture.inbox
+        configuredInbox.lastKnownUidValidity = oldEpoch
+        let inbox = configuredInbox
+        var configuredArchive = fixture.archive
+        configuredArchive.lastKnownUidValidity = oldEpoch
+        let archive = configuredArchive
+        try await fixture.pool.writeWithoutTransaction { db in
+            _ = try Folder.filter(key: inbox.id)
+                .updateAll(db, Column("lastKnownUidValidity").set(to: oldEpoch))
+            _ = try Folder.filter(key: archive.id)
+                .updateAll(db, Column("lastKnownUidValidity").set(to: oldEpoch))
+        }
+
+        let checkpointA = makeHeader(
+            folder: inbox, uid: checkpointAUid,
+            rfc822MessageId: checkpointARfc, subject: "Checkpoint A")
+        var configuredCheckpointB = makeHeader(
+            folder: archive, uid: checkpointBUid,
+            rfc822MessageId: checkpointBRfc, subject: "Checkpoint B")
+        configuredCheckpointB.isRead = true
+        let checkpointB = configuredCheckpointB
+        let producerRefusal = makeHeader(
+            folder: inbox, uid: producerUid,
+            rfc822MessageId: producerRfc, subject: "Producer refusal")
+        try await fixture.pool.writeWithoutTransaction { db in
+            try checkpointA.insert(db)
+            try checkpointB.insert(db)
+            try producerRefusal.insert(db)
+        }
+
+        // Admit two E1 operations while no provider is registered. The single
+        // seeded reset below then separates them: INBOX is recognized as E2,
+        // so checkpoint A drops its op; Archive stays DB-E1 while wire-E2, so
+        // checkpoint B drops its op after live SELECT.
+        await AccountManager.shared.markRead([checkpointA])
+        await AccountManager.shared.markUnread([checkpointB])
+        let admittedBeforeReset = try await fixture.pool.read { db in
+            try PendingOperation.fetchCount(db)
+        }
+        #expect(admittedBeforeReset == 2, "setup: both E1 operations must be durable before the reset trigger")
+
+        let decoys = performEpochReset(
+            server: server, mailboxes: ["INBOX", "Archive"],
+            newEpoch: newEpoch, rng: &rng)
+        try await fixture.pool.writeWithoutTransaction { db in
+            _ = try Folder.filter(key: inbox.id)
+                .updateAll(db, Column("lastKnownUidValidity").set(to: newEpoch))
+        }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        try await drainProviderQueue(pool: fixture.pool)
+
+        // A fresh gesture made after the reset but from a captured E1 row is
+        // refused by the producer before local mutation/admission.
+        await AccountManager.shared.markFlagged([producerRefusal], flagged: true)
+        try await drainProviderQueue(pool: fixture.pool)
+
+        // Intention records are deliberately created AFTER the reset boundary.
+        // Their witness reads the fake-server authority under its lock.
+        let ledger = IntentionLedger()
+        for (label, header, mailbox) in [
+            ("checkpoint A", checkpointA, "INBOX"),
+            ("checkpoint B", checkpointB, "Archive"),
+            ("producer refusal", producerRefusal, "INBOX"),
+        ] {
+            ledger.record(
+                label: "\(label) seed=0x\(String(seed, radix: 16))",
+                durableIdentity: Self.durableIdentity(of: header),
+                idResetDrop: .init(
+                    epochAtGesture: oldEpoch,
+                    epochAtSettle: { _ in server.uidValidity(for: mailbox) }),
+                endStateAchieved: { _ in false })
+        }
+        let outcomes = await ledger.settle(pool: fixture.pool, reportedIds: [])
+        #expect(outcomes.count == 3)
+        #expect(outcomes.allSatisfy { $0.outcome == .acceptedIdResetDrop })
+
+        let mutationCommands = server.recordedCommands().filter { command in
+            let upper = command.uppercased()
+            return upper.contains("UID STORE") || upper.contains("UID MOVE")
+                || upper.contains("UID COPY") || upper.contains("UID EXPUNGE")
+                || upper.hasPrefix("STORE ") || upper == "EXPUNGE"
+                || upper.hasPrefix("EXPUNGE ")
+        }
+        #expect(mutationCommands.isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+        #expect(
+            !server.recordedCommands().contains {
+                let upper = $0.uppercased()
+                return upper.contains("SELECT") && upper.contains("INBOX")
+            },
+            "checkpoint A and producer refusal must terminate before selecting INBOX")
+        for decoy in decoys {
+            #expect(server.messageIDs(in: decoy.mailbox).contains {
+                $0.trimmingCharacters(in: CharacterSet(charactersIn: "<>")) == decoy.rfc
+            })
+            #expect(server.flags(in: decoy.mailbox, uid: decoy.uid) == decoy.flags)
+        }
+        let remaining = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(remaining.isEmpty, "the queue must converge with no split children")
+
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+        try? await provider.disconnect()
+    }
 }
