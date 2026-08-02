@@ -81,23 +81,22 @@ struct SyncDeltaOrphanReclaimGuardTests {
     /// not supplemented — leaving a blessing test and adding a sibling has
     /// produced two regressions in this project.
     ///
-    /// The pending-op check is only the FIRST leg. Admission requires BOTH:
-    /// no pending destructive op AND no identity collision between the parked
-    /// survivor and the incoming occupant. The completed-drain case (op row
-    /// deleted, survivor still parked under this folder's PK) is precisely
-    /// where the pending check answers "not pending" and the identity check is
-    /// the only thing standing between a reused address and a wrong-message
-    /// rewrite.
+    /// The pending-op check is only the FIRST leg. Admission also requires
+    /// provider-address ownership. The completed-drain case (op row deleted,
+    /// survivor still parked under this folder's PK) is precisely where the
+    /// pending check answers "not pending" but the moved row's membership and
+    /// nil source observation refuse the source-folder reclaim.
     ///
     /// The durable end-state proofs — A's body never served as B's, and the
     /// refusal healing once the destination sync vacates the PK — live in
     /// `RFC822IdentityMergeGuardTests`, driven through the real
     /// `SyncEngine.runSyncMessages`.
-    @Test("No pending op is NOT sufficient: admission also requires a non-colliding identity")
-    func noPendingOp_stillRequiresIdentityAgreement() throws {
+    @Test("No pending op is NOT sufficient: admission also requires provider-address ownership")
+    func noPendingOp_stillRequiresProviderAddressOwnership() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1", provider: .imap)
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
 
         let pk = MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "100")
         try TestDatabase.insertMessageHeader(
@@ -108,6 +107,14 @@ struct SyncDeltaOrphanReclaimGuardTests {
             folderPath: "INBOX",
             rfc822MessageId: "orphan@example.com"
         )
+        try db.write { dbConn in
+            try MessageHeader.filter(Column("id") == pk).updateAll(
+                dbConn,
+                Column("folderId").set(to: "acc1:Archive"),
+                Column("folderPath").set(to: "Archive"),
+                Column("observedUidValidity").set(to: nil)
+            )
+        }
 
         try db.write { dbConn in
             let snapshot = try PendingOperationSnapshot.load(accountId: "acc1", db: dbConn)
@@ -120,26 +127,11 @@ struct SyncDeltaOrphanReclaimGuardTests {
             )
             #expect(!orphanIsPending, "precondition: the drain completed, so the pending leg does not fire")
 
-            let stored = SyncEngine.normalizedRfc822Identity(orphaned.rfc822MessageId)
-            // A DIFFERENT message now occupies this address — reclaiming would
-            // rewrite the survivor's identity in place while its PK-keyed body,
-            // labels, references and search index stay attached to the old one.
-            #expect(
-                SyncEngine.classifyRFC822Merge(
-                    storedNormalized: stored,
-                    incomingNormalized: SyncEngine.normalizedRfc822Identity("occupant@example.com")
-                ) == .collision,
-                "not-pending must NOT be enough to admit a reclaim onto a different message"
-            )
-            // The same message really is still admitted — the guard refuses
-            // collisions, not orphan reclaims in general.
-            #expect(
-                SyncEngine.classifyRFC822Merge(
-                    storedNormalized: stored,
-                    incomingNormalized: SyncEngine.normalizedRfc822Identity("<orphan@example.com>")
-                ) == .notACollision,
-                "a same-identity orphan (bracket forms included) is still reclaimed"
-            )
+            #expect(!SyncEngine.providerAddressOwnershipProven(
+                row: orphaned, accountId: "acc1", folderPath: "INBOX",
+                folderId: "acc1:INBOX", messageId: "100", canonicalId: pk,
+                windowMode: .uid, sourceBoundEpoch: 101),
+                "not-pending and RFC agreement must not admit a moved row whose provider address is unproven")
         }
     }
 

@@ -733,24 +733,15 @@ struct UidValidityResetReactionTests {
     }
 }
 
-/// ADDENDUM (same commit as T4.S6, because T4.S6 is what restores its missing
-/// precondition) — **the `existing` merge branch must CLASSIFY before it MUTATES.**
-///
-/// THE INVARIANT: *no mutation lands on a stored row whose identity provably
-/// differs from the one the fetch described.* Asserted on the DURABLE ROW after a
-/// real `runSyncMessages`, never on the classifier's return value — the classifier
-/// was always right; the bug was that its answer arrived after the assignments.
-///
-/// The pre-fix shape ran the assignments first and then, on a collision, restored
-/// only `rfc822MessageId`/`referencesJSON`. `updateChanges` persisted the rest, so
-/// the row kept message A's identity and PK-keyed body while displaying message
-/// B's sender, date and recipients — and because the UID stays in `remoteIds` the
-/// row is never stale and never UID-remapped, so every later pass re-applied it.
-/// PERMANENT.
+/// T5.11 supersedes the former RFC-collision veto in this suite. Within one
+/// bound UIDVALIDITY epoch the provider `(mailbox, UID)` owns the row; RFC
+/// Message-ID is metadata and cannot establish a parallel identity authority.
+/// A nil RFC still carries no metadata signal and therefore cannot erase a
+/// stored value.
 ///
 /// `.serialized, .processGlobalState` — replaces `AppDatabase.shared`.
-@Suite("A same-UID identity collision leaves the stored row untouched", .serialized, .processGlobalState)
-struct RFC822CollisionMergeRefusalTests {
+@Suite("A provider-proven UID owns its row", .serialized, .processGlobalState)
+struct ProviderAddressMergeAuthorityTests {
 
     private static let storedDate = Date(timeIntervalSince1970: 1_600_000_000)
     private static let incomingDate = Date(timeIntervalSince1970: 1_700_000_000)
@@ -805,10 +796,9 @@ struct RFC822CollisionMergeRefusalTests {
         }
     }
 
-    /// 🚨 RED PROOF CASE. Same folder, same UID, provably different identity.
-    @Test("A collision leaves the stored row's sender, date, recipients and flags exactly as they were")
+    @Test("A same-epoch provider address accepts current metadata even when RFC changes")
     @MainActor
-    func collisionLeavesTheStoredRowUntouched() async throws {
+    func providerAddressAcceptsCurrentMetadata() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
@@ -822,8 +812,7 @@ struct RFC822CollisionMergeRefusalTests {
 
         let mock = MockEmailProvider()
         await mock.setFetchMessagesResult([Self.incoming(uid: "901", rfc822: "incoming-b@example.com")])
-        // Same epoch on both sides: this test is about identity, not turnover — the
-        // merge pass's epoch guard must not be what produces the green.
+        // Same bound epoch: provider address is authoritative; RFC is metadata.
         await mock.setMockedBoundFetchEpoch(900_001, folderPath: "Archive")
 
         let folder = try #require(try FolderEpochTestFixture.readFolder(
@@ -833,29 +822,14 @@ struct RFC822CollisionMergeRefusalTests {
             dbPool: AppDatabase.dbPool)
 
         let row = try #require(try Self.storedRow(accountId: accountId, path: "Archive", uid: "901", pool: pool))
-        #expect(row.rfc822MessageId == "stored-a@example.com",
-                "the stored identity was overwritten by a message that is not this row's")
-        #expect(row.from == "Stored Sender" && row.fromAddress == "stored-sender@example.com",
-                """
-                the incoming message's SENDER was written onto a row whose identity provably \
-                belongs to a different message. The user sees B's sender on A's mail, and because \
-                the UID stays in `remoteIds` the row is never stale and never re-keyed — every \
-                later pass re-applies it. The classification must run BEFORE the assignments.
-                """)
-        #expect(row.date == Self.storedDate,
-                "the incoming message's DATE was written onto a row of different identity")
-        #expect(row.to == "stored-to@example.com" && row.cc == "stored-cc@example.com",
-                "the incoming message's RECIPIENTS were written onto a row of different identity")
-        #expect(!row.isRead,
-                "the incoming message's read state was written onto a row of different identity")
+        #expect(row.rfc822MessageId == "incoming-b@example.com")
+        #expect(row.from == "Incoming Sender" && row.fromAddress == "incoming-sender@example.com")
+        #expect(row.date == Self.incomingDate)
+        #expect(row.to == "incoming-to@example.com" && row.cc == "incoming-cc@example.com")
+        #expect(row.isRead && row.isFlagged)
     }
 
-    /// THE MIRROR IMAGE, and the reason the fix is a `continue` on `.collision`
-    /// rather than a narrower merge: the ORDINARY path — same identity — must still
-    /// merge every field exactly as before. A guard that suppressed normal flag and
-    /// date merging would be a far worse regression than the bug it closes.
-    ///
-    /// Passes on both trees. It is an over-refusal control, not a red proof.
+    /// Ordinary equal-RFC metadata remains an over-refusal control.
     @Test("Control: a matching identity still merges every field")
     @MainActor
     func matchingIdentityStillMerges() async throws {
@@ -888,10 +862,8 @@ struct RFC822CollisionMergeRefusalTests {
         #expect(row.to == "incoming-to@example.com", "the ordinary merge stopped applying the server's recipients")
     }
 
-    /// The assign/keep rule must survive the reorder: a NIL incoming identity is
-    /// `.notACollision` (so the row still merges) but must NEVER null the stored
-    /// `rfc822MessageId`. Nulling it flips `MessageHeader.stableId` to the bare UID
-    /// and re-admits bare-UID gestures.
+    /// A NIL incoming RFC carries no metadata signal and must never null the
+    /// stored `rfc822MessageId` while the provider-proven row still merges.
     @Test("Control: a nil incoming identity merges the row but never nulls the stored one")
     @MainActor
     func nilIncomingIdentityKeepsTheStoredOne() async throws {

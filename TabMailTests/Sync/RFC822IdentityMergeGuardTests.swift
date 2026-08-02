@@ -12,7 +12,7 @@ import GRDB
 ///
 /// Every assertion below is on the SYSTEM PROPERTY — which message still exists,
 /// what identity it still carries, whose body is attached to it — never on the
-/// mechanism that delivers it ("`classifyRFC822Merge` returned `.collision`").
+/// mechanism that delivers it.
 /// A mechanism-pinning test inherits a wrong spec's error and stays green on a
 /// broken system; that exact shape produced two regressions in this project's
 /// audit train (2026-07-16), so it is deliberately avoided here.
@@ -41,14 +41,13 @@ import GRDB
 ///
 /// `.serialized, .processGlobalState` — swaps the `AppDatabase.shared` singleton.
 ///
-/// ⚑ R0 (`v2final`, tag `7904961ded`): the guards under test are ported from
-/// `SyncEngine.classifyRFC822Merge` + the §5 arms in
+/// ⚑ R0 (`v2final`, tag `7904961ded`): the fail-closed control-flow under test
+/// is ported from `SyncEngine.canonicalizeLocalRows` + the §5 arms in
 /// `v2final:TabMail/Services/Sync/SyncEngineFullSync.swift` (origin commits
-/// `4d34ee864` ADR-IOS-061 §5 / R15-F1, and `711dc68cb` R14-F1). What does NOT
-/// transfer is the reference's epoch-mismatch arm, which fires a
-/// purge-and-resync reaction v3 does not have (plan item T4.S6); under
-/// constraint C6 it collapses into the plain refusal, which these tests pin.
-@Suite("§5 RFC822 identity merge guards — C3, never mutate the wrong message",
+/// `4d34ee864` ADR-IOS-061 §5 / R15-F1, and `711dc68cb` R14-F1). The reference's
+/// RFC discriminator is SUBTRACTED; provider-address proof is the minimum
+/// ⚑ NO REFERENCE — INVENTED replacement.
+@Suite("Provider-address ownership guards — C3, never mutate the wrong message",
        .serialized, .processGlobalState)
 struct RFC822IdentityMergeGuardTests {
 
@@ -91,7 +90,8 @@ struct RFC822IdentityMergeGuardTests {
         pkFolderPath: String,
         folderPath: String,
         subject: String = "Original subject",
-        bodyHTML: String? = nil
+        bodyHTML: String? = nil,
+        observedUidValidity: Int? = nil
     ) throws -> String {
         var header = MessageHeader(
             messageId: messageId,
@@ -107,6 +107,7 @@ struct RFC822IdentityMergeGuardTests {
             isInInbox: pkFolderPath == "INBOX"
         )
         header.rfc822MessageId = rfc822
+        header.observedUidValidity = observedUidValidity
         header.headerComplete = true
         try pool.writeWithoutTransaction { db in
             try header.insert(db)
@@ -156,8 +157,14 @@ struct RFC822IdentityMergeGuardTests {
         )
     }
 
-    private func mock(_ messages: [MessageHeaderInfo]) async -> MockEmailProvider {
+    private func mock(
+        _ messages: [MessageHeaderInfo], observedUidValidity: UInt32? = nil,
+        folderPath: String? = nil
+    ) async -> MockEmailProvider {
         let provider = MockEmailProvider(staleWindowMode: .uid)
+        if let folderPath {
+            await provider.setMockedBoundFetchEpoch(observedUidValidity, folderPath: folderPath)
+        }
         await provider.setFetchMessagesResult(messages)
         return provider
     }
@@ -256,23 +263,62 @@ struct RFC822IdentityMergeGuardTests {
         #expect(try header(pool, id: nativeId)?.rfc822MessageId == "native@example.com")
     }
 
-    /// The mirror-image check for the gate: two rows at one address that DO
-    /// share an identity are still merged into one. A guard that refused this
-    /// would turn a wrong-merge bug into a permanent-duplicate bug.
-    @Test("Two rows at one address that share an identity are still merged")
-    func sameIdentityDuplicatesStillMerge() async throws {
+    /// RFC Message-ID equality is not provider-address ownership. The moved-in
+    /// row carries an INBOX UID in Archive's folder membership, while the
+    /// canonical row carries Archive's own UID and the exact epoch observed by
+    /// the FETCH serving this pass. Only the latter may be merged into.
+    @Test("A colliding optimistic row is not merged or deleted")
+    func collidingOptimisticRowIsNotMergedOrDeleted() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+
+        let movedId = try insertHeader(
+            pool, messageId: "501", rfc822: "same@example.com",
+            pkFolderPath: "INBOX", folderPath: "Archive",
+            subject: "The user's optimistic move", bodyHTML: "<p>authored state</p>")
+        let nativeId = try insertHeader(
+            pool, messageId: "501", rfc822: "same@example.com",
+            pkFolderPath: "Archive", folderPath: "Archive",
+            subject: "Archive's provider-native occupant", observedUidValidity: 202)
+
+        let provider = await mock(
+            [headerInfo(messageId: "501", rfc822: "same@example.com")],
+            observedUidValidity: 202, folderPath: "Archive")
+        let result = try await sync(pool, folderId: "acc1:Archive", provider: provider)
+
+        #expect(try header(pool, id: movedId) != nil,
+                "RFC equality cannot authorize deleting the moved foreign-address row")
+        #expect(try bodyHTML(pool, id: movedId) == "<p>authored state</p>")
+        #expect(!result.staleIds.contains(movedId))
+        #expect(try header(pool, id: nativeId)?.observedUidValidity == 202,
+                "the direct canonical row keeps the epoch bound to the serving FETCH")
+        let rows = try headers(pool, messageId: "501")
+        #expect(rows.count == 2,
+                "provider-address ownership proves which row may update; it does not make the foreign row a duplicate")
+    }
+
+    /// The mirror-image check for the gate: two rows at one provider address
+    /// whose source observations are both proven still merge. RFC equality is
+    /// deliberately irrelevant to the admission decision.
+    @Test("Two provider-proven rows at one address are still merged")
+    func providerProvenDuplicatesStillMerge() async throws {
         let (pool, dir, previous) = try makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         try seedAccountAndFolders(pool)
 
         let remnantId = try insertHeader(
             pool, messageId: "500", rfc822: "same@example.com",
-            pkFolderPath: "INBOX", folderPath: "Archive")
+            pkFolderPath: "INBOX", folderPath: "Archive",
+            observedUidValidity: 202)
         let canonicalId = try insertHeader(
             pool, messageId: "500", rfc822: "same@example.com",
-            pkFolderPath: "Archive", folderPath: "Archive")
+            pkFolderPath: "Archive", folderPath: "Archive",
+            observedUidValidity: 202)
 
-        let provider = await mock([headerInfo(messageId: "500", rfc822: "same@example.com")])
+        let provider = await mock(
+            [headerInfo(messageId: "500", rfc822: "same@example.com")],
+            observedUidValidity: 202, folderPath: "Archive")
         _ = try await sync(pool, folderId: "acc1:Archive", provider: provider)
 
         let rows = try headers(pool, messageId: "500")
@@ -305,7 +351,9 @@ struct RFC822IdentityMergeGuardTests {
             pool, messageId: "700", rfc822: "durable@example.com",
             pkFolderPath: "INBOX", folderPath: "INBOX")
 
-        let provider = await mock([headerInfo(messageId: "700", rfc822: nil)])
+        let provider = await mock(
+            [headerInfo(messageId: "700", rfc822: nil)],
+            observedUidValidity: 202, folderPath: "INBOX")
         _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
 
         let row = try header(pool, id: id)
@@ -314,13 +362,10 @@ struct RFC822IdentityMergeGuardTests {
         #expect(row?.rfc822MessageId == "durable@example.com")
     }
 
-    /// **A fetch carrying a DIFFERENT Message-ID never overwrites a stored one
-    /// — while non-identity fields still merge.**
-    ///
-    /// The second half is the mirror-image check: the refusal must be scoped to
-    /// the identity fields, not escalated into a blanket abort of the merge.
-    @Test("A fetch carrying a different Message-ID never overwrites the stored one, but non-identity fields still merge")
-    func collidingIncomingIdentityIsRefusedButOtherFieldsMerge() async throws {
+    /// A provider-proven address owns the row even when RFC metadata changes.
+    /// RFC is corroboration/metadata only and cannot veto the provider id.
+    @Test("A provider-proven address accepts changed RFC metadata")
+    func providerProvenAddressAcceptsChangedRfcMetadata() async throws {
         let (pool, dir, previous) = try makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         try seedAccountAndFolders(pool)
@@ -329,16 +374,13 @@ struct RFC822IdentityMergeGuardTests {
             pool, messageId: "800", rfc822: "stored@example.com",
             pkFolderPath: "INBOX", folderPath: "INBOX", subject: "Original subject")
 
-        let provider = await mock([
-            headerInfo(messageId: "800", rfc822: "different@example.com", subject: "Server subject")
-        ])
+        let provider = await mock(
+            [headerInfo(messageId: "800", rfc822: "different@example.com", subject: "Server subject")],
+            observedUidValidity: 202, folderPath: "INBOX")
         _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
 
         let row = try header(pool, id: id)
-        #expect(row?.rfc822MessageId == "stored@example.com",
-                "a disagreeing incoming identity must never be written over the stored one")
-        #expect(row?.from == "Sender",
-                "non-identity fields still merge — the refusal is scoped to identity, not a blanket abort")
+        #expect(row?.rfc822MessageId == "different@example.com")
     }
 
     /// Enrichment must still land: a row that carries NO identity yet adopts the
@@ -355,7 +397,9 @@ struct RFC822IdentityMergeGuardTests {
             pkFolderPath: "INBOX", folderPath: "INBOX")
         #expect(try header(pool, id: id)?.stableId == "810", "precondition: bare-UID stableId")
 
-        let provider = await mock([headerInfo(messageId: "810", rfc822: "enriched@example.com")])
+        let provider = await mock(
+            [headerInfo(messageId: "810", rfc822: "enriched@example.com")],
+            observedUidValidity: 202, folderPath: "INBOX")
         _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
 
         #expect(try header(pool, id: id)?.stableId == "enriched@example.com",
@@ -448,11 +492,10 @@ struct RFC822IdentityMergeGuardTests {
                 "the refusal must not outlive the condition that caused it")
     }
 
-    /// The mirror-image check for the reclaim guard: an orphan of the SAME
-    /// message is still reclaimed. A guard that refused this would strand every
-    /// no-op optimistic move (e.g. archive from All Mail) in the wrong folder.
-    @Test("An orphan of the same message is still reclaimed")
-    func sameIdentityOrphanIsStillReclaimed() async throws {
+    /// RFC agreement is not enough to reclaim an IMAP row whose membership
+    /// proves it belongs to another mailbox. Fail closed and let sync heal it.
+    @Test("An RFC-matching IMAP orphan is not reclaimed without provider-address proof")
+    func sameRfcOrphanIsNotReclaimed() async throws {
         let (pool, dir, previous) = try makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         try seedAccountAndFolders(pool)
@@ -465,15 +508,14 @@ struct RFC822IdentityMergeGuardTests {
         _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
 
         let reclaimed = try header(pool, id: orphanId)
-        #expect(reclaimed?.folderPath == "INBOX",
-                "a same-identity orphan must still be reclaimed — the guard must not refuse this")
-        #expect(reclaimed?.folderId == "acc1:INBOX")
+        #expect(reclaimed?.folderPath == "Archive")
+        #expect(reclaimed?.folderId == "acc1:Archive")
     }
 
-    /// Assign/keep on the reclaim leg: an rfc-less incoming fetch must not NULL
-    /// the survivor's identity even when the reclaim itself is admitted.
-    @Test("A reclaim driven by an rfc-less fetch never NULLs the survivor's identity")
-    func reclaimWithNilIncomingKeepsStoredIdentity() async throws {
+    /// A nil RFC supplies no substitute for provider-address proof either; the
+    /// parked survivor stays untouched and retains its metadata.
+    @Test("An rfc-less fetch cannot reclaim an unproven survivor")
+    func nilRfcCannotReclaimUnprovenSurvivor() async throws {
         let (pool, dir, previous) = try makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         try seedAccountAndFolders(pool)
@@ -486,9 +528,8 @@ struct RFC822IdentityMergeGuardTests {
         _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
 
         let reclaimed = try header(pool, id: orphanId)
-        #expect(reclaimed?.folderPath == "INBOX", "nil incoming is not a collision — the reclaim proceeds")
-        #expect(reclaimed?.stableId == "keepme@example.com",
-                "but the rfc-less fetch must not demote it to a bare-UID stableId")
+        #expect(reclaimed?.folderPath == "Archive")
+        #expect(reclaimed?.stableId == "keepme@example.com")
     }
 
     // MARK: - Pre-sync inbox reclaim (R15-F1 sibling gate)
@@ -518,38 +559,7 @@ struct RFC822IdentityMergeGuardTests {
         #expect(movedIn != nil, "the user's moved-in message must not be deleted by the reclaim")
         #expect(movedIn?.rfc822MessageId == "movedin@example.com")
         #expect(try bodyHTML(pool, id: movedInId) == "<p>moved-in body</p>")
-        // The incoming message is stored on its own canonical PK, not by
-        // cannibalising the moved-in row.
-        #expect(try header(pool, id: "acc1:INBOX:600")?.rfc822MessageId == "inboxnative@example.com")
-    }
-}
-
-/// Pure-function coverage for the classifier the §5 arms above share. These
-/// pin the CONTRACT (which of the four shapes is a collision), which is what
-/// each call site's assign/keep decision is built on.
-@Suite("classifyRFC822Merge — the §5 collision contract")
-struct RFC822MergeClassificationTests {
-
-    @Test("Both sides non-nil and different is the only collision")
-    func onlyDisagreeingNonNilPairsCollide() {
-        #expect(SyncEngine.classifyRFC822Merge(storedNormalized: "a@example.com", incomingNormalized: "b@example.com") == .collision)
-        #expect(SyncEngine.classifyRFC822Merge(storedNormalized: "a@example.com", incomingNormalized: "a@example.com") == .notACollision)
-        #expect(SyncEngine.classifyRFC822Merge(storedNormalized: nil, incomingNormalized: "b@example.com") == .notACollision)
-        #expect(SyncEngine.classifyRFC822Merge(storedNormalized: "a@example.com", incomingNormalized: nil) == .notACollision)
-        #expect(SyncEngine.classifyRFC822Merge(storedNormalized: nil, incomingNormalized: nil) == .notACollision)
-    }
-
-    @Test("Identity normalization: brackets and whitespace stripped, empty collapses to nil")
-    func normalizationCollapsesEmptyAndStripsBrackets() {
-        #expect(SyncEngine.normalizedRfc822Identity("<a@example.com>") == "a@example.com")
-        #expect(SyncEngine.normalizedRfc822Identity("  a@example.com  ") == "a@example.com")
-        #expect(SyncEngine.normalizedRfc822Identity("") == nil)
-        #expect(SyncEngine.normalizedRfc822Identity("   ") == nil)
-        #expect(SyncEngine.normalizedRfc822Identity(nil) == nil)
-        // An angle-bracketed stored value and a bare incoming value are the SAME
-        // identity — without normalization every such pair would be a collision.
-        #expect(SyncEngine.classifyRFC822Merge(
-            storedNormalized: SyncEngine.normalizedRfc822Identity("<x@example.com>"),
-            incomingNormalized: SyncEngine.normalizedRfc822Identity("x@example.com")) == .notACollision)
+        // Failing closed may defer the incoming occupant until sync vacates the
+        // ambiguous address; it must never cannibalise the moved-in row.
     }
 }

@@ -94,8 +94,8 @@ struct MessageHeaderObservationEpochTests {
         #expect(row?.observedUidValidity == 101)
     }
 
-    @Test("A positive RFC collision clears a seeded usable observation epoch")
-    func collisionClearsEpoch() async throws {
+    @Test("Provider-address proof outranks a positive RFC disagreement")
+    func providerAddressProofOutranksRfcDisagreement() async throws {
         let (pool, dir, previous, folder) = try Self.fixture()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         try await pool.write { db in
@@ -104,8 +104,8 @@ struct MessageHeaderObservationEpochTests {
         }
         try await Self.run(folder: folder, pool: pool, epoch: 101, infos: [Self.info(uid: "1", rfc822: "new@example.com")])
         let row = try await Self.stored(pool, id: "source-epoch:INBOX:1")
-        #expect(row?.observedUidValidity == nil)
-        #expect(row?.rfc822MessageId == "old@example.com")
+        #expect(row?.observedUidValidity == 101)
+        #expect(row?.rfc822MessageId == "new@example.com")
     }
 
     @Test("An RFC-only UID remap remains epochless until an exact folder-native observation")
@@ -143,9 +143,17 @@ struct MessageHeaderObservationEpochTests {
             var remnant = MessageHeader(messageId: "7", subject: "moved", from: "Sender", fromAddress: "sender@example.com", to: "r@example.com", date: .distantPast, snippet: "moved", folderId: "acc1:Archive", accountId: "acc1", folderPath: "INBOX", isInInbox: false)
             remnant.observedUidValidity = 100
             try remnant.insert(connection)
-            let result = try SyncEngine.canonicalizeLocalRows(accountId: "acc1", folderPath: "Archive", folderId: "acc1:Archive", messageId: "7", isInInbox: false, incomingNormalizedRfc822: nil, db: connection)
+            let result = try SyncEngine.canonicalizeLocalRows(
+                accountId: "acc1", folderPath: "Archive", folderId: "acc1:Archive",
+                messageId: "7", isInInbox: false, windowMode: .uid,
+                sourceBoundEpoch: 100, db: connection)
             #expect(result.sourceAddressProven == false)
             #expect(result.row?.observedUidValidity == nil)
+            #expect(result.ftsRekey == nil,
+                    "an unproven moved row must not be re-keyed into a provider address it may not own")
+            #expect(result.row?.id == "acc1:INBOX:7")
+            #expect(try MessageHeader.fetchOne(connection, key: "acc1:INBOX:7") != nil)
+            #expect(try MessageHeader.fetchOne(connection, key: "acc1:Archive:7") == nil)
         }
     }
 

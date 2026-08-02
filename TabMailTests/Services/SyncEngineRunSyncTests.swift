@@ -60,9 +60,8 @@ private func makeHeaderInfo(
 /// This replicates the logic from SyncEngineFullSync.swift but accepts DatabaseWriter
 /// so it works with the in-memory DatabaseQueue used by tests.
 ///
-/// ⚠ **DELIBERATELY OMITTED: the §5 RFC822 identity guards** (ADR-IOS-061 —
-/// `SyncEngine.classifyRFC822Merge` and the assign/keep rule in the `existing`
-/// merge branch and the orphan-reclaim branch). This simulation keeps the
+/// ⚠ **DELIBERATELY OMITTED: provider-address ownership** (T5.11 — the
+/// canonicalizer, existing-merge, and orphan-reclaim gates). This simulation keeps the
 /// pre-guard unconditional `rfc822MessageId` assignment because the cases below
 /// are about stale detection, insert, UID remap and pending-op protection —
 /// every fixture uses one identity per address, where guarded and unguarded
