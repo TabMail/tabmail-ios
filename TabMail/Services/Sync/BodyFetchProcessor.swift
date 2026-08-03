@@ -99,21 +99,38 @@ enum BodyFetchProcessor {
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
-                print("[BodyFetch] Body too large for \(item.messageId) — exceeds buffer")
-                do {
-                    try await AppDatabase.dbPool.write { db in
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 1 WHERE id = ?",
-                            arguments: [item.headerId]
-                        )
-                    }
-                } catch {
-                    // ADR-IOS-046: a suspension abort here is expected + retryable —
-                    // don't log it as a failure (BodyFetchProcessor writes run on
-                    // background backfill paths that can suspend mid-flight).
-                    if !error.isDatabaseSuspensionAbort {
-                        print("[BodyFetch] Failed to flag payload-too-large \(item.headerId.prefix(30)): \(error)")
-                    }
+                // Data-integrity rule 1 ("NEVER mark unfetched content as fetched"):
+                // a PayloadTooLargeError is NOT an empty body — the message overflowed
+                // the fixed per-binary NIO buffer, so it is honestly INCOMPLETE, not
+                // empty. The body demonstrably EXISTS; it is merely bigger than this
+                // request could carry, which is the opposite of the one permitted
+                // exception (a verified permanent "content confirmed gone").
+                //
+                // So we must NOT write `bodyEmptyConfirmed = 1` here. That flag is read
+                // as "the server confirmed this message has no content", and every body
+                // queue / FTS self-heal / embedding repopulate query gates on
+                // `bodyEmptyConfirmed = 0`. Setting it retires the row from all of them
+                // permanently, leaving the message searchable-but-unopenable — the
+                // silent user-message drop the rule exists to prevent.
+                //
+                // The row instead stays `bodyComplete = 0` / `bodyEmptyConfirmed = 0`
+                // (truthfully retryable), and `emptyFetchCount` is deliberately NOT
+                // incremented — an oversized body must not consume a strike from the
+                // empty-confirmation budget that `process` spends on genuinely empty
+                // fetches.
+                //
+                // Termination: this branch is reachable only from the single-item
+                // user-open path (`fetchAndProcess` ← `AccountManagerFetch
+                // .fetchBodyIfNeeded`). That path performs no retry loop — it surfaces
+                // `.payloadTooLarge` to the user as a visible error and stops — so
+                // leaving the row retryable cannot spin. The batched queues never reach
+                // here (they use `fetchMessagesBatch` + `renderFetched` and own their
+                // separate oversize handling).
+                //
+                // PORT of `v2final`'s `BodyFetchProcessor.fetch` (commit `737aea64f`),
+                // which deleted this same write from this same branch.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[BodyFetch] Body too large for \(item.messageId) — exceeds buffer (left honestly-incomplete, not marked empty)")
                 }
                 return .failure(.payloadTooLarge)
             } else {

@@ -108,7 +108,8 @@ struct BodyAssetPreparationLeaseTests {
         let bytes = Data("prepared-but-not-yet-published".utf8)
         guard let prepared = BodyAssetStore.prepare(
             contentKey: key, kind: .attachment, key: "1.1",
-            contentType: "application/pdf", data: bytes
+            contentType: "application/pdf", data: bytes,
+            identityStamp: "rfc:lease-1@example.com"
         ) else {
             Issue.record("prepare failed")
             return
@@ -143,7 +144,7 @@ struct BodyAssetPreparationLeaseTests {
         let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-2")
         guard let publishedId = BodyAssetStore.writeAttachment(
             contentKey: key, section: "1.1", contentType: "application/pdf",
-            data: Data("already-cached".utf8)
+            data: Data("already-cached".utf8), identityStamp: "rfc:lease-2@example.com"
         ) else {
             Issue.record("writeAttachment failed")
             return
@@ -153,7 +154,8 @@ struct BodyAssetPreparationLeaseTests {
         let inFlight = Data("still-being-written".utf8)
         guard let prepared = BodyAssetStore.prepare(
             contentKey: key, kind: .attachment, key: "1.2",
-            contentType: "application/pdf", data: inFlight
+            contentType: "application/pdf", data: inFlight,
+            identityStamp: "rfc:lease-2@example.com"
         ) else {
             Issue.record("prepare failed")
             return
@@ -178,7 +180,7 @@ struct BodyAssetPreparationLeaseTests {
         let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-3")
         guard let assetId = BodyAssetStore.writeAttachment(
             contentKey: key, section: "3.1", contentType: "application/pdf",
-            data: Data("v1".utf8)
+            data: Data("v1".utf8), identityStamp: "rfc:lease-3@example.com"
         ) else {
             Issue.record("writeAttachment failed")
             return
@@ -188,7 +190,8 @@ struct BodyAssetPreparationLeaseTests {
         let v2 = Data("v2".utf8)
         guard let prepared = BodyAssetStore.prepare(
             contentKey: key, kind: .attachment, key: "3.1",
-            contentType: "application/pdf", data: v2
+            contentType: "application/pdf", data: v2,
+            identityStamp: "rfc:lease-3@example.com"
         ) else {
             Issue.record("prepare failed")
             return
@@ -217,7 +220,8 @@ struct BodyAssetPreparationLeaseTests {
         let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-4")
         guard let prepared = BodyAssetStore.prepare(
             contentKey: key, kind: .attachment, key: "1.1",
-            contentType: "application/pdf", data: Data(repeating: 0x11, count: 64)
+            contentType: "application/pdf", data: Data(repeating: 0x11, count: 64),
+            identityStamp: "rfc:lease-4@example.com"
         ) else {
             Issue.record("prepare failed")
             return
@@ -251,7 +255,8 @@ struct BodyAssetPreparationLeaseTests {
         let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-5")
         guard let prepared = BodyAssetStore.prepare(
             contentKey: key, kind: .attachment, key: "2.1",
-            contentType: "application/pdf", data: Data(repeating: 0x22, count: 32)
+            contentType: "application/pdf", data: Data(repeating: 0x22, count: 32),
+            identityStamp: "rfc:lease-5@example.com"
         ) else {
             Issue.record("prepare failed")
             return
@@ -266,7 +271,9 @@ struct BodyAssetPreparationLeaseTests {
         #expect(BodyAssetStore.publish(prepared) == nil)
         let rows = try Self.manifestRowCount(blobId: prepared.blobId)
         #expect(rows == 0)
-        #expect(BodyAssetStore.attachmentAssetId(contentKey: key, section: "2.1") == nil)
+        #expect(BodyAssetStore.attachmentAssetId(
+            contentKey: key, section: "2.1",
+            identityStamp: "rfc:lease-5@example.com") == nil)
     }
 
     @Test("A published asset survives an orphan sweep while a true orphan does not")
@@ -277,7 +284,8 @@ struct BodyAssetPreparationLeaseTests {
         let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-6")
         let bytes = Data("published-bytes".utf8)
         guard let assetId = BodyAssetStore.writeAttachment(
-            contentKey: key, section: "1.1", contentType: "application/pdf", data: bytes
+            contentKey: key, section: "1.1", contentType: "application/pdf", data: bytes,
+            identityStamp: "rfc:lease-6@example.com"
         ) else {
             Issue.record("writeAttachment failed")
             return
@@ -367,5 +375,75 @@ struct BodyAssetPreparationLeaseTests {
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM bodyAssetPreparation") ?? -1
         }
         #expect(leases == 1)
+    }
+
+    /// The UPGRADE half of `migrateAttachmentIdentitySchema`'s convergence claim
+    /// (ADR-IOS-066 / T5.1). A manifest that predates `identityStamp` must gain the
+    /// column and then behave identically to a freshly created one — otherwise every
+    /// existing install's attachment cache is a hard error rather than a miss.
+    @Test("A manifest that predates identityStamp upgrades and then serves stamped attachments")
+    func attachmentIdentitySchemaUpgradesAnExistingManifest() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bodyAssetLegacyUpgrade-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            BodyAssetStore._resetForTesting()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        // The PRE-column manifest, verbatim as it shipped.
+        let queue = try DatabaseQueue()
+        try queue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE bodyAsset (
+                    id                TEXT PRIMARY KEY,
+                    headerId          TEXT NOT NULL,
+                    kind              INTEGER NOT NULL,
+                    contentId         TEXT,
+                    attachmentSection TEXT,
+                    contentType       TEXT NOT NULL,
+                    sizeBytes         INTEGER NOT NULL,
+                    createdAt         INTEGER NOT NULL,
+                    lastAccessedAt    INTEGER
+                )
+                """)
+            try BodyAssetStore.migratePreparationSchema(db)
+        }
+
+        // Same introspection form the production migration itself uses, so this
+        // cannot pass against a `PRAGMA` spelling the migration would not see.
+        func hasIdentityStampColumn() throws -> Bool {
+            try queue.read { db in
+                try Row.fetchAll(db, sql: "PRAGMA table_info(bodyAsset)")
+                    .map { $0["name"] as String }
+                    .contains("identityStamp")
+            }
+        }
+        let hadColumnBefore = try hasIdentityStampColumn()
+        #expect(hadColumnBefore == false,
+                "precondition: the column really is absent before the upgrade")
+
+        // Run twice — the upgrade path is also re-entered on every manifest open.
+        try queue.write { db in try BodyAssetStore.migrateAttachmentIdentitySchema(db) }
+        try queue.write { db in try BodyAssetStore.migrateAttachmentIdentitySchema(db) }
+        let hasColumnAfter = try hasIdentityStampColumn()
+        #expect(hasColumnAfter)
+
+        // …and the upgraded manifest behaves exactly like a fresh one.
+        BodyAssetStore._setTestEnvironment(containerURL: dir, queue: queue)
+        let key = ContentKey(rawValue: "acc1:INBOX:upgraded")
+        let stamp = "rfc:upgraded@example.com"
+        guard let assetId = BodyAssetStore.writeAttachment(
+            contentKey: key, section: "2", contentType: "application/pdf",
+            data: Data("upgraded-bytes".utf8), identityStamp: stamp
+        ) else {
+            Issue.record("writeAttachment failed on the upgraded manifest")
+            return
+        }
+        #expect(BodyAssetStore.attachmentAssetId(
+            contentKey: key, section: "2", identityStamp: stamp) == assetId)
+        #expect(BodyAssetStore.attachmentAssetId(
+            contentKey: key, section: "2", identityStamp: "rfc:someone-else@example.com") == nil,
+            "the upgraded manifest must refuse a different message just as a fresh one does")
     }
 }

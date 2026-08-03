@@ -117,10 +117,12 @@ enum BodyAssetStore {
                         contentType       TEXT NOT NULL,
                         sizeBytes         INTEGER NOT NULL,
                         createdAt         INTEGER NOT NULL,
-                        lastAccessedAt    INTEGER
+                        lastAccessedAt    INTEGER,
+                        identityStamp     TEXT
                     )
                     """)
                 try migratePreparationSchema(db)
+                try migrateAttachmentIdentitySchema(db)
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_header ON bodyAsset (headerId)")
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_lru ON bodyAsset (lastAccessedAt)")
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")
@@ -159,6 +161,58 @@ enum BodyAssetStore {
             CREATE INDEX IF NOT EXISTS idx_bodyAssetPreparation_blob
             ON bodyAssetPreparation(blobId)
             """)
+    }
+
+    /// Ad-hoc migration for `bodyAsset.identityStamp` — the ATTACHMENT cache's
+    /// identity binding (ADR-IOS-066 / T5.1).
+    ///
+    /// ⚑ WHY THE COLUMN EXISTS — the invariant, not an instance. An attachment is
+    /// looked up by `(headerId, kind, attachmentSection)`. BOTH halves of that
+    /// address are mutable and reusable:
+    ///   - `headerId` is a CONTENT key, `"<accountId>:<folderPath>:<tail>"`, and at
+    ///     the current stage the tail is the provider message id — an IMAP UID. A
+    ///     `UIDVALIDITY` change reassigns that UID to a DIFFERENT physical message,
+    ///     so the same key names a different message before and after;
+    ///   - `attachmentSection` is a positional MIME part path (`"2"`, `"1.2"`), which
+    ///     essentially every multipart message reuses.
+    /// The `UIDVALIDITY` reaction purges this manifest, but that purge is explicitly
+    /// best-effort and non-aborting (see `AccountManagerUidValidityReset`'s step 4
+    /// comment), and the reaction refuses to start at all for a folder with no
+    /// recorded epoch. A surviving row is therefore reachable, and without a positive
+    /// identity check the user is served a STRANGER'S ATTACHMENT under their own
+    /// message's name. `ContentKey` does not close this: `ContentKey.forHeader` is
+    /// inert at Stage B and returns `MessageHeader.id` verbatim, so the newtype
+    /// separates two key SPACES, not two MESSAGES at one address.
+    ///
+    /// ⚑ NULL IS NOT A MISMATCH — IT IS AN UNANSWERED QUESTION. A NULL stamp never
+    /// matches the `identityStamp = ?` bind in `attachmentAssetId`, so a legacy row
+    /// is a strict cache MISS and the attachment is RE-FETCHED. Nothing here, and
+    /// nothing downstream, may delete a row because its stamp is absent or differs —
+    /// only `deleteAllAssets` / eviction / the orphan sweeps delete, and all of them
+    /// key by content key alone, exactly as before.
+    ///
+    /// PORT of `v2final`'s `BodyAssetStore.migrateIdentityBoundSchema` (commit
+    /// `486bafd4b`), narrowed to ONE column. The manifest is a SEPARATE database from
+    /// `AppDatabase` — it lives in the App Group so the NSE can write it — so it has
+    /// no GRDB `DatabaseMigrator` and no numbered `vNN`; schema evolution is the same
+    /// `PRAGMA table_info` + `ALTER TABLE ADD COLUMN` idiom the reference used.
+    ///
+    /// CONVERGENCE: a FRESH manifest is created by the `CREATE TABLE` in
+    /// `manifestQueue()` / `_makeTestQueue()`, which already lists `identityStamp`,
+    /// so the `ALTER` here is skipped; an EXISTING manifest gets the column added
+    /// here. Both end with the identical schema — the create statements and this
+    /// addition list must be kept in lockstep.
+    static func migrateAttachmentIdentitySchema(_ db: Database) throws {
+        let columns = Set(
+            try Row.fetchAll(db, sql: "PRAGMA table_info(bodyAsset)")
+                .map { $0["name"] as String }
+        )
+        let additions: [(String, String)] = [
+            ("identityStamp", "TEXT"),
+        ]
+        for (name, type) in additions where !columns.contains(name) {
+            try db.execute(sql: "ALTER TABLE bodyAsset ADD COLUMN \(name) \(type)")
+        }
     }
 
     // MARK: - Public: budget
@@ -311,24 +365,47 @@ enum BodyAssetStore {
         let key: String
         let contentType: String
         let sizeBytes: Int
+        /// The identity of the message these bytes were fetched FOR, as minted by
+        /// `AttachmentCacheIdentity.stamp(for:)`. Non-nil for `.attachment`, nil for
+        /// `.inlineImage` (whose reader addresses immutable content by asset id out
+        /// of the rendered HTML rather than by the mutable `(headerId, cid)` slot).
+        let identityStamp: String?
     }
 
     // MARK: - Public: writes (identical path in NSE and main app)
 
     /// Writes inline image bytes. Returns the assetId on success, nil on failure.
+    ///
+    /// Deliberately UNSTAMPED. An inline image is never looked up by its
+    /// `(headerId, contentId)` slot: the only reader is `BodyAssetSchemeHandler`,
+    /// which resolves the `tabmail-asset://<assetId>` URL that `makeInlineImageWriter`
+    /// baked into the cached HTML, and that URL is emitted only after the bytes for
+    /// THAT render succeeded. A replacement occupant at the same content key renders
+    /// its OWN body, so it references its own asset ids and overwrites the slot it
+    /// shares. See `writeAttachment` for why the attachment path cannot make that
+    /// argument.
     static func writeInlineImage(
         contentKey: ContentKey, contentId: String, contentType: String, data: Data
     ) -> String? {
         write(contentKey: contentKey, kind: .inlineImage, key: contentId,
-              contentType: contentType, data: data)
+              contentType: contentType, data: data, identityStamp: nil)
     }
 
     /// Writes attachment bytes. Returns the assetId on success, nil on failure.
+    ///
+    /// `identityStamp` is REQUIRED and deliberately has NO default: it is the only
+    /// thing that makes the `(contentKey, section)` slot — two mutable, reusable
+    /// halves — safe to read back. A defaulted stamp would let a new writer be added
+    /// that silently records nothing while `attachmentAssetId` still reads as though
+    /// it were protected. Mint it with `AttachmentCacheIdentity.stamp(for:)`; when
+    /// that returns nil the message's identity is UNPROVEN and the caller must not
+    /// cache at all.
     static func writeAttachment(
-        contentKey: ContentKey, section: String, contentType: String, data: Data
+        contentKey: ContentKey, section: String, contentType: String, data: Data,
+        identityStamp: String
     ) -> String? {
         write(contentKey: contentKey, kind: .attachment, key: section,
-              contentType: contentType, data: data)
+              contentType: contentType, data: data, identityStamp: identityStamp)
     }
 
     /// Materialises bytes on disk WITHOUT publishing a manifest row, under a
@@ -346,7 +423,7 @@ enum BodyAssetStore {
     /// production reaches it through `write`.
     static func prepare(
         contentKey: ContentKey, kind: BodyAssetKind, key: String,
-        contentType: String, data: Data
+        contentType: String, data: Data, identityStamp: String?
     ) -> PreparedWrite? {
         guard let dir = storeDirectory(), let queue = manifestQueue() else { return nil }
         let hHash = headerHash(contentKey)
@@ -359,7 +436,8 @@ enum BodyAssetStore {
             kind: kind,
             key: key,
             contentType: contentType,
-            sizeBytes: data.count
+            sizeBytes: data.count,
+            identityStamp: identityStamp
         )
 
         // 1. Lease FIRST, before the filesystem is touched at all. Every
@@ -438,19 +516,31 @@ enum BodyAssetStore {
                 )
                 guard db.changesCount == 1 else { return false }
 
+                // ⚑ THE CONFLICT UPDATE MUST CARRY THE STAMP. `blobId` names the
+                // logical SLOT, not the bytes, and `prepare` ALWAYS re-materialises
+                // the file — so by the time this runs, the slot already holds THIS
+                // writer's bytes. Leaving a previous occupant's `identityStamp` in
+                // place would make the row describe one message while its bytes are
+                // another's: the manifest would be lying, and the lie would point at
+                // the message whose attachment this ISN'T. Overwriting the stamp is
+                // the truthful record, and it is not an invalidation of anything —
+                // the prior bytes are already gone.
                 try db.execute(
                     sql: """
                     INSERT INTO bodyAsset (id, headerId, kind, contentId, attachmentSection,
-                                           contentType, sizeBytes, createdAt, lastAccessedAt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                                           contentType, sizeBytes, createdAt, lastAccessedAt,
+                                           identityStamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         contentType = excluded.contentType,
-                        sizeBytes = excluded.sizeBytes
+                        sizeBytes = excluded.sizeBytes,
+                        identityStamp = excluded.identityStamp
                     """,
                     arguments: [
                         prepared.blobId, prepared.contentKey, prepared.kind.rawValue,
                         contentIdValue, attachmentSectionValue,
-                        prepared.contentType, prepared.sizeBytes, nowMs
+                        prepared.contentType, prepared.sizeBytes, nowMs,
+                        prepared.identityStamp
                     ]
                 )
                 try db.execute(
@@ -478,14 +568,15 @@ enum BodyAssetStore {
 
     private static func write(
         contentKey: ContentKey, kind: BodyAssetKind, key: String,
-        contentType: String, data: Data
+        contentType: String, data: Data, identityStamp: String?
     ) -> String? {
         guard let prepared = prepare(
             contentKey: contentKey,
             kind: kind,
             key: key,
             contentType: contentType,
-            data: data
+            data: data,
+            identityStamp: identityStamp
         ) else { return nil }
         let result = publish(prepared)
         if result == nil {
@@ -678,15 +769,46 @@ enum BodyAssetStore {
         return try? Data(contentsOf: url)
     }
 
-    /// Looks up the assetId for an attachment by (contentKey, section).
-    static func attachmentAssetId(contentKey: ContentKey, section: String) -> String? {
+    /// Looks up the assetId for an attachment by (contentKey, section) — but ONLY
+    /// when the row was published for the SAME message that is asking.
+    ///
+    /// ⚑ THE INVARIANT: a cached attachment is served only for the message it was
+    /// fetched for. `(contentKey, section)` alone cannot express that — both halves
+    /// are mutable addresses a different physical message reoccupies (an IMAP UID
+    /// after a `UIDVALIDITY` change; a positional MIME part path that every
+    /// multipart message reuses). Without the stamp this lookup hands the user a
+    /// stranger's attachment under their own message's name. See
+    /// `migrateAttachmentIdentitySchema` for the full closure.
+    ///
+    /// PORT of `v2final`'s `BodyAssetStore.attachmentAsset(headerId:section:)` /
+    /// `attachmentAssetId(headerId:section:)` (commit `486bafd4b`), which likewise
+    /// admits only rows carrying an identity and treats stampless legacy rows as
+    /// strict cache misses.
+    ///
+    /// FAIL-CLOSED, NEVER FAIL-DESTRUCTIVE. Every refusal here — a NULL legacy stamp,
+    /// a differing stamp, an unreadable manifest — returns "no cached asset", which
+    /// re-fetches. It never deletes a row, never marks content fetched, and never
+    /// widens to a partial match.
+    ///
+    /// `identityStamp` is REQUIRED and has NO default, so a future reader cannot be
+    /// added that skips the check and still compiles.
+    static func attachmentAssetId(
+        contentKey: ContentKey, section: String, identityStamp: String
+    ) -> String? {
         guard let queue = manifestQueue() else { return nil }
         do {
             return try queue.read { db in
                 try String.fetchOne(
                     db,
-                    sql: "SELECT id FROM bodyAsset WHERE headerId = ? AND kind = ? AND attachmentSection = ?",
-                    arguments: [contentKey, BodyAssetKind.attachment.rawValue, section]
+                    sql: """
+                        SELECT id FROM bodyAsset
+                        WHERE headerId = ? AND kind = ? AND attachmentSection = ?
+                          AND identityStamp = ?
+                        """,
+                    arguments: [
+                        contentKey, BodyAssetKind.attachment.rawValue, section,
+                        identityStamp,
+                    ]
                 )
             }
         } catch {
@@ -1097,10 +1219,12 @@ enum BodyAssetStore {
                     contentType       TEXT NOT NULL,
                     sizeBytes         INTEGER NOT NULL,
                     createdAt         INTEGER NOT NULL,
-                    lastAccessedAt    INTEGER
+                    lastAccessedAt    INTEGER,
+                    identityStamp     TEXT
                 )
                 """)
             try migratePreparationSchema(db)
+            try migrateAttachmentIdentitySchema(db)
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_header ON bodyAsset (headerId)")
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_lru ON bodyAsset (lastAccessedAt)")
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")

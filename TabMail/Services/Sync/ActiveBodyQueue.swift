@@ -5,6 +5,21 @@
 import Foundation
 import GRDB
 
+/// Test-only snapshot of a body queue's `QueueStorage` bookkeeping, shared by
+/// `ActiveBodyQueue` and `BackfillBodyQueue`.
+///
+/// Every field is already readable through `QueueStorage`'s `private(set)` getters;
+/// this type only bundles them so a test can assert the whole disposition of one
+/// oversized item at once — that it left the queue, was NOT recorded as completed,
+/// and never touched `activeJobs` (which these two queues do not use — they track
+/// `activeBatchCount` instead, so a stray decrement would drive it negative).
+struct BodyQueueStorageSnapshot: Sendable {
+    let queueCount: Int
+    let enqueuedCount: Int
+    let recentlyCompletedCount: Int
+    let activeJobs: Int
+}
+
 /// Forward/UX body-fetch queue for inbox messages (delta/full sync new messages).
 /// Uses shared BodyFetchProcessor: full message fetch → render → FTS → flags → AI.
 /// Runs at full speed (no power-aware delay) — this is the user-facing queue.
@@ -35,11 +50,65 @@ actor ActiveBodyQueue {
     private let maxConcurrentBatches = 3
     private let batchSize = SyncConfig.backfillBodyDispatchBatch // 50
 
-    /// Per-folder batch size cap. Halved on PayloadTooLargeError, restored on success.
+    /// Per-folder batch size cap. Fixed (default `batchSize`); NO longer
+    /// auto-halved/restored on PayloadTooLarge. That auto-adjust was keyed only by
+    /// `folderPath` and RESTORED on ANY successful batch (incl. another account's
+    /// INBOX), so a sibling success reset it and it could not reliably slice an
+    /// oversized batch down to a single item → retry-exhaust → repopulate HOT LOOP.
+    /// Oversized-item isolation is now FAILURE-LOCAL via `isolationPending` below.
+    /// Kept as a plain per-folder safety cap + test seam.
     private var folderMaxBatch: [String: Int] = [:]
-    /// Per-folder active batch count. Max 2 per folder (1 running + 1 queued).
-    private var folderActiveBatches: [String: Int] = [:]
+    /// Per-(account,folder) active batch count. Max 2 per account-folder (1
+    /// running + 1 queued). Keyed by BOTH accountId AND folderPath: separate
+    /// accounts fetch over separate IMAP connections, so their same-named folders
+    /// (every account has an "INBOX") must NOT share this cap. A folderPath-only
+    /// key let one account's 50-item batches perpetually hold both "INBOX" slots
+    /// and starve ANOTHER account's isolation singleton (size-1 groups sort last
+    /// under the size-descending dispatch order) — which would leave a genuinely
+    /// oversized message never size-tested alone, i.e. never reaching the defer.
+    private struct FolderCapKey: Hashable { let accountId: String; let folderPath: String }
+    private var folderActiveBatches: [FolderCapKey: Int] = [:]
     private let maxBatchesPerFolder = 2
+
+    /// headerIds from a PayloadTooLarge batch whose `items.count > 1` — one (or a
+    /// few) of them is oversized, but the batch error doesn't say which. Each is
+    /// dispatched ALONE (a forced single-item batch, via
+    /// `groupCandidatesForDispatch`) so it is size-tested in isolation INDEPENDENT
+    /// of `folderMaxBatch`. A lone PayloadTooLarge then defers it
+    /// (`oversizedDeferredThisSession`); a resolution drops it here. Being
+    /// failure-local, a sibling success can never let an oversized item escape
+    /// single-item testing — so it reaches the defer instead of hot-looping.
+    /// Cleared for a folder on UIDVALIDITY reset (`clearOversizedDeferred`).
+    private var isolationPending: Set<String> = []
+
+    /// Bumped by `clearOversizedDeferred` on every UIDVALIDITY reset. A batch
+    /// captures this at DISPATCH (before the fetch await) and passes it to
+    /// `handlePayloadTooLarge`, which skips inserting into
+    /// `oversizedDeferredThisSession` / `isolationPending` if the generation changed
+    /// meanwhile — i.e. a reset landed during this batch's fetch window and already
+    /// cleared the sets. Without this, a batch that started BEFORE the reset could
+    /// resume AFTER the clear and re-insert the now-stale OLD-epoch headerId,
+    /// wrongly rejecting a new-epoch message reusing that UID until relaunch.
+    private var resetGeneration = 0
+
+    /// Process-lifetime set of headerIds deferred because their body overflowed the
+    /// fixed NIO buffer (`PayloadTooLargeError` — size-deterministic per binary).
+    ///
+    /// ⚑ THIS IS A BOUNDED, VISIBLE, RETRYABLE QUARANTINE — NOT A DISCARD. The DB
+    /// row is left honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0`, so it stays
+    /// in every work-remaining query, stays visible to `StuckMessageDiagnostics`, and
+    /// stays fetchable by the on-demand user-open path (`BodyFetchProcessor
+    /// .fetchAndProcess`, which never consults this set). Only the BACKGROUND
+    /// pre-fetch is suppressed, and only until one of its three releases fires:
+    ///   1. process relaunch — the set starts empty, so a new binary (whose NIO
+    ///      buffer may be larger) gets one fresh attempt per item;
+    ///   2. a UIDVALIDITY reset for the folder — `clearOversizedDeferred`;
+    ///   3. a UID remap / cross-folder move — that mints a NEW headerId which is not
+    ///      in this set, so `admit` takes it.
+    /// NOT cleared per drain cycle: a size-deterministic oversize cannot become
+    /// fetchable mid-process, so re-attempting it every cycle is exactly the hot loop
+    /// this set exists to stop. `private(set)` so tests can assert membership.
+    private(set) var oversizedDeferredThisSession: Set<String> = []
 
     // .normal-tier (ADR-IOS-056): higher than deep backfill (.background) but
     // below the merge/user-action/badge tier (.priority) — this queue drains
@@ -57,7 +126,132 @@ actor ActiveBodyQueue {
     /// seams in this file set (see `NSEDataBridge.resetStageMemoForTesting`).
     var dbPoolPriorityForTesting: WritePriority { dbPool.priority }
 
+    /// Test-only seam: snapshot of the underlying `QueueStorage` bookkeeping so the
+    /// oversized-defer tests can assert the item was removed, was NOT marked
+    /// recentlyCompleted, and `activeJobs` was left untouched. Same internal
+    /// visibility as `dbPoolPriorityForTesting`.
+    var storageSnapshotForTesting: BodyQueueStorageSnapshot {
+        BodyQueueStorageSnapshot(
+            queueCount: storage.count,
+            enqueuedCount: storage.enqueued.count,
+            recentlyCompletedCount: storage.recentlyCompleted.count,
+            activeJobs: storage.activeJobs
+        )
+    }
+
+    /// Test-only seam: the items currently held by the queue, so a convergence test
+    /// can drive its passes off the REAL queue contents rather than a model of them.
+    var queuedItemsForTesting: [Item] { storage.queue }
+
+    /// Test-only seam: pre-set the per-folder batch cap so the disposition tests can
+    /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
+    /// shared cap — a concurrent fast-failing batch lowering the cap to 1 must not
+    /// cause a genuine multi-item batch of ordinary messages to defer.
+    func setFolderMaxBatchForTesting(_ n: Int, folderPath: String) {
+        folderMaxBatch[folderPath] = n
+    }
+
+    /// Test-only seam: the isolation-pending set — items from a multi-item
+    /// PayloadTooLarge awaiting single-item testing.
+    var isolationPendingForTesting: Set<String> { isolationPending }
+
+    /// Test-only seam: the current reset generation (what a batch captures at dispatch).
+    var resetGenerationForTesting: Int { resetGeneration }
+
+    /// Test-only seam: drive an item's batch-completion disposition (what a real
+    /// isolation-singleton batch applies on success/retry) without the live
+    /// network/provider scaffolding the full dispatch path needs.
+    func completeItemForTesting(_ item: Item, shouldRetry: Bool) {
+        batchItemDone(item: item, shouldRetry: shouldRetry)
+    }
+
+    /// Test-only seam: mirror ONE real batch dispatch's effect on the
+    /// per-(account,folder) cap counter, through the SAME `FolderCapKey` the live
+    /// dispatch path uses.
+    func noteFolderBatchDispatchedForTesting(accountId: String, folderPath: String) {
+        folderActiveBatches[FolderCapKey(accountId: accountId, folderPath: folderPath), default: 0] += 1
+    }
+
+    /// Test-only seam: read the per-(account,folder) active-batch count via the SAME
+    /// `FolderCapKey` the cap guard uses.
+    func folderActiveBatchCountForTesting(accountId: String, folderPath: String) -> Int {
+        folderActiveBatches[FolderCapKey(accountId: accountId, folderPath: folderPath)] ?? 0
+    }
+
     // MARK: - Public API
+
+    /// Guarded admission — the SINGLE gate every enqueue site in this actor routes
+    /// through: skip a headerId already deferred as oversized so a deferred item is
+    /// never re-admitted this process lifetime. The repopulate/drain SELECTs still
+    /// return the row (`bodyComplete = 0 / bodyEmptyConfirmed = 0` is truthfully
+    /// retryable — the row is NOT lied about), but this gate keeps it out of the
+    /// queue, which is what stops the repopulate → dispatch → overflow → repopulate
+    /// hot loop. Returns true iff the item was actually enqueued.
+    @discardableResult
+    func admit(_ item: Item) -> Bool {
+        guard !oversizedDeferredThisSession.contains(item.headerId) else { return false }
+        return storage.enqueue(item)
+    }
+
+    /// Drop every oversized-deferred / isolation-pending key belonging to
+    /// (accountId, folderPath). Called by the UIDVALIDITY reset reaction after it
+    /// purges + resyncs the folder.
+    ///
+    /// ⚠ WITHOUT THIS THE QUARANTINE BECOMES A PERMANENT DISCARD BY ANOTHER NAME.
+    /// Both sets key by headerId = `accountId:folderPath:UID`, a mutable ADDRESS,
+    /// not an identity. A UIDVALIDITY reset renumbers the mailbox, so the resync
+    /// re-inserts fresh-epoch rows that MAY reuse a deferred header's UID; a stale
+    /// key would make `admit()` reject a message that was never oversized, starving
+    /// it of its body until relaunch. The purge-and-resync is the correct
+    /// invalidation point (ADR-IOS-061/062). Colon-hierarchy safe via
+    /// `MessageIdentity.headerIdBelongsToFolder` — a nested `:`-delimited sibling
+    /// folder is not matched.
+    func clearOversizedDeferred(accountId: String, folderPath: String) {
+        // Bump FIRST (the generation guard): any in-flight batch that captured the
+        // pre-reset generation and resumes after this clear will now skip its stale
+        // insert instead of re-populating the just-cleared sets.
+        resetGeneration &+= 1
+        let before = oversizedDeferredThisSession.count + isolationPending.count
+        oversizedDeferredThisSession = oversizedDeferredThisSession.filter {
+            !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
+        }
+        isolationPending = isolationPending.filter {
+            !MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
+        }
+        let removed = before - (oversizedDeferredThisSession.count + isolationPending.count)
+        if removed > 0, DebugModeManager.isLoggingEnabled() {
+            print("[ActiveBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
+        }
+    }
+
+    /// Dispatch grouping key. `isolationHeaderId` is non-nil only for a forced
+    /// single-item ISOLATION batch — its headerId makes the group unique so it never
+    /// coalesces with the folder's normal batch or another isolation item.
+    struct GroupKey: Hashable {
+        let accountId: String
+        let folderPath: String
+        let isolationHeaderId: String?
+    }
+
+    /// Group dispatchable candidates. An item whose headerId is in
+    /// `isolationPending` gets a UNIQUE key (its headerId) so it forms a single-item
+    /// batch tested ALONE — independent of `folderMaxBatch`. Ordinary items coalesce
+    /// per (account, folder). Pure, so the isolation invariant is assertable without
+    /// the live-network dispatch scaffolding.
+    static func groupCandidatesForDispatch(
+        _ candidates: [Item], isolationPending: Set<String>
+    ) -> [GroupKey: [Item]] {
+        var groups: [GroupKey: [Item]] = [:]
+        for item in candidates {
+            let key = GroupKey(
+                accountId: item.accountId,
+                folderPath: item.folderPath,
+                isolationHeaderId: isolationPending.contains(item.headerId) ? item.headerId : nil
+            )
+            groups[key, default: []].append(item)
+        }
+        return groups
+    }
 
     func enqueue(header: MessageHeader) {
         let item = Item(
@@ -65,7 +259,7 @@ actor ActiveBodyQueue {
             folderPath: header.folderPath, messageId: header.messageId,
             isInInbox: header.isInInbox
         )
-        guard storage.enqueue(item) else { return }
+        guard admit(item) else { return }
         scheduleDispatch()
     }
 
@@ -77,7 +271,7 @@ actor ActiveBodyQueue {
                 folderPath: header.folderPath, messageId: header.messageId,
                 isInInbox: header.isInInbox
             )
-            if storage.enqueue(item) { added += 1 }
+            if admit(item) { added += 1 }
         }
         guard added > 0 else { return }
         print("[ActiveBody] Enqueued \(added) items (total: \(storage.count))")
@@ -111,7 +305,7 @@ actor ActiveBodyQueue {
             }
             var added = 0
             for item in items {
-                if storage.enqueue(item) { added += 1 }
+                if admit(item) { added += 1 }
             }
             if added > 0 {
                 print("[ActiveBody] Repopulated \(added) inbox items in \(ms)ms")
@@ -218,23 +412,25 @@ actor ActiveBodyQueue {
             }
         }
 
-        // Group by (accountId, folderPath) for batched IMAP fetch.
-        // Skip folders already at max batches (1 running + 1 queued) — items go back to pending.
-        struct GroupKey: Hashable { let accountId: String; let folderPath: String }
-        var groups: [GroupKey: [Item]] = [:]
+        // Filter to dispatchable candidates (provider present, folder under its
+        // batch cap), then group. Isolation-pending items each form their OWN
+        // single-item group via `groupCandidatesForDispatch`; ordinary items
+        // coalesce per (account, folder). Folders already at max batches (1 running
+        // + 1 queued) go back to pending.
+        var dispatchable: [Item] = []
         for item in batch {
             guard providerByAccount[item.accountId] != nil else {
                 storage.releaseInFlightOnly(item)
                 continue
             }
-            let active = folderActiveBatches[item.folderPath] ?? 0
+            let active = folderActiveBatches[FolderCapKey(accountId: item.accountId, folderPath: item.folderPath)] ?? 0
             guard active < maxBatchesPerFolder else {
                 storage.releaseInFlightOnly(item)
                 continue
             }
-            let key = GroupKey(accountId: item.accountId, folderPath: item.folderPath)
-            groups[key, default: []].append(item)
+            dispatchable.append(item)
         }
+        let groups = Self.groupCandidatesForDispatch(dispatchable, isolationPending: isolationPending)
 
         // Sort groups by size descending — dispatch largest groups first for best throughput.
         // Only launch up to maxConcurrentBatches groups to avoid pool/NIO saturation.
@@ -256,7 +452,17 @@ actor ActiveBodyQueue {
         for (key, allItems) in groupsToDispatch {
             guard let provider = providerByAccount[key.accountId] else { continue }
 
-            // Cap folder group by per-folder batch limit (halved on PayloadTooLarge)
+            // Enforce the per-folder batch cap ACROSS the groups dispatched in THIS
+            // cycle too — isolation singletons can now yield multiple groups for one
+            // folder per cycle (1 normal + N single-item isolation batches); the
+            // grouping guard above only saw the pre-cycle folderActiveBatches count.
+            let capKey = FolderCapKey(accountId: key.accountId, folderPath: key.folderPath)
+            guard (folderActiveBatches[capKey] ?? 0) < maxBatchesPerFolder else {
+                for item in allItems { storage.releaseInFlightOnly(item) }
+                continue
+            }
+
+            // Cap folder group by the fixed per-folder batch limit (default batchSize).
             let maxForFolder = folderMaxBatch[key.folderPath] ?? batchSize
             let items: [Item]
             if allItems.count > maxForFolder {
@@ -267,8 +473,12 @@ actor ActiveBodyQueue {
                 items = allItems
             }
             let itemCount = items.count
+            // Generation guard: capture at DISPATCH (before the fetch await) so
+            // handlePayloadTooLarge can detect a UIDVALIDITY reset that lands during
+            // this batch's fetch window and skip re-populating the just-cleared sets.
+            let capturedResetGeneration = resetGeneration
             activeBatchCount += 1
-            folderActiveBatches[key.folderPath, default: 0] += 1
+            folderActiveBatches[capKey, default: 0] += 1
 
             let batchTask = Task { [self] in
                 let t0 = CFAbsoluteTimeGetCurrent()
@@ -348,36 +558,20 @@ actor ActiveBodyQueue {
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                     print("[ActiveBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
 
-                    // Success — restore folder batch size if it was halved
-                    if self.folderMaxBatch[key.folderPath] != nil {
-                        self.folderMaxBatch.removeValue(forKey: key.folderPath)
-                    }
-
                 } catch {
                     let desc = "\(error)"
                     if desc.contains("PayloadTooLargeError") {
-                        let current = self.folderMaxBatch[key.folderPath] ?? self.batchSize
-                        if current <= 1 {
-                            // Single message too large — mark all items as empty
-                            print("[ActiveBody] Single item too large for \(key.folderPath) — marking bodyEmptyConfirmed")
-                            for item in items {
-                                // .normal-tier (ADR-IOS-056) — same tag as this queue's dbPool.
-                                try? await AppDatabase.syncPool.write { db in
-                                    try db.execute(
-                                        sql: "UPDATE messageHeader SET bodyEmptyConfirmed = 1 WHERE id = ?",
-                                        arguments: [item.headerId]
-                                    )
-                                }
-                                self.batchItemDone(item: item, shouldRetry: false)
-                            }
-                        } else {
-                            let halved = max(1, current / 2)
-                            self.folderMaxBatch[key.folderPath] = halved
-                            print("[ActiveBody] PayloadTooLarge for \(key.folderPath) — halving batch to \(halved)")
-                            for item in items {
-                                self.batchItemDone(item: item, shouldRetry: true)
-                            }
-                        }
+                        // Defer a genuinely single oversized item WITHOUT marking it
+                        // empty; a multi-item batch isolates its members so a later
+                        // dispatch slices each one singly. The decision keys on THIS
+                        // batch's actual `items.count`, NOT the shared folderMaxBatch
+                        // cap — a concurrent fast-failing batch could lower that cap
+                        // to 1, which would wrongly defer a whole batch of ordinary
+                        // messages for the process lifetime.
+                        self.handlePayloadTooLarge(
+                            items: items, folderPath: key.folderPath,
+                            capturedGeneration: capturedResetGeneration
+                        )
                     } else {
                         // Connection-level error — retry all items
                         print("[ActiveBody] Batch FAILED for \(key.folderPath): \(error)")
@@ -392,11 +586,11 @@ actor ActiveBodyQueue {
                 guard !Task.isCancelled else { return }
 
                 activeBatchCount -= 1
-                let remaining = (self.folderActiveBatches[key.folderPath] ?? 1) - 1
+                let remaining = (self.folderActiveBatches[capKey] ?? 1) - 1
                 if remaining <= 0 {
-                    self.folderActiveBatches.removeValue(forKey: key.folderPath)
+                    self.folderActiveBatches.removeValue(forKey: capKey)
                 } else {
-                    self.folderActiveBatches[key.folderPath] = remaining
+                    self.folderActiveBatches[capKey] = remaining
                 }
                 notifyActiveStateIfNeeded()
 
@@ -416,7 +610,84 @@ actor ActiveBodyQueue {
     }
 
     private func batchItemDone(item: Item, shouldRetry: Bool) {
+        // An item that RESOLVES (shouldRetry=false — fetched OK, confirmed gone,
+        // re-keyed, or retry-exhausted) is no longer an oversize suspect; drop it
+        // from isolation so it isn't needlessly single-item-dispatched again. (A
+        // lone oversized item defers via handlePayloadTooLarge, which clears it
+        // there.) Set.remove is a no-op for non-members.
+        if !shouldRetry { isolationPending.remove(item.headerId) }
         _ = storage.batchItemCompleted(item, shouldRetry: shouldRetry, maxRetries: SyncConfig.maxQueueRetries)
+    }
+
+    /// PayloadTooLarge disposition. Factored out of `dispatchBatch`'s catch so the
+    /// defer/isolate decision is directly testable (driving the full dispatch
+    /// pipeline needs live network + provider scaffolding). Runs SYNCHRONOUSLY on
+    /// the actor — there is deliberately no `await` anywhere in it, so no producer
+    /// can slip an enqueue in between the set insert and the queue removal.
+    ///
+    ///  - `items.count == 1` (a genuinely isolated oversized message): DEFER without
+    ///    completion. `PayloadTooLargeError` is size-deterministic (the NIO buffer is
+    ///    fixed per binary), so it cannot become fetchable this process lifetime.
+    ///    Insert the headerId into the process-lifetime
+    ///    `oversizedDeferredThisSession` set, then `storage.removeFromQueue`
+    ///    DIRECTLY. We do NOT mark `bodyEmptyConfirmed` (Data Integrity rule 1: an
+    ///    oversized body is the OPPOSITE of "content confirmed gone" — the body
+    ///    demonstrably exists, it merely did not fit — so the row stays honestly
+    ///    incomplete and retryable, just out of the background queue until one of the
+    ///    three releases documented on `oversizedDeferredThisSession` fires), do NOT
+    ///    set `recentlyCompleted` (no false 30s repopulate suppression), and do NOT
+    ///    call `abandonWithoutCompletion` (it decrements `activeJobs`, which this
+    ///    queue never uses — it tracks `activeBatchCount`). The batch counter still
+    ///    decrements once in the dispatch task below.
+    ///  - `items.count > 1`: mark every item ISOLATION-PENDING and retry it — a later
+    ///    dispatch tests each ALONE (a forced single-item batch, via
+    ///    `groupCandidatesForDispatch`), INDEPENDENT of `folderMaxBatch`; each
+    ///    genuinely oversized single then defers here, ordinary siblings fetch
+    ///    normally. Failure-local, so a sibling success can never undo the isolation
+    ///    (the removed folderMaxBatch halving could — any success reset it).
+    func handlePayloadTooLarge(items: [Item], folderPath: String, capturedGeneration: Int? = nil) {
+        // Generation guard: a UIDVALIDITY reset landed during this batch's fetch
+        // window (`clearOversizedDeferred` bumped `resetGeneration` and already
+        // cleared the sets). The items in hand are OLD-epoch; re-adding their
+        // headerIds would UNDO the clear and starve a new-epoch message reusing the
+        // UID. Skip BOTH set inserts and just release the items retryable (their rows
+        // were purged → they resolve as gone / are superseded by the resync).
+        // `capturedGeneration == nil` = a direct/test call with no reset-guard
+        // context → never stale.
+        let stale = capturedGeneration.map { $0 != resetGeneration } ?? false
+        if items.count == 1 {
+            let item = items[0]
+            if stale {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ActiveBody] Oversized single item in \(folderPath) raced a UIDVALIDITY reset — NOT deferring stale \(item.headerId.prefix(30)); retrying")
+                }
+                batchItemDone(item: item, shouldRetry: true)
+                return
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ActiveBody] Single item too large in \(folderPath) — deferring \(item.headerId.prefix(30)) in-memory (bodyComplete=0, NOT marked empty)")
+            }
+            oversizedDeferredThisSession.insert(item.headerId)
+            isolationPending.remove(item.headerId)   // resolved as the oversized one
+            storage.removeFromQueue(item)
+        } else {
+            // One (or a few) of these is oversized, but the batch error doesn't say
+            // which. Isolate each so a later dispatch tests it ALONE — reaching the
+            // items.count==1 defer above regardless of any sibling success. Insert
+            // BEFORE batchItemDone (shouldRetry=true won't clear it). Skip the insert
+            // when stale — same reasoning as the single path.
+            for item in items {
+                if !stale { isolationPending.insert(item.headerId) }
+                batchItemDone(item: item, shouldRetry: true)
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                if stale {
+                    print("[ActiveBody] PayloadTooLarge for \(folderPath) raced a UIDVALIDITY reset — NOT isolating \(items.count) stale items; retrying")
+                } else {
+                    print("[ActiveBody] PayloadTooLarge for \(folderPath) — isolating \(items.count) items for single-item testing")
+                }
+            }
+        }
     }
 
     /// Missed-UID handling for inbox items — the same counter / confirm-gone /
@@ -492,7 +763,7 @@ actor ActiveBodyQueue {
                             folderPath: migrated.folderPath, messageId: migrated.messageId,
                             isInInbox: migrated.isInInbox
                         )
-                        if storage.enqueue(newItem) { scheduleDispatch() }
+                        if admit(newItem) { scheduleDispatch() }
                     case .duplicateDropped:
                         print("[ActiveBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
                         self.batchItemDone(item: item, shouldRetry: false)
@@ -543,7 +814,7 @@ actor ActiveBodyQueue {
             guard !items.isEmpty else { return }
             var added = 0
             for item in items {
-                if storage.enqueue(item) { added += 1 }
+                if admit(item) { added += 1 }
             }
             if added > 0 {
                 print("[ActiveBody] Drain-time self-repopulate enqueued \(added) items")

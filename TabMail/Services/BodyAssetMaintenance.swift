@@ -267,3 +267,83 @@ enum BodyAssetMaintenance {
         BodyAssetStore.pruneOrphanFiles()
     }
 }
+
+/// The identity a cached ATTACHMENT is bound to, as a single opaque string the
+/// manifest stores verbatim and compares with `=` (ADR-IOS-066 / T5.1).
+///
+/// ⚑ THE PROBLEM IT SOLVES, stated as the closure rather than the instance. An
+/// attachment is cached at `(contentKey, attachmentSection)`. Neither half names a
+/// message: `contentKey`'s tail is the provider message id — an IMAP UID, which a
+/// `UIDVALIDITY` change reassigns to a different physical message — and
+/// `attachmentSection` is a positional MIME part path that essentially every
+/// multipart message reuses. So the address alone can, and after a reset does,
+/// resolve to a DIFFERENT message's bytes. This value is the missing term: what the
+/// bytes were fetched FOR.
+///
+/// ⚑ IT IS EVIDENCE, NOT MUTATION AUTHORITY. Reading the RFC 822 Message-ID to
+/// answer "are these the same message?" is permitted on `v3`; keying a durable
+/// mutation by it is not (D4). Nothing derived from this value ever executes a
+/// provider action, and nothing derived from it ever deletes: a nil stamp, an absent
+/// stamp on a stored row, or a differing stamp all mean exactly one thing —
+/// RE-FETCH.
+///
+/// PORT of the identity LADDER in `v2final`'s
+/// `DisplayedAttachmentIdentity.resolve(for:)` (same file there; commit `486bafd4b`),
+/// with three deliberate subtractions:
+///
+///  - **SUBTRACT `DisplayedAttachmentIdentity.settledUidEpoch(_:)`.** The reference
+///    had to read the FOLDER's *current* `lastKnownUidValidity`, because `v2final`'s
+///    `MessageHeader` carries no epoch of its own (its own comment says so). That
+///    forced it to slam the bare-UID door shut for any folder with ANY reset history,
+///    since a retained pre-reset snapshot would otherwise be "confirmed" against the
+///    post-reset epoch. `v3` has `MessageHeader.observedUidValidity` — the epoch
+///    observed by the exact SELECT/FETCH that supplied THIS row's UID, marked
+///    `⚑ NO REFERENCE — INVENTED` there precisely because `486bafd4b` deferred it.
+///    Reading the row's own proven epoch cannot sample a later one, so the premise of
+///    the reference's extra refusal is unreachable here.
+///  - **SUBTRACT the `.providerMessageId` leg for `.gmail` / `.outlook`.** The
+///    reference resolved the provider by reading `Account` from the database. A
+///    stable-provider id is never reassigned, so its `contentKey` already IS a
+///    positive identity and the leg adds no safety; keeping it would only buy a cache
+///    HIT for a stable-provider message with no usable RFC 822 Message-ID, at the
+///    cost of an async DB read on the attachment-tap path. Those messages fall to
+///    `nil` and re-fetch. ACCEPTED LIMITATION, recorded rather than hidden: a
+///    correctness-neutral cache regression for a rare shape.
+///  - **SUBTRACT `matches(currentHeader:provider:currentFolder:)`.** That half of the
+///    reference type guards ACTIONS, not the cache. `v3` guards actions through the
+///    `observedUidValidity` admission stamps in `AccountManagerActions` /
+///    `AccountManagerQueue`; re-deriving a second, parallel action guard here is the
+///    compensating-mechanism shape rule A3 forbids.
+enum AttachmentCacheIdentity {
+
+    /// The stamp for a message, or `nil` when its identity cannot be PROVEN — in
+    /// which case the caller must neither read nor write the attachment cache.
+    ///
+    /// The ladder, in order, each rung a positive identity:
+    ///  1. a usable RFC 822 Message-ID — device-independent and epoch-independent,
+    ///     so it survives every renumber the address does not;
+    ///  2. the header's own `observedUidValidity`. A bare UID is only an address, but
+    ///     a UID paired with the `UIDVALIDITY` it was proven under IS an identity:
+    ///     within one epoch an IMAP server never reassigns a UID, and the UID itself
+    ///     is already the `contentKey`'s tail. (Stable-provider headers leave this
+    ///     column nil by design, so this rung cannot fire for them.)
+    ///  3. otherwise nil — refuse.
+    ///
+    /// `comparableRfc822Identity` is the correct normalizer here, NOT
+    /// `usableRfc822Tail`: this value is compared with `=`, never used as a key tail,
+    /// so the `':'` folder-scoping rejection that `usableRfc822Tail` adds would only
+    /// throw away real identities (see both doc comments in `MessageIdentity`).
+    ///
+    /// The rung prefixes are load-bearing: they keep an RFC identity and an epoch
+    /// from ever comparing equal to one another.
+    static func stamp(for header: MessageHeader) -> String? {
+        if let rfc = MessageIdentity.comparableRfc822Identity(header.rfc822MessageId) {
+            return "rfc:\(rfc)"
+        }
+        if let epoch = header.observedUidValidity {
+            return "uid:\(epoch)"
+        }
+        return nil
+    }
+}
+

@@ -188,7 +188,8 @@ struct ContentOwnershipSweepTests {
         let key = ContentKey(rawValue: "\(accountId):INBOX:9002")
         #expect(BodyAssetStore.writeAttachment(
             contentKey: key, section: "2", contentType: "application/pdf",
-            data: Data(repeating: 7, count: 64)) != nil)
+            data: Data(repeating: 7, count: 64),
+            identityStamp: "rfc:quarantine-9002@example.com") != nil)
 
         await BodyAssetMaintenance.pruneOrphans()
 
@@ -211,7 +212,8 @@ struct ContentOwnershipSweepTests {
         try await seedFTSRow(key: key, messageId: "9003", folderId: folderId, body: "dead body text")
         #expect(BodyAssetStore.writeAttachment(
             contentKey: key, section: "2", contentType: "application/pdf",
-            data: Data(repeating: 3, count: 32)) != nil)
+            data: Data(repeating: 3, count: 32),
+            identityStamp: "rfc:dead-9003@example.com") != nil)
 
         let engine = SyncEngine()
         _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
@@ -403,7 +405,8 @@ struct ContentOwnershipSweepTests {
         let newKey = ContentKey(rawValue: "\(accountId):Archive:\(providerMessageId)")
         let assetId = BodyAssetStore.writeAttachment(
             contentKey: oldKey, section: "2", contentType: "application/pdf",
-            data: Data(repeating: 9, count: 128))
+            data: Data(repeating: 9, count: 128),
+            identityStamp: "rfc:moved@example.com")
         #expect(assetId != nil)
         try await seedHeader(
             accountId: accountId, folderPath: "Archive", messageId: providerMessageId)
@@ -618,7 +621,8 @@ struct ContentOwnershipSweepTests {
         try await seedFTSRow(key: key, messageId: "77", folderId: folderId, body: "f4 body text")
         #expect(BodyAssetStore.writeAttachment(
             contentKey: key, section: "2", contentType: "application/pdf",
-            data: Data(repeating: 5, count: 48)) != nil)
+            data: Data(repeating: 5, count: 48),
+            identityStamp: "uid:77") != nil)
 
         // The steady-state transition: sync learns the RFC 822 Message-ID.
         try await AppDatabase.dbPool.write { db in
