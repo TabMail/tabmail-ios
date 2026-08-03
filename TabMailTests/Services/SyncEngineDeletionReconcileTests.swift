@@ -36,6 +36,18 @@ private enum ChunkScript: Sendable {
     case fail
     /// Throws a connection-class error (walk aborts).
     case failConnection
+    /// Throws the TYPED epoch refusal `ProviderError.uidValidityChanged` (T4.S1).
+    /// Its description matches none of `isConnectionError`'s or
+    /// `isSelectFailedError`'s substrings, so without the typed arm the walk
+    /// classifies it as an ordinary per-chunk failure and keeps walking.
+    case failEpochRefused
+}
+
+/// The typed refusal a chunk's SEARCH raises when the epoch it was served under
+/// disagrees with the epoch the caller admitted. `stored`/`live` are fixture
+/// values — the walk must not read them (see `epochRefusalNeverClaimsTurnover`).
+private func epochRefusal() -> ProviderError {
+    .uidValidityChanged(folderPath: "INBOX", stored: 7, live: 9)
 }
 
 // MARK: - Pure decision functions
@@ -166,6 +178,8 @@ struct DeletionReconcileWalkTests {
                     throw PlainSearchError()
                 case .failConnection:
                     throw URLError(.notConnectedToInternet)
+                case .failEpochRefused:
+                    throw epochRefusal()
                 }
             },
             deleteGhosts: { ghosts in
@@ -244,6 +258,93 @@ struct DeletionReconcileWalkTests {
         #expect(outcome.aborted)
         #expect(outcome.failedChunks == 1)
         #expect(recorder.searchCalls.count == 1) // second chunk never searched
+        #expect(recorder.deleteCalls.isEmpty)
+    }
+
+    // MARK: T4.S1 — the typed epoch refusal is a WHOLE-WALK abort, not a skipped chunk
+
+    /// T4.S1. A SEARCH that THROWS `ProviderError.uidValidityChanged` says the UID
+    /// numbering this walk is judging against is in doubt — for the whole mailbox,
+    /// not for one chunk. Before the typed arm, that error matched neither
+    /// `isConnectionError` nor `isSelectFailedError`, so it fell to the generic
+    /// `continue`: the walk carried on and deleted every later chunk's local UIDs as
+    /// "ghosts" on the strength of a numbering nothing had reconciled.
+    ///
+    /// RED-FIRST (the arm removed, so the refusal falls through to `continue`):
+    /// chunk 1 is skipped, chunk 2 is searched and its two UIDs are deleted —
+    /// `deletedCount → 2`, `aborted → false`, `searchCalls.count → 2`.
+    @Test("A typed UIDVALIDITY refusal from SEARCH aborts the whole walk — later chunks are never searched")
+    func epochRefusalAbortsWholeWalk() async {
+        let recorder = WalkRecorder()
+        let outcome = await runWalk(
+            localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: 7,
+            script: [
+                .failEpochRefused,             // chunk [1,2] — the numbering is refused
+                .found([], uidValidity: 7),    // chunk [3,4] — must never be reached
+            ],
+            recorder: recorder
+        )
+        #expect(outcome.aborted)
+        #expect(outcome.abortReason?.hasPrefix("uidValidity changed") == true)
+        #expect(outcome.failedChunks == 1)
+        #expect(outcome.deletedCount == 0)
+        #expect(recorder.searchCalls.count == 1) // the walk stopped, it did not skip
+        #expect(recorder.deleteCalls.isEmpty)
+    }
+
+    /// T4.S1, mid-walk. The refusal stops the walk where it lands: deletions already
+    /// confirmed by chunks the server DID serve under the expected epoch stand (they
+    /// were proven against a numbering that agreed), and not one UID beyond the
+    /// refusal is judged.
+    ///
+    /// RED-FIRST (arm removed): chunk 2 is skipped and chunk 3 is searched and swept,
+    /// so `deletedCount → 3`, `searchCalls.count → 3`, `aborted → false`.
+    @Test("A typed UIDVALIDITY refusal mid-walk stops further deletion and leaves earlier deletions intact")
+    func epochRefusalMidWalkStopsFurtherDeletion() async {
+        let recorder = WalkRecorder()
+        let outcome = await runWalk(
+            localUIDs: [1, 2, 3, 4, 5, 6], chunkSize: 2, storedUidValidity: 7,
+            script: [
+                .found([1], uidValidity: 7),   // chunk [1,2] — ghost: 2, epoch agrees
+                .failEpochRefused,             // chunk [3,4] — the numbering is refused
+                .found([], uidValidity: 7),    // chunk [5,6] — must never be reached
+            ],
+            recorder: recorder
+        )
+        #expect(outcome.aborted)
+        #expect(outcome.deletedCount == 1)
+        #expect(recorder.searchCalls.count == 2)
+        let deletes = recorder.deleteCalls
+        #expect(deletes.count == 1)
+        guard deletes.count == 1 else { return }
+        #expect(deletes[0] == [2])
+    }
+
+    /// T4.S1 — the abort must NOT be upgraded into a purge. `uidValidityMismatch` is
+    /// the caller's trigger for `fireUidValidityChangeHandler`, which purges the
+    /// folder and resyncs it; that is destructive and unrecoverable, so it may only
+    /// ever be founded on this walk's OWN stored-vs-observed comparison. A thrown
+    /// refusal's `stored` comes from a different authority (on v3,
+    /// `IMAPProvider.requireUidValidity` reports a queued operation's admitted
+    /// epoch), so this leg refuses to delete and claims nothing about a turnover.
+    ///
+    /// RED-FIRST: pre-fix the walk did not abort at all, so `aborted` fails here too;
+    /// the `uidValidityMismatch` assertion pins the direction a future change must
+    /// not flip.
+    @Test("A typed UIDVALIDITY refusal never claims a folder turnover — the purge reaction is not fired")
+    func epochRefusalNeverClaimsTurnover() async {
+        let recorder = WalkRecorder()
+        let outcome = await runWalk(
+            localUIDs: [1, 2], chunkSize: 2, storedUidValidity: 7,
+            script: [.failEpochRefused],
+            recorder: recorder
+        )
+        #expect(outcome.aborted)
+        // `uidValidityMismatch` is a TUPLE optional, so read it into a Bool rather
+        // than relying on tuple equality inside the macro.
+        let claimedTurnover = outcome.uidValidityMismatch != nil
+        #expect(!claimedTurnover)
+        #expect(outcome.deletedCount == 0)
         #expect(recorder.deleteCalls.isEmpty)
     }
 

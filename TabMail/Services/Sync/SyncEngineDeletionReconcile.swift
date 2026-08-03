@@ -99,7 +99,8 @@ extension SyncEngine {
     /// invariants are unit-testable without IMAP:
     ///
     /// - A thrown SEARCH chunk deletes NOTHING from that chunk. Non-connection
-    ///   errors skip the chunk and continue; connection/SELECT errors abort.
+    ///   errors skip the chunk and continue; connection/SELECT errors — and a
+    ///   typed `ProviderError.uidValidityChanged` refusal (T4.S1) — abort.
     /// - UIDVALIDITY guard: `storedUidValidity` pins the expected value; any
     ///   mismatch — or an unreported (0) value — ABORTS the walk.
     /// - **`storedUidValidity == nil` ABORTS before the first SEARCH** with
@@ -182,6 +183,40 @@ extension SyncEngine {
                 // predicate re-fires next sync. Other errors skip just this
                 // chunk and continue.
                 outcome.failedChunks += 1
+                // T4.S1 — PORT of `v2final`'s arm in this same function, with its
+                // ARGUMENT re-founded on v3's own throw site. A refusal that NAMES an
+                // epoch disagreement is not an ordinary per-chunk failure: what is in
+                // doubt is the whole mailbox's UID numbering, so `continue` would carry
+                // every LATER chunk's "the server did not list UID n" into a delete
+                // decision made against a numbering nothing has reconciled — the
+                // mass-deletion shape this walk exists to refuse. Abort the WHOLE walk;
+                // the trigger predicate is durable and re-fires next sync.
+                //
+                // This guards the walk's CONTRACT — `search` is an injected closure —
+                // not one implementation of it, so it holds for whichever layer
+                // (provider, pool, work queue) ends up raising the refusal.
+                //
+                // Classified BEFORE the string-matching connection/SELECT predicates,
+                // as in the reference, so a typed cause is never reported as a
+                // connection error.
+                //
+                // 🚨 NO reaction is fired from this leg — `uidValidityMismatch` stays
+                // nil, per its own contract ("an unknown is not a turnover and must not
+                // purge a folder"). On `v2final` the tracked SELECT inside `search`
+                // threw this AND had already fired the change-reaction itself. On v3
+                // the throw site is `IMAPProvider.requireUidValidity`, whose `stored`
+                // is a QUEUED OPERATION's admitted epoch, not this folder's
+                // `lastKnownUidValidity` — a different authority. A purge is
+                // destructive and unrecoverable, so it may only ever be founded on this
+                // walk's own stored-vs-observed comparison below. Aborting is the
+                // fail-closed half and is sufficient: if the folder really did turn
+                // over, the next pass's `verifyAndBootstrapPrePopulatedFolderEpoch` and
+                // this walk's own epoch guard produce a properly founded mismatch.
+                if case ProviderError.uidValidityChanged = error {
+                    outcome.aborted = true
+                    outcome.abortReason = "uidValidity changed: \(error)"
+                    break
+                }
                 if isConnectionError(error) || isSelectFailedError(error) {
                     outcome.aborted = true
                     outcome.abortReason = "connection error: \(error)"
