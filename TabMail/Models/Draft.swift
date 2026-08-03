@@ -34,9 +34,32 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     var rfc822MessageId: String?  // Stable Message-ID for IMAP dedup
     var attachmentsDirName: String? // Disk directory under draft_attachments/
 
+    /// PORT — v2final `Draft.lastTouchedSeq` (its v78; ours is v79). The monotonic
+    /// eviction-recency key. Assigned `MAX(lastTouchedSeq) + 1` INSIDE the save
+    /// transaction (`DraftStore.applySave`), so under GRDB's single serialized
+    /// writer it is strictly increasing with no wall-clock ties and no clock
+    /// rollback. `DraftStore.evictImpl` orders by this (DESC) instead of
+    /// `updatedAt`, so a just-saved draft can never be mis-ranked beyond the
+    /// keep-limit and evicted.
+    ///
+    /// It is EVICTION RECENCY, NEVER A CONFLICT VERSION — that is
+    /// `pushAttemptVersion`, which the Stage A/B CAS compares. Nothing may CAS,
+    /// fence, or admit on `lastTouchedSeq`.
+    ///
+    /// Contract: distinct and increasing among CURRENTLY-RETAINED rows, which is
+    /// all eviction needs. It is NOT a global-across-time identity — a value freed
+    /// by deleting the MAX row may be reused, which is harmless because eviction
+    /// only ever compares survivors (`MAX+1` always exceeds every survivor).
+    ///
+    /// The declaration default `0` keeps every memberwise-init caller compiling;
+    /// the value a caller's snapshot carries is IGNORED — `applySave` overrides it
+    /// in-transaction (migration `v79` seeds pre-existing rows with a distinct rank).
+    var lastTouchedSeq: Int = 0
+
     /// PORT — compose generation from v2final commit 3f2cc4c34.
     var instanceEpoch: String? = nil
-    /// PORT — conflict version used by the v2final Stage A/B CAS.
+    /// PORT — conflict version used by the v2final Stage A/B CAS. SEPARATE from
+    /// `lastTouchedSeq` above (eviction recency, never a conflict version).
     var pushAttemptVersion: Int = 0
     /// Mailbox component of the strong IMAP draft address.
     var serverDraftFolderPath: String? = nil
@@ -184,6 +207,29 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
 
 // MARK: - Draft Attachment Disk Storage
 
+/// PORT — `v2final:TabMail/Models/Draft.swift`'s `enum DraftAttachmentLoadError`
+/// (commit `d2f0c96a3`), verbatim.
+///
+/// Failure modes for `DraftAttachmentStorage.loadAttachments`. Outbox Reliability
+/// Rule 5 applied to drafts: the loader FAILS CLOSED — a compose reopen or a
+/// server-draft push must never silently proceed with a SUBSET of the attachments
+/// the user attached. Any of these cases throws all-or-nothing rather than
+/// dropping a file.
+enum DraftAttachmentLoadError: Error {
+    /// A draft referenced an attachments directory (non-nil `attachmentsDirName`)
+    /// but the directory is missing or its contents could not be enumerated.
+    /// A referenced-but-absent dir is NOT "no attachments" — fail closed.
+    case directoryUnreadable(dirName: String, underlying: Error)
+    /// A present attachment data file could not be read. Never drop it.
+    case fileUnreadable(name: String, underlying: Error)
+    /// A `.meta`-suffixed file has no corresponding data sibling, so it is
+    /// AMBIGUOUS with a real attachment literally named `*.meta` (stored as
+    /// `<idx>_*.meta`). The current index-prefix format cannot disambiguate this
+    /// from a metadata sidecar, so fail closed rather than silently drop the
+    /// real attachment. A disambiguating on-disk manifest is the tracked follow-up.
+    case ambiguousMetaFilename(name: String)
+}
+
 /// Mirrors OutboxMessage's attachment storage pattern for drafts.
 /// Attachments stored under `Application Support/TabMail/draft_attachments/{dirName}/`.
 enum DraftAttachmentStorage {
@@ -193,14 +239,16 @@ enum DraftAttachmentStorage {
             .appendingPathComponent("draft_attachments", isDirectory: true)
     }
 
-    static func dirURL(for dirName: String) -> URL {
-        baseDir.appendingPathComponent(dirName, isDirectory: true)
+    /// `root` is a test seam: when nil (production) the global `baseDir` is used;
+    /// tests inject a temporary directory so they can create/mutate real files.
+    static func dirURL(for dirName: String, root: URL? = nil) -> URL {
+        (root ?? baseDir).appendingPathComponent(dirName, isDirectory: true)
     }
 
     /// Save attachments to disk. Throws if any write fails.
-    static func saveAttachments(_ attachments: [DraftAttachment], dirName: String) throws {
+    static func saveAttachments(_ attachments: [DraftAttachment], dirName: String, root: URL? = nil) throws {
         guard !attachments.isEmpty else { return }
-        let dir = dirURL(for: dirName)
+        let dir = dirURL(for: dirName, root: root)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (index, att) in attachments.enumerated() {
             let dataName = "\(index)_\(att.filename)"
@@ -212,17 +260,63 @@ enum DraftAttachmentStorage {
         }
     }
 
-    /// Load attachments from disk. Returns empty array if dir doesn't exist.
-    static func loadAttachments(dirName: String) -> [DraftAttachment] {
-        let dir = dirURL(for: dirName)
-        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return [] }
-        let dataFiles = files.filter { !$0.lastPathComponent.hasSuffix(".meta") }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-        return dataFiles.compactMap { fileURL in
-            guard let data = try? Data(contentsOf: fileURL) else { return nil }
+    /// PORT — `v2final`'s `DraftAttachmentStorage.loadAttachments(dirName:root:)`
+    /// (commit `d2f0c96a3`), verbatim.
+    ///
+    /// Load attachments from disk, FAIL-CLOSED. Returns `[]` ONLY for a nil
+    /// `dirName` (the sole clean attachment-less case). Otherwise it throws rather
+    /// than return a partial set: a missing/unenumerable directory, an unreadable
+    /// data file, or a `.meta`-ambiguous filename all THROW. A missing/unreadable
+    /// metadata sidecar is NOT a data-loss case (the bytes are intact) — it keeps
+    /// the existing MIME fallback.
+    static func loadAttachments(dirName: String?, root: URL? = nil) throws -> [DraftAttachment] {
+        // nil dirName is the ONLY clean attachment-less case.
+        guard let dirName else { return [] }
+        let dir = dirURL(for: dirName, root: root)
+        // A referenced-but-absent directory (or an enumeration failure) is NOT
+        // "no attachments" — fail closed instead of returning [].
+        let files: [URL]
+        do {
+            files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        } catch {
+            throw DraftAttachmentLoadError.directoryUnreadable(dirName: dirName, underlying: error)
+        }
+
+        // Classify. A ".meta" file is a metadata SIDECAR iff its base (name minus
+        // ".meta") is a present file: `0_x.pdf.meta` is the sidecar of data
+        // `0_x.pdf`, and `0_settings.meta.meta` is the sidecar of a real attachment
+        // literally named `settings.meta` (stored as data `0_settings.meta`). A
+        // ".meta" file whose base is ABSENT is itself a DATA file.
+        let allNames = Set(files.map { $0.lastPathComponent })
+        func isSidecar(_ name: String) -> Bool {
+            name.hasSuffix(".meta") && allNames.contains(String(name.dropLast(".meta".count)))
+        }
+        let dataFiles = files.filter { !isSidecar($0.lastPathComponent) }
+        // Fail closed on a DATA file whose name ends in ".meta" but whose OWN
+        // sidecar ("<name>.meta") is absent: it is indistinguishable from a
+        // lost-data orphan (the real data file gone, only its ".meta" sidecar
+        // left), so throw rather than load metadata bytes as the attachment.
+        for url in dataFiles where url.lastPathComponent.hasSuffix(".meta") {
+            guard allNames.contains(url.lastPathComponent + ".meta") else {
+                throw DraftAttachmentLoadError.ambiguousMetaFilename(name: url.lastPathComponent)
+            }
+        }
+
+        let sorted = dataFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return try sorted.map { fileURL in
+            let data: Data
+            do {
+                data = try Data(contentsOf: fileURL)
+            } catch {
+                // A present-but-unreadable data file must NEVER be dropped.
+                throw DraftAttachmentLoadError.fileUnreadable(name: fileURL.lastPathComponent, underlying: error)
+            }
             let fullName = fileURL.lastPathComponent
             // Strip index prefix: "0_filename.pdf" → "filename.pdf"
             let filename = fullName.contains("_") ? String(fullName.drop(while: { $0 != "_" }).dropFirst()) : fullName
-            // Meta sidecar uses full indexed name (matching save)
+            // Meta sidecar uses full indexed name (matching save). A missing/
+            // unreadable sidecar is not data loss (bytes are intact) — keep the
+            // MIME fallback rather than throwing.
             let metaURL = dir.appendingPathComponent("\(fullName).meta")
             let meta = (try? String(contentsOf: metaURL, encoding: .utf8))?.split(separator: "\n")
             let mimeType = meta?.first.map(String.init) ?? "application/octet-stream"
@@ -232,8 +326,8 @@ enum DraftAttachmentStorage {
     }
 
     /// Delete attachments directory for a draft.
-    static func deleteAttachments(dirName: String) {
-        let dir = dirURL(for: dirName)
+    static func deleteAttachments(dirName: String, root: URL? = nil) {
+        let dir = dirURL(for: dirName, root: root)
         try? FileManager.default.removeItem(at: dir)
     }
 }

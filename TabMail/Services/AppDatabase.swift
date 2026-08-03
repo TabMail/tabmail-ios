@@ -2254,5 +2254,46 @@ final class AppDatabase: Sendable {
             }
             try db.execute(sql: "UPDATE pendingOperation SET everAttempted = 1")
         }
+
+        // PORT — v2final `v78_addDraftLastTouchedSeq` (commit `fc90bcc2c`), taken
+        // here as v79 (v78 is already registered above and is immutable).
+        //
+        // `DraftStore.evictImpl` previously ordered by wall-clock `updatedAt`, so
+        // equal timestamps or a clock rollback could rank a freshly-saved draft
+        // beyond the keep-limit and DELETE it — authored user bytes lost to routine
+        // maintenance. `lastTouchedSeq` is assigned `MAX(lastTouchedSeq) + 1` inside
+        // the save transaction (GRDB's single serialized writer ⇒ strictly
+        // increasing, no ties, no rollback).
+        //
+        // SEED existing rows with a DISTINCT rank so post-upgrade eviction has a
+        // total order immediately, rather than an all-zero tie that would fall back
+        // to the wall clock this migration exists to stop trusting: each row's
+        // 1-based position in `(updatedAt ASC, id ASC)` — the recency signal the app
+        // already displays by, and the best available legacy proxy. `applySave`'s
+        // `MAX+1` then continues from N. Additive; no data reshape; no row deleted.
+        migrator.registerMigration("v79_addDraftLastTouchedSeq") { db in
+            try db.alter(table: "draft") { t in
+                t.add(column: "lastTouchedSeq", .integer).notNull().defaults(to: 0)
+            }
+            try AppDatabase.seedDraftLastTouchedSeq(db)
+        }
+    }
+
+    /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
+    /// so the v79 migration and its tests share ONE algorithm.
+    ///
+    /// Ranks every existing `draft` row 1-based by `(updatedAt ASC, id ASC)`. The
+    /// `d2.id <= draft.id` tie-break counts the row itself, so the lowest-ranked row
+    /// gets 1 (never 0, which is the column default a never-saved row would keep).
+    /// Pure ranking — it reads and rewrites only `lastTouchedSeq`, and never
+    /// deletes or reshapes a draft.
+    static func seedDraftLastTouchedSeq(_ db: Database) throws {
+        try db.execute(sql: """
+            UPDATE draft SET lastTouchedSeq = (
+                SELECT COUNT(*) FROM draft d2
+                WHERE d2.updatedAt < draft.updatedAt
+                   OR (d2.updatedAt = draft.updatedAt AND d2.id <= draft.id)
+            )
+        """)
     }
 }

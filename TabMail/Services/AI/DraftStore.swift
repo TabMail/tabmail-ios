@@ -94,15 +94,51 @@ actor DraftStore {
     }
 
     /// PORT — merge authored fields only and bump the Stage A/B conflict version.
+    ///
+    /// SUBTRACT — v2final's F3a BACK-SEED (`applySave`'s
+    /// `if merged.serverDraftId == nil, let seeded = draft.serverDraftId { … }` and
+    /// its `rfc822MessageId` twin) is deliberately NOT ported. Census over every v3
+    /// producer of a `Draft` reaching this function — `ComposeView.saveDraftAndDismiss`
+    /// (`draftToSave`), `ComposeView.send` (`ownedDraft`), and
+    /// `DynamicIslandChatButton.autoSaveDraft` (both branches) — shows each one takes
+    /// its linkage from a prior read of THIS row or leaves it nil; v3 has no
+    /// `ServerDraftOpen.seedServerLinkage` equivalent, and its open path
+    /// (`ServerDraftComposeLoader` → `LocallyAuthoredDraftOpenAuthority.matches`)
+    /// fails closed unless the durable row ALREADY carries the exact provider-native
+    /// address. So the reference's "rfc822-matched row with a nil serverDraftId"
+    /// premise is unreachable here, and the only state a back-seed could restore is
+    /// the linkage `applyPushCompletion`'s `.unaddressable` arm deliberately CLEARED —
+    /// resurrecting a provider address the provider disowned, from a bare id that for
+    /// IMAP would arrive without its `serverDraftFolderPath`/`serverDraftUidValidity`
+    /// half. Do not add it back without a fresh reachability proof.
     @discardableResult
     static func applySave(_ draft: Draft, db: Database) throws -> SaveResult {
         guard let current = try Draft.fetchOne(db, key: draft.id) else {
             var inserted = draft
             if inserted.serverPushStatus == "pushed" { inserted.serverPushStatus = "dirty" }
+            // PORT — assign the monotonic eviction-recency key. On an INSERT the MAX
+            // excludes this not-yet-inserted row, so the new seq is strictly greater
+            // than every existing row and the new draft sorts newest.
+            inserted.lastTouchedSeq = try Self.nextLastTouchedSeq(db)
             try inserted.insert(db)
             return .applied
         }
-        guard draft.updatedAt >= current.updatedAt else { return .notApplied }
+        // PORT — OUT-OF-ORDER-SAVE GUARD. `save`/`saveAsync` are nonisolated, so two
+        // in-flight saves are not serialized against each other: an OLDER snapshot can
+        // commit AFTER a NEWER one. Writing it unconditionally would clobber the newer
+        // authored content and move `updatedAt` BACKWARD (a local lost update). If the
+        // incoming snapshot is older than the row already on disk, the newer edit
+        // already won — SKIP the write entirely, leaving the row (including its
+        // `serverPushStatus`, its provider linkage and its `lastTouchedSeq`) untouched.
+        // `updatedAt` is a full-precision Double of epoch seconds: an equal-`updatedAt`
+        // save is a negligible no-op, and a clock-backward snapshot is a rare accepted
+        // edge.
+        guard draft.updatedAt >= current.updatedAt else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftStore] applySave: skipping stale snapshot for \(draft.id) — incoming updatedAt=\(draft.updatedAt) < current=\(current.updatedAt)")
+            }
+            return .notApplied
+        }
         var merged = current
         merged.toJSON = draft.toJSON
         merged.ccJSON = draft.ccJSON
@@ -117,8 +153,28 @@ actor DraftStore {
             || current.serverPushStatus == "unconfirmed" {
             merged.serverPushStatus = "dirty"
         }
+        // PORT — bump the monotonic eviction-recency key. This save TOUCHED the draft,
+        // so it floats to the top of the eviction order. `MAX+1` under the single
+        // serialized writer is strictly increasing (no wall-clock tie, no rollback).
+        // The `.notApplied` stale path above returned WITHOUT reaching here, so a
+        // losing snapshot never bumps.
+        merged.lastTouchedSeq = try Self.nextLastTouchedSeq(db)
         try merged.update(db)
         return .applied
+    }
+
+    /// PORT — v2final `DraftStore.nextLastTouchedSeq`. The next monotonic
+    /// eviction-recency sequence, computed INSIDE the save write transaction. GRDB's
+    /// `DatabasePool` serializes writers, so `MAX+1` across concurrent saves is
+    /// strictly increasing with no wall-clock ties and no clock rollback.
+    ///
+    /// The value is distinct and increasing among CURRENTLY-RETAINED rows, which is
+    /// all eviction recency needs; it is NOT a global-across-time identity. A value
+    /// freed by deleting the MAX row may be reused, which is harmless because
+    /// eviction only ever compares surviving rows (`MAX+1` always exceeds every
+    /// survivor). Never use it as a conflict version — that is `pushAttemptVersion`.
+    private static func nextLastTouchedSeq(_ db: Database) throws -> Int {
+        (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(lastTouchedSeq), 0) FROM draft") ?? 0) + 1
     }
 
     // MARK: - Load
@@ -432,6 +488,15 @@ actor DraftStore {
             : "tabmail.local"
         let freshRfc = "draft-\(UUID().uuidString)@\(domain)"
 
+        // Compile repair for T4.D1 (not this item's scope): `loadAttachments` now
+        // fails closed instead of silently returning a partial set. Hoisted above
+        // the payload and above Stage A's write, so an unreadable attachment
+        // directory throws BEFORE anything is persisted or sent — the producer's
+        // drain retries rather than pushing a draft that lost the user's files
+        // (Outbox Rule 5). Never `try?` here, and never continue with `[]`.
+        let attachments = try DraftAttachmentStorage.loadAttachments(
+            dirName: initialDraft.attachmentsDirName)
+
         // Build every provider payload field from the exact pre-A snapshot.
         var payload = DraftMessage(
             to: initialDraft.toArray,
@@ -441,9 +506,7 @@ actor DraftStore {
             body: MessageBody.plainTextToHTML(initialDraft.body),
             isHTML: true,
             inReplyTo: nil,
-            attachments: initialDraft.attachmentsDirName.map {
-                DraftAttachmentStorage.loadAttachments(dirName: $0)
-            } ?? [])
+            attachments: attachments)
         payload.messageId = freshRfc
 
         guard let context = try await AppDatabase.dbPool.write({ db in
@@ -533,9 +596,28 @@ actor DraftStore {
         try Self.evictImpl(dbPool: dbPool, limit: limit)
     }
 
+    /// SUBTRACT — v2final's `pendingSaveDraftIds` exemption (G8-5a) is not ported.
+    /// It existed to stop an evicted Draft un-gating an epoch-aligned recovery
+    /// `.saveDraft` frontier outside the matched 4-wake set, stranding the global
+    /// FIFO — machinery v3 does not have. Here a `.saveDraft` whose Draft row is
+    /// gone reaches `pushDraftToServer`, fails the `load(id:)` guard, returns
+    /// `.notApplied`, and the producer retires normally. No wedge, so no exemption.
+
     private static func evictImpl(dbPool: PrioritizedDatabase, limit: Int) throws -> Int {
         // Collect attachment dirs to delete outside the DB transaction (file I/O outside transaction)
         var attachmentDirsToDelete: [String] = []
+
+        // PORT — snapshot the compose sessions the user currently has OPEN. Every
+        // deletion below EXEMPTS them so background maintenance never drops a draft
+        // (or its authored chat turns) mid-compose. Both guard forms are derived from
+        // ONE snapshot so the draft-row guard and the orphan-session guard can never
+        // disagree (a register/unregister landing between two separate reads would
+        // otherwise protect one but not the other). The register-vs-commit window (a
+        // compose registering AFTER this read but before the write commits) is the
+        // accepted narrow interleaving; it only ever costs a retention, and the next
+        // maintenance pass reclaims a genuinely stale row.
+        let activeDraftIds = DraftSessionRegistry.shared.snapshot()
+        let activeComposeSessions = Set(activeDraftIds.flatMap { ["compose:\($0)", "demo:compose:\($0)"] })
 
         let evictedCount: Int = try dbPool.write { db in
             // Also clean orphaned compose sessions (chatTurn with no matching draft)
@@ -548,6 +630,10 @@ actor DraftStore {
             var orphanEvicted = 0
             for row in orphanedSessions {
                 let sid: String = row["sessionId"]
+                // PORT — a brand-new compose has chat turns BEFORE its first Draft-row
+                // save, so it looks "orphaned" here. Never delete an ACTIVE compose's
+                // turns: the user is mid-conversation and those are authored bytes.
+                if activeComposeSessions.contains(sid) { continue }
                 _ = try ChatTurn.filter(Column("sessionId") == sid).deleteAll(db)
                 orphanEvicted += 1
             }
@@ -555,12 +641,22 @@ actor DraftStore {
                 print("[DraftStore] Cleaned \(orphanEvicted) orphaned compose sessions")
             }
 
-            // Evict oldest drafts beyond limit
-            let allDrafts = try Draft.order(Column("updatedAt").desc).fetchAll(db)
+            // Evict oldest drafts beyond limit. PORT — order by the MONOTONIC
+            // `lastTouchedSeq` (DESC) so a fresh save is never mis-ranked beyond the
+            // keep-limit by an equal or rolled-back wall-clock `updatedAt`. `updatedAt`
+            // is the secondary key only to order legacy rows that share a seq (none,
+            // post-v79-seed; belt-and-suspenders for any future 0-defaulted row).
+            let allDrafts = try Draft
+                .order(Column("lastTouchedSeq").desc, Column("updatedAt").desc)
+                .fetchAll(db)
 
             var kept = 0
             var evicted = 0
             for draft in allDrafts {
+                // PORT — never evict a draft the user currently has OPEN in a
+                // ComposeView (mirrors the inbox-tied exemption below: `continue`, so
+                // it is neither evicted nor counted toward `kept`).
+                if activeDraftIds.contains(draft.id) { continue }
                 // Exempt: reply/forward drafts where the original message is still in inbox.
                 // Strategy 1: lookup by GRDB PK (replyToId).
                 // Strategy 2: if PK stale (IMAP MOVE), extract stableId from draft key

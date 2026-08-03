@@ -567,8 +567,9 @@ struct DraftAttachmentStorageTests {
         ]
         try DraftAttachmentStorage.saveAttachments(attachments, dirName: dirName)
 
-        let loaded = DraftAttachmentStorage.loadAttachments(dirName: dirName)
+        let loaded = try DraftAttachmentStorage.loadAttachments(dirName: dirName)
         #expect(loaded.count == 2)
+        guard loaded.count == 2 else { DraftAttachmentStorage.deleteAttachments(dirName: dirName); return }
         #expect(loaded[0].filename == "doc.pdf")
         #expect(loaded[0].mimeType == "application/pdf")
         #expect(String(data: loaded[0].data, encoding: .utf8) == "pdf-content")
@@ -586,8 +587,9 @@ struct DraftAttachmentStorageTests {
         ]
         try DraftAttachmentStorage.saveAttachments(attachments, dirName: dirName)
 
-        let loaded = DraftAttachmentStorage.loadAttachments(dirName: dirName)
+        let loaded = try DraftAttachmentStorage.loadAttachments(dirName: dirName)
         #expect(loaded.count == 2)
+        guard loaded.count == 2 else { DraftAttachmentStorage.deleteAttachments(dirName: dirName); return }
         // Each should have its OWN mimeType (not the other's)
         #expect(loaded[0].mimeType == "application/pdf")
         #expect(loaded[1].mimeType == "text/plain")
@@ -595,13 +597,18 @@ struct DraftAttachmentStorageTests {
         DraftAttachmentStorage.deleteAttachments(dirName: dirName)
     }
 
-    @Test("Load from nonexistent directory returns empty")
-    func loadNonexistent() {
-        let loaded = DraftAttachmentStorage.loadAttachments(dirName: "nonexistent-\(UUID().uuidString)")
-        #expect(loaded.isEmpty)
+    // T4.D1 — these two previously asserted that a referenced-but-absent directory
+    // loads as EMPTY, which BLESSED the silent-subset bug. `loadAttachments` now
+    // fails closed: `[]` is reachable ONLY for a nil `dirName`.
+
+    @Test("Load from a nonexistent referenced directory throws instead of returning empty")
+    func loadNonexistentThrows() {
+        #expect(throws: DraftAttachmentLoadError.self) {
+            _ = try DraftAttachmentStorage.loadAttachments(dirName: "nonexistent-\(UUID().uuidString)")
+        }
     }
 
-    @Test("Delete removes directory")
+    @Test("Delete removes directory, and loading the deleted directory throws")
     func deleteRemovesDir() throws {
         let dirName = "test-del-\(UUID().uuidString)"
         try DraftAttachmentStorage.saveAttachments(
@@ -610,8 +617,10 @@ struct DraftAttachmentStorageTests {
         )
         DraftAttachmentStorage.deleteAttachments(dirName: dirName)
 
-        let loaded = DraftAttachmentStorage.loadAttachments(dirName: dirName)
-        #expect(loaded.isEmpty)
+        // The dir is gone — a referenced-but-absent dir is fail-closed, not "empty".
+        #expect(throws: DraftAttachmentLoadError.self) {
+            _ = try DraftAttachmentStorage.loadAttachments(dirName: dirName)
+        }
     }
 }
 

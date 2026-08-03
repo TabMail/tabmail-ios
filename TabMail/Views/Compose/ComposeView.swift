@@ -109,6 +109,13 @@ struct ComposeView: View {
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
+    /// PORT — v2final `ComposeView.attachmentLoadFailed` (B1, commit `d2f0c96a3`).
+    /// Set when the draft's attachments could not be loaded (fail-closed loader).
+    /// While true, Send and save-to-server are BLOCKED so we never send/persist a
+    /// silent subset of the user's attachments, and close never DELETES the row.
+    /// Cleared only by a successful reload (reopen), never by proceeding with a
+    /// partial set.
+    @State private var attachmentLoadFailed = false
     /// Snapshot of draft state at load time — used to detect actual changes for "Save?" prompt
     @State private var initialSubject = ""
     @State private var initialBody = ""
@@ -528,7 +535,9 @@ struct ComposeView: View {
                         Button("Send") { trySend() }
                             .font(.subheadline)
                             .fontWeight(.semibold)
-                            .disabled(toTokens.isEmpty || subject.isEmpty)
+                            // B1: block Send while attachments failed to load —
+                            // never send a silent subset of the user's files.
+                            .disabled(toTokens.isEmpty || subject.isEmpty || attachmentLoadFailed)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -769,6 +778,13 @@ struct ComposeView: View {
                     let stableKey = "\(reply.accountId):\(reply.stableId)"
                     draftId = Draft.draftKey(replyTo: stableKey, isForward: isForward, newId: nil)
                 }
+                // PORT — mark this compose OPEN so background maintenance (draft
+                // eviction, orphan compose-session cleanup) never deletes it or its
+                // authored chat turns while it is on screen. Refcounted; balanced by
+                // the `.onDisappear` unregister. Registered AFTER `draftId` is
+                // resolved above, and `draftId` is never reassigned outside this
+                // block, so the two calls always name the same id.
+                DraftSessionRegistry.shared.register(draftId)
                 if DebugModeManager.isLoggingEnabled() {
                     print("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
                 }
@@ -801,6 +817,11 @@ struct ComposeView: View {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
                 }
+                // PORT — this compose closed; drop its eviction guard (refcounted, so
+                // a sibling view replying to the same message stays protected). A
+                // missed `.onDisappear` over-RETAINS, which is the safe direction, and
+                // self-heals at launch when the registry starts empty.
+                DraftSessionRegistry.shared.unregister(draftId)
                 // Normal teardown path: mark the tracker so its deinit
                 // fallback is a no-op, then fire the outcome/hooks directly
                 // (synchronous — faster than the deinit path).
@@ -1318,9 +1339,21 @@ struct ComposeView: View {
             if !ccTokens.isEmpty || !bccTokens.isEmpty { showCc = true }
             // Load attachments from disk (saveDraftAndDismiss writes them via
             // DraftAttachmentStorage.saveAttachments; reopen restores them so
-            // user sees what was saved).
-            if let dir = draft.attachmentsDirName {
-                attachments = DraftAttachmentStorage.loadAttachments(dirName: dir)
+            // user sees what was saved). B1: the loader FAILS CLOSED — if a
+            // referenced attachment is unreadable/missing (or the dir is gone) it
+            // THROWS rather than returning a silent subset. On failure we DO NOT
+            // open compose with a partial set: enter the blocking state that
+            // disables Send + save-to-server until the user resolves it (discard,
+            // or reopen to retry the load). A nil dirName is the only clean
+            // attachment-less case and returns [] without throwing.
+            do {
+                attachments = try DraftAttachmentStorage.loadAttachments(dirName: draft.attachmentsDirName)
+            } catch {
+                attachmentLoadFailed = true
+                sendError = "Some attachments couldn't be loaded, so this draft can't be sent or saved to the server. Close and reopen the draft to retry, or discard it."
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] ⚠ Draft attachment load FAILED for draftId=\(draftId) — blocking Send/save-to-server: \(error)")
+                }
             }
 
             // For reply/forward: set up quoted text and attribution (but NOT AI suggestion).
@@ -1402,7 +1435,13 @@ struct ComposeView: View {
         } else {
             // No content or no changes — just dismiss (delete empty draft if it exists).
             // Async delete so the main actor isn't blocked behind a busy writer.
-            if !hasContent, draftReadState == .loaded {
+            // B1 / PORT of v2final `ComposeCloseState.closeAction`'s ".error blocks
+            // EVERY mutation — never delete/overwrite a draft that merely failed to
+            // load": an attachment load failure leaves `attachments` EMPTY in memory,
+            // so a draft whose only content WAS its attachments reads as
+            // `hasContent == false` and would be silently DELETED here — destroying
+            // the very files we failed to read. Fail closed: dismiss, row intact.
+            if !hasContent, draftReadState == .loaded, !attachmentLoadFailed {
                 do {
                     guard try await DraftStore.shared.deleteAsync(
                         id: draftId,
@@ -1420,6 +1459,16 @@ struct ComposeView: View {
     }
 
     private func saveDraftAndDismiss() async {
+        // B1: refuse to save-to-server while attachments failed to load. Saving
+        // here would (a) queue a push of a partial set to the server draft and
+        // (b) rewrite the on-disk attachments dir from the empty in-memory list
+        // (the deleteAttachments+saveAttachments below), turning a recoverable
+        // read failure into permanent loss. Keep compose open and surface the
+        // block; the user can discard, or reopen to retry the load.
+        guard !attachmentLoadFailed else {
+            sendError = "Some attachments couldn't be loaded, so this draft can't be saved to the server. Reopen the draft to retry, or discard it."
+            return
+        }
         guard draftReadState != .error else {
             sendError = "This draft did not finish loading. Close and reopen it before saving."
             return
@@ -1870,6 +1919,13 @@ struct ComposeView: View {
         // firewall (queueSend dedups on draftId) is the backstop. `isSending` is
         // reset on every early-return / error path below so the user can retry.
         guard !isSending else { return }
+        // B1 defense-in-depth: the Send button is disabled while
+        // `attachmentLoadFailed`, but guard the action too so no alternate path
+        // (e.g. the empty-body prompt) can send a silent subset of attachments.
+        guard !attachmentLoadFailed else {
+            sendError = "Some attachments couldn't be loaded. Reopen the draft to retry, or discard it, before sending."
+            return
+        }
         guard draftReadState != .error else {
             sendError = "This draft did not finish loading. Close and reopen it before sending."
             return

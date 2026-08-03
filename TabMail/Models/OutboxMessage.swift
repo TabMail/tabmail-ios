@@ -212,10 +212,27 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
         guard let dir = attachmentsDir else { return [] }
         let files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
 
-        // Find attachment files (not .meta sidecars), sorted by index prefix
-        let attachmentFiles = files
-            .filter { !$0.lastPathComponent.hasSuffix(".meta") }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        // A ".meta" file is a metadata SIDECAR iff its base (name minus ".meta") is a
+        // present file — mirrors DraftAttachmentStorage.loadAttachments (fixed in
+        // 6c4f973). The old naive `!hasSuffix(".meta")` filter treated a REAL
+        // attachment literally named `*.meta` (stored `<idx>_x.meta`, sidecar
+        // `<idx>_x.meta.meta`) as a sidecar and SILENTLY DROPPED it, sending the email
+        // WITHOUT that attachment (silent data corruption — Outbox Rule 5).
+        let allNames = Set(files.map { $0.lastPathComponent })
+        func isSidecar(_ name: String) -> Bool {
+            name.hasSuffix(".meta") && allNames.contains(String(name.dropLast(".meta".count)))
+        }
+        let dataFiles = files.filter { !isSidecar($0.lastPathComponent) }
+        // Fail closed on a DATA file whose name ends in ".meta" but whose OWN sidecar
+        // ("<name>.meta") is absent: indistinguishable from a lost-data orphan, so
+        // THROW rather than send an email with a missing/wrong attachment.
+        for url in dataFiles where url.lastPathComponent.hasSuffix(".meta") {
+            guard allNames.contains(url.lastPathComponent + ".meta") else {
+                throw DraftAttachmentLoadError.ambiguousMetaFilename(name: url.lastPathComponent)
+            }
+        }
+        // Sorted by index prefix.
+        let attachmentFiles = dataFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
 
         return try attachmentFiles.map { fileURL in
             let data = try Data(contentsOf: fileURL)
