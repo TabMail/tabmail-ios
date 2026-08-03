@@ -212,23 +212,66 @@ struct SearchView: View {
 
     // MARK: - Navigation
 
+    /// Resolve a REMOTE search result to a current durable headerId, folder-
+    /// scoped so a colliding UID in another folder — or another account — can
+    /// never be opened. Returns nil when no folder-native match exists; the
+    /// caller then does not navigate, so nothing opens.
+    ///
+    /// `nonisolated static` on purpose: it touches no `@State` and needs no view,
+    /// so a test can call it with a bare `Database`. The logic used to be inline
+    /// in `openResult` and was therefore untestable.
+    ///
+    /// WHY FOLDER-SCOPED. A bare `(accountId, messageId)` match is an ADDRESS,
+    /// not an identity: for IMAP `messageId` is the per-folder UID (see
+    /// `IMAPFetchMapping.messageIdString`), so the same UID names DIFFERENT
+    /// messages in different folders. Opening a row seeds
+    /// `MessageDetailView`/`MessageDetailViewModel`, whose
+    /// `markReadOnOpenIfNeeded` durably marks it read — so a wrong resolve is a
+    /// wrong-message MUTATION (C3), not merely a wrong render. The guard is
+    /// therefore fail-CLOSED: when identity cannot be established we resolve to
+    /// nothing, never to a looser global match.
+    ///
+    /// Account-wide provider search passes `folderPath == ""` (Gmail/Graph, where
+    /// `messageId` is already globally unique per account) and needs no folder
+    /// constraint — the account constraint still applies. Mirrors the snippet
+    /// lookup's own guard in `launchRemoteSearch` and the composite
+    /// `SearchResult.id`.
+    nonisolated static func resolveRemoteResultHeaderId(
+        accountEmail: String, messageId: String, folderPath: String, db: Database
+    ) throws -> String? {
+        guard let accountId = try Account
+            .filter(Column("emailAddress") == accountEmail).fetchOne(db)?.id else {
+            // Cannot resolve the account → never fall back to a global,
+            // cross-account messageId match (that opened another account's
+            // same-UID message).
+            return nil
+        }
+        var request = MessageHeader
+            .filter(Column("messageId") == messageId && Column("accountId") == accountId)
+        if !folderPath.isEmpty {
+            request = request.filter(Column("folderPath") == folderPath)
+        }
+        return try request.fetchOne(db)?.id
+    }
+
     private func openResult(_ result: SearchResult) {
         // Local result with headerId — navigate directly
         if let headerId = result.headerId {
             navigationPath.append(headerId)
             return
         }
-        // Remote result: look up by messageId + accountEmail via GRDB
-        let msgId = result.messageId
-        let email = result.accountEmail
-        if let header = try? dbPool.read({ db in
-            let account = try Account.filter(Column("emailAddress") == email).fetchOne(db)
-            if let accountId = account?.id {
-                return try MessageHeader.filter(Column("messageId") == msgId && Column("accountId") == accountId).fetchOne(db)
-            }
-            return try MessageHeader.filter(Column("messageId") == msgId).fetchOne(db)
-        }) {
-            navigationPath.append(header.id)
+        // Remote result: resolve folder-scoped; never a cross-folder/-account guess.
+        // A nil resolve navigates nowhere — nothing opens, nothing is marked read.
+        let resolved = try? dbPool.read { db in
+            try Self.resolveRemoteResultHeaderId(
+                accountEmail: result.accountEmail,
+                messageId: result.messageId,
+                folderPath: result.folderPath,
+                db: db
+            )
+        }
+        if let headerId = resolved {
+            navigationPath.append(headerId)
         }
     }
 

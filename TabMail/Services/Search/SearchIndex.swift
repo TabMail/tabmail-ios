@@ -35,9 +35,57 @@ struct FTSHeaderRecord: Sendable {
     let dateMs: Int64
     let folderId: String
 
+    // MARK: - The identity stamp (ADR-IOS-066)
+    //
+    // Four values that answer ONE question at the upsert: *is the entry already
+    // sitting at this content key the SAME message this record describes?* They are
+    // EVIDENCE, never a key — `contentKey` alone addresses the row. Reading the RFC
+    // 822 Message-ID here is not a return to RFC keying: on `v3` the RFC id is never
+    // mutation authority for a durable ACTION (D4 keys those by native provider id),
+    // but it remains the strongest available proof of *which message this is*, which
+    // is exactly the question a content-store write has to answer.
+    //
+    // 🚨 **A NULL IDENTITY STAMP MEANS RE-FETCH, NEVER DESTROY.** Every one of these
+    // is OPTIONAL and defaults to `nil` — "this producer did not state it" — and a
+    // `nil` can only ever make the write MORE conservative (preserve the existing
+    // body and embedding, adopt the new header fields). The nil default is therefore
+    // fail-SAFE in the direction its only consumer reads it: a dropped injection
+    // costs a re-index, never a destroyed body. See
+    // `SearchIndex.identityWriteDisposition`.
+
+    /// The message's raw RFC 822 Message-ID, unvalidated —
+    /// `MessageIdentity.comparableRfc822Identity` normalizes it at the compare.
+    let rfc822MessageId: String?
+    /// The mailbox's `UIDVALIDITY` epoch (`Folder.lastKnownUidValidity`) — `nil`
+    /// for a provider that does not have one, and for a folder whose epoch is
+    /// still unknown (`nil` there means UNKNOWN, never "fresh").
+    let uidValidity: Int?
+    /// A monotonic marker for the generation this record was read in, ordering two
+    /// writers against each other.
+    ///
+    /// ⚠ NO `v3` PRODUCER SUPPLIES THIS TODAY, by an explicit design decision
+    /// recorded on `Folder.uidValidityResetPendingAt`: *"`v2final`'s companion
+    /// column `lastUidValidityResetAt` is deliberately NOT ported — its sole purpose
+    /// there is to be the monotonic authority sidecar producers compare against, and
+    /// v3 has no such producer."* The parameter is carried so the refusal arm exists
+    /// and is exercisable the day one does.
+    ///
+    /// ⚑ ALL-OR-NOTHING PER FOLDER. `resetMarkerOrder` reads a stored marker with no
+    /// incoming one as `.incomingOlder` (the reference's semantics, ported
+    /// verbatim), so the first producer to start stamping a folder makes every
+    /// producer that does NOT stamp that same folder get REFUSED. Whoever wires the
+    /// first one must wire them all.
+    let resetAtMs: Int64?
+    /// Which identity space this provider's content rows draw their key tail from —
+    /// bridge in through `AccountProvider.contentKeySpace`. `nil` is "unstated",
+    /// which is NOT the same as `.uidAddressed`.
+    let contentKeySpace: ContentKeySpace?
+
     init(contentKey: ContentKey, headerId: String, messageId: String, subject: String,
          from: String, to: String, cc: String = "", bcc: String = "",
-         dateMs: Int64, folderId: String = "") {
+         dateMs: Int64, folderId: String = "",
+         rfc822MessageId: String? = nil, uidValidity: Int? = nil,
+         resetAtMs: Int64? = nil, contentKeySpace: ContentKeySpace? = nil) {
         self.contentKey = contentKey
         self.headerId = headerId
         self.messageId = messageId
@@ -48,6 +96,10 @@ struct FTSHeaderRecord: Sendable {
         self.bcc = bcc
         self.dateMs = dateMs
         self.folderId = folderId
+        self.rfc822MessageId = rfc822MessageId
+        self.uidValidity = uidValidity
+        self.resetAtMs = resetAtMs
+        self.contentKeySpace = contentKeySpace
     }
 }
 
@@ -371,6 +423,38 @@ actor SearchIndex {
             // won't be re-queued by cleanup/backfill/embedding rebuild.
             if !columnNames.contains("bodyConfirmedEmpty") {
                 try db.execute(sql: "ALTER TABLE message_meta ADD COLUMN bodyConfirmedEmpty INTEGER NOT NULL DEFAULT 0")
+            }
+
+            // v8: the identity stamp the header upsert classifies against
+            // (ADR-IOS-066). PORT of `v2final:SearchIndex.migrateSchema`'s v8 block
+            // (`486bafd4b`), verbatim including the NULL-able column types.
+            //
+            // ⚠ THIS IS NOT A GRDB MIGRATION. It is the FTS database's own
+            // re-entrant "add the column if `PRAGMA table_info` does not list it"
+            // check, which runs on EVERY launch and is idempotent by construction —
+            // it carries none of the frozen-name/frozen-body hazard that makes an
+            // applied `AppDatabase` migration immutable. A fresh database is created
+            // by `createSchema()` without these columns and immediately runs this,
+            // so fresh and upgraded databases converge on the identical
+            // `message_meta` column set.
+            //
+            // 🚨 EXISTING ROWS STAY NULL, AND NULL MEANS UNVERIFIED — NEVER
+            // "MISMATCHED". A pre-upgrade row is a message whose identity was simply
+            // never recorded; a header refresh must preserve its body and embedding
+            // and lazily adopt the incoming tuple. Absence of evidence is never a
+            // destructive-write permit. NOT NULL defaults are deliberately absent:
+            // a default would manufacture exactly the evidence this must not have.
+            let identityColumns: [(String, String)] = [
+                ("identityTokenVersion", "INTEGER"),
+                ("identityRfc822MessageId", "TEXT"),
+                ("identityUidValidity", "INTEGER"),
+                ("identityResetAtMs", "INTEGER"),
+                ("identityStableProvider", "INTEGER"),
+            ]
+            for (name, type) in identityColumns where !columnNames.contains(name) {
+                try db.execute(
+                    sql: "ALTER TABLE message_meta ADD COLUMN \(name) \(type)"
+                )
             }
         }
     }
@@ -808,12 +892,25 @@ actor SearchIndex {
             // `message_ids` carries no `folderId` column, so a pre-existing ORPHAN
             // id — one whose `message_meta` / shard rows are already gone, e.g. from
             // an earlier partially-failed purge — never appears in `rows` above and
-            // therefore survives every folder-relation delete. It is NOT inert:
-            // `indexHeaders` is `INSERT OR IGNORE` plus skip-if-unchanged, so a
-            // surviving id turns the resync's re-index of that very key into a no-op
-            // and the new-epoch message occupying that address is never searchable
-            // again. Recomputable from the folder alone ⇒ idempotent on a crash
+            // therefore survives every folder-relation delete. It is NOT inert: a
+            // surviving id is a live claim on a content key by a folder that has
+            // been purged, so it keeps that key minted for an account/folder pair
+            // that no longer holds it and every later census
+            // (`documentCountForAccount`, `purgeForAccount`'s prefix delete) counts
+            // it. Recomputable from the folder alone ⇒ idempotent on a crash
             // re-drive, exactly like the query above.
+            //
+            // ⚑ CORRECTED BY T5.2 (ADR-IOS-066), AND THE CORRECTION MATTERS. The
+            // original rationale here was that `indexHeaders` is `INSERT OR IGNORE`
+            // plus skip-if-unchanged, so a surviving id turned the resync's re-index
+            // of that very key into a silent no-op. That half is no longer true:
+            // `upsertHeader` finds no `message_meta` row behind the orphan, falls to
+            // `insertHeader`, and its `INSERT OR IGNORE` ADOPTS the orphan's rowid,
+            // so the message does become searchable again. This sweep is therefore
+            // no longer the only thing standing between an orphan and unsearchable
+            // mail — but it is still required for the reason restated above, and the
+            // assertion that discriminates its presence is
+            // `testContentKeyIsMinted(...) == false`, not the re-index count.
             //
             // SUBTRACT — a deliberate NARROWING of the reference, which deletes every
             // prefix match unconditionally. The `NOT EXISTS` term leaves alone any id
@@ -848,11 +945,103 @@ actor SearchIndex {
 
     // MARK: - Indexing
 
-    /// Batch index message headers into FTS5. Deduplicates by content key.
-    /// Returns count of newly inserted documents.
+    /// The identity-tuple shape `message_meta`'s `identity*` columns are written in.
+    /// A stored value that is not this is a tuple written by a version whose meaning
+    /// is unknown here, and is treated as UNVERIFIED — see decision 1 of
+    /// `identityWriteDisposition`.
+    private static let identityTokenVersion = 1
+
+    /// The `accountId` an FTS row belongs to, taken from its content key's leading
+    /// field (`"<accountId>:<folderPath>:<tail>"`). The same derivation the v1
+    /// `accountId` backfill does in SQL, and the one `indexHeaders` has always used.
+    private nonisolated static func accountId(of contentKey: ContentKey) -> String {
+        String(contentKey.rawValue.prefix(while: { $0 != ":" }))
+    }
+
+    /// What one header write did to the entry at its content key.
+    private enum HeaderUpsertResult {
+        case inserted
+        case updated
+        case refusedOlderGeneration
+    }
+
+    /// What a header write may do to the CONTENT (indexed body + embedding) already
+    /// sitting at a content key. The header FIELDS are rewritten either way — that
+    /// is the whole point of the upsert; only the expensive-to-rebuild content is
+    /// arbitrated here.
+    private enum IdentityWriteDisposition {
+        case preserveAndAdopt
+        case clearAndAdopt
+        case refuseOlderGeneration
+    }
+
+    /// Ordering of two reset markers.
+    ///
+    /// PORT of `v2final:MessageIdentity.ResetMarkerOrder` + `resetMarkerOrder`
+    /// (`486bafd4b`), RELOCATED into this file: on `v3` the shared
+    /// `MessageIdentity` has no such helper and the FTS index is its only would-be
+    /// consumer. If a second consumer appears, promote it back to
+    /// `Shared/Keys/MessageIdentity.swift` rather than growing a second copy.
+    private enum ResetMarkerOrder {
+        case same
+        case incomingNewer
+        case incomingOlder
+    }
+
+    /// PORT (`v2final:MessageIdentity.resetMarkerOrder`, `486bafd4b`) — verbatim,
+    /// INCLUDING the asymmetry that a stored marker with no incoming one reads as
+    /// `.incomingOlder`. See `FTSHeaderRecord.resetAtMs`'s all-or-nothing note.
+    private nonisolated static func resetMarkerOrder(
+        existingMs: Int64?,
+        incomingMs: Int64?
+    ) -> ResetMarkerOrder {
+        switch (existingMs, incomingMs) {
+        case (.none, .none):
+            return .same
+        case (.none, .some):
+            return .incomingNewer
+        case (.some, .none):
+            return .incomingOlder
+        case let (.some(existing), .some(incoming)) where incoming > existing:
+            return .incomingNewer
+        case let (.some(existing), .some(incoming)) where incoming < existing:
+            return .incomingOlder
+        default:
+            return .same
+        }
+    }
+
+    /// Batch index message headers into FTS5, keyed by content key.
+    /// Returns count of newly inserted documents — an entry that was REFRESHED in
+    /// place is not counted, which is the same meaning the previous
+    /// `INSERT OR IGNORE` form returned.
     ///
     /// ⚠ Reads `record.contentKey` and never `record.headerId` — the FTS row is
     /// keyed by content. See `FTSHeaderRecord`'s two-id note.
+    ///
+    /// PORT (`v2final:SearchIndex.indexLiveHeaders` → `upsertLiveHeader`,
+    /// `486bafd4b`). This is what closes D-A: the previous form was
+    /// `INSERT OR IGNORE` plus an explicit skip-if-present, so a `message_meta`
+    /// record left behind by a PREVIOUS occupant of a reused content key could never
+    /// be corrected — after a UIDVALIDITY reset, search returned the NEW message
+    /// carrying the OLD message's subject and sender, permanently. An existing entry
+    /// is now REFRESHED in place instead of ignored.
+    ///
+    /// SUBTRACT — the reference's entry point re-reads every searchable field and
+    /// identity value out of GRDB while holding its writer transaction across the
+    /// FTS write, and flips `messageHeader.headerComplete` for what it indexed. None
+    /// of that is ported: on `v3` every production producer already builds its
+    /// records inside its own GRDB read and owns the `headerComplete` flip, so
+    /// re-reading here would duplicate their work, cross a second database's writer
+    /// inside this one, and change a signature they all depend on. The identity
+    /// tuple travels ON the record instead — see `FTSHeaderRecord`.
+    ///
+    /// CENSUS as of this change — nine `FTSHeaderRecord(` construction sites across
+    /// seven files, enumerated by grepping the TYPE rather than any one call shape:
+    /// `SyncEngineFTS` ×2, `NSEDataBridge` ×2, `SyncEngineFullSync`,
+    /// `SyncEngineBackfillDeep`, `AccountManagerActions`, `AccountManagerOutbox`,
+    /// `DemoModeService`. All nine pass a real `folderId`, which is why the meta
+    /// UPDATE below may refresh that column without blanking a correct one.
     func indexHeaders(_ records: [FTSHeaderRecord]) throws -> Int {
         ensureReady()
         guard let dbPool, !records.isEmpty else { return 0 }
@@ -860,45 +1049,296 @@ actor SearchIndex {
         return try dbPool.write { [self] db in
             var inserted = 0
 
+            // LOOP VARIANT: the number of elements of `records` not yet visited,
+            // which strictly decreases by exactly one per iteration and is bounded
+            // below by 0. `continue` advances to the next element like any other
+            // arm — no arm re-enters an element, and none of the three results can
+            // extend the sequence — so the refusal arm cannot hang the loop.
             for record in records {
-                // Dedup check
-                try db.execute(
-                    sql: "INSERT OR IGNORE INTO message_ids (headerId) VALUES (?)",
-                    arguments: [record.contentKey]
-                )
-                guard db.changesCount > 0 else { continue }
-
-                let rowid = try Int64.fetchOne(
-                    db,
-                    sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
-                    arguments: [record.contentKey]
-                )!
-
-                // Route to year-specific FTS table
-                let year = yearFromDateMs(record.dateMs)
-                try ensureShard(year: year, db: db)
-                let table = ftsTableName(year: year)
-
-                // FTS5 insert (body empty — filled later via updateBody)
-                try db.execute(
-                    sql: "INSERT INTO \(table) (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?, ?, ?, ?, ?, ?, ?, '')",
-                    arguments: [rowid, record.messageId, record.subject, record.from, record.to, record.cc, record.bcc]
-                )
-
-                // Metadata (accountId extracted from the key's prefix "accountId:...")
-                let accountId = String(record.contentKey.rawValue.prefix(while: { $0 != ":" }))
-                // INSERT OR IGNORE: don't overwrite existing entries.
-                // Flags (bodyComplete, bodyEmptyConfirmed) live in GRDB only.
-                try db.execute(
-                    sql: "INSERT OR IGNORE INTO message_meta (rowid, headerId, dateMs, accountId, shardYear, folderId) VALUES (?, ?, ?, ?, ?, ?)",
-                    arguments: [rowid, record.contentKey, record.dateMs, accountId, year, record.folderId]
-                )
-
-                inserted += 1
+                switch try upsertHeader(record, db: db) {
+                case .inserted:
+                    inserted += 1
+                case .updated:
+                    break
+                case .refusedOlderGeneration:
+                    continue
+                }
             }
 
             return inserted
         }
+    }
+
+    /// Write one header record over whatever occupies its content key, arbitrating
+    /// the existing body and embedding through `identityWriteDisposition`.
+    ///
+    /// PORT (`v2final:SearchIndex.upsertLiveHeader`, `486bafd4b`), keyed by
+    /// `ContentKey` rather than the reference's raw `headerId` string.
+    private func upsertHeader(
+        _ record: FTSHeaderRecord,
+        db: Database
+    ) throws -> HeaderUpsertResult {
+        guard let mapping = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT mi.rowid, meta.shardYear, meta.identityTokenVersion,
+                       meta.identityRfc822MessageId,
+                       meta.identityUidValidity, meta.identityResetAtMs,
+                       meta.identityStableProvider
+                FROM message_ids mi
+                JOIN message_meta meta ON meta.rowid = mi.rowid
+                WHERE mi.headerId = ?
+                """,
+            arguments: [record.contentKey]
+        ) else {
+            try insertHeader(record, db: db)
+            return .inserted
+        }
+
+        let rowid: Int64 = mapping["rowid"]
+        let oldYear: Int = mapping["shardYear"]
+        let oldTable = ftsTableName(year: oldYear)
+        guard let oldFTS = try Row.fetchOne(
+            db,
+            sql: "SELECT body FROM \(oldTable) WHERE rowid = ?",
+            arguments: [rowid]
+        ) else {
+            // Dangling mapping — id + meta rows with no shard row behind them.
+            // There is no content to arbitrate, so rebuild the entry outright.
+            try db.execute(
+                sql: "DELETE FROM message_meta WHERE rowid = ?",
+                arguments: [rowid]
+            )
+            try db.execute(
+                sql: "DELETE FROM message_ids WHERE headerId = ?",
+                arguments: [record.contentKey]
+            )
+            try? db.execute(
+                sql: "DELETE FROM messages_vec WHERE rowid = ?",
+                arguments: [rowid]
+            )
+            try insertHeader(record, db: db)
+            return .inserted
+        }
+
+        let disposition = identityWriteDisposition(record, stored: mapping)
+        let body: String
+        switch disposition {
+        case .preserveAndAdopt:
+            // ⚠ CARRIES THE FULL INDEXED BODY ACROSS, never a prefix of it. The
+            // stored copy is what search reads; nothing here shortens it.
+            body = oldFTS["body"]
+        case .clearAndAdopt:
+            body = ""
+        case .refuseOlderGeneration:
+            return .refusedOlderGeneration
+        }
+
+        let newYear = yearFromDateMs(record.dateMs)
+        if newYear == oldYear {
+            try db.execute(
+                sql: """
+                    UPDATE \(oldTable)
+                    SET msgId = ?, subject = ?, from_ = ?, to_ = ?,
+                        cc = ?, bcc = ?, body = ?
+                    WHERE rowid = ?
+                    """,
+                arguments: [
+                    record.messageId, record.subject, record.from, record.to,
+                    record.cc, record.bcc, body, rowid,
+                ]
+            )
+        } else {
+            try ensureShard(year: newYear, db: db)
+            let newTable = ftsTableName(year: newYear)
+            try db.execute(
+                sql: """
+                    INSERT OR REPLACE INTO \(newTable)
+                        (rowid, msgId, subject, from_, to_, cc, bcc, body)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                arguments: [
+                    rowid, record.messageId, record.subject, record.from,
+                    record.to, record.cc, record.bcc, body,
+                ]
+            )
+            try db.execute(
+                sql: "DELETE FROM \(oldTable) WHERE rowid = ?",
+                arguments: [rowid]
+            )
+        }
+
+        if case .clearAndAdopt = disposition {
+            // The embedding describes the body just cleared, so it is now a
+            // different message's vector sitting at this rowid. `try?` matches
+            // every other `messages_vec` write in this file: the table is absent
+            // on a device where the `vec0` module failed to register.
+            try? db.execute(
+                sql: "DELETE FROM messages_vec WHERE rowid = ?",
+                arguments: [rowid]
+            )
+        }
+
+        let stableProvider: Bool? = record.contentKeySpace.map {
+            $0 == .stableProviderId
+        }
+        try db.execute(
+            sql: """
+                UPDATE message_meta
+                SET dateMs = ?, accountId = ?, shardYear = ?, folderId = ?,
+                    identityTokenVersion = ?, identityRfc822MessageId = ?,
+                    identityUidValidity = ?, identityResetAtMs = ?,
+                    identityStableProvider = ?
+                WHERE rowid = ?
+                """,
+            arguments: [
+                record.dateMs, Self.accountId(of: record.contentKey), newYear,
+                record.folderId, Self.identityTokenVersion,
+                record.rfc822MessageId, record.uidValidity, record.resetAtMs,
+                stableProvider, rowid,
+            ]
+        )
+        return .updated
+    }
+
+    /// Mint a brand-new FTS entry for a content key nothing occupies yet.
+    ///
+    /// PORT (`v2final:SearchIndex.insertLiveHeader`, `486bafd4b`). The `OR IGNORE` /
+    /// `OR REPLACE` conflict clauses are a deliberate widening of the reference's
+    /// bare `INSERT`s: `message_ids` can legitimately still hold an ORPHANED key
+    /// whose `message_meta` and shard rows are already gone (the state
+    /// `removeMessagesForFolder`'s H-2 sweep exists to clear, and the state the
+    /// dangling-mapping branch above creates on purpose). The reference throws
+    /// there and aborts the whole batch write; adopting the orphan's rowid indexes
+    /// the message instead, which is the outcome that sweep is trying to reach.
+    private func insertHeader(_ record: FTSHeaderRecord, db: Database) throws {
+        try db.execute(
+            sql: "INSERT OR IGNORE INTO message_ids (headerId) VALUES (?)",
+            arguments: [record.contentKey]
+        )
+        let rowid = try Int64.fetchOne(
+            db,
+            sql: "SELECT rowid FROM message_ids WHERE headerId = ?",
+            arguments: [record.contentKey]
+        )!
+        let year = yearFromDateMs(record.dateMs)
+        try ensureShard(year: year, db: db)
+        let table = ftsTableName(year: year)
+        // Body empty — filled later via updateBody/updateBodies.
+        try db.execute(
+            sql: """
+                INSERT OR REPLACE INTO \(table)
+                    (rowid, msgId, subject, from_, to_, cc, bcc, body)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '')
+                """,
+            arguments: [
+                rowid, record.messageId, record.subject, record.from,
+                record.to, record.cc, record.bcc,
+            ]
+        )
+        // Flags (bodyComplete, bodyEmptyConfirmed) live in GRDB only.
+        let stableProvider: Bool? = record.contentKeySpace.map {
+            $0 == .stableProviderId
+        }
+        try db.execute(
+            sql: """
+                INSERT OR REPLACE INTO message_meta (
+                    rowid, headerId, dateMs, accountId, shardYear, folderId,
+                    identityTokenVersion, identityRfc822MessageId,
+                    identityUidValidity, identityResetAtMs, identityStableProvider
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                rowid, record.contentKey, record.dateMs,
+                Self.accountId(of: record.contentKey), year, record.folderId,
+                Self.identityTokenVersion, record.rfc822MessageId,
+                record.uidValidity, record.resetAtMs, stableProvider,
+            ]
+        )
+    }
+
+    /// 🚨 **A NULL IDENTITY STAMP MEANS RE-FETCH, NEVER DESTROY.**
+    ///
+    /// Classifies a header write without turning MISSING evidence into a delete.
+    /// Reset markers ORDER two writers (an older one is refused; a newer one may
+    /// adopt); body and embedding are cleared ONLY on a POSITIVE identity
+    /// disagreement — two values that are both present and differ. Legacy,
+    /// unstamped or incomplete tuples are preserved and lazily adopted.
+    ///
+    /// ⚑ THE REFERENCE ITSELF GOT THIS WRONG, WHICH IS WHY THE RULE IS SPELLED OUT
+    /// RATHER THAN LEFT TO THE READER: it guarded this WRITE with a rule meant for
+    /// READS and unrecoverably wiped the FTS body of every pre-upgrade row. The
+    /// corrected form is what is ported here (`486bafd4b`'s own commit message lists
+    /// that regression first). Every arm that returns `.clearAndAdopt` below is
+    /// reached only from two non-nil values that disagree; there is no arm where the
+    /// ABSENCE of a value clears anything.
+    ///
+    /// PORT (`v2final:SearchIndex.liveIdentityWriteDisposition`, `486bafd4b`).
+    private nonisolated func identityWriteDisposition(
+        _ record: FTSHeaderRecord,
+        stored: Row
+    ) -> IdentityWriteDisposition {
+        // DECISION 1 — a tuple this version does not recognise (including the NULL
+        // a pre-upgrade row carries) is UNVERIFIED, not mismatched. PRESERVE.
+        let version: Int? = stored["identityTokenVersion"]
+        guard version == Self.identityTokenVersion else { return .preserveAndAdopt }
+
+        let oldResetAtMs: Int64? = stored["identityResetAtMs"]
+        let resetOrder = Self.resetMarkerOrder(
+            existingMs: oldResetAtMs,
+            incomingMs: record.resetAtMs
+        )
+        if resetOrder == .incomingOlder {
+            return .refuseOlderGeneration
+        }
+
+        // DECISION 2 — a NULL stored `identityStableProvider`. PRESERVE.
+        let oldStableInt: Int? = stored["identityStableProvider"]
+        guard let oldStableInt else { return .preserveAndAdopt }
+        let oldStable = oldStableInt == 1
+        // NARROWED from the reference, which reads the incoming side as a plain
+        // `Bool` and so cannot tell "this provider is uid-addressed" from "this
+        // producer did not say". On `v3` the incoming value is optional and unstated
+        // at every producer today, so the reference's literal form would clear on
+        // MANUFACTURED evidence the moment one producer starts stating it. An
+        // unstated incoming value skips this branch entirely and falls through to
+        // the RFC/epoch evidence below; it never clears on its own.
+        if let newStable = record.contentKeySpace.map({ $0 == .stableProviderId }),
+           oldStable || newStable {
+            return oldStable == newStable
+                ? .preserveAndAdopt
+                : .clearAndAdopt
+        }
+
+        // DECISION 3 — CLEAR only when BOTH RFC ids are non-nil AND differ.
+        let oldRfc = MessageIdentity.comparableRfc822Identity(
+            stored["identityRfc822MessageId"] as String?
+        )
+        let newRfc = MessageIdentity.comparableRfc822Identity(
+            record.rfc822MessageId
+        )
+        if let oldRfc, let newRfc {
+            return oldRfc == newRfc
+                ? .preserveAndAdopt
+                : .clearAndAdopt
+        }
+
+        if resetOrder == .incomingNewer {
+            return .clearAndAdopt
+        }
+
+        // DECISION 4 — CLEAR only when BOTH epochs are non-nil AND differ.
+        let oldEpoch: Int? = stored["identityUidValidity"]
+        if let oldEpoch, let newEpoch = record.uidValidity {
+            return oldEpoch == newEpoch
+                ? .preserveAndAdopt
+                : .clearAndAdopt
+        }
+
+        // DECISION 5 — the fall-through. No pair of values disagreed, so nothing
+        // has been shown to be a different message. PRESERVE.
+        return .preserveAndAdopt
     }
 
     /// Write body text to FTS for a message. Caller sets GRDB flags (bodyComplete, bodyEmptyConfirmed).

@@ -695,10 +695,19 @@ struct SearchIndexCRUDTests {
 /// partially-failed purge).
 ///
 /// THE INVARIANT (the system end state, not the sweep's mechanism): after
-/// `(accountId, folderPath)` is purged, re-indexing a key belonging to that folder
-/// REALLY LANDS. `indexHeaders` is `INSERT OR IGNORE` plus skip-if-unchanged, so a
-/// surviving orphan id turns the post-purge resync's re-index into a silent no-op and
-/// the message occupying that address under the new epoch is never searchable again.
+/// `(accountId, folderPath)` is purged, no orphaned id keeps claiming a key in that
+/// folder, and re-indexing a key belonging to it REALLY LANDS.
+///
+/// ⚑ ONE HALF OF THIS SUITE'S ORIGINAL RATIONALE WAS RETIRED BY T5.2 (ADR-IOS-066),
+/// AND SAYING SO IS LOAD-BEARING. It used to read: *"`indexHeaders` is
+/// `INSERT OR IGNORE` plus skip-if-unchanged, so a surviving orphan id turns the
+/// post-purge resync's re-index into a silent no-op and the message occupying that
+/// address under the new epoch is never searchable again."* `indexHeaders` is now an
+/// upsert whose insert leg ADOPTS an orphan's rowid, so the re-index lands whether or
+/// not the sweep ran. **The `reIndexed == 1` expectation below therefore no longer
+/// discriminates the sweep's presence — `testContentKeyIsMinted(...) == false` is the
+/// assertion that still goes RED without it.** Do not delete that one believing the
+/// count covers it.
 ///
 /// 🚨 THE TWO TRIPWIRES, both anti-mirror-image. The sweep is scoped by the composite
 /// key's prefix, which is only sound with the no-deeper-colon guard (a ':'-delimiter
@@ -753,8 +762,12 @@ struct SearchIndexFolderPurgeOrphanTests {
         // THE INVARIANT: the resync's re-index of that same key really lands.
         let reIndexed = try await index.indexHeaders(
             [record(key, folderId: folderId, subject: "Orphanzarquon subject")])
+        // ⚑ NO LONGER A TRIPWIRE FOR THE SWEEP — see the suite doc. Since T5.2 the
+        // upsert's insert leg adopts an orphan's rowid, so this lands either way. It
+        // is kept because it still pins the end state the suite is named for: the
+        // resynced message really becomes searchable.
         #expect(reIndexed == 1,
-                "a surviving orphan id makes indexHeaders a silent no-op for the resynced message")
+                "the post-purge resync of this key must produce a real FTS document")
         #expect(try await index.contentKeysMissingFromFTS([contentKey]).isEmpty,
                 "the re-indexed key must be backed by a message_meta row again")
 
@@ -809,5 +822,291 @@ struct SearchIndexFolderPurgeOrphanTests {
         try await index.removeMessagesForFolder(accountId: account, folderPath: childPath)
         #expect(try await index.testContentKeyIsMinted(contentKey) == false,
                 "the child folder's OWN purge must still clear its orphaned id")
+    }
+}
+
+// MARK: - Header upsert: correct a stale record, never destroy unproven content
+
+/// `indexHeaders` used to be `INSERT OR IGNORE INTO message_meta` plus an explicit
+/// skip-if-present, so a record left behind by a PREVIOUS occupant of a reused
+/// content key could never be corrected. After a UIDVALIDITY reset, search returned
+/// the NEW message carrying the OLD message's subject and sender — permanently.
+///
+/// 🚨 **A NULL identity stamp means RE-FETCH, NEVER DESTROY.** The reference guarded
+/// this WRITE with a rule meant for READS and unrecoverably wiped the FTS body of
+/// every pre-upgrade row. Only a POSITIVE mismatch — two values that are both
+/// present and DIFFER — may clear anything. Absence of evidence is never evidence of
+/// mismatch.
+///
+/// Every test pins the END STATE of the index (what a search returns, whether the
+/// body survives), never the disposition enum's shape — a mechanism-pinning test
+/// inherits a wrong spec's error and stays green on a broken system. Every preserve
+/// case carries a positive-mismatch control that DOES clear IN THE SAME RUN, so a
+/// system that never clears anything cannot pass it vacuously.
+@Suite("SearchIndex header upsert identity disposition", .serialized, .processGlobalState)
+struct SearchIndexHeaderUpsertTests {
+
+    private var index: SearchIndex { SearchIndex.shared }
+
+    /// Derived from `Date()` — a hardcoded epoch would silently pin every fixture to
+    /// a year shard that drifts out of the fixture's meaning.
+    private var nowMs: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+    /// The same UTC-year derivation `SearchIndex.yearFromDateMs` uses, so a seeded
+    /// shard and an indexed record land in the same table.
+    private var currentYear: Int {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        return cal.component(.year, from: Date())
+    }
+
+    private func key(_ account: String, _ messageId: String) -> ContentKey {
+        ContentKey(rawValue: MessageIdentity.headerId(
+            accountId: account, folderPath: "INBOX", messageId: messageId))
+    }
+
+    private func record(
+        _ contentKey: ContentKey,
+        subject: String,
+        from: String,
+        rfc822MessageId: String? = nil,
+        uidValidity: Int? = nil,
+        resetAtMs: Int64? = nil,
+        contentKeySpace: ContentKeySpace? = nil
+    ) -> FTSHeaderRecord {
+        FTSHeaderRecord(
+            contentKey: contentKey,
+            headerId: contentKey.rawValue,
+            messageId: "1",
+            subject: subject,
+            from: from,
+            to: "recipient@example.com",
+            dateMs: nowMs,
+            folderId: MessageIdentity.folderId(
+                accountId: String(contentKey.rawValue.prefix(while: { $0 != ":" })),
+                folderPath: "INBOX"),
+            rfc822MessageId: rfc822MessageId,
+            uidValidity: uidValidity,
+            resetAtMs: resetAtMs,
+            contentKeySpace: contentKeySpace
+        )
+    }
+
+    private func hits(_ query: String) async throws -> Set<String> {
+        Set(try await index.keywordSearch(query: query).map(\.contentKey.rawValue))
+    }
+
+    // MARK: (a) a disagreeing record IS overwritten
+
+    @Test("A disagreeing record overwrites the stale one — the new occupant's subject answers and the previous occupant's no longer does")
+    func disagreeingRecordIsOverwritten() async throws {
+        let account = "ftsupsertclear-\(UUID().uuidString)"
+        let target = key(account, "1")
+
+        let inserted = try await index.indexHeaders([record(
+            target, subject: "Staleoccupantzarquon subject", from: "stale@example.com",
+            rfc822MessageId: "<stale@example.com>", uidValidity: 100,
+            contentKeySpace: .uidAddressed)])
+        try #require(inserted == 1)
+        try await index.updateBody(contentKey: target, body: "Staleoccupantbodyzarquon text")
+        let seeded = try await index.rawFTSBody(contentKey: target)
+        try #require(seeded?.contains("Staleoccupantbodyzarquon") == true,
+                     "precondition: the previous occupant's body is indexed")
+
+        // The UID was reused: a DIFFERENT message now occupies this content key, and
+        // says so on every identity value it states.
+        let reIndexed = try await index.indexHeaders([record(
+            target, subject: "Freshoccupantzarquon subject", from: "fresh@example.com",
+            rfc822MessageId: "<fresh@example.com>", uidValidity: 200,
+            contentKeySpace: .uidAddressed)])
+        #expect(reIndexed == 0, "a refreshed entry is not a NEW document")
+
+        let freshHits = try await hits("freshoccupantzarquon")
+        let staleHits = try await hits("staleoccupantzarquon")
+        #expect(freshHits.contains(target.rawValue),
+                "the new occupant's subject must answer searches")
+        #expect(staleHits.contains(target.rawValue) == false,
+                "the previous occupant's subject must NOT keep answering — this permanent staleness is the whole defect the upsert exists to end")
+
+        let survivingBody = try await index.rawFTSBody(contentKey: target)
+        #expect(survivingBody?.isEmpty == true,
+                "a POSITIVELY mismatched identity clears the previous occupant's body — it is not this message's content")
+        let bodyHits = try await hits("staleoccupantbodyzarquon")
+        #expect(bodyHits.contains(target.rawValue) == false,
+                "and the cleared body must stop answering searches too")
+
+        try? await index.removeMessages(contentKeys: [target])
+    }
+
+    // MARK: (b) a NULL-stamped pre-upgrade row KEEPS ITS BODY
+
+    @Test("A NULL identity stamp means RE-FETCH, NEVER DESTROY — a pre-upgrade row keeps its body while its stale header fields are corrected")
+    func nullIdentityStampPreservesTheBody() async throws {
+        // A NULL identity stamp means RE-FETCH, NEVER DESTROY.
+        //
+        // The row seeded here is the shape EVERY row on a device upgrading into
+        // ADR-IOS-066 has: written before `message_meta` carried an identity tuple,
+        // so all five `identity*` columns are NULL. The reference guarded this WRITE
+        // with a rule meant for READS and unrecoverably wiped the FTS body of every
+        // one of them — an unrecoverable loss of user content, not a cache miss.
+        // Absence of evidence is never evidence of mismatch.
+        let account = "ftsupsertnull-\(UUID().uuidString)"
+        let target = key(account, "1")
+
+        _ = try await index.testSeedLegacyShard(
+            year: currentYear, tokenize: SearchConfig.ftsTokenize, contentKey: target,
+            msgId: "1", subject: "Preupgradezarquon subject",
+            from: "preupgrade@example.com",
+            body: "Preupgradebodyzarquon text", dateMs: nowMs)
+        let seeded = try await index.rawFTSBody(contentKey: target)
+        try #require(seeded?.contains("Preupgradebodyzarquon") == true,
+                     "precondition: the pre-upgrade row carries an indexed body")
+
+        // The incoming record POSITIVELY disagrees on every identity value it
+        // states. The STORED side states nothing at all, so there is no mismatch —
+        // there is only a message whose identity was never recorded.
+        _ = try await index.indexHeaders([record(
+            target, subject: "Adoptedzarquon subject", from: "adopted@example.com",
+            rfc822MessageId: "<adopted@example.com>", uidValidity: 777,
+            contentKeySpace: .uidAddressed)])
+
+        let survivingBody = try await index.rawFTSBody(contentKey: target)
+        #expect(survivingBody?.contains("Preupgradebodyzarquon") == true,
+                "🚨 THE PRE-UPGRADE ROW'S BODY MUST SURVIVE. A NULL identity stamp means RE-FETCH, NEVER DESTROY — this is the exact write the reference got wrong, and it destroyed user content unrecoverably.")
+        let bodyHits = try await hits("preupgradebodyzarquon")
+        #expect(bodyHits.contains(target.rawValue),
+                "and it must remain SEARCHABLE, not merely present in the row")
+
+        // Preserve applies to CONTENT. The header fields are corrected regardless —
+        // otherwise the pre-upgrade row would keep serving a stale subject forever.
+        let adoptedHits = try await hits("adoptedzarquon")
+        let staleHits = try await hits("preupgradezarquon")
+        #expect(adoptedHits.contains(target.rawValue),
+                "the incoming subject must answer")
+        #expect(staleHits.contains(target.rawValue) == false,
+                "the pre-upgrade subject must not keep answering")
+
+        // TWO-SIDED, IN THE SAME RUN: the identical disagreement against a STAMPED
+        // row DOES clear. Without this control the preserve above passes vacuously
+        // against a system that never clears anything.
+        let control = key(account, "2")
+        let controlInserted = try await index.indexHeaders([record(
+            control, subject: "Controloriginzarquon subject", from: "origin@example.com",
+            rfc822MessageId: "<origin@example.com>", uidValidity: 100,
+            contentKeySpace: .uidAddressed)])
+        try #require(controlInserted == 1)
+        try await index.updateBody(contentKey: control, body: "Controlbodyzarquon text")
+        let controlSeeded = try await index.rawFTSBody(contentKey: control)
+        try #require(controlSeeded?.contains("Controlbodyzarquon") == true,
+                     "precondition: the control's body is indexed")
+
+        _ = try await index.indexHeaders([record(
+            control, subject: "Controlfreshzarquon subject", from: "fresh@example.com",
+            rfc822MessageId: "<fresh@example.com>", uidValidity: 200,
+            contentKeySpace: .uidAddressed)])
+        let controlBody = try await index.rawFTSBody(contentKey: control)
+        #expect(controlBody?.isEmpty == true,
+                "the control MUST clear — a stamped row whose identity positively disagrees is a different message, and a run where nothing ever clears proves nothing about the preserve above")
+
+        try? await index.removeMessages(contentKeys: [target, control])
+    }
+
+    // MARK: A stored NULL provider-space stamp is also unverified, not mismatched
+
+    @Test("A stored NULL identityStableProvider preserves the body even though both RFC ids are present and differ")
+    func nullStoredProviderSpacePreservesTheBody() async throws {
+        // Written by a producer that did not state its provider's identity space, so
+        // `identityStableProvider` is NULL. That is a second flavour of the same
+        // rule: the stored tuple is INCOMPLETE, and an incomplete tuple is not a
+        // mismatched one.
+        let account = "ftsupsertnospace-\(UUID().uuidString)"
+        let target = key(account, "1")
+
+        let inserted = try await index.indexHeaders([record(
+            target, subject: "Unstatedspacezarquon subject", from: "unstated@example.com",
+            rfc822MessageId: "<unstated@example.com>", uidValidity: 100)])
+        try #require(inserted == 1)
+        try await index.updateBody(contentKey: target, body: "Unstatedbodyzarquon text")
+        let seeded = try await index.rawFTSBody(contentKey: target)
+        try #require(seeded?.contains("Unstatedbodyzarquon") == true,
+                     "precondition: the unstated-space row carries an indexed body")
+
+        _ = try await index.indexHeaders([record(
+            target, subject: "Unstatedfreshzarquon subject", from: "fresh@example.com",
+            rfc822MessageId: "<fresh@example.com>", uidValidity: 200,
+            contentKeySpace: .uidAddressed)])
+
+        let survivingBody = try await index.rawFTSBody(contentKey: target)
+        #expect(survivingBody?.contains("Unstatedbodyzarquon") == true,
+                "an incomplete stored tuple must preserve the body — absence of evidence is never evidence of mismatch")
+        let adoptedHits = try await hits("unstatedfreshzarquon")
+        #expect(adoptedHits.contains(target.rawValue),
+                "the header fields are still adopted")
+
+        // TWO-SIDED, IN THE SAME RUN: state the space on the stored side and the
+        // very same disagreement clears.
+        let control = key(account, "2")
+        let controlInserted = try await index.indexHeaders([record(
+            control, subject: "Statedspacezarquon subject", from: "stated@example.com",
+            rfc822MessageId: "<stated@example.com>", uidValidity: 100,
+            contentKeySpace: .uidAddressed)])
+        try #require(controlInserted == 1)
+        try await index.updateBody(contentKey: control, body: "Statedbodyzarquon text")
+        let controlSeeded = try await index.rawFTSBody(contentKey: control)
+        try #require(controlSeeded?.contains("Statedbodyzarquon") == true)
+
+        _ = try await index.indexHeaders([record(
+            control, subject: "Statedfreshzarquon subject", from: "fresh@example.com",
+            rfc822MessageId: "<fresh@example.com>", uidValidity: 200,
+            contentKeySpace: .uidAddressed)])
+        let controlBody = try await index.rawFTSBody(contentKey: control)
+        #expect(controlBody?.isEmpty == true,
+                "the control MUST clear — the only difference is that the stored side STATED its space")
+
+        try? await index.removeMessages(contentKeys: [target, control])
+    }
+
+    // MARK: The third arm — an older generation may not overwrite newer state
+
+    @Test("An older-generation write is refused outright — its header fields never land on top of newer state")
+    func olderGenerationWriteIsRefused() async throws {
+        let account = "ftsupsertrefuse-\(UUID().uuidString)"
+        let target = key(account, "1")
+        let marker = nowMs
+
+        let inserted = try await index.indexHeaders([record(
+            target, subject: "Newergenzarquon subject", from: "newer@example.com",
+            rfc822MessageId: "<gen@example.com>", uidValidity: 100,
+            resetAtMs: marker, contentKeySpace: .uidAddressed)])
+        try #require(inserted == 1)
+
+        // A writer that carries NO reset marker against a stored one is an OLDER
+        // generation by `resetMarkerOrder`'s ordering, and must not land.
+        let refused = try await index.indexHeaders([record(
+            target, subject: "Oldergenzarquon subject", from: "older@example.com",
+            rfc822MessageId: "<gen@example.com>", uidValidity: 100,
+            contentKeySpace: .uidAddressed)])
+        #expect(refused == 0)
+        let newerHits = try await hits("newergenzarquon")
+        let olderHits = try await hits("oldergenzarquon")
+        #expect(newerHits.contains(target.rawValue),
+                "the newer generation's subject must still answer")
+        #expect(olderHits.contains(target.rawValue) == false,
+                "an older generation's subject must NOT overwrite it")
+
+        // TWO-SIDED, IN THE SAME RUN: a strictly newer marker IS adopted, so the
+        // refusal above is an ordering rule and not a re-introduced skip-if-present.
+        _ = try await index.indexHeaders([record(
+            target, subject: "Newestgenzarquon subject", from: "newest@example.com",
+            rfc822MessageId: "<gen@example.com>", uidValidity: 100,
+            resetAtMs: marker + 1000, contentKeySpace: .uidAddressed)])
+        let newestHits = try await hits("newestgenzarquon")
+        let stillNewerHits = try await hits("newergenzarquon")
+        #expect(newestHits.contains(target.rawValue),
+                "a strictly newer generation MUST be adopted")
+        #expect(stillNewerHits.contains(target.rawValue) == false,
+                "and it must replace the previous subject, not sit alongside it")
+
+        try? await index.removeMessages(contentKeys: [target])
     }
 }
