@@ -218,4 +218,132 @@ struct AuthedHTTPNetworkTests {
         }
         #expect(seenBody == payload)
     }
+
+    // MARK: - T4.H1 — requestPreservingBadRequestBody
+    //
+    // A narrow opt-in: on a final 400 it throws `.networkErrorWithBody` carrying
+    // the raw bytes so an action-path caller can classify the provider's error
+    // payload structurally. Every other status, and every ordinary call site,
+    // keeps throwing the bodyless `.networkError` unchanged.
+
+    @Test("requestPreservingBadRequestBody throws networkErrorWithBody carrying the whole 400 body")
+    func preservingBadRequestBodyCarries400Body() async {
+        let serverBody = Data(#"{"error":{"code":400,"message":"Invalid label: Label_9"}}"#.utf8)
+        let recorder = Recorder(responses: [(400, serverBody)])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let http = AuthedHTTP(auth: auth, retry: .gmail, logLabel: nil, session: session)
+
+        do {
+            _ = try await http.requestPreservingBadRequestBody(
+                url: "https://example.test/v1/messages/modify", method: "POST", body: Data("{}".utf8)
+            )
+            Issue.record("Expected a 400 throw")
+        } catch let HTTPError.networkErrorWithBody(statusCode: s, body: b) {
+            #expect(s == 400)
+            #expect(b == serverBody)
+        } catch {
+            Issue.record("Wrong error: \(error)")
+        }
+        #expect(auth.refreshCount == 0)
+    }
+
+    @Test("requestPreservingBadRequestBody throws bodyless networkError for a non-400 failure")
+    func preservingBadRequestBodyLeavesNon400Bodyless() async {
+        // 500 carries a body on the wire too, but the opt-in converts only 400 —
+        // widening it would silently change how every non-400 failure classifies.
+        let recorder = Recorder(responses: [(500, Data("upstream unavailable".utf8))])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session)
+
+        do {
+            _ = try await http.requestPreservingBadRequestBody(
+                url: "https://example.test/v1/messages/move", method: "POST", body: Data("{}".utf8)
+            )
+            Issue.record("Expected a 500 throw")
+        } catch let HTTPError.networkError(statusCode: s) {
+            #expect(s == 500)
+        } catch {
+            Issue.record("Wrong error: \(error)")
+        }
+    }
+
+    @Test("requestPreservingBadRequestBody falls back to bodyless networkError when the 400 body is empty")
+    func preservingBadRequestBodyEmpty400IsBodyless() async {
+        let recorder = Recorder(responses: [(400, Data())])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session)
+
+        do {
+            _ = try await http.requestPreservingBadRequestBody(
+                url: "https://example.test/v1/messages/move", method: "POST", body: Data("{}".utf8)
+            )
+            Issue.record("Expected a 400 throw")
+        } catch let HTTPError.networkError(statusCode: s) {
+            #expect(s == 400)
+        } catch {
+            Issue.record("Wrong error: \(error)")
+        }
+    }
+
+    @Test("requestPreservingBadRequestBody returns the response data unchanged on success")
+    func preservingBadRequestBodySuccessPassesThrough() async throws {
+        let payload = Data(#"{"id":"m1"}"#.utf8)
+        let recorder = Recorder(responses: [(200, payload)])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session)
+
+        let data = try await http.requestPreservingBadRequestBody(
+            url: "https://example.test/v1/messages/modify", method: "POST", body: Data("{}".utf8)
+        )
+        #expect(data == payload)
+        #expect(recorder.requestCount == 1)
+    }
+
+    @Test("requestPreservingBadRequestBody refreshes once on 401 then preserves the retried 400 body")
+    func preservingBadRequestBodyPreservesPostRefresh400() async {
+        let serverBody = Data(#"{"error":{"code":"ErrorInvalidIdMalformed"}}"#.utf8)
+        let recorder = Recorder(responses: [(401, Data()), (400, serverBody)])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "old", nextRefresh: "new")
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session)
+
+        do {
+            _ = try await http.requestPreservingBadRequestBody(
+                url: "https://example.test/v1/messages/move", method: "POST", body: Data("{}".utf8)
+            )
+            Issue.record("Expected a 400 throw")
+        } catch let HTTPError.networkErrorWithBody(statusCode: s, body: b) {
+            #expect(s == 400)
+            #expect(b == serverBody)
+        } catch {
+            Issue.record("Wrong error: \(error)")
+        }
+        #expect(auth.refreshCount == 1)
+        #expect(recorder.requestCount == 2)
+        guard recorder.requestCount == 2 else { return }
+        #expect(recorder.requests[1].value(forHTTPHeaderField: "Authorization") == "Bearer new")
+    }
+
+    @Test("Ordinary get/post still throw the bodyless networkError on 400 — the opt-in is additive")
+    func ordinaryRequestStillBodylessOn400() async {
+        // Pins that T4.H1 changed nothing for existing consumers, which match on
+        // `HTTPError.networkError(statusCode: 400)`.
+        let recorder = Recorder(responses: [(400, Data(#"{"error":"nope"}"#.utf8))])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session)
+
+        do {
+            _ = try await http.post("https://example.test/v1/messages/move", body: Data("{}".utf8))
+            Issue.record("Expected a 400 throw")
+        } catch let HTTPError.networkError(statusCode: s) {
+            #expect(s == 400)
+        } catch {
+            Issue.record("Wrong error: \(error)")
+        }
+    }
 }

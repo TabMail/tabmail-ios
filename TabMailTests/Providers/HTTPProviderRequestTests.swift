@@ -211,6 +211,111 @@ struct HTTPProviderRequestTests {
         #expect(nilResult.data == nil)
         #expect(nilResult.statusCode == 404)
     }
+
+    // MARK: - T4.H1 — a non-2xx body must survive to the caller
+    //
+    // Before T4.H1 the failure body was read off the wire and dropped on the
+    // floor, so every downstream classifier had to guess from the status code
+    // alone. These pin the INVARIANT ("the bytes the server sent with a
+    // failure reach the caller, whole"), not the mechanism.
+
+    @Test("A non-2xx response preserves the raw error body while data stays nil")
+    func nonSuccessPreservesErrorBody() async throws {
+        let session = mockSession()
+        let serverBody = Data(#"{"error":{"code":400,"message":"Invalid label: Label_9"}}"#.utf8)
+        MockURLProtocol.handler = { request in
+            return (mockResponse(url: request.url!.absoluteString, statusCode: 400), serverBody)
+        }
+
+        let result = try await performHTTPRequest(
+            url: "https://api.test.com/messages/modify", method: "POST", body: nil,
+            token: "tok", session: session
+        )
+        // `data` semantics are unchanged — failures still surface nil there.
+        #expect(result.data == nil)
+        #expect(result.statusCode == 400)
+        #expect(result.errorBody == serverBody)
+    }
+
+    @Test("A 5xx response also preserves its error body")
+    func serverErrorPreservesErrorBody() async throws {
+        let session = mockSession()
+        let serverBody = Data("upstream unavailable".utf8)
+        MockURLProtocol.handler = { request in
+            return (mockResponse(url: request.url!.absoluteString, statusCode: 503), serverBody)
+        }
+
+        let result = try await performHTTPRequest(
+            url: "https://api.test.com/data", method: "GET", body: nil,
+            token: "tok", session: session
+        )
+        #expect(result.data == nil)
+        #expect(result.statusCode == 503)
+        #expect(result.errorBody == serverBody)
+    }
+
+    @Test("An empty non-2xx body leaves errorBody nil rather than empty Data")
+    func emptyErrorBodyStaysNil() async throws {
+        let session = mockSession()
+        MockURLProtocol.handler = { request in
+            return (mockResponse(url: request.url!.absoluteString, statusCode: 400), Data())
+        }
+
+        let result = try await performHTTPRequest(
+            url: "https://api.test.com/data", method: "GET", body: nil,
+            token: "tok", session: session
+        )
+        #expect(result.statusCode == 400)
+        // nil, not Data() — "no payload to classify" must be distinguishable
+        // from "a payload that happens to be zero bytes".
+        #expect(result.errorBody == nil)
+    }
+
+    @Test("A 2xx response leaves errorBody nil — success payloads belong in data")
+    func successLeavesErrorBodyNil() async throws {
+        let session = mockSession()
+        MockURLProtocol.handler = { request in
+            return (mockResponse(url: request.url!.absoluteString, statusCode: 200), Data("ok".utf8))
+        }
+
+        let result = try await performHTTPRequest(
+            url: "https://api.test.com/data", method: "GET", body: nil,
+            token: "tok", session: session
+        )
+        #expect(result.data != nil)
+        #expect(result.errorBody == nil)
+    }
+
+    @Test("errorBody carries the whole body — the 500-character cap is the log line's, not the data's")
+    func errorBodyIsNeverTruncated() async throws {
+        let session = mockSession()
+        // Deliberately far past the 500-character prefix `performHTTPRequest`
+        // applies to its human-readable log line, so a body-side cap would show up.
+        let filler = String(repeating: "x", count: 4096)
+        let serverBody = Data(#"{"error":{"message":"\#(filler)"}}"#.utf8)
+        MockURLProtocol.handler = { request in
+            return (mockResponse(url: request.url!.absoluteString, statusCode: 400), serverBody)
+        }
+
+        // `logLabel` non-nil so the capped log path actually runs alongside the capture.
+        let result = try await performHTTPRequest(
+            url: "https://api.test.com/data", method: "GET", body: nil,
+            token: "tok", session: session, logLabel: "T4.H1"
+        )
+        #expect(result.errorBody?.count == serverBody.count)
+        #expect(result.errorBody == serverBody)
+    }
+
+    @Test("HTTPRequestResult.errorBody defaults to nil so pre-existing call sites are unchanged")
+    func errorBodyDefaultsToNil() {
+        // The two-argument memberwise init must still exist — every production and
+        // test construction predating T4.H1 relies on it.
+        let result = HTTPRequestResult(data: nil, statusCode: 500)
+        #expect(result.errorBody == nil)
+
+        let withBody = HTTPRequestResult(data: nil, statusCode: 400, errorBody: Data("payload".utf8))
+        #expect(withBody.errorBody == Data("payload".utf8))
+    }
 }
 
 // MARK: - Retry Mock (separate from performHTTPRequest mock to avoid static handler conflicts)

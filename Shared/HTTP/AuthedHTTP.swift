@@ -76,6 +76,47 @@ struct AuthedHTTP: Sendable {
         return HTTPAuthedResult(data: result.data, statusCode: result.statusCode)
     }
 
+    /// Like `post`/`get`/`patch`, but on a final (post-401-retry) `400`
+    /// failure throws `HTTPError.networkErrorWithBody` carrying the raw
+    /// response bytes instead of the bodyless `.networkError`. Every other
+    /// failure status still throws the ordinary `.networkError` — this is a
+    /// narrow opt-in for the handful of action-path call sites (Gmail label
+    /// modify/lookup, Graph move) that must structurally classify a `400`
+    /// error payload rather than guess from the status code alone (Law 4:
+    /// only a provably authoritative signal may be treated as stale).
+    func requestPreservingBadRequestBody(
+        url: String,
+        method: String,
+        body: Data?,
+        extraHeaders: [String: String] = [:]
+    ) async throws -> Data {
+        var token = try await currentOrRefresh()
+        var result = try await performHTTPRequestWithRetry(
+            url: url, method: method, body: body, token: token,
+            extraHeaders: extraHeaders,
+            retryableStatusCodes: retry.retryableStatusCodes,
+            maxAttempts: retry.maxAttempts, initialDelay: retry.initialDelay,
+            session: session,
+            logLabel: logLabel
+        )
+
+        if result.statusCode == 401 {
+            token = try await auth.refresh()
+            result = try await performHTTPRequest(
+                url: url, method: method, body: body, token: token,
+                extraHeaders: extraHeaders, session: session, logLabel: logLabel
+            )
+        }
+
+        if let data = result.data {
+            return data
+        }
+        if result.statusCode == 400, let errorBody = result.errorBody {
+            throw HTTPError.networkErrorWithBody(statusCode: 400, body: errorBody)
+        }
+        throw HTTPError.networkError(statusCode: result.statusCode)
+    }
+
     // MARK: - Internal
 
     private func request(url: String, method: String, body: Data?, extraHeaders: [String: String]) async throws -> Data {
