@@ -236,15 +236,43 @@ extension AccountManager {
                         // compatibility, nil fail-open, claimFrontier/global FIFO,
                         // and demotion machinery. ⚑ NO REFERENCE — INVENTED: v3's
                         // DB provider classification and fail-closed shape.
+                        //
+                        // 🚨 EXACTLY ONE ARM OF THIS CHECKPOINT MAY DELETE, and it is
+                        // the POSITIVE mismatch — two epochs that are both real
+                        // (`nz-number`) and disagree. That is exit 4 of
+                        // `Companion/Rules/Active/never-drop-user-intention.md`:
+                        // a PROVEN id reset in the operation's own address space.
+                        // Everything else this guard can observe — a malformed or
+                        // non-canonical provider address, an unstamped or zero op
+                        // epoch, a missing `Folder` row, a folder whose epoch is
+                        // unknown or zero, or a folder mid-reset — is an ABSENCE OF
+                        // EVIDENCE. "We could not determine the answer" is not an
+                        // exit: those ops are NOT claimed this pass and stay durably
+                        // `queued`, exactly as they would across an offline window.
+                        // The predecessor deleted on all of them, which is the single
+                        // most repeated defect class in this codebase's history.
+                        //
+                        // `.setTag`/`.removeTag` are deliberately NOT in this set:
+                        // action tags are LOCAL-ONLY (ADR-IOS-036) and their executor
+                        // arm is a `break`, so such an op carries no provider address
+                        // for a provider-address checkpoint to judge. Subjecting them
+                        // to it made every ReplyDetect `reply→none` op (7 producers,
+                        // all enqueueing an rfc822 `stableId`) a deterministic drop on
+                        // IMAP; leaving them in while the arm above stopped deleting
+                        // would instead accumulate unclaimable rows forever.
                         let nonDraftTypes: Set<OperationType> = [
                             .archive, .delete, .move,
                             .markRead, .markUnread, .markFlagged, .markUnflagged,
-                            .setTag, .removeTag, .markReplied, .markForwarded,
+                            .markReplied, .markForwarded,
                             .addUserLabel, .removeUserLabel,
                         ]
                         if nonDraftTypes.contains(fetched.type) {
                             guard let account = try Account.fetchOne(db, key: fetched.accountId) else {
-                                _ = try PendingOperation.deleteOne(db, key: fetched.id)
+                                // A missing account row tells us nothing about the
+                                // server's state. Leave the intention queued.
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Queue] Checkpoint A skipped \(fetched.id.prefix(8)) — no account row for \(fetched.accountId.prefix(8))")
+                                }
                                 return nil
                             }
                             let isDemo = fetched.accountId == DemoSeed.demoAccountId
@@ -260,13 +288,25 @@ extension AccountManager {
                                       let sourceFolder,
                                       sourceFolder.uidValidityResetPendingAt == nil,
                                       let live = sourceFolder.lastKnownUidValidity,
-                                      let liveUInt = UInt32(exactly: live), liveUInt > 0,
-                                      live == stamped else {
+                                      let liveUInt = UInt32(exactly: live), liveUInt > 0 else {
+                                    // ABSENCE OF EVIDENCE — never a drop. The row is
+                                    // left `queued` and simply not claimed this pass.
+                                    BackgroundSyncLogger.log(
+                                        "[Queue] Checkpoint A skipped \(fetched.id.prefix(8)) " +
+                                        "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
+                                        "provider address or UIDVALIDITY not established; op stays queued")
+                                    return nil
+                                }
+                                if live != stamped {
+                                    // EXIT 4 — a PROVEN turnover in this op's own
+                                    // source address space. Every retry would fail
+                                    // identically and forever, and executing under a
+                                    // numbering the op never observed is C3.
                                     _ = try PendingOperation.deleteOne(db, key: fetched.id)
                                     BackgroundSyncLogger.log(
                                         "[Queue] Checkpoint A refused \(fetched.id.prefix(8)) " +
                                         "(\(fetched.type.rawValue), \(fetched.folderPath)) — " +
-                                        "invalid provider address or UIDVALIDITY; dropped whole before provider I/O")
+                                        "UIDVALIDITY moved \(stamped) → \(live); dropped whole before provider I/O")
                                     return nil
                                 }
                             }
@@ -429,8 +469,23 @@ extension AccountManager {
         let opMsgCount = currentOp.messageIds.count
 
         do {
-            try await withTimeout(seconds: SyncConfig.pendingOperationTimeoutSeconds) {
+            let provenMembers = try await withTimeout(
+                seconds: SyncConfig.pendingOperationTimeoutSeconds
+            ) { () -> [String]? in
                 try await self.executeOperation(currentOp, provider: provider)
+            }
+            // 🚨 RETIREMENT IS PER MEMBER, NEVER PER BATCH. A provider that
+            // proves only SOME members completed has told us nothing about the
+            // rest — they were never mutated, and retiring the whole row would
+            // discard their user intention on an absence of evidence. Narrow the
+            // durable row to the unproven remainder instead; the proven members
+            // are retired, the rest stay queued and retry.
+            if let provenMembers, Set(provenMembers) != Set(currentOp.messageIds) {
+                let remaining = currentOp.messageIds.filter { !provenMembers.contains($0) }
+                await retirePartiallyCompletedOp(
+                    currentOp, provenMembers: provenMembers, remaining: remaining,
+                    context: context)
+                return .haltLane
             }
             // TOCTOU fix: record recentActions BEFORE deleting PendingOp.
             // Sync engine has two guards against re-inserting moved messages:
@@ -535,7 +590,33 @@ extension AccountManager {
                     do {
                         try await dbPool.write { db in
                             for msgId in currentOp.messageIds {
-                                var splitOp = PendingOperation(type: currentOp.type, messageIds: [msgId], accountId: currentOp.accountId, folderPath: currentOp.folderPath, destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue)
+                                var splitOp = PendingOperation(
+                                    type: currentOp.type, messageIds: [msgId],
+                                    accountId: currentOp.accountId, folderPath: currentOp.folderPath,
+                                    destinationPath: currentOp.destinationPath, tagValue: currentOp.tagValue,
+                                    userLabelId: currentOp.userLabelId,
+                                    // 🚨 THE ADMISSION EPOCH MUST TRAVEL WITH THE CHILD.
+                                    // The parent is deleted in this same transaction, so
+                                    // anything not copied here is destroyed. A child built
+                                    // without this stamp is one checkpoint A cannot admit —
+                                    // and before the never-drop fix, one checkpoint A
+                                    // DELETED, silently reverting the whole gesture on the
+                                    // next sync. The children are the SAME user intention,
+                                    // re-shaped: they are admitted under exactly the epoch
+                                    // and identity the parent was.
+                                    observedUidValidity: currentOp.observedUidValidity,
+                                    draftServerUidValidity: currentOp.draftServerUidValidity,
+                                    instanceEpoch: currentOp.instanceEpoch,
+                                    draftId: currentOp.draftId)
+                                // Carried as the stored raw value rather than through the
+                                // typed initializer parameter: an unrecognized raw string
+                                // must survive verbatim, not decode to `nil`.
+                                splitOp.draftDeleteAddressKind = currentOp.draftDeleteAddressKind
+                                // The parent was claimed, so provider I/O may already have
+                                // started for these members. Undo may only annihilate an
+                                // unattempted bundle; a child that forgot this would be
+                                // annihilable after the wire was touched.
+                                splitOp.everAttempted = currentOp.everAttempted
                                 // Split ops inherit the batch's queue position — they are
                                 // the SAME user intention, re-shaped. Without this, the
                                 // default `PendingOperation.init` createdAt (Date()) would
@@ -601,12 +682,28 @@ extension AccountManager {
             // branch below — that branch's whole meaning is "the server told us the
             // message is gone", and nothing here ever asked the server.
             //
+            // ⚠ SCOPE, CORRECTED (audit round 1, finding B-1). Three premises this
+            // comment used to state as unconditional were `.deleteDraft`-specific and
+            // became FALSE when `IMAPProvider.move` started raising this error too:
+            // "refused BEFORE touching the wire" (the COPY had already gone out),
+            // "DETERMINISTIC — the same string will be refused on every future drain"
+            // (it depended on the SERVER's UIDPLUS capability and on whether it chose
+            // to send `COPYUID`, neither of which is a property of the id), and
+            // "`.deleteDraft` — the only op that raises this error". A refusal that
+            // depends on server behaviour is an ABSENCE OF EVIDENCE, not an
+            // authoritative verdict on an identity, and retiring an op on it is a
+            // never-drop violation. `IMAPProvider.move` therefore no longer raises
+            // this error at all: both of its evidence gates now raise the private,
+            // unclassified `IMAPMoveEvidenceUnavailable`, which lands in the generic
+            // retry arm at the bottom of this function. The premises below are once
+            // again true of every op that reaches here.
+            //
             // Ported from `v2final:AccountManagerQueue`'s `.deleteDraft` arm
             // ("TERMINAL drop of a provider-authoritative identity refusal").
             if case ProviderError.actionIdentityResolutionFailed(let refusedId) = error {
                 // ⚑ NEVER SPLIT THIS ONE. A revision of this branch, on seeing an op
                 // with more than one id, split it into one op per id so "the sibling the
-                // provider CAN verify" could execute. For `.deleteDraft` — the only op
+                // provider CAN verify" could execute. For `.deleteDraft` — the op class
                 // that raises this error — the ids are not siblings: slot 0 is the
                 // ADDRESS and slot 1 is the IDENTITY *of the same draft*, and splitting
                 // them manufactured an identity-only op that resolves by Message-ID
@@ -650,25 +747,26 @@ extension AccountManager {
                 context.diagnosedOpIds.insert(currentOp.id)
                 await logStuckOpDiagnostic(currentOp, error: error)
             }
-            // Self-heal: a .move op whose destination Folder doesn't exist locally
-            // is unsalvageable on retry. This happens when the account's folder list
-            // was re-ingested (e.g., IMAP→OAuth migration changing "Deleted Messages"
-            // → "TRASH") after the op was queued, leaving the op pointing at an
-            // obsolete path. Drop the op rather than retry forever — the original
-            // user intent ("remove from source folder") is honored by remote-state-
-            // wins-on-conflict (ADR-IOS-001): if server already moved/deleted the
-            // message, sync brings the truth in; if not, the user can re-issue.
-            if currentOp.type == .move, let destPath = currentOp.destinationPath {
+            // 🚨 A LOCALLY-MISSING DESTINATION FOLDER IS NOT PROVIDER AUTHORITY.
+            // This arm used to DELETE a `.move` op whose destination `Folder` row
+            // was absent from GRDB, calling it a "self-heal" for a re-ingested
+            // folder list (e.g. IMAP→OAuth renaming "Deleted Messages" → "TRASH").
+            // But the local folder table is OUR cache, not the server's answer:
+            // the row is equally absent during a first sync, after a folder-list
+            // read failed, and for any account whose folders have not been
+            // enumerated yet. Dropping on it retires a durable intention on an
+            // absence of evidence — outside the four exits. The op stays queued and
+            // retries; if the folder never returns the op parks visibly rather than
+            // vanishing, and a real server-side "destination is gone" is answered by
+            // `IMAPProvider.move`'s LIST-confirmed `IMAPActionMailboxAbsent` arm,
+            // which IS provider-authoritative. Diagnostic retained.
+            if currentOp.type == .move, let destPath = currentOp.destinationPath,
+               DebugModeManager.isLoggingEnabled() {
                 let destMissing: Bool = (try? await dbPool.read { db in
                     try Folder.fetchOne(db, key: "\(currentOp.accountId):\(destPath)") == nil
                 }) ?? false
                 if destMissing {
-                    print("[Queue] Self-heal: dropping \(opType) — destination Folder missing locally: \(currentOp.accountId):\(destPath)")
-                    try? await retryWrite(dbPool, label: "Queue") { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    }
-                    context.executedAny = true
-                    return .proceed
+                    print("[Queue] \(opType) destination Folder missing locally: \(currentOp.accountId):\(destPath) — op stays queued (local absence is not provider authority)")
                 }
             }
             try? await retryWrite(dbPool, label: "Queue") { db in
@@ -684,6 +782,74 @@ extension AccountManager {
             context.failedAccounts.insert(currentOp.accountId)
             return .haltLane
         }
+    }
+
+    /// Retire ONLY the members a provider positively proved it completed, and
+    /// leave the remainder durably queued.
+    ///
+    /// The batch is one row, but it is N user intentions. A provider that
+    /// mutated some members and could not prove the others (IMAP's `COPYUID`
+    /// names a subset — RFC 4315 §3 makes reporting a MAY, and RFC 3501 §6.4.8
+    /// lets `UID COPY` silently ignore a UID that is already gone) has said
+    /// nothing about the unproven ones. Deleting the whole row there discards
+    /// their intention on an absence of evidence; re-running the whole batch
+    /// would instead re-copy the proven members and duplicate them at the
+    /// destination. Narrowing is the only shape that does neither.
+    private func retirePartiallyCompletedOp(
+        _ currentOp: PendingOperation,
+        provenMembers: [String],
+        remaining: [String],
+        context: DrainContext
+    ) async {
+        print("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
+        // Same TOCTOU ordering as the whole-op success path: the sync-protection
+        // entry for a retired member is recorded BEFORE its id leaves the row.
+        var completedIds: [String] = provenMembers
+        if let infos = try? await dbPool.read({ db -> [(String?, String?)] in
+            var out: [(String?, String?)] = []
+            for msgId in provenMembers {
+                let normalized = EmailFilter.normalizeMessageId(msgId)
+                let header = try MessageHeader
+                    .filter(
+                        (Column("messageId") == msgId || Column("rfc822MessageId") == normalized) &&
+                        Column("accountId") == currentOp.accountId
+                    )
+                    .fetchOne(db)
+                out.append((header?.rfc822MessageId, header?.messageId))
+            }
+            return out
+        }) {
+            for (rfc822, numericId) in infos {
+                if let rfc822 { completedIds.append(rfc822) }
+                if let numericId { completedIds.append(numericId) }
+            }
+        }
+        recordRecentlyCompleted(messageIds: completedIds)
+
+        do {
+            try await retryWrite(dbPool, label: "Queue") { db in
+                guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else { return }
+                fresh.messageIds = remaining
+                fresh.status = PendingStatus.queued.rawValue
+                try fresh.save(db)
+            }
+        } catch {
+            // The narrowing write failed. NEVER leave the row `inFlight` (it
+            // would only unstick at the next launch's crash recovery) and never
+            // delete it: requeue the ORIGINAL bundle. A retry re-copies the
+            // proven members — a duplicate at the destination, which this
+            // codebase prefers over a dropped intention.
+            print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — requeuing the whole bundle (may duplicate already-moved members)")
+            try? await retryWrite(dbPool, label: "Queue") { db in
+                var queued = currentOp
+                queued.status = PendingStatus.queued.rawValue
+                try queued.save(db)
+            }
+        }
+        if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
+            context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
+        }
+        context.executedAny = true
     }
 
     /// Returns true if the error indicates the message no longer exists (conflict — drop op).
@@ -869,49 +1035,52 @@ extension AccountManager {
         print("[QueueDiag] === end op=\(op.id) ===")
     }
 
-    /// Returns true if the error indicates the operation is permanently invalid and should be dropped.
-    /// E.g., Gmail rejects label modifications on system labels like DRAFT — these will never succeed.
-    /// Only matches 400-level errors from REST providers (Gmail/Exchange) to avoid false positives.
+    /// Returns true only when the provider's own response STRUCTURALLY PROVES the
+    /// operation can never succeed — e.g. Gmail rejecting a label modification on
+    /// a system label like `DRAFT`. Such a `400` is a provider-authoritative
+    /// no-op (exit 2) and retires the durable row.
     ///
-    /// Must accept TWO underlying-error shapes — they come from different throw sites:
-    ///   - `HTTPError.networkError(statusCode: 400)` — thrown by `request()` helpers via
-    ///     `catch let e as HTTPError { throw ProviderError.networkError(underlying: e) }`.
-    ///     This is a plain Swift enum; its NSError bridge gives `domain="TabMail.HTTPError"
-    ///     code=1` (the enum case ordinal), NOT `code=400`. So the NSError-domain check
-    ///     below would never match this shape — pattern-match the enum directly.
-    ///   - `NSError(domain: "Gmail"|"Exchange", code: 400)` — thrown by retry-aware paths.
-    ///   - `HTTPError.networkErrorWithBody(statusCode: 400, body:)` — thrown by the
-    ///     body-preserving opt-in (`AuthedHTTP.requestPreservingBadRequestBody`) that
-    ///     action-path call sites use so they can STRUCTURALLY classify a `400` instead
-    ///     of guessing from the status code. It is the SAME failure as
-    ///     `.networkError(400)`, carrying the raw body in addition — so it MUST classify
-    ///     identically. When `GmailProvider.modifyMessage` switched to that helper, a
-    ///     matcher that only knew `.networkError` would have silently stopped matching
-    ///     and every unclassified Gmail action `400` would have been retried forever
-    ///     instead of dropped. Ordinal-appended enum case + status-only matcher is the
-    ///     "half-port drops the guard" shape; the two arms are kept deliberately
-    ///     symmetric so this cannot depend on which port lands first.
+    /// 🚨 A BARE STATUS CODE IS NOT A CLASSIFICATION. The predecessor returned
+    /// `true` for `HTTPError.networkError(400)`, for
+    /// `HTTPError.networkErrorWithBody(400, _)` with the body bound to `_`, and
+    /// for `NSError(domain: "Gmail"|"Exchange", code: 400)` — i.e. it retired the
+    /// user's intention on every `400`, INCLUDING the ones nothing had
+    /// classified. "The request was rejected and we do not know why" is an
+    /// absence of evidence, not the provider telling us the work is already done
+    /// or no longer applicable, and conflating the two is the exact clause-2
+    /// conflation `Companion/Rules/Active/never-drop-user-intention.md` forbids.
+    /// An unclassified `400` now falls through to the generic arm and retries —
+    /// forever, if the provider never explains itself, which is the correct
+    /// disposition for "we could not determine the answer". (`v2final` demotes
+    /// such a chain to its queue tail via `ProviderError.persistentActionFailure`;
+    /// v3 has no demote lane, so the cost of the honest classification is a
+    /// retrying row rather than a silently discarded gesture.)
+    ///
+    /// The only shape that still retires is the one a provider can be held to:
+    /// `HTTPError.networkErrorWithBody(400, body)` whose body decodes to Gmail's
+    /// documented structured error object and names a deterministic rejection —
+    /// see `GmailProvider.isAuthoritativeActionRejection`. That shape reaches
+    /// here through `AuthedHTTP.requestPreservingBadRequestBody`, which action
+    /// call sites opt into precisely so the body survives to be classified
+    /// instead of being guessed at from the status line.
     nonisolated func isPermanentlyInvalidError(_ error: Error) -> Bool {
-        if case ProviderError.networkError(let underlying) = error {
-            if case HTTPError.networkError(let statusCode) = underlying, statusCode == 400 {
-                return true
-            }
-            if case HTTPError.networkErrorWithBody(let statusCode, _) = underlying, statusCode == 400 {
-                return true
-            }
-            let ns = underlying as NSError
-            if ns.code == 400 && (ns.domain == "Gmail" || ns.domain == "Exchange") {
-                return true
-            }
-        }
-        return false
+        GmailProvider.isAuthoritativeActionRejection(error)
     }
 
-    func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws {
+    /// Dispatch one claimed op to its provider.
+    ///
+    /// RETURN VALUE — the subset of `op.messageIds` the provider POSITIVELY
+    /// PROVED it completed, or `nil` for "all of them". Only `IMAPProvider.move`
+    /// can currently return a strict subset: its source cleanup is authorized
+    /// per member by the server's own `COPYUID`, so a response naming fewer
+    /// members than were requested completed fewer members. `executeSingleOp`
+    /// retires exactly the proven members and leaves the rest durably queued —
+    /// retirement is per MEMBER, never per batch.
+    func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> [String]? {
         switch op.type {
         case .archive, .delete:
             // Legacy enum cases — all new ops use .move. No-op for any stale rows.
-            return
+            return nil
         case .move:
             guard let dest = op.destinationPath else {
                 print("[MoveTrace] ERROR: move op missing destinationPath")
@@ -922,20 +1091,22 @@ extension AccountManager {
             // to __GMAIL_ALL_MAIL__). Treating as success lets the op be cleaned up normally.
             guard op.folderPath != dest else {
                 print("[MoveTrace] executeOperation.move — no-op (source==dest): \(op.folderPath)")
-                return
+                return nil
             }
             let opAgeMin = Date().timeIntervalSince(op.createdAt) / 60
             print("[MoveTrace] executeOperation.move — msgIds=\(op.messageIds) from=\(op.folderPath) to=\(dest) provider=\(type(of: provider)) accountId=\(op.accountId) opId=\(op.id) retryCount=\(op.retryCount) ageMin=\(String(format: "%.1f", opAgeMin))")
             if let imap = provider as? IMAPProvider,
                let admitted = op.observedUidValidity,
                let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.move(
+                let proven = try await imap.move(
                     ids: op.messageIds, from: op.folderPath, to: dest,
                     admittedUidValidity: admittedUInt)
-            } else {
-                try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
+                print("[MoveTrace] executeOperation.move — completed for \(proven.count)/\(op.messageIds.count) member(s)")
+                return proven
             }
+            try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
             print("[MoveTrace] executeOperation.move — completed successfully")
+            return nil
         case .markRead:
             if let imap = provider as? IMAPProvider,
                let admitted = op.observedUidValidity,
@@ -982,19 +1153,32 @@ extension AccountManager {
             // queued rows flush cleanly. No provider write.
             break
         case .markReplied:
-            if let imap = provider as? IMAPProvider {
-                try await imap.markReplied(ids: op.messageIds, folder: op.folderPath)
+            // A1 — `v1.6.38` had a WORKING IMAP `markReplied` (`resolveUID` +
+            // `STORE \Answered`). v3 removed RFC-as-mutation-authority (D4), so
+            // the restoration is the same STORE addressed by the op's own proven
+            // provider address and admitted epoch. An op with no epoch is one
+            // checkpoint A never admits, so this arm is only reached WITH one.
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.markReplied(
+                    ids: op.messageIds, folder: op.folderPath,
+                    admittedUidValidity: admittedUInt)
             }
             // Gmail/Exchange REST APIs don't support \Answered flag — local state preserved by sync
         case .markForwarded:
-            if let imap = provider as? IMAPProvider {
-                try await imap.markForwarded(ids: op.messageIds, folder: op.folderPath)
+            if let imap = provider as? IMAPProvider,
+               let admitted = op.observedUidValidity,
+               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.markForwarded(
+                    ids: op.messageIds, folder: op.folderPath,
+                    admittedUidValidity: admittedUInt)
             }
             // Gmail/Exchange REST APIs don't support $Forwarded keyword — local state preserved by sync
         case .saveDraft:
             guard let draftId = op.draftId ?? op.messageIds.first,
                   let instanceEpoch = op.instanceEpoch,
-                  !instanceEpoch.isEmpty else { return }
+                  !instanceEpoch.isEmpty else { return nil }
             let disposition = try await DraftStore.shared.pushDraftToServer(
                 draftId: draftId,
                 expectedInstanceEpoch: instanceEpoch,
@@ -1006,7 +1190,7 @@ extension AccountManager {
                 print("[DraftQueue] Retiring save producer \(op.id) with disposition \(disposition)")
             }
         case .deleteDraft:
-            guard let encodedId = op.messageIds.first else { return }
+            guard let encodedId = op.messageIds.first else { return nil }
             let runtimeKind = Self.draftRuntimeIdentityKind(for: provider)
             let addressKind = op.draftDeleteAddressKind.flatMap(DraftDeleteAddressKind.init(rawValue:))
             let identity: DraftDeleteIdentity
@@ -1041,24 +1225,35 @@ extension AccountManager {
             }
             try await provider.deleteDraft(identity: identity)
         case .addUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return }
+            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return nil }
             if let gmail = provider as? GmailProvider {
                 try await gmail.modifyMessage(id: msgId, addLabelIds: [labelId])
             } else if provider is ExchangeProvider {
                 print("[Queue] addUserLabel not yet supported for Exchange")
-            } else if let imap = provider as? IMAPProvider {
-                try await imap.setUserLabel(messageId: msgId, keyword: labelId, add: true, folder: op.folderPath)
+            } else if let imap = provider as? IMAPProvider,
+                      let admitted = op.observedUidValidity,
+                      let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                // A1 — `v1.6.38`'s IMAP keyword STORE, re-addressed by the op's
+                // own provider address and admitted epoch (see `.markReplied`).
+                try await imap.setUserLabel(
+                    messageId: msgId, keyword: labelId, add: true,
+                    folder: op.folderPath, admittedUidValidity: admittedUInt)
             }
         case .removeUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return }
+            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return nil }
             if let gmail = provider as? GmailProvider {
                 try await gmail.modifyMessage(id: msgId, removeLabelIds: [labelId])
             } else if provider is ExchangeProvider {
                 print("[Queue] removeUserLabel not yet supported for Exchange")
-            } else if let imap = provider as? IMAPProvider {
-                try await imap.setUserLabel(messageId: msgId, keyword: labelId, add: false, folder: op.folderPath)
+            } else if let imap = provider as? IMAPProvider,
+                      let admitted = op.observedUidValidity,
+                      let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
+                try await imap.setUserLabel(
+                    messageId: msgId, keyword: labelId, add: false,
+                    folder: op.folderPath, admittedUidValidity: admittedUInt)
             }
         }
+        return nil
     }
 
     /// On app launch, recover from any crash during the previous session.

@@ -25,7 +25,7 @@ struct ExecuteOperationTests {
             destinationPath: "Archive"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.contains { $0.hasPrefix("move(") })
@@ -49,7 +49,7 @@ struct ExecuteOperationTests {
         )
 
         await #expect(throws: ProviderError.self) {
-            try await AccountManager.shared.executeOperation(op, provider: mock)
+            _ = try await AccountManager.shared.executeOperation(op, provider: mock)
         }
     }
 
@@ -65,7 +65,7 @@ struct ExecuteOperationTests {
             destinationPath: "Archive"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let moved = await mock.movedIds
         #expect(moved.isEmpty, "Self-move should be a no-op — provider.move should not be called")
@@ -85,7 +85,7 @@ struct ExecuteOperationTests {
         )
 
         await #expect(throws: ProviderError.self) {
-            try await AccountManager.shared.executeOperation(op, provider: mock)
+            _ = try await AccountManager.shared.executeOperation(op, provider: mock)
         }
     }
 
@@ -102,7 +102,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.contains { $0.hasPrefix("markRead(") })
@@ -123,7 +123,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let unreads = await mock.markedUnreadIds
         #expect(unreads.count == 1)
@@ -143,7 +143,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let flagged = await mock.markedFlaggedIds
         #expect(flagged.count == 1)
@@ -161,7 +161,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let flagged = await mock.markedFlaggedIds
         #expect(flagged.count == 1)
@@ -181,7 +181,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "Legacy archive should not call any provider method")
@@ -198,7 +198,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "Legacy delete should not call any provider method")
@@ -219,7 +219,7 @@ struct ExecuteOperationTests {
         )
 
         // Should not throw — early returns with a print
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "setTag with nil tagValue should early-return without calling provider")
@@ -237,7 +237,7 @@ struct ExecuteOperationTests {
             tagValue: "reply"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty)
@@ -254,7 +254,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty)
@@ -273,7 +273,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "markReplied with non-IMAP provider should be a no-op")
@@ -290,7 +290,7 @@ struct ExecuteOperationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "markForwarded with non-IMAP provider should be a no-op")

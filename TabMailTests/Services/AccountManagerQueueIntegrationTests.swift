@@ -27,7 +27,7 @@ struct AccountManagerQueueIntegrationTests {
             destinationPath: "Trash"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let moved = await mock.movedIds
         #expect(moved.count == 1)
@@ -47,7 +47,7 @@ struct AccountManagerQueueIntegrationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let reads = await mock.markedReadIds
         #expect(reads.count == 1)
@@ -66,7 +66,7 @@ struct AccountManagerQueueIntegrationTests {
             folderPath: "Sent"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let unreads = await mock.markedUnreadIds
         #expect(unreads.count == 1)
@@ -85,7 +85,7 @@ struct AccountManagerQueueIntegrationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let flagged = await mock.markedFlaggedIds
         #expect(flagged.count == 1)
@@ -105,7 +105,7 @@ struct AccountManagerQueueIntegrationTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let flagged = await mock.markedFlaggedIds
         #expect(flagged.count == 1)
@@ -126,7 +126,7 @@ struct AccountManagerQueueIntegrationTests {
         )
 
         await #expect(throws: ProviderError.self) {
-            try await AccountManager.shared.executeOperation(op, provider: mock)
+            _ = try await AccountManager.shared.executeOperation(op, provider: mock)
         }
     }
 
@@ -144,7 +144,7 @@ struct AccountManagerQueueIntegrationTests {
         )
 
         await #expect(throws: ProviderError.self) {
-            try await AccountManager.shared.executeOperation(op, provider: mock)
+            _ = try await AccountManager.shared.executeOperation(op, provider: mock)
         }
     }
 

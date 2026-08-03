@@ -117,9 +117,27 @@ struct IMAPActionEpochCheckpointTests {
         }
     }
 
-    @Test("A native IMAP action with missing, zero, or mismatched admitted UIDVALIDITY is dropped before provider I/O")
+    /// 🚨 CORRECTED (audit round 1, finding A-3). This test previously asserted
+    /// `operations(f.pool).isEmpty` — it BLESSED the defect, requiring that an
+    /// op with a MISSING or ZERO admitted epoch be deleted alongside the one
+    /// with a proven mismatch.
+    ///
+    /// The three rows exercise the two sides of the closure and must therefore
+    /// end in two different states:
+    ///
+    /// * `nil` and `0` are an ABSENCE of evidence. We do not know whether this
+    ///   op's address space moved, and "we could not determine the answer" is
+    ///   not one of the four exits. They stay durably queued forever.
+    /// * `9` against a live `10` is a PROVEN turnover in the op's own source
+    ///   address space — exit 4, and the ONLY arm of checkpoint A permitted to
+    ///   delete.
+    ///
+    /// Asserting all three states in one drain also pins that retirement is
+    /// decided PER OP: a proven-dead sibling in the same pass may not take the
+    /// undetermined ones with it.
+    @Test("Checkpoint A retires only the proven epoch mismatch and leaves unknown-epoch ops queued")
     @MainActor
-    func invalidAdmissionStampDropsBeforeProvider() async throws {
+    func onlyProvenEpochMismatchRetiresAtCheckpointA() async throws {
         let f = try fixture()
         let provider = MockEmailProvider(staleWindowMode: .uid)
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: provider)
@@ -132,14 +150,24 @@ struct IMAPActionEpochCheckpointTests {
 
         await AccountManager.shared.drainPendingQueue()
 
+        // No epoch was ever agreed, so nothing may reach the wire either way.
         #expect(await provider.callLog.isEmpty)
-        #expect(try operations(f.pool).isEmpty)
+        let surviving = try operations(f.pool)
+        #expect(surviving.count == 2)
+        guard surviving.count == 2 else { await finish(f); return }
+        #expect(Set(surviving.flatMap(\.messageIds)) == Set(["1", "2"]))
         await finish(f)
     }
 
-    @Test("A mixed native and RFC IMAP payload is dropped whole without splitting or provider I/O")
+    /// 🚨 CORRECTED (audit round 1, finding A-3) — was `mixedPayloadDropsWhole`,
+    /// which asserted the op was deleted. A member that is not a canonical UID
+    /// means checkpoint A cannot compare this op against ANY address space, so
+    /// it has no evidence to act on. The two properties that matter are that it
+    /// performs no I/O and that it does not split the batch; deleting it was
+    /// never required by either, and is a silent loss of the user's gesture.
+    @Test("A mixed native and RFC IMAP payload stays queued whole, without splitting or provider I/O")
     @MainActor
-    func mixedPayloadDropsWhole() async throws {
+    func mixedPayloadParksWholeWithoutSplitting() async throws {
         let f = try fixture()
         let provider = MockEmailProvider(staleWindowMode: .uid)
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: provider)
@@ -151,13 +179,28 @@ struct IMAPActionEpochCheckpointTests {
         await AccountManager.shared.drainPendingQueue()
 
         #expect(await provider.callLog.isEmpty)
-        #expect(try operations(f.pool).isEmpty)
+        let surviving = try operations(f.pool)
+        #expect(surviving.count == 1)
+        guard surviving.count == 1 else { await finish(f); return }
+        #expect(surviving[0].messageIds == ["1", "message@example.com"])
         await finish(f)
     }
 
-    @Test("RFC-only nil-epoch IMAP replied, forwarded, add-label, and remove-label operations drop whole before duplicate-RFC provider I/O")
+    /// 🚨 CORRECTED (audit round 1, findings A-3 + A-6) — was
+    /// `rfcOnlyMutatingBypassesDropWhole`, which asserted these four ops were
+    /// deleted. That is precisely the deterministic drop A-6 fixes at the
+    /// producers: a `.markReplied` / `.markForwarded` / label op admitted with an
+    /// rfc822 id and no epoch was accepted by the UI and then destroyed by the
+    /// next drain.
+    ///
+    /// The C3 half of the original test is the half worth keeping and is
+    /// retained verbatim: with two INBOX messages sharing one Message-ID, a
+    /// provider that tried to resolve the RFC id would mutate an arbitrary one
+    /// of them. Nothing may reach the wire. But the op must SURVIVE that
+    /// refusal — parked, retryable, still the user's intention.
+    @Test("RFC-only nil-epoch replied, forwarded, add-label and remove-label operations stay queued with no duplicate-RFC provider I/O")
     @MainActor
-    func rfcOnlyMutatingBypassesDropWhole() async throws {
+    func rfcOnlyMutatingOpsParkWithoutProviderIO() async throws {
         let duplicateRFC = "duplicate-action@example.com"
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [
@@ -194,7 +237,8 @@ struct IMAPActionEpochCheckpointTests {
         }
         #expect(forbiddenCommands.isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
-        #expect(try operations(f.pool).isEmpty)
+        // Every one of the four is still the user's intention.
+        #expect(try operations(f.pool).count == bypassTypes.count)
         try? await provider.disconnect()
         await finish(f)
     }
@@ -373,9 +417,15 @@ struct IMAPActionEpochCheckpointTests {
         await finish(f)
     }
 
-    @Test("An epoch refusal drops the whole batch and never creates split child operations")
+    /// 🚨 CORRECTED (audit round 1, finding A-3) — the ⚑NEVER SPLIT property is
+    /// the point of this test and is unchanged: a refusal must not fan one row
+    /// out into per-member children, because a child inherits the parent's
+    /// unproven addressing. What changed is the second assertion, which used to
+    /// read `isEmpty` — proving the batch was not split by proving it was
+    /// DESTROYED. Not-split and not-dropped are both required.
+    @Test("An unresolvable member never splits the batch and never drops it")
     @MainActor
-    func refusalNeverSplits() async throws {
+    func refusalNeverSplitsAndNeverDrops() async throws {
         let f = try fixture()
         let provider = MockEmailProvider(staleWindowMode: .uid)
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: provider)
@@ -387,7 +437,11 @@ struct IMAPActionEpochCheckpointTests {
         await AccountManager.shared.drainPendingQueue()
 
         #expect(await provider.callLog.isEmpty)
-        #expect(try operations(f.pool).isEmpty)
+        let surviving = try operations(f.pool)
+        #expect(surviving.count == 1)
+        guard surviving.count == 1 else { await finish(f); return }
+        #expect(surviving[0].id == op.id)
+        #expect(surviving[0].messageIds.count == 2)
         await finish(f)
     }
 }

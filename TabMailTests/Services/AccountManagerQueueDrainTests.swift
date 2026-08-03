@@ -192,10 +192,16 @@ struct AccountManagerQueueDrainTests {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
-        // The Archive folder must exist locally — otherwise executeSingleOp's
-        // generic-error self-heal branch (`destMissing`, AccountManagerQueue.swift)
-        // would DROP the op instead of resetting it to queued, defeating the
-        // requeue-then-retry scenario under test here.
+        // The Archive folder exists locally because the scenario under test is
+        // an ordinary move to a real destination.
+        //
+        // ⚑ HISTORICAL NOTE (audit round 1, finding A-5): this used to say the
+        // folder was required, because `executeSingleOp`'s generic-error branch
+        // DELETED the op when the destination was merely absent from local GRDB.
+        // That branch is gone — local absence is not provider authority, so a
+        // missing destination row now leaves the op queued like any other
+        // undetermined outcome. The folder is still created here to keep this
+        // test about the requeue-then-retry path and nothing else.
         try await pool.writeWithoutTransaction { db in
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc-gap2"
@@ -378,23 +384,39 @@ struct AccountManagerQueueDrainTests {
     // `.networkError(400)`. `AccountManagerQueue.isPermanentlyInvalidError` was
     // widened in the same change to classify the two identically.
     //
-    // These two tests pin the SYSTEM property that widening exists for — the
-    // durable row's END STATE — not the matcher's mechanism:
+    // 🚨 CORRECTED (audit round 1, finding B-3). The first of these tests used
+    // to assert the OPPOSITE — that an UNCLASSIFIED Gmail action 400 is
+    // TERMINAL — and it was the test blessing the defect. Its premise was that
+    // a bare status code plus "the body was preserved" is a classification. It
+    // is not. `isPermanentlyInvalidError` bound the body to `_` and retired the
+    // op on the STATUS alone, so `"Precondition check failed."` — a
+    // `failedPrecondition` a retry can resolve — destroyed the user's action
+    // exactly as if Gmail had said the id was never valid.
     //
-    //   * an unclassified Gmail action 400 is TERMINAL: the row is gone;
-    //   * a transient 503 is NOT: the row survives, queued, for another drain.
+    // The three tests now pin the SYSTEM property along the axis that actually
+    // decides it — whether the provider issued an AUTHORITATIVE rejection —
+    // and the durable row's END STATE is the observable:
     //
-    // RED PROOF (recorded, since this defect never existed as a landed commit):
-    // the failing configuration is the HALF-PORT — `modifyMessage` switched to
-    // the body-preserving helper while `isPermanentlyInvalidError` still matched
-    // only `.networkError`. In that state the 400 falls through to the generic
-    // transient branch and the first test below observes the row still present
-    // with `status == queued`, i.e. it becomes indistinguishable from its own
-    // 503 control. Reverting only the `networkErrorWithBody` arm of
-    // `isPermanentlyInvalidError` reproduces it.
+    //   * a STRUCTURALLY RECOGNISED authoritative 400 ("Invalid id value …",
+    //     `reason == invalidArgument`) is TERMINAL: the row is gone. Exit 2.
+    //   * an UNCLASSIFIED 400 is NOT: we could not determine the answer, which
+    //     is not an exit. The row survives, queued.
+    //   * a transient 503 is NOT: the row survives, queued.
+    //
+    // RED PROOF for the unclassified case, recorded: with
+    // `isPermanentlyInvalidError`'s pre-fix bare-status arms restored
+    // (`case .networkError(400), .networkErrorWithBody(400, _): return true`),
+    // `unclassifiedGmailActionBadRequestKeepsTheDurableOpQueued` fails at
+    // `after != nil` — the row is nil, the intention destroyed — and its
+    // `outcome == .haltLane` expectation fails with `.proceed`.
+    //
+    // NON-VACUITY is two-sided and DURABLE + WIRE on every one of the three:
+    // each asserts both the row's end state and that its injected response was
+    // genuinely consumed at the HTTP boundary, so a row that survived because
+    // the provider was never reached cannot pass.
 
-    @Test("real GmailProvider: an UNCLASSIFIED action 400 is terminal — the durable op row is deleted, not left queued")
-    func unclassifiedGmailActionBadRequestRetiresTheDurableOp() async throws {
+    @Test("real GmailProvider: an UNCLASSIFIED action 400 is NOT terminal — the durable op row survives, queued for retry")
+    func unclassifiedGmailActionBadRequestKeepsTheDurableOpQueued() async throws {
         let (pool, dir, previous) = try makeTestDB()
         let accountId = "acc-gmail-unclassified-400"
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
@@ -419,19 +441,62 @@ struct AccountManagerQueueDrainTests {
             op, provider: server.provider(), context: AccountManager.DrainContext()
         )
 
+        #expect(outcome == .haltLane)
+        let after = try fetchOp(op.id, pool: pool)
+        #expect(
+            after != nil,
+            "an unrecognised 400 is an absence of evidence, not the provider telling us the work is moot — it must not retire the user's intention"
+        )
+        guard let after else { return }
+        #expect(after.status == PendingStatus.queued.rawValue)
+        #expect(after.retryCount == op.retryCount + 1)
+        #expect(
+            server.unclassified400ServedCount() == 1,
+            "the injected unclassified 400 must have been served exactly once: \(server.unclassified400ServedCount())"
+        )
+    }
+
+    @Test("real GmailProvider: a STRUCTURALLY RECOGNISED invalid-id 400 IS terminal — the durable op row is deleted")
+    func authoritativeGmailInvalidIdRejectionRetiresTheDurableOp() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-gmail-invalid-id-400"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let providerMessageId = "gmail-queue-invalid-id-1"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "gmail-queue-invalid-id@example.com",
+            providerMessageId: providerMessageId,
+            labels: ["INBOX", "UNREAD"]
+        )])
+        defer { server.close() }
+        // Gmail's real body: reason `invalidArgument`, message
+        // `"Invalid id value <id>"` — the provider stating authoritatively that
+        // this address can never name a message. Exit 2.
+        server.injectInvalidId400OnModify(providerMessageId: providerMessageId)
+
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        let op = PendingOperation(
+            type: .markRead, messageIds: [providerMessageId],
+            accountId: accountId, folderPath: "INBOX"
+        )
+        try insertOp(op, pool: pool)
+
+        let outcome = await AccountManager.shared.executeSingleOp(
+            op, provider: server.provider(), context: AccountManager.DrainContext()
+        )
+
+        // The NON-VACUITY partner of the unclassified test: if the fix had
+        // narrowed the classifier to nothing, this row would survive too and
+        // the pair would stop distinguishing anything.
         #expect(outcome == .proceed)
         let after = try fetchOp(op.id, pool: pool)
         #expect(
             after == nil,
-            "a permanent-shaped Gmail action 400 must not survive as a forever-retrying row"
+            "an authoritative provider rejection of the address itself must retire the op rather than retry it forever"
         )
-        // Two-sided non-vacuity, DURABLE + WIRE: the row is gone AND the
-        // injected 400 was genuinely consumed at the HTTP boundary — a row
-        // deleted for any other reason (provider never reached, op claimed by
-        // something else) leaves this counter at zero.
         #expect(
-            server.unclassified400ServedCount() == 1,
-            "the injected unclassified 400 must have been served exactly once: \(server.unclassified400ServedCount())"
+            server.invalidId400OnModifyServedCount() == 1,
+            "the injected invalid-id 400 must have been served exactly once: \(server.invalidId400OnModifyServedCount())"
         )
     }
 
