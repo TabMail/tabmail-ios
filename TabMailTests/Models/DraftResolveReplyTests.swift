@@ -251,9 +251,14 @@ struct ReplyQuoteIdentityTests {
         snippet: String = "snippet",
         subject: String = "Original subject",
         // Explicit so a test can give two rows the SAME timestamp. Two `Date()` calls
-        // differ by microseconds, and `date` is part of Strategy 2's identity witness —
-        // so genuine copies of one message must be inserted with one shared value, the
-        // way production stores them (both parsed from the same RFC822 Date header).
+        // differ by microseconds, and `date` was the third component of the round-2
+        // identity witness — so genuine copies of one message must be inserted with one
+        // shared value, the way production stores them (both parsed from the same
+        // RFC822 Date header). Round 3 withdrew that witness and Strategy 2 is back on
+        // its cardinality guard, but the parameter stays load-bearing: reproducing
+        // witness agreement is exactly what
+        // `witnessAgreeingRowsWithDifferentBodiesResolveToNothing` has to do to show
+        // the witness was not sufficient.
         date: Date = Date()
     ) throws -> MessageHeader {
         var header = MessageHeader(
@@ -589,16 +594,24 @@ struct ReplyQuoteIdentityTests {
     /// SQLite's arbitrary choice decided which correspondent's body, attribution and
     /// attachments went into the outgoing reply.
     ///
-    /// ⚠ RE-SCOPED (audit round 2), still GREEN and still load-bearing. Round 1 made
-    /// this pass via a cardinality guard (`count == 1`); the guard is now identity
-    /// AGREEMENT instead, and this case still refuses — but for the right reason. The
-    /// two rows here differ in `fromAddress` ("sender@example.com" vs
-    /// "someone-else@domain.com"), so they are a genuine Message-ID COLLISION: two
-    /// different messages under one identity, which is precisely what must fail closed.
-    /// The old doc claimed the resolver "cannot tell them apart"; it now can, and that
-    /// is what its sibling
-    /// `severalCopiesOfOneMessageStillResolveTheReplyTarget` pins from the other side.
-    /// The draft's own authored body is untouched either way.
+    /// ⚠ RE-SCOPED (audit round 2), still GREEN and still load-bearing — and it
+    /// survived round 3's revert UNCHANGED, which is the point of keeping this note.
+    /// Round 1 made this pass via a cardinality guard (`count == 1`); round 2 swapped
+    /// that for identity AGREEMENT on a `(fromAddress, subject, date)` witness; round 3
+    /// withdrew the witness as unsound in both directions and restored the cardinality
+    /// guard. This case refuses under ALL THREE predicates, so it pins a property the
+    /// resolver must hold however the guard is spelled. The two rows here differ in
+    /// `fromAddress` ("sender@example.com" vs "someone-else@domain.com"), so they are a
+    /// genuine Message-ID COLLISION: two different messages under one identity, which
+    /// is precisely what must fail closed.
+    ///
+    /// Its two siblings pin the rest of the space at the current tree state:
+    /// `severalCopiesOfOneMessageFailTheReplyTargetClosed` covers rows that agree on
+    /// everything a copy shares (the restored guard refuses those too — an accepted
+    /// cost, not a proof of difference), and
+    /// `witnessAgreeingRowsWithDifferentBodiesResolveToNothing` covers rows that agree
+    /// on the whole round-2 witness while carrying different bodies, which is why that
+    /// witness could not stand. The draft's own authored body is untouched either way.
     @Test("Two rows sharing one RFC identity yield no reply target, never an arbitrary one")
     func ambiguousRfcIdentityResolvesToNothing() throws {
         let db = try TestDatabase.make()
@@ -648,20 +661,34 @@ struct ReplyQuoteIdentityTests {
         #expect(quote?.bodyHTML?.contains(Self.genuineMarker) != true)
     }
 
-    /// 🚨 AUDIT ROUND 2 — the OTHER side of the guard, and the case round 1's
-    /// cardinality predicate got wrong. Two rows that share an RFC identity AND agree
-    /// on sender, subject and timestamp are copies of ONE message (the same mail held
-    /// in two folders, or under two Gmail labels). They are interchangeable for every
-    /// field this resolver reads, so refusing them is pure loss: the user's reply
-    /// silently loses its quoted body and attribution in the exact situation Strategy 2
-    /// exists to recover — a message whose PK was re-keyed by a folder move.
+    /// 🚨 **AUDIT ROUND 3 — INVERTED. THIS WAS A BLESSING TEST.** It used to assert
+    /// that two rows sharing an RFC identity and agreeing on `(fromAddress, subject,
+    /// date)` DO resolve, on the reasoning that such rows are copies of one message
+    /// and therefore interchangeable. Both fixtures carried the same
+    /// `genuineMarker`, so an arbitrary representative was undetectable and the test
+    /// could not have failed however wrong the choice was.
     ///
-    /// `guard candidates.count == 1` refused this, because it counted ROWS (how many
-    /// folders hold the message) when the question was MESSAGES (how many distinct
-    /// messages are in play). This test pins the system property — a resolvable reply
-    /// target with the RIGHT correspondent's body — not the predicate's shape.
-    @Test("Several copies of one message still resolve the reply target")
-    func severalCopiesOfOneMessageStillResolveTheReplyTarget() throws {
+    /// The witness it blessed is wrong in BOTH directions. It omits everything the
+    /// resolver consumes — body, attachments, `replyTo` — so two DIFFERENT messages
+    /// sharing a Message-ID can satisfy it and the user forwards content they never
+    /// selected (C3; see `witnessAgreeingRowsWithDifferentBodiesResolveToNothing`,
+    /// which is this test's other half). And its `date` is INTERNALDATE, which
+    /// RFC 3501 §6.4.7 makes a SHOULD-not-MUST to preserve across a COPY, so genuine
+    /// copies can disagree on it. The resolver is back on the fail-closed
+    /// cardinality guard.
+    ///
+    /// THE PROPERTY NOW PINNED, and it is a COST, stated rather than hidden: when a
+    /// message is legitimately present in several folders, Strategy 2 refuses and
+    /// the reply ships WITHOUT its quoted body and attribution. The user's authored
+    /// text is untouched and the send still works. This is accepted — C3 says
+    /// failing closed is always acceptable — and shipped `07a4bb703` was WORSE here
+    /// (a bare `.fetchOne`, i.e. an arbitrary row), so this is not a regression to
+    /// the release but an improvement the round-2 witness gave away.
+    ///
+    /// RED PROOF (recorded): against the witness resolver this fails at
+    /// `quote == nil` — two agreeing copies resolve to a representative.
+    @Test("Several copies of one message fail the reply-target resolution closed")
+    func severalCopiesOfOneMessageFailTheReplyTargetClosed() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
         try TestDatabase.insertFolder(db)
@@ -703,16 +730,89 @@ struct ReplyQuoteIdentityTests {
 
         let quote = try Self.resolve(db, draft)
 
-        #expect(quote != nil,
+        #expect(quote == nil,
                 """
-                two interchangeable copies of ONE message were treated as ambiguity, so the reply \
-                lost its quoted body and attribution entirely. Cardinality counted folders, not \
-                messages.
+                a representative was chosen from several rows sharing one RFC identity. Which one \
+                is SQLite's choice, and the rows are indistinguishable only on the fields the \
+                witness happened to compare — not on the body or attachments this quote carries \
+                into the user's outgoing mail.
                 """)
-        #expect(quote?.header.rfc822MessageId == "shared@example.com")
-        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true,
-                "the resolved copy did not carry the message's own body")
+        // The accepted cost, asserted so it cannot be lost silently: no quote at all,
+        // rather than a quote from an unproven copy.
+        #expect(quote?.bodyHTML == nil)
+    }
+
+    /// 🚨 AUDIT ROUND 3 / C3 — the defect the `(fromAddress, subject, date)` witness
+    /// admitted, pinned as a SYSTEM PROPERTY rather than as the guard's shape.
+    ///
+    /// The witness compares exactly three header fields and omits every field the
+    /// resolver actually consumes. Two DIFFERENT messages that collide on a
+    /// Message-ID — a buggy sender, a list rewriter, an alias fan-out — and happen to
+    /// share sender, subject and timestamp therefore AGREE on it, and
+    /// `resolveReplyToHeader` hands back an arbitrary representative whose body and
+    /// attachments `resolveReplyQuote` then loads into the user's outgoing reply or
+    /// forward. Content the user never selected leaves the device.
+    ///
+    /// Note what this test does NOT assert: it does not check which row was picked,
+    /// or that any particular field is compared. Either would inherit the witness's
+    /// own spec error. It asserts the end state — nothing resolves, so nothing
+    /// foreign can be carried.
+    ///
+    /// RED PROOF (recorded): against the witness resolver this fails at
+    /// `quote == nil`, and the resolved body is one of the two markers.
+    @Test("Rows agreeing on the identity witness but differing in body resolve to nothing")
+    func witnessAgreeingRowsWithDifferentBodiesResolveToNothing() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        // Two rows that AGREE on sender, subject and timestamp — every field the
+        // round-2 witness compared — and carry DIFFERENT bodies. Nothing in the
+        // witness can tell them apart, which is the point.
+        let sharedDate = Date(timeIntervalSince1970: 1_760_000_000)
+        let firstId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "witness@example.com",
+            observedUidValidity: 100, date: sharedDate)
+        try TestDatabase.insertMessageBody(
+            db, headerId: firstId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let secondId = "acc1:Archive:77"
+        try Self.insertHeader(
+            db, messageId: "77", folderPath: "Archive",
+            rfc822MessageId: "witness@example.com", observedUidValidity: 900,
+            date: sharedDate)
+        try TestDatabase.insertMessageBody(
+            db, headerId: secondId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        // Strategy 1 cannot answer: the PK the draft names no longer exists, which is
+        // precisely when Strategy 2 runs.
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:witness@example.com", replyToId: "acc1:INBOX:999",
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        // NON-VACUITY: both rows really are present and really do share the identity,
+        // so the refusal below is about ambiguity and not an empty candidate set.
+        let matching = try db.read { conn in
+            try MessageHeader
+                .filter(Column("accountId") == "acc1" && Column("rfc822MessageId") == "witness@example.com")
+                .fetchCount(conn)
+        }
+        #expect(matching == 2)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil,
+                """
+                a reply target was resolved from two rows that are indistinguishable on sender, \
+                subject and date but carry DIFFERENT bodies. Whichever was picked, the user's \
+                outgoing mail can now quote and attach content from a message they never selected.
+                """)
+        // Neither body may reach the draft — including the "right-looking" one, since
+        // nothing here proves which row the user meant.
         #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) != true)
     }
 
     @Test("A draft key with an empty stableId resolves to no reply target")
