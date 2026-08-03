@@ -686,3 +686,128 @@ struct SearchIndexCRUDTests {
         try await index.vacuum()
     }
 }
+
+// MARK: - removeMessagesForFolder: the id table has no folder column
+
+/// `message_meta` carries the authoritative folder relation, but `message_ids` does
+/// not — so a folder purge driven purely by that relation cannot see an ORPHANED id
+/// (one whose `message_meta` / shard rows are already gone from an earlier
+/// partially-failed purge).
+///
+/// THE INVARIANT (the system end state, not the sweep's mechanism): after
+/// `(accountId, folderPath)` is purged, re-indexing a key belonging to that folder
+/// REALLY LANDS. `indexHeaders` is `INSERT OR IGNORE` plus skip-if-unchanged, so a
+/// surviving orphan id turns the post-purge resync's re-index into a silent no-op and
+/// the message occupying that address under the new epoch is never searchable again.
+///
+/// 🚨 THE TWO TRIPWIRES, both anti-mirror-image. The sweep is scoped by the composite
+/// key's prefix, which is only sound with the no-deeper-colon guard (a ':'-delimiter
+/// IMAP server makes `acct:INBOX:Sub:3` share `acct:INBOX:`), and it must fail CLOSED
+/// where the two folder relations disagree: deleting an id whose `message_meta` row is
+/// still live would strand a searchable entry with no id, which the next index of that
+/// key turns into a second rowid whose stale twin keeps answering searches.
+@Suite("SearchIndex folder purge clears orphaned ids", .serialized, .processGlobalState)
+struct SearchIndexFolderPurgeOrphanTests {
+
+    private var index: SearchIndex { SearchIndex.shared }
+
+    /// `dateMs` is derived from the current date — a fixed epoch would silently pin
+    /// the row to a year shard that drifts out of the fixture's meaning.
+    private func record(_ key: String, folderId: String, subject: String) -> FTSHeaderRecord {
+        FTSHeaderRecord(
+            contentKey: ContentKey(rawValue: key),
+            headerId: key,
+            messageId: "m-\(key.suffix(6))",
+            subject: subject,
+            from: "sender@example.com",
+            to: "recipient@example.com",
+            dateMs: Int64(Date().timeIntervalSince1970 * 1000),
+            folderId: folderId
+        )
+    }
+
+    @Test("A folder purge clears an orphaned id so the folder's key indexes again")
+    func purgeClearsOrphanedId() async throws {
+        let account = "ftsorphan-\(UUID().uuidString)"
+        let folderId = MessageIdentity.folderId(accountId: account, folderPath: "INBOX")
+        let key = MessageIdentity.headerId(accountId: account, folderPath: "INBOX", messageId: "1")
+        let contentKey = ContentKey(rawValue: key)
+
+        let inserted = try await index.indexHeaders(
+            [record(key, folderId: folderId, subject: "Orphanzarquon subject")])
+        try #require(inserted == 1)
+
+        // Manufacture the orphan an interrupted purge leaves behind: the id row
+        // survives, its `message_meta` and shard rows do not.
+        try await index.testOrphanContentKey(contentKey)
+        try #require(try await index.testContentKeyIsMinted(contentKey),
+                     "precondition: the orphaned id is still minted")
+        try #require(try await index.contentKeysMissingFromFTS([contentKey]).isEmpty == false,
+                     "precondition: no message_meta row backs it")
+
+        try await index.removeMessagesForFolder(accountId: account, folderPath: "INBOX")
+
+        #expect(try await index.testContentKeyIsMinted(contentKey) == false,
+                "an orphaned id in the purged folder must not survive the purge")
+
+        // THE INVARIANT: the resync's re-index of that same key really lands.
+        let reIndexed = try await index.indexHeaders(
+            [record(key, folderId: folderId, subject: "Orphanzarquon subject")])
+        #expect(reIndexed == 1,
+                "a surviving orphan id makes indexHeaders a silent no-op for the resynced message")
+        #expect(try await index.contentKeysMissingFromFTS([contentKey]).isEmpty,
+                "the re-indexed key must be backed by a message_meta row again")
+
+        try? await index.removeMessages(contentKeys: [contentKey])
+    }
+
+    @Test("A folder purge leaves an id whose live entry another folder still claims")
+    func purgeLeavesDisputedLiveId() async throws {
+        let account = "ftsorphanheld-\(UUID().uuidString)"
+        let archiveFolderId = MessageIdentity.folderId(accountId: account, folderPath: "Archive")
+        // The key says INBOX; the authoritative relation says Archive. That is a
+        // legacy row still awaiting `backfillFolderIdsIfNeeded`, or the window
+        // between a `rekeyHeaders` and its `updateFolderIds`.
+        let key = MessageIdentity.headerId(accountId: account, folderPath: "INBOX", messageId: "2")
+        let contentKey = ContentKey(rawValue: key)
+
+        let inserted = try await index.indexHeaders(
+            [record(key, folderId: archiveFolderId, subject: "Disputedzarquon subject")])
+        try #require(inserted == 1)
+
+        try await index.removeMessagesForFolder(accountId: account, folderPath: "INBOX")
+
+        #expect(try await index.testContentKeyIsMinted(contentKey),
+                "an id whose live entry another folder claims must not be half-deleted here")
+        #expect(try await index.contentKeysMissingFromFTS([contentKey]).isEmpty,
+                "its message_meta row must survive too — a stranded entry with no id is a wrong-occupant search hit")
+
+        try? await index.removeMessages(contentKeys: [contentKey])
+    }
+
+    @Test("A ':'-delimited child folder's orphaned id survives its parent's purge")
+    func childFolderOrphanSurvivesParentPurge() async throws {
+        let account = "ftsorphanchild-\(UUID().uuidString)"
+        let childPath = "INBOX:Sub"
+        let childFolderId = MessageIdentity.folderId(accountId: account, folderPath: childPath)
+        let key = MessageIdentity.headerId(accountId: account, folderPath: childPath, messageId: "3")
+        let contentKey = ContentKey(rawValue: key)
+
+        let inserted = try await index.indexHeaders(
+            [record(key, folderId: childFolderId, subject: "Childzarquon subject")])
+        try #require(inserted == 1)
+        try await index.testOrphanContentKey(contentKey)
+        try #require(try await index.testContentKeyIsMinted(contentKey),
+                     "precondition: the child folder's orphaned id is still minted")
+
+        try await index.removeMessagesForFolder(accountId: account, folderPath: "INBOX")
+
+        #expect(try await index.testContentKeyIsMinted(contentKey),
+                "a ':'-delimited CHILD folder's orphaned id must not be swept by its parent's purge")
+
+        // Two-sided: the guard must scope the sweep, never make the id unreachable.
+        try await index.removeMessagesForFolder(accountId: account, folderPath: childPath)
+        #expect(try await index.testContentKeyIsMinted(contentKey) == false,
+                "the child folder's OWN purge must still clear its orphaned id")
+    }
+}

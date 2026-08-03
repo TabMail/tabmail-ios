@@ -303,12 +303,113 @@ struct SearchIndexRekeyTests {
         try await index.rekeyHeaders([(oldId: oldId, newId: newId, newMessageId: nil)].map { (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId), newMessageId: $0.newMessageId) })
 
         // The pre-existing new-id entry survives; the old entry is removed
-        // (two FTS rows must never share a headerId).
+        // (two FTS rows must never share a headerId). Both entries here are
+        // header-only, so the richness compare is a TIE and the tie keeps the
+        // pre-existing new-key entry — the behaviour this test always pinned.
         let newHits = try await index.keywordSearch(query: "rekeycollisionnew")
         #expect(newHits.contains { $0.contentKey.rawValue == newId })
         let oldHits = try await index.keywordSearch(query: "rekeycollisionold")
         #expect(oldHits.isEmpty)
 
         try? await index.removeMessages( contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
+    }
+
+    // MARK: - Collisions resolve by CONTENT, not by arrival order
+
+    /// THE INVARIANT: a re-key collision never destroys the pair's indexed body or
+    /// embedding. Exactly one of the two entries must go — `message_ids.headerId` is
+    /// the primary key — but which one is a content question. Dropping the old entry
+    /// unconditionally discards a fully indexed body because a skeletal header-only
+    /// row for the new key happened to land first, and neither the body nor the
+    /// embedding is recoverable without a full re-fetch of the message.
+
+    @Test("A rekey collision keeps the old entry's indexed body over a skeletal new key")
+    func rekeyCollisionKeepsTheRicherOldEntry() async throws {
+        let oldId = "\(prefix)_rich:INBOX:1"
+        let newId = "\(prefix)_rich:TRASH:1"
+        try? await index.removeMessages(contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
+
+        _ = try await index.indexHeaders([
+            makeRecord(oldId, subject: "Rekeyricholdsubject unique"),
+            makeRecord(newId, subject: "Rekeyrichnewsubject unique"),
+        ])
+        // Only the OLD entry has been given a body — the expensive part.
+        _ = try await index.updateBodies([
+            (contentKey: ContentKey(rawValue: oldId), body: "rekeyrichbodytoken unmistakable content"),
+        ])
+
+        try await index.rekeyHeaders([(oldKey: ContentKey(rawValue: oldId),
+                                       newKey: ContentKey(rawValue: newId),
+                                       newMessageId: nil)])
+
+        // The indexed body survived and is reachable under the NEW key.
+        let bodyHits = try await index.keywordSearch(query: "rekeyrichbodytoken")
+        #expect(bodyHits.contains { $0.contentKey.rawValue == newId },
+                "the richer entry's indexed body must survive the collision, under the new key")
+        #expect(!bodyHits.contains { $0.contentKey.rawValue == oldId })
+        let body = try await index.bodyText(contentKey: ContentKey(rawValue: newId))
+        #expect(body?.contains("rekeyrichbodytoken") == true,
+                "the body text itself must be readable under the new key")
+
+        // The skeletal entry is the one that goes, and only one entry remains.
+        let skeletalHits = try await index.keywordSearch(query: "rekeyrichnewsubject")
+        #expect(skeletalHits.isEmpty, "the skeletal entry that lost the compare must be gone")
+        #expect(try await index.isIndexed(contentKey: ContentKey(rawValue: oldId)) == false,
+                "the old key must no longer be minted — the entry moved, it was not copied")
+
+        try? await index.removeMessages(contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
+    }
+
+    @Test("A rekey collision still drops the old entry when the new one is no poorer")
+    func rekeyCollisionStillDropsThePoorerOldEntry() async throws {
+        let oldId = "\(prefix)_poor:INBOX:1"
+        let newId = "\(prefix)_poor:TRASH:1"
+        try? await index.removeMessages(contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
+
+        _ = try await index.indexHeaders([
+            makeRecord(oldId, subject: "Rekeypooroldsubject unique"),
+            makeRecord(newId, subject: "Rekeypoornewsubject unique"),
+        ])
+        // The other side of the compare: here the NEW entry is the richer one.
+        _ = try await index.updateBodies([
+            (contentKey: ContentKey(rawValue: newId), body: "rekeypoorbodytoken unmistakable content"),
+        ])
+
+        try await index.rekeyHeaders([(oldKey: ContentKey(rawValue: oldId),
+                                       newKey: ContentKey(rawValue: newId),
+                                       newMessageId: nil)])
+
+        let bodyHits = try await index.keywordSearch(query: "rekeypoorbodytoken")
+        #expect(bodyHits.contains { $0.contentKey.rawValue == newId },
+                "the richer new-key entry must survive untouched")
+        let oldHits = try await index.keywordSearch(query: "rekeypooroldsubject")
+        #expect(oldHits.isEmpty,
+                "the poorer old entry must still be dropped — the compare is not 'always keep the old'")
+
+        try? await index.removeMessages(contentKeys: [oldId, newId].map(ContentKey.init(rawValue:)))
+    }
+
+    @Test("A self-rekey is a no-op and never deletes the entry it converged on")
+    func selfRekeyIsANoOp() async throws {
+        let key = "\(prefix)_self:INBOX:1"
+        let contentKey = ContentKey(rawValue: key)
+        try? await index.removeMessages(contentKeys: [contentKey])
+
+        _ = try await index.indexHeaders([makeRecord(key, subject: "Rekeyselfsubject unique")])
+        _ = try await index.updateBodies([
+            (contentKey: contentKey, body: "rekeyselfbodytoken unmistakable content"),
+        ])
+
+        // Already converged. Without the explicit no-op the collision branch compares
+        // the entry with ITSELF, finds neither side richer, and deletes it outright.
+        try await index.rekeyHeaders([(oldKey: contentKey, newKey: contentKey, newMessageId: nil)])
+
+        #expect(try await index.isIndexed(contentKey: contentKey),
+                "a self-rekey must leave the entry indexed")
+        let bodyHits = try await index.keywordSearch(query: "rekeyselfbodytoken")
+        #expect(bodyHits.contains { $0.contentKey.rawValue == key },
+                "a self-rekey must not destroy the entry's indexed body")
+
+        try? await index.removeMessages(contentKeys: [contentKey])
     }
 }

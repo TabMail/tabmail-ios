@@ -642,6 +642,37 @@ actor SearchIndex {
         }
     }
 
+    /// TEST ONLY: strip a content key's `message_meta`, shard and vector rows while
+    /// LEAVING its `message_ids` entry — the exact orphan shape an earlier
+    /// partially-failed folder purge leaves behind, and the state
+    /// `removeMessagesForFolder`'s H-2 sweep exists to clear. No production API can
+    /// produce it (every removal path goes through `deleteEntry`, which drops all
+    /// four together), so the invariant has no other way to be exercised.
+    func testOrphanContentKey(_ contentKey: ContentKey) throws {
+        ensureReady()
+        guard let dbPool else { return }
+        try dbPool.write { [self] db in
+            guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { return }
+            try db.execute(sql: "DELETE FROM \(ftsTableName(year: resolved.year)) WHERE rowid = ?",
+                           arguments: [resolved.rowid])
+            try db.execute(sql: "DELETE FROM message_meta WHERE rowid = ?",
+                           arguments: [resolved.rowid])
+            try? db.execute(sql: "DELETE FROM messages_vec WHERE rowid = ?",
+                            arguments: [resolved.rowid])
+        }
+    }
+
+    /// TEST ONLY: whether `message_ids` still mints this content key, independent of
+    /// whether a `message_meta` row backs it. The two questions differ exactly on an
+    /// orphan, and `contentKeysMissingFromFTS` only answers the second.
+    func testContentKeyIsMinted(_ contentKey: ContentKey) throws -> Bool {
+        guard let dbPool else { return false }
+        return try dbPool.read { db in
+            try Bool.fetchOne(db, sql: "SELECT COUNT(*) > 0 FROM message_ids WHERE headerId = ?",
+                              arguments: [contentKey]) ?? false
+        }
+    }
+
     /// TEST ONLY: drop a year shard table and forget the year.
     func testDropShard(year: Int) async throws {
         guard let dbPool else { return }
@@ -738,6 +769,10 @@ actor SearchIndex {
         ensureReady()
         guard let dbPool else { return }
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+        let likePrefix = MessageIdentity.escapedHeaderIdLikePrefix(
+            accountId: accountId, folderPath: folderPath) + "%"
+        let rawPrefix = MessageIdentity.headerIdPrefix(accountId: accountId, folderPath: folderPath)
+        let noDeeperColonSQL = MessageIdentity.headerIdLikeNoDeeperColonSQLFragment(column: "headerId")
         try dbPool.write { [self] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT mi.rowid, meta.shardYear
@@ -767,6 +802,47 @@ actor SearchIndex {
                     arguments: [rowid]
                 )
             }
+
+            // H-2 — PORT of the reference's `message_ids` sweep
+            // (`v2final:SearchIndex.removeMessagesForFolder`, ADR-IOS-061 item H).
+            // `message_ids` carries no `folderId` column, so a pre-existing ORPHAN
+            // id — one whose `message_meta` / shard rows are already gone, e.g. from
+            // an earlier partially-failed purge — never appears in `rows` above and
+            // therefore survives every folder-relation delete. It is NOT inert:
+            // `indexHeaders` is `INSERT OR IGNORE` plus skip-if-unchanged, so a
+            // surviving id turns the resync's re-index of that very key into a no-op
+            // and the new-epoch message occupying that address is never searchable
+            // again. Recomputable from the folder alone ⇒ idempotent on a crash
+            // re-drive, exactly like the query above.
+            //
+            // SUBTRACT — a deliberate NARROWING of the reference, which deletes every
+            // prefix match unconditionally. The `NOT EXISTS` term leaves alone any id
+            // whose `message_meta` row is still LIVE but records a different folder
+            // (a legacy row still awaiting `backfillFolderIdsIfNeeded`, or the window
+            // between a `rekeyHeaders` and its `updateFolderIds`). Two folder
+            // relations disagreeing is precisely when a purge must fail closed:
+            // deleting the id alone would strand a searchable `message_meta` + shard
+            // row with no id, and the next index of that key would then mint a SECOND
+            // rowid whose stale twin keeps answering searches. A surviving id is a
+            // nuisance; a half-deleted entry is a wrong-occupant search hit.
+            //
+            // Scoped by the composite-key prefix PLUS the no-deeper-colon guard, so a
+            // ':'-delimiter IMAP server's nested child (`acct:Drafts:Sub:77`, which
+            // shares `acct:Drafts:`) is never swept by its parent's purge; LIKE-escaped
+            // because a folder path may legitimately contain `%` or `_`. Never relax
+            // either term — see `MessageIdentity.usableRfc822Tail`; the fix for a
+            // colon-bearing tail is at the mint.
+            try db.execute(
+                sql: """
+                    DELETE FROM message_ids
+                    WHERE headerId LIKE ? ESCAPE '\\'
+                      AND \(noDeeperColonSQL)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM message_meta meta WHERE meta.rowid = message_ids.rowid
+                      )
+                    """,
+                arguments: [likePrefix, rawPrefix]
+            )
         }
     }
 
@@ -1078,14 +1154,26 @@ actor SearchIndex {
     /// canonicalization. `newMessageId` optionally refreshes the FTS msgId
     /// column (UID remaps change the provider message id).
     ///
-    /// If the new id already exists in FTS (e.g. a leftover orphan or a
-    /// concurrent index), the old entry is removed instead — two rows must
-    /// never share a headerId (`message_ids.headerId` is the primary key).
+    /// If the new key already exists in FTS (e.g. a leftover orphan or a
+    /// concurrent header-only index), KEEP THE RICHER ENTRY: body presence, then
+    /// vector presence, then body length. Two rows must never share a content key
+    /// (`message_ids.headerId` is the primary key), so exactly one of the pair is
+    /// deleted — but which one is a content question, not an ordering accident.
+    /// Dropping the old entry unconditionally discards a fully indexed body and its
+    /// embedding merely because a skeletal new-key header landed first, and neither
+    /// is recoverable without a full re-fetch of the message.
+    /// PORT: `v2final:SearchIndex.rekeyHeaders` + `entryRichness` + `isRicher`
+    /// (`a75196398`).
     func rekeyHeaders(_ rekeys: [(oldKey: ContentKey, newKey: ContentKey, newMessageId: String?)]) throws {
         ensureReady()
         guard let dbPool, !rekeys.isEmpty else { return }
         try dbPool.write { [self] db in
             for rekey in rekeys {
+                // A self-rekey is already converged. Treat it as an explicit no-op:
+                // collision handling would otherwise compare the row with ITSELF,
+                // find neither side richer, and delete the entry's FTS body,
+                // metadata and embedding outright.
+                guard rekey.oldKey != rekey.newKey else { continue }
                 guard let resolved = try resolveRowidAndYear(rekey.oldKey, db: db) else { continue }
                 let table = ftsTableName(year: resolved.year)
                 let newExists = try Bool.fetchOne(
@@ -1094,9 +1182,29 @@ actor SearchIndex {
                     arguments: [rekey.newKey]
                 ) ?? false
                 if newExists {
-                    print("[SearchIndex] rekeyHeaders: \(rekey.newKey.rawValue.prefix(40)) already indexed — removing old entry \(rekey.oldKey.rawValue.prefix(40))")
-                    try deleteEntry(contentKey: rekey.oldKey, rowid: resolved.rowid, year: resolved.year, db: db)
-                    continue
+                    // An id with no `message_meta` row cannot be compared or moved
+                    // onto; leave both entries untouched rather than guess.
+                    guard let newResolved = try resolveRowidAndYear(rekey.newKey, db: db) else {
+                        continue
+                    }
+                    let oldRichness = try entryRichness(
+                        rowid: resolved.rowid, year: resolved.year, db: db)
+                    let newRichness = try entryRichness(
+                        rowid: newResolved.rowid, year: newResolved.year, db: db)
+                    if Self.isRicher(oldRichness, than: newRichness) {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SearchIndex] rekeyHeaders: preserving richer old entry \(rekey.oldKey.rawValue.prefix(40)) over skeletal \(rekey.newKey.rawValue.prefix(40))")
+                        }
+                        try deleteEntry(contentKey: rekey.newKey, rowid: newResolved.rowid,
+                                        year: newResolved.year, db: db)
+                    } else {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SearchIndex] rekeyHeaders: \(rekey.newKey.rawValue.prefix(40)) already indexed — removing old entry \(rekey.oldKey.rawValue.prefix(40))")
+                        }
+                        try deleteEntry(contentKey: rekey.oldKey, rowid: resolved.rowid,
+                                        year: resolved.year, db: db)
+                        continue
+                    }
                 }
                 try db.execute(sql: "UPDATE message_ids SET headerId = ? WHERE headerId = ?",
                                arguments: [rekey.newKey, rekey.oldKey])
@@ -1108,6 +1216,61 @@ actor SearchIndex {
                 }
             }
         }
+    }
+
+    /// How much indexed CONTENT an FTS entry carries, for the `rekeyHeaders`
+    /// collision compare. Ordered by what a re-fetch costs to rebuild: the indexed
+    /// body first, then the embedding, then how much body there is.
+    ///
+    /// PORT (`v2final:SearchIndex.entryRichness`). The reference probes
+    /// `sqlite_master` for `messages_vec` because it ships test seams that DROP the
+    /// table (`testDropVectorTable` / `testRecreateVectorTable`); v3 has neither, but
+    /// keeps the same probe at `storeEmbedding` / `storeEmbeddings` /
+    /// `purgeForAccount` for the device where the `vec0` module fails to register, so
+    /// the probe is carried here for the same reason rather than the reference's.
+    private func entryRichness(
+        rowid: Int64,
+        year: Int,
+        db: Database
+    ) throws -> (hasBody: Bool, hasVector: Bool, bodyLength: Int) {
+        let table = ftsTableName(year: year)
+        let body = try String.fetchOne(
+            db,
+            sql: "SELECT body FROM \(table) WHERE rowid = ?",
+            arguments: [rowid]
+        ) ?? ""
+        // A lone " " is this index's empty-body SENTINEL, not content — the same
+        // reading `rawFTSBody` and `contentKeysWithFTSBody` already apply.
+        let hasBody = !body.isEmpty && body != " "
+        let vectorTableExists = try Bool.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='messages_vec'"
+        ) ?? false
+        let hasVector: Bool
+        if vectorTableExists {
+            hasVector = (try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM messages_vec WHERE rowid = ?",
+                arguments: [rowid]
+            ) ?? 0) > 0
+        } else {
+            hasVector = false
+        }
+        // ⚠ MEASURES, never truncates. `body` is the FULL indexed text; only its
+        // LENGTH is used, and nothing here writes back to any store.
+        return (hasBody, hasVector, body.count)
+    }
+
+    /// PORT (`v2final:SearchIndex.isRicher`). Strict — equal richness is NOT
+    /// "richer", so a tie keeps the pre-existing new-key entry and the old one is
+    /// dropped, exactly as before this compare existed.
+    private nonisolated static func isRicher(
+        _ lhs: (hasBody: Bool, hasVector: Bool, bodyLength: Int),
+        than rhs: (hasBody: Bool, hasVector: Bool, bodyLength: Int)
+    ) -> Bool {
+        if lhs.hasBody != rhs.hasBody { return lhs.hasBody }
+        if lhs.hasVector != rhs.hasVector { return lhs.hasVector }
+        return lhs.bodyLength > rhs.bodyLength
     }
 
     // MARK: - Folder ID Updates
