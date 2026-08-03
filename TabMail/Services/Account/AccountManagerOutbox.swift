@@ -518,11 +518,33 @@ extension AccountManager {
                 // Attachment files corrupted/missing — mark as failed, do NOT send
                 // an incomplete email (missing attachments = silent data corruption).
                 print("[Outbox] ERROR: Could not reconstruct draft for \(current.id): \(error)")
-                try? await retryWrite(dbPool, label: "Outbox") { db in
-                    try db.execute(
-                        sql: "UPDATE outboxMessage SET status = ?, errorMessage = ? WHERE id = ?",
-                        arguments: [OutboxStatus.failed.rawValue, "Attachment files could not be loaded. The message was NOT sent.", current.id]
-                    )
+                // 🚨 NEVER `try?` ON AN OUTBOX STATE TRANSITION (Outbox rule 2).
+                //
+                // This write is the ONLY thing moving the row off `.sending`, and
+                // the drain selects `.queued` only. Swallowing its failure stranded
+                // the row at `.sending` / `sentAt == nil` — no drain would ever look
+                // at it again and the Outbox UI offers no retry for a row that is
+                // not `.failed`, so the user's message became invisible and
+                // unsendable with no error shown. That is the dropped send this
+                // rule exists to prevent.
+                //
+                // On failure we hand the row back to the drain with the SAME helper
+                // the missing-provider claim uses, so the next pass re-attempts both
+                // the reconstruction and this transition. Nothing was sent here, so
+                // requeueing cannot double-send.
+                do {
+                    try await retryWrite(dbPool, label: "Outbox") { db in
+                        try db.execute(
+                            sql: "UPDATE outboxMessage SET status = ?, errorMessage = ? WHERE id = ?",
+                            arguments: [OutboxStatus.failed.rawValue, "Attachment files could not be loaded. The message was NOT sent.", current.id]
+                        )
+                    }
+                } catch {
+                    print("[Outbox] CRITICAL: could not mark \(current.id) failed after attachment-load error: \(error) — requeueing so the row stays drainable")
+                    let requeued = await requeueClaimedOutboxMessage(current.id)
+                    if !requeued {
+                        print("[Outbox] CRITICAL: attachment-failure rollback did not transition exactly one row for \(current.id) — a newer durable state won or the write failed")
+                    }
                 }
                 return
             }
@@ -975,20 +997,43 @@ extension AccountManager {
                 accountId: outbox.accountId,
                 db: db
            ) {
+            // 🚨 ADMIT THROUGH THE PROVIDER-ADDRESS PREDICATE (audit A-6).
+            //
+            // Both flag ops below used to name `original.stableId` — an rfc822
+            // Message-ID on IMAP — with no `observedUidValidity`. That is exactly
+            // the shape the drain's checkpoint A exists to refuse, so on IMAP the
+            // `\Answered` / `$Forwarded` keyword was queued and then deleted
+            // unexecuted on the next drain, every time: a silently accepted,
+            // deterministically dropped action.
+            //
+            // `nil` here means the account row, the folder row or its epoch is
+            // missing — an ABSENCE of evidence. We refuse to queue rather than
+            // queue an op that can only be refused. The LOCAL flags below are set
+            // either way: the user provably replied/forwarded, and that fact does
+            // not depend on whether we can address the message on the wire.
+            let flagAdmission = try AccountManager.admittedOrdinaryActionTargets(
+                [original], accountId: original.accountId,
+                folderPath: original.folderPath, db: db)
             if outbox.isForward {
                 original.isForwarded = true
-                try PendingOperation(
-                    type: .markForwarded,
-                    messageIds: [original.stableId],
-                    accountId: original.accountId,
-                    folderPath: original.folderPath).insert(db)
+                if let flagAdmission {
+                    try PendingOperation(
+                        type: .markForwarded,
+                        messageIds: flagAdmission.providerIds,
+                        accountId: original.accountId,
+                        folderPath: original.folderPath,
+                        observedUidValidity: flagAdmission.observedUidValidity).insert(db)
+                }
             } else {
                 original.isReplied = true
-                try PendingOperation(
-                    type: .markReplied,
-                    messageIds: [original.stableId],
-                    accountId: original.accountId,
-                    folderPath: original.folderPath).insert(db)
+                if let flagAdmission {
+                    try PendingOperation(
+                        type: .markReplied,
+                        messageIds: flagAdmission.providerIds,
+                        accountId: original.accountId,
+                        folderPath: original.folderPath,
+                        observedUidValidity: flagAdmission.observedUidValidity).insert(db)
+                }
                 if original.actionTag == .reply {
                     // `ActionTag.none` is the real tag VALUE "none", not
                     // Optional.none — so this STAMPS `actionTagSetAt`, it does
@@ -1223,10 +1268,26 @@ extension AccountManager {
             if message.sentAt != nil, message.appendedToSent {
                 await finalizeOutboxMessage(message)
             } else if message.sentAt == nil {
-                try? await retryWrite(dbPool, label: "Outbox") { db in
-                    try db.execute(
-                        sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
-                        arguments: [OutboxStatus.queued.rawValue, message.id])
+                // 🚨 NEVER `try?` ON AN OUTBOX STATE TRANSITION (Outbox rule 2).
+                //
+                // This is the crash-recovery transition that makes a row the drain
+                // can see again — `drainOutbox` selects `.queued` only. Swallowing
+                // the failure left the row at `.sending` and the `drainOutbox()`
+                // call at the bottom of this function then skipped it, so a message
+                // the user believes is sending sat untouched for the rest of the
+                // session with nothing logged.
+                //
+                // The next `reconcileOutbox` re-selects `.sending` and re-attempts,
+                // so the row is not permanently stranded — but the failure must be
+                // VISIBLE rather than silent, which is what this rule is for.
+                do {
+                    try await retryWrite(dbPool, label: "Outbox") { db in
+                        try db.execute(
+                            sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
+                            arguments: [OutboxStatus.queued.rawValue, message.id])
+                    }
+                } catch {
+                    print("[Outbox] CRITICAL: crash-recovery requeue failed for \(message.id): \(error) — row remains .sending and will NOT drain until the next reconcile")
                 }
             }
         }

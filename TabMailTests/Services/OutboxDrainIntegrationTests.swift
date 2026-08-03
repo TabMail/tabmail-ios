@@ -1034,16 +1034,48 @@ struct OutboxGenerationFinalizationTests {
         #expect(state.1.isEmpty)
     }
 
+    /// The ADMITTED side of the original-resolution family, and the non-vacuity
+    /// partner for the two refusal tests above it: a change that simply stopped
+    /// flagging would pass both of those and fail here.
+    ///
+    /// 🚨 THE FIXTURE MUST MAKE THE PARENT ADDRESSABLE, and this is why. `install()`
+    /// builds an `.imap` account whose INBOX carries no `lastKnownUidValidity`, and
+    /// `originalHeader` leaves `observedUidValidity` nil — together that is exactly
+    /// the `IOS-EPOCH-001` accepted fail-closed window, in which NO durable IMAP
+    /// gesture is admitted on that folder by owner decision. A parent in that state
+    /// cannot be positively addressed on the wire, so `deleteCompletedSendAtomic`
+    /// correctly queues nothing for it (audit A-6), and a test left on that fixture
+    /// was asserting a refusal window rather than the property it names. Every
+    /// SYNCED row carries the epoch it was observed under (`SyncEngine`/
+    /// `SyncEngineFullSync` stamp `observedUidValidity = sourceBoundEpoch` on
+    /// ingest, and the delta-sync bootstrap writes the folder's own epoch), so the
+    /// stamps below are what an ordinary reply parent actually looks like.
+    ///
+    /// The op is asserted to be EXECUTABLE, not merely present: an op naming the
+    /// rfc822 content id with no epoch — the pre-A-6 shape — is one the drain's
+    /// checkpoint A can only skip and the `.markReplied` executor arm can only
+    /// no-op, which is indistinguishable from never having queued it. The end
+    /// state at the wire is pinned separately by `NeverDropExitClosureTests
+    /// .repliedFlagForAnAddressableParentReachesTheWire`.
     @Test("An exact same-account original with matching RFC evidence is still flagged")
     func originalResolutionAcceptsCorroboratedSameAccountRow() async throws {
         let fixture = try install()
         defer { finish(fixture) }
+        let epoch = 4242
         let rfc822 = "same-account-original@example.com"
-        let original = originalHeader(messageId: "91", rfc822MessageId: rfc822)
+        let original: MessageHeader = {
+            var value = originalHeader(messageId: "91", rfc822MessageId: rfc822)
+            value.observedUidValidity = epoch
+            return value
+        }()
         let completed = completedReply(
             originalId: original.id,
             inReplyTo: "<\(rfc822)>")
         try await fixture.0.writeWithoutTransaction { db in
+            try Folder
+                .filter(Column("id") == MessageIdentity.folderId(
+                    accountId: "acc1", folderPath: "INBOX"))
+                .updateAll(db, Column("lastKnownUidValidity").set(to: epoch))
             try original.insert(db)
             try completed.insert(db)
         }
@@ -1063,6 +1095,13 @@ struct OutboxGenerationFinalizationTests {
         #expect(state.1[0].type == .markReplied)
         #expect(state.1[0].accountId == "acc1")
         #expect(state.1[0].folderPath == "INBOX")
+        // Executable, not merely queued — see the doc comment.
+        #expect(original.stableId != original.messageId,
+                "precondition: content id and provider address must differ, or the check below is blind")
+        #expect(state.1[0].messageIds == [original.messageId],
+                "the op names \(state.1[0].messageIds) — an rfc822 content id is not an address")
+        #expect(state.1[0].observedUidValidity == epoch,
+                "the op must carry the epoch that proved its address, or no drain will ever claim it")
     }
 }
 
