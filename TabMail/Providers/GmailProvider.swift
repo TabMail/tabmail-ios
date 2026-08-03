@@ -4,6 +4,92 @@
 
 import Foundation
 
+/// Actor-owned ordering state for Gmail's `/labels` catalog. Kept as a small
+/// value type so out-of-order response handling can be tested deterministically
+/// without reproducing URLSession scheduling.
+///
+/// PORT — `v2final:TabMail/Providers/GmailProvider.swift`
+/// `GmailUserLabelCatalogState` (commit `a75196398`), taken whole. The three
+/// pieces are load-bearing together and none may be dropped:
+///
+///  - `knownUserLabelIds` is a POSITIVE allowlist. Gmail user labels carry
+///    opaque ids (`Label_42`) drawn from the same namespace Gmail assigns to
+///    its own auto-created labels, so a message's `labelIds` array cannot be
+///    classified from the id alone. Only a complete `/labels` response — which
+///    carries the DISPLAY NAMES — can say which opaque ids are user labels.
+///  - `mutationRevision` is the guard that keeps the allowlist from going
+///    stale: a `/labels` listing that was issued BEFORE a `createLabel` /
+///    `findLabelIdByName` discovery must not replace the newer knowledge, so a
+///    response whose recorded revision no longer matches unions instead of
+///    replacing. An allowlist without this is a stale allowlist that silently
+///    forgets a label the user just created.
+///  - `isAuthoritative` distinguishes "the provider reports no user labels" from
+///    "the catalog has not loaded yet". Before the first complete catalog the
+///    extracted set is empty for the SECOND reason, and any consumer that
+///    treats an empty remote set as an exact remote truth must fail closed.
+struct GmailUserLabelCatalogState: Sendable {
+    struct Request: Sendable, Equatable {
+        fileprivate let generation: Int
+        fileprivate let mutationRevision: Int
+    }
+
+    private(set) var knownUserLabelIds: Set<String> = []
+    private(set) var legacyTmLabelIds: Set<String> = []
+    private(set) var isAuthoritative = false
+    private var mutationRevision = 0
+    private var nextRequestGeneration = 0
+    private var latestAppliedRequestGeneration = 0
+
+    mutating func beginRequest() -> Request {
+        nextRequestGeneration &+= 1
+        return Request(
+            generation: nextRequestGeneration,
+            mutationRevision: mutationRevision
+        )
+    }
+
+    mutating func apply(
+        userLabelIds: Set<String>,
+        legacyTmLabelIds: Set<String>,
+        request: Request
+    ) {
+        guard request.generation > latestAppliedRequestGeneration else { return }
+        if mutationRevision == request.mutationRevision {
+            knownUserLabelIds = userLabelIds
+        } else {
+            knownUserLabelIds.formUnion(userLabelIds)
+        }
+        self.legacyTmLabelIds = legacyTmLabelIds
+        isAuthoritative = true
+        latestAppliedRequestGeneration = request.generation
+    }
+
+    mutating func recordKnownUserLabel(_ labelId: String) {
+        knownUserLabelIds.insert(labelId)
+        mutationRevision &+= 1
+    }
+
+    /// Extract user label IDs from a Gmail message's `labelIds`, keeping only
+    /// ids the catalog has POSITIVELY confirmed are user labels and dropping
+    /// legacy `tm_*` ids (ADR-IOS-036 decay — otherwise messages still tagged
+    /// server-side from pre-ADR installs round-trip the id into
+    /// `MessageUserLabel` junction rows until `move()`'s inbox-exit cleanup
+    /// strips them).
+    ///
+    /// This REPLACES the v3 base's negative `!UserLabelStore.isGmailSystemLabel(id:)`
+    /// predicate, which was handed the bare label id as BOTH the id and the
+    /// name — so `UserLabelStore.shouldExcludeLabel`'s `Label_N` name pattern
+    /// matched every GENUINE Gmail user label as well as the auto-created ones
+    /// it was aimed at, and Gmail user-label membership never reached GRDB at
+    /// all. Only a complete `/labels` response carries the display names that
+    /// separate the two, which is exactly what this allowlist is built from.
+    func extractUserLabelIds(from labelIds: [String]?) -> [String] {
+        (labelIds ?? []).filter { labelId in
+            !legacyTmLabelIds.contains(labelId) && knownUserLabelIds.contains(labelId)
+        }
+    }
+}
+
 /// Gmail API-based provider for Google accounts.
 /// Uses Gmail REST API for all operations — strictly better than IMAP for Gmail.
 actor GmailProvider: EmailProvider {
@@ -27,7 +113,11 @@ actor GmailProvider: EmailProvider {
     /// Used in `move()` to strip the label from the message being moved out
     /// of the inbox, so the legacy pollution decays naturally as the user
     /// triages. Never read for ActionTag resolution (see ADR-IOS-036).
-    private var legacyTmLabelIds: Set<String> = []
+    /// Gmail user labels use opaque IDs such as `Label_42`, which are
+    /// indistinguishable from Gmail's reserved ID namespace without the
+    /// display names returned by `/labels`. Message parsing therefore trusts
+    /// only IDs learned from a complete successful catalog response.
+    private var userLabelCatalog = GmailUserLabelCatalogState()
 
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Gmail API calls.
@@ -64,6 +154,7 @@ actor GmailProvider: EmailProvider {
     }
 
     func fetchFolders() async throws -> [FolderInfo] {
+        let catalogRequest = userLabelCatalog.beginRequest()
         let data = try await request(path: "/labels")
         let response = try JSONDecoder().decode(GmailLabelsResponse.self, from: data)
 
@@ -75,6 +166,8 @@ actor GmailProvider: EmailProvider {
         ]
 
         var folders: [FolderInfo] = []
+        var discoveredLegacyTmLabelIds: Set<String> = []
+        var discoveredUserLabelIds: Set<String> = []
 
         for label in response.labels {
             if label.type == "system" {
@@ -94,11 +187,12 @@ actor GmailProvider: EmailProvider {
                 // folder list, record the ID so `move()` can strip it from
                 // messages exiting the inbox (natural decay, ADR-IOS-036).
                 if label.name.lowercased().hasPrefix("tm_") {
-                    legacyTmLabelIds.insert(label.id)
+                    discoveredLegacyTmLabelIds.insert(label.id)
                 }
                 if UserLabelStore.shouldExcludeLabel(id: label.id, name: label.name) {
                     continue
                 }
+                discoveredUserLabelIds.insert(label.id)
                 // User-created labels → custom folders
                 folders.append(FolderInfo(
                     name: label.name,
@@ -109,6 +203,12 @@ actor GmailProvider: EmailProvider {
                 ))
             }
         }
+
+        userLabelCatalog.apply(
+            userLabelIds: discoveredUserLabelIds,
+            legacyTmLabelIds: discoveredLegacyTmLabelIds,
+            request: catalogRequest
+        )
 
         // Gmail has no explicit archive label — add synthetic "All Mail" folder with .archive role.
         // Gmail's archive = removing INBOX label; "All Mail" is the closest equivalent folder.
@@ -433,8 +533,8 @@ actor GmailProvider: EmailProvider {
         // TabMail versions. Batched into the same messages.modify call — zero
         // extra round-trip. Only runs on inbox-exit so we don't disturb labels
         // on messages that stay in other folders.
-        if source == "INBOX" && !legacyTmLabelIds.isEmpty {
-            remove.append(contentsOf: legacyTmLabelIds)
+        if source == "INBOX" && !userLabelCatalog.legacyTmLabelIds.isEmpty {
+            remove.append(contentsOf: userLabelCatalog.legacyTmLabelIds)
         }
         // No-op: both source and destination resolve to no label changes (e.g., move from
         // All Mail to All Mail). Skip the API call — Gmail rejects empty modify bodies.
@@ -1069,6 +1169,56 @@ actor GmailProvider: EmailProvider {
         }
     }
 
+    /// Same as `request(...)` but for the action-path call site that must
+    /// structurally classify a `400` response (`modifyMessage`): preserves the
+    /// raw response body of a `400` failure instead of throwing the bodyless
+    /// `.networkError`, so it can be parsed for Gmail's error shape (see
+    /// `isGmailInvalidIdError`) rather than guessed from the status code
+    /// alone. Every other failure status still throws the ordinary
+    /// `.networkError` — same as `request(...)`.
+    ///
+    /// PORT — `v2final:TabMail/Providers/GmailProvider.swift`
+    /// `GmailProvider.requestPreservingBadRequestBody(path:method:body:)`
+    /// (commit `a75196398`). SUBTRACT: the reference declares a `"GET"` arm for
+    /// `resolveActionMessageId`'s / `resolveTokenMember`'s list and metadata
+    /// calls. Both of those methods are RFC-search machinery that v3 does not
+    /// have (D4: durable ops key on Gmail's native `message.id`, so nothing
+    /// resolves an identity by search), leaving `modifyMessage`'s POST as the
+    /// only body-classifying call site on this tree. A `GET` arm here would be
+    /// unreachable code, and its absence cannot silently mis-route anything:
+    /// the `default` arm below traps at the callsite rather than quietly
+    /// downgrading to the bodyless path.
+    ///
+    /// `method` and `body` are deliberately NOT defaulted (the reference
+    /// defaults them to `"GET"` / `nil`): on this tree `GET` hits the
+    /// `default` trap, so a default that reaches it would be a latent crash
+    /// rather than a convenience.
+    private func requestPreservingBadRequestBody(
+        path: String,
+        method: String,
+        body: Data?
+    ) async throws -> Data {
+        if path.contains(GmailProvider.archivePath) {
+            print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)")
+            throw ProviderError.syntheticFolderPath(path)
+        }
+        let url = baseURL + path
+        await acquireRequestSlot()
+        defer { releaseRequestSlot() }
+        do {
+            switch method {
+            case "POST":
+                return try await authedHTTP.requestPreservingBadRequestBody(
+                    url: url, method: "POST", body: body ?? Data()
+                )
+            default:
+                fatalError("GmailProvider.requestPreservingBadRequestBody: unsupported HTTP method \(method)")
+            }
+        } catch let e as HTTPError {
+            throw ProviderError.networkError(underlying: e)
+        }
+    }
+
     /// Acquire one of `GmailAPI.maxConcurrentRequests` HTTP slots, suspending FIFO
     /// when the cap is reached. Actor-isolated, so the counter/waiter mutations are
     /// race-free without a lock.
@@ -1101,6 +1251,7 @@ actor GmailProvider: EmailProvider {
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let data = try await request(path: "/labels", method: "POST", body: jsonData)
         let label = try JSONDecoder().decode(GmailLabel.self, from: data)
+        userLabelCatalog.recordKnownUserLabel(label.id)
         return label.id
     }
 
@@ -1110,12 +1261,114 @@ actor GmailProvider: EmailProvider {
         _ = tag
     }
 
+    /// Gmail's structured JSON error body shape (used across the v1 REST API):
+    /// `{"error":{"code":400,"message":"...","errors":[{"domain":"global","reason":"invalidArgument","message":"..."}]}}`.
+    /// https://developers.google.com/workspace/gmail/api/guides/handle-errors
+    ///
+    /// PORT — `v2final:TabMail/Providers/GmailProvider.swift`
+    /// `GmailProvider.GmailAPIErrorBody` (commit `a75196398`).
+    private struct GmailAPIErrorBody: Decodable {
+        struct Detail: Decodable {
+            let domain: String?
+            let reason: String?
+            let message: String?
+        }
+        struct ErrorObject: Decodable {
+            let code: Int?
+            let message: String?
+            let errors: [Detail]?
+        }
+        let error: ErrorObject
+    }
+
+    /// True only when Gmail's structured `400` error body PROVES the exact
+    /// id could never resolve — `reason == "invalidArgument"` AND Gmail's own
+    /// literal wording `"Invalid id value"` (a malformed message id). This is
+    /// the Gmail mirror of Exchange's `ErrorInvalidIdMalformed` handling
+    /// (`ExchangeProvider.isGraphInvalidIdMalformed` in the reference): an id
+    /// Gmail itself rejects as invalid can never resolve on retry, so it is an
+    /// authoritative stale no-op (C3-G2 — failing closed on the mutation is
+    /// always acceptable). Any other `400` shape is uncertainty and must keep
+    /// throwing; a bare status code is never enough to conclude staleness.
+    ///
+    /// PORT — `v2final:TabMail/Providers/GmailProvider.swift`
+    /// `GmailProvider.isGmailInvalidIdError(_:)` (commit `a75196398`), taken
+    /// verbatim.
+    private func isGmailInvalidIdError(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, let body) = underlying,
+              statusCode == 400,
+              let decoded = try? JSONDecoder().decode(GmailAPIErrorBody.self, from: body)
+        else { return false }
+        let detail = decoded.error.errors?.first
+        let reason = detail?.reason ?? ""
+        let message = detail?.message ?? decoded.error.message ?? ""
+        return reason == "invalidArgument" && message.hasPrefix("Invalid id value")
+    }
+
+    /// Apply a label add/remove batch to one Gmail message by its native
+    /// `message.id` (D4: the durable op records that id, so no resolution step
+    /// stands between the op and the wire).
+    ///
+    /// The `400` handling is deliberately two-outcome:
+    ///  - Gmail's proven `"Invalid id value"` `400` is an AUTHORITATIVE stale
+    ///    no-op: return normally, and the queue retires the op as completed.
+    ///  - Every other `400` keeps throwing, so the classification decision
+    ///    stays with the queue rather than being pre-empted here by a guess.
+    ///
+    /// SUBTRACT — the reference's `classifyUnrecognizedActionBadRequest(_:)`
+    /// arm, which rewraps an unclassified `400` as
+    /// `ProviderError.persistentActionFailure` so the generic queue DEMOTES
+    /// the failing chain to the queue tail rather than blocking the FIFO.
+    /// v3 has no `persistentActionFailure` case and no demote lane
+    /// (`AccountManagerQueue` says so at the `.actionIdentityResolutionFailed`
+    /// arm: "machinery this tree does not have (F2b L4)"). Adding the wrapper
+    /// without the lane would be strictly WORSE than not porting it: an
+    /// unrecognized case falls through to the queue's generic transient branch
+    /// and retries forever — the exact wedge the reference's arm exists to
+    /// prevent. Rethrowing unchanged keeps v3's shipped terminal disposition
+    /// for a Gmail action `400` (`AccountManagerQueue.isPermanentlyInvalidError`
+    /// → drop the op), which is what this tree does today and is why that
+    /// matcher had to be widened to `.networkErrorWithBody` in the same change.
+    ///
+    /// SUBTRACT — the reference also handles `isGmailInvalidLabelError` here
+    /// (invalid/gone label → stale no-op). Not ported: on v3 that `400` reaches
+    /// the queue and `isPermanentlyInvalidError` already drops the op, so the
+    /// end state (op removed, never retried) is the same one the reference
+    /// reaches by returning. Porting the classifier without the reference's
+    /// demote lane would only change WHICH terminal branch retires the op, not
+    /// whether it is retired. ⚑ Note the brief's stated premise for dropping it
+    /// — "it only ever classified failures of the deleted RFC search" — is
+    /// FALSE: the reference calls it from `modifyMessage` too. The drop is
+    /// justified by the equivalent end state above, not by that premise.
+    ///
+    /// SUBTRACT — the reference's leading `guard !isHttpGoneStatus(error)`.
+    /// A `404`/`410` is not a `400`, so `requestPreservingBadRequestBody`
+    /// leaves it as the bodyless `.networkError` exactly as `request()` did;
+    /// v3 routes it to `AccountManagerQueue.isMessageNotFoundError` /
+    /// `isConfirmedGoneError`, which is the pre-existing v3 behavior for this
+    /// method and is untouched by this change.
     func modifyMessage(id: String, addLabelIds: [String] = [], removeLabelIds: [String] = []) async throws {
         var body: [String: Any] = [:]
         if !addLabelIds.isEmpty { body["addLabelIds"] = addLabelIds }
         if !removeLabelIds.isEmpty { body["removeLabelIds"] = removeLabelIds }
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/\(id)/modify", method: "POST", body: jsonData)
+        do {
+            _ = try await requestPreservingBadRequestBody(
+                path: "/messages/\(id)/modify", method: "POST", body: jsonData
+            )
+        } catch {
+            guard !isGmailInvalidIdError(error) else {
+                // Authoritative stale: Gmail itself rejects this exact id as
+                // invalid — it can never resolve on retry. Normal return; the
+                // queue treats this as a completed no-op.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Gmail] modifyMessage \(id): invalid-id 400 confirmed stale — treating as no-op")
+                }
+                return
+            }
+            throw error
+        }
     }
 
     // MARK: - Parsing
@@ -1169,30 +1422,42 @@ actor GmailProvider: EmailProvider {
             isReplied: false,
             isForwarded: false,
             actionTag: nil,
-            userLabelIds: extractUserLabelIds(from: metadata.providerLabels)
+            userLabelIds: userLabelCatalog.extractUserLabelIds(from: metadata.providerLabels),
+            userLabelIdsAreAuthoritative: userLabelCatalog.isAuthoritative
         )
-    }
-
-    /// Extract user label IDs from a Gmail message's labelIds, filtering out:
-    /// - Legacy `tm_*` labels (IDs observed in `fetchFolders`, see `legacyTmLabelIds`).
-    ///   Without this filter, messages still tagged server-side from pre-ADR-IOS-036
-    ///   installs would round-trip the ID into `MessageUserLabel` junction rows until
-    ///   `move()`'s inbox-exit cleanup strips them.
-    /// - Gmail system labels (INBOX, SENT, STARRED, CATEGORY_*, Label_N, etc.)
-    /// Returns only user-created label IDs suitable for UserLabel/MessageUserLabel storage.
-    private func extractUserLabelIds(from labelIds: [String]?) -> [String] {
-        let ids = labelIds ?? []
-        return ids.filter { labelId in
-            !legacyTmLabelIds.contains(labelId) && !UserLabelStore.isGmailSystemLabel(id: labelId)
-        }
     }
 
     /// Look up a Gmail label ID by display name. Returns nil if not found.
     /// Used when createLabel returns 409 Conflict (label already exists on server).
     func findLabelIdByName(_ name: String) async throws -> String? {
+        let catalogRequest = userLabelCatalog.beginRequest()
         let data = try await request(path: "/labels")
         let response = try JSONDecoder().decode(GmailLabelsResponse.self, from: data)
-        return response.labels.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.id
+        let userLabels = response.labels.filter {
+            $0.type == "user" && !UserLabelStore.shouldExcludeLabel(id: $0.id, name: $0.name)
+        }
+        let discoveredUserLabelIds = Set(userLabels.map(\.id))
+        let discoveredLegacyTmLabelIds: Set<String> = Set(response.labels.compactMap { label in
+            guard label.type == "user", label.name.lowercased().hasPrefix("tm_") else {
+                return nil
+            }
+            return label.id
+        })
+        userLabelCatalog.apply(
+            userLabelIds: discoveredUserLabelIds,
+            legacyTmLabelIds: discoveredLegacyTmLabelIds,
+            request: catalogRequest
+        )
+        guard let match = userLabels.first(where: {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame
+        }) else {
+            return nil
+        }
+        // Even when this response lost an out-of-order catalog race, the exact
+        // match is provider-confirmed and must survive any older request still
+        // in flight until a later uncontended catalog replaces the cache.
+        userLabelCatalog.recordKnownUserLabel(match.id)
+        return match.id
     }
 
     /// Recursively check all MIME parts for attachments.

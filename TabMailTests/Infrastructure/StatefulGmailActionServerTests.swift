@@ -354,25 +354,25 @@ struct StatefulGmailActionServerTests {
         #expect(archive[0].isFlagged)
     }
 
-    /// Adapted stand-in for the reference's three user-label tests
+    /// Companion to the reference's three user-label tests
     /// (`userLabelCatalogAuthority`, `createdUserLabelIsImmediatelyKnown`,
-    /// `overlappingUserLabelCatalogsKeepNewestKnowledge`).
+    /// `overlappingUserLabelCatalogsKeepNewestKnowledge`), all three of which
+    /// are now ported directly below this one.
     ///
-    /// **Those three cannot port.** All of them assert on
-    /// `GmailUserLabelCatalogState` and `MessageHeaderInfo.userLabelIdsAreAuthoritative`,
-    /// neither of which exists anywhere on `v3` (`git grep` returns nothing in
-    /// `TabMail/`); the request-generation catalog is a `v2final` production
-    /// feature landed after `v1.6.38`. Without it there is no "authoritative"
-    /// bit to observe. The reference's assertion
-    /// `findLabelIdByName("tm_legacy") == nil` also inverts on `v3`, whose
-    /// `findLabelIdByName` is a plain case-insensitive name match with no
-    /// legacy filter.
+    /// ⚠ **CORRECTED (T3.8).** An earlier revision of this comment said those
+    /// three "cannot port" because `GmailUserLabelCatalogState` and
+    /// `MessageHeaderInfo.userLabelIdsAreAuthoritative` existed nowhere on
+    /// `v3`. That was true when it was written and is no longer: T3.8 ported
+    /// the catalog struct into `TabMail/Providers/GmailProvider.swift` and the
+    /// authoritative flag into `MessageHeaderInfo`, and `findLabelIdByName`
+    /// now applies the reference's `UserLabelStore.shouldExcludeLabel` filter
+    /// (so `findLabelIdByName("tm_legacy") == nil` holds here too, and no
+    /// longer inverts).
     ///
-    /// What DOES port is the half of the `/labels` surface `v3` implements:
-    /// catalog discovery classifying user vs legacy `tm_*` labels
-    /// (ADR-IOS-036 decay), and label creation. The decay leg additionally
-    /// proves the catalog feeds `move()`'s inbox-exit strip — otherwise the
-    /// server's `userLabels` / `createdLabelId` seeds have no coverage at all.
+    /// This test keeps its own job: the `/labels` catalog feeding `move()`'s
+    /// inbox-exit legacy-label strip (ADR-IOS-036 decay), which is the only
+    /// coverage the server's `userLabels` / `createdLabelId` seeds otherwise
+    /// have.
     @Test("Gmail label catalog classifies legacy labels and feeds inbox-exit decay")
     func legacyTmLabelDecayUsesTheLabelCatalog() async throws {
         let userLabelId = "Label_42"
@@ -423,6 +423,267 @@ struct StatefulGmailActionServerTests {
         guard log.count == 1 else { return }
         #expect(log[0].providerMessageId == providerMessageId)
         #expect(Set(log[0].removeLabelIds) == ["INBOX", legacyLabelId])
+    }
+
+    // MARK: - T3.8 — Gmail user-label catalog authority (ported from v2final)
+
+    /// PORT — `v2final:TabMailTests/Infrastructure/StatefulGmailActionServerTests.swift`
+    /// `userLabelCatalogAuthority` (commit `a75196398`), unchanged in substance.
+    ///
+    /// The invariant: a message parsed BEFORE the `/labels` catalog has loaded
+    /// carries an empty `userLabelIds` that is explicitly NOT authoritative —
+    /// "we cannot classify these opaque ids yet", never "the provider says this
+    /// message has no user labels". Only after a complete catalog does the same
+    /// message report its real membership AND claim authority.
+    ///
+    /// TWO-SIDED by construction: `beforeCatalog` is the negative half (empty +
+    /// not authoritative) and `afterCatalog` the positive half (exact set +
+    /// authoritative), against the SAME message on the SAME fixture — so a
+    /// catalog that never loaded, or one that claimed authority unconditionally,
+    /// fails one half or the other.
+    @Test("Gmail user-label membership becomes authoritative after catalog discovery")
+    func userLabelCatalogAuthority() async throws {
+        let labelId = "Label_42"
+        let server = StatefulGmailActionServer(
+            messages: [.init(
+                rfc822MessageId: "gmail-label-catalog@example.com",
+                providerMessageId: "gmail-label-catalog-1",
+                labels: ["INBOX", labelId]
+            )],
+            userLabels: [
+                labelId: "Project",
+                "Label_99": "tm_legacy",
+            ]
+        )
+        defer { server.close() }
+        let provider = server.provider()
+
+        let beforeCatalog = try await provider.fetchMessages(
+            folder: "INBOX",
+            limit: 10,
+            offset: 0
+        )
+        #expect(beforeCatalog.count == 1)
+        guard beforeCatalog.count == 1 else { return }
+        #expect(beforeCatalog[0].userLabelIds.isEmpty)
+        #expect(!beforeCatalog[0].userLabelIdsAreAuthoritative)
+
+        #expect(try await provider.findLabelIdByName("Project") == labelId)
+        let legacyLookup = try await provider.findLabelIdByName("tm_legacy")
+        #expect(
+            legacyLookup == nil,
+            "a legacy tm_* label is not a user label and must never be resolvable by name"
+        )
+
+        let folders = try await provider.fetchFolders()
+        #expect(folders.contains { $0.path == labelId && $0.name == "Project" })
+
+        let afterCatalog = try await provider.fetchMessages(
+            folder: "INBOX",
+            limit: 10,
+            offset: 0
+        )
+        #expect(afterCatalog.count == 1)
+        guard afterCatalog.count == 1 else { return }
+        #expect(afterCatalog[0].userLabelIds == [labelId])
+        #expect(afterCatalog[0].userLabelIdsAreAuthoritative)
+    }
+
+    /// PORT — `v2final:…StatefulGmailActionServerTests.swift`
+    /// `createdUserLabelIsImmediatelyKnown` (commit `a75196398`).
+    ///
+    /// The invariant: a label the user just created is user-label knowledge the
+    /// instant the provider confirms it, without waiting for the next `/labels`
+    /// listing. Its opaque id (`Label_43`) is indistinguishable from Gmail's own
+    /// reserved namespace, so an allowlist that only ever grew from full catalog
+    /// responses would drop the brand-new label off every message until the next
+    /// folder refresh.
+    @Test("a newly created opaque Gmail label is immediately recognized by message parsing")
+    func createdUserLabelIsImmediatelyKnown() async throws {
+        let existingLabelId = "Label_42"
+        let createdLabelId = "Label_43"
+        let server = StatefulGmailActionServer(
+            messages: [.init(
+                rfc822MessageId: "gmail-label-created@example.com",
+                providerMessageId: "gmail-label-created-1",
+                labels: ["INBOX", createdLabelId]
+            )],
+            userLabels: [existingLabelId: "Existing"],
+            createdLabelId: createdLabelId
+        )
+        defer { server.close() }
+        let provider = server.provider()
+
+        _ = try await provider.fetchFolders()
+        #expect(try await provider.createLabel(name: "Created") == createdLabelId)
+
+        let headers = try await provider.fetchMessages(
+            folder: "INBOX",
+            limit: 10,
+            offset: 0
+        )
+        #expect(headers.count == 1)
+        guard headers.count == 1 else { return }
+        #expect(headers[0].userLabelIds == [createdLabelId])
+        #expect(headers[0].userLabelIdsAreAuthoritative)
+    }
+
+    /// PORT — `v2final:…StatefulGmailActionServerTests.swift`
+    /// `overlappingUserLabelCatalogsKeepNewestKnowledge` (commit `a75196398`).
+    ///
+    /// The invariant the REVISION guard exists for: an allowlist without it is
+    /// a STALE allowlist. Two halves, both required:
+    ///
+    ///  1. An OLDER in-flight `/labels` response that lands after a newer one
+    ///     must not overwrite the newer knowledge (generation guard).
+    ///  2. A response issued BEFORE a `recordKnownUserLabel` discovery must
+    ///     UNION rather than REPLACE, or the just-created label is forgotten by
+    ///     a listing that could not have contained it (revision guard).
+    ///
+    /// Driven against the value type directly — the reference's stated reason
+    /// for making the catalog a struct at all is that out-of-order response
+    /// handling is then testable without reproducing URLSession scheduling.
+    @Test("an older overlapping label catalog cannot overwrite newer label knowledge")
+    func overlappingUserLabelCatalogsKeepNewestKnowledge() {
+        var catalog = GmailUserLabelCatalogState()
+        let olderRequest = catalog.beginRequest()
+        let newerRequest = catalog.beginRequest()
+
+        catalog.apply(
+            userLabelIds: ["Label_42"],
+            legacyTmLabelIds: [],
+            request: newerRequest
+        )
+        catalog.apply(
+            userLabelIds: ["Label_41"],
+            legacyTmLabelIds: [],
+            request: olderRequest
+        )
+
+        #expect(catalog.knownUserLabelIds == ["Label_42"])
+        #expect(catalog.isAuthoritative)
+
+        let requestBeforeCreate = catalog.beginRequest()
+        catalog.recordKnownUserLabel("Label_43")
+        catalog.apply(
+            userLabelIds: ["Label_42"],
+            legacyTmLabelIds: [],
+            request: requestBeforeCreate
+        )
+        #expect(catalog.knownUserLabelIds == ["Label_42", "Label_43"])
+    }
+
+    // MARK: - T3.5 — Gmail structural 400 classification (provider boundary)
+
+    /// PORT — the `isGmailInvalidIdError` arm of
+    /// `v2final:TabMail/Providers/GmailProvider.swift` (commit `a75196398`),
+    /// relocated from the reference's `resolveTokenMember` GET to v3's
+    /// `modifyMessage` POST because D4 deleted the resolution layer, leaving
+    /// the action write as the only body-classifying Gmail call site.
+    ///
+    /// The invariant (C3-G2): when Gmail's own structured `400` body PROVES the
+    /// exact id can never resolve, the intention is authoritatively stale — the
+    /// provider reports it satisfied and the queue retires it. Failing closed on
+    /// the mutation is always acceptable; retrying an id the server has rejected
+    /// as invalid is not.
+    ///
+    /// NON-VACUITY, two-sided within the test: the wire counter proves the
+    /// injected fault was genuinely consumed (`== 1`, not "the route was never
+    /// hit"), and the end state proves the mutation did NOT land — a `markRead`
+    /// that silently succeeded would report `isRead` and pass a throws-only
+    /// assertion. Its negative twin is
+    /// `unclassifiedBadRequestOnModifyStillThrows` immediately below.
+    @Test("a proven invalid-id 400 on modify is an authoritative stale no-op — the action does not throw")
+    func invalidIdBadRequestOnModifyIsAStaleNoOp() async throws {
+        let providerMessageId = "gmail-invalid-id-1"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "gmail-invalid-id@example.com",
+            providerMessageId: providerMessageId,
+            labels: ["INBOX", "UNREAD"]
+        )])
+        defer { server.close() }
+        let provider = server.provider()
+
+        server.injectInvalidId400OnModify(providerMessageId: providerMessageId)
+
+        // Must NOT throw: this is the whole claim.
+        try await provider.markRead(ids: [providerMessageId], folder: "INBOX")
+
+        #expect(
+            server.invalidId400OnModifyServedCount() == 1,
+            "the injected invalid-id 400 must actually have been served — otherwise this test proves nothing: \(server.invalidId400OnModifyServedCount())"
+        )
+        #expect(server.modifyLog().count == 1)
+
+        let after = server.snapshot(providerMessageId: providerMessageId)
+        #expect(after != nil)
+        guard let after else { return }
+        #expect(
+            !after.isRead,
+            "failing closed: the rejected modify must not have mutated server state"
+        )
+    }
+
+    /// The NEGATIVE half of `invalidIdBadRequestOnModifyIsAStaleNoOp`, and the
+    /// reason a bare status code is never enough.
+    ///
+    /// The invariant: only a body Gmail itself makes terminal may be treated as
+    /// terminal by the provider. An UNCLASSIFIED `400` — structurally a real
+    /// Gmail error body, but matching no known terminal shape — must keep
+    /// throwing, so the disposition decision belongs to the queue rather than
+    /// being pre-empted here by a guess.
+    ///
+    /// It additionally pins the SHAPE that reaches the queue: the body-preserving
+    /// `HTTPError.networkErrorWithBody(400, _)`, not the bodyless
+    /// `.networkError(400)`. That shape change is precisely what
+    /// `AccountManagerQueue.isPermanentlyInvalidError` had to be widened for; if
+    /// this assertion is ever relaxed, the widening's motivation disappears with
+    /// it and the guard silently stops matching.
+    @Test("an UNCLASSIFIED 400 on modify still throws — and reaches the queue body-preserving")
+    func unclassifiedBadRequestOnModifyStillThrows() async throws {
+        let providerMessageId = "gmail-unclassified-400-1"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "gmail-unclassified-400@example.com",
+            providerMessageId: providerMessageId,
+            labels: ["INBOX", "UNREAD"]
+        )])
+        defer { server.close() }
+        let provider = server.provider()
+
+        server.injectUnclassified400(providerMessageId: providerMessageId)
+
+        var caught: (any Error)?
+        do {
+            try await provider.markRead(ids: [providerMessageId], folder: "INBOX")
+        } catch {
+            caught = error
+        }
+
+        let thrown = try #require(
+            caught,
+            "an unclassified 400 must NOT be swallowed as a stale no-op"
+        )
+        let isBodyPreserved400: Bool = { () -> Bool in
+            guard case ProviderError.networkError(let underlying) = thrown,
+                  case HTTPError.networkErrorWithBody(let statusCode, _) = underlying
+            else { return false }
+            return statusCode == 400
+        }()
+        #expect(
+            isBodyPreserved400,
+            "the action-path 400 must arrive body-preserving so it can be classified structurally: \(thrown)"
+        )
+
+        #expect(
+            server.unclassified400ServedCount() == 1,
+            "the injected unclassified 400 must actually have been served: \(server.unclassified400ServedCount())"
+        )
+        #expect(server.modifyLog().count == 1)
+
+        let after = server.snapshot(providerMessageId: providerMessageId)
+        #expect(after != nil)
+        guard let after else { return }
+        #expect(!after.isRead)
     }
 
     /// **The positive control for `consumedLookupFailureCount()`** — `v2final`'s

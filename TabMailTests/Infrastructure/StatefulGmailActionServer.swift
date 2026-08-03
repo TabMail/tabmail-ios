@@ -54,6 +54,20 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var labels: Set<String>
     }
 
+    /// Which injected failure (if any) `/messages/{id}/modify` must serve for
+    /// this attempt. Decided under one lock so the attempt is logged exactly
+    /// once regardless of which arm fires.
+    ///
+    /// `noneInjected`, not `none` — a case named `none` collides with
+    /// `Optional.none` at any callsite where type inference has room, a trap
+    /// this codebase has been bitten by before (`ActionTag.none`).
+    private enum ModifyInjection: Sendable {
+        case noneInjected
+        case unclassified400
+        case invalidId400
+        case transient503
+    }
+
     private struct State: Sendable {
         var messagesByProviderId: [String: Message]
         var userLabels: [String: String]
@@ -72,6 +86,20 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// `clearUnclassified400s()` to simulate the condition resolving.
         var unclassified400ProviderIds: Set<String> = []
         var unclassified400Served = 0
+        /// Provider message ids whose `/messages/{id}/modify` returns Gmail's
+        /// real `"Invalid id value"` `400` — the MODIFY-path counterpart of
+        /// `invalidIdOnGetProviderIds`. Gmail proves the exact id can never
+        /// resolve, so `GmailProvider.isGmailInvalidIdError` classifies it as
+        /// an authoritative stale no-op (C3-G2).
+        var invalidId400OnModifyProviderIds: Set<String> = []
+        var invalidId400OnModifyServed = 0
+        /// Provider message ids whose `/messages/{id}/modify` returns a
+        /// TRANSIENT `503`. Outside `HTTPRetryPolicy.gmail`'s retryable set
+        /// (429/403 only), so it surfaces as a plain bodyless
+        /// `HTTPError.networkError(503)` — the control that proves a terminal
+        /// disposition is not being applied to every failure alike.
+        var transient503OnModifyProviderIds: Set<String> = []
+        var transient503OnModifyServed = 0
         var modifyLog: [ModifyCall] = []
         /// Provider message ids whose exact-ID metadata `GET /messages/{id}`
         /// (token-member resolution, `resolveTokenMember`) returns a
@@ -184,6 +212,33 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// ones) for ordering/attempt-count assertions.
     func modifyLog() -> [ModifyCall] {
         state.value.withLock { $0.modifyLog }
+    }
+
+    /// Inject Gmail's real `"Invalid id value"` `400` for every
+    /// `/messages/{id}/modify` naming `providerMessageId` — the MODIFY-path
+    /// counterpart of `injectInvalidIdOnGet`. Models Gmail rejecting a
+    /// never-valid message id on the ACTION write itself, which is the only
+    /// body-classifying Gmail call site v3 has (D4 removed the RFC-search
+    /// resolution layer the reference classified on the GET path).
+    func injectInvalidId400OnModify(providerMessageId: String) {
+        _ = state.value.withLock { $0.invalidId400OnModifyProviderIds.insert(providerMessageId) }
+    }
+
+    /// How many modify attempts were rejected with the injected invalid-id 400.
+    func invalidId400OnModifyServedCount() -> Int {
+        state.value.withLock { $0.invalidId400OnModifyServed }
+    }
+
+    /// Inject a TRANSIENT `503` for every `/messages/{id}/modify` naming
+    /// `providerMessageId` — the non-terminal control for the structural-400
+    /// classification tests.
+    func injectTransient503OnModify(providerMessageId: String) {
+        _ = state.value.withLock { $0.transient503OnModifyProviderIds.insert(providerMessageId) }
+    }
+
+    /// How many modify attempts were rejected with the injected 503.
+    func transient503OnModifyServedCount() -> Int {
+        state.value.withLock { $0.transient503OnModifyServed }
     }
 
     /// Inject an UNCLASSIFIED structural 400 for the exact-ID metadata `GET
@@ -438,18 +493,38 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             } ?? [:]
             let additions = body["addLabelIds"] as? [String] ?? []
             let removals = body["removeLabelIds"] as? [String] ?? []
-            let injectedUnclassified400 = state.value.withLock { model -> Bool in
+            // ONE log append for every attempt, injected or not — the
+            // modifyLog is the wire-side non-vacuity oracle for the
+            // classification tests, so a rejected attempt must still count.
+            let injection = state.value.withLock { model -> ModifyInjection in
                 model.modifyLog.append(ModifyCall(
                     providerMessageId: providerId,
                     addLabelIds: additions,
                     removeLabelIds: removals
                 ))
-                guard model.unclassified400ProviderIds.contains(providerId) else { return false }
-                model.unclassified400Served += 1
-                return true
+                if model.unclassified400ProviderIds.contains(providerId) {
+                    model.unclassified400Served += 1
+                    return .unclassified400
+                }
+                if model.invalidId400OnModifyProviderIds.contains(providerId) {
+                    model.invalidId400OnModifyServed += 1
+                    return .invalidId400
+                }
+                if model.transient503OnModifyProviderIds.contains(providerId) {
+                    model.transient503OnModifyServed += 1
+                    return .transient503
+                }
+                return .noneInjected
             }
-            if injectedUnclassified400 {
+            switch injection {
+            case .unclassified400:
                 return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            case .invalidId400:
+                return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)
+            case .transient503:
+                return .status(503)
+            case .noneInjected:
+                break
             }
             if let deletedLabel = state.value.withLock({ model in
                 (additions + removals).first(where: { model.deletedLabelIds.contains($0) })
