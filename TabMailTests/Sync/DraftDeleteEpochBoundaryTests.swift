@@ -144,4 +144,87 @@ struct DraftDeleteEpochBoundaryTests {
             try PendingOperation.fetchCount($0)
         } == 0)
     }
+
+    /// PORT — the reused-UID local-header/body refusal invariant of the v2final
+    /// hazard commit `a189814cc` ("Harden the IMAP Drafts-header PK delete
+    /// against UID-collision wrong-deletes"): after a UIDVALIDITY turnover the
+    /// composite PK `accountId:folderPath:<uid>` can address a DIFFERENT
+    /// physical message, so a stale delete must remove NEITHER the local header
+    /// nor its body — and must not queue an op for it either.
+    ///
+    /// SUBTRACT — the reference closed that hazard with `DraftHeaderDeleteGate`'s
+    /// canonical-RFC uniqueness term, which its own comment classifies as a
+    /// pre-F2b PRECURSOR that "proves LOCAL uniqueness — NOT physical-draft
+    /// identity across a UIDVALIDITY reset" and defers the sound closure to
+    /// "F2b's owner-before-delete (instanceEpoch) A/B predicate". v3 carries
+    /// exactly that epoch-correlated evidence in the address itself
+    /// (`.imap(folder:uidValidity:uid:)` checked against
+    /// `Folder.lastKnownUidValidity`), so the uniqueness machinery — and with
+    /// it the RFC-group fallback and the calendar-only admission abort — is not
+    /// ported.
+    ///
+    /// This test PROVES the existing boundary; it does not create it. There is
+    /// no red proof: production is already correct, and manufacturing a failure
+    /// would require breaking it.
+    @Test("A stale E1 IMAP delete cannot remove a reused-UID E2 header or body or queue an operation")
+    func staleEpochCannotRemoveReusedUidHeaderOrBody() async throws {
+        let accountId = "draft-delete-reused-uid"
+        let fixture = try fixture(accountId: accountId)
+        defer { finish(fixture) }
+        let reusedUid = 5152
+        let headerId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: "Drafts", messageId: String(reusedUid))
+        // Byte-identical to the key `queueDraftDelete` would delete under.
+        let bodyKey = ContentKey(rawValue: headerId)
+        let occupantHTML = "<p>E2 occupant — a different physical message</p>"
+        // Hoisted out of the `@Sendable` writer closures — same idiom as
+        // `liveEpoch` above; `Self.e2` is main-actor isolated.
+        let liveEpoch = Self.e2
+
+        // The mailbox was recreated: folder authority is E2, and the numeric UID
+        // the stale E1 caller still holds is now occupied by an E2 message.
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?",
+                arguments: [liveEpoch, "\(accountId):Drafts"])
+        }
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "Drafts", uids: [reusedUid], pool: fixture.pool)
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE id = ?",
+                arguments: [liveEpoch, headerId])
+            try MessageBody(contentKey: bodyKey, htmlContent: occupantHTML).insert(db)
+        }
+        let occupantBefore = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: headerId)
+        }
+        #expect(occupantBefore != nil,
+                "precondition: an E2 message occupies the reused UID")
+
+        // The stale E1 caller addresses that very UID.
+        let admitted = await AccountManager.shared.queueDraftDelete(
+            identity: .imap(folder: "Drafts", uidValidity: Self.e1, uid: reusedUid),
+            accountId: accountId,
+            folderPath: "Drafts")
+
+        #expect(admitted == false,
+                "a stale-epoch address must be refused at admission")
+        let occupantAfter = try await fixture.pool.read { db in
+            try MessageHeader.fetchOne(db, key: headerId)
+        }
+        #expect(occupantAfter != nil,
+                "the E2 header at the reused UID must survive")
+        #expect(occupantAfter == occupantBefore,
+                "the E2 header at the reused UID must be untouched")
+        let bodyAfter = try await fixture.pool.read { db in
+            try MessageBody.fetchOne(db, key: bodyKey)
+        }
+        #expect(bodyAfter?.htmlContent == occupantHTML,
+                "the E2 body at the reused UID must survive")
+        #expect(try await fixture.pool.read {
+            try PendingOperation.fetchCount($0)
+        } == 0,
+                "a refused admission must leave no durable operation behind")
+    }
 }
