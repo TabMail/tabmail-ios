@@ -1,0 +1,5 @@
+
+### Compose body — caret-aware scroll, NO input gating
+- Compose body uses `TextEditor` with `.scrollDisabled(true)` inside the parent SwiftUI `ScrollView`. UIKit propagates scroll-to-cursor via `scrollRectToVisible` on the enclosing UIScrollView, passing the **whole TextEditor frame** (often hundreds of pt) — so we swap the scroll view's class to `CaretAwareUIScrollView` (`ComposeView.swift`) which substitutes the caret rect, no-ops if already visible, and animates with a `UIViewPropertyAnimator`.
+- **DO NOT gate text input during scroll.** A previous version (commit 755fe97, removed) class-swapped the focused UITextView to a `GatedUITextView` and dropped `insertText`/`deleteBackward`/`paste` for 500 ms after every `scrollRectToVisible`. UIKit fires that on every line wrap / Enter / keyboard frame change during normal typing — so a fast typist lost 4-6 keystrokes whenever the body scrolled. There are no real "accidental keystrokes" to drop (UIKit doesn't pre-queue keypresses); the gate is purely destructive.
+- If you ever feel the urge to "block input briefly while the UI settles" in compose, stop and re-read this note.

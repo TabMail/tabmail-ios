@@ -1,0 +1,11 @@
+
+## Startup Data Migrations (`StartupMigrations.swift`)
+
+NOT GRDB schema migrations (those are in `AppDatabase.runMigrations`, the `DatabaseMigrator` v1…vN). `StartupMigrations.run(_ writer:resetFTS:)` is a separate set of **one-time destructive cached-mail resets**, each gated by its own `UserDefaults` bool (`didMigrateHeaderIds_v2`, `didClearBodiesForAttachmentEncoding_v1`, `didResetImapDatesForInternalDate_v1`, `didCleanResetMessageData_v1`). They `DELETE FROM messageHeader/messageBody` + reset backfill cursors + (clean reset) delete the FTS dir, to recover from cache-format changes across app upgrades; safe for real accounts because the server re-syncs. Kept `UserDefaults`-gated (not folded into the GRDB migrator) specifically so existing users who already ran them aren't re-wiped.
+
+- **Where called (2026-06-04):** **synchronously in `AppDatabase.init()`**, right after `runMigrations` and BEFORE the pool is exposed (`AppDatabase.shared` set in `TabMailApp.init`) or the inbox observer is wired. So: DB opens → schema migrates → data resets → only THEN can sync / NSE merge / demo+screenshot seed touch the DB. **NOT** run in the test `init(dbPool:)` (would hit global flags + the real FTS dir). The only production caller of `AppDatabase()` is `TabMailApp.swift`.
+- **No async gate anymore:** because nothing can race the resets, the old `SyncScheduler.migrationsComplete` / `awaitMigrations()` / `signalMigrationsComplete()` latch and RootView's `async let migrations` were **deleted**. `DemoModeService.completeSetup` no longer runs migrations either.
+- **FTS reset = delete the dir.** At DB-open SearchIndex hasn't initialized (no open pool), so the clean reset just `removeItem`s `Application Support/tabmail_fts`; `SearchIndex.initialize()` recreates it fresh. `resetFTS` is injected into `run(...)` so tests don't touch the real FS; it's invoked in lockstep with the main-DB deletes so the flag is set only once both halves are done (crash → re-run next launch).
+- **Cost note:** the first launch after a new reset is introduced runs its DELETE synchronously at launch (blocks first frame briefly, one-time). Correctness (don't show-then-wipe) was chosen over that one-time delay.
+
+---

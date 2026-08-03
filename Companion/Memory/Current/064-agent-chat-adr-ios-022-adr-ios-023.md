@@ -1,0 +1,42 @@
+
+### Agent Chat (ADR-IOS-022, ADR-IOS-023)
+- **Mobile-native UX (ADR-IOS-023)**: iOS departs from TB's "infinite chat" UI while keeping backend architecture identical:
+  - **No welcome-back/greeting bubbles** — reminders shown as top-of-chat cards instead
+  - **Session history with swipe navigation** — past K sessions (configurable, default 10) shown as horizontally swipeable pages in TabView(.page). Rightmost = current/newest. Resuming an old session swaps the conversation history sent to the API.
+  - **Multi-turn within session** — `sessionTurns` sent as `history` to API. When resuming an old session, that session's persisted turns become the history.
+  - **Nudges become reminder cards** — urgent reminders get accent highlighting, tap to expand, dismiss to snooze
+- **ChatStore** (`Services/AI/ChatStore.swift`) — `actor` with GRDB-backed `chatTurn` table. Matches TB's `persistentChatStore.js`.
+  - `ChatTurn` model: id, timestamp (epoch ms), role, content, userMessage, type, chars, renderedContent, sessionId
+  - Budget enforcement: 50 exchanges max (100 turns), 25K chars max, FIFO eviction in atomic write transaction
+  - Turns still persisted for Settings > Chat History view, just not loaded back into live chat
+- **AIChat** (`Services/AI/AIChat.swift`) — `AIService` extension for agent chat via completions API
+  - Builds: system message (`system_prompt_agent`) + user message (`chat_converse`). History is current session's turns (multi-turn).
+  - KB + reminders refreshed per turn (matches TB parity)
+  - Sends via `sendWithTools()` — server-side tools auto-execute in backend. Client-side tools registered in ToolRegistry.
+  - `chatUserName()` queries GRDB directly for primary account display name (no MainActor dependency)
+- **DynamicIslandChatButton** — chat pill UI. On expand: loads reminder cards (InboxView only), registers email context ID. Persists turns on send/receive. `enrichedText` built inside Task block (after awaiting ID registration) to prevent race.
+- **ChatHistoryView** (`Views/Settings/ChatHistoryView.swift`) — searchable history in Settings > AI > History > Chat History. Pairs user+assistant turns into exchanges. Debounced GRDB search, expand/collapse on tap, debug stats in toolbar menu.
+- **ChatIdTranslator** (`Services/AI/ChatIdTranslator.swift`) — in-memory actor mapping numeric IDs ↔ real MessageHeader.id. Matches TB's `idTranslator.js`. `processResponseForDisplay()` resolves `[Email](N)` patterns to tappable pills with subject text. Cleared when chat history is cleared.
+- **Client-Side Tools** (registered in `ToolRegistry` at app startup via `TabMailApp.init()`):
+  - `InboxReadTool` (`Services/AI/Tools/InboxReadTool.swift`) — queries GRDB inbox, assigns numeric IDs via ChatIdTranslator, formats matching TB's `formatMailList`. Page size 10.
+  - `MemorySearchTool` (`Services/AI/Tools/MemorySearchTool.swift`) — per-turn hybrid FTS5 + sqlite-vec search via `MemoryIndex` (memory.db sidecar). Role-tagged output (USER/AGENT). Page size 5. See ADR-IOS-034.
+  - `MemoryReadTool` (`Services/AI/Tools/MemoryReadTool.swift`) — returns session-bounded context window (±N turns from matched timestamp, clamped to matched turn's session). TB parity.
+  - Tool definitions live in the backend repo (`src/tools/ios/inbox_read-v1.0.0.json`, `memory_search-v1.0.0.json`)
+- **MarkdownChatText** (`Views/Agent/MarkdownChatText.swift`) — SwiftUI view rendering markdown + email pills + reminder cards. Uses `AttributedString(markdown:)` with `inlineOnlyPreservingWhitespace`. Pre-processes `[Email](N)` → `[📧 Subject](tabmail://email/N)` for tappable links. Handles URL taps via NotificationCenter (`.emailPillTapped`).
+- **Backend templates** (in the backend repo, `src/prompts/ios/`):
+  - `system_prompt_agent-v1.0.0.md` — full iOS agent system prompt (identical to TB v1.2.0 for tool sections, with iOS-specific intro and mobile response formatting)
+  - `chat_converse_user_message-v1.0.0.md` → aliased to `chat_converse` in registry (security reminder + `[timestamp] user_message`)
+  - `chat_converse_history-v1.0.0.md` — prior session history wrapper (background memory only)
+  - `chat_converse_reminders-v1.0.0.md` — reminders injection (currently unused, iOS sends empty string)
+- **KB Refinement** (`Services/AI/KBRefinementService.swift`) — `actor` matching TB's `knowledgebase.js`:
+  - Triggered on chat session expiry (idle > 30s) with session turns via fire-and-forget Task
+  - Sends `system_prompt_kb_refine` + current KB + chat history to backend orchestrator
+  - Backend returns `refined_kb` (multi-step: chat summarize → reminder extract → KB refine → trim)
+  - Persists refined KB to `PromptStore.shared.rawKB` (triggers Device Sync broadcast + reminder re-parse)
+  - Guards: privacy opt-out check, minimum 3 exchanges, serialized execution (drops concurrent calls)
+  - Compose mode sessions excluded (no KB value from draft edits)
+  - `CompletionsResponse.refined_kb` field decodes the backend orchestrator's response
+- **GRDB migration**: v6 (`v6_createChatTurn`) adds `chatTurn` table with timestamp index; v7 adds `renderedContent` column; v11 adds `sessionId` column + index; v12 creates `chatIdMapping` table (numericId PK, realId UNIQUE) for persisting ChatIdTranslator mappings across app restarts
+- **ChatIdTranslator persistence**: ID mappings (numeric ↔ real) persisted to GRDB `chatIdMapping` table. Lazy-loaded on first `toNumericId()` call. New mappings written on creation, deleted on eviction/sweep/clear. Ensures `[Email](N)` pill references in old chat sessions remain resolvable
+- **Event pill detail must carry notes AND attendees at every cache site**: the `[📅 Title](tabmail://event/N)` popover (`EventPillPopover` in `MarkdownChatText.swift`) renders title/time/recurrence/availability/location/**notes**/attendees/tz/calendar. `EventPillDetail.notes` ← `GCalEvent.description` (Zoom/Meet links live here). Every `cacheEventDetail` call site MUST pass real `notes` + `attendees` — NEVER hardcode `attendees: []` when the data is available. Sites: `CalendarEventCreateTool` (from tool args via `CalendarToolHelpers.eventPillAttendees(fromArguments:)` + `description` arg), both `CalendarEventReadTool` direct-lookup paths and `cacheEventDetailsForPills` (from the `GCalEvent` via `eventPillAttendees(from:)` + `event.description`). `resolveEventDetail`'s live re-fetch also reads `event.description`. Hardcoding empty attendees in the create/read cache is a bug: the in-memory cache HIT short-circuits the live re-fetch, so the pill shows empty until the entry is evicted. (Fixed 2026-05-27; regression tests in `ToolCachingTests` + `CalendarToolHelpersTests`.) Free/busy-reader events intentionally keep `notes: nil` / `attendees: []` (server strips them).
+- **Factory reset**: `DELETE FROM chatTurn` included in SettingsView nuke

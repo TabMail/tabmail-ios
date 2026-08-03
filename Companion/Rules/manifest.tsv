@@ -1,0 +1,20 @@
+# source=CLAUDE.md
+# source_base_revision=0bcc851
+# source_capture=working tree after the first companion-routing rewrite and owner rules 2h/2i, immediately before second-stage rule compaction
+# source_sha256=9965b8c0507289a68cba475d30046e614ea80355f695b416c088758bd0dff8bb
+# source_bytes=43230
+# source_lines=311
+order	status	sha256	separator	path	heading
+0	historical	01d4f99ecaafbd4cff5611466cc3ee6a69434e4c3a8ed265b8b5dd6c3b657726	LF	Companion/Process/History/000-pre-compaction-preamble.md	__preamble__
+1	historical	cbc359a3d36c37df0190afdddeecec5119677ef55e87fc28cf0e06c9c0edd745	LF	Companion/Process/History/001-pre-compaction-routing.md	Companion Routing (MANDATORY BEFORE EVERY TASK)
+2	active	9c08d68cbea957cba890491d35bae9d1e418c3f62dbada0c8c03e150c2b921c1	LF	Companion/Rules/Active/development-rules.md	Development Rules
+3	current	8c34cb8b0a871b2a88774f68a9790fadd865def425aaaa8a07fd8deb0d92c742	LF	Companion/Process/Current/audit-workflow.md	Cross-Model Audit Workflow — STANDARD (current owner-directed role assignment 2026-07-27)
+4	active	d463d9210f35ae38b2e0c9f557f6b980b377266b32f567e8a9332e80cf59bbca	LF	Companion/Rules/Active/never-drop-user-intention.md	Core Philosophy: Never Drop User Intention
+5	active	d09260626986709b23d65935dbfea1678ba4e4c74d6dade1669110177ad78d2b	LF	Companion/Rules/Active/data-integrity.md	Data Integrity Rules — ABSOLUTE
+6	active	88dd272da3f0edb041a4fd5ff398511a80982bc0b00327388526d8a317560746	LF	Companion/Rules/Active/resilience.md	Resilience Rules
+7	active	d0887817274ec6aeb5428bcc653d776fee2063e5c6c288b1c3179f505bc99fa4	LF	Companion/Rules/Active/outbox-reliability.md	Outbox Reliability Rules
+8	active	ecf91b715e49f3279951485451a6c6fcd6a222613b2fd5af4945e621e603156e	LF	Companion/Rules/Active/ai-processing.md	AI Processing Rules
+9	active	4bd4214e7039b61aa810c9ec93a041352dea387ece6626cb4698c5c731d2697e	LF	Companion/Rules/Active/swiftui-mutation-safety.md	SwiftUI Mutation Safety Rules
+10	active	ee47455e9214f4a97370cf0b0b38d46483f4c0fae34aed17abb54229fc97dd36	LF	Companion/Rules/Active/user-interaction-freeze.md	User Interaction Freeze Rule
+11	active	401446f95de80029da079952d06051bfe82125cb45da91853e54eae3e1e22833	LF	Companion/Rules/Active/keyboard-dismiss.md	Keyboard Dismiss Rule
+12	current	4c4de97900ef70b011c51705aad2d3f5135cac659bdc97e8f3b4606f643bfba4	NONE	Companion/Process/Current/other-notes.md	Other notes

@@ -1,0 +1,7 @@
+
+### GRDB ValueObservation — DO NOT put on `messageHeader`
+- **NEVER** use `ValueObservation` to drive the inbox list off the `messageHeader` table. `messageHeader` is written on every sync commit, every AI field update (`actionTag`, `summary`), every unread recount, every backfill batch. A row-level observation would re-emit on every one of those writes, causing full list re-fetch + diff + @Observable invalidation + SwiftUI re-render many times per second during sync bursts. This is strictly worse than the current design.
+- **Current design is load-bearing and correct:** explicit `.inboxDataDidChange` notifications fire at deliberate checkpoints; the observer has a 500ms throttle + dirty-bit coalescer; AI updates route through `.messageDataDidChange` into `flushAIBatch` (per-row in-place snapshot replacement, no full reload).
+- **`ValueObservation` IS appropriate for `folder` table** — small set (5–50 rows), rarely changes (only at startup classification and folder add/remove), cheap per emission. `InboxViewModel.startFolderObservation()` uses it to drive `VM.folders` authoritatively; dedup on `(id, role)` keeps `unreadCount` churn from reaching the sink.
+- `NavigationStore.outboxMessages` correctly uses `ValueObservation` on the outbox table — small set, user-driven writes only.
+- Rule of thumb: `ValueObservation` is only OK on tables where write frequency is low (user-initiated, not sync-driven) AND the tracked set is small.

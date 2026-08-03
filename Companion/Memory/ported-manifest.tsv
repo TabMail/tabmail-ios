@@ -1,0 +1,3 @@
+source_rev	status	sha256	path	title
+e28dd4edb33cfb77a0d069de48e136f6ad92cd0c	historical	f2dc1fd76a907d03d0ec27a80b5cd34d16ffea4126028cf6d8a6abebfd06dfe8	Companion/Memory/History/090-historical-intention-journal-fold-at-drain-adr-ios-058-2026-07-11-queue.md	HISTORICAL — Intention journal + fold-at-drain (ADR-IOS-058, 2026-07-11; queue/Undo mechanics superseded by ADR-IOS-060)
+e28dd4edb33cfb77a0d069de48e136f6ad92cd0c	current	a3e3ca0250891b56a1d3f9d99aed25f50f21703ba8185bf904b6d2bd38ec6b58	Companion/Memory/Current/092-intention-queue-v2-authoritative-current-direction-adr-ios-060-2026-07-1.md	Intention queue V2 — authoritative current direction (ADR-IOS-060, 2026-07-13)

@@ -1,0 +1,5 @@
+
+### Screen Keep-Awake (chat pill)
+- `Theme/ScreenKeepAwake.swift` — reference-counted wrapper around `UIApplication.isIdleTimerDisabled` + `.keepScreenAwake(while:)` view modifier. The idle-timer flag is a single global, so holders are counted; the modifier tracks its own held state (`@State holding`) so acquire/release fire exactly once per transition regardless of `onChange` vs `onDisappear` teardown ordering.
+- Applied once in `DynamicIslandChatButton.swift` on the pill root: `isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || speechRecognizer.isRecording` (same scope as the wand-glow indicator). Covers all three host screens (Inbox/Compose/MessageDetail) with no per-screen wiring.
+- No `scenePhase` handling needed — iOS only honors `isIdleTimerDisabled` while the app is foreground; the hold resumes automatically on return. Reuse `.keepScreenAwake(while:)` for any future keep-awake need (never set `isIdleTimerDisabled` directly).

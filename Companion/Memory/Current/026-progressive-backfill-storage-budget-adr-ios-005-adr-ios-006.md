@@ -1,0 +1,22 @@
+
+### Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006)
+- **No age cutoff** — backfill always walks to completion: IMAP walks UID range from UIDNEXT-1 to UID 1, Gmail/Exchange exhausts all page tokens. Storage budget is the only gate.
+- `StorageEstimator.budgetMB` (UserDefaults, default 2048) — global storage soft cap across all accounts
+- After initial sync, `SyncEngine.startBackfill()` fetches older messages in background
+- **Backfills ALL folders** (not just primary/secondary) — sorted by priority: inbox → favorites → secondary → custom
+- IMAP backfill uses UID range walking (no SEARCH, avoids NIO 8KB buffer limit)
+- Gmail/Exchange uses page-token cursor walk from newest to oldest
+- **Backfill inserts via GRDB**: `insertBackfillBatch` uses `dbPool.write { }` — GRDB's `DatabasePool` is thread-safe, no background DispatchQueue or ModelContext needed.
+- **Strictly incremental backfill** (no large object materialization): Two-step approach — (1) provider SEARCH/LIST returns lightweight IDs, (2) batch `fetchSet` existence checks via GRDB (never materializes objects), (3) FETCH only missing IDs. `insertBackfillBatch` uses a batch `fetchSet` for final dedup (one query, not per-row). Returns `(inserted, ftsRecords)` — FTS indexing coalesced per window by caller.
+- `Folder.backfillComplete` / `Folder.oldestSyncedDate` track per-folder progress
+- Backfill pauses for user activity via `signalUserActivity()` → `waitForIdle()` at folder, window, deep-crawl, BodyFTS, and SnippetFill boundaries. Inner loops also check `isUserActive` per-iteration for near-immediate yield. Views signal activity via `.onScrollPhaseChange` → `AccountManager.signalViewActivity()`
+- **IMAP pool priority checkout**: `pool.checkout(priority: true)` inserts at FRONT of waiter queue — used by all user-initiated IMAP methods (fetchMessage, markRead, archive, delete, move, search, fetchAttachment, fetchOlderMessages). Background backfill batches use `priority: false` (FIFO). Ensures user ops never wait behind multiple background batches.
+- **fullSync**: GRDB writes are immediate and don't trigger SwiftUI re-renders directly — `NavigationStore` handles UI refresh.
+- **No age-based eviction** — fetched messages are never deleted based on age
+- **Storage pruning**: `pruneIfOverBudget()` runs after sync — deletes bodies first (re-fetchable), then headers, oldest-first across ALL accounts, but keeps ≥50 messages per folder
+- **StorageEstimator**: measures actual file sizes (GRDB `tabmail.sqlite` + FTS `fts.db` + WAL/SHM files) across Application Support
+- **MessageBody**: only stores `htmlContent` (no `textContent`). Plain-text-only emails converted via `plainTextToHTML` on ingest using RFC 3676 format=flowed: trailing space before line break = soft wrap (join with next line), no trailing space = hard break (preserve). `white-space: pre-wrap` on container preserves multiple spaces. FTS holds stripped plain text for search.
+- **Infinite scroll**: `fetchOlderMessages()` in SyncEngine/AccountManager, triggered by sentinel view at bottom of inbox list. IMAP uses bounded SEARCH windows to avoid buffer overflow.
+- **Power-aware backfill (BackfillProfile)**: Two profiles — `normal` (default) and `aggressive` (on power + user idle 30s+ + not low-power + not thermally throttled). Aggressive mode uses larger chunks (1000 vs 500), higher batch sizes, and much shorter delays (0.1s vs 0.5s between batches, 0.5s vs 3s between cycles). `UIDevice.current.isBatteryMonitoringEnabled = true` set in TabMailApp.init. Profile checked dynamically at each decision point via `SyncEngine.backfillProfile`. **Battery gate**: backfill pauses entirely when battery < 20% and not charging (`shouldPauseBackfill`). **Cellular gate**: on metered connections (`NetworkMonitor.isExpensive`), only inbox-role folders are backfilled.
+- **Per-batch pool checkout**: `fetchMessageHeaders` checks out a pool connection per batch (100/200 UIDs) instead of holding one for the entire call. Each batch gets a fresh connection, re-SELECTs the folder, and returns it. Other operations can use the pool between batches.
+- **Connection failure backoff**: After 3 consecutive connection failures within a backfill cycle, the cycle aborts. Next sync poll restarts backfill with a fresh connection.

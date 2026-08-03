@@ -1,0 +1,13 @@
+
+## CLI testing breaks with "Simulator device failed to launch / Launchd job spawn failed" → app is UNSIGNED in DerivedData (2026-06-22)
+
+**Symptom:** `xcodebuild ... test` (or `test-without-building`) fails at *launch*, not compile, with:
+`Simulator device failed to launch ai.tabmail.ios … The request was denied by service delegate (SBMainWorkspace) … The process failed to launch … Launchd job spawn failed (NSPOSIXErrorDomain Code 163)`. `build-for-testing` SUCCEEDS (exit 0) — the code compiles & links fine — so it's NOT a source/uncommitted-change problem. This is a red-herring error: the modern iOS Simulator refuses to *spawn* an unsigned app.
+
+**Root cause:** the app target's **CodeSign build phase never ran** → `TabMail.app/TabMail` (the thin launcher) AND `TabMail.app/TabMail.debug.dylib` (the Debug "debug dylib" that holds the real app code) are left "code object is not signed at all". A prior `xcodebuild` build was interrupted *after* `Ld`/`CopySwiftLibs` but *before* `CodeSign`; the build database then records compile/link as up-to-date, so subsequent **incremental** builds never re-run `CodeSign` and the app stays unsigned forever. Tell-tale in the build log: it jumps straight from `CopySwiftLibs` to `** TEST BUILD SUCCEEDED **` with **no `CodeSign TabMail.app` line**. (Nested `.xctest`/`.appex` were signed — only the top-level app + its `.debug.dylib` were bare. `codesign --sign - TabMail.app` by hand signs the executable but NOT the root-level `.debug.dylib`, so a manual ad-hoc sign of just the bundle still dies with dyld `@rpath/TabMail.debug.dylib … Trying to load an unsigned library`.)
+
+**Diagnosis sequence (reuse this):** (1) `codesign -dv <built app>` → "not signed at all" = this bug. (2) `codesign -dv <app>/TabMail.debug.dylib` → also unsigned. (3) grep the build log for `^CodeSign ` — absent = the phase was skipped.
+
+**Fix: a CLEAN build** — `xcodebuild -project TabMail.xcodeproj -scheme TabMail -destination 'platform=iOS Simulator,name=iPhone 17 Pro' clean build-for-testing`. A clean build forces the full CodeSign phase; verify with `grep '^CodeSign ' log` (should list `TabMail.debug.dylib`, `__preview.dylib`, `TabMail.app`) and `codesign --verify --deep --strict <app>` (exit 0). Then `test-without-building` runs green. NOTE: this is **ad-hoc (`-`) simulator signing** — it needs NO keychain, so the SSH/keychain limitation (`../CLAUDE.md` git recipe) is NOT the cause here; don't chase keychain. NOTE: a stale/booted simulator can ALSO throw a transient launch error — a `simctl shutdown all` + restart of `com.apple.CoreSimulator.CoreSimulatorService` is the first thing to rule out, but if the app is unsigned that won't help (the real signal is `codesign -dv`).
+
+---

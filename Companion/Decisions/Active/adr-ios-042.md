@@ -1,0 +1,19 @@
+
+## ADR-IOS-042: Stale-Detection Overlap Window Is Measured in the Fetch's Ordering Dimension (UID for IMAP, date for Gmail/Exchange)
+
+**Context:** Full-sync (`SyncEngine.runSyncMessages`) fetches only the newest `SyncConfig.syncMessageLimit` (=50) messages per folder, then stale-DELETEs local rows in the "overlap window" the server didn't return. The window was bounded by **message date** (`date >= min(fetched dates)`) for every provider. That is only safe when the windowed fetch's ordering correlates with date. It does NOT for IMAP: `fetchMessages(limit:)` returns the highest **UIDs**, and a folder's UID order is **archive-time**, not message date. Archiving an OLD-dated email assigns it a fresh HIGH UID, so it enters the newest-50 and drags `min(fetched dates)` backwards — sweeping every mid-range month that wasn't in the newest-50 into "stale" and deleting it. Re-fires every full-sync (so it survives Smart Reindex re-fetches). Diagnosed from a real user mailbox: IMAP `Archive` lost all of May 2026 (`2026-04=135, 2026-05=0, 2026-06=48`, `bfComplete=Y`) while Sent/Trash (UID≈date) and Gmail All Mail (date-ordered fetch) were intact — exactly the reported "missing months", IMAP-only.
+
+**Decision:**
+1. `EmailProvider.staleWindowMode: StaleWindowMode` (`enum { uid, date }`). Default `.date` (HTTP providers fetch most-recent-by-date); `IMAPProvider` overrides to `.uid`.
+2. `SyncEngine.selectStaleHeaders(candidates:fetched:limit:windowMode:)` is the **single source of truth** for which local rows are stale-deletable — pure, `nonisolated static`, no DB/IO. `< limit` ⇒ whole folder fetched ⇒ anything local-not-remote is gone; `.uid` ⇒ candidate iff `Int64(messageId) >= min(fetched UID)` AND not in remote; `.date` ⇒ `date >= min(fetched date)` AND not in remote (unchanged).
+3. Production `runSyncMessages` still loads only the **bounded** candidate slice from SQL (`CAST(messageId AS INTEGER) >= floor` for `.uid`; `date >= cutoff` for `.date`) to preserve the memory budget, then defers the keep/delete decision to `selectStaleHeaders`. The test harness `simulateRunSyncMessages` calls the SAME function — no logic copy that can drift.
+
+**Rationale:** "We only have complete remote knowledge for the slice the fetch actually covered" is the real invariant, and the slice must be measured in the dimension the fetch ordered by. UID is that dimension for IMAP; switching to it makes archiving old mail harmless (there is no date floor to drag). Gmail/Exchange are already correct (date-ordered fetch, non-numeric ids) and are left unchanged.
+
+**Consequences:**
+- A windowed IMAP stale pass can no longer delete rows below the fetched UID floor — those are simply outside the window and wait for a future fetch/backfill that covers them. It still deletes genuinely server-removed rows *inside* the UID slice.
+- **Field heal (v59 migration):** the code fix only STOPS deletion — already-deleted Archive mail is gone locally until re-fetched. `v59_rewalkImapArchiveAfterStaleWindowFix` (shared body `AppDatabase.rewalkImapArchiveFolders`) runs once on upgrade: resets `backfillComplete=0` / `backfillUidCursor=NULL` for **IMAP archive-role folders only** so the next backfill re-walks and re-fetches the deleted headers (existence-checked, so intact folders cost ~SEARCH only); the UID-window fix keeps them this time. MUST ship in the SAME build as the fix (without it the re-walked mail would just be deleted again). Without v59, each user would have to trigger Smart Reindex manually.
+- Any future windowed stale-delete (any provider) MUST route through `selectStaleHeaders`. `deltaSync` has no windowed date-stale path and is unaffected.
+- Regression: `E2ESyncScenarioTests.StaleDetectionWindowTests` (3 tests, incl. a characterization that the old `.date` window over-deletes) + `ArchiveRewalkHealTests` (v59 scoping).
+
+---

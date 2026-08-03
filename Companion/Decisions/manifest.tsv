@@ -1,0 +1,58 @@
+order	status	source_lines	sha256	path	title
+0	active	1-18	b65697c441a7d5490d9e200506be500bebc7ead9e95c410bf91ac3101c541537	Companion/Decisions/foundational-principle.md	Foundational principle: never drop user intention
+1	active	19-44	dfcdf0c77873aafcbb40ca0137335f32ec421d1d6d27a03dbb1d3774dacd98b7	Companion/Decisions/Active/adr-ios-001.md	ADR-IOS-001: Optimistic UI with Hardened Sync
+2	active	45-64	eea280c33ba0bd6009fca0353a2374e53b8a8a0f505a6584d7e9e0f4fdfe02c1	Companion/Decisions/Active/adr-ios-002.md	ADR-IOS-002: User Activity Prioritization
+3	active	65-83	f1be2d5a693d08ecfea4cb2cfbd46c59eab2aeadd776a8f1c26f79edb330c212	Companion/Decisions/Active/adr-ios-003.md	ADR-IOS-003: Pending Operation Queue for Crash Recovery
+4	superseded	84-95	283add9ea8b6cc7d5834ec47dbf9bfad372bc31a905865391c78dfacd4f9a151	Companion/Decisions/Superseded/adr-ios-004.md	ADR-IOS-004: ~~First Compute Wins for Cross-Instance Action Tags~~ (SUPERSEDED by ADR-IOS-036)
+5	active	96-118	e723dfde810996a82c74b99447f8914876c86ee63399fc328f77da1c7b95754d	Companion/Decisions/Active/adr-ios-005.md	ADR-IOS-005: Progressive Background Backfill
+6	active	119-147	39e38245b2a782c57f47e7fc58bb54e0fc02c08620f1e2916e837a8ca31077b3	Companion/Decisions/Active/adr-ios-006.md	ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
+7	active	148-177	0d0d50f26cda9aa429610e2337e0abd66e7ea0ddc6cf1ecbd341c9541a53955a	Companion/Decisions/Active/adr-ios-007.md	ADR-IOS-007: Hybrid FTS5 + Vector Search (Local)
+8	active	178-207	38e3f3dee78e9efaa60a5683a9b3f0e72785d4164506c0b76d983b52e16e5ccc	Companion/Decisions/Active/adr-ios-008.md	ADR-IOS-008: AI Processing Must Replicate TB Addon Architecture
+9	active	208-233	7213e0f9e642b70bdfbc7756381a0cad4e3cc3230f7ac6315c73c1f3b2630763	Companion/Decisions/Active/adr-ios-009.md	ADR-IOS-009: Two-Tier Delta + Full Sync
+10	active	234-260	1465e0565f83301c112c645948859df9edb7562e362a8dd6f559b400038bcbd5	Companion/Decisions/Active/adr-ios-010.md	ADR-IOS-010: Device Always-On Sync with AI Cache Probe
+11	active	261-275	74a17ec82c5522020f3726820592650225c56121d93b670de8515d05f1f8b60e	Companion/Decisions/Active/adr-ios-011.md	ADR-IOS-011: ActionTag Raw Values Are Plain Names
+12	superseded	276-287	be77e22538dd2e778480d123108528dd4d540b38da6bc4e3f3b1f4f837cccfa6	Companion/Decisions/Superseded/adr-ios-012.md	ADR-IOS-012: ~~Inbox Excluded from Stale Detection~~ (SUPERSEDED)
+13	active	288-305	1f0bbc932b00945a703fefe564a1369c8c7df3a34cac6386bf2699745cde7d5b	Companion/Decisions/Active/adr-ios-013.md	ADR-IOS-013: Direct Priority Path for Opened Emails
+14	active	306-330	7e34cab1b4316c9597610a2598afa90c8f21a96442293f97d2002ad3574f553e	Companion/Decisions/Active/adr-ios-014.md	ADR-IOS-014: IMAP Connection Pool (supersedes serial lock)
+15	active	331-355	caf947f731402feaacb3f86d433e1c807447fc70b681c0744f265f2e86703eb5	Companion/Decisions/Active/adr-ios-015.md	ADR-IOS-015: Three-Tier Background Execution for AI Processing
+16	superseded	356-363	12f1337bd443e4268cec0eaacd0e3054055f14f28ca6763931b18d52d319d548	Companion/Decisions/Superseded/adr-ios-016.md	ADR-IOS-016: ~~PersistenceGateway — Coalesced SwiftData Saves~~ (SUPERSEDED)
+17	superseded	364-371	7a09874ecb49e8a5318c4ab3df8265bfa870a03d6bb90f643cda599bf015889d	Companion/Decisions/Superseded/adr-ios-017.md	ADR-IOS-017: ~~Remove Folder→MessageHeader @Relationship~~ (SUPERSEDED)
+18	active	372-411	f6d99ed069bab479e15d4e0a0ffeea1afe3ffc3079247d59adf5d6ff4ebe2386	Companion/Decisions/Active/adr-ios-018.md	ADR-IOS-018: Persistent Offline Action Queue
+19	active	412-451	5a59f9c7b3de5b7d6cc50446f4ed5f9983137ebf4d5b7612fecbfbcb8f525784	Companion/Decisions/Active/adr-ios-019.md	ADR-IOS-019: Outbox — Persistent Offline Send Queue
+20	active	452-478	36c6e0d2bccb56809d0175a0584e11e65f3145a405908bd476a170e0fa6b52ff	Companion/Decisions/Active/adr-ios-020.md	ADR-IOS-020: Swift 6 BGTask Handler Isolation Pattern
+21	active	479-503	f9a2619228cb18fd157582e142a606a096be5766a65d4c81b0db809b3e2f897c	Companion/Decisions/Active/adr-ios-021.md	ADR-IOS-021: Backfill Power Optimization
+22	active	504-528	b247ba5f425d4d0191693de14393ff20af59da0a0ce96c56cbc7420cf9b4ad91	Companion/Decisions/Active/adr-ios-022.md	ADR-IOS-022: Agent Chat with Persistent History
+23	active	529-571	286a628e0b36f4d789f8bb19e057c211d8aa2c991b047c98dec4011e4e6cc715	Companion/Decisions/Active/adr-ios-023.md	ADR-IOS-023: Mobile-Native Chat UX (Exception to TB Parity)
+24	active	572-598	2300926ddd8b3a80eed0d3514e09bc9bc700d541028903f68c950dd215034b52	Companion/Decisions/Active/adr-ios-024.md	ADR-IOS-024: Destructive Tool Confirmation with ToolDeclinedError
+25	template	599-615	61f8196e3b9829fcbaa7f7044500bd5c7d65c4bc265627ad4a984eef09164e28	Companion/Decisions/Templates/new-decision-template.md	Template for new decisions
+26	active	616-646	cb90dec04fc9672fd46e1eec70e48a6a98ac86edbd2d82ac52b4907602c138df	Companion/Decisions/Active/adr-ios-025.md	ADR-IOS-025: Backfill Crawl Progress Must Not Use Date-Based Anchors From Unrelated Queries
+27	active	647-668	43f6d0fdc09c1b54b2487fe1709b2de8e3d34daad7be8e4384c651d1928ff718	Companion/Decisions/Active/adr-ios-026.md	ADR-IOS-026: Proactive Local Notifications (Replicating TB's Nudge System)
+28	active	669-713	a6509894654dd0e2ff93ff2e71d0720d5de20563ea977160092d9419542161da	Companion/Decisions/Active/adr-ios-027.md	ADR-IOS-027: Ever-Rolling FIFO Queues — Leave Only on Confirmed Success or Confirmed Stale
+29	superseded	714-736	d006507fe46ef463b048ebaa1dbb8e25c85b66d5e2929846379a1ee6fa15eec3	Companion/Decisions/Superseded/adr-ios-026b.md	ADR-IOS-026B: PendingOperation Uses Stable IDs (rfc822MessageId)
+30	active	737-808	39ffb5fa7b0dbfb184de1b7cf345f9d2a43aa6a53b498857d86673818a06c7aa	Companion/Decisions/Active/adr-ios-028.md	ADR-IOS-028: Background Execution Budget — Lightweight Refresh, Heavy Processing
+31	active	809-839	82a8eb0f517ca86870b1d9053e3c3c1585bbdef43c1b7478fc3b0333125ebc8b	Companion/Decisions/Active/adr-ios-029.md	ADR-IOS-029: Database Index Management — Purpose-Built Indexes, Drop What's Superseded
+32	active	840-909	c7e424dcb162991e5b7e01f82a63139092945499273bb4a9c4006f28830a3509	Companion/Decisions/Active/adr-ios-030.md	ADR-IOS-030: Agent Compose Tool FIFO Queue
+33	active	910-966	c71d2038878deee1eb31f3918b87f6cac6e6a126be3f155a47261ccab87350f6	Companion/Decisions/Active/adr-ios-031.md	ADR-IOS-031: Background Tasks Touching GRDB MUST Use `.medium` Priority (Never `.low` / `.utility` / `.background`)
+34	active	967-1015	4314c1304c8cf9eafb76900c0c96d9fb2bc0aab7f29a47db86c4de71ed77a8ee	Companion/Decisions/Active/adr-ios-032.md	ADR-IOS-032: Memory Search Reuses iOS Swift Hybrid FTS Stack (No Rust FFI)
+35	active	1016-1063	67f3ca058ff9204c02fe0e1c20d418c2c502c70b958232b9ddc7f116adddb141	Companion/Decisions/Active/adr-ios-034.md	ADR-IOS-034: Memory Index Moves to Per-Turn Granularity (Supersedes v2 Session-Document Model)
+36	active	1064-1119	11d26eb846e2e96a27e8d66afa0a782bb31ff06bec8b73e95f47fc204dfb2cac	Companion/Decisions/Active/adr-ios-036.md	ADR-IOS-036: Action Tags Are Local-Only (Supersedes ADR-IOS-004)
+37	active	1120-1161	a84441a5f2dfbebcbb076019b634adf27b6f9f8a430bf2d245be5add03bc6ecf	Companion/Decisions/Active/adr-ios-037.md	ADR-IOS-037: NSE/Main-App AI Ownership Lease (Cross-Process Coordination)
+38	active	1162-1383	33dce9acee985f4449abe1cbd2c14cdc99b3bf26cd5aee49cdedf649ebbc9927	Companion/Decisions/Active/adr-ios-038.md	ADR-IOS-038: Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache
+39	active	1384-1498	1165249945f5a6cd1334b4e2fd823926af7ba928fe00b94de3330d270e0bef39	Companion/Decisions/Active/adr-ios-039.md	ADR-IOS-039: Idempotent HTML Render Fit + Scroll-Phase Height Freeze
+40	active	1499-1550	338413f2ecb8dc74488fc311602e0f2cd67e4af95078c6c6d8e7ebb5ac3fd719	Companion/Decisions/Active/adr-ios-040.md	ADR-IOS-040: Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming
+41	active	1551-1582	cb9f358b678b0a62fb8510b4fab42ac929b6d461bbf4645e2a6b8a78ec023429	Companion/Decisions/Active/adr-ios-041.md	ADR-IOS-041: GRDB Database Suspension — 0xdead10cc Defense
+42	active	1583-1601	30e521ddb6a11b074f6fbfb0d3b9e52fbd9faeae847d14f4ebd60c1f8b645f31	Companion/Decisions/Active/adr-ios-042.md	ADR-IOS-042: Stale-Detection Overlap Window Is Measured in the Fetch's Ordering Dimension (UID for IMAP, date for Gmail/Exchange)
+43	active	1602-1626	d3ad0e09bcd32c918d89c0ab654a779fe665f9ca6342b230f9aea006298b1b0a	Companion/Decisions/Active/adr-ios-043.md	ADR-IOS-043: Outgoing Thread Binding — One Header Builder, Gmail Carries `threadId`
+44	active	1627-1647	747a5afd67274b9bc02ef0cbb81210091059e00989626b2b177312e43dd28638	Companion/Decisions/Active/adr-ios-044.md	ADR-IOS-044: Inbox Usage-Throttle Banner — Driven by Cached `/whoami`, Tier-Branched CTA
+45	active	1648-1664	e92d6da4519c9aad2163eba99431920967f1616b1d08c1da0591973bb059710a	Companion/Decisions/Active/adr-ios-045.md	ADR-IOS-045: Attachment QuickLook Is Presented Imperatively (Detached From the SwiftUI Tree)
+46	active	1665-1710	250fd3c4b656c68d5cfb54bbe204b94c448988be210af1d9ca66182c1e93697d	Companion/Decisions/Active/adr-ios-046.md	ADR-IOS-046: Background Drain Loops Are Abandon-on-Suspend — Never Hold a Lease to "Look Cooperative"
+47	active	1711-1740	88f511c30c1ac867e022b47667bf93d3f4fb0a40843a6fc6e017fc77c0cffc54	Companion/Decisions/Active/adr-ios-047.md	ADR-IOS-047: Two-Phase NSE Merge — Header+Snippet Visibility Is Decoupled From the Body-Blob Write
+48	active	1741-1786	9d552044bd2c4b13963869f7662ba044c61d787eb5f61c65cab0bc3af6c87222	Companion/Decisions/Active/adr-ios-049.md	ADR-IOS-049: Instant Inbox Insert — Render NSE-Staged Mail In-Memory, Before the Durable Merge Write
+49	active	1787-1812	fa3c8a3c2788c43ee01e85004d520c50d7bcb820df1a59d201890b683ca17306	Companion/Decisions/Active/adr-ios-050.md	ADR-IOS-050: `bodyComplete` Is the FTS-Indexed Truth — Display-Cache Eviction Never Touches It
+50	active	1813-1838	49d0422b4fdb68dee3470d1a11cc7c5a8c0d68d7e080105067984fb8aa9befec	Companion/Decisions/Active/adr-ios-051.md	ADR-IOS-051: Evidence-Triggered IMAP External-Deletion Reconcile (VANISHED + Count-Mismatch UID Walk)
+51	active	1839-1863	d6d412a64a9765e918f67475435c531fa4be942485aec030add0e0936469aae7	Companion/Decisions/Active/adr-ios-052.md	ADR-IOS-052: Presentation-Time ICS Sanitizer for Incoming Invites
+52	active	1864-1889	7597e0e39f91a93847674d131e88a43f7b89aec6f0d8bbca0bb2668e38bfe747	Companion/Decisions/Active/adr-ios-053.md	ADR-IOS-053: Owned, Level-Triggered Delivery for FSM Tool UI Requests (Supersedes the delivery mechanism of ADR-IOS-024 and ADR-IOS-030)
+53	active	1890-1908	ac593fa99851394ba1a2c8906c361d9b9a516401255664c64a33d74ac520bf0f	Companion/Decisions/Active/adr-ios-054.md	ADR-IOS-054: Programmatic Message Opens Use a Real `navigationDestination(item:)` Push — Never the Inbox `List(selection:)` Binding
+54	active	1909-1945	0e3fb669e0576de7c61c0128a9e03714b3f66b4457760d311d08887b79456047	Companion/Decisions/Active/adr-ios-055.md	ADR-IOS-055: Single Merged Read-Model for the Inbox List — One Pure Composer over Durable ∪ Pinned ∪ Staged
+55	active	1946-1968	c167fe8244121002e52230f730640c10f5d99a8d9d803718985c582453277a55	Companion/Decisions/Active/adr-ios-056.md	ADR-IOS-056: Active Body/AI Flushes Are Normal-Tier; the Drain Budget Is a Background-Envelope Watchdog Only
+56	superseded	1969-2000	6e11300ad9b97d1ed65612d26831c277ee4db15c74a7b518a10c464e72bd4978	Companion/Decisions/Superseded/adr-ios-057.md	ADR-IOS-057: The Action Queue Is an Intent Register, Not an Event Log — Latest-Intent Coalescing per Message Id

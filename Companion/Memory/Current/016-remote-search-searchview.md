@@ -1,0 +1,5 @@
+
+### Remote Search (SearchView)
+- Typing only searches locally (legacy string match + FTS after 150 ms debounce). **Remote search fires only on keyboard submit** (`triggerRemoteSearch`) — never per keystroke. Scope toggle re-runs an already-submitted remote search (`hasSubmittedRemote`).
+- The FTS debounce UNIONS with the legacy substring hits (FTS ranked first, deduped by headerId) — never replaces. A substring scan can still catch what FTS misses (e.g. mid-part fragments like "marc-sup"), so never hide what's already shown (graceful degradation, ADR-IOS-007).
+- **`SearchResult` identity MUST be `accountEmail+folderPath+messageId`, never `UUID()` or bare `messageId`** (SearchView). IMAP `messageId` is the per-folder UID (`IMAPFetchMapping.messageIdString` returns `"\(uid)"`), so it repeats across folders; a search-all hitting several folders of one account would mint duplicate/`UUID()`-churning identities → SwiftUI `List` paints the wrong subject on a row (correct on open). The same composite scopes the remote-merge dedup (account-wide `folderPath==""` for Gmail/Graph globally-unique ids; folder-matched for IMAP). Fixed 2026-06-16.
