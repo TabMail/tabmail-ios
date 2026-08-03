@@ -37,6 +37,30 @@
 > still **not** an exit. Never-drop holds in full on the ordinary path — offline, retry, app kill,
 > provider error, transient read failure — and the carve-out does not extend past queue state:
 > Outbox sends, user-authored drafts, bodies, attachments and FTS content are never dropped under it.
+>
+> **2026-08-03 amendment (audit round 2): the enumeration is about RUNTIME RETIREMENT, and there is
+> one owner-approved LIFECYCLE class outside it.** The four exits above answer a single question —
+> *may the drain retire THIS operation, on THIS attempt, given what the provider said?* They do not
+> govern deliberate, owner-approved destruction of the queue as a whole at a **lifecycle boundary**:
+> a schema upgrade, account removal, demo reset, or a full local wipe. Those are not the queue
+> deciding an intention's fate on evidence; they are the queue, or the account it belongs to, ceasing
+> to exist.
+>
+> The absolute needed this stated because a shipped migration already contradicts it:
+> `v74_purgeLegacyPendingOperations` executes `DELETE FROM pendingOperation` with no predicate at an
+> upgrade boundary. **v74 is already applied and therefore immutable** — a registered migration is
+> frozen in name and body the moment any database has run it, so it cannot be edited and the clause
+> cannot be repaired by changing the code. Its cost is registered as `IOS-ACTION-001`.
+>
+> **This carve-out is narrow and must never be read as widening the four exits.** It is
+> distinguished by three properties, all required: it is **owner-approved and explicit**, never a
+> code path deciding for itself; it destroys the queue **as a whole** at a boundary, never an
+> individual operation on the strength of something observed about it; and it happens **outside the
+> drain**, so no evidence, epoch, identity or provider result is consulted or needed. A runtime
+> retirement that dresses itself in lifecycle language — "this op is legacy", "this shape is
+> obsolete", "we are cleaning up" — is a drop, and must satisfy one of the four exits. And it does
+> not extend past queue state either: the lifecycle boundaries above do not authorize destroying
+> Outbox sends, user-authored drafts, bodies, attachments or FTS content.
 <!-- COMPANION-CURRENT-NOTE-END -->
 ## Core Philosophy: Never Drop User Intention
 

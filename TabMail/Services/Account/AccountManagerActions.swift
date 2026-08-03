@@ -408,7 +408,14 @@ extension AccountManager {
     /// `deleteCompletedSendAtomic` reply/forward flags live in other files and
     /// must admit through this exact predicate. They previously enqueued
     /// `MessageHeader.stableId` — an rfc822 string on IMAP — with no epoch, which
-    /// checkpoint A could only ever refuse (audit finding A-6).
+    /// checkpoint A could only ever refuse (audit finding A-6). ⚠ CORRECTED (audit
+    /// round 2): the A-6 write-ups described that refusal as the op being "queued
+    /// and then deleted unexecuted on the next drain". That was checkpoint A's
+    /// behaviour at the time; it now SKIPS an unprovable op rather than deleting it,
+    /// because an absence of evidence is not an exit. The accurate description of
+    /// the un-admitted shape today is a PERMANENTLY UNCLAIMABLE ROW — never
+    /// executed, never retired. The user-visible loss is unchanged, which is why
+    /// admitting through this predicate is still the fix.
     nonisolated static func admittedOrdinaryActionTargets(
         _ messages: [MessageHeader],
         accountId: String,

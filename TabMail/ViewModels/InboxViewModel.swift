@@ -2222,8 +2222,12 @@ final class InboxViewModel {
                 // 🚨 ADMIT THROUGH THE PROVIDER-ADDRESS PREDICATE (audit A-6).
                 // `stableId` is an rfc822 Message-ID on IMAP and carried no epoch,
                 // so the drain's checkpoint A could only refuse this op: the label
-                // vanished from the row, the op was written, and the very next
-                // drain deleted it unexecuted. Admitting the same way every other
+                // vanished from the row, the op was written, and no drain ever
+                // executed it. ⚠ CORRECTED (audit round 2): this said "the very
+                // next drain deleted it unexecuted", which was checkpoint A's
+                // behaviour when the defect shipped. It now SKIPS rather than
+                // deletes, so today the same shape leaves a permanently
+                // unclaimable row instead of vanishing. Admitting the same way every other
                 // ordinary action does records the provider's native address and
                 // the epoch that proved it.
                 guard let admission = try AccountManager.admittedOrdinaryActionTargets(

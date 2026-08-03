@@ -240,8 +240,15 @@ final class UserLabelMenuModel {
                 // This used to enqueue `header.stableId` — an rfc822 Message-ID on
                 // IMAP — with no epoch. The drain's checkpoint A can only refuse
                 // that shape, so every IMAP label gesture was accepted here,
-                // checkmarked in the UI, and then DELETED unexecuted: a
-                // deterministic loss of an action `v1.6.38` performed. Admitting
+                // checkmarked in the UI, and then never executed: a deterministic
+                // loss of an action `v1.6.38` performed. ⚠ CORRECTED (audit round
+                // 2): this said "DELETED unexecuted", which described checkpoint A
+                // as it stood WHEN THE DEFECT SHIPPED. Checkpoint A now SKIPS an
+                // unprovable op instead of deleting it — an absence of evidence is
+                // not an exit — so the accurate description of this shape today is
+                // a PERMANENTLY UNCLAIMABLE ROW: the gesture never reaches the
+                // server and the row never leaves the queue. The user-visible loss
+                // is identical; only the wreckage differs. Admitting
                 // through the same helper the other ordinary actions use records
                 // the provider's native address and the epoch that proved it.
                 guard let admission = try AccountManager.admittedOrdinaryActionTargets(
@@ -286,9 +293,10 @@ final class UserLabelMenuModel {
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                     accountId: header.accountId, folderPath: header.folderPath, db: db) else { return false }
                 // 🚨 ADMIT THROUGH THE PROVIDER-ADDRESS PREDICATE (audit A-6) —
-                // see the identical comment in `applyLabel`. An rfc822 id with no
-                // epoch is a shape checkpoint A can only refuse, so this gesture
-                // was accepted, un-checkmarked in the UI, and then dropped.
+                // see the identical comment in `applyLabel`, including its round-2
+                // correction. An rfc822 id with no epoch is a shape checkpoint A
+                // can only refuse, so this gesture was accepted, un-checkmarked in
+                // the UI, and then never executed.
                 guard let admission = try AccountManager.admittedOrdinaryActionTargets(
                     [header], accountId: header.accountId,
                     folderPath: header.folderPath, db: db) else { return false }
