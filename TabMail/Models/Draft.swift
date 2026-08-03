@@ -376,26 +376,20 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     }
 
     /// Resolve the reply-to `MessageHeader` from a draft key + `replyToId`, guarding
-    /// the PK hit against an impostor. Production entry point — opens ONE DB read
-    /// and delegates to the `db`-scoped resolver.
+    /// the PK hit against an impostor. The SOLE entry point; every caller supplies
+    /// its own `db` snapshot.
     ///
-    /// PORT — `v2final:Draft.resolveReplyToHeader(draftKey:replyToId:isForward:)`,
-    /// plus the v80 stamp parameters (⚑ INVENTED).
-    static func resolveReplyToHeader(
-        draftKey: String,
-        replyToId: String?,
-        isForward: Bool,
-        expectedProviderMessageId: String?,
-        expectedUidValidity: Int?
-    ) -> MessageHeader? {
-        try? AppDatabase.dbPool.read { db in
-            try resolveReplyToHeader(
-                draftKey: draftKey, replyToId: replyToId, isForward: isForward,
-                expectedProviderMessageId: expectedProviderMessageId,
-                expectedUidValidity: expectedUidValidity, db: db)
-        }
-    }
-
+    /// ⚠️ DO NOT RE-ADD A NON-`db` CONVENIENCE OVERLOAD. One existed
+    /// (`v2final:Draft.resolveReplyToHeader(draftKey:replyToId:isForward:)`, ported
+    /// with the v80 stamp parameters) whose whole body was
+    /// `try? AppDatabase.dbPool.read { … }`. That `try?` collapsed a THROWN read
+    /// into the same nil a genuine refusal returns, so a busy or suspended database
+    /// was reported to `DraftComposePresenter` as "this draft has no reply parent"
+    /// — "we could not look" manufactured into an authoritative negative, the
+    /// never-drop clause-2 error. Its last caller moved to this overload in the
+    /// reply-target send fix and it was deleted as dead code. A caller that wants
+    /// the convenience must decide for ITSELF what a thrown read means.
+    ///
     /// PORT — `v2final:Draft.resolveReplyToHeader(draftKey:replyToId:isForward:db:)`.
     /// The `db`-scoped resolver (and the testable seam).
     ///
@@ -486,10 +480,27 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         // present in several folders or under several Gmail labels will sometimes
         // fail Strategy 2, and the reply ships without its quoted body or the
         // forward without its attachments. The user's own authored text is never
-        // touched and the send still works. Note that shipped `07a4bb703` used a
-        // bare `.fetchOne` here — an arbitrary row, i.e. the FAIL-OPEN version — so
-        // this guard was already an improvement over the release, and this is a
-        // restoration of it, not a regression to it.
+        // touched. Note that shipped `07a4bb703` used a bare `.fetchOne` here — an
+        // arbitrary row, i.e. the FAIL-OPEN version — so this guard was already an
+        // improvement over the release, and this is a restoration of it, not a
+        // regression to it.
+        //
+        // ⚠️ CORRECTED — "and the send still works" USED TO STAND HERE AND NO
+        // LONGER DOES. It was true of this function (which only omits a quote) and
+        // false of the system: a refusal ALSO left `ComposeView.send` with no
+        // reply parent, so the reply left as a brand-new message — no `In-Reply-To`,
+        // no `References`, and `AccountManagerOutbox.persistQueuedSend` skipped the
+        // parent's `isReplied`/`isForwarded` write and the Reply action-tag clear —
+        // while the compose dismissed and the draft became deletable on delivery.
+        // The cost was adjudicated as "quote and attribution only" on that
+        // understated premise. `ComposeView` now derives the SEND's parent from
+        // this same resolution (`ComposeDraftGuards.sendReplyTarget`) and BLOCKS the
+        // send when a claimed parent resolves to nothing; the local draft stays
+        // openable, editable, savable and discardable. So the cost of a refusal is
+        // now: no quote, and no send until the user starts the reply again from the
+        // original message. See `KNOWN_ISSUES.md` `IOS-DRAFT-009`.
+        //
+        // This comment edit changes NO executable line in this file.
         let candidates = try MessageHeader
             .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
             .limit(2)

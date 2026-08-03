@@ -680,10 +680,21 @@ struct ReplyQuoteIdentityTests {
     /// THE PROPERTY NOW PINNED, and it is a COST, stated rather than hidden: when a
     /// message is legitimately present in several folders, Strategy 2 refuses and
     /// the reply ships WITHOUT its quoted body and attribution. The user's authored
-    /// text is untouched and the send still works. This is accepted — C3 says
-    /// failing closed is always acceptable — and shipped `07a4bb703` was WORSE here
-    /// (a bare `.fetchOne`, i.e. an arbitrary row), so this is not a regression to
-    /// the release but an improvement the round-2 witness gave away.
+    /// text is untouched. This is accepted — C3 says failing closed is always
+    /// acceptable — and shipped `07a4bb703` was WORSE here (a bare `.fetchOne`,
+    /// i.e. an arbitrary row), so this is not a regression to the release but an
+    /// improvement the round-2 witness gave away.
+    ///
+    /// ⚠️ CORRECTED — "and the send still works" USED TO STAND IN THE LINE ABOVE.
+    /// It described THIS function (a refusal costs only the quote) and was false of
+    /// the system: the same refusal also left `ComposeView.send` with no reply
+    /// parent, so the reply left as a brand-new message — no `In-Reply-To`, no
+    /// `References`, no `isReplied`/`isForwarded` on the parent, no Reply
+    /// action-tag clear — and compose dismissed anyway. `ComposeView` now derives
+    /// the SEND's parent from this same resolution and BLOCKS the send when a
+    /// claimed parent resolves to nothing (`ComposeSendReplyTargetTests`); the
+    /// draft stays editable, savable and discardable. Nothing in THIS test changes
+    /// — it asserts `quote == nil`, never sendability, so it never blessed the bug.
     ///
     /// RED PROOF (recorded): against the witness resolver this fails at
     /// `quote == nil` — two agreeing copies resolve to a representative.
