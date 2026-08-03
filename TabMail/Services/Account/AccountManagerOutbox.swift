@@ -1187,6 +1187,73 @@ extension AccountManager {
         await cleanOrphanedAttachmentDirs()
         await drainOutbox()
     }
+
+    /// D2 — the ONE deletion decision the outbox orphan cleaner makes: an
+    /// attachment directory is reclaimable only when it is BOTH unreferenced by
+    /// a committed row AND older than
+    /// `SyncConfig.attachmentOrphanReclaimGraceSeconds`.
+    ///
+    /// WHY A GRACE WINDOW (and not a marker file or a temp name adopted on
+    /// commit). `queueSend` stages the attachment directory to disk via
+    /// `OutboxMessage.saveAttachments` BEFORE the gated write that commits the
+    /// referencing row — deliberately, so that file I/O never runs inside a DB
+    /// transaction (Outbox Reliability Rule 6) and a half-written dir can never
+    /// be adopted by a committed row. For the whole staging→commit window the
+    /// directory is live user data that NO committed row references, so an
+    /// "unreferenced ⇒ orphan" sweep DELETES it; `loadAttachments` then fails
+    /// closed (Outbox Rule 5) and the send is permanently failed.
+    /// - A staging marker file needs its own crash-safe lifecycle (nothing
+    ///   removes a marker left by a killed process), i.e. it replaces the orphan
+    ///   problem with a second orphan problem one level up.
+    /// - A temp name adopted on commit cannot work on the outbox side at all:
+    ///   the directory name IS the row id (`attachmentsDirName = self.id`), so
+    ///   adoption would be a post-commit RENAME — reopening the identical window
+    ///   on the far side of the commit.
+    /// - The grace window costs only DELAYED byte reclamation. This cleaner is
+    ///   pure byte reclamation, never repair (the DB always has exactly one
+    ///   owner), it runs on every `reconcileOutbox`, and a deferred directory is
+    ///   reclaimed by the next pass once it ages out. Sweeping inside the window
+    ///   costs the user's attachments. That asymmetry decides it.
+    ///
+    /// SCOPE — this is a BOUNDED MITIGATION, not a proof of the invariant.
+    /// Nothing in the source bounds staging-to-commit latency below the grace
+    /// interval, so the loss window is narrowed by orders of magnitude, not
+    /// closed.
+    ///
+    /// Age comes from the CREATION date — a staging directory is created
+    /// immediately before its gated write, so its creation instant IS the start
+    /// of the staging→commit window. An UNDETERMINABLE age is treated as
+    /// in-flight and deferred: the cost of deferring is bytes, the cost of
+    /// deleting is data.
+    ///
+    /// `now` is a test seam (age is simulated by advancing `now`, never by
+    /// backdating filesystem attributes).
+    nonisolated static func reclaimUnreferencedAttachmentDirs(
+        baseDir: URL,
+        referenced: Set<String>,
+        now: Date = Date(),
+        graceSeconds: TimeInterval = SyncConfig.attachmentOrphanReclaimGraceSeconds
+    ) -> (reclaimed: [String], deferredInFlight: [String]) {
+        guard let dirs = try? FileManager.default.contentsOfDirectory(
+            at: baseDir, includingPropertiesForKeys: [.creationDateKey]
+        ) else { return ([], []) }
+
+        var reclaimed: [String] = []
+        var deferredInFlight: [String] = []
+        for dir in dirs {
+            let dirName = dir.lastPathComponent
+            guard !referenced.contains(dirName) else { continue }
+            let created = try? dir.resourceValues(forKeys: [.creationDateKey]).creationDate
+            guard let created, now.timeIntervalSince(created) >= graceSeconds else {
+                deferredInFlight.append(dirName)
+                continue
+            }
+            try? FileManager.default.removeItem(at: dir)
+            reclaimed.append(dirName)
+        }
+        return (reclaimed, deferredInFlight)
+    }
+
     /// Remove attachment directories that have no matching outboxMessage row.
     private func cleanOrphanedAttachmentDirs() async {
         let baseDir = OutboxMessage.attachmentsBaseDir
@@ -1204,12 +1271,12 @@ extension AccountManager {
             return
         }
 
-        for dir in dirs {
-            let dirName = dir.lastPathComponent
-            if !existingIds.contains(dirName) {
-                print("[Outbox] Cleaning orphaned attachment dir: \(dirName)")
-                try? FileManager.default.removeItem(at: dir)
-            }
+        let sweep = Self.reclaimUnreferencedAttachmentDirs(baseDir: baseDir, referenced: existingIds)
+        for dirName in sweep.reclaimed {
+            print("[Outbox] Cleaning orphaned attachment dir: \(dirName)")
+        }
+        if DebugModeManager.isLoggingEnabled(), !sweep.deferredInFlight.isEmpty {
+            print("[Outbox] Deferred \(sweep.deferredInFlight.count) unreferenced attachment dir(s) inside the staging grace window")
         }
     }
 

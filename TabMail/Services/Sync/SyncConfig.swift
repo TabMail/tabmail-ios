@@ -605,6 +605,23 @@ enum SyncConfig {
     /// next to the recipient field. Below this, counter is hidden.
     static let outboxMaxRecipientsWarnThreshold: Int = 45
 
+    /// Grace window (seconds) an UNREFERENCED outbox attachment directory must
+    /// age past before `cleanOrphanedAttachmentDirs` may reclaim its bytes.
+    ///
+    /// `queueSend` deliberately writes the attachment directory to disk BEFORE
+    /// the gated write that commits the row referencing it (Outbox Reliability
+    /// Rule 6 — file I/O must never run inside a DB transaction), so for the
+    /// whole staging→commit window the live directory is referenced by NO
+    /// committed row and a concurrent sweep would classify it as an orphan.
+    /// The window is one gated write long (milliseconds to a few seconds on a
+    /// contended writer); 10 minutes is orders of magnitude above that while
+    /// still reclaiming crash orphans on the next `reconcileOutbox` pass.
+    ///
+    /// This is a BOUNDED MITIGATION, not a proof: nothing in the source bounds
+    /// staging-to-commit latency below this interval, so the loss window is
+    /// narrowed by orders of magnitude, not closed.
+    static let attachmentOrphanReclaimGraceSeconds: TimeInterval = 600
+
     // MARK: - IMAP External-Deletion Reconcile (ADR-IOS-051)
 
     /// Tolerance for the deletion-reconcile trigger predicate
