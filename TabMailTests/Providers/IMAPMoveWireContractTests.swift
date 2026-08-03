@@ -216,28 +216,60 @@ struct IMAPMoveWireContractTests {
         #expect(server.wrongMessageViolations().isEmpty)
     }
 
-    // MARK: - T3.4 — a UIDPLUS server is held to its own COPYUID
+    // MARK: - T3.4 — COPYUID authorizes the PURGE; the tagged OK plus liveness authorizes the soft delete
 
-    /// ⚠ **THE COMMENT BELOW WAS INVERTED BY AUDIT ROUND 3 — record it, because
-    /// it was the reasoning that produced the wedge.** It read: *"Both shapes
-    /// must produce the same refusal, or the gate would be a capability check
-    /// dressed up as an evidence check."* The two shapes are NOT the same and
-    /// must NOT produce the same outcome. A server that advertises UIDPLUS and
-    /// withholds `COPYUID` has made a CHOICE it can unmake on the next attempt
-    /// (RFC 4315 §3 makes sending it a MAY), so refusing is a bounded wait for
-    /// evidence. A server that does not advertise UIDPLUS has no choice to
-    /// unmake, so the identical refusal is permanent and starves the whole lane
-    /// — which is why that case now completes on the COPY's tagged OK instead.
-    /// Requiring both to behave alike is what turned a capability gap into an
-    /// unresolvable one; the pair `nonUidPlusMoveCompletesWithoutAnyExpunge` /
-    /// this test is deliberately two-sided now.
-    @Test("A UIDPLUS server that withholds COPYUID leaves the source untouched and refuses the move")
-    func withheldCopyUidRefusesAllSourceCleanup() async throws {
+    /// ⚠ **REWRITTEN TWICE — record every prior display name, because a stale
+    /// entry on an expected-name list silently reads as ABSENT.**
+    ///  1. *"A move on a server that cannot prove COPYUID leaves the source
+    ///     untouched"* (round 1).
+    ///  2. *"A UIDPLUS server that withholds COPYUID leaves the source untouched
+    ///     and refuses the move"* (rounds 2–3).
+    ///
+    /// ⚠ **THE COMMENT THAT STOOD HERE WAS INVERTED BY AUDIT ROUND 3 AND IS NOW
+    /// INVERTED AGAIN BY ROUND 4 — record both, because each was the reasoning
+    /// that produced a wedge.** Round 1–2 said: *"Both shapes must produce the
+    /// same refusal, or the gate would be a capability check dressed up as an
+    /// evidence check."* Round 3 replied that the two shapes are NOT the same,
+    /// because *"a server that advertises UIDPLUS and withholds `COPYUID` has
+    /// made a CHOICE it can unmake on the next attempt (RFC 4315 §3 makes
+    /// sending it a MAY), so refusing is a bounded wait for evidence."*
+    ///
+    /// **That second sentence is false, and this test was BLESSING it.** RFC
+    /// 4315 §3 makes the response code a SHOULD "with limited exceptions", then
+    /// names two: a mailbox the client may COPY or APPEND to but not SELECT or
+    /// EXAMINE, where the server "SHOULD NOT send" it "as it would disclose
+    /// information about the mailbox"; and a `UIDNOTSTICKY` mail store, where it
+    /// "MAY omit" it "as it is not meaningful". Both are properties of the
+    /// MAILBOX rather than of the attempt. For such a server the evidence never
+    /// arrives, so the "bounded wait" is unbounded:
+    /// the op reaches none of the four never-drop exits, its `.haltLane`
+    /// disposition starves every later gesture on the same message, and — worse
+    /// than the capability wedge round 3 deleted — the refusal is raised AFTER
+    /// the `UID COPY`, so every drain seats another duplicate at the destination.
+    ///
+    /// THE PROPERTIES NOW, all end state at the server:
+    ///  - the move COMPLETES: the copy is at the destination and the source copy
+    ///    is soft-deleted, authorized by the COPY's tagged OK (RFC 3501 §6.4.7)
+    ///    ANDed with the member still being in the source when that COPY ran
+    ///    (RFC 3501 §6.4.8 / §2.3.1.1 — see `IMAPProvider.liveSourceUIDs`);
+    ///  - **NO EXPUNGE of any kind.** The widened evidence authorizes only the
+    ///    REVERSIBLE half. `COPYUID` remains the sole authority for an
+    ///    irreversible purge, so a server that withholds it leaves the source
+    ///    copy `\Deleted`-but-present — the same accepted cost as the
+    ///    non-UIDPLUS arm (`IOS-IMAP-001`), and the reason widening is safe even
+    ///    against a server that answers OK to a COPY it did not complete;
+    ///  - the co-resident soft-deleted bystander is untouched.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider this fails at
+    /// `deletedStores(server).count == 1` and at `flags(in: "Work", uid: 92)` —
+    /// the move threw `noCopyUidEvidence` and mutated nothing.
+    @Test("A UIDPLUS server that withholds COPYUID completes the move by soft delete and never purges")
+    func withheldCopyUidCompletesWithoutPurgingTheSource() async throws {
         let target = "withheld-target@example.com"
         let bystander = "withheld-bystander@example.com"
-        // UIDPLUS IS advertised here, and that is the whole difference: this
-        // server CAN name what it copied and declined to, which RFC 4315 §3
-        // permits and which the next attempt may not repeat.
+        // UIDPLUS IS advertised here: this server CAN name what it copied and
+        // declined to, which RFC 4315 §3 permits and which — for a UIDNOTSTICKY
+        // store or a COPY-but-not-SELECT mailbox — it will decline forever.
         let server = FakeIMAPServer(mailboxes: [
             "Work": [Self.message(91, bystander), Self.message(92, target)],
             "Archive": [],
@@ -253,44 +285,53 @@ struct IMAPMoveWireContractTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        // 🚨 CORRECTED (audit round 1, finding B-1) — same reasoning as the
-        // non-UIDPLUS sibling above. A server that declines to send COPYUID,
-        // which RFC 4315 §3 permits, has told us nothing about whether the move
-        // should happen; it has only failed to tell us that it did.
-        var thrown: Error?
-        do {
-            try await provider.move(
-                ids: ["92"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
-        } catch {
-            thrown = error
-        }
-        #expect(thrown != nil, "a copy the server refuses to name must not report success")
-        if let thrown {
-            if case ProviderError.uidValidityChanged = thrown {
-                Issue.record("a withheld COPYUID is not a proven epoch turnover")
-            }
-            if case ProviderError.actionIdentityResolutionFailed = thrown {
-                Issue.record("a withheld COPYUID must not be dropped as an unverifiable identity — the op stays queued")
-            }
-        }
+        let proven = try await provider.move(
+            ids: ["92"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
 
-        // NON-VACUITY, wire side: the copy was issued AND landed, so the server
-        // really did withhold evidence for work it really did.
+        // The member is reported complete, so the drain retires it and releases
+        // its lane. The queue-level partner is
+        // `NeverDropExitClosureTests.aWithheldCopyUidMoveCompletesAndReleasesItsLane`.
+        #expect(proven == ["92"])
+
+        // NON-VACUITY, wire side: exactly one COPY was issued and it landed, so
+        // the server really did withhold evidence for work it really did.
         #expect(Self.commands(server, containing: "UID COPY").count == 1)
         #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
-        // The property: an unproven copy authorizes nothing. Had the source
-        // been purged here, the destination copy would be the only survivor of
-        // a move this attempt could not even name.
-        #expect(Self.deletedStores(server).isEmpty)
+
+        // THE MOVE HAPPENED — reversibly.
+        #expect(Self.deletedStores(server).count == 1)
+        #expect(server.flags(in: "Work", uid: 92).contains("\\Deleted"))
+
+        // AND NOTHING WAS DESTROYED. Without `COPYUID` no purge is authorized,
+        // so both the moved message and the bystander are still present.
         #expect(Self.anyExpunges(server).isEmpty)
+        #expect(Self.bareExpunges(server).isEmpty)
         #expect(server.messageIDs(in: "Work").count == 2)
-        #expect(server.flags(in: "Work", uid: 92).isEmpty)
         #expect(server.flags(in: "Work", uid: 91).contains("\\Deleted"))
         #expect(server.wrongMessageViolations().isEmpty)
     }
 
-    @Test("A member COPYUID does not name survives the source cleanup its named sibling receives")
-    func copyUidAuthorizesOnlyTheMembersItNames() async throws {
+    /// ⚠ **RE-SCOPED BY AUDIT ROUND 4. Prior display name: *"A member COPYUID
+    /// does not name survives the source cleanup its named sibling receives"*.**
+    /// It asserted that an unnamed member is left completely untouched. That was
+    /// a BLESSING TEST for the same wedge as the case above, one member down:
+    /// the unnamed member was not retired either, so the drain narrowed the row
+    /// to it, re-copied it on the next pass (a duplicate at the destination) and
+    /// then refused for want of the evidence that server had already declined to
+    /// send — forever.
+    ///
+    /// THE PROPERTY NOW, and it is the one the round-3 name was reaching for:
+    /// **`COPYUID` is the authority for the IRREVERSIBLE purge, per member.**
+    /// A member it names is expunged from the source; a member it does not name
+    /// is soft-deleted on the tagged OK plus its own liveness and is NEVER
+    /// expunged. Both moved, so both retire — the difference the withheld
+    /// evidence makes is exactly one purge, not one lost intention.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider this fails at
+    /// `flags(in: "Work", uid: 102).contains("\\Deleted")` — the unnamed member
+    /// was left unflagged and its intention was left queued.
+    @Test("COPYUID authorizes the purge per member while the members it does not name are only soft-deleted")
+    func copyUidAuthorizesThePurgeOnlyForTheMembersItNames() async throws {
         let named = "per-member-named@example.com"
         let unnamed = "per-member-unnamed@example.com"
         let server = FakeIMAPServer(mailboxes: [
@@ -309,24 +350,146 @@ struct IMAPMoveWireContractTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        try await provider.move(
+        let proven = try await provider.move(
             ids: ["101", "102"], from: "Work", to: "Archive",
             admittedUidValidity: Self.epoch)
+
+        // Both members were dispositioned, so neither is left for a later pass
+        // to re-copy.
+        #expect(Set(proven) == ["101", "102"])
 
         // NON-VACUITY, wire side: one COPY carrying both members, and both
         // copies landed — the split below is produced by the evidence, not by a
         // partially-failed copy.
         #expect(Self.commands(server, containing: "UID COPY").count == 1)
         #expect(Set(server.messageIDs(in: "Archive")) == ["<\(named)>", "<\(unnamed)>"])
-        // The property, stated as an end state: the member the server named is
-        // gone from the source; the member it did not name is still there,
-        // unflagged. One `\Deleted` STORE and one UID EXPUNGE were issued, and
-        // both addressed only the named member.
+        // THE PROPERTY, as an end state: the member the server named is GONE
+        // from the source; the member it did not name is still there and marked
+        // `\Deleted`. Exactly one UID EXPUNGE was issued and it took only the
+        // named member.
         #expect(server.messageIDs(in: "Work") == ["<\(unnamed)>"])
-        #expect(server.flags(in: "Work", uid: 102).isEmpty)
+        #expect(server.flags(in: "Work", uid: 102).contains("\\Deleted"))
         #expect(Self.deletedStores(server).count == 1)
         #expect(Self.commands(server, containing: "UID EXPUNGE").count == 1)
         #expect(Self.bareExpunges(server).isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    /// 🚨 **AUDIT ROUND 4 — HOLE 1, at the wire.** Round 3 authorized the source
+    /// cleanup of the WHOLE requested set on the COPY's tagged OK, reading RFC
+    /// 3501 §6.4.7 (an unsuccessful COPY MUST restore the destination) as proof
+    /// that every named message was copied. §6.4.8 says otherwise, verbatim:
+    /// *"A non-existent unique identifier is ignored without any error message
+    /// generated. Thus, it is possible for a UID FETCH command to return an OK
+    /// without any data or a UID COPY or UID STORE to return an OK without
+    /// performing any operations."*
+    ///
+    /// THE FIXTURE IS THE REAL RACE: the user swipes two messages to Archive,
+    /// and before the drain runs another client moves one of them out of the
+    /// source folder. UIDVALIDITY never changes, so every epoch assertion
+    /// passes; the `UID COPY` silently copies one message and returns tagged OK.
+    ///
+    /// THE PROPERTY: **the source cleanup addresses only the members the source
+    /// still holds.** The sibling that WAS present moves and is soft-deleted;
+    /// the absent member is not swept into the cleanup on that sibling's OK.
+    /// This suite asserts the BYTES the provider sends, so the claim is made
+    /// where it is observable — the absent member's own end state is identical
+    /// either way (a `UID STORE` naming it is a no-op by the same §6.4.8), which
+    /// is precisely why the defect survived: nothing about the outcome
+    /// contradicted it, only the authorization did. The never-drop consequence
+    /// is asserted from the queue side by
+    /// `NeverDropExitClosureTests.aSourceAbsentMemberRetiresWithoutWedgingItsLane`.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider the `\Deleted`
+    /// STORE reads `UID STORE 22,23 +FLAGS (\Deleted)` and this fails at the
+    /// `!store.contains("23")` expectation.
+    @Test("A source cleanup addresses only the members the source still holds")
+    func sourceCleanupSkipsAMemberTheSourceNoLongerHolds() async throws {
+        let present = "absent-member-present@example.com"
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: [
+                "INBOX": [Self.message(22, present)],
+                "Archive": [],
+            ])
+        server.setUidValidity(Int(Self.epoch), for: "INBOX")
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.expectMutation(rfc822MessageId: present)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        // UID 23 was in INBOX when the user swiped and is not there now.
+        let proven = try await provider.move(
+            ids: ["22", "23"], from: "INBOX", to: "Archive",
+            admittedUidValidity: Self.epoch)
+
+        // Both members leave the queue: 22 because it moved, 23 because the
+        // server itself says it is not in the source folder (exit 2).
+        #expect(Set(proven) == ["22", "23"])
+
+        // The present sibling really did move.
+        #expect(server.messageIDs(in: "Archive") == ["<\(present)>"])
+        #expect(server.flags(in: "INBOX", uid: 22).contains("\\Deleted"))
+
+        // THE PROPERTY: the cleanup names only what the source still holds.
+        let stores = Self.deletedStores(server)
+        #expect(stores.count == 1)
+        guard stores.count == 1 else { return }
+        #expect(stores[0].contains("22"))
+        #expect(
+            !stores[0].contains("23"),
+            """
+            the source cleanup addressed a UID the source no longer holds. Its own copy was never \
+            proven — a tagged OK on a UID COPY says nothing about a UID the server silently ignored \
+            (RFC 3501 §6.4.8) — so it must not be swept into a sibling's cleanup: \(stores[0])
+            """)
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    /// The whole-op form of the case above, and the shape shipped `v1.6.38`
+    /// handled with `idempotentMove`'s `if srcUIDs.isEmpty { … return }`: every
+    /// member of the op has already left the source folder.
+    ///
+    /// THE PROPERTY: the op completes as a no-op that mutates NOTHING anywhere —
+    /// no `\Deleted` STORE, no EXPUNGE — and reports every member complete, so
+    /// the drain retires it instead of retrying an unsatisfiable move forever.
+    /// A `UID COPY` is still issued (the provider learns the members are gone
+    /// only from the source itself, and §6.4.8 makes that COPY a server-side
+    /// no-op), which is why the destination stays empty.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider this fails at
+    /// `deletedStores(server).isEmpty` — the whole requested set was authorized
+    /// and a `\Deleted` STORE went out for a UID the mailbox does not contain.
+    @Test("A move whose members have all left the source completes without mutating anything")
+    func aWhollyAbsentSourceSetIsATerminalNoOp() async throws {
+        let bystander = "wholly-absent-bystander@example.com"
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: [
+                "INBOX": [Self.message(21, bystander)],
+                "Archive": [],
+            ])
+        server.setUidValidity(Int(Self.epoch), for: "INBOX")
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let proven = try await provider.move(
+            ids: ["23"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
+
+        #expect(proven == ["23"])
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        // The co-resident message is untouched: nothing here addressed it.
+        #expect(server.messageIDs(in: "INBOX") == ["<\(bystander)>"])
+        #expect(server.flags(in: "INBOX", uid: 21).isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
     }
 

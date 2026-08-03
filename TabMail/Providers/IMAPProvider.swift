@@ -3842,6 +3842,71 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return UIDSet(proven)
     }
 
+    /// 🚨 AUDIT ROUND 4 — ⚑ NO REFERENCE — INVENTED. The subset of `requested`
+    /// the SOURCE mailbox still contains, read from the server itself.
+    ///
+    /// WHY IT EXISTS. Round 3 authorized the source cleanup of a whole batch on
+    /// the COPY's tagged OK, citing RFC 3501 §6.4.7 (an unsuccessful COPY MUST
+    /// restore the destination mailbox). That citation is real but it is not the
+    /// whole rule: the command issued is a `UID COPY`, and §6.4.8 says verbatim
+    /// that *"a non-existent unique identifier is ignored without any error
+    /// message generated. Thus, it is possible for a UID FETCH command to return
+    /// an OK without any data or a UID COPY or UID STORE to return an OK without
+    /// performing any operations."* A UID that is no longer in the mailbox is
+    /// dropped FROM the command, so the tagged OK is silent about it — and
+    /// round 3 retired it as provider success anyway, which in a batch let an
+    /// absent member ride out of the queue on a PRESENT sibling's OK.
+    ///
+    /// WHAT IT PROVES, and why the proof is per member. RFC 3501 §2.3.1.1 makes
+    /// UID + UIDVALIDITY a 64-bit value that *"MUST NOT refer to any other
+    /// message in the mailbox or any subsequent mailbox with the same name
+    /// forever"* and assigns UIDs *"in a strictly ascending fashion"*. So within
+    /// ONE epoch a UID can only ever LEAVE a mailbox — it can never arrive, come
+    /// back, or be reused. A member still present AFTER the COPY was therefore
+    /// present DURING it, which is exactly the premise §6.4.7 needs: it was one
+    /// of "the specified message(s)", the COPY was tagged OK, so its copy is at
+    /// the destination. The epoch that makes the argument hold is asserted
+    /// before the COPY (A3) and again before the STORE (A4).
+    ///
+    /// The converse is the other half of the fix: a member the server does NOT
+    /// return is one the server has just told us is not in that mailbox. That is
+    /// a POSITIVE provider statement (exit 2 of
+    /// `Companion/Rules/Active/never-drop-user-intention.md`), not an absence of
+    /// evidence — and it is the same fact `v1.6.38`'s `idempotentMove` acted on
+    /// with `if srcUIDs.isEmpty { … return }`. A THROWN probe proves nothing and
+    /// propagates, so the op stays queued.
+    ///
+    /// ⚠ IN BOUNDS UNDER ADR-IOS-068 / D4. This is a source-UID existence check:
+    /// it re-reads UIDs this operation already owns and can only ever NARROW the
+    /// destructive set. No rfc822 Message-ID is consulted, and no `SEARCH`
+    /// result is a mutation target. (RFC 4315 §3 suggests recovering the missing
+    /// mapping by SEARCHing the DESTINATION for a Message-ID; that route is
+    /// exactly what D4 forbids and it is not taken here.)
+    ///
+    /// `.uidFlagsOnly` is the smallest per-message payload SwiftMail offers, and
+    /// RFC 3501 §6.4.8 requires the UID data item in any FETCH response caused
+    /// by a UID command, so one round trip answers the question for the whole
+    /// set. Filtering against `requested` is the same C3 guard
+    /// `copyProvenSourceUIDs` applies: a response naming a UID this call never
+    /// asked about must never widen the destructive set.
+    private func liveSourceUIDs(
+        of requested: UIDSet, server: IMAPServer
+    ) async throws -> UIDSet {
+        let infos = try await server.fetchMessageInfosBulk(
+            using: requested, options: .uidFlagsOnly)
+        let requestedValues = Set(requested.toArray().map(\.value))
+        var live: [UID] = []
+        // LOOP VARIANT: the number of unvisited elements of `infos`, a finite
+        // array fixed before the loop begins. It strictly decreases by one per
+        // iteration and is bounded below by 0; the `continue` arm advances the
+        // iteration exactly like the fall-through arm.
+        for info in infos {
+            guard let uid = info.uid, requestedValues.contains(uid.value) else { continue }
+            live.append(uid)
+        }
+        return UIDSet(live)
+    }
+
     /// T3.14 — ⚑ NO REFERENCE — INVENTED. The DESTINATION-side epoch refusal.
     ///
     /// Deliberately NOT `ProviderError.uidValidityChanged`, and deliberately a
@@ -3876,41 +3941,37 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// and its description carries none of the substrings
     /// `AccountManagerQueue.isMessageNotFoundError` matches, so it cannot be
     /// mistaken for a confirmed-stale message.
-    /// B-1 — the MOVE path's evidence refusal, which is RETRYABLE.
-    ///
-    /// It means "this server CAN name what it copied and this attempt did not
-    /// get that naming". That is an ABSENCE OF EVIDENCE about the SERVER, never
-    /// a verdict on the ids — which are well-formed UIDs the drain admitted
-    /// under a proven epoch — and never the provider telling us the work is
-    /// already done. It therefore must not reach
-    /// `ProviderError.actionIdentityResolutionFailed`, whose drain arm DELETES
-    /// the op and whose stated premises ("refused before touching the wire",
-    /// "the same string will be refused on every future drain", "`.deleteDraft`
-    /// — the only op that raises this error") are each false for a move.
-    ///
-    /// 🚨 AUDIT ROUND 3 — THE SECOND CASE IS GONE, AND ITS ABSENCE IS THE FIX.
-    /// This enum used to carry `noUidPlusCapability`, thrown unconditionally
-    /// when the server did not advertise UIDPLUS. Because `COPYUID` is a UIDPLUS
-    /// response code (RFC 4315 §3) that refusal was raised on EVERY attempt,
-    /// forever: on a standards-valid non-UIDPLUS server archive/move could never
-    /// complete, and since this error's drain arm returns `.haltLane`, every
-    /// later gesture naming that message was starved on every future drain too.
-    /// An op that stays queued but blocks every intention behind it has not been
-    /// preserved. A capability the server simply does not have is not evidence
-    /// that can "arrive later", so demanding it is not fail-closed — it is a
-    /// permanent wedge. See `move` for what authorizes the source cleanup there
-    /// instead (the tagged-OK `UID COPY` itself, RFC 3501 §6.4.7).
-    ///
-    /// `private` and unclassified — exactly like `IMAPDestinationEpochRefusal` —
-    /// so it can never become a classification input anywhere else and lands in
-    /// the drain's generic requeue-and-retry arm. Its description carries none
-    /// of the substrings `AccountManagerQueue.isMessageNotFoundError` matches.
-    private enum IMAPMoveEvidenceUnavailable: ProviderEvidenceUnavailable {
-        /// A UIDPLUS server issued the COPY and then reported no usable
-        /// per-member mapping. RFC 4315 §3 makes sending the response code a
-        /// MAY, so this is server behaviour and can differ on the next attempt.
-        case noCopyUidEvidence(source: String, destination: String, requested: Int)
-    }
+    // 🚨 AUDIT ROUND 4 — `IMAPMoveEvidenceUnavailable` IS DELETED, AND ITS
+    // ABSENCE IS THE SECOND HALF OF THIS ROUND'S FIX. History, kept because
+    // superseded material is never dropped in this repo:
+    //
+    //  - It was introduced by audit round 1 (finding B-1) carrying TWO cases,
+    //    `noUidPlusCapability` and `noCopyUidEvidence`, so that the MOVE path's
+    //    evidence refusals would stop reaching
+    //    `ProviderError.actionIdentityResolutionFailed` — whose drain arm
+    //    DELETES the op and whose stated premises ("refused before touching the
+    //    wire", "the same string will be refused on every future drain",
+    //    "`.deleteDraft` — the only op that raises this error") are each false
+    //    for a move.
+    //  - Audit round 3 deleted `noUidPlusCapability`: `COPYUID` is a UIDPLUS
+    //    response code (RFC 4315 §3), so on a standards-valid non-UIDPLUS server
+    //    that refusal fired on EVERY attempt, forever, and its `.haltLane` drain
+    //    arm starved every later gesture on the same message. A capability the
+    //    server does not have is not evidence that can "arrive later".
+    //  - Audit round 4 deletes `noCopyUidEvidence` for the SAME reason, which
+    //    round 3 stopped one step short of. RFC 4315 §3 makes `COPYUID` a
+    //    SHOULD with named exceptions — a `UIDNOTSTICKY` mail store, and a
+    //    mailbox the client may COPY to but not SELECT — so for those servers
+    //    the response code never arrives either, and "evidence that may appear
+    //    next time" was a hope, not a property. The refusal reached NONE of the
+    //    four never-drop exits, halted the lane on every drain, and re-issued
+    //    the `UID COPY` each time, seating another destination duplicate.
+    //
+    // An op that stays queued but blocks every intention behind it has not been
+    // preserved (the never-drop WEDGE corollary). What authorizes the source
+    // cleanup when no `COPYUID` arrives is stated at `move`'s authorization
+    // gate: the COPY's tagged OK, applied ONLY to members a source-UID
+    // existence check proves were in the mailbox when that COPY ran.
 
     /// ⚠ Conforms to `ProviderEvidenceUnavailable` for the SAME reason its two
     /// siblings above do — it is the same class of refusal (the provider asked the
@@ -4091,22 +4152,34 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the server's own `COPYUID` (see `copyProvenSourceUIDs`) — but ONLY on the
     /// class of server that can produce it.
     ///
-    /// 🚨 AUDIT ROUND 3 — the source cleanup is authorized at the STRONGEST
-    /// RESOLUTION THE SERVER CAN EXPRESS, and there are two of those:
-    ///  - **UIDPLUS advertised** ⇒ per-member `COPYUID` evidence, unchanged. The
-    ///    cleanup addresses ONLY the UIDs the COPY response named, and a
-    ///    response naming none of them cleans nothing and keeps the op queued.
-    ///  - **UIDPLUS not advertised** ⇒ the COPY's own tagged OK, which RFC 3501
-    ///    §6.4.7 makes a positive statement that the whole named set copied
-    ///    (an unsuccessful COPY MUST restore the destination). The cleanup then
-    ///    addresses exactly the set this call resolved under the admitted epoch
-    ///    and handed to `server.copy` — never a wider one.
+    /// 🚨 AUDIT ROUND 4 — the source cleanup is authorized PER MEMBER, by a
+    /// positive fact about THAT member, and the two facts authorize different
+    /// things (full argument at the authorization gate in the body):
+    ///  - **`COPYUID` names the member** (RFC 4315 §3) ⇒ it authorizes both the
+    ///    reversible `\Deleted` STORE and the irreversible `UID EXPUNGE`.
+    ///    Unchanged from round 3, and it is still the ONLY thing that may
+    ///    authorize a purge.
+    ///  - **no `COPYUID` for that member** — no UIDPLUS, a withheld response
+    ///    code, or a COPY that copied nothing ⇒ the COPY's tagged OK
+    ///    (RFC 3501 §6.4.7: an unsuccessful COPY MUST restore the destination)
+    ///    ANDed with proof that the member was IN the source mailbox when that
+    ///    COPY ran (`liveSourceUIDs`). That authorizes the `\Deleted` STORE and
+    ///    nothing else.
+    ///  - **the member is no longer in the source at all** ⇒ the server has told
+    ///    us there is nothing left to move. Exit 2, zero mutation, retired.
     ///
-    /// The A1 capability refusal that used to sit between them is DELETED: it
-    /// made archive/move impossible forever on standards-valid non-UIDPLUS
-    /// servers and, via `.haltLane`, starved every later gesture on the same
-    /// message. See the deletion site for the full argument. What IS ported from
-    /// the reference is everything that does not depend on RFC identity:
+    /// ROUND 3 GOT TWO THINGS WRONG HERE AND BOTH ARE FIXED. It read the tagged
+    /// OK as covering the WHOLE named set, which RFC 3501 §6.4.8 contradicts —
+    /// a non-existent UID is ignored without error, so a `UID COPY` can return
+    /// OK having copied nothing, and in a batch an absent member was retired as
+    /// provider success on a present sibling's OK. And it left the withheld-
+    /// `COPYUID` refusal in place on the UIDPLUS arm, where RFC 4315 §3's named
+    /// exceptions (`UIDNOTSTICKY`; a mailbox the client may COPY to but not
+    /// SELECT) make the evidence unobtainable for some servers — the identical
+    /// permanent wedge round 3 had just removed from the other arm, still
+    /// re-copying on every drain. The A1 capability refusal round 3 deleted
+    /// stays deleted. What IS ported from the reference is everything that does
+    /// not depend on RFC identity:
     ///
     ///  - T3.3: the destination is probed for EXISTENCE before any source
     ///    mutation, and a confirmed-absent destination makes the whole op a
@@ -4142,13 +4215,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// owner-decided trade — and buys an epoch assertion immediately before
     /// each of the three steps.
     ///
-    /// RETURNS the subset of `ids` whose move this attempt PROVED — the members
-    /// the server's own `COPYUID` named and whose source copy was therefore
-    /// soft-deleted and purged. An unproven member was never mutated anywhere,
-    /// so it is not this call's to retire: the caller keeps it queued and
-    /// retries. Retirement is per MEMBER, never per batch (B-2). A whole-op
-    /// no-op — a LIST-confirmed absent source or destination — returns `ids`,
-    /// because that IS provider authority that nothing remains to do.
+    /// RETURNS the subset of `ids` this attempt DISPOSITIONED. Retirement is per
+    /// MEMBER, never per batch (B-2), and the return value is how that reaches
+    /// the drain.
+    ///
+    /// 🚨 AUDIT ROUND 4 — on every path that returns rather than throws, that
+    /// subset is now ALL of `ids`, and the reason is the point rather than a
+    /// simplification: each member has been given its OWN positive disposition
+    /// before this returns — it moved (proved by `COPYUID`, or by the tagged OK
+    /// plus its own liveness in the source), or the server itself said it is no
+    /// longer in the source folder, which is exit 2 and leaves nothing to do.
+    /// There is no third state left to leave queued, so no member can ride out
+    /// of the queue on a sibling's evidence and none can be stranded on the
+    /// absence of its own. `AccountManagerQueue.retirePartiallyCompletedOp`
+    /// therefore has no producer here any more; it remains the drain's contract
+    /// for any provider that does return a strict subset.
+    ///
+    /// A whole-op no-op — a LIST-confirmed absent source or destination — also
+    /// returns `ids`, because that too IS provider authority that nothing
+    /// remains to do.
     @discardableResult
     func move(
         ids: [String],
@@ -4189,18 +4274,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // that "if the COPY command is unsuccessful for any reason,
                 // server implementations MUST restore the destination mailbox
                 // to its state before the COPY attempt" — so a tagged OK is a
-                // POSITIVE statement that every message named in the command
-                // was copied. That is exactly the difference the never-drop
-                // rule turns on: it is evidence, not the absence of it.
-                // `COPYUID` adds WHERE each copy landed, which the source
-                // cleanup does not need and never reads on this path. Where the
-                // server CAN name what it copied (UIDPLUS advertised) v3 still
-                // holds it to that stronger per-member evidence — see the
-                // authorization gate below, which is unchanged for that class.
+                // POSITIVE statement that the message(s) the command actually
+                // addressed were copied.
                 //
-                // Read ONCE, here, and reused by both the authorization gate
-                // and the purge tail, so the two decisions cannot disagree
-                // about which kind of server this is. `supportsUIDPlus` reads
+                // ⚠ AUDIT ROUND 4 CORRECTED THE SENTENCE THAT USED TO END THAT
+                // PARAGRAPH — it read "…that EVERY MESSAGE NAMED IN THE COMMAND
+                // was copied", and RFC 3501 §6.4.8 says otherwise: on a `UID`
+                // command "a non-existent unique identifier is ignored without
+                // any error message generated", so a named-but-absent UID is
+                // never one of "the specified message(s)" and the OK is silent
+                // about it. The tagged OK is therefore joined with a per-member
+                // liveness proof at the authorization gate below, and that gate
+                // now serves BOTH classes of server rather than this one only.
+                //
+                // Read ONCE, here. Round 4 narrowed its remaining consumer to
+                // the purge tail — `UID EXPUNGE` is itself a UIDPLUS command
+                // (RFC 4315 §2.1), so this decides whether the tail may exist at
+                // all, while WHICH members it may address is decided by the
+                // evidence rather than the capability. `supportsUIDPlus` reads
                 // capabilities the connection already gathered at login; it is
                 // not a wire command.
                 let serverSupportsUIDPlus = await server.supportsUIDPlus
@@ -4358,100 +4449,122 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
 
                 // THE AUTHORIZATION GATE — what may be soft-deleted from the
-                // source. From here down the set being mutated is
-                // `authorizedUIDs`, never `sourceUIDs`.
+                // source, and separately what may be PURGED from it. From here
+                // down the sets being mutated are `authorizedUIDs` and
+                // `purgeAuthorizedUIDs`, never `sourceUIDs`.
                 //
-                // 🚨 AUDIT ROUND 3 — TWO CLASSES OF SERVER, ONE RULE: mutate
-                // only what the server itself said it copied, at the strongest
-                // resolution that server can express.
+                // ONE RULE, stated per member: a source copy may be destroyed
+                // only on a POSITIVE, PER-MEMBER fact about THAT member. There
+                // are two such facts and they authorize different things.
                 //
-                //  - UIDPLUS advertised ⇒ the server CAN name each copy
-                //    (`COPYUID`, RFC 4315 §3), so it is held to per-member
-                //    evidence exactly as before. Unchanged, including the
-                //    `noCopyUidEvidence` refusal below for the withholding
-                //    case. Nothing on this arm is relaxed.
-                //  - UIDPLUS NOT advertised ⇒ `COPYUID` is unobtainable in
-                //    principle, and the tagged OK on the `UID COPY` is the
-                //    server's own positive statement that the copy landed:
-                //    RFC 3501 §6.4.7 requires that an unsuccessful COPY MUST
-                //    leave the destination mailbox as it was, so a partial copy
-                //    cannot be reported as OK. `try await server.copy` returning
-                //    normally therefore means "tagged OK": SwiftMail's
-                //    `CommandHandler.processResponse` routes every non-`.ok`
-                //    tagged state to `handleTaggedErrorResponse`, and
-                //    `CopyHandler` overrides it to fail the promise with
-                //    `IMAPError.copyFailed`, which `executeCommand` rethrows.
-                //    (Verified in the pinned fork, audit round 3 — this is the
-                //    load-bearing premise of this whole arm.)
+                //  1. `COPYUID` (RFC 4315 §3) names this member's copy and where
+                //     it landed. Strongest, and the ONLY thing allowed to
+                //     authorize the IRREVERSIBLE `UID EXPUNGE`. Unchanged.
+                //  2. The COPY's tagged OK, ANDed with proof that this member
+                //     was in the source mailbox when that COPY ran. RFC 3501
+                //     §6.4.7 requires that an unsuccessful COPY MUST leave the
+                //     destination as it was, so a partial copy cannot be
+                //     reported as OK; `try await server.copy` returning normally
+                //     therefore means tagged OK (in the pinned SwiftMail fork
+                //     `BaseIMAPCommandHandler.processResponse` routes every
+                //     non-`.ok` tagged state to `handleTaggedErrorResponse`,
+                //     which `CopyHandler` overrides to fail the promise with
+                //     `IMAPError.copyFailed`; `executeCommand` rethrows it).
+                //     The liveness half is what audit round 4 adds — see
+                //     `liveSourceUIDs` for the §6.4.8 / §2.3.1.1 argument. This
+                //     authorizes the REVERSIBLE `\Deleted` STORE and nothing
+                //     more.
                 //
-                // ⚠ C3 BOUNDARY, unmoved: `sourceUIDs` is the set resolved from
-                // the op's own ids and validated under the admitted epoch at A1,
-                // and it is the SAME set handed to `server.copy` two statements
-                // above. So the members cleaned up here are exactly the members
-                // this COPY named — never a wider set — and A4 re-asserts the
-                // epoch immediately before the STORE that mutates them.
-                let authorizedUIDs = serverSupportsUIDPlus
-                    ? Self.copyProvenSourceUIDs(copyEvidence, requested: sourceUIDs)
-                    : sourceUIDs
-                guard !authorizedUIDs.isEmpty else {
-                    // No per-member COPYUID evidence for ANY requested UID, so
-                    // nothing here authorizes a `\Deleted` STORE or an EXPUNGE
-                    // against the source. Only a UIDPLUS server can reach this
-                    // guard (the non-UIDPLUS arm above is authorized by the
-                    // tagged OK and is never empty), so what lands here is a
-                    // server that DOES advertise UIDPLUS and still gave no
-                    // usable mapping: it omitted the response code (RFC 4315 §3
-                    // makes sending it a MAY), or it sent one naming none of the
-                    // UIDs we asked it to copy — including the "it copied
-                    // nothing because those UIDs are already gone" case, where
-                    // there is equally nothing to clean.
-                    //
-                    // ⚠ RETRYABLE, NOT TERMINAL (audit round 1, finding B-1).
-                    // This threw `actionIdentityResolutionFailed`, and the
-                    // drain DELETED the op. Whether a UIDPLUS server chooses to
-                    // send `COPYUID` is SERVER behaviour, not a property of the
-                    // ids — so "the same string will be refused on every future
-                    // drain", the premise that arm rests on, is false here. An
-                    // absence of evidence may not retire a durable intention.
-                    //
-                    // THE ACCEPTED COST, and the bound RE-DERIVED (audit round
-                    // 2) rather than restated. The COPY has ALREADY gone out
-                    // when this throws, so every attempt seats one unproven
-                    // duplicate at the destination while the source stays
-                    // intact. The bound is therefore exactly the number of
-                    // ATTEMPTS, and the earlier text asserted "one per drain"
-                    // without that being enforced anywhere: the drain runs up to
-                    // three passes and re-claims whatever is still queued, so
-                    // any pass after the first could re-attempt this op and seat
-                    // another copy. What makes "one per drain" true is
-                    // `DrainContext.evidenceRefused` — the drain records this op
-                    // and its lane declines to re-enter the provider for the
-                    // rest of that drain. So: ONE unproven duplicate per drain
-                    // in which this op is attempted, and it accumulates across
-                    // drains for as long as the server keeps withholding
-                    // `COPYUID`. Duplicated mail is recoverable by the user; a
-                    // silently discarded archive/delete is not, and the
-                    // never-drop rule ranks them in that order.
-                    print("[IMAP] move \(source)→\(destination): COPY returned no per-member COPYUID evidence for \(ids.count) requested uid(s) — REFUSING all source cleanup (fail closed; the copy is unproven, so nothing may be deleted) and keeping the op queued")
-                    throw IMAPMoveEvidenceUnavailable.noCopyUidEvidence(
-                        source: source, destination: destination, requested: ids.count)
-                }
-                // B-2 — the PROVEN subset, computed here and returned to the
-                // caller. An unproven member is untouched in the source and
-                // unmoved at the destination: this attempt completed NOTHING for
-                // it, so it may not ride out of the queue on its siblings'
-                // success. `copyProvenSourceUIDs` already filtered to the
-                // REQUESTED set, so every element maps back to an input id.
-                let provenIds = authorizedUIDs.toArray().map { String($0.value) }
-                if authorizedUIDs.count != sourceUIDs.count {
-                    print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): COPYUID proves \(authorizedUIDs.count) of \(sourceUIDs.count) requested uid(s); the unproven remainder is left untouched in the source and stays queued")
+                // 🚨 AUDIT ROUND 4 — WHY FACT 2 IS NOW ALLOWED ON A UIDPLUS
+                // SERVER TOO, which round 3 deliberately did not do. Round 3
+                // gave the tagged OK to the non-UIDPLUS arm only, on the theory
+                // that a UIDPLUS server which withholds `COPYUID` has made a
+                // choice it can unmake next time. RFC 4315 §3 says otherwise.
+                // It opens with "server implementations that advertise the
+                // UIDPLUS extension SHOULD return these response codes" — but
+                // "with limited exceptions, discussed below" — and then names
+                // two, at two different normative strengths: for a mailbox the
+                // client may COPY or APPEND to but not SELECT or EXAMINE, the
+                // server "SHOULD NOT send an APPENDUID or COPYUID response code
+                // as it would disclose information about the mailbox"; for a
+                // `UIDNOTSTICKY` mail store it "MAY omit" it "as it is not
+                // meaningful". Either way the omission is a PROPERTY OF THAT
+                // MAILBOX, not a per-attempt coin flip, so for such a server the
+                // evidence never arrives and the refusal was a permanent wedge
+                // that re-copied on every drain. Fact 2 is not a weaker
+                // reading of fact 1; it is an independent, RFC-grounded proof of
+                // the SAME thing (this member's copy is at the destination),
+                // and it does not depend on any capability. Widening it is
+                // sound BECAUSE the irreversible half stays on fact 1: against a
+                // non-conforming server that answers OK to a COPY it did not
+                // complete, the worst this arm can do is leave a message marked
+                // `\Deleted` and still present — recoverable — never expunged.
+                //
+                // ⚠ C3 BOUNDARY, unmoved: both sets are subsets of `sourceUIDs`,
+                // the set resolved from the op's own ids and validated under the
+                // admitted epoch at A1, and the SAME set handed to `server.copy`
+                // above. Every gate here NARROWS; none can widen. A4 re-asserts
+                // the epoch immediately before the STORE that mutates them.
+                let copyProvenUIDs = Self.copyProvenSourceUIDs(
+                    copyEvidence, requested: sourceUIDs)
+                let authorizedUIDs: UIDSet
+                let purgeAuthorizedUIDs: UIDSet
+                if copyProvenUIDs.count == sourceUIDs.count {
+                    // The server named every member. Fact 1 covers the whole
+                    // request, so the liveness probe would answer a question
+                    // already answered: no extra round trip, and this path — the
+                    // one every UIDPLUS server that follows RFC 4315 §3's SHOULD
+                    // takes — is byte-for-byte what it was before round 4.
+                    authorizedUIDs = copyProvenUIDs
+                    purgeAuthorizedUIDs = copyProvenUIDs
+                } else {
+                    // Some or all members are unnamed: no UIDPLUS, a withheld
+                    // response code, or a COPY that copied nothing because the
+                    // UIDs are already gone. Ask the source itself which of them
+                    // it still holds, and authorize per member from that.
+                    let live = try await self.liveSourceUIDs(
+                        of: sourceUIDs, server: server)
+                    authorizedUIDs = live
+                    let liveValues = Set(live.toArray().map(\.value))
+                    purgeAuthorizedUIDs = UIDSet(
+                        copyProvenUIDs.toArray().filter { liveValues.contains($0.value) })
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): COPYUID named \(copyProvenUIDs.count) of \(sourceUIDs.count) requested uid(s); the source still holds \(live.count) of them, so \(live.count) are soft-deleted on the tagged OK and \(sourceUIDs.count - live.count) are already gone from the source (provider-authoritative no-op, nothing to do)")
+                    }
                 }
 
-                // A4 — immediately before the source soft-delete.
+                // EVERY MEMBER REACHED AN EXIT, so every member retires and the
+                // op is complete. A member the source still holds moved (fact 1
+                // or fact 2 above); a member it no longer holds was answered by
+                // the server itself — it is not in the folder this op names, so
+                // there is nothing left to move, which is exit 2 and is exactly
+                // what `v1.6.38`'s `idempotentMove` did with `if srcUIDs.isEmpty
+                // { return }`. Returning the input `ids` rather than mapping the
+                // mutated set back to strings also keeps the caller's
+                // set-equality check free of any round-trip assumption.
+                let provenIds = ids
+
+                // A4 — immediately before the source soft-delete. Nothing but
+                // this assertion sits between it and the STORE; the liveness
+                // probe above is a READ and is itself bracketed by A3 and A4,
+                // which is what makes "present after the COPY" mean "present
+                // under the epoch this op was admitted under".
                 let preDelete = try await self.selectMailboxTracked(server, folder: source)
                 try self.requireUidValidity(
                     preDelete, expected: admittedUidValidity, folder: source)
-                try await server.store(flags: [.deleted], on: authorizedUIDs, operation: .add)
+                if !authorizedUIDs.isEmpty {
+                    try await server.store(
+                        flags: [.deleted], on: authorizedUIDs, operation: .add)
+                } else if DebugModeManager.isLoggingEnabled() {
+                    // The whole request is already gone from the source. There
+                    // is nothing to soft-delete and nothing to purge, and the op
+                    // retires on the server's own answer rather than on a
+                    // command that would address no message (RFC 3501 §6.4.8: a
+                    // `UID STORE` naming only absent UIDs is a silent no-op, so
+                    // issuing one would be a wire round trip that proves and
+                    // changes nothing).
+                    print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): the source holds none of the \(sourceUIDs.count) requested uid(s) — whole-op no-op, nothing mutated anywhere")
+                }
 
                 try Task.checkCancellation()
 
@@ -4469,7 +4582,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // instead of delegating to `expungeScopedToTargets`, whose
                 // UIDPLUS check is internal and therefore cannot have A5
                 // sequenced inside it.
-                if serverSupportsUIDPlus {
+                //
+                // 🚨 AUDIT ROUND 4 — the gate now ALSO requires per-member
+                // `COPYUID`, because that is the only evidence allowed to
+                // authorize an IRREVERSIBLE deletion (see the authorization
+                // gate). `serverSupportsUIDPlus` is kept as the outer condition
+                // and not collapsed into the emptiness check: `UID EXPUNGE` is
+                // itself a UIDPLUS command (RFC 4315 §2.1), so a server that
+                // does not advertise the extension must never be sent one even
+                // if it somehow returned a `COPYUID`.
+                if serverSupportsUIDPlus, !purgeAuthorizedUIDs.isEmpty {
                     // A5 — immediately before the purge. `v2final` asserts here
                     // too (`deleteActionSource`'s `finalSourceSelection`): STORE
                     // and UID EXPUNGE are distinct awaits, and a UID resolved
@@ -4478,7 +4600,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     let preExpunge = try await self.selectMailboxTracked(server, folder: source)
                     try self.requireUidValidity(
                         preExpunge, expected: admittedUidValidity, folder: source)
-                    try await server.expunge(messages: authorizedUIDs)
+                    try await server.expunge(messages: purgeAuthorizedUIDs)
                 } else {
                     // 🚨 AUDIT ROUND 3 — THIS ARM IS LIVE AGAIN, and it is the
                     // whole of the non-UIDPLUS move's tail. T3.4's capability
@@ -4486,6 +4608,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // refusal is deleted, so a non-UIDPLUS move now runs COPY →
                     // `\Deleted` STORE → *nothing here*, and RETURNS, which
                     // retires the op and releases its lane.
+                    //
+                    // 🚨 AUDIT ROUND 4 — this arm is now reached by a SECOND
+                    // class of server as well: one that advertises UIDPLUS and
+                    // furnished no `COPYUID` for a member. The accepted cost
+                    // below is identical for it, and so is the reason.
                     //
                     // THE ACCEPTED COST, stated plainly: the source copy stays
                     // on the server, soft-deleted, and may remain visible or
@@ -4517,7 +4644,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // destination already has the copy, and a UIDPLUS-capable
                     // client or the server's own policy completes the purge.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): server lacks UIDPLUS — the tagged-OK COPY authorized the source cleanup, so the source is copied and marked \\Deleted (soft delete); the mailbox-wide EXPUNGE is skipped to avoid a wrong-delete (IOS-IMAP-001) and the move COMPLETES")
+                        print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): no UID EXPUNGE (uidPlus=\(serverSupportsUIDPlus), copyuid-proven-and-live=\(purgeAuthorizedUIDs.count)) — the tagged-OK COPY plus source liveness authorized the soft delete, so the source is copied and marked \\Deleted; the mailbox-wide EXPUNGE is skipped to avoid a wrong-delete (IOS-IMAP-001) and the move COMPLETES")
                     }
                 }
                 return provenIds

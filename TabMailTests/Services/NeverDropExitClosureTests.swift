@@ -384,27 +384,39 @@ struct NeverDropExitClosureTests {
     /// `.deleteDraft`-specific, so the effect was that upgrading silently
     /// discarded archives on exactly the servers least able to prove anything.
     ///
-    /// ⚠ **RE-SCOPED (audit round 3) — the fixture changed from a NON-UIDPLUS
-    /// server to a UIDPLUS server that WITHHOLDS `COPYUID`, and the change is
-    /// the point.** This test used to be a BLESSING TEST: it pinned "a move on a
-    /// non-UIDPLUS server leaves the source untouched and the op queued" as
-    /// correct, when that shape was in fact a permanent, unresolvable wedge —
-    /// the capability can never appear, so the op could never complete on any
-    /// future drain either, and its `.haltLane` disposition starved every later
-    /// gesture on the same message forever. Round 3 deleted that refusal; a
-    /// non-UIDPLUS move now COMPLETES (see
-    /// `aNonUidPlusMoveCompletesAndReleasesItsLane`, the two-sided partner).
+    /// ⚠ **RE-SCOPED TWICE — record both prior fixtures, because each was a
+    /// BLESSING TEST for the wedge of its round, and a display name that no
+    /// longer exists silently reads as ABSENT on an expected-name list.**
+    ///  1. Rounds 1–2: a NON-UIDPLUS server. That pinned "a move on a
+    ///     non-UIDPLUS server leaves the source untouched and the op queued" as
+    ///     correct, when the capability can never appear, so the op could never
+    ///     complete on any future drain and its `.haltLane` disposition starved
+    ///     every later gesture on that message forever. Round 3 deleted the
+    ///     capability refusal; the two-sided partner is now
+    ///     `aNonUidPlusMoveCompletesAndReleasesItsLane`.
+    ///  2. Round 3: a UIDPLUS server that WITHHOLDS `COPYUID`, on the theory
+    ///     that such a server "may prove it next time" (RFC 4315 §3 makes the
+    ///     response code a MAY). **Audit round 4 found that theory false** — §3
+    ///     makes it a SHOULD "with limited exceptions", then names two, both
+    ///     properties of the MAILBOX rather than of the attempt: a mailbox the
+    ///     client may COPY or APPEND to but not SELECT or EXAMINE ("SHOULD NOT
+    ///     send"), and a `UIDNOTSTICKY` mail store ("MAY omit"). For such a
+    ///     server the evidence never arrives and this was
+    ///     blessing a second permanent wedge, one that re-COPIES on every drain
+    ///     and seats a destination duplicate each time. The two-sided partner is
+    ///     now `aWithheldCopyUidMoveCompletesAndReleasesItsLane`.
     ///
-    /// What survives, and what this now pins, is the case that genuinely cannot
-    /// be proved and genuinely may be provable on the next attempt: a server
-    /// that DOES advertise UIDPLUS and still declines to send the response code
-    /// (RFC 4315 §3 makes it a MAY). That is an absence of evidence about a
-    /// server that could have furnished it, so the intention must survive.
+    /// The display name is unchanged only because the property is unchanged: an
+    /// op whose outcome this attempt could not DETERMINE stays queued. What
+    /// changed both times is the fixture — which server behaviour actually
+    /// leaves the outcome undetermined.
     ///
-    /// ACCEPTED COST, documented at the production site: each retry re-issues
-    /// the COPY, so such a server accumulates an unproven duplicate at the
-    /// destination while the source stays intact. Duplicated mail is
-    /// recoverable; a silently discarded archive is not.
+    /// **The fixture now is a destination that omits the REQUIRED
+    /// `* OK [UIDVALIDITY n]` from its SELECT response (RFC 3501 §6.3.1).**
+    /// This is the genuine "we could not determine the answer": the move is
+    /// refused BEFORE the `UID COPY`, so no wire mutation happens, no duplicate
+    /// is seated, and the next attempt against a conforming SELECT completes
+    /// normally. Nothing about it is a capability the server can never have.
     ///
     /// RED PROOF (recorded): restoring
     /// `throw ProviderError.actionIdentityResolutionFailed` on the evidence
@@ -418,10 +430,11 @@ struct NeverDropExitClosureTests {
             "INBOX": [Self.message(uid: 77, id: target)],
             "Archive": [],
         ])
-        // UIDPLUS IS advertised; the server simply declines to name what it
-        // copied. That is server behaviour, not a capability gap, so it may
-        // differ on the next attempt — which is exactly why the op stays.
-        server.withholdCopyUID(forSourceUIDs: [77])
+        // The destination's SELECT omits `* OK [UIDVALIDITY n]`, so this attempt
+        // never learns which address space a `COPYUID` would even refer to. That
+        // is an absence of evidence, not a statement about the mailbox, and the
+        // very next conformant SELECT ends it.
+        server.suppressSelectUidValidity(for: "Archive")
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Archive")
         server.expectMutation(rfc822MessageId: target)
@@ -440,7 +453,7 @@ struct NeverDropExitClosureTests {
         let after = try operations(f.pool)
         #expect(
             after.count == 1,
-            "a server that cannot furnish COPYUID has told us nothing about whether the move should happen — the intention must survive"
+            "a server that did not report the destination epoch has told us nothing about whether the move happened — the intention must survive"
         )
         guard after.count == 1 else {
             try? await provider.disconnect()
@@ -449,8 +462,11 @@ struct NeverDropExitClosureTests {
         }
         #expect(after[0].id == op.id)
         #expect(after[0].status == PendingStatus.queued.rawValue)
-        // The source is untouched, so nothing was lost by refusing.
+        // The source is untouched and NOTHING was copied, so nothing was lost by
+        // refusing and no retry can accumulate duplicates.
         #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.flags(in: "INBOX", uid: 77).isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
         await finish(f)
@@ -498,17 +514,26 @@ struct NeverDropExitClosureTests {
     /// mechanism, and a test written against them would keep passing if the poison
     /// simply moved somewhere else.
     ///
-    /// ⚠ **RE-SCOPED (audit round 3), same change and same reason as
-    /// `unprovableMoveKeepsTheOpQueued` above.** The fixture was a NON-UIDPLUS
-    /// server, which made property 2 a BLESSING TEST: it required the lane-mate
-    /// never to reach the wire, and on that fixture the predecessor could never
-    /// complete on any drain ever, so what it actually pinned as correct was
-    /// PERMANENT STARVATION of a gesture the user made. Property 2 is only a
-    /// lane-ordering property when the predecessor is genuinely unresolved-FOR-NOW,
-    /// so the fixture is now a UIDPLUS server that withholds `COPYUID` — an
-    /// absence of evidence that can end. The non-UIDPLUS case is asserted from the
-    /// other side by `aNonUidPlusMoveCompletesAndReleasesItsLane`, where the
-    /// lane-mate MUST execute.
+    /// ⚠ **RE-SCOPED TWICE, each time for the same reason and in lockstep with
+    /// `unprovableMoveKeepsTheOpQueued` above — read that test's fixture history
+    /// first; it is the full argument.** Property 2 requires the lane-mate NOT
+    /// to reach the wire, so it is a lane-ORDERING property only while the
+    /// predecessor is genuinely unresolved-FOR-NOW. On a predecessor that can
+    /// never resolve, the very same assertion pins PERMANENT STARVATION of a
+    /// gesture the user made as correct — which is what it was doing with a
+    /// NON-UIDPLUS fixture (rounds 1–2) and again with a `COPYUID`-withholding
+    /// UIDPLUS fixture (round 3; audit round 4 showed RFC 4315 §3 names servers
+    /// for which that response code never arrives). Both of those now COMPLETE,
+    /// and their lane-mates MUST execute — see
+    /// `aNonUidPlusMoveCompletesAndReleasesItsLane` and
+    /// `aWithheldCopyUidMoveCompletesAndReleasesItsLane`.
+    ///
+    /// The fixture is therefore a destination whose SELECT omits the REQUIRED
+    /// `* OK [UIDVALIDITY n]` (RFC 3501 §6.3.1): refused before any wire
+    /// mutation, resolvable by the next conformant SELECT, and — the reason it
+    /// suits THIS test specifically — scoped to the move's destination, so the
+    /// account's other gestures on INBOX are entirely unaffected by it, which is
+    /// exactly the separation property 1 measures.
     @Test("An op the server will never prove wedges only its own lane, not the account")
     @MainActor
     func unprovableOpDoesNotWedgeTheAccountsOtherGestures() async throws {
@@ -518,9 +543,10 @@ struct NeverDropExitClosureTests {
             "INBOX": [Self.message(uid: 77, id: unprovable), Self.message(uid: 88, id: bystander)],
             "Archive": [],
         ])
-        // UIDPLUS advertised, `COPYUID` withheld for the move's source UID: the
-        // op cannot be proven THIS attempt, but could be on the next one.
-        server.withholdCopyUID(forSourceUIDs: [77])
+        // The move's destination reports no UIDVALIDITY, so the move cannot be
+        // resolved THIS attempt and is refused before any wire mutation; a
+        // conformant SELECT on any later attempt ends the refusal.
+        server.suppressSelectUidValidity(for: "Archive")
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Archive")
         server.expectMutation(rfc822MessageId: unprovable)
@@ -708,7 +734,7 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
-    // MARK: - B-2 — retirement is per member, never per batch
+    // MARK: - B-2 — every member is dispositioned on ITS OWN evidence, never on a sibling's
 
     /// B-2. When COPYUID named only SOME of the requested UIDs, `move` returned
     /// normally and the drain retired the WHOLE op as provider success. The
@@ -716,15 +742,35 @@ struct NeverDropExitClosureTests {
     /// folder, and their move was thrown away — a silent partial loss that no
     /// later sync recovers, because the durable row is gone.
     ///
-    /// THE PROPERTY: the provider received a mutation for every still-live
-    /// member. Asserted across TWO drains against the server's own mailbox
-    /// contents, so it holds regardless of how retirement is implemented.
+    /// ⚠ **RE-SCOPED (audit round 4). Prior display name: *"A partial COPYUID
+    /// retires only the proven member and re-queues the rest"*.** It required
+    /// the unnamed member to stay QUEUED, which was correct only while "unnamed"
+    /// meant "undetermined". It does not: the COPY's tagged OK covers every
+    /// message the command actually addressed (RFC 3501 §6.4.7), and a member
+    /// the source still holds after the COPY is one the COPY addressed, because
+    /// a UID can only ever LEAVE a mailbox within one UIDVALIDITY (§2.3.1.1).
+    /// So the unnamed-but-live member's outcome IS determined, and leaving it
+    /// queued made this a BLESSING TEST for the round-2 wedge: the row narrowed
+    /// to that member, re-COPIED it on the next drain (seating a destination
+    /// duplicate) and then halted its lane on the same missing evidence, for a
+    /// server RFC 4315 §3 says may never furnish it.
     ///
-    /// RED PROOF (recorded): making `IMAPProvider.move` return `ids` instead of
-    /// the proven subset — the pre-fix whole-batch retirement — fails this at
-    /// the second drain: `Work` still contains the withheld member and the queue
-    /// is empty, so nothing will ever move it.
-    @Test("A partial COPYUID retires only the proven member and re-queues the rest")
+    /// THE PROPERTY, unchanged in substance and now stated for all three
+    /// possible per-member outcomes: **each member is dispositioned on ITS OWN
+    /// evidence, never on a sibling's.** What differs per member is WHICH
+    /// mutation the evidence authorizes:
+    ///  - `COPYUID` names 81 ⇒ its source copy may be irreversibly PURGED;
+    ///  - 82 is unnamed but still in the source ⇒ tagged OK + liveness moves it,
+    ///    authorizing only the REVERSIBLE `\Deleted` mark;
+    ///  - and both moved, so both retire and NOTHING is left to re-copy.
+    /// Asserted across TWO drains against the server's own mailbox contents, so
+    /// it holds regardless of how retirement is implemented.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider this fails at the
+    /// queue-empty expectation and at the `\Deleted` flag on the withheld
+    /// member — that member was left unflagged, unmoved-from-the-user's-view and
+    /// queued behind evidence that was never coming.
+    @Test("A partial COPYUID moves every member and purges only the one it names")
     @MainActor
     func partialCopyUidRetiresPerMember() async throws {
         let proven = "partial-proven@example.com"
@@ -748,25 +794,245 @@ struct NeverDropExitClosureTests {
         try insert([op], into: f.pool)
 
         await AccountManager.shared.drainPendingQueue()
+        // A second drain is the duplicate detector: anything still queued here
+        // re-issues its COPY against a destination that already holds the copy.
+        await AccountManager.shared.drainPendingQueue()
 
-        // The unproven member's intention survives.
-        let after = try operations(f.pool)
+        let remaining = try operations(f.pool).map(\.messageIds)
         #expect(
-            after.count == 1,
-            "the member COPYUID never named was not moved — its intention must remain: \(after.map(\.messageIds))"
+            remaining.isEmpty,
+            """
+            an op stayed queued after every one of its members had moved. Its next drain re-COPIES \
+            what is already at the destination, and on a server that never sends COPYUID it does \
+            that forever: \(remaining)
+            """
         )
-        guard after.count == 1 else {
-            try? await provider.disconnect()
-            await finish(f)
-            return
-        }
+        // BOTH members moved, exactly once each.
+        #expect(Set(server.messageIDs(in: "Archive")) == ["<\(proven)>", "<\(withheld)>"])
         #expect(
-            after[0].messageIds == ["82"],
-            "retirement is per member: the proven one is done, the unproven one is not"
-        )
-        // The proven member really did leave the source; the unproven one did not.
+            server.messageIDs(in: "Archive").count == 2,
+            "a member was copied twice — an unretired op re-COPIED on the second drain: \(server.messageIDs(in: "Archive"))")
+        // The member COPYUID named was purged; the member it did not name is
+        // soft-deleted and still there, which is the accepted `IOS-IMAP-001`
+        // cost of moving on evidence that authorizes nothing irreversible.
         #expect(!server.messageIDs(in: "INBOX").contains("<\(proven)>"))
         #expect(server.messageIDs(in: "INBOX").contains("<\(withheld)>"))
+        #expect(
+            server.flags(in: "INBOX", uid: 82).contains("\\Deleted"),
+            """
+            the member COPYUID did not name was never marked, so the user's move did not happen for \
+            it at all — flags: \(server.flags(in: "INBOX", uid: 82))
+            """)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - AUDIT ROUND 4 — a member the source no longer holds is exit 2, not a sibling's success
+
+    /// 🚨 **AUDIT ROUND 4 — HOLE 1, at the queue.** Round 3 authorized the whole
+    /// requested set's source cleanup on the COPY's tagged OK. The command is a
+    /// `UID COPY`, and RFC 3501 §6.4.8 says a non-existent UID *"is ignored
+    /// without any error message generated"*, so a UID COPY can *"return an OK
+    /// without performing any operations"*. A member that had already left the
+    /// source therefore rode out of the queue on a PRESENT sibling's tagged OK.
+    ///
+    /// **The mirror image is what makes this test necessary rather than
+    /// obvious:** the fix must NOT keep such a member queued. The server has
+    /// stated it is not in that folder — a positive, provider-authoritative
+    /// fact (exit 2), and precisely what shipped `v1.6.38`'s `idempotentMove`
+    /// acted on with `if srcUIDs.isEmpty { … return }`. Keeping it queued would
+    /// re-create the wedge `15d97a628` removed, since no later drain can make an
+    /// absent message present again.
+    ///
+    /// THE PROPERTIES, all end state:
+    ///  1. the present sibling MOVED — destination holds it, source does not;
+    ///  2. the queue is EMPTY, so neither the absent member nor the op it rode
+    ///     in is starving anything;
+    ///  3. a LANE-MATE gesture the user issued afterwards on the same message
+    ///     REACHED the wire — the half that makes this a wedge test rather than
+    ///     a move test. Its flag lands on nothing because its own predecessor
+    ///     purged the message, which is correct and is why the assertion is that
+    ///     the gesture was ATTEMPTED, not that a flag survived.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider this fails at
+    /// properties 2 and 3 — `move` retires only the COPYUID-named member, the
+    /// row narrows to the absent one, and the next claim in the same drain
+    /// throws `noCopyUidEvidence`, halting the lane with two rows queued.
+    @Test("A member the source no longer holds retires without wedging its lane")
+    @MainActor
+    func aSourceAbsentMemberRetiresWithoutWedgingItsLane() async throws {
+        let present = "absent-member-present@example.com"
+        let bystander = "absent-member-bystander@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: present), Self.message(uid: 88, id: bystander)],
+            "Archive": [],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.expectMutation(rfc822MessageId: present)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-source-absent-member")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        // UID 99 was in INBOX when the user swiped both messages to Archive and
+        // is not there now — another client moved it. UIDVALIDITY never changed,
+        // so every epoch assertion passes and the `UID COPY` silently copies one
+        // of the two and returns tagged OK.
+        var move = PendingOperation(
+            type: .move, messageIds: ["77", "99"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        move.createdAt = Date().addingTimeInterval(-60)
+        var laneMate = PendingOperation(
+            type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", observedUidValidity: 10)
+        laneMate.createdAt = Date().addingTimeInterval(-40)
+        try insert([move, laneMate], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // PROPERTY 1 — the sibling that WAS present moved.
+        #expect(server.messageIDs(in: "Archive") == ["<\(present)>"])
+        #expect(!server.messageIDs(in: "INBOX").contains("<\(present)>"))
+        // Nothing at all happened to the co-resident message.
+        #expect(server.messageIDs(in: "INBOX") == ["<\(bystander)>"])
+        #expect(server.flags(in: "INBOX", uid: 88).isEmpty)
+
+        // PROPERTY 2 — nothing is starved.
+        let remaining = try operations(f.pool).map(\.messageIds)
+        #expect(
+            remaining.isEmpty,
+            """
+            an op stayed queued for a member the SERVER says is not in that folder. No later drain \
+            can make an absent message present, so this is the permanent wedge in its other form: \
+            \(remaining)
+            """
+        )
+
+        // PROPERTY 3 — the lane-mate the user issued afterwards was attempted.
+        // NON-VACUOUS the other way round: pre-fix the lane halts and this
+        // command never appears on the wire at all.
+        let flagStores = server.recordedCommands().filter {
+            let upper = $0.uppercased()
+            return upper.contains("UID STORE") && upper.contains("\\FLAGGED")
+        }
+        #expect(
+            flagStores.contains { $0.contains("77") },
+            """
+            the lane-mate gesture never reached the server. Its predecessor reached an exit for \
+            every member, so nothing legitimately holds it — commands: \(flagStores)
+            """)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - AUDIT ROUND 4 — a server that never sends COPYUID must still reach an exit
+
+    /// 🚨 **AUDIT ROUND 4 — HOLE 2, and the direct two-sided partner of
+    /// `unprovableMoveKeepsTheOpQueued`.** Round 3 kept a whole-op refusal
+    /// (`noCopyUidEvidence`) for a UIDPLUS server that returns no `COPYUID`, on
+    /// the theory that such a server may furnish it next time. RFC 4315 §3
+    /// exempts two mailbox kinds from its SHOULD — one the client may COPY or
+    /// APPEND to but not SELECT or EXAMINE ("SHOULD NOT send", to avoid
+    /// disclosing the mailbox) and a `UIDNOTSTICKY` mail store ("MAY omit", as
+    /// not meaningful) — and both are properties of the MAILBOX, so a server
+    /// that omits the code omits it every time. For those the op reached NONE of
+    /// the four never-drop exits, and the refusal is raised AFTER the `UID
+    /// COPY`, so it was strictly worse than the capability wedge `15d97a628`
+    /// deleted: every drain seated another duplicate at the destination and then
+    /// halted the same lane again.
+    ///
+    /// THE PROPERTIES, asserted at the server across TWO drains:
+    ///  1. the move COMPLETED — the destination holds the message and the source
+    ///     copy is soft-deleted;
+    ///  2. the destination holds EXACTLY ONE copy after two drains. This is the
+    ///     duplicate half, and it is the reason a "just keep retrying" answer is
+    ///     not acceptable for this server;
+    ///  3. the queue is EMPTY and a LANE-MATE gesture issued afterwards on the
+    ///     same message EXECUTED and is visible in the flags — possible here,
+    ///     unlike the source-absent case, precisely because no `COPYUID` means
+    ///     no purge, so the soft-deleted source copy is still addressable.
+    ///
+    /// The source copy staying `\Deleted`-but-present is the accepted
+    /// `IOS-IMAP-001` cost: `COPYUID` remains the ONLY evidence that authorizes
+    /// an irreversible `UID EXPUNGE`, so a server that withholds it gets the
+    /// reversible half of the move and nothing more.
+    ///
+    /// RED PROOF (recorded): against the pre-round-4 provider this fails at
+    /// property 2 (`Archive` holds TWO copies, one per drain), at property 1's
+    /// `\Deleted` mark, and at property 3 — the op never leaves the queue.
+    @Test("A UIDPLUS server that never sends COPYUID still completes the move and releases its lane")
+    @MainActor
+    func aWithheldCopyUidMoveCompletesAndReleasesItsLane() async throws {
+        let target = "withheld-completes@example.com"
+        let bystander = "withheld-completes-bystander@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: bystander)],
+            "Archive": [],
+        ])
+        // UIDPLUS advertised, `COPYUID` never sent for this UID — the RFC 4315
+        // §3 server that has no response code to give.
+        server.withholdCopyUID(forSourceUIDs: [77])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-withheld-completes")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        var move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        move.createdAt = Date().addingTimeInterval(-60)
+        // Issued AFTER the move and naming the SAME message, so `buildLanes`
+        // puts it in the move's lane, behind it.
+        var laneMate = PendingOperation(
+            type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", observedUidValidity: 10)
+        laneMate.createdAt = Date().addingTimeInterval(-40)
+        try insert([move, laneMate], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainPendingQueue()
+
+        // PROPERTY 1 — the move completed.
+        #expect(
+            server.messageIDs(in: "Archive") == ["<\(target)>"],
+            """
+            the user's archive never reached the destination on a server whose only defect is that \
+            it does not send a response code RFC 4315 §3 says it may have no way to send — Archive: \
+            \(server.messageIDs(in: "Archive"))
+            """)
+        let sourceFlags = server.flags(in: "INBOX", uid: 77)
+        #expect(
+            sourceFlags.contains("\\Deleted"),
+            "the source copy was not soft-deleted, so the move only half happened — flags: \(sourceFlags)")
+
+        // PROPERTY 2 — no duplicate. Two drains, one copy.
+        #expect(
+            server.messageIDs(in: "Archive").count == 1,
+            """
+            the destination accumulated a duplicate across drains — an op that cannot retire keeps \
+            re-issuing its COPY: \(server.messageIDs(in: "Archive"))
+            """)
+        #expect(server.messageIDs(in: "INBOX").contains("<\(bystander)>"))
+
+        // PROPERTY 3 — nothing is starved, and the lane-mate executed.
+        #expect(
+            try operations(f.pool).isEmpty,
+            "an op remained queued after a move that completed, so the lane is still held")
+        #expect(
+            sourceFlags.contains("\\Flagged"),
+            """
+            the lane-mate gesture never reached the server. Its predecessor completed, so nothing \
+            legitimately holds it — this is the permanent starvation the evidence refusal caused — \
+            flags: \(sourceFlags)
+            """)
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
         await finish(f)

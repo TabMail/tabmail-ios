@@ -31,9 +31,19 @@ extension AccountManager {
         ///
         /// ⚠ THE SKIP IS LOAD-BEARING, not an optimization. Without it the outer
         /// drain loop re-claims this op as soon as any other op sets `executedAny`,
-        /// and `.noCopyUidEvidence` is raised AFTER the `UID COPY` has gone out — so
-        /// every re-attempt within one drain seats another unproven duplicate at the
-        /// destination. Attempt each evidence-refused op AT MOST ONCE PER DRAIN.
+        /// and a refusal can be raised AFTER a wire mutation has already gone out —
+        /// so every re-attempt within one drain could repeat it. Attempt each
+        /// evidence-refused op AT MOST ONCE PER DRAIN.
+        ///
+        /// ⚠ AUDIT ROUND 4 — the case that motivated this, `IMAPProvider.move`'s
+        /// withheld-`COPYUID` refusal, is GONE (it was raised after the `UID COPY`,
+        /// so each re-attempt seated another destination duplicate; RFC 4315 §3
+        /// names servers for which the evidence never arrives, so it was a wedge).
+        /// The surviving producers — the destination-epoch and source-epoch
+        /// refusals — are raised BEFORE any wire mutation, so the bound is now
+        /// about round trips rather than duplicates. The skip stays: it is the
+        /// general contract for `ProviderEvidenceUnavailable`, not a patch for one
+        /// error case, and a future producer may again refuse post-mutation.
         ///
         /// ⚠ AND IT IS CONSULTED IN THE LANE LOOP, NEVER THE CLAIM LOOP. The op must
         /// still be claimed and still enter `buildLanes`, or its lane-mates would
@@ -385,10 +395,12 @@ extension AccountManager {
                             continue
                         }
                         // 🚨 ALREADY REFUSED THIS DRAIN for want of provider evidence.
-                        // Attempt it AT MOST ONCE per drain: `.noCopyUidEvidence` is
-                        // raised AFTER the `UID COPY` has gone out, so a second
-                        // attempt inside one drain seats another unproven duplicate
-                        // at the destination.
+                        // Attempt it AT MOST ONCE per drain — a refusal raised after
+                        // a wire mutation has gone out would otherwise be repeated
+                        // within the same drain, and the one that motivated this
+                        // (`IMAPProvider.move`'s withheld-`COPYUID` refusal, deleted
+                        // in audit round 4) seated another destination duplicate
+                        // each time. See `DrainContext.evidenceRefused`.
                         //
                         // ⚠ THE CHECK BELONGS HERE, NOT IN THE CLAIM LOOP. Skipping
                         // the op at claim time would keep it out of `buildLanes`
@@ -748,11 +760,12 @@ extension AccountManager {
             // depends on server behaviour is an ABSENCE OF EVIDENCE, not an
             // authoritative verdict on an identity, and retiring an op on it is a
             // never-drop violation. `IMAPProvider.move` therefore no longer raises
-            // this error at all: both of its evidence gates raise the private
-            // `IMAPMoveEvidenceUnavailable`, which audit round 2 routed to the
+            // this error at all: audit round 2 routed its evidence gates to the
             // dedicated `ProviderEvidenceUnavailable` arm below — requeue and retry
             // WITHOUT poisoning the account, rather than the generic connection arm
-            // it originally fell through to. The premises below are once again true
+            // it originally fell through to — and audit round 4 removed the
+            // withheld-`COPYUID` gate entirely, so what is left of that arm refuses
+            // only BEFORE any wire mutation. The premises below are once again true
             // of every op that reaches here.
             //
             // Ported from `v2final:AccountManagerQueue`'s `.deleteDraft` arm
@@ -815,10 +828,12 @@ extension AccountManager {
             //    account poisoning; the lane halt is correct and stays.
             //  - `evidenceRefused`, so this op is attempted AT MOST ONCE per drain.
             //    Required, not defensive: another lane's success sets `executedAny`,
-            //    the outer loop iterates, and this op would be re-claimed — but
-            //    `.noCopyUidEvidence` is raised AFTER the `UID COPY` has already gone
-            //    out, so each re-attempt seats ANOTHER unproven duplicate at the
-            //    destination.
+            //    the outer loop iterates, and this op would be re-claimed. The
+            //    refusal that made that costly — `IMAPProvider.move`'s withheld-
+            //    `COPYUID` gate, raised AFTER the `UID COPY` so each re-attempt
+            //    seated ANOTHER unproven duplicate at the destination — was deleted
+            //    in audit round 4, but the property is a contract of this arm and
+            //    not a patch for one error case, so it stays.
             //  - `executedAny` is NOT set. This arm made no progress, so it must not
             //    by itself keep the drain looping; `if !ctx.executedAny { break }`
             //    still terminates when nothing else advanced.
@@ -911,11 +926,18 @@ extension AccountManager {
     /// THE BOUND, stated because "one per drain" was assumed here and is not true
     /// of this path: this arm sets `executedAny = true`, so the outer loop takes
     /// another pass and re-claims the narrowed row IN THE SAME DRAIN. It did not
-    /// throw, so `evidenceRefused` — which bounds the zero-evidence sibling in
+    /// throw, so `evidenceRefused` — which bounded the zero-evidence sibling in
     /// `IMAPProvider.move` — does not cover it. The narrowed members can therefore
     /// be re-copied once per remaining pass, i.e. up to the drain's 3-pass cap,
     /// and again on every later drain until the server proves or denies them.
     /// Duplicated mail is recoverable; a dropped intention is not.
+    ///
+    /// ⚠ AUDIT ROUND 4 — THIS PATH HAS NO CURRENT PRODUCER. `IMAPProvider.move`
+    /// was the only one, and it now dispositions every member positively before
+    /// returning (see `executeOperation`'s return-value note), so there is no
+    /// undetermined remainder for this to narrow to — which is also why the
+    /// re-copy cost above can no longer be incurred. It is retained as the
+    /// drain's contract for any provider that returns a strict subset.
     private func retirePartiallyCompletedOp(
         _ currentOp: PendingOperation,
         provenMembers: [String],
@@ -1191,12 +1213,21 @@ extension AccountManager {
     /// Dispatch one claimed op to its provider.
     ///
     /// RETURN VALUE — the subset of `op.messageIds` the provider POSITIVELY
-    /// PROVED it completed, or `nil` for "all of them". Only `IMAPProvider.move`
-    /// can currently return a strict subset: its source cleanup is authorized
-    /// per member by the server's own `COPYUID`, so a response naming fewer
-    /// members than were requested completed fewer members. `executeSingleOp`
-    /// retires exactly the proven members and leaves the rest durably queued —
-    /// retirement is per MEMBER, never per batch.
+    /// DISPOSITIONED, or `nil` for "all of them". `executeSingleOp` retires
+    /// exactly those members and leaves the rest durably queued — retirement is
+    /// per MEMBER, never per batch.
+    ///
+    /// ⚠ AUDIT ROUND 4 — NO PROVIDER CURRENTLY RETURNS A STRICT SUBSET, and that
+    /// is a strengthening rather than a simplification. `IMAPProvider.move` was
+    /// the only producer: it returned the members the server's own `COPYUID`
+    /// named, leaving members it did not name queued on the absence of evidence
+    /// about them. It now determines EVERY member positively before returning —
+    /// moved (COPYUID, or the COPY's tagged OK plus proof the member was in the
+    /// source when that COPY ran), or no longer in the source folder at all,
+    /// which is the provider saying there is nothing left to do. So no member is
+    /// left undetermined for this arm to preserve. The narrowing path below is
+    /// kept as the drain's standing contract for any provider that does return a
+    /// strict subset; it is not dead code, it has no current producer.
     func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> [String]? {
         switch op.type {
         case .archive, .delete:
