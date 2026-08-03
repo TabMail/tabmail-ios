@@ -92,6 +92,46 @@ struct OutboxDoubleSendTests {
         try await pool.read { db in try OutboxMessage.fetchCount(db) }
     }
 
+    /// PORT — v2final's focused owner-authority regression. Production already
+    /// contains the ported guard, so RED is intentionally MISSING rather than
+    /// recreated by sabotaging an already-landed invariant.
+    @Test("A same-draftId Draft under a foreign account rejects every send before admission")
+    func foreignAccountDraftRejectsSend() async throws {
+        let (dir, pool, previous) = try makeOutboxTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let draftId = "shared-draft-id"
+        try await pool.write { db in
+            var other = Account(
+                emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
+            other.id = "acc2"
+            try other.insert(db)
+        }
+        try await insertDraftAuthority(
+            pool, id: draftId, accountId: "acc2", epoch: "E-foreign")
+
+        do {
+            _ = try await AccountManager.persistQueuedSend(
+                draft: makeDraft(), accountId: "acc1", replyToHeaderId: nil,
+                isForward: false, serverDraftId: nil,
+                draftId: draftId, instanceEpoch: "E1")
+            Issue.record("a send must reject a live Draft owned by another account")
+        } catch let error as OutboxAdmissionError {
+            #expect(error == .draftOwnerMismatch(draftId: draftId))
+        }
+
+        let state = try await pool.read { db -> (outboxCount: Int, draft: Draft?) in
+            (try OutboxMessage.fetchCount(db), try Draft.fetchOne(db, key: draftId))
+        }
+        #expect(state.outboxCount == 0, "rejection must occur before Outbox admission")
+        #expect(state.draft?.accountId == "acc2", "the foreign Draft must remain owned by acc2")
+        #expect(state.draft?.instanceEpoch == "E-foreign", "the foreign Draft must remain intact")
+        #expect(state.draft?.subject == "Draft", "the foreign Draft payload must remain intact")
+        #expect(state.draft?.body == "Body", "the foreign Draft payload must remain intact")
+    }
+
     @Test("Generation-aware dedup rejects E2 over queued E1, while an exact E1 duplicate still dedups")
     func crossEpochAttemptCannotCollapseIntoExistingPayload() async throws {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
