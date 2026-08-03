@@ -42,7 +42,7 @@ struct SessionSplittingTests {
     @Test("loadContextSession loads msg-detail session by exact ID")
     func loadContextSessionMsgDetail() throws {
         let db = try TestDatabase.make()
-        let ctx = EmailContextSnapshot(messageHeaderId: "acc1:INBOX:42", subject: "Budget", from: "cfo@co.com")
+        let ctx = EmailContextSnapshot(messageHeaderId: "acc1:INBOX:42", subject: "Budget", from: "cfo@company.com")
         let turns = [
             ChatTurn(id: "t1", timestamp: 1000, role: "user", content: "chat_converse", userMessage: "Summarize", type: "normal", chars: 9, renderedContent: nil, sessionId: "msg:acc1:INBOX:42", remindersSnapshot: nil, emailContextJSON: ChatStore.encodeEmailContext(ctx), thinkingContent: nil),
             ChatTurn(id: "t2", timestamp: 2000, role: "assistant", content: "Here's the summary", userMessage: nil, type: "normal", chars: 18, renderedContent: nil, sessionId: "msg:acc1:INBOX:42", remindersSnapshot: nil, emailContextJSON: nil, thinkingContent: nil),
@@ -249,7 +249,7 @@ struct EmailContextSnapshotTests {
     @Test("Email context persists in ChatTurn GRDB")
     func emailContextInChatTurn() throws {
         let db = try TestDatabase.make()
-        let ctx = EmailContextSnapshot(messageHeaderId: "m100", subject: "Notes", from: "bob@co.com")
+        let ctx = EmailContextSnapshot(messageHeaderId: "m100", subject: "Notes", from: "bob@company.com")
         let turn = ChatTurn(id: "ec-1", timestamp: 1000, role: "user", content: "chat_converse", userMessage: "Summarize", type: "normal", chars: 9, renderedContent: nil, sessionId: "msg:m100", remindersSnapshot: nil, emailContextJSON: ChatStore.encodeEmailContext(ctx), thinkingContent: nil)
         try db.write { try turn.insert($0) }
         let fetched = try db.read { try ChatTurn.fetchOne($0, key: "ec-1") }
@@ -510,35 +510,35 @@ struct DraftParseRecipientsTests {
 
     @Test("Simple comma-separated emails")
     func simpleComma() {
-        let result = Draft.parseRecipients("alice@co.com, bob@co.com")
-        #expect(result == ["alice@co.com", "bob@co.com"])
+        let result = Draft.parseRecipients("alice@company.com, bob@company.com")
+        #expect(result == ["alice@company.com", "bob@company.com"])
     }
 
     @Test("Angle-bracket format extracts bare email")
     func angleBracket() {
-        let result = Draft.parseRecipients("Alice <alice@co.com>, Bob <bob@co.com>")
-        #expect(result == ["alice@co.com", "bob@co.com"])
+        let result = Draft.parseRecipients("Alice <alice@company.com>, Bob <bob@company.com>")
+        #expect(result == ["alice@company.com", "bob@company.com"])
     }
 
     @Test("Mixed format")
     func mixed() {
-        let result = Draft.parseRecipients("alice@co.com, Bob <bob@co.com>")
-        #expect(result == ["alice@co.com", "bob@co.com"])
+        let result = Draft.parseRecipients("alice@company.com, Bob <bob@company.com>")
+        #expect(result == ["alice@company.com", "bob@company.com"])
     }
 
     @Test("Name with comma in display name")
     func commaInName() {
-        let result = Draft.parseRecipients("\"Last, First\" <alice@co.com>, bob@co.com")
+        let result = Draft.parseRecipients("\"Last, First\" <alice@company.com>, bob@company.com")
         // The comma inside quotes is tricky but angle-bracket parsing handles it
-        // because <alice@co.com> protects the address
+        // because <alice@company.com> protects the address
         #expect(result.count == 2)
-        #expect(result[1] == "bob@co.com")
-        #expect(result[0] == "alice@co.com")
+        #expect(result[1] == "bob@company.com")
+        #expect(result[0] == "alice@company.com")
     }
 
     @Test("Single email")
     func single() {
-        #expect(Draft.parseRecipients("alice@co.com") == ["alice@co.com"])
+        #expect(Draft.parseRecipients("alice@company.com") == ["alice@company.com"])
     }
 
     @Test("Empty string")
@@ -548,8 +548,8 @@ struct DraftParseRecipientsTests {
 
     @Test("Whitespace handling")
     func whitespace() {
-        let result = Draft.parseRecipients("  alice@co.com  ,  bob@co.com  ")
-        #expect(result == ["alice@co.com", "bob@co.com"])
+        let result = Draft.parseRecipients("  alice@company.com  ,  bob@company.com  ")
+        #expect(result == ["alice@company.com", "bob@company.com"])
     }
 }
 
@@ -638,7 +638,7 @@ struct DraftServerFieldPreservationTests {
         var draft = Draft(
             id: "reply:acc1:stable-123",
             accountId: "acc1",
-            toJSON: "[\"alice@co.com\"]",
+            toJSON: "[\"alice@company.com\"]",
             ccJSON: "[]",
             bccJSON: "[]",
             subject: "Re: Original",
@@ -650,7 +650,7 @@ struct DraftServerFieldPreservationTests {
             updatedAt: 1000,
             serverDraftId: "gmail-draft-xyz",
             serverPushStatus: "pushed",
-            rfc822MessageId: "<draft-abc@co.com>",
+            rfc822MessageId: "<draft-abc@company.com>",
             attachmentsDirName: "att-dir-1"
         )
         try db.write { try draft.insert($0) }
@@ -678,7 +678,7 @@ struct DraftServerFieldPreservationTests {
         // Server fields preserved (NOT wiped to nil)
         #expect(fetched?.serverDraftId == "gmail-draft-xyz")
         #expect(fetched?.serverPushStatus == "dirty") // pushed -> dirty
-        #expect(fetched?.rfc822MessageId == "<draft-abc@co.com>")
+        #expect(fetched?.rfc822MessageId == "<draft-abc@company.com>")
         #expect(fetched?.attachmentsDirName == "att-dir-1")
         // Immutable fields preserved
         #expect(fetched?.replyToId == "acc1:INBOX:100")
@@ -1100,11 +1100,11 @@ struct ChatIdTranslatorRemapTests {
         let toolOutput = """
         unique_id: acc1:INBOX:msg1
         subject: Budget Review
-        from: alice@co.com
+        from: alice@company.com
 
         unique_id: acc1:INBOX:msg2
         subject: Meeting Notes
-        from: bob@co.com
+        from: bob@company.com
         """
 
         // The tool output has real IDs in unique_id fields
@@ -1492,7 +1492,7 @@ struct ResolveOriginalMessageTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1")
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try TestDatabase.insertMessageHeader(db, messageId: "uid100", folderId: "acc1:INBOX", accountId: "acc1", rfc822MessageId: "<test@co.com>")
+        try TestDatabase.insertMessageHeader(db, messageId: "uid100", folderId: "acc1:INBOX", accountId: "acc1", rfc822MessageId: "<test@company.com>")
 
         let header = try db.read { db -> MessageHeader? in
             if let h = try MessageHeader.fetchOne(db, key: "acc1:INBOX:uid100") { return h }
@@ -1507,13 +1507,13 @@ struct ResolveOriginalMessageTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1")
         try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
-        try TestDatabase.insertMessageHeader(db, messageId: "uid200", folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", rfc822MessageId: "<moved@co.com>")
+        try TestDatabase.insertMessageHeader(db, messageId: "uid200", folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", rfc822MessageId: "<moved@company.com>")
 
         // PK "acc1:INBOX:uid100" is stale — message moved to Archive
         let header = try db.read { db -> MessageHeader? in
             if let h = try MessageHeader.fetchOne(db, key: "acc1:INBOX:uid100") { return h }
             // Fallback: search by rfc822MessageId (from inReplyTo)
-            let rfc822 = "<moved@co.com>"
+            let rfc822 = "<moved@company.com>"
             return try MessageHeader.filter(Column("rfc822MessageId") == rfc822).fetchOne(db)
         }
         #expect(header != nil)
@@ -1527,7 +1527,7 @@ struct ResolveOriginalMessageTests {
 
         let header = try db.read { db -> MessageHeader? in
             if let h = try MessageHeader.fetchOne(db, key: "acc1:INBOX:uid999") { return h }
-            let rfc822 = "<gone@co.com>"
+            let rfc822 = "<gone@company.com>"
             return try MessageHeader.filter(Column("rfc822MessageId") == rfc822).fetchOne(db)
         }
         #expect(header == nil)
@@ -1698,7 +1698,7 @@ struct ServerDraftComposeRoutingTests {
         var draft = MessageHeader(
             messageId: "draft5", subject: "New Message",
             from: "me@example.com", fromAddress: "me@example.com",
-            to: "alice@co.com, Bob <bob@co.com>", date: Date(), snippet: "",
+            to: "alice@company.com, Bob <bob@company.com>", date: Date(), snippet: "",
             folderId: "acc1:Drafts", accountId: "acc1",
             folderPath: "Drafts", isInInbox: false
         )
@@ -1706,7 +1706,7 @@ struct ServerDraftComposeRoutingTests {
 
         let fetched = try db.read { try MessageHeader.fetchOne($0, key: "acc1:Drafts:draft5") }
         let recipients = Draft.parseRecipients(fetched!.to)
-        #expect(recipients == ["alice@co.com", "bob@co.com"])
+        #expect(recipients == ["alice@company.com", "bob@company.com"])
     }
 }
 

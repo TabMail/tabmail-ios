@@ -32,6 +32,10 @@ struct EmailDeleteTool: AgentTool, Sendable {
         // Resolve numeric IDs to MessageHeaders
         let translator = ctx.translator
         var resolved: [MessageHeader] = []
+        /// Parallel to `resolved` — the agent-facing numeric id for each resolved
+        /// header, so the per-id dispositions below can be reported back in the
+        /// same vocabulary the agent used (T4.V8).
+        var resolvedNumericIds: [Int] = []
         var emailDetails: [AgentToolRouter.ActionConfirmation.EmailDetail] = []
         var failedIds: [Int] = []
 
@@ -47,6 +51,7 @@ struct EmailDeleteTool: AgentTool, Sendable {
             // real email from demo (and vice versa) via stale translator IDs.
             if let header, DemoToolGuard.headerAccessible(header) {
                 resolved.append(header)
+                resolvedNumericIds.append(numericId)
                 emailDetails.append(.init(
                     numericId: numericId,
                     subject: header.subject.isEmpty ? "(No subject)" : header.subject,
@@ -83,20 +88,50 @@ struct EmailDeleteTool: AgentTool, Sendable {
         // `resolved` snapshot — which may have gone stale during the
         // unbounded confirmation wait above. `resolved` is still used for the
         // confirmation card display and the response payload below.
-        await AccountManager.shared.performCoordinatedRoleMove(ids: resolved.map(\.id), role: .trash)
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(
+            ids: resolved.map(\.id), role: .trash)
+        // T4.V8 (PORT of `v2final:EmailDeleteTool.execute`, commit `b1c89ad4a`):
+        // report only DURABLY ADMITTED work as deleted. This call previously
+        // reported `"success": true` with `deleted_count == resolved.count`
+        // unconditionally, so a refused admission, a rolled-back write, or a
+        // vanished row all read to the agent exactly like a completed delete.
+        let actedHeaderIds = admission.admittedIds
+        // A PENDING id is still outstanding and its outcome is unconfirmed — it
+        // must never be reported as `failed`, or the agent may retry it itself
+        // and act twice.
+        let pendingHeaderIds = admission.pendingIds
+        let terminalHeaderIds = admission.failedIds
+        let acted = zip(resolvedNumericIds, resolved).filter { actedHeaderIds.contains($0.1.id) }
+        let pendingIds = zip(resolvedNumericIds, resolved)
+            .filter { pendingHeaderIds.contains($0.1.id) }
+            .map(\.0)
+        let terminalResolvedIds = zip(resolvedNumericIds, resolved)
+            .filter { terminalHeaderIds.contains($0.1.id) }
+            .map(\.0)
+        failedIds.append(contentsOf: terminalResolvedIds)
 
-        let subjects = resolved.map { $0.subject.isEmpty ? "(No subject)" : $0.subject }
+        let subjects = acted.map { $0.1.subject.isEmpty ? "(No subject)" : $0.1.subject }
+        let complete = acted.count == resolved.count
+            && failedIds.isEmpty
+            && pendingIds.isEmpty
         var result: [String: Any] = [
-            "success": true,
-            "deleted_count": resolved.count,
+            "success": complete,
+            "deleted_count": acted.count,
             "deleted_subjects": subjects,
         ]
+        if !pendingIds.isEmpty {
+            result["pending_ids"] = pendingIds
+            result["pending_message"] =
+                "\(pendingIds.count) email action(s) are still outstanding — their outcome could not be confirmed. Do not repeat the action."
+        }
         if !failedIds.isEmpty {
             result["failed_ids"] = failedIds
-            result["warning"] = "\(failedIds.count) email(s) could not be found"
+            result["warning"] = "\(failedIds.count) email(s) could not be deleted"
         }
 
-        print("[EmailDeleteTool] Deleted \(resolved.count) emails, \(failedIds.count) failed")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[EmailDeleteTool] Admitted \(acted.count), pending \(pendingIds.count), terminal \(failedIds.count)")
+        }
 
         return ToolJSON.string(from: result)
     }

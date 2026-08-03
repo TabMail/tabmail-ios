@@ -579,10 +579,21 @@ actor ActiveAIQueue {
             }
         }
 
-        // Read message from GRDB — may have been processed by direct path already
-        guard let message = try? await dbPool.read({ db in
-            try MessageHeader.fetchOne(db, key: job.headerId)
-        }) else { return false }
+        // Read message from GRDB — may have been processed by direct path already.
+        // T4.V7: capture the AI-write identity in the SAME read that supplies the
+        // job's snapshot, BEFORE any await on the LLM. Every header write this job
+        // performs re-resolves through it, so a UIDVALIDITY turnover during the
+        // in-flight window can never bind this message's result onto whichever
+        // physical message the new numbering put at the same address.
+        let captured: (message: MessageHeader, target: AIWriteTarget)? =
+            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget)? in
+                guard let message = try MessageHeader.fetchOne(db, key: job.headerId),
+                      let target = try AIWriteTarget.capture(message: message, db: db) else { return nil }
+                return (message, target)
+            }) ?? nil
+        guard let captured else { return false }
+        let message = captured.message
+        let target = captured.target
 
         // Large inbox gate: skip messages outside the top N most recent.
         if message.isInInbox {
@@ -644,40 +655,44 @@ actor ActiveAIQueue {
             if !probeKey.isEmpty,
                let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
                let cached = probeResults[probeKey] {
-                // Write peer data to GRDB — individual jobs will find fields filled and skip LLM
+                // Write peer data to GRDB — individual jobs will find fields filled and skip LLM.
+                // T4.V7 site 1: the field-wise "only if still empty" merge runs
+                // against the RE-RESOLVED row, and the AI-cache write-through keys
+                // off that row's own folderPath/RFC rather than the job-start
+                // snapshot's.
                 try? await dbPool.write { db in
-                    guard var msg = try MessageHeader.fetchOne(db, key: job.headerId) else { return }
-                    var changed = false
-                    if let ps = cached.summary, msg.summaryBlurb == nil {
-                        let blurb = ps.blurb.isEmpty ? nil : ps.blurb
-                        if let blurb {
-                            msg.summaryBlurb = blurb
-                            msg.summaryTodos = ps.todos?.isEmpty == true ? nil : ps.todos
-                            msg.reminderDate = ps.reminderDate?.isEmpty == true ? nil : ps.reminderDate
-                            msg.reminderTime = ps.reminderTime?.isEmpty == true ? nil : ps.reminderTime
-                            msg.reminderContent = ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent
-                            changed = true
-                            BackgroundSyncLogger.logAIProcessing("DeviceSync summary HIT for \(Self.logId(job.headerId))")
+                    _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                        var changed = false
+                        if let ps = cached.summary, msg.summaryBlurb == nil {
+                            let blurb = ps.blurb.isEmpty ? nil : ps.blurb
+                            if let blurb {
+                                msg.summaryBlurb = blurb
+                                msg.summaryTodos = ps.todos?.isEmpty == true ? nil : ps.todos
+                                msg.reminderDate = ps.reminderDate?.isEmpty == true ? nil : ps.reminderDate
+                                msg.reminderTime = ps.reminderTime?.isEmpty == true ? nil : ps.reminderTime
+                                msg.reminderContent = ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent
+                                changed = true
+                                BackgroundSyncLogger.logAIProcessing("DeviceSync summary HIT for \(Self.logId(job.headerId))")
+                            }
                         }
-                    }
-                    if let pa = cached.action, msg.actionTag == nil, let tag = ActionTag(rawValue: pa) {
-                        let effective = (tag == .reply && msg.isReplied) ? ActionTag.none : tag
-                        msg.actionTag = effective
-                        msg.tagSortOrder = effective.sortOrder
-                        changed = true
-                        BackgroundSyncLogger.logAIProcessing("DeviceSync action HIT for \(Self.logId(job.headerId)): \(tag.rawValue)")
-                    }
-                    if let pr = cached.reply, !pr.isEmpty, msg.cachedReply == nil {
-                        msg.cachedReply = pr
-                        changed = true
-                        BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(Self.logId(job.headerId))")
-                    }
-                    if changed {
+                        if let pa = cached.action, msg.actionTag == nil, let tag = ActionTag(rawValue: pa) {
+                            let effective = (tag == .reply && msg.isReplied) ? ActionTag.none : tag
+                            msg.actionTag = effective
+                            msg.tagSortOrder = effective.sortOrder
+                            changed = true
+                            BackgroundSyncLogger.logAIProcessing("DeviceSync action HIT for \(Self.logId(job.headerId)): \(tag.rawValue)")
+                        }
+                        if let pr = cached.reply, !pr.isEmpty, msg.cachedReply == nil {
+                            msg.cachedReply = pr
+                            changed = true
+                            BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(Self.logId(job.headerId))")
+                        }
+                        guard changed else { return }
                         try msg.save(db)
                         try MessageAICache.writeThrough(
                             accountId: account.id,
-                            folderPath: message.folderPath,
-                            rfc822MessageId: message.rfc822MessageId,
+                            folderPath: msg.folderPath,
+                            rfc822MessageId: msg.rfc822MessageId,
                             summaryBlurb: msg.summaryBlurb,
                             summaryTodos: msg.summaryTodos,
                             reminderDate: msg.reminderDate,
@@ -797,11 +812,11 @@ actor ActiveAIQueue {
             group.addTask {
                 switch job.jobType {
                 case .summary:
-                    return await self.executeSummaryJob(job, message: message, plainText: plainText, account: account, config: config)
+                    return await self.executeSummaryJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
                 case .action:
-                    return await self.executeActionJob(job, message: message, plainText: plainText, account: account, config: config)
+                    return await self.executeActionJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
                 case .reply:
-                    return await self.executeReplyJob(job, message: message, plainText: plainText, account: account, config: config)
+                    return await self.executeReplyJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
                 }
             }
             group.addTask {
@@ -859,7 +874,7 @@ actor ActiveAIQueue {
     /// Returns true if should retry.
     private func executeSummaryJob(
         _ job: AIJob, message: MessageHeader, plainText: String,
-        account: Account, config: DispatchConfig
+        account: Account, target: AIWriteTarget, config: DispatchConfig
     ) async -> Bool {
         // Cache check: if summary already exists, skip LLM but still chain A.
         if let existing = message.summaryBlurb, !existing.isEmpty {
@@ -903,26 +918,36 @@ actor ActiveAIQueue {
                 return false
             }
 
-            try? await dbPool.write { db in
-                guard var msg = try MessageHeader.fetchOne(db, key: job.headerId) else { return }
-                msg.summaryBlurb = blurb
-                msg.summaryTodos = summary.todos
-                msg.reminderDate = summary.reminderDate
-                msg.reminderTime = summary.reminderTime
-                msg.reminderContent = summary.reminderContent
-                try msg.save(db)
+            // T4.V7 site 2. A `.dropped` (or a thrown write, which maps to it here
+            // exactly as the pre-existing `try?` already swallowed one) fires NO
+            // success side effect and is NOT a self-declared success: `jobCompleted`
+            // re-reads GRDB, finds `summaryBlurb` still empty, and re-drives the job
+            // — the queue's own "GRDB is the arbiter" contract, unchanged.
+            let outcome = (try? await dbPool.write { db in
+                try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                    msg.summaryBlurb = blurb
+                    msg.summaryTodos = summary.todos
+                    msg.reminderDate = summary.reminderDate
+                    msg.reminderTime = summary.reminderTime
+                    msg.reminderContent = summary.reminderContent
+                    try msg.save(db)
 
-                try MessageAICache.writeThrough(
-                    accountId: account.id,
-                    folderPath: message.folderPath,
-                    rfc822MessageId: message.rfc822MessageId,
-                    summaryBlurb: blurb,
-                    summaryTodos: summary.todos,
-                    reminderDate: summary.reminderDate,
-                    reminderTime: summary.reminderTime,
-                    reminderContent: summary.reminderContent,
-                    db: db
-                )
+                    try MessageAICache.writeThrough(
+                        accountId: account.id,
+                        folderPath: msg.folderPath,
+                        rfc822MessageId: msg.rfc822MessageId,
+                        summaryBlurb: blurb,
+                        summaryTodos: summary.todos,
+                        reminderDate: summary.reminderDate,
+                        reminderTime: summary.reminderTime,
+                        reminderContent: summary.reminderContent,
+                        db: db
+                    )
+                }
+            }) ?? .dropped
+            guard outcome == .written else {
+                BackgroundSyncLogger.logAIProcessing("Summary write DROPPED (captured identity moved) for \(Self.logId(job.headerId))")
+                return false
             }
 
             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
@@ -955,7 +980,7 @@ actor ActiveAIQueue {
     /// Returns true if should retry.
     private func executeActionJob(
         _ job: AIJob, message: MessageHeader, plainText: String,
-        account: Account, config: DispatchConfig
+        account: Account, target: AIWriteTarget, config: DispatchConfig
     ) async -> Bool {
         // Re-read to get latest state (summary may have been written by summary job)
         guard let msg = try? await dbPool.read({ db in
@@ -996,21 +1021,33 @@ actor ActiveAIQueue {
                 actionPrompt: config.actionPrompt
             )
             if let action {
-                let effectiveAction: ActionTag = (try? await dbPool.write { db -> ActionTag in
-                    guard var updMsg = try MessageHeader.fetchOne(db, key: job.headerId) else { return action }
-                    let resolved = (action == .reply && updMsg.isReplied) ? ActionTag.none : action
-                    updMsg.actionTag = resolved
-                    updMsg.tagSortOrder = resolved.sortOrder
-                    try updMsg.save(db)
-                    try MessageAICache.writeThrough(
-                        accountId: account.id,
-                        folderPath: msg.folderPath,
-                        rfc822MessageId: msg.rfc822MessageId,
-                        actionTag: action,
-                        db: db
-                    )
-                    return resolved
-                }) ?? action
+                // T4.V7 site 3. The `?? action` false-success is REMOVED — reporting
+                // the requested tag as landed when nothing was written is precisely
+                // the misattribution this guards.
+                let written: (outcome: AIWriteOutcome, effective: ActionTag)? =
+                    try? await dbPool.write { db in
+                        var effective = action
+                        let outcome = try AccountManager.aiGuardedHeaderWrite(db, target: target) { updMsg, db in
+                            let resolved = (action == .reply && updMsg.isReplied) ? ActionTag.none : action
+                            effective = resolved
+                            updMsg.actionTag = resolved
+                            updMsg.tagSortOrder = resolved.sortOrder
+                            try updMsg.save(db)
+                            try MessageAICache.writeThrough(
+                                accountId: account.id,
+                                folderPath: updMsg.folderPath,
+                                rfc822MessageId: updMsg.rfc822MessageId,
+                                actionTag: action,
+                                db: db
+                            )
+                        }
+                        return (outcome, effective)
+                    }
+                guard let written, written.outcome == .written else {
+                    BackgroundSyncLogger.logAIProcessing("Action write DROPPED (captured identity moved) for \(Self.logId(job.headerId))")
+                    return false
+                }
+                let effectiveAction = written.effective
                 if effectiveAction != action {
                     print("[ReplyDetect] ActiveAI action: reply→none for \(message.messageId)")
                 }
@@ -1040,7 +1077,7 @@ actor ActiveAIQueue {
     /// Returns true if should retry.
     private func executeReplyJob(
         _ job: AIJob, message: MessageHeader, plainText: String,
-        account: Account, config: DispatchConfig
+        account: Account, target: AIWriteTarget, config: DispatchConfig
     ) async -> Bool {
         // Cache check: if reply already exists, skip LLM
         if let existing = message.cachedReply, !existing.isEmpty {
@@ -1068,25 +1105,35 @@ actor ActiveAIQueue {
                 compositionPrompt: config.compositionPrompt
             )
             if let reply {
-                try? await dbPool.write { db in
-                    guard var msg = try MessageHeader.fetchOne(db, key: job.headerId) else { return }
-                    msg.cachedReply = reply
-                    try msg.save(db)
-                    if !reply.isEmpty {
-                        try MessageAICache.writeThrough(
-                            accountId: account.id,
-                            folderPath: message.folderPath,
-                            rfc822MessageId: msg.rfc822MessageId,
-                            cachedReply: reply,
-                            replyGeneratedAt: Date(),
-                            db: db
-                        )
-                        let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                        print("[ActiveAI] Reply precomputed for \(message.messageId)")
-                        BackgroundSyncLogger.logAIProcessing("Reply precomputed for \(Self.logId(job.headerId)) in \(elapsed)ms")
-                    } else {
-                        print("[ActiveAI] Reply filtered (sentinel) for \(message.messageId)")
+                // T4.V7 site 4.
+                let outcome = (try? await dbPool.write { db in
+                    try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                        msg.cachedReply = reply
+                        try msg.save(db)
+                        if !reply.isEmpty {
+                            try MessageAICache.writeThrough(
+                                accountId: account.id,
+                                folderPath: msg.folderPath,
+                                rfc822MessageId: msg.rfc822MessageId,
+                                cachedReply: reply,
+                                replyGeneratedAt: Date(),
+                                db: db
+                            )
+                            let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[ActiveAI] Reply precomputed for \(message.messageId)")
+                            }
+                            BackgroundSyncLogger.logAIProcessing("Reply precomputed for \(Self.logId(job.headerId)) in \(elapsed)ms")
+                        } else {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[ActiveAI] Reply filtered (sentinel) for \(message.messageId)")
+                            }
+                        }
                     }
+                }) ?? .dropped
+                guard outcome == .written else {
+                    BackgroundSyncLogger.logAIProcessing("Reply write DROPPED (captured identity moved) for \(Self.logId(job.headerId))")
+                    return false
                 }
                 NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                 await AISubscriptionGate.shared.openGate()

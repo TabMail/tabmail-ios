@@ -60,9 +60,11 @@ struct ChatHistoryTurn: Codable, FetchableRecord, PersistableRecord, Sendable {
 actor ChatStore {
     static let shared = ChatStore()
 
-    /// Budget constants (matching TB)
-    private static let maxExchanges = 50
-    private static let charsPerExchange = 500
+    /// Budget constants (matching TB). PORT — internal (not private), as in
+    /// v2final's `ChatStore`, so the active-compose-guard tests derive the budget
+    /// thresholds FROM these constants instead of hardcoding the numbers.
+    static let maxExchanges = 50
+    static let charsPerExchange = 500
 
     // MARK: - Load
 
@@ -159,6 +161,11 @@ actor ChatStore {
     /// catches up on next launch (A−B direction). See ADR-IOS-034.
     @discardableResult
     func appendTurn(_ turn: ChatTurn) async throws -> [ChatTurn] {
+        // PORT — v2final `ChatStore.appendTurn`. Both budget branches below delete the
+        // globally-OLDEST turns during a normal append. Exempt the compose sessions the
+        // user currently has OPEN so an append in ANOTHER session can't evict an active
+        // reopened compose's turns.
+        let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         let (evictedTurns, historyTurn) = try await AppDatabase.dbPool.write { db -> ([ChatTurn], ChatHistoryTurn) in
             try turn.insert(db)
 
@@ -176,36 +183,7 @@ actor ChatStore {
             )
             try historyTurn.save(db) // save = INSERT OR REPLACE (updates if session gets more turns)
 
-            var evictedTurns: [ChatTurn] = []
-
-            // Enforce turn count budget
-            let totalTurns = try ChatTurn.fetchCount(db)
-            let maxMessages = Self.maxExchanges * 2
-            if totalTurns > maxMessages {
-                // Delete oldest turns beyond budget (FIFO)
-                let excess = totalTurns - maxMessages
-                let oldest = try ChatTurn
-                    .order(Column("timestamp").asc)
-                    .limit(excess)
-                    .fetchAll(db)
-                for old in oldest {
-                    try old.delete(db)
-                    evictedTurns.append(old)
-                }
-            }
-
-            // Also enforce char budget — fetch oldest turns and evict until under budget
-            var totalChars = try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(chars), 0) FROM chatTurn") ?? 0
-            let maxChars = Self.maxExchanges * Self.charsPerExchange
-            if totalChars > maxChars {
-                let oldestTurns = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
-                for oldest in oldestTurns {
-                    guard totalChars > maxChars else { break }
-                    totalChars -= oldest.chars
-                    try oldest.delete(db)
-                    evictedTurns.append(oldest)
-                }
-            }
+            let evictedTurns = try Self.enforceTurnBudgets(db: db, activeComposeSessions: activeComposeSessions)
 
             if !evictedTurns.isEmpty {
                 print("[ChatStore] Evicted \(evictedTurns.count) turns (budget enforcement)")
@@ -225,6 +203,68 @@ actor ChatStore {
                 text: text
             )
             await BackfillMemoryEmbeddingQueue.shared.enqueue(chatHistoryId: historyTurn.id)
+        }
+
+        return evictedTurns
+    }
+
+    /// PORT — v2final `ChatStore.enforceTurnBudgets(db:activeComposeSessions:)`.
+    /// The two `chatTurn` budget sweeps (count FIFO + char), factored out of
+    /// `appendTurn` so the active-compose exemption is unit-testable against a real
+    /// db without the actor / global-pool / post-commit memory-index machinery.
+    ///
+    /// Both sweeps EXEMPT `activeComposeSessions`: a compose the user has OPEN must
+    /// not lose its turns to a budget triggered by an append in ANOTHER session —
+    /// those are authored user bytes, on screen right now. A nil `sessionId`
+    /// (legacy) is never in the active set → stays evictable. The exemption is a
+    /// bounded, visible DEFERRAL, never a discard: `DraftSessionRegistry` is
+    /// in-memory only and starts EMPTY at every launch, so a missed `unregister`
+    /// over-retains for at most the remainder of the process and the next
+    /// maintenance pass reclaims it. Both caps therefore stay SOFT rather than
+    /// disabled — every INACTIVE turn is still fully evictable.
+    ///
+    /// TERMINATION — each loop iterates a materialized array fetched BEFORE the
+    /// loop. The measured variant is the number of unvisited elements of that array
+    /// (strictly decreasing by exactly 1 per iteration, lower bound 0); the exempt
+    /// arm `continue`s, which consumes the variant like every other arm, so an
+    /// exempted session can never stall the sweep. `deleted`/`totalChars` are early
+    /// exits, not the variant.
+    ///
+    /// Returns the deleted turns (for the caller's ID-translator cleanup). Runs
+    /// inside the caller's write transaction (`db`).
+    static func enforceTurnBudgets(db: Database, activeComposeSessions: Set<String>) throws -> [ChatTurn] {
+        var evictedTurns: [ChatTurn] = []
+
+        // Turn-COUNT budget. Scan oldest-first, SKIP active-compose turns, delete
+        // `excess` ELIGIBLE turns (a bare `.limit(excess)` could pick active ones).
+        // If too few inactive turns exist the cap stays SOFT — active history wins.
+        let totalTurns = try ChatTurn.fetchCount(db)
+        let maxMessages = Self.maxExchanges * 2
+        if totalTurns > maxMessages {
+            let excess = totalTurns - maxMessages
+            let oldestAll = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
+            var deleted = 0
+            for old in oldestAll {
+                if deleted >= excess { break }
+                if let sid = old.sessionId, activeComposeSessions.contains(sid) { continue }
+                try old.delete(db)
+                evictedTurns.append(old)
+                deleted += 1
+            }
+        }
+
+        // CHAR budget — evict oldest (skipping active-compose) until under budget.
+        var totalChars = try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(chars), 0) FROM chatTurn") ?? 0
+        let maxChars = Self.maxExchanges * Self.charsPerExchange
+        if totalChars > maxChars {
+            let oldestTurns = try ChatTurn.order(Column("timestamp").asc).fetchAll(db)
+            for oldest in oldestTurns {
+                guard totalChars > maxChars else { break }
+                if let sid = oldest.sessionId, activeComposeSessions.contains(sid) { continue }
+                totalChars -= oldest.chars
+                try oldest.delete(db)
+                evictedTurns.append(oldest)
+            }
         }
 
         return evictedTurns
@@ -453,18 +493,24 @@ actor ChatStore {
 
     // MARK: - StableId Helpers
 
-    /// Extract the stableId component from a msg-detail sessionId.
-    /// Format: "msg:{accountId}:{stableId}" (optionally "demo:"-prefixed in
-    /// demo mode) → returns "{stableId}".
-    /// Returns nil if the sessionId doesn't match the expected format.
-    private static func extractStableId(from sessionId: String) -> String? {
+    /// PORT — v2final `ChatStore.extractAccountAndStableId(from:)`, which REPLACED
+    /// that branch's `extractStableId(from:)` (v3's twin, removed here — it had no
+    /// other callers). Parse a msg-detail sessionId "msg:{accountId}:{stableId}"
+    /// (optionally "demo:"-prefixed) into its components. Splits on the FIRST ':'
+    /// after "msg:" so a stableId that itself contains colons round-trips. The
+    /// session account is authoritative for identity scoping. Rejects empty account
+    /// or empty stable components; non-message sessions (compose:/inbox/malformed)
+    /// return nil.
+    static func extractAccountAndStableId(from sessionId: String) -> (accountId: String, stableId: String)? {
         var sid = sessionId
         if sid.hasPrefix("demo:") { sid = String(sid.dropFirst(5)) }
         guard sid.hasPrefix("msg:") else { return nil }
         let after = String(sid.dropFirst(4)) // drop "msg:"
         guard let ci = after.firstIndex(of: ":") else { return nil }
+        let accountId = String(after[..<ci])
         let stableId = String(after[after.index(after: ci)...])
-        return stableId.isEmpty ? nil : stableId
+        guard !accountId.isEmpty, !stableId.isEmpty else { return nil }
+        return (accountId, stableId)
     }
 
     // MARK: - Inbox Session Eviction
@@ -508,11 +554,37 @@ actor ChatStore {
         }
     }
 
-    /// Find a MessageHeader by stableId (rfc822MessageId search, indexed).
-    /// Used as fallback when GRDB PK is stale after IMAP folder moves.
-    private static func findByStableId(_ stableId: String, db: Database) throws -> MessageHeader? {
-        let normalized = EmailFilter.normalizeMessageId(stableId)
-        return try MessageHeader.filter(Column("rfc822MessageId") == normalized).fetchOne(db)
+    /// PORT — v2final `ChatStore.findByStableId(_:accountId:db:)`. Resolve a
+    /// MessageHeader by the session's stable-identity `anchor`, SCOPED to
+    /// `accountId`. Used as the fallback when the GRDB PK is stale after an IMAP
+    /// folder move.
+    ///
+    /// ⚑ THE KEY IS UNCHANGED AND STILL RFC-822-BASED — `rfc822MessageId`, exactly
+    /// as before. This adds a SCOPE (`accountId`), not a keying scheme: chat binding
+    /// is CONTENT identity ("same content ⇒ same key"), never the provider-id keying
+    /// the durable action queue uses. Without the scope the lookup searched
+    /// `rfc822MessageId` GLOBALLY, so a session in account A could bind to account
+    /// B's copy of the same message.
+    ///
+    /// Only a CANONICAL RFC anchor is resolvable here (rfc822 is the move-durable
+    /// identity); a token/bare anchor is NOT globally matched — a bare "123" must
+    /// never bind a row whose stored rfc822 is the malformed literal "123". The PK
+    /// strategy at each caller already covers the token/bare row.
+    /// `MessageIdentity.comparableRfc822Identity` is this branch's name for the
+    /// reference's `MessageIdentity.durableActionRFC822MessageId` (see that symbol's
+    /// doc comment: renamed because v3 reversed the RFC-keyed action queue, ported
+    /// verbatim in semantics, and it is the identity-COMPARISON form — the one this
+    /// call needs — not the key-MINTING form).
+    ///
+    /// Deterministic inbox-preferred pick among same-account, same-RFC copies
+    /// (siblings = one logical message), so a resolve never flip-flops between an
+    /// Inbox row and its Archive twin.
+    static func findByStableId(_ anchor: String, accountId: String, db: Database) throws -> MessageHeader? {
+        guard let canonical = MessageIdentity.comparableRfc822Identity(anchor) else { return nil }
+        return try MessageHeader
+            .filter(Column("accountId") == accountId && Column("rfc822MessageId") == canonical)
+            .order(Column("isInInbox").desc, Column("id").asc)
+            .fetchOne(db)
     }
 
     // MARK: - Memory Turn Cap Eviction
@@ -538,14 +610,37 @@ actor ChatStore {
     }
 
     private static func evictHistoryBeyondCapImpl(dbPool: PrioritizedDatabase, maxTurns: Int) throws -> [String] {
-        try dbPool.write { db in
+        // PORT — v2final `ChatStore.evictHistoryBeyondCapImpl`. Never cap-evict history
+        // turns of a compose session the user currently has OPEN. The cap stays a SOFT
+        // target: only the oldest INACTIVE turns are selected, so active compose history
+        // survives even if it keeps total > cap.
+        let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
+        return try dbPool.write { db in
             let totalCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM chatHistory") ?? 0
             guard totalCount > maxTurns else { return [] }
             let excess = totalCount - maxTurns
-            // Capture the IDs BEFORE deletion so we can cascade to memory.db.
-            let evictedIds = try String.fetchAll(db, sql: """
-                SELECT id FROM chatHistory ORDER BY timestamp ASC LIMIT ?
-            """, arguments: [excess])
+            // Capture the IDs BEFORE deletion so we can cascade to memory.db. Select
+            // the oldest EVICTABLE ids: exclude active compose sessions. NULL-safe —
+            // `sessionId IS NULL OR sessionId NOT IN (...)` keeps null/non-compose rows
+            // eligible (a bare `NOT IN` yields NULL for a null sessionId, which would
+            // wrongly immortalize it). Empty active set → the plain query (avoids the
+            // invalid `NOT IN ()`).
+            let evictedIds: [String]
+            if activeComposeSessions.isEmpty {
+                evictedIds = try String.fetchAll(db, sql: """
+                    SELECT id FROM chatHistory ORDER BY timestamp ASC LIMIT ?
+                """, arguments: [excess])
+            } else {
+                let activeArr = Array(activeComposeSessions)
+                let ph = Array(repeating: "?", count: activeArr.count).joined(separator: ",")
+                var args: [DatabaseValueConvertible] = activeArr
+                args.append(excess)
+                evictedIds = try String.fetchAll(db, sql: """
+                    SELECT id FROM chatHistory
+                    WHERE (sessionId IS NULL OR sessionId NOT IN (\(ph)))
+                    ORDER BY timestamp ASC LIMIT ?
+                """, arguments: StatementArguments(args))
+            }
             guard !evictedIds.isEmpty else { return [] }
             let placeholders = Array(repeating: "?", count: evictedIds.count).joined(separator: ",")
             try db.execute(
@@ -602,8 +697,10 @@ actor ChatStore {
     }
 
     /// Check if the message for a msg-detail session is still in inbox.
-    /// Strategy 1: emailContextJSON PK lookup. Strategy 2: stableId rfc822MessageId search.
-    private static func isMessageInInbox(sessionId: String, db: Database) throws -> Bool {
+    /// Strategy 1: emailContextJSON PK lookup. Strategy 2: the session's stable-identity
+    /// anchor, re-resolved ACCOUNT-SCOPED (see `findByStableId`) — a session in account A
+    /// must never decide its inbox membership from account B's copy of the same RFC id.
+    static func isMessageInInbox(sessionId: String, db: Database) throws -> Bool {
         let firstTurn = try ChatTurn
             .filter(Column("sessionId") == sessionId)
             .order(Column("timestamp").asc)
@@ -613,8 +710,8 @@ actor ChatStore {
            let header = try MessageHeader.fetchOne(db, key: ctx.messageHeaderId) {
             return header.isInInbox
         }
-        if let stableId = extractStableId(from: sessionId),
-           let header = try findByStableId(stableId, db: db) {
+        if let (acct, anchor) = extractAccountAndStableId(from: sessionId),
+           let header = try findByStableId(anchor, accountId: acct, db: db) {
             return header.isInInbox
         }
         return false
@@ -638,6 +735,11 @@ actor ChatStore {
 
     private static func evictComposeSessionsImpl(dbPool: PrioritizedDatabase, ttlDays: Int) throws -> Int {
         let cutoffMs = (Date().timeIntervalSince1970 - Double(ttlDays) * 86400) * 1000
+        // PORT — v2final `ChatStore.evictComposeSessionsImpl`. Never TTL-sweep a compose
+        // session the user currently has OPEN. A REOPENED compose whose turns are all
+        // older than the TTL would otherwise lose its live chat history while on screen
+        // (no race required).
+        let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         return try dbPool.write { db in
             let sessionRows = try Row.fetchAll(db, sql: """
                 SELECT sessionId, MAX(timestamp) as maxTs
@@ -650,6 +752,7 @@ actor ChatStore {
             var evicted = 0
             for row in sessionRows {
                 let sid: String = row["sessionId"]
+                if activeComposeSessions.contains(sid) { continue }
                 _ = try ChatTurn.filter(Column("sessionId") == sid).deleteAll(db)
                 evicted += 1
             }
@@ -663,18 +766,27 @@ actor ChatStore {
     // MARK: - Message Header ID Resolution
 
     /// Resolve a possibly-stale messageHeaderId to the current GRDB PK.
-    /// Strategy 1: PK lookup. Strategy 2: stableId rfc822MessageId search.
+    /// Strategy 1: PK lookup. Strategy 2: account-scoped stable-identity re-resolve.
     func resolveMessageHeaderId(originalId: String, sessionId: String) throws -> String? {
         try AppDatabase.dbPool.read { db in
-            if try MessageHeader.fetchOne(db, key: originalId) != nil {
-                return originalId
-            }
-            if let stableId = Self.extractStableId(from: sessionId),
-               let header = try Self.findByStableId(stableId, db: db) {
-                return header.id
-            }
-            return nil
+            try Self.resolveMessageHeaderId(originalId: originalId, sessionId: sessionId, db: db)
         }
+    }
+
+    /// PORT — v2final `ChatStore.resolveMessageHeaderId(originalId:sessionId:db:)`, the
+    /// testable core of the wrapper above (the actor method reads the global pool).
+    /// Strategy 1: PK lookup, unchanged. Strategy 2: the session's stable-identity
+    /// anchor, re-resolved ACCOUNT-SCOPED (see `findByStableId`) so a stale PK in
+    /// account A can never resolve onto account B's copy of the same RFC id.
+    static func resolveMessageHeaderId(originalId: String, sessionId: String, db: Database) throws -> String? {
+        if try MessageHeader.fetchOne(db, key: originalId) != nil {
+            return originalId
+        }
+        if let (acct, anchor) = extractAccountAndStableId(from: sessionId),
+           let header = try findByStableId(anchor, accountId: acct, db: db) {
+            return header.id
+        }
+        return nil
     }
 
     // MARK: - Reminder Snapshot Encoding

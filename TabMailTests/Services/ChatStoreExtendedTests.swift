@@ -576,7 +576,7 @@ struct ChatStoreReminderSnapshotExtendedTests {
                      instruction: nil, scheduleDays: nil, scheduleDate: nil, scheduleTime: nil, timezone: nil, rawLine: nil),
             Reminder(type: "reminder", content: "Reply to Alice", dueDate: nil, dueTime: nil,
                      source: "message", hash: "h2", enabled: true, action: nil,
-                     messageId: nil, uniqueId: nil, subject: "Budget Q3", from: "alice@co.com",
+                     messageId: nil, uniqueId: nil, subject: "Budget Q3", from: "alice@company.com",
                      instruction: nil, scheduleDays: nil, scheduleDate: nil, scheduleTime: nil, timezone: nil, rawLine: nil),
         ]
         let encoded = ChatStore.encodeRemindersSnapshot(reminders)
@@ -590,7 +590,7 @@ struct ChatStoreReminderSnapshotExtendedTests {
         #expect(decoded?[0].source == "kb")
         #expect(decoded?[0].hash == "h1")
         #expect(decoded?[1].subject == "Budget Q3")
-        #expect(decoded?[1].from == "alice@co.com")
+        #expect(decoded?[1].from == "alice@company.com")
         #expect(decoded?[1].dueDate == nil)
     }
 

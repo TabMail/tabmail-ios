@@ -65,42 +65,42 @@ struct DraftParseRecipientsExtendedTests {
 
     @Test("Multiple comma-separated emails")
     func multipleEmails() {
-        let result = Draft.parseRecipients("alice@co.com, bob@co.com, carol@co.com")
+        let result = Draft.parseRecipients("alice@company.com, bob@company.com, carol@company.com")
         #expect(result.count == 3)
-        #expect(result[0] == "alice@co.com")
-        #expect(result[1] == "bob@co.com")
-        #expect(result[2] == "carol@co.com")
+        #expect(result[0] == "alice@company.com")
+        #expect(result[1] == "bob@company.com")
+        #expect(result[2] == "carol@company.com")
     }
 
     @Test("Angle bracket format extracts email")
     func angleBracketFormat() {
-        let result = Draft.parseRecipients("Alice Smith <alice@co.com>")
-        #expect(result == ["alice@co.com"])
+        let result = Draft.parseRecipients("Alice Smith <alice@company.com>")
+        #expect(result == ["alice@company.com"])
     }
 
     @Test("Mixed format with angle brackets and bare emails")
     func mixedFormat() {
-        let result = Draft.parseRecipients("Alice <alice@co.com>, bob@co.com, Carol D <carol@co.com>")
+        let result = Draft.parseRecipients("Alice <alice@company.com>, bob@company.com, Carol D <carol@company.com>")
         #expect(result.count == 3)
-        #expect(result[0] == "alice@co.com")
-        #expect(result[1] == "bob@co.com")
-        #expect(result[2] == "carol@co.com")
+        #expect(result[0] == "alice@company.com")
+        #expect(result[1] == "bob@company.com")
+        #expect(result[2] == "carol@company.com")
     }
 
     @Test("Commas inside angle brackets are not split")
     func commaInAngleBrackets() {
         // This is an edge case — a comma inside angle brackets should not split
-        let result = Draft.parseRecipients("\"Last, First\" <user@co.com>")
+        let result = Draft.parseRecipients("\"Last, First\" <user@company.com>")
         #expect(result.count == 1)
-        #expect(result[0] == "user@co.com")
+        #expect(result[0] == "user@company.com")
     }
 
     @Test("Whitespace is trimmed")
     func whitespace() {
-        let result = Draft.parseRecipients("  alice@co.com  ,  bob@co.com  ")
+        let result = Draft.parseRecipients("  alice@company.com  ,  bob@company.com  ")
         #expect(result.count == 2)
-        #expect(result[0] == "alice@co.com")
-        #expect(result[1] == "bob@co.com")
+        #expect(result[0] == "alice@company.com")
+        #expect(result[1] == "bob@company.com")
     }
 }
 
@@ -117,16 +117,16 @@ struct DraftJSONHelperTests {
 
     @Test("encodeStringArray encodes multiple values")
     func encodeMultiple() {
-        let result = Draft.encodeStringArray(["alice@co.com", "bob@co.com"])
+        let result = Draft.encodeStringArray(["alice@company.com", "bob@company.com"])
         let decoded = try! JSONDecoder().decode([String].self, from: Data(result.utf8))
-        #expect(decoded == ["alice@co.com", "bob@co.com"])
+        #expect(decoded == ["alice@company.com", "bob@company.com"])
     }
 
     @Test("toArray parses valid JSON")
     func toArrayValid() {
         let draft = Draft(
             id: "test", accountId: "acc1",
-            toJSON: "[\"alice@co.com\",\"bob@co.com\"]",
+            toJSON: "[\"alice@company.com\",\"bob@company.com\"]",
             ccJSON: "[]", bccJSON: "[]",
             subject: "Test", body: "Body",
             replyToId: nil, isForward: false,
@@ -136,7 +136,7 @@ struct DraftJSONHelperTests {
             serverDraftId: nil, serverPushStatus: nil,
             rfc822MessageId: nil, attachmentsDirName: nil
         )
-        #expect(draft.toArray == ["alice@co.com", "bob@co.com"])
+        #expect(draft.toArray == ["alice@company.com", "bob@company.com"])
     }
 
     @Test("toArray returns empty for invalid JSON")
@@ -161,7 +161,7 @@ struct DraftJSONHelperTests {
         let draft = Draft(
             id: "test", accountId: "acc1",
             toJSON: "[]",
-            ccJSON: "[\"cc@co.com\"]", bccJSON: "[\"bcc@co.com\"]",
+            ccJSON: "[\"cc@company.com\"]", bccJSON: "[\"bcc@company.com\"]",
             subject: "Test", body: "Body",
             replyToId: nil, isForward: false,
             editHistoryJSON: nil,
@@ -170,8 +170,8 @@ struct DraftJSONHelperTests {
             serverDraftId: nil, serverPushStatus: nil,
             rfc822MessageId: nil, attachmentsDirName: nil
         )
-        #expect(draft.ccArray == ["cc@co.com"])
-        #expect(draft.bccArray == ["bcc@co.com"])
+        #expect(draft.ccArray == ["cc@company.com"])
+        #expect(draft.bccArray == ["bcc@company.com"])
     }
 }
 
@@ -220,7 +220,7 @@ struct DraftGRDBPersistenceTests {
         let now = Date().timeIntervalSince1970
         let draft = Draft(
             id: "new:test-uuid", accountId: "acc1",
-            toJSON: "[\"alice@co.com\"]", ccJSON: "[]", bccJSON: "[]",
+            toJSON: "[\"alice@company.com\"]", ccJSON: "[]", bccJSON: "[]",
             subject: "Test Subject", body: "Hello world",
             replyToId: nil, isForward: false,
             editHistoryJSON: nil,
@@ -238,7 +238,7 @@ struct DraftGRDBPersistenceTests {
         #expect(fetched.subject == "Test Subject")
         #expect(fetched.body == "Hello world")
         #expect(fetched.accountId == "acc1")
-        #expect(fetched.toArray == ["alice@co.com"])
+        #expect(fetched.toArray == ["alice@company.com"])
     }
 
     @Test("Draft update (save) preserves existing record")

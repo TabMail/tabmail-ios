@@ -20,6 +20,12 @@ struct DynamicIslandChat: View {
     let composeContext: ComposeEditContext?
     let draftId: String?
     let draftReplyToId: String?  // MessageHeader.id of the email being replied to (for draft eviction)
+    /// T5.8 — the reply target's PROVIDER id (`MessageHeader.messageId`) and observed
+    /// UIDVALIDITY, captured from the SAME header `draftReplyToId` came from. Stamped
+    /// onto the `Draft` row this view creates so the durable address survives the
+    /// re-keying that makes `draftReplyToId` untrustworthy.
+    let draftReplyToProviderMessageId: String?
+    let draftReplyToUidValidity: Int?
     let composeGenerationCursor: ComposeGenerationCursor?
     let composeAgentSendFence: ComposeAgentSendFence?
     let composeMutationAllowed: Bool
@@ -185,6 +191,8 @@ struct DynamicIslandChat: View {
         composeContext: ComposeEditContext? = nil,
         draftId: String? = nil,
         draftReplyToId: String? = nil,
+        draftReplyToProviderMessageId: String? = nil,
+        draftReplyToUidValidity: Int? = nil,
         composeGenerationCursor: ComposeGenerationCursor? = nil,
         composeAgentSendFence: ComposeAgentSendFence? = nil,
         composeMutationAllowed: Bool = true,
@@ -201,6 +209,8 @@ struct DynamicIslandChat: View {
         self.composeContext = composeContext
         self.draftId = draftId
         self.draftReplyToId = draftReplyToId
+        self.draftReplyToProviderMessageId = draftReplyToProviderMessageId
+        self.draftReplyToUidValidity = draftReplyToUidValidity
         self.composeGenerationCursor = composeGenerationCursor
         self.composeAgentSendFence = composeAgentSendFence
         self.composeMutationAllowed = composeMutationAllowed
@@ -1548,7 +1558,7 @@ struct DynamicIslandChat: View {
                 return
             }
             savedAccountId = aid
-            let draft = Draft(
+            var draft = Draft(
                 id: draftKey,
                 accountId: aid,
                 toJSON: Draft.encodeStringArray(ctx.recipients),
@@ -1562,11 +1572,21 @@ struct DynamicIslandChat: View {
                 createdAt: now,
                 updatedAt: now
             )
+            // T5.8 — stamp the reply target's durable ADDRESS beside its mutable PK,
+            // from the SAME header both values were captured from. This is the FIRST
+            // save of the row, so an unstamped row here would stay unstamped for the
+            // draft's whole life (the update path preserves, it does not re-derive).
+            draft.replyToProviderMessageId = draftReplyToProviderMessageId
+            draft.replyToUidValidity = draftReplyToUidValidity
+            // Immutable copy for the escaping admission closure, mirroring the
+            // `existingToSave` binding in the update branch above (a captured `var`
+            // is a concurrency hazard, not merely a style point).
+            let draftToSave = draft
             let saveStart = Date()
             do {
                 let result = try await cursor.admit { newEpoch, predecessor in
                     try await DraftStore.shared.saveAsync(
-                        draft,
+                        draftToSave,
                         epoch: newEpoch,
                         expectedPredecessor: predecessor)
                 }

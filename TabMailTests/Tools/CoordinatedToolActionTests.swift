@@ -353,4 +353,242 @@ struct CoordinatedToolActionTests {
             #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded for \(id)")
         }
     }
+
+    // MARK: - (6) T4.V8 — honest `(admitted, pending, failed)` reporting
+    //
+    // The invariant, in both directions:
+    //   * work that never reached the provider must NOT be reported as success;
+    //   * work that WAS admitted and is merely pending must NOT be reported as
+    //     failure (telling an agent a pending action failed invites it to retry
+    //     and act twice).
+    // That is why the receipt is a TRIPLE. Each test below therefore asserts all
+    // THREE buckets, never just the one it is named for — a test that checked only
+    // its own bucket would stay green if the other two were collapsed together.
+
+    /// Adds a second, IMAP-backed account whose folder epochs the test controls.
+    /// IMAP is the only provider family for which `admittedOrdinaryActionTargets`
+    /// consults a UIDVALIDITY epoch at all.
+    private func seedIMAPAccount(
+        pool: DatabasePool,
+        accountId: String,
+        inboxEpoch: Int?
+    ) throws -> (inbox: Folder, archive: Folder) {
+        let inbox: Folder = {
+            var f = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            f.lastKnownUidValidity = inboxEpoch
+            return f
+        }()
+        let archive: Folder = {
+            var f = Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId)
+            f.lastKnownUidValidity = inboxEpoch
+            return f
+        }()
+        try pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "imap-\(accountId)@example.com", displayName: "IMAP", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            try inbox.insert(db)
+            try archive.insert(db)
+        }
+        return (inbox, archive)
+    }
+
+    /// An IMAP header whose provider address is a bare numeric UID (what
+    /// `admittedOrdinaryActionTargets` requires) and whose observed epoch the
+    /// test controls.
+    private func makeIMAPHeader(folder: Folder, uid: String, observedEpoch: Int?) -> MessageHeader {
+        var h = makeDurableHeader(folder: folder, messageId: uid)
+        h.observedUidValidity = observedEpoch
+        return h
+    }
+
+    @Test("T4.V8 three-way control: a coordinated archive that durably lands its PendingOperation reports the id as ADMITTED — and reports nothing as pending and nothing as failed")
+    func admittedWorkIsReportedAdmittedAndNothingElse() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-v8-admitted")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+
+        #expect(admission.admittedIds == [id], "a landed archive must be reported as durably admitted")
+        #expect(admission.pendingIds.isEmpty, "completed work must never be reported as pending")
+        #expect(admission.failedIds.isEmpty, "completed work must never be reported as failed")
+
+        // Non-vacuity: the durable successor really is there.
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].destinationPath == archive.path)
+    }
+
+    @Test("T4.V8: an IMAP message whose source folder has no known UIDVALIDITY epoch yet is reported PENDING — never admitted (zero PendingOperations were queued) and never failed (an unread epoch is an absence of evidence, not a provider verdict)")
+    func unknownEpochIsPendingNeverAdmittedAndNeverFailed() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        // `lastKnownUidValidity == nil` — the T1.3 first-sync window.
+        let (imapInbox, _) = try seedIMAPAccount(pool: pool, accountId: "acc-v8-unknown", inboxEpoch: nil)
+        let header = makeIMAPHeader(folder: imapInbox, uid: "9001", observedEpoch: nil)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+
+        #expect(admission.pendingIds == [id], "an unknown folder epoch is retryable — it must land in the pending bucket")
+        #expect(admission.admittedIds.isEmpty, "nothing reached the provider, so nothing may be reported as admitted")
+        #expect(admission.failedIds.isEmpty, "an UNKNOWN epoch must never be reported as a terminal failure")
+
+        // Non-vacuity in the durable direction: no op was queued and the row did
+        // not move, so a caller reporting success here would be reporting a lie.
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "no PendingOperation may exist for a refused admission")
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderPath == imapInbox.path, "the row must still be in its source folder")
+
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
+    }
+
+    @Test("T4.V8: an IMAP message whose folder epoch PROVABLY moved is reported FAILED — a positive epoch mismatch is the one terminal exit, and it must not be softened into pending")
+    func provenEpochTurnoverIsTerminalNotPending() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        // The server reported epoch 7 on its last SELECT; this row was observed
+        // under epoch 5. That is a POSITIVE disagreement, not an unknown.
+        let (imapInbox, _) = try seedIMAPAccount(pool: pool, accountId: "acc-v8-turnover", inboxEpoch: 7)
+        let header = makeIMAPHeader(folder: imapInbox, uid: "9002", observedEpoch: 5)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+
+        #expect(admission.failedIds == [id], "a proven epoch turnover is terminal — C3 fail-closed")
+        #expect(admission.admittedIds.isEmpty, "a refused admission must never be reported as admitted")
+        #expect(admission.pendingIds.isEmpty, "a PROVEN turnover is not an unknown — it must not sit in the pending bucket forever")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "no PendingOperation may address a UID from an abandoned epoch")
+    }
+
+    @Test("T4.V8: an id with no row anywhere — durable or staged — is reported FAILED as proven absent, and never as admitted")
+    func provenAbsentIdIsTerminalNeverAdmitted() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let ghostId = "acc1:INBOX:m-v8-ghost-\(UUID().uuidString)"
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [ghostId], role: .archive)
+
+        #expect(admission.failedIds == [ghostId], "a clean read that finds no row anywhere is proven absence")
+        #expect(admission.admittedIds.isEmpty, "nothing reached the provider")
+        #expect(admission.pendingIds.isEmpty)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty)
+    }
+
+    // MARK: - (7) T4.V8 — what the agent tools actually tell the model
+
+    /// Auto-responding confirmation sink, so a tool's unbounded confirmation
+    /// wait resolves inline. Mirrors `FSMToolDeliveryTests.MockUISink`; kept
+    /// local so this suite does not depend on another suite's fixture.
+    @MainActor
+    private final class AutoConfirmSink: AgentUISink {
+        func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+            confirmation.onRespond(true)
+        }
+    }
+
+    @Test("T4.V8: EmailArchiveTool reports success=false with archived_count 0 and a pending_ids list — and NO failed_ids — when the admission was refused by an unknown folder epoch")
+    func archiveToolReportsPendingNotSuccessAndNotFailure() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(pool: pool, accountId: "acc-v8-tool-pending", inboxEpoch: nil)
+        let header = makeIMAPHeader(folder: imapInbox, uid: "9101", observedEpoch: nil)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+
+        let translator = MockChatIdTranslator()
+        await translator.seed(11, realId: header.id)
+        let tool = EmailArchiveTool(context: ToolContext(db: pool, translator: translator))
+        let sink = AutoConfirmSink()
+        let output = try await tool.execute(
+            arguments: ["unique_ids": .array([.int(11)])],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "t4v8-archive-pending"))
+
+        #expect(output.contains("\"success\":false") || output.contains("\"success\": false"),
+                "the tool must not claim success for work that never reached the provider — got: \(output)")
+        #expect(output.contains("\"archived_count\":0") || output.contains("\"archived_count\": 0"),
+                "archived_count must count DURABLY ADMITTED work only — got: \(output)")
+        #expect(output.contains("pending_ids"), "a still-outstanding id must be surfaced as pending — got: \(output)")
+        #expect(!output.contains("failed_ids"),
+                "a pending id must NEVER be reported as failed — that is what makes an agent retry and act twice; got: \(output)")
+    }
+
+    @Test("T4.V8 three-way control: EmailArchiveTool still reports success=true with the full archived_count when every id is durably admitted")
+    func archiveToolStillReportsSuccessWhenWorkCompletes() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-v8-tool-ok")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+
+        let translator = MockChatIdTranslator()
+        await translator.seed(12, realId: header.id)
+        let tool = EmailArchiveTool(context: ToolContext(db: pool, translator: translator))
+        let sink = AutoConfirmSink()
+        let output = try await tool.execute(
+            arguments: ["unique_ids": .array([.int(12)])],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "t4v8-archive-ok"))
+
+        #expect(output.contains("\"success\":true") || output.contains("\"success\": true"),
+                "genuinely completed work must still report success — got: \(output)")
+        #expect(output.contains("\"archived_count\":1") || output.contains("\"archived_count\": 1"),
+                "got: \(output)")
+        #expect(!output.contains("pending_ids"), "got: \(output)")
+        #expect(!output.contains("failed_ids"), "got: \(output)")
+    }
+
+    @Test("T4.V8: EmailDeleteTool reports success=false with deleted_count 0 and a pending_ids list — and NO failed_ids — when the admission was refused by an unknown folder epoch")
+    func deleteToolReportsPendingNotSuccessAndNotFailure() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(pool: pool, accountId: "acc-v8-tool-del", inboxEpoch: nil)
+        // A trash-role folder must exist, so the refusal proven here is the
+        // epoch one and not the "no role folder for this account" skip.
+        try await pool.writeWithoutTransaction { db in
+            try Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc-v8-tool-del").insert(db)
+        }
+        let header = makeIMAPHeader(folder: imapInbox, uid: "9102", observedEpoch: nil)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+
+        let translator = MockChatIdTranslator()
+        await translator.seed(13, realId: header.id)
+        let tool = EmailDeleteTool(context: ToolContext(db: pool, translator: translator))
+        let sink = AutoConfirmSink()
+        let output = try await tool.execute(
+            arguments: ["unique_ids": .array([.int(13)])],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "t4v8-delete-pending"))
+
+        #expect(output.contains("\"success\":false") || output.contains("\"success\": false"),
+                "the tool must not claim success for work that never reached the provider — got: \(output)")
+        #expect(output.contains("\"deleted_count\":0") || output.contains("\"deleted_count\": 0"),
+                "deleted_count must count DURABLY ADMITTED work only — got: \(output)")
+        #expect(output.contains("pending_ids"), "got: \(output)")
+        #expect(!output.contains("failed_ids"),
+                "a pending id must NEVER be reported as failed; got: \(output)")
+    }
 }

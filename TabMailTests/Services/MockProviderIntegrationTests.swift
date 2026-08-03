@@ -883,8 +883,8 @@ struct E2ESyncSimulationTests {
         // Configure messages
         let date = Date(timeIntervalSince1970: 1_700_000_000)
         let msgInfos = [
-            makeHeaderInfo(messageId: "m1", subject: "Welcome", from: "Admin", fromAddress: "admin@co.com", date: date, snippet: "Welcome aboard"),
-            makeHeaderInfo(messageId: "m2", subject: "Task", from: "Manager", fromAddress: "mgr@co.com", date: date.addingTimeInterval(60), snippet: "Please review"),
+            makeHeaderInfo(messageId: "m1", subject: "Welcome", from: "Admin", fromAddress: "admin@company.com", date: date, snippet: "Welcome aboard"),
+            makeHeaderInfo(messageId: "m2", subject: "Task", from: "Manager", fromAddress: "mgr@company.com", date: date.addingTimeInterval(60), snippet: "Please review"),
         ]
         await mock.setFetchMessagesResult(msgInfos)
 

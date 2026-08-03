@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 /// Tests for ActiveAIQueue's Item type and QueueStorage behavior.
@@ -370,5 +371,317 @@ struct ActiveAIQueueTests {
         let sem = LLMSemaphore(maxConcurrent: SyncConfig.maxConcurrentLLMCalls)
         #expect(sem.activeCount == 0)
         #expect(sem.waiterCount == 0)
+    }
+}
+
+// MARK: - T4.V7 AI-write identity guard
+
+/// The invariant these pin is a SYSTEM PROPERTY, not a mechanism: **an AI result
+/// computed for message X never lands on a different physical message that has
+/// since taken over X's composite address** — and, in the other direction, the
+/// guard must not become a blanket refusal, because these writes are the ONLY
+/// source of a message's summary / action tag / precomputed reply / `notified`
+/// stamp. Every test drives the real production choke point
+/// (`AccountManager.aiGuardedHeaderWrite`), which all nine automatic-AI header
+/// writes in `ActiveAIQueue` and `AccountManagerAI` route through.
+@Suite("T4.V7 - AI write identity guard")
+struct AIWriteIdentityGuardTests {
+
+    private static let accountId = "acc1"
+    private static let folderPath = "INBOX"
+    private static let uid = "42"
+
+    private static var folderId: String {
+        MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+    }
+
+    private static var headerId: String {
+        MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: uid)
+    }
+
+    // MARK: Fixture
+
+    /// Account + folder, with the folder's epoch state under the test's control.
+    private func makeFixture(
+        folderEpoch: Int?,
+        resetPendingAt: Date? = nil,
+        accountId: String = AIWriteIdentityGuardTests.accountId,
+        provider: AccountProvider = .imap
+    ) throws -> DatabaseQueue {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: accountId, email: "user@example.com", provider: provider)
+        var folder = Folder(
+            name: "INBOX", path: AIWriteIdentityGuardTests.folderPath,
+            role: .inbox, accountId: accountId
+        )
+        folder.lastKnownUidValidity = folderEpoch
+        folder.uidValidityResetPendingAt = resetPendingAt
+        try db.write { try folder.insert($0) }
+        return db
+    }
+
+    private func makeHeader(
+        subject: String,
+        rfc822: String?,
+        observedEpoch: Int?,
+        accountId: String = AIWriteIdentityGuardTests.accountId
+    ) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: AIWriteIdentityGuardTests.uid,
+            subject: subject,
+            from: "Sender <sender@example.com>",
+            fromAddress: "sender@example.com",
+            to: "user@example.com",
+            // Dynamic per testing rule 7 — never a literal date.
+            date: Date().addingTimeInterval(-3600),
+            snippet: "snippet",
+            folderId: MessageIdentity.folderId(
+                accountId: accountId, folderPath: AIWriteIdentityGuardTests.folderPath),
+            accountId: accountId,
+            folderPath: AIWriteIdentityGuardTests.folderPath,
+            isInInbox: true
+        )
+        header.rfc822MessageId = rfc822
+        header.observedUidValidity = observedEpoch
+        return header
+    }
+
+    /// Capture exactly as `ActiveAIQueue.executeJob` / `AccountManager.processOpenedMessage` do.
+    private func capture(_ db: DatabaseQueue, _ message: MessageHeader) throws -> AIWriteTarget? {
+        try db.read { try AIWriteTarget.capture(message: message, db: $0) }
+    }
+
+    /// The one guarded mutation every test attempts: stamp X's summary.
+    private func attemptSummaryWrite(
+        _ db: DatabaseQueue, target: AIWriteTarget, blurb: String
+    ) throws -> AIWriteOutcome {
+        try db.write { db in
+            try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                msg.summaryBlurb = blurb
+                try msg.save(db)
+            }
+        }
+    }
+
+    private func blurb(_ db: DatabaseQueue, _ id: String) throws -> String? {
+        try db.read { db -> String? in
+            guard let header = try MessageHeader.fetchOne(db, key: id) else { return nil }
+            return header.summaryBlurb
+        }
+    }
+
+    // MARK: The hazard — a proven UIDVALIDITY turnover
+
+    @Test("A UIDVALIDITY turnover means X's AI summary never lands on the message now at X's address")
+    func turnoverDropsTheWriteOntoTheReplacement() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed on an ordinary stamped IMAP row")
+        guard let target else { return }
+
+        // The turnover, exactly as the purge-and-resync reaction leaves the world:
+        // the old epoch's rows are gone, a DIFFERENT physical message occupies the
+        // same UID under the new numbering, and the fresh epoch is stamped.
+        let impostor = makeHeader(subject: "Impostor Y", rfc822: "<y@example.com>", observedEpoch: 222)
+        try db.write { db in
+            _ = try MessageHeader.deleteOne(db, key: Self.headerId)
+            guard var folder = try Folder.fetchOne(db, key: Self.folderId) else { return }
+            folder.lastKnownUidValidity = 222
+            try folder.update(db)
+            try impostor.insert(db)
+        }
+
+        // NON-VACUITY, and the value-level RED evidence: run the EXACT pre-guard
+        // expression every one of the nine sites used before T4.V7 — a bare
+        // `MessageHeader.fetchOne(db, key: headerId)` + mutate + save. It LANDS on
+        // the impostor. So the drop below is the guard refusing, not the row being
+        // absent, locked, or otherwise unwritable.
+        let bareWriteLanded: Bool = try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return false }
+            bare.summaryBlurb = "pre-guard control write"
+            try bare.save(db)
+            return true
+        }
+        #expect(bareWriteLanded, "the impostor row must be present and writable, else the drop proves nothing")
+        let controlBlurb = try blurb(db, Self.headerId)
+        #expect(controlBlurb == "pre-guard control write")
+
+        // Reset so the guarded attempt starts from a clean row.
+        try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            bare.summaryBlurb = nil
+            try bare.save(db)
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        #expect(after?.rfc822MessageId == "<y@example.com>", "the row at X's address is still the replacement")
+        #expect(after?.summaryBlurb == nil, "X's summary must never land on the replacement")
+    }
+
+    @Test("A vanished row drops the AI write and never resurrects the message")
+    func vanishedRowDropsTheWrite() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+        try db.write { db in _ = try MessageHeader.deleteOne(db, key: Self.headerId) }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+        let after = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        #expect(after == nil, "a guarded write must never re-create a purged row")
+    }
+
+    @Test("A folder mid UIDVALIDITY reset drops the AI write")
+    func midResetDropsTheWrite() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+        try db.write { db in
+            guard var folder = try Folder.fetchOne(db, key: Self.folderId) else { return }
+            folder.uidValidityResetPendingAt = Date()
+            try folder.update(db)
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+        let after = try blurb(db, Self.headerId)
+        #expect(after == nil, "no AI result may land on a folder whose rows are mid purge-and-resync")
+    }
+
+    // MARK: The other side — the guard must not become a blanket refusal
+
+    @Test("An unchanged captured target still writes through")
+    func unchangedTargetWritesThrough() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .written)
+        let after = try blurb(db, Self.headerId)
+        #expect(after == "X's summary", "the ordinary healthy write must land — this is the whole product")
+    }
+
+    @Test("An rfc-less message with no epoch anywhere is still captured and still written")
+    func rfcLessMessageIsStillWritten() throws {
+        // The exact shape `v2final`'s `AIWriteTarget.capture` REFUSES
+        // (`normalizedRfc == nil && observedUidValidity == nil`). On v3 that shape is
+        // the demo account, the ScreenshotMode folders and the whole first-sync
+        // window, so refusing would disable AI for them permanently and silently.
+        let db = try makeFixture(folderEpoch: nil)
+        let original = makeHeader(subject: "No RFC", rfc822: nil, observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must NOT refuse an rfc-less row with no epoch baseline")
+        guard let target else { return }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .written)
+        let after = try blurb(db, Self.headerId)
+        #expect(after == "X's summary", "an rfc-less message must not be permanently un-writable by AI")
+    }
+
+    @Test("An unknown folder epoch is an absence of evidence, not a mismatch — the write lands")
+    func unknownFolderEpochStillWrites() throws {
+        let db = try makeFixture(folderEpoch: nil)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .written)
+        let after = try blurb(db, Self.headerId)
+        #expect(after == "X's summary", "T1.3 first-sync / demo / screenshot state must not disable AI")
+    }
+
+    @Test("An unstamped header row is an absence of evidence, not a mismatch — the write lands")
+    func unstampedHeaderStillWrites() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .written)
+        let after = try blurb(db, Self.headerId)
+        #expect(after == "X's summary", "an unproven address is an unknown, never a proven turnover")
+    }
+
+    @Test("The demo account writes through even when its stored epochs disagree")
+    func demoAccountIsNotEpochAddressed() throws {
+        // Stored as `.imap`, served by `DemoProvider`: no server, no SELECT, no
+        // epoch, ever. A disagreement that would be a proven turnover on a real
+        // IMAP account cannot mean anything here, so the write must still land.
+        let db = try makeFixture(folderEpoch: 111, accountId: DemoSeed.demoAccountId, provider: .imap)
+        let original = makeHeader(
+            subject: "Demo", rfc822: "<demo@example.com>",
+            observedEpoch: 999, accountId: DemoSeed.demoAccountId)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "demo summary")
+        #expect(outcome == .written)
+        let after = try blurb(db, original.id)
+        #expect(after == "demo summary", "the demo account must never be epoch-refused")
+    }
+
+    @Test("A stable-provider account is not epoch-addressed and writes through")
+    func stableProviderIsNotEpochAddressed() throws {
+        // Gmail ids are never reassigned, so the address IS the identity and the
+        // folder's epoch columns are meaningless for it.
+        let db = try makeFixture(folderEpoch: 111, provider: .gmail)
+        let original = makeHeader(subject: "Gmail", rfc822: "<g@example.com>", observedEpoch: 999)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        guard let target else {
+            #expect(Bool(false), "capture must succeed")
+            return
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "gmail summary")
+        #expect(outcome == .written)
+        let after = try blurb(db, Self.headerId)
+        #expect(after == "gmail summary", "a stable-provider message must never be epoch-refused")
     }
 }

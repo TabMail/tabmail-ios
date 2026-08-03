@@ -560,6 +560,75 @@ actor ChatIdTranslator {
         return 1
     }
 
+    // MARK: - Folder purge (T4.V11)
+
+    /// Purge every chat-pill identity mapping whose `realId` belongs to ONE folder,
+    /// as part of the UIDVALIDITY purge-and-resync reaction
+    /// (`AccountManager.runUidValidityResetReaction`). PORTED from `v2final`'s
+    /// `ChatIdTranslator.purgeMappingsForFolder` (commit `4d34ee864`).
+    ///
+    /// WHY IT EXISTS: this store is keyed by `MessageHeader.id` — an ADDRESS
+    /// (`accountId:folderPath:UID`), not an identity. Once the server renumbers the
+    /// folder, a new message can occupy an old, still-mapped headerId, and a pill in
+    /// an OLD chat turn would then resolve to it — one message's subject, snippet and
+    /// body served under another message's reference (C3).
+    ///
+    /// MATCHING is the composite `"accountId:folderPath:"` PREFIX plus the
+    /// no-deeper-colon guard (`MessageIdentity.headerIdBelongsToFolder`): an IMAP
+    /// server whose hierarchy delimiter is ':' makes a bare prefix ALSO match a
+    /// NESTED SIBLING's ids (`"acc:Work:"` matching `"acc:Work:Sub:123"`), and
+    /// sweeping a foreign folder's mappings is strictly worse than leaving one
+    /// behind. MODEL-NEUTRAL by construction: it reads only the stored key strings,
+    /// never `MessageHeader` or any other row — so it is correct for a mapping whose
+    /// header is ALREADY deleted, which is exactly the state the reaction's purge
+    /// transaction leaves behind. Event (`CompoundEventId`), contact and template ids
+    /// never take the `accountId:folderPath:` shape, so no type discriminator is
+    /// needed.
+    ///
+    /// ⚑ THE PERSISTED HALF IS PART OF THIS PURGE, NOT A SEPARATE STEP. The reaction's
+    /// step-3 transaction deletes `chatIdMapping` rows by the exact
+    /// `messageHeader.folderId` relation, which cannot see a mapping whose header row
+    /// is already gone; `deletePersistedMappings` below closes that gap because
+    /// `ensureLoadedFromDB` makes `idMap` a superset of every persisted row. Dropping
+    /// only the in-memory maps would leave impostor mappings on disk to be reloaded
+    /// at the next launch.
+    ///
+    /// Idempotent: re-running after the GRDB rows are already gone just clears caches.
+    func purgeMappingsForFolder(accountId: String, folderPath: String) {
+        ensureLoadedFromDB()
+        let matches = idMap.filter {
+            MessageIdentity.headerIdBelongsToFolder($0.value, accountId: accountId, folderPath: folderPath)
+        }
+        guard !matches.isEmpty else { return }
+        // Measured variant: `matches` is a fixed snapshot taken before any mutation;
+        // each iteration consumes one of its entries and the remaining count strictly
+        // decreases, bounded below by 0. Nothing inside the loop can add to it.
+        for (numericId, realId) in matches {
+            idMap.removeValue(forKey: numericId)
+            reverseMap.removeValue(forKey: realId)
+            refCounts.removeValue(forKey: numericId)
+            subjectCache.removeValue(forKey: numericId)
+            eventTitleCache.removeValue(forKey: numericId)
+            templateNameCache.removeValue(forKey: numericId)
+            eventDetailCache.removeValue(forKey: realId)
+            eventCalendarCache.removeValue(forKey: realId)
+        }
+        // ⚑ DEVIATION FROM THE REFERENCE, deliberate. `v2final` writes
+        // `displayCache.removeValue(forKey: realId)` inside the loop above, which is a
+        // GUARANTEED NO-OP: `displayCache` is keyed by the INPUT TEXT of
+        // `processResponseForDisplay`, never by a realId. Ported verbatim it would read
+        // as invalidating rendered pill text while leaving every stale entry in place,
+        // so a re-render of an old turn would still show the purged message's subject.
+        // v3's own sibling eviction (`sweepOrphans`) already solves this the only way
+        // the key shape allows — drop the whole cache — so this reuses that idiom.
+        // Cheap: entries are re-derived on the next render.
+        displayCache.removeAll()
+        deletePersistedMappings(Array(matches.keys))
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ChatIdTranslator] Purged \(matches.count) mapping(s) for folder \(accountId.prefix(8)):\(folderPath)")
+        }
+    }
+
     // MARK: - Email Subject Resolution
 
     /// Fetch email subject from GRDB for a numeric ID.
