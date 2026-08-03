@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
 
 /// Integration tests for `ExchangeProvider.fetchMessage` and `fetchAttachment`
@@ -414,5 +415,227 @@ struct ExchangeProviderMockTests {
         let urls = FakeHTTP.recordedCalls().map { $0.url }
         let fallbackPrefix = "/microsoft.graph.itemattachment/item/attachments"
         #expect(!urls.contains { $0.contains(fallbackPrefix) })
+    }
+}
+
+@Suite("ExchangeProvider — draft delete HTTP")
+struct ExchangeProviderDraftDeleteHTTPTests {
+    private func provider(
+        _ http: FakeHTTP.Scenario,
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String = { _ in
+            "initial-token"
+        }
+    ) -> ExchangeProvider {
+        ExchangeProvider(
+            userEmail: "owner@example.com",
+            accessToken: accessToken,
+            session: http.session
+        )
+    }
+
+    private func delete(
+        _ provider: ExchangeProvider,
+        draftId: String
+    ) async throws {
+        try await provider.deleteDraft(identity: .outlook(graphId: draftId))
+    }
+
+    private func expectExchangeNetworkError(
+        _ error: Error,
+        statusCode: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        guard case ProviderError.networkError(let underlying) = error else {
+            Issue.record("expected ProviderError.networkError, got \(error)", sourceLocation: sourceLocation)
+            return
+        }
+        let nsError = underlying as NSError
+        #expect(nsError.domain == "Exchange", sourceLocation: sourceLocation)
+        #expect(nsError.code == statusCode, sourceLocation: sourceLocation)
+    }
+
+    @Test("DELETE 204 succeeds through the production owner")
+    func deleteSuccess() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-success"
+        http.register(
+            path: "/messages/\(draftId)",
+            method: "DELETE",
+            response: .status(204)
+        )
+
+        try await delete(provider(http), draftId: draftId)
+
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].method == "DELETE")
+        #expect(calls[0].url.contains("/v1.0/me/messages/\(draftId)"))
+        #expect(calls[0].body == nil)
+    }
+
+    @Test("DELETE 404 is idempotent success")
+    func deleteAlreadyGone() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-gone"
+        http.register(
+            path: "/messages/\(draftId)",
+            method: "DELETE",
+            response: .status(404)
+        )
+
+        try await delete(provider(http), draftId: draftId)
+
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        #expect(calls.allSatisfy { $0.method == "DELETE" })
+    }
+
+    @Test("DELETE refreshes authentication once after 401 and succeeds")
+    func deleteRefreshesOnceAfter401() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-auth"
+        let requestCount = Mutex(0)
+        http.register(path: "/messages/\(draftId)", method: "DELETE") { _ in
+            requestCount.withLock { count in
+                count += 1
+                return count == 1 ? .status(401) : .status(204)
+            }
+        }
+        let tokenRequests = Mutex<[Bool]>([])
+
+        try await delete(
+            provider(http) { forceRefresh in
+                tokenRequests.withLock { $0.append(forceRefresh) }
+                return forceRefresh ? "fresh-token" : "initial-token"
+            },
+            draftId: draftId
+        )
+
+        let calls = http.recordedCalls()
+        #expect(calls.count == 2)
+        #expect(calls.allSatisfy { $0.method == "DELETE" })
+        #expect(tokenRequests.withLock { $0 } == [false, true])
+    }
+
+    @Test("a second 401 fails after exactly one forced refresh")
+    func deleteDoesNotRefreshTwice() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-auth-exhausted"
+        http.register(
+            path: "/messages/\(draftId)",
+            method: "DELETE",
+            response: .status(401)
+        )
+        let tokenRequests = Mutex<[Bool]>([])
+
+        do {
+            try await delete(
+                provider(http) { forceRefresh in
+                    tokenRequests.withLock { $0.append(forceRefresh) }
+                    return forceRefresh ? "fresh-token" : "initial-token"
+                },
+                draftId: draftId
+            )
+            Issue.record("a repeated 401 must throw")
+        } catch {
+            expectExchangeNetworkError(error, statusCode: 401)
+        }
+
+        #expect(http.recordedCalls().count == 2)
+        #expect(tokenRequests.withLock { $0 } == [false, true])
+    }
+
+    @Test("DELETE exhausts the bounded 429 retry policy as a retryable provider failure")
+    func deleteExhausts429Retries() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-rate-limited"
+        http.register(
+            path: "/messages/\(draftId)",
+            method: "DELETE",
+            response: .status(429)
+        )
+
+        do {
+            try await delete(provider(http), draftId: draftId)
+            Issue.record("an exhausted 429 must throw")
+        } catch {
+            expectExchangeNetworkError(error, statusCode: 429)
+        }
+
+        // One initial request plus the production helper's three bounded retries.
+        #expect(http.recordedCalls().count == 4)
+    }
+
+    @Test("DELETE preserves a transport failure for upstream retry")
+    func deleteTransportFailureThrows() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-transport"
+        http.register(
+            path: "/messages/\(draftId)",
+            method: "DELETE",
+            response: .transportError(.networkConnectionLost)
+        )
+
+        do {
+            try await delete(provider(http), draftId: draftId)
+            Issue.record("a transport failure must throw")
+        } catch {
+            let urlError = error as? URLError
+            #expect(urlError?.code == .networkConnectionLost)
+        }
+
+        #expect(http.recordedCalls().count == 1)
+    }
+
+    @Test("a non-retryable HTTP failure is classified without another request")
+    func deleteOtherStatusFailsWithoutRetry() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let draftId = "graph-draft-server-error"
+        http.register(
+            path: "/messages/\(draftId)",
+            method: "DELETE",
+            response: .status(500)
+        )
+
+        do {
+            try await delete(provider(http), draftId: draftId)
+            Issue.record("a 500 must throw")
+        } catch {
+            expectExchangeNetworkError(error, statusCode: 500)
+        }
+
+        #expect(http.recordedCalls().count == 1)
+    }
+
+    @Test("a non-Outlook draft identity fails before authentication or HTTP")
+    func deleteRejectsWrongIdentityBeforeNetwork() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let tokenRequests = Mutex<[Bool]>([])
+        let exchange = provider(http) { forceRefresh in
+            tokenRequests.withLock { $0.append(forceRefresh) }
+            return "unused-token"
+        }
+
+        do {
+            try await exchange.deleteDraft(identity: .gmail(resourceId: "wrong-provider"))
+            Issue.record("a non-Outlook identity must throw")
+        } catch {
+            guard case ProviderError.actionIdentityResolutionFailed = error else {
+                Issue.record("expected actionIdentityResolutionFailed, got \(error)")
+                return
+            }
+        }
+
+        #expect(tokenRequests.withLock { $0 }.isEmpty)
+        #expect(http.recordedCalls().isEmpty)
     }
 }
