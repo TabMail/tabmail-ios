@@ -580,6 +580,29 @@ struct BackfillResult: Sendable {
     let error: Error?
 }
 
+/// Marker for a provider refusal that is an ABSENCE OF EVIDENCE ABOUT THE SERVER
+/// rather than any verdict on the operation: the provider's own safety gate asked
+/// the server for a proof (a `COPYUID` mapping, a `UIDVALIDITY`) and the server did
+/// not supply one. Nothing was determined, so nothing may be retired — but equally,
+/// nothing about the ACCOUNT was determined either.
+///
+/// That second half is the whole reason this marker exists. These refusals used to
+/// land in `AccountManagerQueue.executeSingleOp`'s generic connection/transient arm,
+/// which inserts the account into `DrainContext.failedAccounts`. That set exists to
+/// stop hammering an account whose PROVIDER IS DOWN — a connectivity fact — and it
+/// is account-wide, so one op the server would never prove stopped every later
+/// gesture on that account from executing, in that drain and identically in every
+/// drain after it. On a standards-valid non-UIDPLUS server (RFC 4315 §3 makes
+/// `COPYUID` a MAY) that is permanent: the user's queue silently stops moving and no
+/// UI lists or clears `PendingOperation` rows. Preserving one intention by denying
+/// every intention behind it is not never-drop.
+///
+/// ⚠ DELIBERATELY EMPTY, and it must stay that way. It carries no cases, no payload
+/// and no requirements, so it can classify a refusal as retryable-and-not-a-provider-
+/// outage and nothing else. It is NOT a licence to retire an op: every conformer
+/// stays durably queued, retrying forever if the server never conforms.
+protocol ProviderEvidenceUnavailable: Error {}
+
 enum ProviderError: LocalizedError {
     case notConnected
     case messageNotFound

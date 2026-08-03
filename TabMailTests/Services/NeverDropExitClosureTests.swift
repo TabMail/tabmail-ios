@@ -439,6 +439,139 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    // MARK: - AUDIT ROUND 2 / MUST FIX 2 — an unprovable op is not an account outage
+
+    /// 🚨 AUDIT ROUND 2. `unprovableMoveKeepsTheOpQueued` above proved the
+    /// unprovable op SURVIVES. It did not ask what that survival cost everything
+    /// else, and the answer was: everything else.
+    ///
+    /// The evidence-unavailable refusals fell through to the drain's generic
+    /// connection/transient arm, which does
+    /// `context.failedAccounts.insert(currentOp.accountId)`. That set means "this
+    /// account's PROVIDER is down, stop hammering it" and it is ACCOUNT-WIDE — so
+    /// an op the server merely declined to prove took every other gesture on the
+    /// account down with it, and `ctx` is per-drain so the next drain reproduced it
+    /// exactly. On a standards-valid non-UIDPLUS server (RFC 4315 §3 makes COPYUID
+    /// a MAY) that is not a hiccup, it is the queue's permanent end state, and no
+    /// UI lists or clears `PendingOperation` rows so the user can neither see it
+    /// nor clear it. Before round 1 the op was simply deleted: one dropped move,
+    /// queue kept working. **Preserving one intention by denying every intention
+    /// behind it is not never-drop — it is a worse violation wearing a safe shape.**
+    ///
+    /// TWO PROPERTIES, both asserted at the server across TWO drains, because the
+    /// fix has to hold a line on each side and the obvious repair breaks the other:
+    ///
+    ///  1. **An UNRELATED op on the same account still reaches the wire.** Different
+    ///     lane, so nothing about it depends on the unprovable op's outcome. Three
+    ///     of them, not one, each landing a distinct flag: the account-wide skip was
+    ///     re-evaluated before EVERY op in a lane, so the second and third were
+    ///     refused even once the first had slipped through.
+    ///  2. **A LANE-MATE of the unprovable op does NOT reach the wire while that op
+    ///     is still queued.** `buildLanes` unions on shared message ids, so a
+    ///     lane-mate names the same message; running it ahead of an unresolved
+    ///     predecessor is the race `.haltLane` exists to prevent, and the fix must
+    ///     not buy property 1 by giving that up. This is a REGRESSION GUARD: it is
+    ///     green pre-fix (the poison stopped everything, including this) and green
+    ///     post-fix, and it goes red on the natural-looking repair that skips the
+    ///     refused op at CLAIM time — which lets its lane form without it.
+    ///
+    /// It deliberately does NOT assert that the unprovable op is still queued (that
+    /// is `unprovableMoveKeepsTheOpQueued`'s job) and never inspects
+    /// `failedAccounts`, `evidenceRefused` or any other drain internal — all
+    /// mechanism, and a test written against them would keep passing if the poison
+    /// simply moved somewhere else.
+    @Test("An op the server will never prove wedges only its own lane, not the account")
+    @MainActor
+    func unprovableOpDoesNotWedgeTheAccountsOtherGestures() async throws {
+        let unprovable = "wedge-unprovable@example.com"
+        let bystander = "wedge-bystander@example.com"
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: [
+                "INBOX": [Self.message(uid: 77, id: unprovable), Self.message(uid: 88, id: bystander)],
+                "Archive": [],
+            ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.expectMutation(rfc822MessageId: unprovable)
+        server.expectMutation(rfc822MessageId: bystander)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-wedge")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        // The op no server without UIDPLUS can ever furnish evidence for.
+        var unprovableMove = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        unprovableMove.createdAt = Date().addingTimeInterval(-60)
+
+        func later(
+            _ type: OperationType, on uid: String, _ secondsAgo: TimeInterval
+        ) -> PendingOperation {
+            var op = PendingOperation(
+                type: type, messageIds: [uid], accountId: f.accountId,
+                folderPath: "INBOX", observedUidValidity: 10)
+            op.createdAt = Date().addingTimeInterval(-secondsAgo)
+            return op
+        }
+        try insert(
+            [
+                unprovableMove,
+                // Property 2's subject: names the SAME message as the unprovable
+                // move, so `buildLanes` puts it in that op's lane, behind it.
+                later(.markFlagged, on: "77", 40),
+                // Property 1's subjects: a different message, therefore a different
+                // lane, therefore nothing to do with the refusal.
+                later(.markRead, on: "88", 30),
+                later(.markFlagged, on: "88", 20),
+                later(.markReplied, on: "88", 10),
+            ],
+            into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainPendingQueue()
+
+        // PROPERTY 1 — the rest of the account still reaches the wire.
+        let unrelated = server.flags(in: "INBOX", uid: 88)
+        #expect(
+            unrelated.contains("\\Seen"),
+            "the first unrelated gesture never reached the server — flags: \(unrelated)")
+        #expect(
+            unrelated.contains("\\Flagged"),
+            """
+            a gesture on an UNRELATED message was refused because a different op could not be \
+            proven. An unprovable refusal is not a provider outage, and one intention may never be \
+            preserved by denying every intention behind it — flags: \(unrelated)
+            """)
+        #expect(
+            unrelated.contains("\\Answered"),
+            """
+            the account is still wedged after the earlier gestures got through — the account-wide \
+            skip is re-evaluated before every op in a lane, so a later one is refused even once an \
+            earlier one slipped past — flags: \(unrelated)
+            """)
+
+        // PROPERTY 2 — the lane-mate is still held behind its unresolved
+        // predecessor. NON-VACUOUS by construction: the identical `.markFlagged`
+        // gesture on uid 88 above provably lands, so this absence is the lane
+        // ordering holding, not `.markFlagged` being unable to work.
+        let laneMate = server.flags(in: "INBOX", uid: 77)
+        #expect(
+            !laneMate.contains("\\Flagged"),
+            """
+            a lane-mate of the unprovable op executed while that op was still queued. They name the \
+            SAME message by construction, so this gesture ran ahead of a predecessor the user \
+            issued FIRST and whose eventual retry will now act against state it never observed — \
+            flags: \(laneMate)
+            """)
+        // C3 holds throughout: nothing was mutated on a message no gesture named.
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - B-2 — retirement is per member, never per batch
 
     /// B-2. When COPYUID named only SOME of the requested UIDs, `move` returned
@@ -522,8 +655,9 @@ struct NeverDropExitClosureTests {
     ///
     /// This is the addressable case. The UNaddressable one — a parent whose folder
     /// or row carries no epoch — is the `IOS-EPOCH-001` accepted fail-closed
-    /// window, where refusing to queue is the specified behaviour and there is no
-    /// wire effect to assert.
+    /// window, where refusing to queue is the specified behaviour. Audit round 2
+    /// wrote that negative case: see
+    /// `sendCompletionWithholdsBothHalvesForAnUnaddressableParent` below.
     ///
     /// RED PROOF (recorded): reverting the producer to
     /// `messageIds: [original.stableId]` with no `observedUidValidity` fails this
@@ -589,6 +723,129 @@ struct NeverDropExitClosureTests {
         }
         #expect(flaggedParent?.isReplied == true)
         #expect(try operations(f.pool).isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - AUDIT ROUND 2 / MUST FIX 3 — the refusal must refuse BOTH halves
+
+    /// 🚨 AUDIT ROUND 2. The negative case the test above scopes out.
+    ///
+    /// `deleteCompletedSendAtomic` set `original.isReplied` / `.isForwarded`
+    /// OUTSIDE its `if let flagAdmission` guards. So for a parent the app cannot
+    /// address — the `IOS-EPOCH-001` fail-closed window — the LOCAL half was
+    /// written and the DURABLE half was not: no op, no retry, no record, no
+    /// disposition to the caller. The UI then said "replied" while the account,
+    /// seen from any other client, had no `\Answered` on that message and never
+    /// would. Both siblings deciding the same question —
+    /// `UserLabelMenuModel.applyLabel`/`removeLabel` and
+    /// `InboxViewModel.removeUserLabel` — guard BEFORE the local mutation so
+    /// neither half lands; this was a third shape inside one remediation.
+    ///
+    /// THE PROPERTY: local state and the server AGREE. `isReplied` is not a private
+    /// note that the user composed something — it is the local mirror of the
+    /// server's `\Answered`, and it may not assert a flag that was never queued.
+    ///
+    /// ⚠ THE FIX IS NOT TO ADMIT THE GESTURE. Withholding an unaddressable durable
+    /// op is the specified disposition and this test would be WRONG to demand a
+    /// `\Answered` here. It demands only that the local half be as withheld as the
+    /// durable half.
+    ///
+    /// ⚠ SCOPE — READ THE NAME LITERALLY. This covers the COMPLETION producer,
+    /// `deleteCompletedSendAtomic`, and nothing else. It is deliberately NOT named
+    /// as an end-to-end guarantee, because there is not one: the OTHER producer,
+    /// `AccountManagerOutbox.persistQueuedSend`, writes
+    /// `UPDATE messageHeader SET isReplied = 1` optimistically at QUEUE time with no
+    /// admission gate, so on the full queue→send→complete path the local claim still
+    /// outlives an unaddressable parent. That write is verbatim in the shipped
+    /// release `07a4bb703`, is correct optimistic-UI behaviour per ADR-IOS-001, and
+    /// is deliberately unchanged; the residual end-to-end gap is registered in
+    /// `KNOWN_ISSUES.md`. A universally-quantified name here would repeat the exact
+    /// hazard that let the label-producer bug survive a release line —
+    /// `ProviderNativeActionAdmissionTests`' *"Every ordinary IMAP producer …"*
+    /// enumerates four.
+    ///
+    /// NON-VACUITY, and the reason the parent carries a `reply` action tag: the tag
+    /// IS cleared. That proves `deleteCompletedSendAtomic` resolved this parent and
+    /// ran its reply branch — so `isReplied == false` is the guard refusing, not the
+    /// function bailing out earlier at `resolveOriginalMessage` and never reaching
+    /// the flag at all. (The tag is local-only by ADR-IOS-036, so clearing it claims
+    /// nothing about the server and is deliberately outside the admission guard.)
+    /// The addressable half of the pair is `completedReplyFlagsItsParentOnTheServer`
+    /// immediately above, which runs the identical shape WITH epochs and gets both.
+    @Test("Send COMPLETION does not mark an unaddressable parent replied when it queues no flag op")
+    @MainActor
+    func sendCompletionWithholdsBothHalvesForAnUnaddressableParent() async throws {
+        let parentRfc = "unaddressable-parent@example.com"
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [Self.message(uid: 57, id: parentRfc)]])
+        server.setUidValidity(10, for: "INBOX")
+        try server.start()
+        defer { server.stop() }
+
+        // The accepted fail-closed window: the folder has never been SELECTed, so
+        // nothing can positively address a message inside it.
+        let f = try fixture(accountId: "closure-unaddressable", folders: [("INBOX", .inbox, nil)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        let parent: MessageHeader = {
+            var value = MessageHeader(
+                messageId: "57", subject: "Original", from: "Sender",
+                fromAddress: "sender@example.com", to: "me@example.com", date: Date(),
+                snippet: "original",
+                folderId: MessageIdentity.folderId(accountId: f.accountId, folderPath: "INBOX"),
+                accountId: f.accountId, folderPath: "INBOX", isInInbox: true)
+            value.rfc822MessageId = parentRfc
+            value.headerComplete = true
+            // No epoch on the row either — an unproven address, both sides.
+            value.observedUidValidity = nil
+            value.setActionTag(.reply)
+            return value
+        }()
+
+        let sent: OutboxMessage = {
+            var value = OutboxMessage(
+                accountId: f.accountId,
+                draft: DraftMessage(
+                    to: ["sender@example.com"], subject: "Re: Original", body: "reply",
+                    inReplyTo: "<\(parentRfc)>"),
+                originalMessageHeaderId: parent.id,
+                isForward: false)
+            value.status = OutboxStatus.sending.rawValue
+            value.sentAt = Date()
+            value.appendedToSent = true
+            return value
+        }()
+        try await f.pool.writeWithoutTransaction { db in
+            try parent.insert(db)
+            try sent.insert(db)
+        }
+
+        _ = try await f.pool.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
+        }
+        await AccountManager.shared.drainPendingQueue()
+
+        let parentId = parent.id
+        let after = try await f.pool.read { db in try MessageHeader.fetchOne(db, key: parentId) }
+
+        // NON-VACUITY: the function really did resolve this parent and run the
+        // reply branch — the local-only action tag was cleared.
+        #expect(
+            after?.actionTag == ActionTag.none,
+            "precondition: the reply branch must have run, or the assertion below proves nothing")
+
+        #expect(
+            after?.isReplied == false,
+            """
+            the parent is marked replied locally while no durable gesture was queued for it and the \
+            server carries no \\Answered. `isReplied` is the local mirror of the server flag, so \
+            writing it here asserts a server-side fact on the strength of evidence we just refused \
+            to act on. Refusing must refuse BOTH halves.
+            """)
+        #expect(
+            !server.flags(in: "INBOX", uid: 57).contains("\\Answered"),
+            "nothing may reach the wire for a parent the app cannot positively address")
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
         await finish(f)

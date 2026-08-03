@@ -3894,7 +3894,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// so it can never become a classification input anywhere else and lands in
     /// the drain's generic requeue-and-retry arm. Its description carries none
     /// of the substrings `AccountManagerQueue.isMessageNotFoundError` matches.
-    private enum IMAPMoveEvidenceUnavailable: Error {
+    private enum IMAPMoveEvidenceUnavailable: ProviderEvidenceUnavailable {
         /// The server does not advertise UIDPLUS, so it can never send
         /// `COPYUID` (RFC 4315 §3). Raised BEFORE the COPY: zero wire mutation,
         /// so a retry costs one SELECT and can never manufacture a duplicate.
@@ -3905,7 +3905,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         case noCopyUidEvidence(source: String, destination: String, requested: Int)
     }
 
-    private enum IMAPDestinationEpochRefusal: Error {
+    /// ⚠ Conforms to `ProviderEvidenceUnavailable` for the SAME reason its two
+    /// siblings above do — it is the same class of refusal (the provider asked the
+    /// server for a destination epoch and did not get a usable one), reaching the
+    /// same generic arm, with the same account-wide wedge. Audit round 2 named the
+    /// siblings explicitly; this one is the third instance of that class and is
+    /// folded in here rather than left as a second door onto the identical defect.
+    private enum IMAPDestinationEpochRefusal: ProviderEvidenceUnavailable {
         /// The destination SELECT reported no usable UIDVALIDITY (SwiftMail
         /// defaults `Mailbox.Selection.uidValidity` to `UIDValidity(0)` when the
         /// server omits the REQUIRED untagged response). Absence of evidence:
@@ -3961,7 +3967,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// forever if the server never conforms. Its description carries none of the
     /// substrings `AccountManagerQueue.isMessageNotFoundError` matches, so it
     /// cannot be mistaken for a confirmed-stale message.
-    private enum IMAPEpochEvidenceMissing: Error {
+    private enum IMAPEpochEvidenceMissing: ProviderEvidenceUnavailable {
         /// The SELECT reported no usable UIDVALIDITY for `folder`.
         case unknownLiveEpoch(folder: String, expected: UInt32)
         /// The caller supplied no usable admitted epoch to compare against.
@@ -4364,12 +4370,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // ids — so "the same string will be refused on every future
                     // drain", the premise that arm rests on, is false here. An
                     // absence of evidence may not retire a durable intention.
-                    // The accepted cost, stated plainly: a retry re-issues the
-                    // COPY, so a server that never reports `COPYUID` accumulates
-                    // one unproven duplicate at the destination per drain while
-                    // the source stays intact. Duplicated mail is recoverable by
-                    // the user; a silently discarded archive/delete is not, and
-                    // the never-drop rule ranks them in that order.
+                    //
+                    // THE ACCEPTED COST, and the bound RE-DERIVED (audit round
+                    // 2) rather than restated. The COPY has ALREADY gone out
+                    // when this throws, so every attempt seats one unproven
+                    // duplicate at the destination while the source stays
+                    // intact. The bound is therefore exactly the number of
+                    // ATTEMPTS, and the earlier text asserted "one per drain"
+                    // without that being enforced anywhere: the drain runs up to
+                    // three passes and re-claims whatever is still queued, so
+                    // any pass after the first could re-attempt this op and seat
+                    // another copy. What makes "one per drain" true is
+                    // `DrainContext.evidenceRefused` — the drain records this op
+                    // and its lane declines to re-enter the provider for the
+                    // rest of that drain. So: ONE unproven duplicate per drain
+                    // in which this op is attempted, and it accumulates across
+                    // drains for as long as the server keeps withholding
+                    // `COPYUID`. Duplicated mail is recoverable by the user; a
+                    // silently discarded archive/delete is not, and the
+                    // never-drop rule ranks them in that order.
                     print("[IMAP] move \(source)→\(destination): COPY returned no per-member COPYUID evidence for \(ids.count) requested uid(s) — REFUSING all source cleanup (fail closed; the copy is unproven, so nothing may be deleted) and keeping the op queued")
                     throw IMAPMoveEvidenceUnavailable.noCopyUidEvidence(
                         source: source, destination: destination, requested: ids.count)

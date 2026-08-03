@@ -15,8 +15,32 @@ extension AccountManager {
     /// at await points. `internal` (not `private`) so tests can construct it directly
     /// to call `executeSingleOp`.
     class DrainContext: @unchecked Sendable {
+        /// Accounts whose PROVIDER is failing — a connectivity fact, deliberately
+        /// account-wide, so one drain does not hammer a server that is down.
+        ///
+        /// ⚠ Membership stops EVERY op on that account for the rest of the drain,
+        /// so only an error that says something about the CONNECTION belongs here.
+        /// A provider refusal that merely could not obtain a proof does not: see
+        /// `ProviderEvidenceUnavailable` and `evidenceRefused`.
         var failedAccounts = Set<String>()
         var foldersToSync: Set<String> = []
+        /// `PendingOperation.id`s whose provider could not obtain the evidence its
+        /// own safety gate requires (`ProviderEvidenceUnavailable`). Per-op, not
+        /// per-account: the op stays durably queued and retries on a LATER drain,
+        /// while everything else on the account keeps executing in THIS one.
+        ///
+        /// ⚠ THE SKIP IS LOAD-BEARING, not an optimization. Without it the outer
+        /// drain loop re-claims this op as soon as any other op sets `executedAny`,
+        /// and `.noCopyUidEvidence` is raised AFTER the `UID COPY` has gone out — so
+        /// every re-attempt within one drain seats another unproven duplicate at the
+        /// destination. Attempt each evidence-refused op AT MOST ONCE PER DRAIN.
+        ///
+        /// ⚠ AND IT IS CONSULTED IN THE LANE LOOP, NEVER THE CLAIM LOOP. The op must
+        /// still be claimed and still enter `buildLanes`, or its lane-mates would
+        /// form a lane without it and run ahead of it — see the comment at the check
+        /// itself. Skipping is about not re-attempting the PROVIDER, not about
+        /// removing the op from its lane.
+        var evidenceRefused: Set<String> = []
         var executedAny = false
         // op.id values that have already produced a [QueueDiag] deep-dump this drain.
         // Prevents log-spam on the same stuck op that retries every drain cycle.
@@ -360,6 +384,37 @@ extension AccountManager {
                             }
                             continue
                         }
+                        // 🚨 ALREADY REFUSED THIS DRAIN for want of provider evidence.
+                        // Attempt it AT MOST ONCE per drain: `.noCopyUidEvidence` is
+                        // raised AFTER the `UID COPY` has gone out, so a second
+                        // attempt inside one drain seats another unproven duplicate
+                        // at the destination.
+                        //
+                        // ⚠ THE CHECK BELONGS HERE, NOT IN THE CLAIM LOOP. Skipping
+                        // the op at claim time would keep it out of `buildLanes`
+                        // entirely, so its lane-mates — ops that share a message id
+                        // with it BY CONSTRUCTION — would form a lane without it and
+                        // execute, running ahead of an unresolved predecessor. That
+                        // is precisely the race `.haltLane` exists to prevent: a
+                        // `delete M` landing before the `move M` the user asked for
+                        // first, with the move's retry then acting on state it never
+                        // observed. Holding the op inside its lane and stopping the
+                        // lane HERE preserves lane membership and ordering while
+                        // still letting every other lane and account drain.
+                        if capturedCtx.evidenceRefused.contains(op.id) {
+                            // This op was claimed (`inFlight`) this pass, so the
+                            // requeue starts AT it, not after it — unlike the
+                            // `.haltLane` branch below, where the op has already been
+                            // dispositioned by `executeSingleOp`.
+                            for heldOp in capturedLane[index...] {
+                                try? await retryWrite(dbPool, label: "Queue") { db in
+                                    var updated = heldOp
+                                    updated.status = PendingStatus.queued.rawValue
+                                    try updated.save(db)
+                                }
+                            }
+                            break
+                        }
                         guard let queue = self.workQueues[op.accountId] else {
                             try? await retryWrite(dbPool, label: "Queue") { db in
                                 var updated = op
@@ -693,10 +748,12 @@ extension AccountManager {
             // depends on server behaviour is an ABSENCE OF EVIDENCE, not an
             // authoritative verdict on an identity, and retiring an op on it is a
             // never-drop violation. `IMAPProvider.move` therefore no longer raises
-            // this error at all: both of its evidence gates now raise the private,
-            // unclassified `IMAPMoveEvidenceUnavailable`, which lands in the generic
-            // retry arm at the bottom of this function. The premises below are once
-            // again true of every op that reaches here.
+            // this error at all: both of its evidence gates raise the private
+            // `IMAPMoveEvidenceUnavailable`, which audit round 2 routed to the
+            // dedicated `ProviderEvidenceUnavailable` arm below — requeue and retry
+            // WITHOUT poisoning the account, rather than the generic connection arm
+            // it originally fell through to. The premises below are once again true
+            // of every op that reaches here.
             //
             // Ported from `v2final:AccountManagerQueue`'s `.deleteDraft` arm
             // ("TERMINAL drop of a provider-authoritative identity refusal").
@@ -732,6 +789,54 @@ extension AccountManager {
                 }
                 context.executedAny = true
                 return .proceed
+            }
+            // 🚨 EVIDENCE UNAVAILABLE — RETRYABLE, AND NOT AN ACCOUNT-LEVEL FACT.
+            //
+            // The provider's own safety gate asked the server for a proof (a
+            // `COPYUID` mapping, a `UIDVALIDITY`) and did not get one. Nothing was
+            // determined about this op, so it stays durably queued — and nothing was
+            // determined about the ACCOUNT either, which is the half this arm exists
+            // to say. Before it, these errors fell through to the generic arm below
+            // and inserted the account into `failedAccounts`, whose skip is
+            // account-wide. On a standards-valid non-UIDPLUS server (RFC 4315 §3
+            // makes `COPYUID` a MAY) one unprovable op therefore stopped EVERY later
+            // gesture on that account from executing — permanently, since `ctx` is
+            // per-drain and the next drain reproduced it identically, and invisibly,
+            // since no UI lists or clears `PendingOperation` rows. The predecessor
+            // behaviour was to delete the op: one dropped move, queue kept working.
+            // Preserving one intention by denying every intention behind it is not
+            // never-drop; it is a worse never-drop violation wearing a safe shape.
+            //
+            // THREE properties, each load-bearing:
+            //  - `.haltLane`, NOT `.proceed`. Every op later in this lane shares a
+            //    message id with this one BY CONSTRUCTION (`buildLanes` is a
+            //    connected-component grouping), so running one ahead of an unresolved
+            //    predecessor races its eventual retry on the wire. The defect was the
+            //    account poisoning; the lane halt is correct and stays.
+            //  - `evidenceRefused`, so this op is attempted AT MOST ONCE per drain.
+            //    Required, not defensive: another lane's success sets `executedAny`,
+            //    the outer loop iterates, and this op would be re-claimed — but
+            //    `.noCopyUidEvidence` is raised AFTER the `UID COPY` has already gone
+            //    out, so each re-attempt seats ANOTHER unproven duplicate at the
+            //    destination.
+            //  - `executedAny` is NOT set. This arm made no progress, so it must not
+            //    by itself keep the drain looping; `if !ctx.executedAny { break }`
+            //    still terminates when nothing else advanced.
+            if error is ProviderEvidenceUnavailable {
+                let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
+                print("[Queue] Evidence unavailable for \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — op stays queued, retries next drain; the rest of this account keeps draining")
+                if !context.diagnosedOpIds.contains(currentOp.id) {
+                    context.diagnosedOpIds.insert(currentOp.id)
+                    await logStuckOpDiagnostic(currentOp, error: error)
+                }
+                try? await retryWrite(dbPool, label: "Queue") { db in
+                    var updated = currentOp
+                    updated.status = PendingStatus.queued.rawValue
+                    updated.retryCount += 1
+                    try updated.save(db)
+                }
+                context.evidenceRefused.insert(currentOp.id)
+                return .haltLane
             }
             // Connection/transient error — reset op to queued and mark account failed.
             // NEVER drop on age alone — transient errors don't confirm the op is stale.
@@ -794,7 +899,23 @@ extension AccountManager {
     /// nothing about the unproven ones. Deleting the whole row there discards
     /// their intention on an absence of evidence; re-running the whole batch
     /// would instead re-copy the proven members and duplicate them at the
-    /// destination. Narrowing is the only shape that does neither.
+    /// destination. Narrowing avoids BOTH of those.
+    ///
+    /// ⚠ IT DOES NOT AVOID DUPLICATION (audit round 2). This used to say
+    /// "narrowing is the only shape that does neither", which is false about the
+    /// unproven members: the initial `UID COPY` was issued for the WHOLE set, so a
+    /// withheld `COPYUID` is SILENCE about the outcome, not evidence the copy
+    /// failed. Those members may well be sitting at the destination already, and
+    /// the narrowed row's retry copies them again.
+    ///
+    /// THE BOUND, stated because "one per drain" was assumed here and is not true
+    /// of this path: this arm sets `executedAny = true`, so the outer loop takes
+    /// another pass and re-claims the narrowed row IN THE SAME DRAIN. It did not
+    /// throw, so `evidenceRefused` — which bounds the zero-evidence sibling in
+    /// `IMAPProvider.move` — does not cover it. The narrowed members can therefore
+    /// be re-copied once per remaining pass, i.e. up to the drain's 3-pass cap,
+    /// and again on every later drain until the server proves or denies them.
+    /// Duplicated mail is recoverable; a dropped intention is not.
     private func retirePartiallyCompletedOp(
         _ currentOp: PendingOperation,
         provenMembers: [String],
