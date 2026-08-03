@@ -101,9 +101,15 @@ enum ReplyParentResolver {
             // be mirrored to the server via setTag.
             let clearedReplyTag = (actionTag == .reply)
             if clearedReplyTag {
+                // Raw SQL (not `MessageHeader.setActionTag`) because this loop
+                // works off a projected `Row`, never a materialised header — so
+                // it stamps `actionTagSetAt` explicitly to keep the invariant
+                // `actionTag != nil ⇒ actionTagSetAt != nil`. `ActionTag.none`
+                // is the real tag VALUE "none", not Optional.none, so this is a
+                // tag ASSIGNMENT and must carry a fresh stamp.
                 try db.execute(
-                    sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
-                    arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, id]
+                    sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ?, actionTagSetAt = ? WHERE id = ?",
+                    arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, Date(), id]
                 )
                 try PendingOperation(
                     type: .setTag,
@@ -130,6 +136,14 @@ enum ReplyParentResolver {
     /// action tags are local-only; mirroring the going-forward `markParents-
     /// Replied` queue behavior here would flood the queue with potentially
     /// thousands of historic ops.
+    ///
+    /// Deliberately does NOT stamp `actionTagSetAt` (unlike the going-forward
+    /// `markParentsReplied` path above): this runs inside migration v53, and on a
+    /// fresh install the `actionTagSetAt` column does not exist yet — v81 adds it
+    /// afterwards. v81's backfill (`WHERE actionTag IS NOT NULL`) covers every row
+    /// this writes, because the `'none'` it assigns is NOT NULL in SQL. Migration
+    /// ordering, not a stamp here, is what keeps `actionTag != nil ⇒
+    /// actionTagSetAt != nil` true for these rows.
     ///
     /// Returns the number of parent rows updated, for logging.
     @discardableResult

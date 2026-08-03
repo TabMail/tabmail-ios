@@ -324,6 +324,35 @@ struct ReplyParentResolverTests {
         #expect(setTagOps[0].messageIds.contains(parent.stableId))
     }
 
+    @Test("Reply-tag clear leaves the parent stamped — a raw-SQL tag write must not break actionTag != nil ⇒ actionTagSetAt != nil")
+    func replyTagClearStampsActionTagSetAt() throws {
+        let db = try TestDatabase.make()
+        // Seeded the legacy way: tag set, stamp NULL — exactly the shape a
+        // pre-v81 row has, so the assertion below can only pass if the
+        // production UPDATE writes the stamp itself.
+        let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
+        let before = Date()
+
+        try db.write { db in
+            _ = try ReplyParentResolver.markParentsReplied(
+                inReplyTos: ["a@x"],
+                folderRole: .sent,
+                accountId: "acc1",
+                db: db
+            )
+        }
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: parent.id) }
+        // `ActionTag.none` is a real tag VALUE, not `Optional.none` — the row
+        // still CARRIES a tag, so it must carry a stamp.
+        #expect(after?.actionTag == ActionTag.none)
+        let setAt = try #require(after?.actionTagSetAt, "a row left carrying a tag with a NULL stamp is swept on the very next maintenance pass")
+        // 1s slack: GRDB persists Date at millisecond precision, so a stamp
+        // taken microseconds after `before` can round just below it.
+        #expect(setAt >= before.addingTimeInterval(-1))
+        #expect(setAt <= Date().addingTimeInterval(1))
+    }
+
     // MARK: - 12. Other action tags are NOT cleared
 
     @Test("Parent with actionTag = .archive → tag preserved, no setTag PendingOp written")

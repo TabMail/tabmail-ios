@@ -322,6 +322,9 @@ enum SyncConfig {
     /// Reply cache TTL — precomputed replies older than this are regenerated (seconds).
     /// Matches TB's SETTINGS.replyTTLSeconds in config.js.
     static let replyTTLSeconds: TimeInterval = 604_800 // 1 week
+    /// Age before an out-of-inbox action tag is reclaimed by sweepStaleActionTags.
+    /// Matches TB's SETTINGS.actionTTLSeconds (1 week). Inbox tags are never swept.
+    static let actionTagTTLSeconds: TimeInterval = 604_800
     /// AI cache TTL — MessageAICache entries not refreshed within this period are purged.
     /// Entries are touched during inbox sync; entries for messages that leave inbox expire.
     static let aiCacheTTLDays = 7

@@ -246,6 +246,93 @@ struct ApplyManualTagAICacheTests {
     }
 }
 
+// MARK: - Action tag stamp invariant (Round D-0b)
+
+/// Pins the SYSTEM PROPERTY the `actionTagSetAt` column exists to guarantee:
+/// **a persisted row that carries an `actionTag` also carries a stamp**
+/// (`actionTag != nil ⇒ actionTagSetAt != nil`). Without it, `sweepStaleActionTags`
+/// has no TTL basis and a legacy/unstamped row is indistinguishable from a
+/// fresh one.
+///
+/// These drive `MessageHeader.setActionTag` — the single mutator every
+/// model-save tag writer routes through — rather than any one caller's
+/// mechanism, so a new writer that hand-assigns `actionTag` cannot pass by
+/// coincidence.
+@Suite("Action tag stamp invariant (Round D-0b)")
+struct ActionTagStampInvariantTests {
+
+    @Test("setActionTag(non-nil) stamps actionTagSetAt and the derived tagSortOrder together")
+    func setStampsAll() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1")
+        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let msg = try TestDatabase.insertMessageHeader(
+            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX"
+        )
+
+        let before = Date()
+        try db.write { db in
+            guard var header = try MessageHeader.fetchOne(db, key: msg.id) else { return }
+            header.setActionTag(.archive)
+            try header.save(db)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
+        #expect(updated?.actionTag == .archive)
+        #expect(updated?.tagSortOrder == ActionTag.archive.sortOrder)
+        let setAt = try #require(updated?.actionTagSetAt)
+        // 1s slack: GRDB persists Date at millisecond precision, so a stamp
+        // taken microseconds after `before` can round just below it.
+        #expect(setAt >= before.addingTimeInterval(-1), "a tag write must carry the moment it happened, not an inherited stamp")
+        #expect(setAt <= Date().addingTimeInterval(1))
+    }
+
+    @Test("setActionTag(nil) clears the stamp with the tag — no orphan stamp survives")
+    func clearNilsStamp() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1")
+        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let msg = try TestDatabase.insertMessageHeader(
+            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1",
+            folderPath: "INBOX", actionTag: .reply
+        )
+
+        try db.write { db in
+            guard var header = try MessageHeader.fetchOne(db, key: msg.id) else { return }
+            header.setActionTag(.archive)          // stamp it first…
+            header.setActionTag(nil)               // …then clear
+            try header.save(db)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
+        #expect(updated?.actionTag == nil)
+        #expect(updated?.tagSortOrder == 99)
+        #expect(updated?.actionTagSetAt == nil)
+    }
+
+    @Test("ActionTag.none is a tag VALUE, not absence — setActionTag(.none) STAMPS rather than clearing")
+    func actionTagNoneStampsNotClears() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1")
+        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let msg = try TestDatabase.insertMessageHeader(
+            db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1",
+            folderPath: "INBOX", actionTag: .reply
+        )
+
+        try db.write { db in
+            guard var header = try MessageHeader.fetchOne(db, key: msg.id) else { return }
+            header.setActionTag(ActionTag.none)
+            try header.save(db)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: msg.id) }
+        #expect(updated?.actionTag == ActionTag.none)
+        #expect(updated?.tagSortOrder == ActionTag.none.sortOrder)
+        #expect(updated?.actionTagSetAt != nil, "`ActionTag.none` is not `Optional.none`; the row still carries a tag and must carry a stamp")
+    }
+}
+
 @Suite("ApplyManualTag — Auto-Prompt Update Guard")
 struct ApplyManualTagAutoPromptTests {
 

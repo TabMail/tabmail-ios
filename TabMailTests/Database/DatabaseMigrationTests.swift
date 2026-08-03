@@ -666,6 +666,152 @@ struct DatabaseMigrationTests {
         let inserted = try db.read { try PendingOperation.fetchOne($0, key: fresh.id) }
         #expect(inserted?.everAttempted == false)
     }
+
+    // MARK: - The migration chain's arrival invariants
+
+    /// The database's whole SHAPE as comparable text, so two databases can be
+    /// compared without naming a single column by hand.
+    ///
+    /// Three layers, because no one of them is sufficient: every `sqlite_master`
+    /// entry (tables, indexes, triggers, views — autoindexes appear here with a
+    /// NULL `sql`), then each table's `columnShape` (a renamed/retyped/reordered
+    /// column that left the CREATE text alone still fails) and `indexShape` (which
+    /// reads `PRAGMA index_list`, the only place the implicit primary-key
+    /// autoindex is visible at all).
+    private static func schemaDump(_ db: DatabaseQueue) throws -> [String] {
+        let objects: [String] = try db.read { conn in
+            try Row.fetchAll(conn, sql: """
+                SELECT type, name, tbl_name, COALESCE(sql, '∅') AS sql
+                FROM sqlite_master
+                ORDER BY type, name, tbl_name
+                """).map {
+                "\($0["type"] as String)|\($0["name"] as String)|\($0["tbl_name"] as String)|\($0["sql"] as String)"
+            }
+        }
+        let tables: [String] = try db.read { conn in
+            try String.fetchAll(
+                conn, sql: "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        }
+        var dump = objects
+        for table in tables {
+            let columns = try columnShape(db, table).map { "col \(table).\($0)" }
+            let indexes = try indexShape(db, table).map { "idx \(table).\($0)" }
+            dump.append("── \(table)")
+            dump.append(contentsOf: columns)
+            dump.append(contentsOf: indexes)
+        }
+        return dump
+    }
+
+    /// GRDB's applied-migrations ledger, read straight out of GRDB's own table
+    /// rather than through `DatabaseMigrator` — the point is what is RECORDED,
+    /// not what the migrator computes.
+    private static func appliedLedger(_ db: DatabaseQueue) throws -> [String] {
+        try db.read {
+            try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier")
+        }
+    }
+
+    /// 🚨 THE INVARIANT EVERY INSTALLED DEVICE DEPENDS ON, ASSERTED AS AN OUTCOME.
+    ///
+    /// Migrations are IMMUTABLE once applied, and `registerAllMigrations` now
+    /// registers all of them through a wrapper — i.e. something in the execution
+    /// path around every already-shipped body changed even though no identifier or
+    /// SQL did. The property that must survive that is: a database already at the
+    /// current version runs **zero** migration bodies on the next launch, and its
+    /// schema does not move.
+    ///
+    /// "Zero bodies ran" is asserted through the two migrations that would leave
+    /// FORENSIC EVIDENCE if they re-ran — `v74` (`DELETE FROM pendingOperation`)
+    /// and `v78` (`UPDATE pendingOperation SET everAttempted = 1`) — against a
+    /// sentinel row inserted AFTER the first pass. "No schema change" is asserted
+    /// through the whole schema dump plus `PRAGMA schema_version`, SQLite's own DDL
+    /// counter, which any re-run `ALTER`/`CREATE` would move.
+    ///
+    /// Nothing here inspects the wrapper, a clock, or a log line: a test that
+    /// pinned the mechanism would go green on a wrapper that re-ran everything.
+    @Test("An already-migrated database runs no migration body on a second pass")
+    func alreadyMigratedDatabaseRunsNoMigrationBodyOnASecondPass() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", provider: .gmail)
+        // Sentinel: v74 would DELETE this row, v78 would flip everAttempted to 1.
+        try Self.insertRawPendingOperation(db, id: "op-sentinel", accountId: "acc1")
+
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        let registered = migrator.migrations
+        let ledgerBefore = try Self.appliedLedger(db)
+        // Non-vacuity: the second pass is only a no-op test if the FIRST pass
+        // really applied the whole chain.
+        #expect(!registered.isEmpty)
+        #expect(ledgerBefore == registered.sorted())
+        let cookieBeforeValue = try db.read { try Int.fetchOne($0, sql: "PRAGMA schema_version") }
+        // `try #require` rather than comparing two optionals: if the pragma stopped
+        // being readable, `nil == nil` would pass and assert nothing.
+        let schemaCookieBefore = try #require(cookieBeforeValue)
+        let schemaBefore = try Self.schemaDump(db)
+
+        try AppDatabase.runMigrations(on: db)
+
+        let cookieAfterValue = try db.read { try Int.fetchOne($0, sql: "PRAGMA schema_version") }
+        let schemaCookieAfter = try #require(cookieAfterValue)
+        let schemaAfter = try Self.schemaDump(db)
+        let ledgerAfter = try Self.appliedLedger(db)
+        let sentinelRow = try db.read {
+            try Row.fetchOne(
+                $0, sql: "SELECT everAttempted FROM pendingOperation WHERE id = 'op-sentinel'")
+        }
+
+        #expect(ledgerAfter == ledgerBefore)
+        #expect(schemaAfter == schemaBefore)
+        #expect(schemaCookieAfter == schemaCookieBefore,
+                "no DDL ran, so SQLite's schema cookie must not move")
+        let sentinel = try #require(sentinelRow, "v74's DELETE must not have re-run")
+        #expect((sentinel["everAttempted"] as Int) == 0,
+                "v78's backfill UPDATE must not have re-run")
+    }
+
+    /// 🚨 THE TWO WAYS A DEVICE ARRIVES AT THE CURRENT SCHEMA MUST AGREE.
+    ///
+    /// A NEW install runs the whole chain in one pass; an EXISTING install that
+    /// shipped every intermediate release arrives one version at a time. Because
+    /// the wrapper is applied to ALL registrations at once, anything it perturbed
+    /// — registration order, `v2`'s `foreignKeyChecks: .deferred` mode, the
+    /// identifier GRDB records — would show up as these two paths landing on
+    /// different schemas. Compared whole: DDL text, column shape and index shape
+    /// (autoindexes included) for every table.
+    @Test("A fresh database and one upgraded version-by-version reach the same schema")
+    func freshAndVersionByVersionUpgradedDatabasesReachTheSameSchema() throws {
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        let identifiers = migrator.migrations
+        // Non-vacuity: the stepped path must really have taken many steps.
+        #expect(identifiers.count > 1)
+        guard identifiers.count > 1 else { return }
+
+        let fresh = try TestDatabase.make()
+
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let upgraded = try DatabaseQueue(configuration: configuration)
+        for identifier in identifiers {
+            try migrator.migrate(upgraded, upTo: identifier)
+        }
+
+        // Both paths must have recorded the SAME ledger — the identifiers are what
+        // GRDB keys on, so a diverging ledger is a diverging schema by definition.
+        let expectedLedger = identifiers.sorted()
+        let freshLedger = try Self.appliedLedger(fresh)
+        let upgradedLedger = try Self.appliedLedger(upgraded)
+        #expect(freshLedger == expectedLedger)
+        #expect(upgradedLedger == expectedLedger)
+
+        let freshDump = try Self.schemaDump(fresh)
+        let upgradedDump = try Self.schemaDump(upgraded)
+        // Non-vacuity: an empty dump would make the comparison below trivially true.
+        #expect(!freshDump.isEmpty)
+        #expect(freshDump == upgradedDump)
+    }
 }
 
 /// `v70` drops and recreates a table in the MAIN database. The two other stores a
@@ -732,11 +878,16 @@ struct V70CrossStoreInvariantTests {
         try TestDatabase.insertMessageBody(db, headerId: "acc1:INBOX:1")
 
         let key = ContentKey(rawValue: "acc1:INBOX:1")
+        // The message this cached attachment belongs to. Same value on the write and
+        // the read: the point of this test is that the SAME message still gets its
+        // cache back across the migration, not that any lookup does.
+        let v70AttachmentIdentityStamp = "rfc:v70-cached@example.com"
         let pixel = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         let inlineId = BodyAssetStore.writeInlineImage(
             contentKey: key, contentId: "cid-1", contentType: "image/png", data: pixel)
         let attachmentId = BodyAssetStore.writeAttachment(
-            contentKey: key, section: "2", contentType: "application/pdf", data: pixel)
+            contentKey: key, section: "2", contentType: "application/pdf", data: pixel,
+            identityStamp: v70AttachmentIdentityStamp)
         #expect(inlineId != nil)
         #expect(attachmentId != nil)
         let filesBefore = Self.filesOnDisk(dir)
@@ -750,7 +901,9 @@ struct V70CrossStoreInvariantTests {
         #expect(Self.filesOnDisk(dir) == filesBefore,
                 "v70 must not delete still-owned assets — their headers are untouched")
         #expect(BodyAssetStore.allManifestContentKeys().contains(key))
-        #expect(BodyAssetStore.attachmentAssetId(contentKey: key, section: "2") == attachmentId,
+        #expect(BodyAssetStore.attachmentAssetId(
+                    contentKey: key, section: "2",
+                    identityStamp: v70AttachmentIdentityStamp) == attachmentId,
                 "the cached attachment must still resolve, so the refetch skips the network")
         if let inlineId {
             let url = BodyAssetStore.urlOnDisk(assetId: inlineId)
@@ -764,7 +917,8 @@ struct V70CrossStoreInvariantTests {
         let inlineIdAgain = BodyAssetStore.writeInlineImage(
             contentKey: key, contentId: "cid-1", contentType: "image/png", data: pixel)
         let attachmentIdAgain = BodyAssetStore.writeAttachment(
-            contentKey: key, section: "2", contentType: "application/pdf", data: pixel)
+            contentKey: key, section: "2", contentType: "application/pdf", data: pixel,
+            identityStamp: v70AttachmentIdentityStamp)
         #expect(inlineIdAgain == inlineId)
         #expect(attachmentIdAgain == attachmentId)
         #expect(Self.filesOnDisk(dir) == filesBefore,
@@ -842,5 +996,71 @@ struct V70CrossStoreInvariantTests {
             try Int.fetchOne($0, sql: "SELECT observedUidValidity FROM messageHeader WHERE id = ?", arguments: [headerId])
         }
         #expect(value == nil)
+    }
+
+    /// The legacy-row rule for `actionTagSetAt`: every row already carrying a
+    /// tag when v81 runs is stamped AT MIGRATION TIME, so it gets a full
+    /// `SyncConfig.actionTagTTLSeconds` from the upgrade instead of being
+    /// instantly stale — and rows with no tag stay NULL, so the backfill
+    /// cannot invent a stamp with nothing to stamp. Two-sided on purpose: an
+    /// unconditional backfill fails the second assertion, a missing backfill
+    /// fails the first.
+    @Test("v81: backfills actionTagSetAt for pre-migration tagged rows and leaves untagged rows NULL")
+    func v81BackfillsStampForTaggedRowsOnly() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var beforeMigrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &beforeMigrator)
+        try beforeMigrator.migrate(db, upTo: "v80_addDraftReplyTargetAddress")
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        let taggedId = try insertPreV77Header(db, messageId: "81-tagged", actionTag: .reply)
+        let untaggedId = try insertPreV77Header(db, messageId: "81-untagged", actionTag: nil)
+
+        let before = Date()
+        var afterMigrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &afterMigrator)
+        try afterMigrator.migrate(db, upTo: "v81_addActionTagSetAt")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(messageHeader)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "actionTagSetAt" })
+        #expect((column["notnull"] as Int) == 0)
+
+        let tagged = try db.read { try MessageHeader.fetchOne($0, key: taggedId) }
+        let stamp = try #require(tagged?.actionTagSetAt, "an existing tagged row must survive the upgrade with a full TTL, not be instantly stale")
+        #expect(stamp >= before.addingTimeInterval(-1))
+
+        let untagged = try db.read { try MessageHeader.fetchOne($0, key: untaggedId) }
+        #expect(untagged?.actionTag == nil)
+        #expect(untagged?.actionTagSetAt == nil, "no tag means nothing to stamp")
+    }
+
+    @Test("v81: a fresh install has a nullable actionTagSetAt column that round-trips a stamp")
+    func v81FreshInstallColumnIsUsableImmediately() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db)
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        let before = Date()
+        var header = MessageHeader(
+            messageId: "81-fresh", subject: "s", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "snippet",
+            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        header.setActionTag(.reply)
+        try db.write { try header.insert($0) }
+
+        let stored = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(stored?.actionTag == .reply)
+        let stamp = try #require(stored?.actionTagSetAt)
+        #expect(stamp >= before.addingTimeInterval(-1))
     }
 }

@@ -138,6 +138,16 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     var actionTag: ActionTag?
     var tagSortOrder: Int = 99  // Mirrors actionTag?.sortOrder ?? 99 for triage sorting
 
+    /// When `actionTag` was last assigned a non-nil value. Nil whenever
+    /// `actionTag` is nil. Drives `sweepStaleActionTags`'s TTL reclaim
+    /// (`SyncConfig.actionTagTTLSeconds`, migration v81) — the sweep only
+    /// enumerates non-inbox folders, so an inbox tag is never swept
+    /// regardless of age; only an out-of-inbox tag older than the TTL is
+    /// reclaimed. A NULL stamp on a non-nil tag (pre-migration legacy row,
+    /// or a writer that failed to stamp) is treated as immediately
+    /// eligible — fail-safe toward MORE reclaiming, never less.
+    var actionTagSetAt: Date? = nil
+
     // AI-generated summary fields
     var summaryBlurb: String?
     var summaryTodos: String?
@@ -216,6 +226,22 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
             return rfc822
         }
         return messageId
+    }
+
+    /// Set `actionTag` (and its two derived companions, `tagSortOrder` and
+    /// `actionTagSetAt`) atomically. Use this instead of assigning `actionTag`
+    /// directly wherever a model-save path applies a NEW tag value or clears
+    /// one: a non-nil `tag` stamps `actionTagSetAt = date` (defaults to now —
+    /// the moment this write happens); nil clears both `tagSortOrder` (→ 99)
+    /// and `actionTagSetAt` (→ nil) together, preserving the invariant
+    /// `actionTag != nil ⇒ actionTagSetAt != nil`. Callers CARRYING a stamp
+    /// forward from another row/generation (identity merges, AI-cache
+    /// restores, provider-DTO round-trips) should pass that source's
+    /// `actionTagSetAt` as `date` instead of accepting the `Date()` default.
+    mutating func setActionTag(_ tag: ActionTag?, at date: Date = Date()) {
+        actionTag = tag
+        actionTagSetAt = tag == nil ? nil : date
+        tagSortOrder = tag?.sortOrder ?? 99
     }
 
     // MARK: - GRDB Associations

@@ -469,8 +469,16 @@ final class AppDatabase: Sendable {
 
     // MARK: - Migration Definitions
 
+    /// Every schema migration, in order. Registered through
+    /// `DatabaseMigrator.registerTimedMigration` (bottom of this file) — a
+    /// pass-through wrapper that adds a debug-gated per-migration duration line
+    /// and forwards the identifier and body to GRDB unchanged.
+    ///
+    /// The identifier strings and bodies below are what GRDB records in
+    /// `grdb_migrations`: **immutable once applied**. Never edit an applied
+    /// migration — add a new one.
     static func registerAllMigrations(on migrator: inout DatabaseMigrator) {
-        migrator.registerMigration("v1_createTables") { db in
+        migrator.registerTimedMigration("v1_createTables") { db in
             // Account
             try db.create(table: "account") { t in
                 t.primaryKey("id", .text)
@@ -592,7 +600,7 @@ final class AppDatabase: Sendable {
         // The FK prevents optimistic UI updates (setting folderId = "" for pending
         // archive/delete) because "" is not a valid folder.id. Replace with FK on
         // accountId → account for CASCADE cleanup on account deletion.
-        migrator.registerMigration("v2_dropMessageHeaderFolderFK", foreignKeyChecks: .deferred) { db in
+        migrator.registerTimedMigration("v2_dropMessageHeaderFolderFK", foreignKeyChecks: .deferred) { db in
             // Backup existing data
             try db.execute(sql: "CREATE TABLE messageHeader_backup AS SELECT * FROM messageHeader")
             try db.execute(sql: "CREATE TABLE messageBody_backup AS SELECT * FROM messageBody")
@@ -660,7 +668,7 @@ final class AppDatabase: Sendable {
         }
 
         // v3: Add outboxMessage table for offline send queue.
-        migrator.registerMigration("v3_createOutboxMessage") { db in
+        migrator.registerTimedMigration("v3_createOutboxMessage") { db in
             try db.create(table: "outboxMessage") { t in
                 t.primaryKey("id", .text)
                 t.column("accountId", .text).notNull()
@@ -688,14 +696,14 @@ final class AppDatabase: Sendable {
         // v4: Add sentAt column — set after successful provider.send() but before
         // DB delete. Allows reconcileOutbox to distinguish "crashed mid-send" from
         // "crashed after send succeeded" and avoid double-sends.
-        migrator.registerMigration("v4_addOutboxSentAt") { db in
+        migrator.registerTimedMigration("v4_addOutboxSentAt") { db in
             try db.alter(table: "outboxMessage") { t in
                 t.add(column: "sentAt", .datetime)
             }
         }
 
         // v5: Add isPrimary column to account — explicit primary account for compose default.
-        migrator.registerMigration("v5_addAccountIsPrimary") { db in
+        migrator.registerTimedMigration("v5_addAccountIsPrimary") { db in
             try db.alter(table: "account") { t in
                 t.add(column: "isPrimary", .boolean).notNull().defaults(to: false)
             }
@@ -707,7 +715,7 @@ final class AppDatabase: Sendable {
         }
 
         // v6: Add chatTurn table for persistent agent chat history (device-local, not synced).
-        migrator.registerMigration("v6_createChatTurn") { db in
+        migrator.registerTimedMigration("v6_createChatTurn") { db in
             try db.create(table: "chatTurn") { t in
                 t.primaryKey("id", .text)
                 t.column("timestamp", .double).notNull()
@@ -723,7 +731,7 @@ final class AppDatabase: Sendable {
         // v7: Add renderedContent column to chatTurn — stores pre-processed text with resolved
         // email pills (subjects baked in) so history renders correctly across sessions.
         // Matches TB's _rendered snapshot approach.
-        migrator.registerMigration("v7_addChatTurnRenderedContent") { db in
+        migrator.registerTimedMigration("v7_addChatTurnRenderedContent") { db in
             try db.alter(table: "chatTurn") { t in
                 t.add(column: "renderedContent", .text)
             }
@@ -731,7 +739,7 @@ final class AppDatabase: Sendable {
 
         // v8: Pending calendar operation queue — crash-safe calendar mutations.
         // Mirrors PendingOperation pattern: persist before acknowledging, drain async.
-        migrator.registerMigration("v8_createPendingCalendarOperation") { db in
+        migrator.registerTimedMigration("v8_createPendingCalendarOperation") { db in
             try db.create(table: "pendingCalendarOperation") { t in
                 t.primaryKey("id", .text)
                 t.column("operationType", .text).notNull()
@@ -747,7 +755,7 @@ final class AppDatabase: Sendable {
 
         // v9: Backfill subject-based threadIds for existing IMAP messages (threadId IS NULL).
         // Uses cursor for bounded memory. Gmail messages already have threadId — skipped.
-        migrator.registerMigration("v9_backfillThreadIds") { db in
+        migrator.registerTimedMigration("v9_backfillThreadIds") { db in
             let rows = try Row.fetchCursor(db, sql: """
                 SELECT id, accountId, subject FROM messageHeader WHERE threadId IS NULL
             """)
@@ -763,7 +771,7 @@ final class AppDatabase: Sendable {
 
         // v10: Add cc/bcc columns to messageHeader for FTS search parity with TB.
         // Defaults to empty string — will be populated on next header re-fetch.
-        migrator.registerMigration("v10_addCcBcc") { db in
+        migrator.registerTimedMigration("v10_addCcBcc") { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "cc", .text).notNull().defaults(to: "")
                 t.add(column: "bcc", .text).notNull().defaults(to: "")
@@ -773,7 +781,7 @@ final class AppDatabase: Sendable {
         // v11: Add sessionId to chatTurn — groups turns into sessions for swipe-navigable
         // history in the chat pill. Existing turns keep NULL sessionId (visible in Settings
         // Chat History only, not in pill session navigation).
-        migrator.registerMigration("v11_addChatTurnSessionId") { db in
+        migrator.registerTimedMigration("v11_addChatTurnSessionId") { db in
             try db.alter(table: "chatTurn") { t in
                 t.add(column: "sessionId", .text)
             }
@@ -782,7 +790,7 @@ final class AppDatabase: Sendable {
 
         // v12: Persistent ID mapping for ChatIdTranslator — survives app restart so that
         // pill references ([Email](N)) in old sessions remain resolvable.
-        migrator.registerMigration("v12_createChatIdMapping") { db in
+        migrator.registerTimedMigration("v12_createChatIdMapping") { db in
             try db.create(table: "chatIdMapping") { t in
                 t.primaryKey("numericId", .integer)
                 t.column("realId", .text).notNull().unique()
@@ -791,7 +799,7 @@ final class AppDatabase: Sendable {
 
         // v13: Add inReplyTo column to messageHeader — RFC 2822 In-Reply-To header
         // for header-based thread detection (replaces subject heuristic).
-        migrator.registerMigration("v13_addMessageHeaderInReplyTo") { db in
+        migrator.registerTimedMigration("v13_addMessageHeaderInReplyTo") { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "inReplyTo", .text)
             }
@@ -801,7 +809,7 @@ final class AppDatabase: Sendable {
         // v14: Add backfillUidCursor column to folder — IMAP backfill walks backward
         // from UIDNEXT by UID range instead of date-windowed SEARCH.
         // Seed cursor for in-progress IMAP backfills from MIN(messageId) where messageId is numeric (UID).
-        migrator.registerMigration("v14_addFolderBackfillUidCursor") { db in
+        migrator.registerTimedMigration("v14_addFolderBackfillUidCursor") { db in
             try db.alter(table: "folder") { t in
                 t.add(column: "backfillUidCursor", .integer)
             }
@@ -830,14 +838,14 @@ final class AppDatabase: Sendable {
         // v15: Add backfillPageToken column to folder — Gmail/Exchange page-token cursor
         // for backfill. Walks the full label/folder listing one page at a time, resuming
         // from stored token. Nil means start from page 1.
-        migrator.registerMigration("v15_addFolderBackfillPageToken") { db in
+        migrator.registerTimedMigration("v15_addFolderBackfillPageToken") { db in
             try db.alter(table: "folder") { t in
                 t.add(column: "backfillPageToken", .text)
             }
         }
 
         // v16: CalDAV support — config table + calendarOnly flag on account.
-        migrator.registerMigration("v16_createCalDAVConfig") { db in
+        migrator.registerTimedMigration("v16_createCalDAVConfig") { db in
             try db.create(table: "caldavConfig") { t in
                 t.primaryKey("id", .text)
                 t.column("accountId", .text).notNull()
@@ -852,7 +860,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v17_addCalendarOnlyToAccount") { db in
+        migrator.registerTimedMigration("v17_addCalendarOnlyToAccount") { db in
             try db.alter(table: "account") { t in
                 t.add(column: "calendarOnly", .boolean).notNull().defaults(to: false)
             }
@@ -862,14 +870,14 @@ final class AppDatabase: Sendable {
         // the outbox message stays alive until the copy is appended to the Sent folder.
         // sentMessageId: RFC822 Message-ID generated before send (used for dedup on retry).
         // appendedToSent: false until IMAP APPEND (or Gmail/Exchange auto-save) confirms.
-        migrator.registerMigration("v18_addOutboxSentAppend") { db in
+        migrator.registerTimedMigration("v18_addOutboxSentAppend") { db in
             try db.alter(table: "outboxMessage") { t in
                 t.add(column: "sentMessageId", .text)
                 t.add(column: "appendedToSent", .boolean).notNull().defaults(to: false)
             }
         }
 
-        migrator.registerMigration("v19_addMessageBodyIcsText") { db in
+        migrator.registerTimedMigration("v19_addMessageBodyIcsText") { db in
             try db.alter(table: "messageBody") { t in
                 t.add(column: "icsText", .text)
             }
@@ -878,7 +886,7 @@ final class AppDatabase: Sendable {
         // v20: Add remindersSnapshot to chatTurn — stores the reminder list shown when a session
         // started, as JSON. Only populated on the first turn of each session. Enables read-only
         // reminder display when viewing past sessions.
-        migrator.registerMigration("v20_addChatTurnRemindersSnapshot") { db in
+        migrator.registerTimedMigration("v20_addChatTurnRemindersSnapshot") { db in
             try db.alter(table: "chatTurn") { t in
                 t.add(column: "remindersSnapshot", .text)
             }
@@ -887,14 +895,14 @@ final class AppDatabase: Sendable {
         // v21: Composite index for efficient unread count queries.
         // COUNT(*) WHERE folderId = ? AND isRead = 0 is a covering index scan
         // instead of index lookup + row filter.
-        migrator.registerMigration("v21_addUnreadCountIndex") { db in
+        migrator.registerTimedMigration("v21_addUnreadCountIndex") { db in
             try db.create(index: "messageHeader_folderId_isRead", on: "messageHeader", columns: ["folderId", "isRead"])
         }
 
         // v22: Email context snapshot for message-detail chat sessions.
         // Stores the email being discussed (subject, from, messageHeaderId) on the first
         // turn of a message-detail session so past sessions show which email was discussed.
-        migrator.registerMigration("v22_addChatTurnEmailContext") { db in
+        migrator.registerTimedMigration("v22_addChatTurnEmailContext") { db in
             try db.alter(table: "chatTurn") { t in
                 t.add(column: "emailContextJSON", .text)
             }
@@ -903,7 +911,7 @@ final class AppDatabase: Sendable {
         // v23: Draft persistence for compose sessions.
         // Stores draft state (to/cc/bcc/subject/body) + edit history so compose chat
         // can resume on reopen. Tied to reply/forward via replyToId, or new compose via UUID key.
-        migrator.registerMigration("v23_createDraft") { db in
+        migrator.registerTimedMigration("v23_createDraft") { db in
             try db.create(table: "draft") { t in
                 t.primaryKey("id", .text)                           // draftKey: "reply:{id}", "forward:{id}", "new:{uuid}"
                 t.column("accountId", .text).notNull()
@@ -928,7 +936,7 @@ final class AppDatabase: Sendable {
         // rfc822MessageId: Stable Message-ID for IMAP dedup across UID changes
         // attachmentsDirName: Disk directory for draft attachments (mirrors outbox pattern)
         // Also adds serverDraftId to outboxMessage for post-send draft cleanup.
-        migrator.registerMigration("v24_addServerDraftSync") { db in
+        migrator.registerTimedMigration("v24_addServerDraftSync") { db in
             try db.alter(table: "draft") { t in
                 t.add(column: "serverDraftId", .text)
                 t.add(column: "serverPushStatus", .text)
@@ -945,7 +953,7 @@ final class AppDatabase: Sendable {
         // chatHistory = memory (dereferenced content, searchable by MemorySearchTool).
         // Written alongside chatTurn on every turn persist. Evicted only by global turn cap.
         // Backfill existing chatTurn data: use renderedContent if available, else content.
-        migrator.registerMigration("v25_createChatHistory") { db in
+        migrator.registerTimedMigration("v25_createChatHistory") { db in
             try db.create(table: "chatHistory") { t in
                 t.primaryKey("id", .text)              // same ID as chatTurn
                 t.column("timestamp", .double).notNull()
@@ -970,7 +978,7 @@ final class AppDatabase: Sendable {
         // v26: Add referencesJSON column to messageHeader — RFC 2822 References header
         // as JSON array of normalized message IDs. Enables thread detection when inReplyTo
         // points to a message not in the local DB (common with forwarded email chains).
-        migrator.registerMigration("v26_addMessageHeaderReferences") { db in
+        migrator.registerTimedMigration("v26_addMessageHeaderReferences") { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "referencesJSON", .text)
             }
@@ -980,7 +988,7 @@ final class AppDatabase: Sendable {
         // computedThreadId: assigned once at insert time. Gmail/Exchange: copied from native threadId.
         // IMAP: computed by chain-walking inReplyTo/References in the DB.
         // messageReference: junction table for indexed reverse lookups of References header.
-        migrator.registerMigration("v27_computedThreadId") { db in
+        migrator.registerTimedMigration("v27_computedThreadId") { db in
             // 1. Add computedThreadId column
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "computedThreadId", .text).notNull().defaults(to: "")
@@ -1100,13 +1108,13 @@ final class AppDatabase: Sendable {
         // v28: Add calendarId to pendingCalendarOperation — stores which calendar
         // an event belongs to so edit/delete operations target the correct calendar.
         // Nullable for backwards compat: existing queued ops fall back to preferred calendar.
-        migrator.registerMigration("v28_addPendingCalendarOpCalendarId") { db in
+        migrator.registerTimedMigration("v28_addPendingCalendarOpCalendarId") { db in
             try db.alter(table: "pendingCalendarOperation") { t in
                 t.add(column: "calendarId", .text)
             }
         }
 
-        migrator.registerMigration("v29_addChatTurnThinkingContent") { db in
+        migrator.registerTimedMigration("v29_addChatTurnThinkingContent") { db in
             try db.alter(table: "chatTurn") { t in
                 t.add(column: "thinkingContent", .text)
             }
@@ -1116,7 +1124,7 @@ final class AppDatabase: Sendable {
         // The old cursor could advance past failed ranges, permanently skipping messages.
         // Re-walking with the new claim/confirm model ensures nothing is missed.
         // Existing messages are preserved — dedup in insertBackfillBatch handles duplicates.
-        migrator.registerMigration("v30_resetBackfillForRobustCursor") { db in
+        migrator.registerTimedMigration("v30_resetBackfillForRobustCursor") { db in
             try db.execute(sql: """
                 UPDATE folder SET
                     backfillComplete = 0,
@@ -1131,7 +1139,7 @@ final class AppDatabase: Sendable {
         // (reduces repopulate from ~20s to <1ms).
         // Backfill: mark existing messages that already have snippets (snippet is set
         // at the same time as FTS body write, so non-empty snippet ↔ body in FTS).
-        migrator.registerMigration("v31_addHasBodyInFTS") { db in
+        migrator.registerTimedMigration("v31_addHasBodyInFTS") { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "bodyComplete", .boolean).notNull().defaults(to: false)
             }
@@ -1152,7 +1160,7 @@ final class AppDatabase: Sendable {
         // Persists fetched message bodies between fetch and render so they
         // survive app kills. Evicted after MessageBody is created.
         // Also serves as offline cache: fetchBody checks here before server.
-        migrator.registerMigration("v32_createPendingRender") { db in
+        migrator.registerTimedMigration("v32_createPendingRender") { db in
             try db.create(table: "pendingRender") { t in
                 t.primaryKey("id", .text)           // headerId
                 t.column("accountId", .text).notNull()
@@ -1169,7 +1177,7 @@ final class AppDatabase: Sendable {
         // v33: UserLabel support — user-facing labels (Gmail labels, IMAP keywords).
         // Creates userLabel + messageUserLabel tables, adds userLabelId to pendingOperation,
         // and resets backfill state so existing messages get label data during re-walk.
-        migrator.registerMigration("v33_userLabelSupport") { db in
+        migrator.registerTimedMigration("v33_userLabelSupport") { db in
             // 1. Create userLabel table
             try db.create(table: "userLabel") { t in
                 t.primaryKey("id", .text)
@@ -1208,7 +1216,7 @@ final class AppDatabase: Sendable {
             """)
         }
 
-        migrator.registerMigration("v34_addConfirmedEmptyBody") { db in
+        migrator.registerTimedMigration("v34_addConfirmedEmptyBody") { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "confirmedEmptyBody", .boolean).notNull().defaults(to: false)
             }
@@ -1219,13 +1227,13 @@ final class AppDatabase: Sendable {
             )
         }
 
-        migrator.registerMigration("v35_addHasEmbedding") { db in
+        migrator.registerTimedMigration("v35_addHasEmbedding") { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "hasEmbedding", .boolean).notNull().defaults(to: false)
             }
         }
 
-        migrator.registerMigration("v36_renameBodyFlags") { db in
+        migrator.registerTimedMigration("v36_renameBodyFlags") { db in
             // Rename columns for clarity: "has/confirmed" → "complete/confirmed" semantics.
             // bodyComplete already has its final name (renamed in v31).
             // confirmedEmptyBody → bodyEmptyConfirmed (server confirmed no content)
@@ -1243,7 +1251,7 @@ final class AppDatabase: Sendable {
             )
         }
 
-        migrator.registerMigration("v37_bodyStatusIndexWithInbox") { db in
+        migrator.registerTimedMigration("v37_bodyStatusIndexWithInbox") { db in
             // Include isInInbox in the body status index so ActiveBodyQueue (isInInbox=1)
             // and BackfillBodyQueue (isInInbox=0) repopulate queries can be answered
             // directly from the index without scanning ~144K rows. Drops repopulate
@@ -1256,7 +1264,7 @@ final class AppDatabase: Sendable {
             )
         }
 
-        migrator.registerMigration("v38_addHeaderComplete") { db in
+        migrator.registerTimedMigration("v38_addHeaderComplete") { db in
             // Tracks whether header's FTS indexing is complete (GRDB + FTS two-phase write).
             // Body queue requires headerComplete=1 before fetching body — prevents the race
             // where body fetch runs before FTS indexing, causing permanent AI processing failure.
@@ -1304,7 +1312,7 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "ANALYZE")
         }
 
-        migrator.registerMigration("v39_restoreOriginalIndexes") { db in
+        migrator.registerTimedMigration("v39_restoreOriginalIndexes") { db in
             // v38 incorrectly DROPPED the original (folderId) and (folderId, isRead) indexes
             // and replaced them with composite indexes that broke unrelated queries.
             // Restore the originals — they serve unread counts, folder listings, etc.
@@ -1339,7 +1347,7 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "ANALYZE")
         }
 
-        migrator.registerMigration("v40_completeIndexCoverage") { db in
+        migrator.registerTimedMigration("v40_completeIndexCoverage") { db in
             // Full query audit found multiple hot-path queries without covering indexes.
             // Per ADR-IOS-029: never drop existing indexes, only add new ones.
 
@@ -1396,7 +1404,7 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "ANALYZE")
         }
 
-        migrator.registerMigration("v41_addEmptyFetchCount") { db in
+        migrator.registerTimedMigration("v41_addEmptyFetchCount") { db in
             // Track how many times a body fetch returned empty for a message.
             // Prevents false-positive bodyEmptyConfirmed from partial IMAP responses
             // (connection drops, BGTask cancellation). A single empty fetch no longer
@@ -1406,7 +1414,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v42_addNotified") { db in
+        migrator.registerTimedMigration("v42_addNotified") { db in
             // NSE notification tracking. Prevents double-notifying: if the NSE already
             // delivered an AI-classified notification for a message, the main app won't
             // post a duplicate local notification. Set by NSE (via staging DB merge) or
@@ -1416,7 +1424,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v43_folderAccountIdRoleIndex") { db in
+        migrator.registerTimedMigration("v43_folderAccountIdRoleIndex") { db in
             // Covers UnreadCountManager.updateBadge() and NSEDataBridge's inbox
             // folderId resolution (WHERE role = 'inbox' [AND accountId IN ...]).
             // folder had no indexes previously.
@@ -1426,7 +1434,7 @@ final class AppDatabase: Sendable {
             """)
         }
 
-        migrator.registerMigration("v44_messageAICacheKeyIndex") { db in
+        migrator.registerTimedMigration("v44_messageAICacheKeyIndex") { db in
             // Covers account-deletion cleanup queries of the form
             //   DELETE FROM messageAICache WHERE key LIKE 'accountId:%'
             // Prefix LIKE (no leading '%') is index-seekable once key is indexed.
@@ -1441,7 +1449,7 @@ final class AppDatabase: Sendable {
         // KB refine on chat session end). PK = dedupKey so INSERT OR REPLACE
         // collapses re-enqueues of the same (jobType + identifying fields) in place.
         // Work-remaining state is "row exists"; drain deletes on success.
-        migrator.registerMigration("v45_createPendingAIRefinement") { db in
+        migrator.registerTimedMigration("v45_createPendingAIRefinement") { db in
             try db.create(table: "pendingAIRefinement") { t in
                 t.primaryKey("dedupKey", .text)
                 t.column("jobType", .text).notNull()
@@ -1456,7 +1464,7 @@ final class AppDatabase: Sendable {
             """)
         }
 
-        migrator.registerMigration("v46_addMissFetchCount") { db in
+        migrator.registerTimedMigration("v46_addMissFetchCount") { db in
             // Count of consecutive times an IMAP batch fetch did not return the UID
             // for this header. After 5 misses the header is considered gone from the
             // server and the row is deleted. Reset to 0 on any successful body fetch.
@@ -1483,7 +1491,7 @@ final class AppDatabase: Sendable {
         // Oldest-first order so that once an earlier row adopts, later rows in
         // the same cluster can observe that adoption and converge on the same
         // thread key.
-        migrator.registerMigration("v47_lateralThreadRepair") { db in
+        migrator.registerTimedMigration("v47_lateralThreadRepair") { db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, rfc822MessageId, inReplyTo, referencesJSON FROM messageHeader
                 WHERE computedThreadId != ''
@@ -1516,7 +1524,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v48_dedupFolderRoles") { db in
+        migrator.registerTimedMigration("v48_dedupFolderRoles") { db in
             // Heal accounts where multiple folders ended up with the same
             // non-custom role (iCloud's "Trash" + "Deleted Messages" both
             // matched the legacy name heuristic). Pick a winner per
@@ -1580,7 +1588,7 @@ final class AppDatabase: Sendable {
         // draftId: the Draft row id associated with the send, used at claim time
         //   to fire deferred DraftStore.delete (so Undo can reopen compose with
         //   the exact draft contents).
-        migrator.registerMigration("v49_addOutboxHoldAndDraftId") { db in
+        migrator.registerTimedMigration("v49_addOutboxHoldAndDraftId") { db in
             try db.alter(table: "outboxMessage") { t in
                 t.add(column: "holdUntil", .datetime)
                 t.add(column: "draftId", .text)
@@ -1608,7 +1616,7 @@ final class AppDatabase: Sendable {
         //   query that filters on `isInInbox=1 AND bodyComplete=1`.
         //
         // Re-ANALYZE after so planner sees the new landscape.
-        migrator.registerMigration("v50_embeddingRepopulatePartialIndex") { db in
+        migrator.registerTimedMigration("v50_embeddingRepopulatePartialIndex") { db in
             try db.execute(sql: """
                 CREATE INDEX IF NOT EXISTS messageHeader_embeddingIncomplete
                 ON messageHeader(isInInbox DESC, date DESC)
@@ -1632,7 +1640,7 @@ final class AppDatabase: Sendable {
         // predicate. At steady state the partial holds 0 rows, so seek returns instantly.
         // When recovery IS needed (post-crash), the few pending rows are in the index
         // and still found quickly.
-        migrator.registerMigration("v51_headerIncompletePartialIndex") { db in
+        migrator.registerTimedMigration("v51_headerIncompletePartialIndex") { db in
             try db.execute(sql: """
                 CREATE INDEX IF NOT EXISTS messageHeader_headerIncomplete
                 ON messageHeader(id)
@@ -1658,7 +1666,7 @@ final class AppDatabase: Sendable {
         // assistant-role with generic content (greetings etc.), so mis-classifying a
         // handful as 'normal' adds low-volume FTS noise, not garbage. Forward-new turns
         // post-migration get precise type via the updated ChatStore.appendTurn write.
-        migrator.registerMigration("v52_addChatHistoryType") { db in
+        migrator.registerTimedMigration("v52_addChatHistoryType") { db in
             try db.alter(table: "chatHistory") { t in
                 t.add(column: "type", .text).notNull().defaults(to: "normal")
             }
@@ -1675,7 +1683,7 @@ final class AppDatabase: Sendable {
         // reply gets isReplied = 1 (and a stale .reply action tag cleared).
         // Going-forward inserts use ReplyParentResolver.markParentsReplied;
         // this catches the historic backlog.
-        migrator.registerMigration("v53_backfillIsRepliedFromSentReplies") { db in
+        migrator.registerTimedMigration("v53_backfillIsRepliedFromSentReplies") { db in
             let count = try ReplyParentResolver.runHistoricBackfill(db: db)
             print("[v53] Backfilled isReplied for \(count) historic parents of Sent replies")
         }
@@ -1698,7 +1706,7 @@ final class AppDatabase: Sendable {
         // chain partially merged. Each pass propagates one hop further;
         // bounded by `maxPasses` as a safety guard against pathological
         // cases. Realistic email threads converge in 1-3 passes.
-        migrator.registerMigration("v54_mergeFragmentedThreads") { db in
+        migrator.registerTimedMigration("v54_mergeFragmentedThreads") { db in
             let totalMerged = try ThreadUtils.runFragmentMergeToFixpoint(db: db)
             print("[v54] Merged \(totalMerged) fragmented thread rows")
         }
@@ -1711,7 +1719,7 @@ final class AppDatabase: Sendable {
         // We deliberately do NOT snapshot title/dates/attendees: those come
         // straight from the calendar API on each tap, so renames or rescheds
         // by other clients show through immediately.
-        migrator.registerMigration("v55_createChatEventCalendar") { db in
+        migrator.registerTimedMigration("v55_createChatEventCalendar") { db in
             try db.create(table: "chatEventCalendar") { t in
                 t.primaryKey("compoundId", .text)
                 t.column("accountId", .text).notNull()
@@ -1725,7 +1733,7 @@ final class AppDatabase: Sendable {
         // (DELETE FROM demoCalendarEvent — table-prefix scoping).
         // Times stored as INTEGER ms-since-epoch for consistency with the
         // calendar provider protocol's epoch-ms fields.
-        migrator.registerMigration("v56_createDemoCalendarEvent") { db in
+        migrator.registerTimedMigration("v56_createDemoCalendarEvent") { db in
             try db.create(table: "demoCalendarEvent") { t in
                 t.primaryKey("id", .text)
                 t.column("accountId", .text).notNull()
@@ -1753,7 +1761,7 @@ final class AppDatabase: Sendable {
         // any "sent-%" placeholder that has a matching messageBody row gets
         // bodyComplete=1 immediately. Bounded — only touches rows that actually
         // have a body cached locally.
-        migrator.registerMigration("v57_repairOptimisticSentBodyComplete") { db in
+        migrator.registerTimedMigration("v57_repairOptimisticSentBodyComplete") { db in
             try db.execute(sql: """
                 UPDATE messageHeader
                 SET bodyComplete = 1
@@ -1776,7 +1784,7 @@ final class AppDatabase: Sendable {
         // the bottom even though the tag indicator rendered correctly. The
         // NSE write path is now fixed; this migration repairs already-stored
         // rows so existing inboxes don't keep showing the misplaced email.
-        migrator.registerMigration("v58_resyncTagSortOrderFromActionTag") { db in
+        migrator.registerTimedMigration("v58_resyncTagSortOrderFromActionTag") { db in
             try db.execute(sql: """
                 UPDATE messageHeader
                 SET tagSortOrder = CASE actionTag
@@ -1808,7 +1816,7 @@ final class AppDatabase: Sendable {
         // this one-time reset re-walks the affected folders so the deleted headers are
         // re-fetched from the server and now survive. Ships in the SAME build as the
         // fix — without the fix, the re-walked mail would just be deleted again.
-        migrator.registerMigration("v59_rewalkImapArchiveAfterStaleWindowFix") { db in
+        migrator.registerTimedMigration("v59_rewalkImapArchiveAfterStaleWindowFix") { db in
             let reset = try AppDatabase.rewalkImapArchiveFolders(db)
             if reset > 0 {
                 print("[v59] Reset backfill for \(reset) IMAP archive folder(s) — re-fetching stale-window-deleted mail")
@@ -1820,19 +1828,19 @@ final class AppDatabase: Sendable {
         // relaunch (outbox drain re-sends with the same binding). Gmail REST send
         // only; IMAP/Exchange thread via In-Reply-To/References headers. See
         // PLAN_THREAD_FIX.md / ADR-IOS-043.
-        migrator.registerMigration("v60_addOutboxThreadId") { db in
+        migrator.registerTimedMigration("v60_addOutboxThreadId") { db in
             try db.alter(table: "outboxMessage") { t in
                 t.add(column: "threadId", .text)
             }
         }
 
-        migrator.registerMigration("v61_addCalendarSetupFailedToAccount") { db in
+        migrator.registerTimedMigration("v61_addCalendarSetupFailedToAccount") { db in
             try db.alter(table: "account") { t in
                 t.add(column: "calendarSetupFailed", .boolean).notNull().defaults(to: false)
             }
         }
 
-        migrator.registerMigration("v62_inboxQueryUnreadDateIndex") { db in
+        migrator.registerTimedMigration("v62_inboxQueryUnreadDateIndex") { db in
             // The UNREAD-filter inbox query is `WHERE folderId=? AND isRead=false
             // ORDER BY date DESC LIMIT N` (InboxViewModel fetchPage/fetchFullRange).
             // `messageHeader_folderId_date` (folderId,date) ALREADY exists and covers
@@ -1860,7 +1868,7 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_isRead_date ON messageHeader(folderId, isRead, date)")
         }
 
-        migrator.registerMigration("v63_addFolderUidValidity") { db in
+        migrator.registerTimedMigration("v63_addFolderUidValidity") { db in
             // ADR-IOS-051: UIDVALIDITY abort guard for the IMAP deletion-reconcile
             // walk. Nullable — bootstrapped by the folder's first reconcile walk;
             // a later mismatch aborts the walk (local UIDs would be from an
@@ -1870,7 +1878,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v64_messageIdCompositeIndexes") { db in
+        migrator.registerTimedMigration("v64_messageIdCompositeIndexes") { db in
             // Sync/NSE HOT PATH: two-column-equality lookups keyed on `messageId` run
             // ONCE PER fetched/pushed message inside write transactions. The predicate
             // is indexed only on the OTHER column (folderId or accountId), so the
@@ -1907,7 +1915,7 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "DROP INDEX IF EXISTS messageHeader_accountId")
         }
 
-        migrator.registerMigration("v65_addFolderHighestModSeq") { db in
+        migrator.registerTimedMigration("v65_addFolderHighestModSeq") { db in
             // IMAP CONDSTORE (RFC 7162) flag-aware change cursor. Lets delta sync detect
             // \Seen/flag changes on EXISTING messages (which uidNext+count miss — the
             // latent "read-on-another-client doesn't propagate on IMAP" bug) and lets
@@ -1918,7 +1926,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v66_folderIdUidIntIndex") { db in
+        migrator.registerTimedMigration("v66_folderIdUidIntIndex") { db in
             // Stale-detection windowed slice (SyncEngineFullSync :737) for LARGE IMAP
             // folders: `WHERE folderId=? AND CAST(messageId AS INTEGER) >= ?` — a numeric
             // UID range that NO text index serves (v64's (folderId, messageId) is
@@ -1933,7 +1941,7 @@ final class AppDatabase: Sendable {
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageHeader_folderId_uidInt ON messageHeader(folderId, CAST(messageId AS INTEGER))")
         }
 
-        migrator.registerMigration("v67_addUidResolutionRetryCount") { db in
+        migrator.registerTimedMigration("v67_addUidResolutionRetryCount") { db in
             // Historical RFC-resolution retry budget. The column remains because
             // this migration shipped; provider-ID actions leave it dormant.
             try db.alter(table: "pendingOperation") { t in
@@ -1941,7 +1949,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v68_addFolderUidValidityResetPending") { db in
+        migrator.registerTimedMigration("v68_addFolderUidValidityResetPending") { db in
             // T4.S6 — the UIDVALIDITY purge-and-resync reaction's own quarantine
             // state. Non-nil ⇒ `AccountManager.runUidValidityResetReaction` armed
             // this folder and has not yet stamped the fresh epoch. Nullable with no
@@ -1956,7 +1964,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v69_addPendingOperationObservedUidValidity") { db in
+        migrator.registerTimedMigration("v69_addPendingOperationObservedUidValidity") { db in
             // T4.S6 follow-up — the admission-time UIDVALIDITY stamp for a durable op
             // that will be executed by BARE UID (see `PendingOperation
             // .observedUidValidity`). Nullable, no default and no backfill: a
@@ -1976,7 +1984,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v70_dropMessageBodyHeaderFK") { db in
+        migrator.registerTimedMigration("v70_dropMessageBodyHeaderFK") { db in
             // #37 Stage D. `messageBody.id` is a CONTENT key, not a header id
             // (`ContentKeySpace`). Once its tail becomes the RFC 822 Message-ID at
             // Stage E1 the reference is invalid in BOTH directions: the FK REJECTS
@@ -2092,7 +2100,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v71_addOutboxDraftRfc822MessageId") { db in
+        migrator.registerTimedMigration("v71_addOutboxDraftRfc822MessageId") { db in
             // The DRAFT's own RFC 822 Message-ID, snapshotted at queue-send time so
             // the post-send server-draft cleanup can name the Drafts copy by an
             // identity instead of by the bare IMAP UID `IMAPProvider.saveDraft`
@@ -2119,7 +2127,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v72_addDraftServerUidValidity") { db in
+        migrator.registerTimedMigration("v72_addDraftServerUidValidity") { db in
             // The UIDVALIDITY EPOCH the draft's server address (`serverDraftId`, a bare
             // IMAP UID) was MINTED under, carried beside that address everywhere the
             // address goes: the `draft` row that owns it, the `outboxMessage` snapshot
@@ -2177,7 +2185,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v73_bindDraftUidToMailbox") { db in
+        migrator.registerTimedMigration("v73_bindDraftUidToMailbox") { db in
             try db.alter(table: "draft") { t in
                 t.add(column: "serverDraftFolderPath", .text)
             }
@@ -2201,21 +2209,21 @@ final class AppDatabase: Sendable {
                 """)
         }
 
-        migrator.registerMigration("v74_purgeLegacyPendingOperations") { db in
+        migrator.registerTimedMigration("v74_purgeLegacyPendingOperations") { db in
             // ⚑ NO REFERENCE — INVENTED. Owner-approved C6 upgrade boundary:
             // superseded in-flight operations are discarded without decoding.
             // Draft, Outbox, authored content and attachments remain untouched.
             try db.execute(sql: "DELETE FROM pendingOperation")
         }
 
-        migrator.registerMigration("v75_addDraftPushAttemptVersion") { db in
+        migrator.registerTimedMigration("v75_addDraftPushAttemptVersion") { db in
             // PORT — v2final v81 conflict version, with recovery fields omitted.
             try db.alter(table: "draft") { t in
                 t.add(column: "pushAttemptVersion", .integer).notNull().defaults(to: 0)
             }
         }
 
-        migrator.registerMigration("v76_addDraftGenerationAndTypedIdentity") { db in
+        migrator.registerTimedMigration("v76_addDraftGenerationAndTypedIdentity") { db in
             // PORT — reduced generation/provider-native schema. No backfill and
             // no pending/outbox compatibility: nil generations fail closed until
             // an ordinary compose admission acquires the existing Draft.
@@ -2233,7 +2241,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v77_addMessageHeaderObservedUidValidity") { db in
+        migrator.registerTimedMigration("v77_addMessageHeaderObservedUidValidity") { db in
             // ⚑ NO REFERENCE — INVENTED. Source-bound IMAP epoch transport,
             // explicitly deferred by v2final commit 486bafd4b. Nullable, with no
             // default and no backfill: existing rows remain unproven rather than
@@ -2243,7 +2251,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v78_addPendingOperationEverAttempted") { db in
+        migrator.registerTimedMigration("v78_addPendingOperationEverAttempted") { db in
             // PORT — v2final v73 (`d1d4f01ce`). Annihilation is only an
             // optimization, so pre-existing rows take the conservative TRUE
             // backfill: a false positive costs one inverse provider call;
@@ -2271,11 +2279,75 @@ final class AppDatabase: Sendable {
         // 1-based position in `(updatedAt ASC, id ASC)` — the recency signal the app
         // already displays by, and the best available legacy proxy. `applySave`'s
         // `MAX+1` then continues from N. Additive; no data reshape; no row deleted.
-        migrator.registerMigration("v79_addDraftLastTouchedSeq") { db in
+        migrator.registerTimedMigration("v79_addDraftLastTouchedSeq") { db in
             try db.alter(table: "draft") { t in
                 t.add(column: "lastTouchedSeq", .integer).notNull().defaults(to: 0)
             }
             try AppDatabase.seedDraftLastTouchedSeq(db)
+        }
+
+        // T5.8 — the ADDRESS of the message a reply/forward draft was written
+        // against, recorded beside the (mutable) `replyToId` PK it can no longer be
+        // recovered from.
+        //
+        // ⚑ NO REFERENCE — INVENTED. `v2final` discriminates the reply target by
+        // RFC 822 Message-ID (`Draft.expectedReplyToRfc` / `acceptStrategy1ReplyHit`),
+        // which recovers a baseline only for a numeric-IMAP source. That RFC baseline
+        // is PORTED and still runs; these two columns are the second, independent
+        // baseline v3 needs because `replyToId` is `accountId:folderPath:messageId`
+        // and every part of it is mutable — a folder move re-keys it, and a
+        // UIDVALIDITY reset + purge-and-resync can seat a DIFFERENT physical message
+        // at the very same PK while keeping the same UID. Quoting the body found
+        // there puts another correspondent's mail into the user's OUTGOING reply
+        // (C3: no action may mutate or misattribute the wrong message).
+        //
+        // `replyToProviderMessageId` belongs to the **provider-id (action)** keying
+        // scheme — the question is which physical COPY the user replied to, not
+        // which content — and `replyToUidValidity` is the epoch that address is only
+        // meaningful within. Neither belongs to the RFC/content scheme; both keying
+        // schemes exist in this repo on purpose (`MessageIdentity.ContentKeySpace`).
+        //
+        // NULLABLE, NO DEFAULT, and deliberately NO BACKFILL. Backfilling from the
+        // row currently sitting at `replyToId` would ADOPT whatever is there as "the
+        // expected identity" — which, for exactly the substituted rows this exists to
+        // catch, BLESSES the impostor and converts a detectable hazard into a
+        // permanent laundered pass. A pre-v80 row therefore keeps nil = UNKNOWN, and
+        // the ported RFC baseline (recoverable from the draft KEY, which every legacy
+        // row already has) is what guards it until an ordinary save re-stamps it.
+        //
+        // Never 0 for the epoch: RFC 3501 §2.3.1.1 types UIDVALIDITY as `nz-number`,
+        // so a synthesised zero would compare equal to another synthesised zero.
+        migrator.registerTimedMigration("v80_addDraftReplyTargetAddress") { db in
+            try db.alter(table: "draft") { t in
+                t.add(column: "replyToProviderMessageId", .text)
+                t.add(column: "replyToUidValidity", .integer)
+            }
+        }
+
+        // PORT — v2final `v72_addActionTagSetAt` (renumbered: v72..v80 are already
+        // taken on this line, and a migration is immutable once applied).
+        //
+        // Round D-0b: real TTL semantics for `sweepStaleActionTags` (mirrors TB's
+        // SETTINGS.actionTTLSeconds — SyncConfig.actionTagTTLSeconds, 1 week).
+        // Nullable, no default, NO INDEX: the sweep is a bounded ~15-minute
+        // maintenance scan over out-of-inbox rows only (SyncEngineMaintenance.swift),
+        // so an index here is unjustified. Backfill every already-tagged row with a
+        // stamp AT MIGRATION TIME so it gets a full TTL from upgrade, keeping the
+        // invariant `actionTag != nil ⇒ actionTagSetAt != nil` true from day one —
+        // including for the historic v53/legacy raw-SQL rows whose actionTag is the
+        // string 'none' (still NOT NULL in SQL, so still covered by this WHERE
+        // clause). Convergence: a fresh install runs v53 then v81, an existing DB
+        // skips v53 and runs v81 — either way every row carrying a tag when v81
+        // runs leaves it stamped, and every untagged row leaves it NULL.
+        migrator.registerTimedMigration("v81_addActionTagSetAt") { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "actionTagSetAt", .datetime)
+            }
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET actionTagSetAt = ?
+                WHERE actionTag IS NOT NULL
+                """, arguments: [Date()])
         }
     }
 
@@ -2295,5 +2367,78 @@ final class AppDatabase: Sendable {
                    OR (d2.updatedAt = draft.updatedAt AND d2.id <= draft.id)
             )
         """)
+    }
+}
+
+// MARK: - Per-migration timing
+
+/// ⚑ NO REFERENCE — INVENTED. `v2final` times the migration pass only in
+/// AGGREGATE (`AppDatabase.init`'s "schema migrations completed in Nms" line,
+/// which is KEPT as-is and stays always-on); it has no per-migration counterpart.
+///
+/// Wraps `DatabaseMigrator.registerMigration` so every registration in
+/// `AppDatabase.registerAllMigrations` reports how long ITS OWN body took. The
+/// aggregate line can only say a multi-version jump cost 12s; this says WHICH of
+/// the O(mailbox-size) bodies (v9 / v27 / v47 / v53 / v54 …) spent it — the
+/// attribution the "hang on boot" reports need.
+///
+/// **The applied-migrations ledger is untouched.** The identifier string and the
+/// migrate closure are forwarded to GRDB byte-for-byte; the only change is an
+/// outer closure that calls `migrate(db)`. GRDB keys `grdb_migrations` by
+/// identifier, so every already-applied migration stays applied and its body is
+/// never re-run — migrations are immutable once applied, and this wrapper is
+/// deliberately the one thing around them that is not part of that identity.
+private extension DatabaseMigrator {
+
+    /// `Duration.components` splits into (seconds, attoseconds), so rendering the
+    /// fractional part in milliseconds needs these unit factors. Not tunables:
+    /// 1 s = 1e3 ms and 1 ms = 1e-3 s = 1e15 as.
+    static let millisecondsPerSecond: Int64 = 1_000
+    static let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
+
+    /// Whole elapsed milliseconds, matching the aggregate line's `Nms` format.
+    static func wholeMilliseconds(_ duration: Duration) -> Int {
+        let (seconds, attoseconds) = duration.components
+        return Int(seconds * millisecondsPerSecond + attoseconds / attosecondsPerMillisecond)
+    }
+
+    /// `registerMigration`, plus a **debug-gated** per-migration duration line
+    /// that distinguishes success from failure. Errors propagate unchanged.
+    ///
+    /// - Gating (project rule 12): with debug logging LOCKED — the default
+    ///   release state — the wrapper is one `UserDefaults` bool read and then a
+    ///   direct `migrate(db)`: no clock is read and no string is built. And since
+    ///   GRDB only invokes bodies for UNAPPLIED migrations, an up-to-date
+    ///   database pays even that nothing at all.
+    /// - Clock: `ContinuousClock` is MONOTONIC. A wall-clock source
+    ///   (`CFAbsoluteTimeGetCurrent`) can be stepped by an NTP/timezone
+    ///   adjustment mid-migration and report a nonsense or negative duration.
+    /// - Failure: a throwing body is logged as FAILED, with its own elapsed time
+    ///   and the error, and is then re-thrown UNCHANGED so GRDB still rolls the
+    ///   migration back. Without this, a body that dies 40s in is invisible —
+    ///   the aggregate line never prints because `init` throws first.
+    mutating func registerTimedMigration(
+        _ identifier: String,
+        foreignKeyChecks: ForeignKeyChecks = .deferred,
+        migrate: @escaping @Sendable (Database) throws -> Void
+    ) {
+        registerMigration(identifier, foreignKeyChecks: foreignKeyChecks) { db in
+            guard DebugModeManager.isLoggingEnabled() else {
+                try migrate(db)
+                return
+            }
+            let start = ContinuousClock.now
+            // `start.duration(to: .now)` rather than `.now - start`: reads as
+            // "elapsed since start", so no sign convention has to be recalled.
+            do {
+                try migrate(db)
+                let elapsed = DatabaseMigrator.wholeMilliseconds(start.duration(to: ContinuousClock.now))
+                BackgroundSyncLogger.log("AppDatabase: migration \(identifier) applied in \(elapsed)ms")
+            } catch {
+                let elapsed = DatabaseMigrator.wholeMilliseconds(start.duration(to: ContinuousClock.now))
+                BackgroundSyncLogger.log("AppDatabase: migration \(identifier) FAILED after \(elapsed)ms: \(error)")
+                throw error
+            }
+        }
     }
 }
