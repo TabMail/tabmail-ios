@@ -231,21 +231,29 @@ struct SearchView: View {
     /// therefore fail-CLOSED: when identity cannot be established we resolve to
     /// nothing, never to a looser global match.
     ///
+    /// 🚨 WHY IT TAKES `accountId`, NOT AN EMAIL ADDRESS (audit round 1 / C-3).
+    /// This used to look the account up by `Account.emailAddress`, which is NOT a
+    /// key: `Account.id` is a UUID and nothing stops the same address being added
+    /// twice against different IMAP servers or credentials (a personal and a work
+    /// mailbox behind the same alias, a migration in progress). The lookup returned
+    /// whichever row `fetchOne` happened to pick, so a result found on account B
+    /// resolved into account A's message at the same folder+UID — opened it and
+    /// durably marked it read. The account identity travels with the result now
+    /// (`SearchResult.accountId`), so no re-derivation from a non-unique attribute
+    /// happens at tap time at all.
+    ///
     /// Account-wide provider search passes `folderPath == ""` (Gmail/Graph, where
     /// `messageId` is already globally unique per account) and needs no folder
     /// constraint — the account constraint still applies. Mirrors the snippet
     /// lookup's own guard in `launchRemoteSearch` and the composite
     /// `SearchResult.id`.
     nonisolated static func resolveRemoteResultHeaderId(
-        accountEmail: String, messageId: String, folderPath: String, db: Database
+        accountId: String, messageId: String, folderPath: String, db: Database
     ) throws -> String? {
-        guard let accountId = try Account
-            .filter(Column("emailAddress") == accountEmail).fetchOne(db)?.id else {
-            // Cannot resolve the account → never fall back to a global,
-            // cross-account messageId match (that opened another account's
-            // same-UID message).
-            return nil
-        }
+        // An empty accountId is not an identity — it would drop the constraint's
+        // meaning and match nothing useful, but state the refusal explicitly rather
+        // than relying on the query.
+        guard !accountId.isEmpty else { return nil }
         var request = MessageHeader
             .filter(Column("messageId") == messageId && Column("accountId") == accountId)
         if !folderPath.isEmpty {
@@ -264,7 +272,7 @@ struct SearchView: View {
         // A nil resolve navigates nowhere — nothing opens, nothing is marked read.
         let resolved = try? dbPool.read { db in
             try Self.resolveRemoteResultHeaderId(
-                accountEmail: result.accountEmail,
+                accountId: result.accountId,
                 messageId: result.messageId,
                 folderPath: result.folderPath,
                 db: db
@@ -435,7 +443,11 @@ struct SearchView: View {
                     let accountResults = await searchAccount(account, folder: folderPath, query: query, after: after, before: before)
                     guard searchGeneration == generation else { return }
                     if !accountResults.isEmpty {
-                        let accountEmail = account.emailAddress
+                        // C-3: the ACCOUNT ID, never the address. Two accounts may
+                        // legitimately share one `emailAddress` (same alias, different
+                        // servers or credentials), and matching on it collapsed their
+                        // results into each other before the user ever tapped one.
+                        let accountId = account.id
                         let remoteIds = Set(accountResults.map(\.messageId))
                         // Identifies a prior row that is the SAME message as one of this
                         // batch's results. messageId is only unique within (account, folder)
@@ -445,7 +457,7 @@ struct SearchView: View {
                         // also collapses the local row (folderPath="INBOX") against the
                         // account-wide remote row (folderPath="").
                         let isSameMessage: (SearchResult) -> Bool = { r in
-                            r.accountEmail == accountEmail
+                            r.accountId == accountId
                                 && remoteIds.contains(r.messageId)
                                 && (folderPath.isEmpty || r.folderPath == folderPath)
                         }
@@ -482,7 +494,8 @@ struct SearchView: View {
                             // Try local snippet first, then the batched GRDB lookup
                             let snippet = localSnippets[result.messageId] ?? dbSnippets[result.messageId] ?? ""
                             guard !snippet.isEmpty else { return result }
-                            return SearchResult(source: result.source, accountEmail: result.accountEmail,
+                            return SearchResult(source: result.source, accountId: result.accountId,
+                                accountEmail: result.accountEmail,
                                 messageId: result.messageId, folderPath: result.folderPath,
                                 subject: result.subject, from: result.from,
                                 fromAddress: result.fromAddress, date: result.date, snippet: snippet,
@@ -604,6 +617,7 @@ struct SearchView: View {
 
             return SearchResult(
                 source: .local,
+                accountId: header.accountId,
                 accountEmail: accountEmail,
                 messageId: header.messageId,
                 folderPath: header.folderPath,
@@ -682,6 +696,7 @@ struct SearchView: View {
             .map { msg in
                 SearchResult(
                     source: .local,
+                    accountId: msg.accountId,
                     accountEmail: accountEmails[msg.accountId] ?? "",
                     messageId: msg.messageId,
                     folderPath: msg.folderPath,
@@ -702,6 +717,10 @@ struct SearchView: View {
     @MainActor
     private func searchAccount(_ account: Account, folder: String, query: String, after: Date?, before: Date?) async -> [SearchResult] {
         let email = account.emailAddress
+        // C-3: carry the account's real identity with every result it produces. The
+        // address is display-only from here on; it is not a key and two accounts may
+        // share one.
+        let resultAccountId = account.id
         let searchTask = Task { @MainActor in
             try await manager.search(query: query, account: account, folder: folder, after: after, before: before)
         }
@@ -735,6 +754,7 @@ struct SearchView: View {
         return infos.map { info in
             SearchResult(
                 source: .remote,
+                accountId: resultAccountId,
                 accountEmail: email,
                 messageId: info.messageId,
                 // The folder this result was searched in. Empty for provider
@@ -760,26 +780,31 @@ struct SearchView: View {
         query = "partnership proposal"
         hasSearched = true
         let now = Date()
+        let screenshotAccountId = "screenshot-account"
         results = [
-            SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg008",
+            SearchResult(source: .local, accountId: screenshotAccountId,
+                         accountEmail: "alex@gmail.com", messageId: "msg008",
                          folderPath: "INBOX",
                          subject: "Re: Partnership Proposal — Next Steps", from: "Emily Torres",
                          fromAddress: "emily.torres@client.com", date: now.addingTimeInterval(-45 * 60),
                          snippet: "Thanks for the detailed proposal, Alex. Our team has reviewed it and we'd like to move forward with a pilot program...",
                          isRead: false, isFlagged: false, headerId: "screenshot-account:INBOX:msg008"),
-            SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg-old-1",
+            SearchResult(source: .local, accountId: screenshotAccountId,
+                         accountEmail: "alex@gmail.com", messageId: "msg-old-1",
                          folderPath: "INBOX",
                          subject: "Partnership Proposal — Draft for Review", from: "Alex Morgan",
                          fromAddress: "alex@gmail.com", date: now.addingTimeInterval(-3 * 86400),
                          snippet: "Hi Emily, attached is the partnership proposal we discussed. The pilot would cover 3 enterprise accounts starting April...",
                          isRead: true, isFlagged: false, headerId: nil),
-            SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg-old-2",
+            SearchResult(source: .local, accountId: screenshotAccountId,
+                         accountEmail: "alex@gmail.com", messageId: "msg-old-2",
                          folderPath: "INBOX",
                          subject: "Re: Partnership Discussion — Follow Up", from: "Emily Torres",
                          fromAddress: "emily.torres@client.com", date: now.addingTimeInterval(-5 * 86400),
                          snippet: "Great meeting today! I'll share the proposal with our leadership team and get back to you by end of week...",
                          isRead: true, isFlagged: true, headerId: nil),
-            SearchResult(source: .local, accountEmail: "alex@gmail.com", messageId: "msg-old-3",
+            SearchResult(source: .local, accountId: screenshotAccountId,
+                         accountEmail: "alex@gmail.com", messageId: "msg-old-3",
                          folderPath: "INBOX",
                          subject: "Partnership Opportunity — Initial Inquiry", from: "Emily Torres",
                          fromAddress: "emily.torres@client.com", date: now.addingTimeInterval(-12 * 86400),
@@ -805,11 +830,22 @@ struct SearchResult: Identifiable {
     /// `IMAPFetchMapping.messageIdString`), so two *different* messages in two
     /// folders of the same account share a UID. A search-all that hits several
     /// folders would then mint duplicate identities → wrong subjects again. The
-    /// key must include the folder: `accountEmail + folderPath + messageId`
+    /// key must include the folder: `accountId + folderPath + messageId`
     /// mirrors the local headerId ("accountId:folderPath:messageId") and is the
     /// same composite dedup uses.
-    var id: String { "\(accountEmail)\u{1}\(folderPath)\u{1}\(messageId)" }
+    ///
+    /// 🚨 KEYED ON `accountId`, NOT `accountEmail` (audit round 1 / C-3). The
+    /// address is not a key — two accounts may carry the same `emailAddress` on
+    /// different servers or credentials — so keying on it collapsed two different
+    /// accounts' results into ONE identity, both in this id and in
+    /// `launchRemoteSearch`'s dedup, before the user ever tapped one.
+    var id: String { "\(accountId)\u{1}\(folderPath)\u{1}\(messageId)" }
     let source: Source
+    /// The owning `Account.id`. THE identity: threaded from the searched account
+    /// (remote) or the header row (local) all the way to `openResult`, so the tap
+    /// never has to re-derive an account from a non-unique attribute.
+    let accountId: String
+    /// Display only — the account's address as shown to the user. Never a key.
     let accountEmail: String
     let messageId: String
     /// Folder the result came from. Local: the message's GRDB `folderPath`.

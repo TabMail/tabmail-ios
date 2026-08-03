@@ -624,9 +624,78 @@ struct AIWriteIdentityGuardTests {
         #expect(after == "X's summary", "T1.3 first-sync / demo / screenshot state must not disable AI")
     }
 
-    @Test("An unstamped header row is an absence of evidence, not a mismatch — the write lands")
-    func unstampedHeaderStillWrites() throws {
+    /// 🚨 AUDIT ROUND 1 / C-1. This test previously asserted the OPPOSITE
+    /// ("An unstamped header row is an absence of evidence, not a mismatch — the
+    /// write lands") and so BLESSED the defect: with the folder's epoch known and
+    /// the captured row's stamp nil, `resolveCurrentHeader` admitted the write, and
+    /// a turnover in the LLM window bound X's summary to whatever message the
+    /// resync seated at X's UID. It is rewritten here to the SYSTEM PROPERTY the
+    /// suite exists for — *an AI result computed against X is never written to a
+    /// row that is not X* — with the same two-sided control the turnover test uses.
+    ///
+    /// A nil captured stamp is common and benign in ISOLATION (an optimistic move,
+    /// a delta-sync re-key and the orphan-migration paths all null it), which is
+    /// why "the write lands" looked reasonable. It is not benign when the FOLDER
+    /// has a live numbering: then the row's UID was never proven under any epoch,
+    /// so nothing rules out a re-seat. Refusing is recomputable; binding X's
+    /// summary onto Y is not.
+    @Test("An AI result computed against an UNSTAMPED row never lands on the message that replaced it")
+    func unstampedHeaderNeverWritesOntoTheReplacement() throws {
         let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must still succeed — refusing to capture would disable AI, not guard it")
+        guard let target else { return }
+
+        // The turnover, exactly as the purge-and-resync reaction leaves the world.
+        let impostor = makeHeader(subject: "Impostor Y", rfc822: "<y@example.com>", observedEpoch: 222)
+        try db.write { db in
+            _ = try MessageHeader.deleteOne(db, key: Self.headerId)
+            guard var folder = try Folder.fetchOne(db, key: Self.folderId) else { return }
+            folder.lastKnownUidValidity = 222
+            try folder.update(db)
+            try impostor.insert(db)
+        }
+
+        // NON-VACUITY: the pre-guard expression (a bare fetch + mutate + save) LANDS
+        // on the impostor, so the drop below is the guard refusing rather than the
+        // row being absent or unwritable.
+        let bareWriteLanded: Bool = try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return false }
+            bare.summaryBlurb = "pre-guard control write"
+            try bare.save(db)
+            return true
+        }
+        #expect(bareWriteLanded, "the impostor row must be present and writable, else the drop proves nothing")
+        try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            bare.summaryBlurb = nil
+            try bare.save(db)
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        #expect(after?.rfc822MessageId == "<y@example.com>", "the row at X's address is still the replacement")
+        #expect(after?.summaryBlurb == nil,
+                """
+                X's summary landed on the message that replaced it. X's row carried no proven epoch, so \
+                nothing established that the UID still names X — an absence of evidence must never \
+                authorize a write (C3).
+                """)
+    }
+
+    /// The other half of C-1's split, and the reason 6a is evaluated BEFORE 6b: a
+    /// row that is unstamped because the FOLDER was never observed either (first
+    /// sync, `ScreenshotMode`'s raw-SQL folders) must still be written. Without
+    /// this the fix above would read as "refuse whenever the stamp is nil", which
+    /// silently disables AI for every account's first sync.
+    @Test("An unstamped row in a never-observed folder still writes through")
+    func unstampedHeaderInNeverObservedFolderStillWrites() throws {
+        let db = try makeFixture(folderEpoch: nil)
         let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
         try db.write { try original.insert($0) }
 
@@ -639,7 +708,8 @@ struct AIWriteIdentityGuardTests {
         let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
         #expect(outcome == .written)
         let after = try blurb(db, Self.headerId)
-        #expect(after == "X's summary", "an unproven address is an unknown, never a proven turnover")
+        #expect(after == "X's summary",
+                "a folder that has never been observed has no numbering to have turned over — AI must not go dark there")
     }
 
     @Test("The demo account writes through even when its stored epochs disagree")

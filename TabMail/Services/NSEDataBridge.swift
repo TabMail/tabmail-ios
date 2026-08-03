@@ -529,29 +529,41 @@ enum NSEDataBridge {
     ///    `Mutex.withLock` shape the stale-by-move scrub in `performMerge` uses.
     ///  - Staging DB: `nse_processed_message WHERE accountId = ? AND folderPath = ?`.
     ///
-    /// ⚑ THIS PURGE IS BEST-EFFORT AND MUST STAY THAT WAY — it is deliberately
-    /// non-throwing, so the reaction has no failure to abort on. That is NOT an
-    /// exception carved out of an "every purge must succeed" rule; the reaction has
-    /// no such rule (exactly ONE of its step-4 purges aborts, the FTS one, and the
-    /// reasoning is stated at that call site). A staged row this purge misses
-    /// re-inserts a header the reaction removed — which is precisely the RESIDUAL
-    /// the reaction already accepted and bounded BEFORE this helper existed: the
-    /// NSE stages only inbox arrivals, and the next ordinary sync pass stale-sweeps
-    /// a UID the server no longer returns. Aborting the reaction here would trade
-    /// that bounded, self-healing residue for a folder left quarantined with its
-    /// mail already gone.
+    /// 🚨 RETURNS WHETHER THE DURABLE PURGE COMMITTED, AND THE CALLER MUST CONSUME
+    /// IT (audit round 1 / C-4). This used to be non-throwing AND non-reporting, so
+    /// a failed DELETE was invisible: the reaction went on to stamp the NEW epoch
+    /// and clear the quarantine over a staging file still holding OLD-epoch
+    /// instructions, and the next merge applied them to whatever the resync had
+    /// seated at the reused UID.
     ///
-    /// ⚠ `v2final` justifies the swallow by its D-6 merge epoch guard
-    /// (`detectOldEpochStagedRows`), which v3 does NOT have — the sync-pass sweep
-    /// above is v3's weaker second line. Stated so a later reader does not cite a
-    /// guard this tree lacks.
+    /// The doc that stood here justified the swallow with "the next ordinary sync
+    /// pass stale-sweeps a UID the server no longer returns". **That premise is
+    /// false for the case that matters**: after a UIDVALIDITY turnover the new epoch
+    /// legitimately REUSES and RETURNS the same UIDs, so the sweep never fires and
+    /// the stale instruction lands on a live message. The comment encoded the bug;
+    /// it is replaced rather than annotated.
+    ///
+    /// `true` means the staged rows for this scope are provably gone — including the
+    /// case where no staging file exists at all, which is a COMPLETE purge over an
+    /// empty set, not a skipped one. `false` means the staging DB exists and could
+    /// not be written (or could not be opened), i.e. the contents are UNKNOWN.
+    ///
+    /// The in-memory scrub happens unconditionally and first: it cannot fail, and it
+    /// must not be skipped just because the durable half did.
+    ///
+    /// Idempotent: filtering an already-clean snapshot and deleting already-gone
+    /// staging rows are both no-ops, so a re-drive may call this again freely.
+    ///
+    /// ⚠ `v2final` justifies its swallow by the D-6 merge epoch guard
+    /// (`detectOldEpochStagedRows`), which v3 does NOT have. Stated so a later reader
+    /// does not cite a guard this tree lacks — refusing to advance the epoch is v3's
+    /// substitute for it.
     ///
     /// `stagingPathOverride` mirrors `mergeNSEStagingData`'s test seam — production
-    /// callers never pass it and fall back to `openStagingDB()`, the real App-Group
-    /// file.
+    /// callers never pass it and fall back to the real App-Group file.
     static func purgeStagedStateForFolder(
         accountId: String, folderPath: String, stagingPathOverride: String? = nil
-    ) {
+    ) -> Bool {
         latestStagedRows.withLock { rows in
             rows.removeAll { $0.accountId == accountId && $0.folderPath == folderPath }
         }
@@ -564,18 +576,29 @@ enum NSEDataBridge {
             }
             for key in victims { bodies.removeValue(forKey: key) }
         }
-        guard let queue = stagingQueueForPurge(stagingPathOverride: stagingPathOverride) else { return }
-        do {
-            try queue.write { db in
-                guard try db.tableExists("nse_processed_message") else { return }
-                try db.execute(
-                    sql: "DELETE FROM nse_processed_message WHERE accountId = ? AND folderPath = ?",
-                    arguments: [accountId, folderPath]
-                )
-            }
-        } catch {
+        switch stagingPurgeTarget(stagingPathOverride: stagingPathOverride) {
+        case .nothingStaged:
+            return true
+        case .unreachable:
             if DebugModeManager.isLoggingEnabled() {
-                print("[NSEDataBridge] purgeStagedStateForFolder nse_processed_message delete failed for \(accountId.prefix(8)):\(folderPath): \(error)")
+                print("[NSEDataBridge] purgeStagedStateForFolder could not open the staging DB for \(accountId.prefix(8)):\(folderPath) — contents unknown, reporting FAILURE")
+            }
+            return false
+        case .queue(let queue):
+            do {
+                try queue.write { db in
+                    guard try db.tableExists("nse_processed_message") else { return }
+                    try db.execute(
+                        sql: "DELETE FROM nse_processed_message WHERE accountId = ? AND folderPath = ?",
+                        arguments: [accountId, folderPath]
+                    )
+                }
+                return true
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[NSEDataBridge] purgeStagedStateForFolder nse_processed_message delete failed for \(accountId.prefix(8)):\(folderPath): \(error)")
+                }
+                return false
             }
         }
     }
@@ -591,18 +614,35 @@ enum NSEDataBridge {
     /// non-inbox folder's reset, whose staged removals it has no claim over.
     ///
     /// Runs adjacent to (never inside) the main purge transaction — the staging DB
-    /// is a separate file — and is idempotent and best-effort for the same reason
-    /// `purgeStagedStateForFolder` is.
-    static func purgeInboxRemovalMarkersForAccount(accountId: String, stagingPathOverride: String? = nil) {
-        guard let queue = stagingQueueForPurge(stagingPathOverride: stagingPathOverride) else { return }
-        do {
-            try queue.write { db in
-                guard try db.tableExists("nse_inbox_removal") else { return }
-                try db.execute(sql: "DELETE FROM nse_inbox_removal WHERE accountId = ?", arguments: [accountId])
-            }
-        } catch {
+    /// is a separate file — and is idempotent.
+    ///
+    /// 🚨 RETURNS WHETHER THE DELETE COMMITTED (audit round 1 / C-4), with exactly
+    /// the semantics of `purgeStagedStateForFolder`'s result. A surviving marker here
+    /// is the sharpest form of the hazard: it is an executable DELETE instruction
+    /// naming a bare UID, so once the reaction advances the folder to the new epoch
+    /// and the resync seats a different message at that UID, the next merge deletes
+    /// it. The caller must not advance the epoch over a `false`.
+    static func purgeInboxRemovalMarkersForAccount(accountId: String, stagingPathOverride: String? = nil) -> Bool {
+        switch stagingPurgeTarget(stagingPathOverride: stagingPathOverride) {
+        case .nothingStaged:
+            return true
+        case .unreachable:
             if DebugModeManager.isLoggingEnabled() {
-                print("[NSEDataBridge] purgeInboxRemovalMarkersForAccount failed for \(accountId.prefix(8)): \(error)")
+                print("[NSEDataBridge] purgeInboxRemovalMarkersForAccount could not open the staging DB for \(accountId.prefix(8)) — contents unknown, reporting FAILURE")
+            }
+            return false
+        case .queue(let queue):
+            do {
+                try queue.write { db in
+                    guard try db.tableExists("nse_inbox_removal") else { return }
+                    try db.execute(sql: "DELETE FROM nse_inbox_removal WHERE accountId = ?", arguments: [accountId])
+                }
+                return true
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[NSEDataBridge] purgeInboxRemovalMarkersForAccount failed for \(accountId.prefix(8)): \(error)")
+                }
+                return false
             }
         }
     }
@@ -621,18 +661,42 @@ enum NSEDataBridge {
     static let purgeStagingPathOverrideForTesting = Mutex<String?>(nil)
     #endif
 
+    /// What a purge has to work with. The three cases exist because "there is
+    /// nothing to purge" and "there is something and we cannot reach it" are
+    /// OPPOSITE answers to the caller's question, and the old `DatabaseQueue?`
+    /// collapsed them into one `nil` (audit round 1 / C-4).
+    private enum StagingPurgeTarget {
+        /// Open. The DELETE decides.
+        case queue(DatabaseQueue)
+        /// No App Group container, or no staging file: nothing was ever staged, so a
+        /// purge over it is vacuously COMPLETE.
+        case nothingStaged
+        /// A staging file exists but could not be opened. Its contents are unknown,
+        /// which is a FAILURE — never a silent success.
+        case unreachable
+    }
+
     /// Shared resolution for the two purge helpers above — an explicit override
-    /// path (tests) or the real staging DB (`openStagingDB()`).
-    private static func stagingQueueForPurge(stagingPathOverride: String?) -> DatabaseQueue? {
-        if let stagingPathOverride {
-            return try? DatabaseQueue(path: stagingPathOverride)
-        }
+    /// path (tests), the DEBUG ambient override, or the real App-Group staging file.
+    private static func stagingPurgeTarget(stagingPathOverride: String?) -> StagingPurgeTarget {
+        var explicitPath = stagingPathOverride
         #if DEBUG
-        if let injected = purgeStagingPathOverrideForTesting.withLock({ $0 }) {
-            return try? DatabaseQueue(path: injected)
+        if explicitPath == nil {
+            explicitPath = purgeStagingPathOverrideForTesting.withLock { $0 }
         }
         #endif
-        return openStagingDB()
+        if let explicitPath {
+            guard FileManager.default.fileExists(atPath: explicitPath) else { return .nothingStaged }
+            guard let queue = try? DatabaseQueue(path: explicitPath) else { return .unreachable }
+            return .queue(queue)
+        }
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupId
+        ) else { return .nothingStaged }
+        let stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
+        guard FileManager.default.fileExists(atPath: stagingPath) else { return .nothingStaged }
+        guard let queue = openStagingDB() else { return .unreachable }
+        return .queue(queue)
     }
 
     // NOTE (2026-07-07): a `readStagedForDisplay` direct staging-FILE read for the

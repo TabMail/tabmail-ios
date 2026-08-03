@@ -80,8 +80,16 @@ struct AIWriteTarget: Sendable, Equatable {
     let provider: AccountProvider
     /// The captured row's own `MessageHeader.observedUidValidity`. `nil` for a
     /// stable-provider row (never stamped by design), for a row whose address was
-    /// invalidated by a move, and for any row predating the column — all of which
-    /// are an ABSENCE of evidence and therefore PROCEED, never a mismatch.
+    /// invalidated by a move or a re-key (`AccountManagerActions
+    /// .optimisticMoveToFolder`, `SyncEngineDeltaSync`, `SyncEngineFullSync`,
+    /// `BackfillBodyQueue` all null it), and for any row predating the column.
+    ///
+    /// ⚠ A nil here is an absence of evidence, and an absence of evidence NEVER
+    /// AUTHORIZES A WRITE. On an epoch-addressed provider whose folder DOES have a
+    /// known epoch, a nil captured stamp means this row's UID was never proven
+    /// under any numbering, so nothing can rule out that a turnover has since
+    /// re-seated that UID — `resolveCurrentHeader` arm 6b refuses. See arm 6a for
+    /// the genuinely epoch-less states, which are the ones that must still write.
     let observedUidValidity: Int?
 
     /// Whether this target's address space can be RENUMBERED under it. Account-side
@@ -114,9 +122,20 @@ struct AIWriteTarget: Sendable, Equatable {
     /// message; `nil` on any disagreement (⇒ the caller drops the write, and the
     /// next recompute heals).
     ///
-    /// **The governing rule: only a POSITIVE, PROVEN disagreement authorizes
-    /// dropping.** An absence of evidence — a nil epoch on either side — is never
-    /// laundered into a mismatch.
+    /// **The governing rule: a WRITE needs positive evidence, and this function
+    /// returns a row only when the captured identity is still positively
+    /// established.** This is the C3 direction, and it is the OPPOSITE of the
+    /// never-drop direction that governs a durable `PendingOperation`: there, an
+    /// unknown epoch must never retire the user's intention; here, an unknown epoch
+    /// must never authorize a mutation. An AI write-back is recomputable derived
+    /// metadata — refusing costs one recompute, admitting on an unproven identity
+    /// binds message X's summary to message Y and cannot be undone. The two rules
+    /// point in opposite directions because the cost of being wrong does.
+    ///
+    /// The earlier text here said "only a POSITIVE, PROVEN disagreement authorizes
+    /// dropping" and arm 6 implemented it literally, admitting the write whenever
+    /// the CAPTURED epoch was nil. That is the defect corrected below (arms 6a/6b):
+    /// it is exactly backwards for a mutation path.
     ///
     /// Arms, in evaluation order:
     ///  1. **row gone** ⇒ `nil`. Structural: there is no row bearing the captured
@@ -134,14 +153,30 @@ struct AIWriteTarget: Sendable, Equatable {
     ///     purge-and-resync (T4.S6): its rows either belong to an epoch the server
     ///     abandoned or have been purged and not yet resynced. TRANSIENT — the next
     ///     job recomputes.
-    ///  6. **either epoch nil** ⇒ PROCEED. `lastKnownUidValidity == nil` is the
-    ///     T1.3 first-sync window / demo / screenshot state; a nil header stamp is
-    ///     an unproven address. Dropping on either would permanently disable AI for
-    ///     the demo and screenshot accounts (see the SUBTRACT note above).
-    ///  7. **captured stamp != live folder epoch** ⇒ `nil`. **The only
-    ///     positive-evidence exit**: the server reported a UIDVALIDITY that
-    ///     disagrees with the one this row's UID was proven under, i.e. a proven
-    ///     turnover. Same shape as the single terminal arm of
+    ///  6a. **`lastKnownUidValidity == nil`** ⇒ PROCEED. The FOLDER has never been
+    ///     observed at all: the T1.3 first-sync window and `ScreenshotMode`'s
+    ///     raw-SQL folders (which insert without the column). No SELECT has ever
+    ///     reported an epoch here, so no turnover can have been observed either,
+    ///     and there is nothing this address could have been re-seated FROM.
+    ///     Dropping on it would permanently disable AI for those states (see the
+    ///     SUBTRACT note above).
+    ///  6b. **captured stamp nil while the folder's epoch IS known** ⇒ `nil`. This
+    ///     is NOT the mirror of 6a and must not be collapsed into it. The folder
+    ///     has a live numbering; this row's UID was never proven under any
+    ///     numbering (nulled by an optimistic move / delta-sync re-key / orphan
+    ///     migration, or written before the column existed). Nothing can then rule
+    ///     out that a turnover re-seated that UID with a DIFFERENT message, so
+    ///     admitting the write is an absence of evidence authorizing a
+    ///     wrong-message bind (C3). Refusing is safe AND self-healing: the caller
+    ///     drops this write, the next ordinary sync re-stamps the row, and the
+    ///     queue's arbiter re-drives the job. **Neither the demo account nor
+    ///     `ScreenshotMode` is affected** — demo exits at arm 4
+    ///     (`isEpochAddressed` excludes `DemoSeed.demoAccountId`) and
+    ///     `ScreenshotMode`'s folders have no `lastKnownUidValidity`, so they exit
+    ///     at 6a.
+    ///  7. **captured stamp != live folder epoch** ⇒ `nil`. The server reported a
+    ///     UIDVALIDITY that disagrees with the one this row's UID was proven under,
+    ///     i.e. a proven turnover. Same shape as the single terminal arm of
     ///     `AccountManagerActions.roleMoveRejectDispositions`.
     func resolveCurrentHeader(db: Database) throws -> MessageHeader? {
         guard let header = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
@@ -155,8 +190,12 @@ struct AIWriteTarget: Sendable, Equatable {
 
         let folder = try Folder.fetchOne(db, key: folderId)
         guard folder?.uidValidityResetPendingAt == nil else { return nil }
-        guard let capturedEpoch = observedUidValidity,
-              let liveEpoch = folder?.lastKnownUidValidity else { return header }
+        // 6a — the folder itself was never observed. ORDER MATTERS: this arm must be
+        // evaluated BEFORE 6b, or `ScreenshotMode` / first-sync rows (nil on BOTH
+        // sides) would be refused by 6b instead of admitted here.
+        guard let liveEpoch = folder?.lastKnownUidValidity else { return header }
+        // 6b — the folder's numbering is known; this row's is not. Refuse.
+        guard let capturedEpoch = observedUidValidity else { return nil }
         guard capturedEpoch == liveEpoch else { return nil }
         return header
     }

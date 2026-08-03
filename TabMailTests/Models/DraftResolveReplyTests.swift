@@ -164,21 +164,24 @@ struct ReplyTargetAddressVerdictTests {
         // epoch disagrees, which is exactly why the epoch is stored.
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: "42", expectedUidValidity: 100,
-            hitProviderMessageId: "42", hitUidValidity: 200) == .mismatch)
+            hitProviderMessageId: "42", hitUidValidity: 200,
+            isEpochAddressed: true) == .mismatch)
     }
 
     @Test("A different provider id is a proven mismatch")
     func differentProviderIdIsMismatch() {
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: "42", expectedUidValidity: 100,
-            hitProviderMessageId: "43", hitUidValidity: 100) == .mismatch)
+            hitProviderMessageId: "43", hitUidValidity: 100,
+            isEpochAddressed: true) == .mismatch)
     }
 
     @Test("The same address under the same epoch is confirmed")
     func sameAddressSameEpochIsConfirmed() {
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: "42", expectedUidValidity: 100,
-            hitProviderMessageId: "42", hitUidValidity: 100) == .confirmed)
+            hitProviderMessageId: "42", hitUidValidity: 100,
+            isEpochAddressed: true) == .confirmed)
     }
 
     @Test("A stable-provider-id account, which has no epoch at all, is confirmed")
@@ -187,7 +190,21 @@ struct ReplyTargetAddressVerdictTests {
         // Treating that as unverifiable would refuse every Gmail reply quote.
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: "18c9abc", expectedUidValidity: nil,
-            hitProviderMessageId: "18c9abc", hitUidValidity: nil) == .confirmed)
+            hitProviderMessageId: "18c9abc", hitUidValidity: nil,
+            isEpochAddressed: false) == .confirmed)
+    }
+
+    /// 🚨 AUDIT ROUND 1 / C-2. The SAME (nil, nil) input on a RENUMBERABLE id space
+    /// is not proof of anything: a bare UID names a slot, and two absences do not
+    /// establish that the slot still holds the same message. This cell returned
+    /// `.confirmed` for every provider before the fix, which is what let an
+    /// unstamped IMAP reply target be accepted purely for sitting at the same UID.
+    @Test("The same bare UID with no epoch on either side is NOT confirmed on a renumberable id space")
+    func bareUidWithNoEpochOnEitherSideIsNotConfirmed() {
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "42", expectedUidValidity: nil,
+            hitProviderMessageId: "42", hitUidValidity: nil,
+            isEpochAddressed: true) == .unverifiable)
     }
 
     @Test("A one-sided unknown epoch is unverifiable, never a mismatch")
@@ -196,10 +213,12 @@ struct ReplyTargetAddressVerdictTests {
         // positive disagreement, in either direction.
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: "42", expectedUidValidity: 100,
-            hitProviderMessageId: "42", hitUidValidity: nil) == .unverifiable)
+            hitProviderMessageId: "42", hitUidValidity: nil,
+            isEpochAddressed: true) == .unverifiable)
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: "42", expectedUidValidity: nil,
-            hitProviderMessageId: "42", hitUidValidity: 100) == .unverifiable)
+            hitProviderMessageId: "42", hitUidValidity: 100,
+            isEpochAddressed: true) == .unverifiable)
     }
 
     @Test("An absent address stamp is unverifiable, never a mismatch")
@@ -207,7 +226,8 @@ struct ReplyTargetAddressVerdictTests {
         // Every pre-v80 draft row. Absence of a stamp is absence of evidence.
         #expect(Draft.replyTargetAddressVerdict(
             expectedProviderMessageId: nil, expectedUidValidity: nil,
-            hitProviderMessageId: "42", hitUidValidity: 200) == .unverifiable)
+            hitProviderMessageId: "42", hitUidValidity: 200,
+            isEpochAddressed: true) == .unverifiable)
     }
 }
 
@@ -451,7 +471,168 @@ struct ReplyQuoteIdentityTests {
         #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true)
     }
 
+    // MARK: - AUDIT ROUND 1 / C-2 — silence from BOTH baselines is not identity
+
+    /// 🚨 The disclosure this whole mechanism exists to prevent, in the one shape
+    /// that used to slip through: an RFC-less IMAP message. Its draft key carries
+    /// the bare UID (`MessageHeader.stableId` falls back to `messageId` when there
+    /// is no RFC id), so `expectedReplyToRfc` recovers NO baseline; and the draft's
+    /// epoch stamp is nil because the row's address was never proven. The old
+    /// predicate accepted on `.unverifiable` + no RFC baseline, so the message that
+    /// took over UID 42 supplied the attribution, the body and the attachments of
+    /// the user's OUTGOING reply.
+    ///
+    /// The property asserted is the end state — no foreign content in the quote —
+    /// not which column decided.
+    @Test("An RFC-less IMAP reply target whose UID was taken over yields no quote, never the new occupant's body")
+    func rfcLessTargetWithUnprovenEpochYieldsNoForeignQuote() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        // UID 42 now holds a DIFFERENT correspondent's message under a new epoch.
+        let occupantId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: nil, observedUidValidity: 200,
+            from: "someone-else@domain.com", snippet: "occupant snippet")
+        try TestDatabase.insertMessageBody(
+            db, headerId: occupantId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        // The draft the user is still composing: it names UID 42, and its epoch was
+        // never proven (nil), which is the ordinary state after an optimistic move
+        // or a delta-sync re-key.
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:42", replyToId: occupantId,
+            stampProviderMessageId: "42", stampUidValidity: nil)
+
+        // NON-VACUITY: the foreign body really is sitting at the exact key the
+        // pre-fix resolver returned, so `nil` below is a refusal, not an empty DB.
+        let planted = try db.read { conn in
+            try MessageBody.fetchOne(conn, key: occupantId)?.htmlContent
+        }
+        #expect(planted?.contains(Self.foreignMarker) == true)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil,
+                """
+                a reply target was accepted with NOTHING proving it is the copy the user replied to — \
+                no RFC baseline and no epoch on either side, only a matching bare UID. On a renumberable \
+                id space that is an address match, not an identity.
+                """)
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true,
+                "another correspondent's body would have been quoted into the user's outgoing reply")
+    }
+
+    /// The same hazard through the OTHER unproven cell: neither side carries an
+    /// epoch at all. That pair used to read as `.confirmed` — two absences
+    /// laundered into positive per-copy identity.
+    @Test("An RFC-less IMAP reply target with no epoch on either side yields no quote")
+    func rfcLessTargetWithNoEpochAnywhereYieldsNoQuote() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        let occupantId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: nil, observedUidValidity: nil,
+            from: "someone-else@domain.com", snippet: "occupant snippet")
+        try TestDatabase.insertMessageBody(
+            db, headerId: occupantId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:42", replyToId: occupantId,
+            stampProviderMessageId: "42", stampUidValidity: nil)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil)
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
+    }
+
+    /// The two-sided control for both tests above: an RFC-less IMAP target is NOT
+    /// permanently unquotable. When the epoch IS proven on both sides the address
+    /// baseline confirms the exact copy on its own, and the quote must land.
+    @Test("An RFC-less IMAP reply target with a PROVEN epoch on both sides still quotes")
+    func rfcLessTargetWithProvenEpochStillQuotes() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        let targetId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: nil, observedUidValidity: 100)
+        try TestDatabase.insertMessageBody(
+            db, headerId: targetId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:42", replyToId: targetId,
+            stampProviderMessageId: "42", stampUidValidity: 100)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote?.header.id == targetId,
+                "a proven (UID, UIDVALIDITY) pair IS positive per-copy identity — refusing it is pure loss")
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true)
+    }
+
     // MARK: - The account+RFC recovery must not itself resolve to an arbitrary row
+
+    /// 🚨 AUDIT ROUND 1 / C-2. `(accountId, rfc822MessageId)` carries no uniqueness
+    /// constraint, and Strategy 2 used a bare `fetchOne` — so with two matching rows
+    /// SQLite's arbitrary choice decided which correspondent's body, attribution and
+    /// attachments went into the outgoing reply. Two rows share an RFC identity for
+    /// benign reasons (one Gmail message under several labels) and for hostile ones
+    /// (a Message-ID collision), and this resolver cannot tell them apart — so it
+    /// must refuse. The draft's own authored body is untouched either way.
+    @Test("Two rows sharing one RFC identity yield no reply target, never an arbitrary one")
+    func ambiguousRfcIdentityResolvesToNothing() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        let firstId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "collision@example.com",
+            observedUidValidity: 100)
+        try TestDatabase.insertMessageBody(
+            db, headerId: firstId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let secondId = "acc1:Archive:77"
+        try Self.insertHeader(
+            db, messageId: "77", folderPath: "Archive",
+            rfc822MessageId: "collision@example.com", observedUidValidity: 900,
+            from: "someone-else@domain.com")
+        try TestDatabase.insertMessageBody(
+            db, headerId: secondId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        // Strategy 1 cannot answer: the PK the draft names no longer exists, which
+        // is precisely when Strategy 2 runs.
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:collision@example.com", replyToId: "acc1:INBOX:999",
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        // NON-VACUITY: BOTH rows really are there and really do share the identity,
+        // so the refusal below is about ambiguity and not about an empty result.
+        let matching = try db.read { conn in
+            try MessageHeader
+                .filter(Column("accountId") == "acc1" && Column("rfc822MessageId") == "collision@example.com")
+                .fetchCount(conn)
+        }
+        #expect(matching == 2)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil,
+                """
+                one of two indistinguishable rows was picked to supply the reply target. Which one is \
+                SQLite's choice, so a colliding Message-ID silently substitutes another message's \
+                attribution, body and attachments into the user's reply.
+                """)
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) != true)
+    }
 
     @Test("A draft key with an empty stableId resolves to no reply target")
     func emptyStableIdInDraftKeyResolvesToNothing() throws {

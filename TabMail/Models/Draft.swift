@@ -218,31 +218,58 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// - A nil `expectedProviderMessageId` (every pre-v80 row) is `.unverifiable` —
     ///   absence of a stamp is absence of evidence, never evidence of substitution.
     /// - Different provider ids ⇒ `.mismatch` (a positive, proven disagreement).
-    /// - Same provider id, both epochs nil ⇒ `.confirmed`. Both nil is the NORMAL,
-    ///   correct state for Gmail/Graph, whose ids are stable and never reused, so
-    ///   the address itself is durable identity there.
+    /// - Same provider id, both epochs nil, **NOT epoch-addressed** ⇒ `.confirmed`.
+    ///   Both nil is the NORMAL, correct state for Gmail/Graph, whose ids are stable
+    ///   and never reused, so the address itself is durable identity there.
+    /// - Same provider id, both epochs nil, **epoch-addressed** ⇒ `.unverifiable`.
+    ///   ⚠ AUDIT ROUND 1 / C-2: this cell used to return `.confirmed` for every
+    ///   provider. On IMAP/iCloud a bare UID with no epoch on EITHER side is two
+    ///   absences, not an agreement — the id space is renumberable, so "same UID"
+    ///   is an address match and nothing more. Confirming it laundered a pair of
+    ///   unknowns into positive per-copy identity.
     /// - Same provider id, both epochs present ⇒ equality decides. THIS is the cell
     ///   that catches the UIDVALIDITY reset: the resynced row keeps UID 42 and
     ///   changes only the epoch.
     /// - Same provider id, exactly ONE epoch present ⇒ `.unverifiable`. An unknown
     ///   epoch is retryable/inconclusive, never a proven turnover (`CLAUDE.md`:
     ///   exit 4 requires a PROVEN epoch change and "does not widen clause 2").
+    ///
+    /// `.unverifiable` carries no authority in EITHER direction — read
+    /// `acceptsReplyTargetHit` for what actually admits a candidate.
     static func replyTargetAddressVerdict(
         expectedProviderMessageId: String?,
         expectedUidValidity: Int?,
         hitProviderMessageId: String,
-        hitUidValidity: Int?
+        hitUidValidity: Int?,
+        isEpochAddressed: Bool
     ) -> ReplyTargetVerdict {
         guard let expectedProviderMessageId else { return .unverifiable }
         guard expectedProviderMessageId == hitProviderMessageId else { return .mismatch }
         switch (expectedUidValidity, hitUidValidity) {
         case (nil, nil):
-            return .confirmed
+            return isEpochAddressed ? .unverifiable : .confirmed
         case let (expected?, hit?):
             return expected == hit ? .confirmed : .mismatch
         default:
             return .unverifiable
         }
+    }
+
+    /// Whether an account addresses its messages by a RENUMBERABLE id, i.e. an IMAP
+    /// UID inside one `(mailbox, UIDVALIDITY)` epoch. Account-side mirror of
+    /// `EmailProvider.staleWindowMode == .uid`, and deliberately the SAME three
+    /// clauses as `AIWriteTarget.isEpochAddressed` and
+    /// `AccountManager.newGestureRefusedForUnknownEpoch`: `.icloud` is IMAP, and the
+    /// demo account is stored as `.imap` but served by `DemoProvider`, so it has no
+    /// server, no SELECT and no epoch, ever.
+    ///
+    /// Fails CLOSED (`true`) when the account row cannot be read: this predicate
+    /// only ever TIGHTENS acceptance, so an unknown provider must get the strict
+    /// treatment, never the lenient one.
+    static func replyTargetIsEpochAddressed(accountId: String, db: Database) throws -> Bool {
+        guard let account = try Account.fetchOne(db, key: accountId) else { return true }
+        guard accountId != DemoSeed.demoAccountId else { return false }
+        return account.provider == .imap || account.provider == .icloud
     }
 
     /// PORT — `v2final:Draft.expectedReplyToRfc(draftKey:isForward:)`.
@@ -290,33 +317,62 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// THE PREDICATE. May the row currently at the draft's `replyToId` be accepted
     /// as the message the user replied to?
     ///
-    /// **Accept iff NEITHER baseline positively disagrees.** Both baselines are
-    /// independent positive-identity checks over data external to the candidate; a
-    /// baseline that cannot decide (no v80 stamp, unknown epoch, RFC-less source)
-    /// contributes nothing rather than laundering its silence into either verdict.
-    /// This is not a "fallback chain" (`CLAUDE.md` rule 4) — nothing here retries a
-    /// failed operation, and no branch re-attempts a rejected candidate a laxer way.
+    /// **On a renumberable (epoch-addressed) id space, accept ONLY on POSITIVE
+    /// proof from at least one baseline; elsewhere, accept unless one positively
+    /// disagrees.** This is not a "fallback chain" (`CLAUDE.md` rule 4) — nothing
+    /// here retries a failed operation, and no branch re-attempts a rejected
+    /// candidate a laxer way.
+    ///
+    /// 🚨 AUDIT ROUND 1 / C-2 — WHY THE RULE IS ASYMMETRIC. This used to be "accept
+    /// iff NEITHER baseline positively disagrees", implemented as
+    /// `guard addressVerdict != .mismatch` followed by the RFC check. Two silences
+    /// therefore ACCEPTED: an RFC-less IMAP message whose draft carried no epoch
+    /// (`.unverifiable`) and whose key yielded no RFC baseline (`nil` ⇒ the RFC half
+    /// returns `true`) was admitted purely because it sat at the same UID. A
+    /// UIDVALIDITY reset during compose re-seats that UID, and `resolveReplyQuote`
+    /// then loads the NEW occupant's attribution, body and attachments into the
+    /// user's OUTGOING reply — another correspondent's mail leaving the device. An
+    /// absence of evidence must never authorize a disclosure; and unlike a durable
+    /// queue entry there is nothing to drop here, because omitting a quote costs the
+    /// user a paragraph they can re-add, not their intention.
+    ///
+    /// The asymmetry is not a hedge: on Gmail/Graph the provider id IS durable
+    /// identity (never reused, never renumbered), so "no baseline disagrees" really
+    /// is proof there. Only a UID needs its epoch to mean anything.
     ///
     /// Where each baseline is load-bearing:
     /// - pre-v80 (legacy) row, IMAP with an RFC id → stamp `.unverifiable`, RFC
-    ///   baseline decides. Exactly the reference's behaviour; NOT a laundered pass.
-    /// - pre-v80 row, Gmail/Graph → both baselines silent → accept. Correct: the
-    ///   provider id IS durable identity there, so there is no hazard to guard.
+    ///   baseline PROVES it. Exactly the reference's behaviour.
+    /// - pre-v80 row, Gmail/Graph → both baselines silent → accept, because that id
+    ///   space is not renumberable and there is no hazard to guard.
     /// - stamped row, RFC-less IMAP, UIDVALIDITY reset → RFC baseline silent, stamp
     ///   says `.mismatch` → reject. This is what v80 adds over the reference.
+    /// - RFC-less IMAP with no epoch on either side → NOTHING proves the copy →
+    ///   reject (the C-2 case; the reply is still composable, just unquoted).
     static func acceptsReplyTargetHit(
         expectedRfc: String?,
         expectedProviderMessageId: String?,
         expectedUidValidity: Int?,
-        hit: MessageHeader
+        hit: MessageHeader,
+        hitIsEpochAddressed: Bool
     ) -> Bool {
         let addressVerdict = replyTargetAddressVerdict(
             expectedProviderMessageId: expectedProviderMessageId,
             expectedUidValidity: expectedUidValidity,
             hitProviderMessageId: hit.messageId,
-            hitUidValidity: hit.observedUidValidity)
+            hitUidValidity: hit.observedUidValidity,
+            isEpochAddressed: hitIsEpochAddressed)
         guard addressVerdict != .mismatch else { return false }
-        return acceptStrategy1ReplyHit(expectedRfc: expectedRfc, hitRfc: hit.rfc822MessageId)
+        // Either baseline may still VETO; a veto outranks the other's proof.
+        guard acceptStrategy1ReplyHit(expectedRfc: expectedRfc, hitRfc: hit.rfc822MessageId) else { return false }
+        // A non-renumberable id space: the address IS the identity, so surviving both
+        // vetoes is proof.
+        guard hitIsEpochAddressed else { return true }
+        // Renumberable: require a POSITIVE confirmation. `expectedRfc != nil` here
+        // means the RFC baseline ran AND matched (the veto above would have returned
+        // otherwise), which pins the exact physical copy — an RFC identity cannot be
+        // borne by two rows at one PK.
+        return addressVerdict == .confirmed || expectedRfc != nil
     }
 
     /// Resolve the reply-to `MessageHeader` from a draft key + `replyToId`, guarding
@@ -351,7 +407,8 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// Strategy 2 is deliberately NOT re-checked against the v80 address stamp: a
     /// legitimate MOVE gives the same message a new UID, so the stamp would refuse
     /// the very case Strategy 2 exists to recover. Its own `accountId` + normalized
-    /// `rfc822MessageId` predicate is the positive identity proof.
+    /// `rfc822MessageId` predicate is the positive identity proof — but ONLY when it
+    /// names exactly ONE row; see the cardinality guard at that query.
     static func resolveReplyToHeader(
         draftKey: String,
         replyToId: String?,
@@ -364,11 +421,12 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         // Strategy 1: direct PK lookup — accepted only when it cannot be an impostor.
         if let replyId = replyToId,
            let header = try MessageHeader.fetchOne(db, key: replyId),
-           acceptsReplyTargetHit(
+           try acceptsReplyTargetHit(
                expectedRfc: expectedRfc,
                expectedProviderMessageId: expectedProviderMessageId,
                expectedUidValidity: expectedUidValidity,
-               hit: header) {
+               hit: header,
+               hitIsEpochAddressed: replyTargetIsEpochAddressed(accountId: header.accountId, db: db)) {
             return header
         }
         // Strategy 2: parse accountId + stableId from the draft key, look up by
@@ -385,9 +443,30 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         // a wrong-message resolution (C3). `DraftStore.evictImpl`'s twin of this query
         // already carries the same guard.
         guard !normalized.isEmpty else { return nil }
-        return try MessageHeader
+        // 🚨 AUDIT ROUND 1 / C-2 — CARDINALITY IS PART OF THE PROOF. This was a bare
+        // `fetchOne`, which silently picked an ARBITRARY row whenever more than one
+        // matched. `(accountId, rfc822MessageId)` has no uniqueness constraint and is
+        // genuinely non-unique in practice: one Gmail message lives under several
+        // labels as several header rows, and a Message-ID collision (a buggy sender,
+        // a list rewriter) puts two DIFFERENT messages under one identity. What this
+        // resolver returns is not content — it drives the reply ADDRESS, the
+        // attribution line, the quoted body and the forwarded attachments — so
+        // picking "one of them" is exactly the header-specific decision the RFC
+        // (content) key cannot make. Two candidates therefore fail CLOSED: the draft
+        // and its authored body are untouched, the quote is simply omitted, and the
+        // user can still send. `limit(2)` because the only question is one-or-more
+        // than-one.
+        let candidates = try MessageHeader
             .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
-            .fetchOne(db)
+            .limit(2)
+            .fetchAll(db)
+        guard candidates.count == 1 else {
+            if candidates.count > 1, DebugModeManager.isLoggingEnabled() {
+                print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — \(candidates.count)+ rows share this account's RFC identity; no single physical copy is proven")
+            }
+            return nil
+        }
+        return candidates[0]
     }
 
     /// PORT — `v2final:Draft.ReplyQuote`.
@@ -442,8 +521,9 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
             expectedUidValidity: expectedUidValidity, db: db)
         else { return nil }
         // The resolver already validated identity (Strategy-1 guarded, or Strategy-2's
-        // exact account+RFC match). The body is read from the RESOLVED header's own id
-        // in THIS SAME snapshot — never from the caller's mutable `replyToId`.
+        // exact account+RFC match proven UNIQUE within the account). The body is read
+        // from the RESOLVED header's own id in THIS SAME snapshot — never from the
+        // caller's mutable `replyToId`.
         let body = try MessageBody.fetchOne(db, key: header.id)
         return ReplyQuote(header: header, body: body)
     }
