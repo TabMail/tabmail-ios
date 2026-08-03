@@ -27,10 +27,17 @@ enum ComposeDraftGuards {
     /// absence.**
     enum ReadState: Equatable { case loaded, notFound, error }
 
-    static func readState(_ result: Result<Draft?, Error>) -> ReadState {
+    /// Generic over the record read so the SAME three-way distinction covers every
+    /// compose-path read that must not conflate "we could not look" with "there is
+    /// nothing there" — the `Draft` reads on load / save / discard / send, and (as
+    /// of the reply-target fix) the GUARDED reply-target resolution in
+    /// `DraftComposePresenter`, whose thrown read previously returned a nil target
+    /// that the presenter rendered as an authoritative "this draft has no reply
+    /// parent".
+    static func readState<Record>(_ result: Result<Record?, Error>) -> ReadState {
         switch result {
         case .failure: return .error
-        case .success(let draft): return draft == nil ? .notFound : .loaded
+        case .success(let record): return record == nil ? .notFound : .loaded
         }
     }
 
@@ -164,6 +171,92 @@ enum ComposeDraftGuards {
         confirmedBodyHTML
     }
 
+    /// ⚑ NO REFERENCE — INVENTED. What the PERSISTED `Draft` row says about this
+    /// compose's reply/forward parent, once the GUARDED resolver
+    /// (`Draft.resolveReplyQuote`, i.e. `Draft.resolveReplyToHeader` plus its body)
+    /// has run over the row's own stored claim.
+    ///
+    /// The ROW — not `ComposeView.replyTo` — is the authority whenever a row
+    /// exists. The parameter is absent on the paths that reopen a stored draft:
+    /// `UndoReopenCompose.composeView(for:)` constructs
+    /// `ComposeView(account:prefillDraftId:retainedDraftAuthority:)` and passes NO
+    /// `replyTo`, while the row it reopens still carries `replyToId` (preserved by
+    /// `ComposeView.send`'s `snapshot.replyToHeaderId ?? draftRecord?.replyToId`
+    /// and by `saveDraftAndDismiss`'s `existing` branch). Deriving the send's
+    /// parent from the parameter there shipped the reply as a BRAND-NEW message:
+    /// `ThreadUtils.outgoingThreadHeaders(replyTo: nil)` returns `.none`, so no
+    /// `In-Reply-To` and no `References`, and
+    /// `AccountManagerOutbox.persistQueuedSend` skipped the parent's
+    /// `isReplied`/`isForwarded` write and the Reply action-tag clear.
+    enum PersistedReplyTargetClaim: Equatable {
+        /// The row names no reply/forward parent AND none could be established from
+        /// its key either. Deliberately NOT spelled `none`: a bare `.none` in a
+        /// `switch` over this type is ambiguous with `Optional.none` (a repeat trap
+        /// in this codebase).
+        case noClaim
+        /// The row's claim resolved, through the guard, to exactly this header.
+        /// Reached either by the guarded PK hit or by the draft key's RFC identity
+        /// proven unique within the account — so it also covers the folder move
+        /// that re-keys the stored PK.
+        case resolved(MessageHeader)
+        /// The row CLAIMS a reply/forward parent (`replyToId != nil`) that resolved
+        /// to NOTHING — refused by the impostor / cardinality guard, or unreadable.
+        /// No physical message is proven, so none may be threaded against and none
+        /// may be marked replied/forwarded.
+        case unresolved
+    }
+
+    /// Map the GUARDED resolver's outcome over a PERSISTED row into that row's
+    /// claim. `rowClaimsTarget` is the row's own `isReplyOrForward`; `resolved` is
+    /// what the guarded resolver returned (nil = refused, or the read failed).
+    static func persistedReplyTargetClaim(
+        rowClaimsTarget: Bool, resolved: MessageHeader?
+    ) -> PersistedReplyTargetClaim {
+        if let resolved { return .resolved(resolved) }
+        return rowClaimsTarget ? .unresolved : .noClaim
+    }
+
+    /// The reply/forward parent a SEND may use.
+    enum SendReplyTarget: Equatable {
+        /// Send against this parent. `nil` is a genuinely unthreaded new message,
+        /// not an unknown one.
+        case send(MessageHeader?)
+        /// BLOCK the send. The draft names a reply/forward parent that no longer
+        /// resolves to exactly one message, so threading against it is impossible
+        /// and marking it replied/forwarded would risk the WRONG message (C3).
+        /// Blocks the SEND only — the local draft stays openable, editable,
+        /// savable and discardable, which is what preserves the user's agency over
+        /// the text they authored.
+        case blocked
+    }
+
+    /// THE PREDICATE for the send's reply/forward parent.
+    ///
+    /// - A persisted row exists ⇒ that row's guarded resolution is the target.
+    /// - No persisted row ⇒ `composeParameter` — the header the user LITERALLY
+    ///   tapped on a fresh reply/forward — is the target.
+    ///
+    /// The parameter is not consulted when a row exists, deliberately: the row is
+    /// the durable record of what this draft replies to, and the two only diverge
+    /// on paths where the parameter is the weaker of the two (absent on the Undo
+    /// reopen; a pre-captured snapshot elsewhere). No production path can present a
+    /// row that claims NOTHING together with a non-nil parameter — every writer of
+    /// a `reply:`/`forward:`-keyed row takes `replyToId` from the same non-nil
+    /// header the parameter came from (`ComposeView.saveDraftAndDismiss`'s INSERT
+    /// branch, `ComposeView.send`'s `ownedDraft`, `DynamicIslandChat`'s
+    /// `draftReplyToId`), and the update paths preserve it.
+    static func sendReplyTarget(
+        composeParameter: MessageHeader?,
+        persistedRowClaim: PersistedReplyTargetClaim?
+    ) -> SendReplyTarget {
+        guard let persistedRowClaim else { return .send(composeParameter) }
+        switch persistedRowClaim {
+        case .noClaim: return .send(nil)
+        case .resolved(let header): return .send(header)
+        case .unresolved: return .blocked
+        }
+    }
+
     /// ⚑ NO REFERENCE — INVENTED **shape**; the BEHAVIOUR is a PORT of
     /// `v2final:ComposeView.saveDraftAndDismiss`'s post-commit `switch saveResult`
     /// (F0d), which consumed `v2final:DraftStore.SaveResult.applied(previousDir:)`.
@@ -231,6 +324,20 @@ struct ComposeView: View {
         /// stamp can never describe a different message than the PK beside it.
         let replyToProviderMessageId: String?
         let replyToUidValidity: Int?
+        /// The reply/forward PARENT this send threads against and marks
+        /// replied/forwarded — `ComposeDraftGuards.sendReplyTarget`'s answer,
+        /// captured in the same MainActor turn as everything else here.
+        ///
+        /// Distinct from the three fields above ON PURPOSE. Those carry the DRAFT
+        /// ROW's stamp forward across the save-before-send (`snapshot
+        /// .replyToHeaderId ?? draftRecord?.replyToId`, branch for branch) so the
+        /// address the user replied to stays decided-once-at-creation. This one is
+        /// the parent the OUTBOUND message threads against, which on a reopened
+        /// draft is the row's guarded resolution — and after a folder move that is
+        /// the parent's CURRENT primary key, which is what
+        /// `AccountManagerOutbox.persistQueuedSend` needs to find the row it marks
+        /// replied.
+        let resolvedReplyTarget: MessageHeader?
         let isForward: Bool
         let outbound: DraftMessage
     }
@@ -312,6 +419,12 @@ struct ComposeView: View {
     /// Cleared only by a successful reload (reopen), never by proceeding with a
     /// partial set.
     @State private var attachmentLoadFailed = false
+    /// What the PERSISTED `Draft` row this compose opened says about its
+    /// reply/forward parent, after the guarded resolver ran at load time. `nil`
+    /// means NO persisted row was loaded (a fresh compose / reply / forward), which
+    /// is the only state in which the `replyTo` PARAMETER is the send's authority.
+    /// See `ComposeDraftGuards.sendReplyTarget`.
+    @State private var persistedReplyTargetClaim: ComposeDraftGuards.PersistedReplyTargetClaim?
     /// Snapshot of draft state at load time — used to detect actual changes for "Save?" prompt
     @State private var initialSubject = ""
     @State private var initialBody = ""
@@ -428,6 +541,27 @@ struct ComposeView: View {
         }
         return nil
     }
+
+    /// The reply/forward parent this compose SENDS against, and whether the send is
+    /// admissible at all. See `ComposeDraftGuards.sendReplyTarget`.
+    private var sendReplyTarget: ComposeDraftGuards.SendReplyTarget {
+        ComposeDraftGuards.sendReplyTarget(
+            composeParameter: replyTo, persistedRowClaim: persistedReplyTargetClaim)
+    }
+
+    /// True when the loaded draft row names a reply/forward parent that no longer
+    /// resolves to exactly one message. Blocks SEND only — deliberately NOT the
+    /// save, close or discard paths, so the user can always recover, edit or bin
+    /// the text they authored. (`attachmentLoadFailed`, whose idiom this follows,
+    /// DOES additionally block save-to-server, because saving there would destroy
+    /// attachments; nothing is destroyed here.)
+    private var replyTargetBlocksSend: Bool { sendReplyTarget == .blocked }
+
+    /// Shown when `replyTargetBlocksSend`. States the block, states that the
+    /// authored text is safe, and names the two ways out.
+    private static let unresolvedReplyTargetMessage =
+        "The message this draft replies to can no longer be identified, so it can't be sent. "
+        + "Your text is safe — save or discard this draft, or start again from the original message."
 
     // MARK: - Recipient cap
     /// Total recipients across To + Cc + Bcc. Tokens only; pending input text
@@ -733,7 +867,13 @@ struct ComposeView: View {
                             .fontWeight(.semibold)
                             // B1: block Send while attachments failed to load —
                             // never send a silent subset of the user's files.
-                            .disabled(toTokens.isEmpty || subject.isEmpty || attachmentLoadFailed)
+                            // …and while the draft names a reply/forward parent
+                            // that no longer resolves — never ship a reply as an
+                            // untethered new message, and never mark a message
+                            // replied that we have not identified.
+                            .disabled(
+                                toTokens.isEmpty || subject.isEmpty || attachmentLoadFailed
+                                || replyTargetBlocksSend)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1668,6 +1808,19 @@ struct ComposeView: View {
             // arbitrary account (the fallback fires whenever `account`, the picker
             // and the reply parent all fail to resolve), which is the exact
             // wrong-account send this item exists to prevent.
+            // THE ROW IS THE AUTHORITY on this compose's reply/forward parent, for
+            // the QUOTE (above) and — as of this change — for the SEND as well. The
+            // resolver already ran; record its verdict so `send()` threads against
+            // the SAME header the quote came from instead of the `replyTo`
+            // parameter, which the Undo-Send reopen does not carry at all. A
+            // CLAIMED-but-unresolved parent blocks Send; it blocks nothing else, so
+            // the draft stays editable, savable and discardable.
+            let rowClaim = ComposeDraftGuards.persistedReplyTargetClaim(
+                rowClaimsTarget: draft.isReplyOrForward, resolved: quote?.header)
+            persistedReplyTargetClaim = rowClaim
+            if rowClaim == .unresolved {
+                sendError = Self.unresolvedReplyTargetMessage
+            }
             if let quote {
                 let reply = quote.header
                 let resolvedForward = replyTo != nil ? isForward : draft.isForward
@@ -1687,7 +1840,7 @@ struct ComposeView: View {
                     quotedHTML = EmailFilter.stripEmbeddedEmlSections(html)
                 }
             } else if draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
-                print("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED (authored body untouched)")
+                print("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED and SEND BLOCKED (authored body untouched; save/discard unaffected)")
             }
 
             print("[ComposeView] Loaded draft: id=\(draftId) subject=\(subject.prefix(40))")
@@ -2409,6 +2562,22 @@ struct ComposeView: View {
             sendError = "This draft did not finish loading. Close and reopen it before sending."
             return
         }
+        // The reply/forward PARENT this send threads against. When a persisted
+        // `Draft` row owns this compose, the row's GUARDED resolution is the target
+        // and the `replyTo` parameter is not consulted; the parameter is authority
+        // only for a fresh reply/forward with no row. Defense-in-depth twin of the
+        // `.disabled` on Send, so no alternate path (the empty-body prompt) can
+        // send a draft whose claimed parent resolved to nothing — that would ship
+        // the reply UNTHREADED and hand `persistQueuedSend` an id it cannot verify.
+        // Blocks the SEND only: save, close and discard are untouched.
+        let sendTarget: MessageHeader?
+        switch sendReplyTarget {
+        case .blocked:
+            sendError = Self.unresolvedReplyTargetMessage
+            return
+        case .send(let header):
+            sendTarget = header
+        }
         guard let account = resolvedAccount else {
             sendError = "No account available to send from."
             return
@@ -2441,7 +2610,7 @@ struct ComposeView: View {
         // for Gmail, the conversation threadId (guarded by account + subject
         // match). Forward threads like reply per Gmail convention. See ADR-IOS-043.
         let threadHeaders = ThreadUtils.outgoingThreadHeaders(
-            replyTo: replyTo,
+            replyTo: sendTarget,
             sendAccountId: account.id,
             sendSubject: subject,
             providerKind: account.provider
@@ -2471,6 +2640,7 @@ struct ComposeView: View {
             replyToHeaderId: replyTo?.id,
             replyToProviderMessageId: replyTo?.messageId,
             replyToUidValidity: replyTo?.observedUidValidity,
+            resolvedReplyTarget: sendTarget,
             isForward: isForward,
             outbound: outbound)
 
@@ -2622,7 +2792,13 @@ struct ComposeView: View {
             outboxId = try await AccountManager.shared.queueSend(
                 draft: snapshot.outbound,
                 from: snapshot.account,
-                replyToHeaderId: snapshot.replyToHeaderId,
+                // The RESOLVED parent, not the raw parameter: `persistQueuedSend`
+                // uses this id to mark the parent isReplied/isForwarded and to
+                // clear its Reply action tag, so it must name the message this send
+                // actually threads against. On the Undo-Send reopen the parameter
+                // is nil while the row's resolution is the real parent — that path
+                // previously skipped the parent bookkeeping entirely.
+                replyToHeaderId: snapshot.resolvedReplyTarget?.id,
                 isForward: snapshot.isForward,
                 serverDraftId: draftRecord?.serverDraftId,
                 draftUidValidity: draftRecord?.serverDraftUidValidity,

@@ -224,8 +224,33 @@ struct DraftComposePresenter: View {
             }
         }
 
-        // Resolve reply-to message (with stableId fallback for stale PKs)
-        let replyTo = resolveReplyTo(draft: draft)
+        // Resolve reply-to message (with stableId fallback for stale PKs).
+        //
+        // A THROWN resolver read is NOT "this draft has no reply parent". The
+        // superseded call went through `Draft.resolveReplyToHeader`'s non-`db`
+        // overload, whose whole body is `try? AppDatabase.dbPool.read { … }`: a
+        // busy or suspended database returned nil and this function still returned
+        // `.loaded(draft:replyTo: nil, account:)`. That manufactured an
+        // authoritative negative out of "we could not look" — the never-drop
+        // clause-2 error, in the very function whose `.loadFailed` arm documents
+        // that a thrown read is not absence. A genuine REFUSAL by the guard still
+        // returns nil and still opens compose (unquoted); only the throw diverts.
+        let replyToResult: Result<MessageHeader?, Error>
+        do {
+            replyToResult = .success(try await resolveReplyTo(draft: draft))
+        } catch {
+            replyToResult = .failure(error)
+        }
+        guard ComposeDraftGuards.readState(replyToResult) != .error else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftComposePresenter] ⚠ Reply-target resolve THREW for \(draftId) — offering retry, not a nil reply target")
+            }
+            return .loadFailed
+        }
+        // `.error` is excluded above, so this is the resolver's genuine verdict:
+        // a proven header, or a refusal (nil) that opens compose with no parent.
+        let replyTo: MessageHeader?
+        if case .success(let value) = replyToResult { replyTo = value } else { replyTo = nil }
 
         print("[DraftComposePresenter] Loaded draft: \(draftId) replyTo=\(replyTo?.id.prefix(20) ?? "nil")")
         return .loaded(draft: draft, replyTo: replyTo, account: account)
@@ -241,10 +266,23 @@ struct DraftComposePresenter: View {
     /// reply, not merely a wrong quote. The v80 stamp names the address the user
     /// actually replied to; nil (a pre-v80 row) falls to the draft key's RFC
     /// baseline inside the resolver, never to an unconditional accept.
-    private func resolveReplyTo(draft: Draft) -> MessageHeader? {
-        Draft.resolveReplyToHeader(
-            draftKey: draftId, replyToId: draft.replyToId, isForward: draft.isForward,
-            expectedProviderMessageId: draft.replyToProviderMessageId,
-            expectedUidValidity: draft.replyToUidValidity)
+    ///
+    /// Goes through the `db`-scoped overload and PROPAGATES a failed read, so the
+    /// caller can tell a refusal (nil) from an unreadable database (throw). The
+    /// non-`db` convenience overload swallows the latter into the former.
+    private func resolveReplyTo(draft: Draft) async throws -> MessageHeader? {
+        // Hoisted into locals so the `@Sendable` read closure captures plain values
+        // instead of `self`.
+        let key = draftId
+        let replyToId = draft.replyToId
+        let isForward = draft.isForward
+        let expectedProviderMessageId = draft.replyToProviderMessageId
+        let expectedUidValidity = draft.replyToUidValidity
+        return try await AppDatabase.dbPool.read { db in
+            try Draft.resolveReplyToHeader(
+                draftKey: key, replyToId: replyToId, isForward: isForward,
+                expectedProviderMessageId: expectedProviderMessageId,
+                expectedUidValidity: expectedUidValidity, db: db)
+        }
     }
 }
