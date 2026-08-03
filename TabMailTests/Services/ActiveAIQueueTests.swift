@@ -639,6 +639,14 @@ struct AIWriteIdentityGuardTests {
     /// has a live numbering: then the row's UID was never proven under any epoch,
     /// so nothing rules out a re-seat. Refusing is recomputable; binding X's
     /// summary onto Y is not.
+    ///
+    /// AUDIT ROUND 2 classification: **correct, but non-discriminating — kept.**
+    /// The property it asserts is true and it passes both before and after round
+    /// 2's fix. But it moves the replacement row AND the folder's epoch together,
+    /// so a guard that only ever consulted the FOLDER would satisfy it — and the
+    /// round-1 guard was exactly that guard, which is why this test could not see
+    /// the C3 hole sitting next to it. The three tests that follow hold the folder
+    /// still and vary one field at a time.
     @Test("An AI result computed against an UNSTAMPED row never lands on the message that replaced it")
     func unstampedHeaderNeverWritesOntoTheReplacement() throws {
         let db = try makeFixture(folderEpoch: 111)
@@ -688,11 +696,201 @@ struct AIWriteIdentityGuardTests {
                 """)
     }
 
-    /// The other half of C-1's split, and the reason 6a is evaluated BEFORE 6b: a
-    /// row that is unstamped because the FOLDER was never observed either (first
-    /// sync, `ScreenshotMode`'s raw-SQL folders) must still be written. Without
-    /// this the fix above would read as "refuse whenever the stamp is nil", which
-    /// silently disables AI for every account's first sync.
+    /// 🚨 AUDIT ROUND 2 / MUST FIX 1, invariant 1. The test ABOVE moves the
+    /// replacement row and the folder's epoch TOGETHER, so it cannot tell whether
+    /// the guard authenticated the MESSAGE or merely noticed the FOLDER moved — it
+    /// passed on the pre-fix code for the wrong reason. This one holds the folder
+    /// still: the folder stays on the captured epoch and unquarantined, and only
+    /// the row at the captured address is replaced, by a row bearing no stamp at
+    /// all (exactly what the merge window seats).
+    ///
+    /// RED on the pre-fix code: the old arms read `folder.lastKnownUidValidity`
+    /// (still 111, so 6a passed), then the CAPTURED stamp (111, non-nil, so 6b
+    /// passed), then compared captured-vs-folder (111 == 111, so arm 7 passed) —
+    /// and returned the impostor. X's summary landed on Y. Every arm consulted the
+    /// folder or the capture; not one of them looked at the row in front of it.
+    @Test("X's AI result never lands on a replacement seated under the SAME folder epoch")
+    func replacementUnderUnchangedFolderEpochNeverReceivesTheWrite() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed on an ordinary stamped IMAP row")
+        guard let target else { return }
+
+        // The merge window, NOT a completed reset reaction: a different physical
+        // message is seated at the captured address carrying no proven epoch, while
+        // the folder stays stamped 111 and unquarantined.
+        let impostor = makeHeader(subject: "Impostor Y", rfc822: "<y@example.com>", observedEpoch: nil)
+        try db.write { db in
+            _ = try MessageHeader.deleteOne(db, key: Self.headerId)
+            try impostor.insert(db)
+        }
+
+        // The folder state the pre-fix arms consulted is UNCHANGED — this is what
+        // makes the drop attributable to the row rather than to the folder.
+        let folderAfter = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(folderAfter?.lastKnownUidValidity == 111, "the folder must still carry the captured epoch")
+        #expect(folderAfter?.uidValidityResetPendingAt == nil, "the folder must not be quarantined")
+
+        // NON-VACUITY: the pre-guard expression LANDS on the impostor, so the drop
+        // below is the guard refusing rather than the row being absent or unwritable.
+        let bareWriteLanded: Bool = try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return false }
+            bare.summaryBlurb = "pre-guard control write"
+            try bare.save(db)
+            return true
+        }
+        #expect(bareWriteLanded, "the impostor row must be present and writable, else the drop proves nothing")
+        try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            bare.summaryBlurb = nil
+            try bare.save(db)
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        #expect(after?.rfc822MessageId == "<y@example.com>", "the row at X's address is still the replacement")
+        #expect(after?.summaryBlurb == nil,
+                """
+                X's summary landed on the message that replaced it. The folder's stored epoch still \
+                matched, so a guard that authenticates the CAPTURED value against FOLDER state cannot \
+                see this replacement at all — only the row's own epoch state can (C3).
+                """)
+    }
+
+    /// 🚨 AUDIT ROUND 2 / MUST FIX 1, invariant 2. The cost half of the same
+    /// conflation. An unstamped row is ORDINARY, not suspicious: 15 production
+    /// sites null `observedUidValidity` against 4 that set it. When such a row has
+    /// NOT been replaced, refusing does not fail closed in any useful sense — it
+    /// leaves `summaryBlurb` nil, so `needsSummary` stays true, so the next open
+    /// re-runs the LLM and drops it again: a paid API call repeated forever for a
+    /// summary that can never land.
+    ///
+    /// RED on the pre-fix code: arm 6a passed (the folder's epoch is known, 111),
+    /// then arm 6b refused solely because the CAPTURED stamp was nil — without ever
+    /// checking that the row was still the very row that was captured.
+    ///
+    /// What makes admitting it SAFE rather than merely cheaper is the row's RFC
+    /// Message-ID: it is unchanged, and it names the content rather than the
+    /// address. Note what this test does NOT say — it does not say "a nil stamp
+    /// writes through". The very next test holds everything here fixed except the
+    /// Message-ID, and requires a refusal.
+    @Test("An UNSTAMPED but UNREPLACED row still receives its AI result, and is not recomputed forever")
+    func unstampedButUnreplacedRowStillWritesThrough() throws {
+        // The folder has a live numbering; the row does not carry one. This is the
+        // steady state after an optimistic move, a delta-sync re-key, a backfill
+        // body write, or any row predating the column.
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed — refusing to capture would disable AI, not guard it")
+        guard let target else { return }
+
+        // Nothing replaces X. The world simply moves on: the LLM round trip returns.
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .written)
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        #expect(after?.rfc822MessageId == "<x@example.com>", "the row must still be X")
+        #expect(after?.summaryBlurb == "X's summary",
+                """
+                X's own AI result was refused even though X was never replaced. The result is not \
+                merely lost: needsSummary stays true, so the LLM is re-billed on every subsequent \
+                open and the summary can never land.
+                """)
+        // The system property the cost half is really about: the job is DONE, so the
+        // arbiter stops re-driving it.
+        // `needsSummary` is not a column — it is the arbiter's own derived predicate
+        // (`AccountManagerAI.processMessage`: `summaryBlurb == nil || summaryBlurb?.isEmpty == true`).
+        // Re-deriving it here rather than asserting on `summaryBlurb` directly is
+        // deliberate: the property under test is "the arbiter stops re-driving this
+        // job", so the assertion has to ask the question the arbiter asks.
+        let stillNeedsSummary = try db.read { db -> Bool in
+            guard let header = try MessageHeader.fetchOne(db, key: Self.headerId) else { return false }
+            return header.summaryBlurb == nil || header.summaryBlurb?.isEmpty == true
+        }
+        #expect(stillNeedsSummary == false, "a landed summary must retire the job, not re-drive it forever")
+    }
+
+    /// 🚨 AUDIT ROUND 2 / MUST FIX 1 — the MIRROR-IMAGE hole, pinned so it cannot
+    /// be reopened. This is the exact case the first attempted fix for invariant 2
+    /// would have shipped broken: "the row's own stamp still equals the captured
+    /// stamp" admits nil-against-nil, and a replacement seated at the captured UID
+    /// with no stamp satisfies that just as well as the original does. An absence
+    /// matching an absence is not evidence of anything.
+    ///
+    /// It is the previous test with EXACTLY ONE field changed — the Message-ID —
+    /// so the pair isolates what the guard is actually allowed to rely on. Both
+    /// rows are unstamped, the folder is unmoved and unquarantined, and the
+    /// composite address is identical; only the content differs, and only the
+    /// content decides.
+    ///
+    /// Green on the pre-fix code (old arm 6b refused every nil captured stamp, so
+    /// it got this one right by luck rather than by reasoning) and green now. Its
+    /// job is to stay green: it is RED against the rejected "nil == nil proceeds"
+    /// variant, which is the only way this property can be lost.
+    @Test("A replacement seated at the captured address with NO stamp receives no AI write either")
+    func unstampedReplacementUnderUnchangedFolderEpochIsRefused() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        // A DIFFERENT physical message, seated at the same address, carrying no
+        // proven epoch — indistinguishable from X on every field the epoch columns
+        // expose, and distinguishable on exactly one: what email it is.
+        let impostor = makeHeader(subject: "Impostor Y", rfc822: "<y@example.com>", observedEpoch: nil)
+        try db.write { db in
+            _ = try MessageHeader.deleteOne(db, key: Self.headerId)
+            try impostor.insert(db)
+        }
+
+        let folderAfter = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(folderAfter?.lastKnownUidValidity == 111, "the folder must still carry its epoch")
+        #expect(folderAfter?.uidValidityResetPendingAt == nil, "the folder must not be quarantined")
+
+        // NON-VACUITY: the pre-guard expression LANDS on the impostor.
+        let bareWriteLanded: Bool = try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return false }
+            bare.summaryBlurb = "pre-guard control write"
+            try bare.save(db)
+            return true
+        }
+        #expect(bareWriteLanded, "the impostor row must be present and writable, else the drop proves nothing")
+        try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            bare.summaryBlurb = nil
+            try bare.save(db)
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        #expect(after?.rfc822MessageId == "<y@example.com>", "the row at X's address is still the replacement")
+        #expect(after?.summaryBlurb == nil,
+                """
+                X's summary landed on the message that replaced it. Both rows are unstamped, so the \
+                epoch columns cannot tell them apart — matching an absence against an absence is not \
+                positive identity, and only a positive one may authorize a write (C3).
+                """)
+    }
+
+    /// The state where NOTHING has ever been observed — the folder was never
+    /// selected either (first sync, `ScreenshotMode`'s raw-SQL folders). Distinct
+    /// from the tests above, where the folder's numbering IS known, and reachable
+    /// only through the epoch arms because such a row may have no RFC id at all.
+    /// Without this the fix would be free to read as "refuse whenever a stamp is
+    /// missing", which silently disables AI for every account's first sync.
     @Test("An unstamped row in a never-observed folder still writes through")
     func unstampedHeaderInNeverObservedFolderStillWrites() throws {
         let db = try makeFixture(folderEpoch: nil)

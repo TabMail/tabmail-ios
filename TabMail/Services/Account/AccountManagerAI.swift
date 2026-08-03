@@ -41,8 +41,9 @@ enum AIWriteOutcome: Sendable, Equatable { case written, dropped }
 ///
 /// PORT of `v2final`'s `AIWriteTarget`, with two deliberate subtractions:
 ///
-///  - **SUBTRACT `normalizedRfc822MessageId` and the rfc-less capture refusal.**
-///    The reference stores a normalized RFC 822 Message-ID, refuses to capture at
+///  - **SUBTRACT the rfc-less capture refusal, and the RFC match's NECESSITY —
+///    but not the RFC id itself.** The reference stores a normalized RFC 822
+///    Message-ID, refuses to capture at
 ///    all when `normalizedRfc == nil && observedUidValidity == nil`, and requires
 ///    an RFC match in `resolveCurrentHeader`. A `nil` capture makes the WHOLE AI
 ///    job a no-op, and on v3 that harm is reachable, not theoretical: the epoch
@@ -55,7 +56,16 @@ enum AIWriteOutcome: Sendable, Equatable { case written, dropped }
 ///    An rfc-less message in any of those states would be permanently un-writable
 ///    by AI — no summary, no action tag, no reply, no `notified` stamp, ever, with
 ///    no error and no retry. That is a silent product break, not a fail-closed
-///    safety win: the C3 hazard these sites face is closed by the epoch arm alone.
+///    safety win. So v3 keeps the CAPTURE unconditional and demotes the RFC match
+///    from a NECESSARY condition to a SUFFICIENT one: `resolveCurrentHeader` arm 6
+///    admits on a positive RFC agreement, and rows without one fall through to the
+///    epoch arms instead of being refused outright.
+///
+///    ⚠ AUDIT ROUND 2 restored the field after round 1 had dropped it entirely.
+///    Dropping it left the guard with epoch evidence only, and an epoch proves
+///    NUMBERING, not IDENTITY — there was then no instrument at all that could tell
+///    the captured message apart from a replacement seated at the same UID under
+///    the same epoch state. See arm 6.
 ///  - **SUBTRACT `observedLastUidValidityResetAt`.** The reference's epoch tuple is
 ///    `(lastKnownUidValidity, lastUidValidityResetAt)`. v3's `Folder` has no
 ///    `lastUidValidityResetAt` — its omission is deliberate and documented on
@@ -84,13 +94,24 @@ struct AIWriteTarget: Sendable, Equatable {
     /// .optimisticMoveToFolder`, `SyncEngineDeltaSync`, `SyncEngineFullSync`,
     /// `BackfillBodyQueue` all null it), and for any row predating the column.
     ///
-    /// ⚠ A nil here is an absence of evidence, and an absence of evidence NEVER
-    /// AUTHORIZES A WRITE. On an epoch-addressed provider whose folder DOES have a
-    /// known epoch, a nil captured stamp means this row's UID was never proven
-    /// under any numbering, so nothing can rule out that a turnover has since
-    /// re-seated that UID — `resolveCurrentHeader` arm 6b refuses. See arm 6a for
-    /// the genuinely epoch-less states, which are the ones that must still write.
+    /// ⚠ A nil here is an ORDINARY state, not a signal: it is what 15 production
+    /// sites write against only 4 that stamp the column. So it is neither evidence
+    /// of a turnover NOR, on its own, grounds to admit. It is simply the absence of
+    /// a numbering proof, and `resolveCurrentHeader` treats it as exactly that: the
+    /// numbering arm (8) needs a positive stamp, and a row that has none must be
+    /// carried by the content witness (arm 6) instead.
     let observedUidValidity: Int?
+
+    /// The captured row's RFC 2822 Message-ID, verbatim from the column — the
+    /// content's own device-independent name, and the ONLY captured field that
+    /// identifies the MESSAGE rather than its address. `nil`/empty for mail that
+    /// carried no `Message-ID` header; such a row is not refused, it just has no
+    /// content witness and must satisfy `resolveCurrentHeader`'s epoch arms.
+    ///
+    /// Not normalized: both sides of the comparison are read from this same column
+    /// (capture reads the row, resolve reads whatever row now occupies the address),
+    /// so normalizing would add a transform without adding agreement.
+    let rfc822MessageId: String?
 
     /// Whether this target's address space can be RENUMBERED under it. Account-side
     /// mirror of `staleWindowMode == .uid`, matching
@@ -114,7 +135,8 @@ struct AIWriteTarget: Sendable, Equatable {
             folderId: message.folderId,
             messageId: message.messageId,
             provider: account.provider,
-            observedUidValidity: message.observedUidValidity
+            observedUidValidity: message.observedUidValidity,
+            rfc822MessageId: message.rfc822MessageId
         )
     }
 
@@ -134,7 +156,7 @@ struct AIWriteTarget: Sendable, Equatable {
     ///
     /// The earlier text here said "only a POSITIVE, PROVEN disagreement authorizes
     /// dropping" and arm 6 implemented it literally, admitting the write whenever
-    /// the CAPTURED epoch was nil. That is the defect corrected below (arms 6a/6b):
+    /// the CAPTURED epoch was nil. That is the defect corrected below (arm 6):
     /// it is exactly backwards for a mutation path.
     ///
     /// Arms, in evaluation order:
@@ -153,31 +175,52 @@ struct AIWriteTarget: Sendable, Equatable {
     ///     purge-and-resync (T4.S6): its rows either belong to an epoch the server
     ///     abandoned or have been purged and not yet resynced. TRANSIENT — the next
     ///     job recomputes.
-    ///  6a. **`lastKnownUidValidity == nil`** ⇒ PROCEED. The FOLDER has never been
+    ///  6. **CONTENT PROOF — captured `rfc822MessageId` non-empty and EQUAL to the
+    ///     current row's** ⇒ PROCEED, whatever the epochs say. Arms 1–3 proved only
+    ///     that the row bears the captured composite ADDRESS, and on IMAP
+    ///     `messageId` IS the UID — an address, not an identity. This arm supplies
+    ///     the identity: an RFC 2822 Message-ID is device-independent and is the
+    ///     content's own name, so the same non-empty id in the same account+folder
+    ///     is the same email regardless of what UID it now occupies or which
+    ///     numbering seated it. That is why the write is safe here even with a nil
+    ///     stamp on both sides, and it is the architecturally correct instrument:
+    ///     an AI summary is DERIVED CONTENT, and derived content keys by RFC id
+    ///     (the same scheme `MessageAICache` and the FTS/body stores use), while
+    ///     provider ids key the ACTION queue because actions must distinguish
+    ///     physical copies. A replacement is a different email and therefore
+    ///     carries a different Message-ID, so this witness cannot admit one.
+    ///  7. **`lastKnownUidValidity == nil`** ⇒ PROCEED. The FOLDER has never been
     ///     observed at all: the T1.3 first-sync window and `ScreenshotMode`'s
     ///     raw-SQL folders (which insert without the column). No SELECT has ever
     ///     reported an epoch here, so no turnover can have been observed either,
     ///     and there is nothing this address could have been re-seated FROM.
     ///     Dropping on it would permanently disable AI for those states (see the
-    ///     SUBTRACT note above).
-    ///  6b. **captured stamp nil while the folder's epoch IS known** ⇒ `nil`. This
-    ///     is NOT the mirror of 6a and must not be collapsed into it. The folder
-    ///     has a live numbering; this row's UID was never proven under any
-    ///     numbering (nulled by an optimistic move / delta-sync re-key / orphan
-    ///     migration, or written before the column existed). Nothing can then rule
-    ///     out that a turnover re-seated that UID with a DIFFERENT message, so
-    ///     admitting the write is an absence of evidence authorizing a
-    ///     wrong-message bind (C3). Refusing is safe AND self-healing: the caller
-    ///     drops this write, the next ordinary sync re-stamps the row, and the
-    ///     queue's arbiter re-drives the job. **Neither the demo account nor
-    ///     `ScreenshotMode` is affected** — demo exits at arm 4
-    ///     (`isEpochAddressed` excludes `DemoSeed.demoAccountId`) and
-    ///     `ScreenshotMode`'s folders have no `lastKnownUidValidity`, so they exit
-    ///     at 6a.
-    ///  7. **captured stamp != live folder epoch** ⇒ `nil`. The server reported a
-    ///     UIDVALIDITY that disagrees with the one this row's UID was proven under,
-    ///     i.e. a proven turnover. Same shape as the single terminal arm of
-    ///     `AccountManagerActions.roleMoveRejectDispositions`.
+    ///     SUBTRACT note above) — including rows with no RFC id at all, which is
+    ///     why this arm must survive arm 6 rather than be replaced by it.
+    ///  8. **NUMBERING PROOF — the fallback when there is no content witness.**
+    ///     Requires all three of: a non-nil CAPTURED stamp, the CURRENT ROW's own
+    ///     stamp equal to it, and the folder's live epoch equal to it. Anything
+    ///     less ⇒ `nil`.
+    ///
+    ///     ⚠ AUDIT ROUND 2. This replaces a pair (6a/6b) that compared the CAPTURED
+    ///     stamp against FOLDER state and **never read the current row's stamp at
+    ///     all**. That conflation was wrong in BOTH directions at once. It admitted
+    ///     a replacement bearing a `nil` stamp while the folder stayed on the
+    ///     captured epoch — arms 6a, 6b and 7 all passed on a row that was not the
+    ///     captured message, binding X's summary onto Y (a C3 hole). And it refused
+    ///     an UNREPLACED row whose stamp was merely absent — 15 production sites
+    ///     null that column against 4 that set it, so absence is the ORDINARY
+    ///     state, not evidence of a turnover — which left `summaryBlurb`/`actionTag`
+    ///     nil, so `needsSummary`/`needsAction` stayed true, so the next open
+    ///     re-ran the LLM and dropped it again: a paid API call repeated forever
+    ///     for a summary that could never land.
+    ///
+    ///     Reading the row's own stamp closes the first half. It does NOT close the
+    ///     second, and must not be mistaken for doing so: captured-nil against
+    ///     row-nil is an absence matching an absence, which a replacement seated at
+    ///     the same UID satisfies just as easily as the original. Only arm 6's
+    ///     positive content witness distinguishes those, which is why the epoch
+    ///     arms here demand a POSITIVE stamp and refuse on nil.
     func resolveCurrentHeader(db: Database) throws -> MessageHeader? {
         guard let header = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
         guard header.accountId == accountId,
@@ -190,12 +233,16 @@ struct AIWriteTarget: Sendable, Equatable {
 
         let folder = try Folder.fetchOne(db, key: folderId)
         guard folder?.uidValidityResetPendingAt == nil else { return nil }
-        // 6a — the folder itself was never observed. ORDER MATTERS: this arm must be
-        // evaluated BEFORE 6b, or `ScreenshotMode` / first-sync rows (nil on BOTH
-        // sides) would be refused by 6b instead of admitted here.
+        // 6 — CONTENT PROOF.
+        if let capturedRfc = rfc822MessageId, !capturedRfc.isEmpty,
+           capturedRfc == header.rfc822MessageId {
+            return header
+        }
+        // 7 — the folder's numbering was never observed at all.
         guard let liveEpoch = folder?.lastKnownUidValidity else { return header }
-        // 6b — the folder's numbering is known; this row's is not. Refuse.
+        // 8 — NUMBERING PROOF. All three must agree.
         guard let capturedEpoch = observedUidValidity else { return nil }
+        guard header.observedUidValidity == capturedEpoch else { return nil }
         guard capturedEpoch == liveEpoch else { return nil }
         return header
     }
