@@ -226,6 +226,40 @@ struct MessageDetailViewModelMoveTests {
         #expect(overlay[thread.id] == nil)
         #expect(vm.threadMessages.first?.folderPath == Self.inboxPath)
 
+        // Two-sided with `focusedMoveReportsNotRecordedWithNoFocusedMessage`
+        // below: a recorded move reports TRUE, so `handleMove` legitimately
+        // dismisses the detail view (and the list row stays hidden).
         await settle()
+    }
+
+    // The detail view's move sheet used to read `viewModel.move(…);
+    // dismissMessage()` — the message was dismissed from the list whether or
+    // not anything was recorded. The Bool report is the only signal
+    // `MessageDetailView.handleMove` has, matching handleArchive/handleDelete.
+
+    @Test("Focused move() reports NOT-recorded when there is no focused message — the detail view must not dismiss, and nothing is recorded")
+    @MainActor
+    func focusedMoveReportsNotRecordedWithNoFocusedMessage() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+
+        // No `_testSeedMessage`: `seedAtInit` reads only the in-memory staged
+        // snapshot, so `message` stays nil — the sole not-recorded leg.
+        let ghostId = "acc1:\(Self.inboxPath):never-existed"
+        let vm = MessageDetailViewModel(messageId: ghostId, dbPool: pool, fetchBodyOverride: { _ in })
+        #expect(vm.message == nil)
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(vm.move(toFolderPath: Self.archivePath) == false)
+
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[ghostId] == nil)
     }
 }

@@ -408,10 +408,37 @@ final class MessageDetailViewModel {
             }
         }
         @Sendable func durableMatch(_ db: Database) throws -> String? {
-            try MessageHeader
+            let request = MessageHeader
                 .filter(Column("messageId") == providerId && Column("isInInbox") == true)
                 .filter(Column("accountId") == accountId)
-                .fetchOne(db)?.id
+            // R16-F1 folder-native guard (sibling of
+            // `NotificationActionRouter.resolveDurableInboxHeader`'s): a bare
+            // inbox address match can be a DIFFERENT message optimistically
+            // moved INTO the inbox at a coinciding UID.
+            // `AccountManager.optimisticMoveToFolder` rewrites
+            // folderId/folderPath/isInInbox to the destination but KEEPS the
+            // source folder's primary key, so such a row claims inbox
+            // membership while carrying the source folder's UID. The tap's true
+            // target is folder-native by NSE construction; a non-native match
+            // would open the WRONG message AND queue a durable mark-read
+            // against it (`markReadOnOpenIfNeeded` acts on whatever this
+            // resolves). Asserted through `MessageIdentity.headerId` itself so
+            // the key format has exactly one definition.
+            //
+            // The staged tier above needs no guard: staged rows are NSE-built
+            // and `StagedInboxRow.headerId` derives from that row's OWN
+            // account/folder/message id, so it is folder-native by construction.
+            //
+            // No `fetchOne`: an impostor must not be able to occupy the one row
+            // a LIMIT would return. Cardinality is bounded by the account's
+            // folder count; `messageHeader_accountId_messageId` covers it.
+            return try request.fetchAll(db).first { row in
+                row.id == MessageIdentity.headerId(
+                    accountId: row.accountId,
+                    folderPath: row.folderPath,
+                    messageId: row.messageId
+                )
+            }?.id
         }
         if let id = stagedMatch() { mark("staged", hit: true); return id }
         if let id = (try? await AppDatabase.rawPool.read(durableMatch)) ?? nil {
@@ -1571,12 +1598,19 @@ final class MessageDetailViewModel {
         return role == .inbox
     }
 
-    func move(toFolderPath: String) {
-        guard let message else { return }
-        moveMessage(message, toFolderPath: toFolderPath)
+    /// Returns false when nothing was recorded (no focused message) — callers
+    /// must not dismiss the detail view then, or the row is hidden from the
+    /// list with no undo entry. Same contract as `archive()`/`delete()`.
+    @discardableResult
+    func move(toFolderPath: String) -> Bool {
+        guard let message else { return false }
+        return moveMessage(message, toFolderPath: toFolderPath)
     }
 
-    func moveMessage(_ msg: MessageHeader, toFolderPath: String) {
+    /// Returns false when nothing was recorded — callers must not dismiss or
+    /// flash then. See `archiveMessage(_:)` for the full contract.
+    @discardableResult
+    func moveMessage(_ msg: MessageHeader, toFolderPath: String) -> Bool {
         let destFolderId = "\(msg.accountId):\(toFolderPath)"
         // Generic move: destination CAN be the inbox — reuse the same
         // dest-is-inbox lookup `updateThreadMessageFolder` below already
@@ -1595,6 +1629,7 @@ final class MessageDetailViewModel {
             msg, newFolderPath: toFolderPath, newFolderId: destFolderId,
             isInInbox: destIsInbox
         )
+        return true
     }
 
     func applyManualTag(_ msg: MessageHeader, tag: ActionTag?) {

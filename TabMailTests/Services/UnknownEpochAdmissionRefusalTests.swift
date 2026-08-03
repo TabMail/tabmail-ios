@@ -750,4 +750,164 @@ struct UnknownEpochAdmissionRefusalTests {
                 must reconcile too, or a label applied since the row was built stays invisible
                 """)
     }
+
+    // MARK: - 12. A label op never targets a folder the user was not acting on
+    //
+    // These four share this suite's harness because they exercise the same
+    // admission transaction, but they are NOT epoch tests: every one of them runs
+    // on a provider the T1.3 epoch guard admits unconditionally (`.gmail`,
+    // `.outlook`), so the guard cannot supply the refusal and the property under
+    // test is isolated.
+    //
+    // 🚨 THE SYSTEM PROPERTY, stated once for the pair 12a/12b: **a queued label
+    // operation names the folder the acted-on row is actually in — never a
+    // default, and above all never `"INBOX"`.** The site that violated it read the
+    // message's folder in its own earlier `dbPool.read` and fell back to
+    // `?? "INBOX"` when the row was missing; an op carrying a guessed path
+    // resolves its id inside a mailbox the user never acted on, which on IMAP
+    // mutates whichever message that numbering put there (C3).
+    //
+    // Neither test asserts the fix's MECHANISM (no "the header was fetched inside
+    // the transaction", no "the helper is gone"). 12a asserts the op's folder
+    // equals the row's; 12b asserts that with no row there is no op at all. A
+    // mechanism assertion would stay green on any other way of guessing.
+    //
+    // 12c/12d are the provider gate, in the same two-sided shape.
+
+    /// 12a — the ADMITTED side. Also the non-vacuity partner for 12b: a fix that
+    /// merely refused every label gesture would pass 12b and fail here.
+    @Test("A queued label op names the folder the message is actually in, not INBOX")
+    @MainActor
+    func labelOpNamesTheMessagesOwnFolder() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .gmail, inboxEpoch: nil)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        // The message lives in Archive, NOT the inbox — so "the folder the row is
+        // in" and "INBOX" are distinguishable, which is the whole point.
+        let msg = try insertMessage(pool, messageId: "910", folderPath: "Archive")
+        let label = UserLabel(id: "lbl-receipts", accountId: "acc1", name: "Receipts", isSystem: false)
+        try await pool.writeWithoutTransaction { db in try label.insert(db) }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+        let admitted = await model.applyLabel(label)
+        #expect(admitted, "precondition: this gesture must be ADMITTED, or the assertion below is vacuous")
+
+        let queued = try await ops(pool)
+        #expect(queued.count == 1, "precondition: exactly one label op")
+        guard queued.count == 1 else { return }
+        #expect(queued[0].folderPath == "Archive",
+                """
+                the label op names folder '\(queued[0].folderPath)' while the message it acts \
+                on is in 'Archive' — the op would resolve its id inside a mailbox the user was \
+                never acting on
+                """)
+        #expect(queued[0].accountId == "acc1")
+        #expect(queued[0].messageIds == [msg.stableId],
+                "the op must name the row it mutated locally, not some other identity")
+        #expect(queued[0].type == .addUserLabel)
+    }
+
+    /// 12b — the REFUSED side. With no row there is no folder, and an absence of
+    /// evidence must not become a default. The refusal latches nothing, so it stays
+    /// RETRYABLE: the user's next tap re-runs the same transaction.
+    @Test("A label gesture whose message row has vanished queues no op at all")
+    @MainActor
+    func vanishedMessageRowQueuesNoLabelOp() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .gmail, inboxEpoch: nil)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "911", folderPath: "Archive")
+        let label = UserLabel(id: "lbl-vendor", accountId: "acc1", name: "Vendor", isSystem: false)
+        try await pool.writeWithoutTransaction { db in try label.insert(db) }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+        // The sheet is open on this message when a purge/move retires its row
+        // underneath — the exact situation the `?? "INBOX"` guess fired in.
+        try await pool.writeWithoutTransaction { db in
+            _ = try MessageHeader.deleteOne(db, key: msg.id)
+        }
+
+        let admitted = await model.applyLabel(label)
+        #expect(admitted == false, "a gesture whose target row is gone must fail CLOSED")
+        #expect(try await ops(pool).isEmpty,
+                """
+                an op was queued for a message whose row no longer exists — with no row there \
+                is no folder to name, so every folder it could name (INBOX above all) is one \
+                the user was not acting on
+                """)
+        let joined = try await pool.read { db in
+            try MessageUserLabel
+                .filter(Column("messageId") == msg.id && Column("userLabelId") == label.id)
+                .fetchCount(db)
+        }
+        #expect(joined == 0, "the local half must not land either — the two must fail together")
+    }
+
+    /// 12c — the provider gate, REFUSED side. Exchange's adapter implements no
+    /// remote user-label mutation, so an admitted op could never execute; the drain
+    /// would carry it forever while the menu showed a checkmark for a label the
+    /// server will never hold.
+    @Test("A provider with no remote user labels queues no label op and offers no menu")
+    @MainActor
+    func providerWithoutRemoteUserLabelsQueuesNoLabelOp() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .outlook, inboxEpoch: nil)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "912")
+        let label = UserLabel(id: "lbl-ledger", accountId: "acc1", name: "Ledger", isSystem: false)
+        try await pool.writeWithoutTransaction { db in try label.insert(db) }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+        #expect(model.supportsRemoteUserLabels == false)
+        #expect(model.sortedLabels.isEmpty,
+                "the menu must not offer labels this account's adapter cannot carry to the server")
+
+        // Entered directly, the way a non-menu caller would: the transaction must
+        // carry its own gate rather than trusting the presentation flag above.
+        let admitted = await model.applyLabel(label)
+        #expect(admitted == false)
+        #expect(try await ops(pool).isEmpty,
+                """
+                a label op was queued for a provider whose adapter cannot mutate labels \
+                remotely — nothing can ever execute it
+                """)
+        let joined = try await pool.read { db in
+            try MessageUserLabel
+                .filter(Column("messageId") == msg.id && Column("userLabelId") == label.id)
+                .fetchCount(db)
+        }
+        #expect(joined == 0, "the local half must not land either — the two must fail together")
+    }
+
+    /// 12d — the provider gate, ADMITTED side. Same fixture as 12c with only the
+    /// provider changed, so a gate that simply refuses everything cannot pass both.
+    @Test("The same label gesture on a provider WITH remote user labels is admitted")
+    @MainActor
+    func providerWithRemoteUserLabelsAdmitsTheLabelOp() async throws {
+        let (pool, dir, previous) = try makeTestDB(provider: .gmail, inboxEpoch: nil)
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let msg = try insertMessage(pool, messageId: "912")
+        let label = UserLabel(id: "lbl-ledger", accountId: "acc1", name: "Ledger", isSystem: false)
+        try await pool.writeWithoutTransaction { db in try label.insert(db) }
+
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
+        model.loadLabels()
+        #expect(model.supportsRemoteUserLabels)
+        #expect(model.sortedLabels.contains(where: { $0.id == label.id }),
+                "the menu must offer the label on an account whose adapter can carry it")
+
+        let admitted = await model.applyLabel(label)
+        #expect(admitted, "the gate must not refuse a provider that DOES support remote user labels")
+        #expect(try await ops(pool).count == 1)
+        let joined = try await pool.read { db in
+            try MessageUserLabel
+                .filter(Column("messageId") == msg.id && Column("userLabelId") == label.id)
+                .fetchCount(db)
+        }
+        #expect(joined == 1, "the local half must land on the admitted path")
+    }
 }

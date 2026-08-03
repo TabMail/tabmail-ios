@@ -369,4 +369,110 @@ struct AccountManagerQueueDrainTests {
         let readCalls = await provider.markedReadIds
         #expect(readCalls.count == 1, "the op must execute EXACTLY ONCE despite two concurrent drain calls")
     }
+
+    // MARK: - T3.5 / T4.H1 coupling — a body-preserving Gmail action 400 is still terminal
+    //
+    // `GmailProvider.modifyMessage` now issues its POST through
+    // `AuthedHTTP.requestPreservingBadRequestBody`, so a final 400 arrives as
+    // `HTTPError.networkErrorWithBody(400, body)` rather than the bodyless
+    // `.networkError(400)`. `AccountManagerQueue.isPermanentlyInvalidError` was
+    // widened in the same change to classify the two identically.
+    //
+    // These two tests pin the SYSTEM property that widening exists for — the
+    // durable row's END STATE — not the matcher's mechanism:
+    //
+    //   * an unclassified Gmail action 400 is TERMINAL: the row is gone;
+    //   * a transient 503 is NOT: the row survives, queued, for another drain.
+    //
+    // RED PROOF (recorded, since this defect never existed as a landed commit):
+    // the failing configuration is the HALF-PORT — `modifyMessage` switched to
+    // the body-preserving helper while `isPermanentlyInvalidError` still matched
+    // only `.networkError`. In that state the 400 falls through to the generic
+    // transient branch and the first test below observes the row still present
+    // with `status == queued`, i.e. it becomes indistinguishable from its own
+    // 503 control. Reverting only the `networkErrorWithBody` arm of
+    // `isPermanentlyInvalidError` reproduces it.
+
+    @Test("real GmailProvider: an UNCLASSIFIED action 400 is terminal — the durable op row is deleted, not left queued")
+    func unclassifiedGmailActionBadRequestRetiresTheDurableOp() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-gmail-unclassified-400"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let providerMessageId = "gmail-queue-unclassified-1"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "gmail-queue-unclassified@example.com",
+            providerMessageId: providerMessageId,
+            labels: ["INBOX", "UNREAD"]
+        )])
+        defer { server.close() }
+        server.injectUnclassified400(providerMessageId: providerMessageId)
+
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        let op = PendingOperation(
+            type: .markRead, messageIds: [providerMessageId],
+            accountId: accountId, folderPath: "INBOX"
+        )
+        try insertOp(op, pool: pool)
+
+        let outcome = await AccountManager.shared.executeSingleOp(
+            op, provider: server.provider(), context: AccountManager.DrainContext()
+        )
+
+        #expect(outcome == .proceed)
+        let after = try fetchOp(op.id, pool: pool)
+        #expect(
+            after == nil,
+            "a permanent-shaped Gmail action 400 must not survive as a forever-retrying row"
+        )
+        // Two-sided non-vacuity, DURABLE + WIRE: the row is gone AND the
+        // injected 400 was genuinely consumed at the HTTP boundary — a row
+        // deleted for any other reason (provider never reached, op claimed by
+        // something else) leaves this counter at zero.
+        #expect(
+            server.unclassified400ServedCount() == 1,
+            "the injected unclassified 400 must have been served exactly once: \(server.unclassified400ServedCount())"
+        )
+    }
+
+    @Test("real GmailProvider: a transient 503 is NOT terminal — the durable op row survives, requeued for retry")
+    func transientGmailActionFailureKeepsTheDurableOpQueued() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        let accountId = "acc-gmail-transient-503"
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let providerMessageId = "gmail-queue-transient-1"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "gmail-queue-transient@example.com",
+            providerMessageId: providerMessageId,
+            labels: ["INBOX", "UNREAD"]
+        )])
+        defer { server.close() }
+        server.injectTransient503OnModify(providerMessageId: providerMessageId)
+
+        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        let op = PendingOperation(
+            type: .markRead, messageIds: [providerMessageId],
+            accountId: accountId, folderPath: "INBOX"
+        )
+        try insertOp(op, pool: pool)
+
+        let outcome = await AccountManager.shared.executeSingleOp(
+            op, provider: server.provider(), context: AccountManager.DrainContext()
+        )
+
+        // The CONTROL: if the terminal classification were over-broad — or if
+        // "the row is gone" in the sibling test came from something other than
+        // the 400 — this row would be gone too.
+        #expect(outcome == .haltLane)
+        let after = try fetchOp(op.id, pool: pool)
+        #expect(after != nil, "a transient failure must never retire the user's intention")
+        guard let after else { return }
+        #expect(after.status == PendingStatus.queued.rawValue)
+        #expect(after.retryCount == op.retryCount + 1)
+        #expect(
+            server.transient503OnModifyServedCount() == 1,
+            "503 is outside HTTPRetryPolicy.gmail's retryable set, so it is served exactly once: \(server.transient503OnModifyServedCount())"
+        )
+    }
 }

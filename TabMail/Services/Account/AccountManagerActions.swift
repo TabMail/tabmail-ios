@@ -5,6 +5,111 @@
 import Foundation
 import GRDB
 
+// MARK: - T4.V8 — honest admission reporting for role moves
+//
+// PORT of `v2final`'s `IntentionAdmissionDisposition` / `IntentionAdmissionOutcome`
+// (`v2final:TabMail/Models/IntentionAdmissionQuarantine.swift`, commit `b1c89ad4a`
+// "Stop reporting success for a user action that never reached the provider"),
+// with the journal machinery SUBTRACTED — see `RoleMoveAdmission`'s doc.
+//
+// The one idea: an action's caller must be able to tell "this landed durably"
+// from "this could not be determined" from "this provably no longer applies".
+// A Bool cannot carry that, and collapsing the middle case into either edge
+// reintroduces the bug in one direction or the other: folded into `admitted`
+// the caller reports success for work that never reached the provider; folded
+// into `failed` the caller reports failure for an action that is still
+// outstanding, which invites an agent to retry and act twice.
+
+/// Per-id outcome of a message-move admission. Case names are deliberately
+/// identical to `v2final`'s `IntentionAdmissionDisposition` so the two trees
+/// stay greppable against each other.
+enum RoleMoveDisposition: String, Sendable, Equatable, CaseIterable {
+    /// The optimistic local mutation AND its durable `PendingOperation`
+    /// committed in the same transaction. The drain owns it from here.
+    /// TERMINAL — success.
+    case durablyAdmitted
+    /// The outcome could not be DETERMINED, or admission was refused by a
+    /// self-healing transient guard (unknown folder epoch — T1.3; a folder
+    /// mid-UIDVALIDITY-reset — T4.S6; a swallowed or thrown database read; a
+    /// rolled-back write). **RETRYABLE.** This is deliberately the default for
+    /// every unknown: "we could not determine the answer" is never
+    /// authoritative (core philosophy §6, exit 2), and conflating it with
+    /// proven staleness is the single most repeated defect in this codebase.
+    case retainedForRetry
+    /// POSITIVELY PROVEN not applicable: the row is proven absent, it already
+    /// sits in the destination role folder, the role is unsupported, or the
+    /// server-reported epoch provably moved away from the one this row
+    /// observed (core philosophy §6, exit 4 — C3 fail-closed).
+    /// **TERMINAL — never retried.**
+    case terminalStale
+}
+
+/// The `(admitted, pending, failed)` triple a role move reports back.
+///
+/// PORT of `v2final:IntentionAdmissionOutcome` (commit `b1c89ad4a`).
+/// **SUBTRACTED:** the `IntentionAdmissionPhase` dimension, `merge(_:
+/// IntentionPhaseAdmission)`, `restricted(to:)` and the quarantine table.
+/// Premise unreachable on v3: v3 has no `IntentionJournal`, no `IntentionFold`,
+/// no `recordAndWait` and no `intentionAdmissionQuarantine` table, so there is
+/// no multi-phase fold whose phases could disagree and nothing that could write
+/// a quarantine row. Restoring the phase key would index every entry by a
+/// constant (`.move`) and adding the table needs a migration, which this work
+/// is forbidden from creating.
+///
+/// `set` is MONOTONE by rank (`durablyAdmitted` > `retainedForRetry` >
+/// `terminalStale`), which makes both halves of the V8 invariant structural
+/// rather than a property of call ordering:
+///   * proven-admitted work can never be downgraded to pending or failed
+///     ("never report failure for work that was admitted"), and
+///   * an unknown can never be downgraded to terminal ("could not determine"
+///     is not "provider says stale").
+/// A coarse outer classification may therefore be written first and refined
+/// later — or not at all — without the result ever becoming a lie.
+struct RoleMoveAdmission: Sendable, Equatable {
+    private(set) var perID: [String: RoleMoveDisposition] = [:]
+
+    static let empty = RoleMoveAdmission()
+
+    private static func rank(_ disposition: RoleMoveDisposition) -> Int {
+        switch disposition {
+        case .durablyAdmitted: 2
+        case .retainedForRetry: 1
+        case .terminalStale: 0
+        }
+    }
+
+    /// Monotone assignment — see the type doc. Never lowers an id's rank.
+    mutating func set(_ disposition: RoleMoveDisposition, id: String) {
+        guard let existing = perID[id] else {
+            perID[id] = disposition
+            return
+        }
+        if Self.rank(disposition) > Self.rank(existing) { perID[id] = disposition }
+    }
+
+    mutating func set(_ disposition: RoleMoveDisposition, ids: some Sequence<String>) {
+        for id in ids { set(disposition, id: id) }
+    }
+
+    mutating func merge(_ other: RoleMoveAdmission) {
+        for (id, disposition) in other.perID { set(disposition, id: id) }
+    }
+
+    func disposition(for id: String) -> RoleMoveDisposition? { perID[id] }
+
+    func ids(with disposition: RoleMoveDisposition) -> Set<String> {
+        Set(perID.compactMap { $0.value == disposition ? $0.key : nil })
+    }
+
+    /// Durably admitted — the only bucket a caller may report as success.
+    var admittedIds: Set<String> { ids(with: .durablyAdmitted) }
+    /// Still outstanding. A caller must report these as NEITHER success NOR
+    /// failure — see `RoleMoveDisposition.retainedForRetry`.
+    var pendingIds: Set<String> { ids(with: .retainedForRetry) }
+    /// Provably not applicable. Safe to surface as a failure.
+    var failedIds: Set<String> { ids(with: .terminalStale) }
+}
+
 extension AccountManager {
 
     // MARK: - Actions (optimistic UI + persistent queue)
@@ -194,8 +299,13 @@ extension AccountManager {
     /// epoch into a durable op — precisely C3. Orphans are reachable by real gestures
     /// (the notification path queries `messageHeader` without joining `folder`).
     /// This does NOT brick the two callers that used to justify the fail-open:
-    /// `UserLabelMenuModel.resolvedFolderPath()` (in the file `UserLabelMenuView.swift`)
-    /// now returns `nil` instead of guessing `"INBOX"` and its callers abort, and the
+    /// `UserLabelMenuModel.applyLabel(_:)` / `removeLabel(_:)` (in the file
+    /// `UserLabelMenuView.swift`) now resolve the header INSIDE their own admission
+    /// write transaction and abort when it is missing — strictly stronger than the
+    /// `resolvedFolderPath()` helper they replaced (T4.V13), which returned `nil`
+    /// instead of guessing `"INBOX"` but still read the header in an EARLIER
+    /// transaction, so a MOVE landing between the two could name the folder the
+    /// message had already left. That helper no longer exists. And the
     /// draft sites consult this guard only when the op will actually resolve an EXISTING
     /// UID (see `queueDraftSave`), so a FIRST save on an account with no drafts-role row
     /// — the one save that must not be refused, because nothing else can create the
@@ -302,6 +412,84 @@ extension AccountManager {
         }
         guard !admitted.isEmpty else { return nil }
         return (admitted, admitted.map(\.messageId), liveEpoch)
+    }
+
+    /// Why `admittedOrdinaryActionTargets` did NOT admit each of `rejected`,
+    /// expressed as the disposition its caller must report. Reads only; changes
+    /// nothing about WHICH messages are admitted — it explains an existing refusal.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final` needs no equivalent: its admission
+    /// refusals are produced by the journal fold, which already types every id
+    /// (`IntentionPhaseAdmission`). v3 admits inside a plain write transaction
+    /// with a `nil`/filtered-out result, so the reason has to be re-derived.
+    ///
+    /// **EXACTLY ONE ARM IS TERMINAL** — a positive epoch mismatch, i.e. the
+    /// folder's `lastKnownUidValidity` (what the server actually reported on
+    /// its last SELECT) disagrees with the `observedUidValidity` this row
+    /// carries. That is core philosophy §6 exit 4: proven turnover, C3
+    /// fail-closed, never retried because every retry would fail identically.
+    ///
+    /// **EVERY OTHER ARM IS RETRYABLE**, including the ones that look like
+    /// permanent refusals:
+    ///   * `observedUidValidity == nil` — the row has not been stamped yet.
+    ///     An UNREAD epoch is an ABSENCE of evidence, never a mismatch.
+    ///   * `lastKnownUidValidity == nil` (T1.3) — the folder's first sync has
+    ///     not finished; bounded by that sync.
+    ///   * `uidValidityResetPendingAt != nil` (T4.S6) — bounded by the reset
+    ///     reaction, which full sync re-drives every cycle.
+    ///   * a missing `Folder` or `Account` row — the admission fails closed on
+    ///     it, but nothing about it is provider-authoritative.
+    ///   * a malformed/empty provider address — a broken LOCAL row, which is
+    ///     also not the provider telling us anything.
+    /// Widening the terminal arm to any of these would drop a user intention
+    /// on an unknown, which is exactly what exit 4 is written to forbid.
+    ///
+    /// A6 (database-performance lens): the `Account` and `Folder` rows are the
+    /// SAME for every member of a group, so they are read ONCE per group, not
+    /// once per message — two keyed primary-key fetches total, and only on the
+    /// refusal path (a fully-admitted group performs zero extra reads).
+    private nonisolated static func roleMoveRejectDispositions(
+        _ rejected: [MessageHeader],
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> [String: RoleMoveDisposition] {
+        guard !rejected.isEmpty else { return [:] }
+
+        func all(_ disposition: RoleMoveDisposition) -> [String: RoleMoveDisposition] {
+            Dictionary(uniqueKeysWithValues: rejected.map { ($0.id, disposition) })
+        }
+
+        guard let account = try Account.fetchOne(db, key: accountId) else { return all(.retainedForRetry) }
+        let isDemo = accountId == DemoSeed.demoAccountId
+        let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
+        // Non-IMAP-family: the only refusal cause is an empty provider id.
+        guard isIMAP else { return all(.retainedForRetry) }
+
+        guard let folder = try Folder.fetchOne(
+            db, key: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)) else {
+            return all(.retainedForRetry)
+        }
+        guard folder.uidValidityResetPendingAt == nil else { return all(.retainedForRetry) }
+        guard let liveEpoch = folder.lastKnownUidValidity,
+              let liveUInt = UInt32(exactly: liveEpoch), liveUInt > 0 else {
+            return all(.retainedForRetry)
+        }
+
+        var result: [String: RoleMoveDisposition] = [:]
+        for message in rejected {
+            // An UNREAD epoch on the row is an absence of evidence, not a
+            // mismatch — the only terminal arm is a POSITIVE disagreement.
+            guard let observed = message.observedUidValidity, observed != liveEpoch else {
+                result[message.id] = .retainedForRetry
+                continue
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] T4.V8 terminal-stale — '\(folderPath)' epoch moved \(observed) → \(liveEpoch) (account \(accountId.prefix(8)))")
+            }
+            result[message.id] = .terminalStale
+        }
+        return result
     }
 
     func markRead(_ messages: [MessageHeader]) async {
@@ -424,7 +612,13 @@ extension AccountManager {
     /// Gmail-specific: archive destination is the synthetic "__GMAIL_ALL_MAIL__" folder;
     /// the provider-level archive just removes the INBOX label. The optimistic folder
     /// assignment works the same regardless.
-    /// Returns the set of affected folder IDs (source + destination) for unread recount.
+    /// Returns the set of affected folder IDs (source + destination) for unread recount,
+    /// plus the per-id `(admitted, pending, failed)` disposition (T4.V8): every id in
+    /// `msgs` that this call does NOT durably admit is classified by
+    /// `roleMoveRejectDisposition` so no caller can mistake a refusal for success.
+    /// ⚠️ The `admission` half is only meaningful when the ENCLOSING transaction
+    /// commits — a later throw rolls the `PendingOperation` insert back with it, so
+    /// `move()`'s catch re-classifies the whole batch rather than trusting a partial.
     @discardableResult
     private nonisolated static func optimisticMoveToFolder(
         msgs: [MessageHeader],
@@ -434,17 +628,27 @@ extension AccountManager {
         opType: OperationType,
         removeTagsIfLeavingInbox: Bool,
         db: Database
-    ) throws -> Set<String> {
+    ) throws -> (folderIds: Set<String>, admission: RoleMoveAdmission) {
+        var outcome = RoleMoveAdmission()
         // Self-move is a no-op — don't create PendingOperation or touch local state.
         // Happens when archiving from All Mail on Gmail (source=dest=__GMAIL_ALL_MAIL__).
         guard folderPath != destinationPath else {
             print("[Queue] Skipping no-op move (source==dest): \(folderPath)")
-            return []
+            // PROVEN: the row already sits at the requested destination, so the
+            // requested end state is already true. Terminal, never retried.
+            outcome.set(.terminalStale, ids: msgs.map(\.id))
+            return ([], outcome)
         }
         // Capture the source-native ids and epoch before the optimistic move
         // clears `observedUidValidity` on the destination row.
-        guard let admission = try Self.admittedOrdinaryActionTargets(
-            msgs, accountId: accountId, folderPath: folderPath, db: db) else { return [] }
+        let admissionResult = try Self.admittedOrdinaryActionTargets(
+            msgs, accountId: accountId, folderPath: folderPath, db: db)
+        let admittedIds = Set((admissionResult?.messages ?? []).map(\.id))
+        let rejectDispositions = try Self.roleMoveRejectDispositions(
+            msgs.filter { !admittedIds.contains($0.id) },
+            accountId: accountId, folderPath: folderPath, db: db)
+        for (id, disposition) in rejectDispositions { outcome.set(disposition, id: id) }
+        guard let admission = admissionResult else { return ([], outcome) }
         let admitted = admission.messages
         let leavingInbox = admitted[0].isInInbox
 
@@ -496,10 +700,19 @@ extension AccountManager {
             destinationPath: destinationPath,
             observedUidValidity: admission.observedUidValidity).insert(db)
         print("[Queue] Queued \(opType.rawValue) for \(admission.providerIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
-        return [admitted[0].folderId, destFolderId]
+        // The local mutation and the durable op are now in the SAME open
+        // transaction — that is exactly what `durablyAdmitted` asserts.
+        outcome.set(.durablyAdmitted, ids: admittedIds)
+        return ([admitted[0].folderId, destFolderId], outcome)
     }
 
-    func move(_ messages: [MessageHeader], to destinationPath: String) async {
+    /// T4.V8: returns the per-id `(admitted, pending, failed)` triple. Existing
+    /// gesture callers (`InboxViewModel`, `MessageDetailViewModel`, `SettingsView`)
+    /// legitimately ignore it, hence `@discardableResult`; the coordinated agent-tool
+    /// and notification paths consume it so they stop reporting success for work that
+    /// never reached the provider.
+    @discardableResult
+    func move(_ messages: [MessageHeader], to destinationPath: String) async -> RoleMoveAdmission {
         // Re-resolve fresh headers by id — the single choke point for every
         // surface (swipe, detail view, agent tools, settings bulk-archive).
         // Gesture paths capture `lookupMessage` snapshots at tap time and pass
@@ -512,13 +725,23 @@ extension AccountManager {
         // as-is (its double resolve is harmless). Ids that no longer resolve
         // (vanished rows) are dropped from the batch — correct, per
         // `resolveHeadersForAction`'s documented contract.
-        let fresh = await resolveHeadersForAction(ids: messages.map(\.id))
+        var outcome = RoleMoveAdmission()
+        let requestedIds = messages.map(\.id)
+        let fresh = await resolveHeadersForAction(ids: requestedIds)
         // Observability (audit round 5): resolveHeadersForAction swallows read
         // errors (`try?` → []), so an empty result for a NON-empty input is
         // either all-rows-vanished (legit) or a genuine read failure — in the
         // latter case this drop is the only trace the gesture ever existed.
         // Distinguishing the two needs a throwing resolve variant — recorded
         // as a phase-2 consideration in PLAN_OVERLAY_CALLSITE_AUDIT.md §6.
+        //
+        // T4.V8: because those two causes are NOT distinguishable here, an id
+        // the resolve dropped is `retainedForRetry`, never `terminalStale` —
+        // a swallowed read failure is an unknown, and this is the gesture path
+        // (zero-extra-DB contract), so the probe that CAN prove absence lives
+        // in `performCoordinatedRoleMove` instead, which is a non-gesture path.
+        let freshIds = Set(fresh.map(\.id))
+        outcome.set(.retainedForRetry, ids: requestedIds.filter { !freshIds.contains($0) })
         if fresh.isEmpty, !messages.isEmpty {
             print("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(messages.count) ids — vanished rows or read failure; nothing queued")
         }
@@ -529,25 +752,38 @@ extension AccountManager {
         // PendingOperation whose server-side MOVE has provider-dependent
         // effects (e.g. archive-from-Archive).
         let movable = fresh.filter { $0.folderPath != destinationPath }
-        guard !movable.isEmpty else { return }
+        // PROVEN: already at the destination, so the requested end state holds.
+        outcome.set(.terminalStale, ids: fresh.filter { $0.folderPath == destinationPath }.map(\.id))
+        guard !movable.isEmpty else { return outcome }
         await ensureDurable(movable)
 
         let grouped = Dictionary(grouping: movable) { "\($0.accountId)|\($0.folderPath)" }
         let affectedFolderIds: Set<String>
         do {
-            affectedFolderIds = try await dbPool.write { db in
+            let written = try await dbPool.write { db -> (folderIds: Set<String>, admission: RoleMoveAdmission) in
                 var folderIds: Set<String> = []
+                var admission = RoleMoveAdmission()
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
                     let moved = try Self.optimisticMoveToFolder(msgs: msgs, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath, opType: .move, removeTagsIfLeavingInbox: true, db: db)
-                    folderIds.formUnion(moved)
+                    folderIds.formUnion(moved.folderIds)
+                    admission.merge(moved.admission)
                 }
-                return folderIds
+                return (folderIds, admission)
             }
+            affectedFolderIds = written.folderIds
+            outcome.merge(written.admission)
         } catch {
             print("[Queue] ERROR: move write failed: \(error)")
             affectedFolderIds = []
+            // The transaction rolled back, so NOTHING landed for ANY member —
+            // including groups that had already produced a `durablyAdmitted`
+            // classification inside the closure (whose return value is
+            // discarded on throw and therefore never reaches `outcome`).
+            // A failed durable write is retryable, never authoritative
+            // (core philosophy §6, exit 2).
+            outcome.set(.retainedForRetry, ids: movable.map(\.id))
         }
         Task { @MainActor in
             NotificationCenter.default.post(name: .unreadCountsDidChange, object: nil)
@@ -555,6 +791,7 @@ extension AccountManager {
         }
         Task { await UnreadCountManager.shared.requestRecount(folderIds: affectedFolderIds) }
         Task { await drainPendingQueue() }
+        return outcome
     }
 
     func markFlagged(_ messages: [MessageHeader], flagged: Bool) async {
@@ -602,16 +839,29 @@ extension AccountManager {
         return messages.filter { !roleFolderIds.contains($0.folderId) }
     }
 
-    func archive(_ messages: [MessageHeader]) async {
+    /// T4.V8: see `move(_:to:)`. Ids `messagesNotInRole` drops are PROVEN already
+    /// in the target role folder (the requested end state already holds), so they
+    /// are `terminalStale`, not a silent success.
+    @discardableResult
+    func archive(_ messages: [MessageHeader]) async -> RoleMoveAdmission {
         let movable = await messagesNotInRole(messages, role: .archive)
-        await moveToRoleFolderPerAccount(movable, role: .archive)
+        var outcome = RoleMoveAdmission()
+        let movableIds = Set(movable.map(\.id))
+        outcome.set(.terminalStale, ids: messages.map(\.id).filter { !movableIds.contains($0) })
+        outcome.merge(await moveToRoleFolderPerAccount(movable, role: .archive))
+        return outcome
     }
 
-    func delete(_ messages: [MessageHeader]) async {
-        guard let first = messages.first else { return }
+    @discardableResult
+    func delete(_ messages: [MessageHeader]) async -> RoleMoveAdmission {
+        guard let first = messages.first else { return .empty }
         AccountManager.logDeleteTrace(accountId: first.accountId, messages: messages, callSite: "AccountManager.delete")
         let movable = await messagesNotInRole(messages, role: .trash)
-        await moveToRoleFolderPerAccount(movable, role: .trash)
+        var outcome = RoleMoveAdmission()
+        let movableIds = Set(movable.map(\.id))
+        outcome.set(.terminalStale, ids: messages.map(\.id).filter { !movableIds.contains($0) })
+        outcome.merge(await moveToRoleFolderPerAccount(movable, role: .trash))
+        return outcome
     }
 
     /// Resolve the role folder PER ACCOUNT and move each account's messages to
@@ -625,20 +875,43 @@ extension AccountManager {
     /// whose destinationPath is meaningless to that provider (self-heal drop —
     /// the archive/delete never happens server-side). Follow-up-session audit
     /// round 6; pre-existing, reachable via EmailArchiveTool/EmailDeleteTool.
-    private func moveToRoleFolderPerAccount(_ movable: [MessageHeader], role: FolderRole) async {
-        guard !movable.isEmpty else { return }
+    ///
+    /// T4.V8 — DEVIATION FROM `v2final`, stated deliberately. `v2final
+    /// :AccountManager.recordRoleMove` classifies an account whose role folder
+    /// resolves cleanly to nothing (`RoleFolderResolution.absent`) as
+    /// `terminalStale`. v3 classifies it `retainedForRetry` instead, because on
+    /// v3 that is an unknown, not a provider verdict: nothing here consulted the
+    /// provider, and the folder row appears as soon as `SyncEngine.fullSync`'s
+    /// folder-list upsert runs. In `v2final` the terminal call was backed by a
+    /// journal + quarantine substrate that kept the intention visible and
+    /// recoverable after a terminal classification; v3 has neither, so a
+    /// terminal verdict here would be a silent drop on an unknown.
+    @discardableResult
+    private func moveToRoleFolderPerAccount(_ movable: [MessageHeader], role: FolderRole) async -> RoleMoveAdmission {
+        guard !movable.isEmpty else { return .empty }
+        var outcome = RoleMoveAdmission()
         let byAccount = Dictionary(grouping: movable, by: \.accountId)
         for (accountId, accountMessages) in byAccount {
-            let path: String? = try? await dbPool.read { db in
-                try Folder.filter(Column("accountId") == accountId && Column("role") == role.rawValue)
-                    .fetchOne(db)?.path
+            let path: String?
+            do {
+                path = try await dbPool.read { db in
+                    try Folder.filter(Column("accountId") == accountId && Column("role") == role.rawValue)
+                        .fetchOne(db)?.path
+                }
+            } catch {
+                // A thrown read answers nothing at all — strictly retryable.
+                print("[Queue] ERROR: \(role.rawValue) folder lookup failed for account \(accountId): \(error) — \(accountMessages.count) message(s) skipped")
+                outcome.set(.retainedForRetry, ids: accountMessages.map(\.id))
+                continue
             }
             guard let path else {
                 print("[Queue] ERROR: no \(role.rawValue) folder found for account \(accountId) — \(accountMessages.count) message(s) skipped")
+                outcome.set(.retainedForRetry, ids: accountMessages.map(\.id))
                 continue
             }
-            await move(accountMessages, to: path)
+            outcome.merge(await move(accountMessages, to: path))
         }
+        return outcome
     }
 
     // MARK: - Coordinated Tool Actions (agent tools, ADR-IOS-057 vicinity)
@@ -668,11 +941,30 @@ extension AccountManager {
     /// `.trash` reach the retain loop at all). There is exactly one path
     /// through the closure body — no early returns — so the two release loops
     /// together cover every id this call ever retained.
-    func performCoordinatedRoleMove(ids: [String], role: FolderRole) async {
-        guard !ids.isEmpty else { return }
+    ///
+    /// **T4.V8 — returns the `(admitted, pending, failed)` triple.** PORT of the
+    /// receipt `v2final:AccountManager.recordRoleMove` returns
+    /// (`IntentionAdmissionOutcome`, commit `b1c89ad4a`), adapted to v3's
+    /// journal-less shape. Callers (`EmailArchiveTool`, `EmailDeleteTool`,
+    /// `NotificationActionRouter`) previously reported unconditional success after
+    /// this `await`, so a refused or rolled-back admission was indistinguishable
+    /// from a completed one. It is a TRIPLE and not a Bool on purpose: collapsing
+    /// `pending` into `admitted` reports success for work that never reached the
+    /// provider, and collapsing it into `failed` tells an agent to retry an action
+    /// that is still outstanding — which makes it act twice.
+    ///
+    /// `@discardableResult` for the test call sites that drive the coordination
+    /// lifecycle rather than the receipt; every production caller consumes it.
+    @discardableResult
+    func performCoordinatedRoleMove(ids: [String], role: FolderRole) async -> RoleMoveAdmission {
+        guard !ids.isEmpty else { return .empty }
+        var outcome = RoleMoveAdmission()
         guard role == .archive || role == .trash else {
             BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unsupported role \(role.rawValue), no-op")
-            return
+            // PORT of `v2final:recordRoleMove`'s unsupported-role arm: terminal,
+            // because no retry of the same call can ever behave differently.
+            outcome.set(.terminalStale, ids: ids)
+            return outcome
         }
 
         // Pre-resolve fresh headers to drop ids that no longer exist or are
@@ -681,39 +973,91 @@ extension AccountManager {
         // snapshot is intentionally re-taken again INSIDE the queued closure
         // below — the actual write never trusts this one.
         let preResolved = await resolveHeadersForAction(ids: ids)
+
+        // T4.V8: `resolveHeadersForAction` swallows read errors (`try?` → []),
+        // so an id it did not return is EITHER a genuinely vanished row OR a
+        // failed read. `move()` cannot tell them apart and must therefore call
+        // the whole set retryable — but this is a non-gesture path (tool /
+        // notification dispatch, not a finger gesture; the same reasoning
+        // `v2final:recordRoleMove` records for its own pre-resolve), so one
+        // extra THROWING probe is affordable here and turns a proven clean
+        // absence into an honest `terminalStale` instead of an eternal
+        // "pending". A thrown probe stays `retainedForRetry`: the database
+        // could not answer, and an unanswered question is never a verdict.
+        let unresolvedIds = Set(ids).subtracting(preResolved.map(\.id))
+        if !unresolvedIds.isEmpty {
+            do {
+                let durablyPresent = try await dbPool.read { db -> Set<String> in
+                    try Set(String.fetchAll(
+                        db,
+                        MessageHeader.select(Column("id")).filter(unresolvedIds.contains(Column("id")))))
+                }
+                // Mirror `resolveHeadersForAction`'s SECOND lookup step so a
+                // row that lives only in the ADR-IOS-049 staged cache is never
+                // declared absent.
+                let stagedPresent = NSEDataBridge.latestStagedRows.withLock { rows in
+                    Set(rows.map(\.headerId)).intersection(unresolvedIds)
+                }
+                let provenAbsent = unresolvedIds.subtracting(durablyPresent).subtracting(stagedPresent)
+                outcome.set(.terminalStale, ids: provenAbsent)
+                outcome.set(.retainedForRetry, ids: unresolvedIds.subtracting(provenAbsent))
+            } catch {
+                print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) absence probe failed: \(error) — \(unresolvedIds.count) id(s) retained")
+                outcome.set(.retainedForRetry, ids: unresolvedIds)
+            }
+        }
+
         let movable = await messagesNotInRole(preResolved, role: role)
+        // PROVEN already in the target role folder — `messagesNotInRole` fails
+        // OPEN on a read error (it returns every message when its read throws),
+        // so an id it DROPS is always a positive in-role match, never an unknown.
+        let movableIds = Set(movable.map(\.id))
+        outcome.set(.terminalStale, ids: preResolved.map(\.id).filter { !movableIds.contains($0) })
         guard !movable.isEmpty else {
             // Observability (audit round 5): callers (agent tools, notification
-            // router) report success unconditionally after this await — a silent
-            // return here on a read failure (resolveHeadersForAction swallows
-            // errors to []) would leave no trace anywhere. Vanished/already-in-
-            // role ids are legit no-ops; the log is the only failure correlate.
+            // router) used to report success unconditionally after this await — a
+            // silent return here on a read failure (resolveHeadersForAction
+            // swallows errors to []) would leave no trace anywhere. Vanished/
+            // already-in-role ids are legit no-ops; the log is the only failure
+            // correlate. T4.V8 additionally returns the typed dispositions above.
             print("[Queue] performCoordinatedRoleMove(\(role.rawValue)): 0 of \(ids.count) ids actionable after resolve/role filter — nothing to do")
-            return
+            return outcome
         }
 
         let accountIds = Set(movable.map(\.accountId))
-        let destFolderIdByAccount: [String: String] = (try? await dbPool.read { db -> [String: String] in
-            var result: [String: String] = [:]
-            for accountId in accountIds {
-                if let folder = try Folder
-                    .filter(Column("accountId") == accountId && Column("role") == role.rawValue)
-                    .fetchOne(db) {
-                    result[accountId] = folder.id
+        let destFolderIdByAccount: [String: String]
+        do {
+            destFolderIdByAccount = try await dbPool.read { db -> [String: String] in
+                var result: [String: String] = [:]
+                for accountId in accountIds {
+                    if let folder = try Folder
+                        .filter(Column("accountId") == accountId && Column("role") == role.rawValue)
+                        .fetchOne(db) {
+                        result[accountId] = folder.id
+                    }
                 }
+                return result
             }
-            return result
-        }) ?? [:]
+        } catch {
+            // T4.V8: this read used to be `try?` → `[:]`, which made a thrown
+            // read look exactly like "no account has a role folder" and skipped
+            // every id. Nothing was consulted and nothing was decided — retryable.
+            print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) role-folder lookup failed: \(error) — \(movable.count) message(s) retained")
+            outcome.set(.retainedForRetry, ids: movable.map(\.id))
+            return outcome
+        }
 
         // Skip ids whose account has no folder for this role — mirrors
         // archive()/delete()'s own "no archive/trash folder for account" skip
-        // (including its ERROR log convention — audit round 5).
+        // (including its ERROR log convention — audit round 5). T4.V8: retryable,
+        // not terminal — see `moveToRoleFolderPerAccount`'s deviation note.
         let actionable = movable.filter { destFolderIdByAccount[$0.accountId] != nil }
+        let actionableIds = Set(actionable.map(\.id))
+        outcome.set(.retainedForRetry, ids: movableIds.subtracting(actionableIds))
         guard !actionable.isEmpty else {
             print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) — no \(role.rawValue) folder resolved for account(s) \(accountIds.sorted().joined(separator: ",")); \(movable.count) message(s) skipped")
-            return
+            return outcome
         }
-        let actionableIds = Set(actionable.map(\.id))
 
         for msg in actionable {
             guard let destFolderId = destFolderIdByAccount[msg.accountId] else { continue }
@@ -729,8 +1073,9 @@ extension AccountManager {
             ))
         }
 
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        let queued = await withCheckedContinuation { (cont: CheckedContinuation<RoleMoveAdmission, Never>) in
             enqueueWrite {
+                var queuedOutcome = RoleMoveAdmission()
                 // Re-resolve INSIDE the queued closure: acts on row truth at
                 // EXECUTION time, not the confirmation-time snapshot above —
                 // the staleness bug this helper exists to close.
@@ -741,27 +1086,40 @@ extension AccountManager {
                 // Ids dropped by the fresh resolve (vanished row, or already
                 // in the role folder — e.g. an earlier queued op moved it
                 // there first) get no write; release their retain now.
-                for id in actionableIds.subtracting(freshIds) {
+                //
+                // T4.V8: those two causes are conflated here (and the vanished
+                // half is itself ambiguous with a swallowed read failure), so
+                // the union is `retainedForRetry` — the classification that is
+                // wrong in NEITHER direction. The earlier pre-resolve pass has
+                // already recorded a proven `terminalStale` for the ids it could
+                // prove, and `set` is monotone, so a proof taken there is never
+                // downgraded by this coarser pass.
+                let droppedByFreshResolve = actionableIds.subtracting(freshIds)
+                queuedOutcome.set(.retainedForRetry, ids: droppedByFreshResolve)
+                for id in droppedByFreshResolve {
                     self.releaseOverlayEntry(id: id)
                 }
 
                 switch role {
                 case .archive:
-                    await self.archive(freshMovable)
+                    queuedOutcome.merge(await self.archive(freshMovable))
                 case .trash:
-                    await self.delete(freshMovable)
+                    queuedOutcome.merge(await self.delete(freshMovable))
                 default:
                     // Unreachable — the guard at the top of this function
                     // only lets .archive/.trash reach the retain loop.
                     BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unexpected role \(role.rawValue) reached queued closure")
+                    queuedOutcome.set(.terminalStale, ids: freshIds)
                 }
 
                 for id in freshIds {
                     self.releaseOverlayEntry(id: id)
                 }
-                cont.resume()
+                cont.resume(returning: queuedOutcome)
             }
         }
+        outcome.merge(queued)
+        return outcome
     }
 
     /// Diagnostic-only: log the trash-folder lookup result and the message(s) being deleted

@@ -1101,10 +1101,17 @@ struct InboxView: View {
         let filtered = viewModel.loadedMessages.filter { !dismissedMessages.contains($0.id) }
         List(selection: listSelectionBinding) {
             ForEach(Array(filtered.enumerated()), id: \.element.id) { index, snapshot in
-                let prevTag: ActionTag? = index > 0 ? filtered[index - 1].actionTag : nil
-                let nextTag: ActionTag? = index < filtered.count - 1 ? filtered[index + 1].actionTag : nil
-                let fadeTop = snapshot.actionTag != nil && prevTag != snapshot.actionTag
-                let fadeBottom = snapshot.actionTag != nil && nextTag != snapshot.actionTag
+                // Tags are retained across folders (ADR-IOS-036) but only
+                // DISPLAYED for inbox rows — gate every tag used for this
+                // row's visuals (stripe, cross-fade, background tint) through
+                // ActionTagDisplay.displayedTag so a row that has transiently
+                // left the inbox (e.g. mid-drain of an optimistic move still
+                // on-screen) cannot leak its retained tag's color.
+                let effectiveTag: ActionTag? = ActionTagDisplay.displayedTag(for: snapshot)
+                let prevTag: ActionTag? = index > 0 ? ActionTagDisplay.displayedTag(for: filtered[index - 1]) : nil
+                let nextTag: ActionTag? = index < filtered.count - 1 ? ActionTagDisplay.displayedTag(for: filtered[index + 1]) : nil
+                let fadeTop = effectiveTag != nil && prevTag != effectiveTag
+                let fadeBottom = effectiveTag != nil && nextTag != effectiveTag
                 ZStack {
                     if !isDraftsContext {
                         NavigationLink(value: snapshot.id) { EmptyView() }
@@ -1123,7 +1130,7 @@ struct InboxView: View {
                 .opacity(swipeFadingMessages.contains(snapshot.id) ? 0 : 1)
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(
-                    triageRowBackground(tag: snapshot.actionTag, isSelected: selectedMessageId == snapshot.id,
+                    triageRowBackground(tag: effectiveTag, isSelected: selectedMessageId == snapshot.id,
                                         fadeTop: fadeTop, fadeBottom: fadeBottom,
                                         prevTag: prevTag, nextTag: nextTag)
                 )
@@ -1320,7 +1327,15 @@ struct InboxView: View {
                 }
             }
             if markRead { viewModel.toggleRead(snapshot.id) }
-            viewModel.archive(snapshot.id)
+            // archive() returns false when nothing was recorded (e.g. no
+            // archive folder for this account, resolved after the pre-check
+            // above raced a concurrent change) — un-hide the row rather than
+            // let it vanish forever with no undo entry.
+            if !viewModel.archive(snapshot.id) {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    _ = dismissedMessages.remove(snapshot.id)
+                }
+            }
         }
     }
 
@@ -1343,7 +1358,15 @@ struct InboxView: View {
                 }
             }
             if markRead { viewModel.toggleRead(snapshot.id) }
-            await viewModel.delete(snapshot.id)
+            // delete() returns false when nothing was recorded (e.g. no trash
+            // folder for this account, or a draft whose provider-addressed
+            // cleanup failed closed) — un-hide the row rather than let it
+            // vanish forever with no undo entry.
+            if !(await viewModel.delete(snapshot.id)) {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    _ = dismissedMessages.remove(snapshot.id)
+                }
+            }
         }
     }
 
@@ -1372,7 +1395,14 @@ struct InboxView: View {
         withAnimation(.easeIn(duration: 0.25)) {
             _ = dismissedMessages.insert(id)
         }
-        viewModel.move(id, toFolderPath: destinationPath)
+        // move() returns false when nothing was recorded (e.g. the message
+        // vanished between the picker opening and this tap) — un-hide the row
+        // rather than let it vanish forever with no undo entry.
+        if !viewModel.move(id, toFolderPath: destinationPath) {
+            withAnimation(.easeOut(duration: 0.35)) {
+                _ = dismissedMessages.remove(id)
+            }
+        }
         viewModel.endInteraction()
     }
 
@@ -1384,77 +1414,137 @@ struct InboxView: View {
         withAnimation(.easeIn(duration: 0.25)) {
             dismissedMessages.formUnion(allIds)
         }
-        viewModel.moveThread(allIds, toFolderPath: destinationPath)
+        // moveThread reports back any ids it did NOT act on — un-hide exactly
+        // those; they were never queued, so they'd otherwise vanish forever
+        // with no undo entry.
+        let skipped = viewModel.moveThread(allIds, toFolderPath: destinationPath)
+        if !skipped.isEmpty {
+            withAnimation(.easeOut(duration: 0.35)) {
+                dismissedMessages.subtract(skipped)
+            }
+        }
         viewModel.endInteraction()
     }
 
     private func dismissAndArchiveThread(_ group: ThreadGroup) {
-        // Archive-from-Archive is a no-op — never hide the rows.
-        guard !viewModel.archiveIsNoOp(group.representative.id) else {
-            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndArchiveThread suppressed — already archived: \(group.representative.id)")
+        // FU-1: per-member visibility — a thread can span folders of different
+        // roles, so an archive-resident REPRESENTATIVE must NOT short-circuit
+        // the whole thread. actionableArchiveIds = the members that are NOT a
+        // per-member archive no-op; an archive-resident member is a settled
+        // no-op that stays VISIBLE (never hidden — nothing happened to it),
+        // while an Inbox member of the same thread is still acted upon.
+        let actionable = viewModel.actionableArchiveIds(group.members.map(\.id))
+        // Empty = the whole thread is a genuine no-op (matches the old
+        // representative guard's pure case — nothing hidden).
+        guard !actionable.isEmpty else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndArchiveThread suppressed — no actionable members (whole thread settled): \(group.representative.id)")
             return
         }
-        let allIds = group.members.map(\.id)
         withAnimation(.easeIn(duration: 0.25)) {
-            dismissedMessages.formUnion(allIds)
+            dismissedMessages.formUnion(actionable)
         }
         Task { @MainActor in
-            viewModel.markRead(allIds)
-            viewModel.archiveThread(allIds)
+            viewModel.markRead(actionable)
+            // archiveThread reports back any ids it did NOT act on — un-hide
+            // exactly those so they don't vanish forever with no undo entry.
+            let skipped = viewModel.archiveThread(actionable)
+            if !skipped.isEmpty {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    dismissedMessages.subtract(skipped)
+                }
+            }
         }
     }
 
     private func dismissAndDeleteThread(_ group: ThreadGroup) {
-        // Delete-from-Trash is a no-op — never hide the rows.
-        guard !viewModel.deleteIsNoOp(group.representative.id) else {
-            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndDeleteThread suppressed — already in trash: \(group.representative.id)")
+        // FU-1: per-member visibility — a thread can span folders of different
+        // roles, so a trash-resident REPRESENTATIVE must NOT short-circuit the
+        // whole thread. actionableDeleteIds = the members that are NOT a
+        // per-member delete no-op; a trash-resident member is a settled no-op
+        // that stays VISIBLE (never hidden — nothing happened to it), while an
+        // Inbox member of the same thread is still acted upon.
+        let actionable = viewModel.actionableDeleteIds(group.members.map(\.id))
+        // Empty = the whole thread is a genuine no-op (matches the old
+        // representative guard's pure case — nothing hidden).
+        guard !actionable.isEmpty else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] dismissAndDeleteThread suppressed — no actionable members (whole thread settled): \(group.representative.id)")
             return
         }
-        let allIds = group.members.map(\.id)
         withAnimation(.easeIn(duration: 0.25)) {
-            dismissedMessages.formUnion(allIds)
+            dismissedMessages.formUnion(actionable)
         }
         Task { @MainActor in
-            viewModel.markRead(allIds)
-            await viewModel.deleteThread(allIds)
+            viewModel.markRead(actionable)
+            // deleteThread reports back any ids it did NOT act on — un-hide
+            // exactly those so they don't vanish forever with no undo entry.
+            let skipped = await viewModel.deleteThread(actionable)
+            if !skipped.isEmpty {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    dismissedMessages.subtract(skipped)
+                }
+            }
         }
     }
 
     private func swipeAndArchiveThread(_ group: ThreadGroup) {
-        // Archive-from-Archive is a no-op — never hide the rows.
-        guard !viewModel.archiveIsNoOp(group.representative.id) else {
-            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndArchiveThread suppressed — already archived: \(group.representative.id)")
+        // FU-1: per-member visibility (see dismissAndArchiveThread) — an
+        // archive-resident member stays VISIBLE (excluded from the hide/act
+        // set); only the genuinely-actionable members fade and archive.
+        let actionable = viewModel.actionableArchiveIds(group.members.map(\.id))
+        guard !actionable.isEmpty else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndArchiveThread suppressed — no actionable members (whole thread settled): \(group.representative.id)")
             return
         }
-        let allIds = group.members.map(\.id)
 
         viewModel.beginInteraction()
-        swipeFadingMessages.formUnion(allIds)
+        swipeFadingMessages.formUnion(actionable)
         Task { @MainActor in
 
             withAnimation(.easeIn(duration: 0.25)) {
-                dismissedMessages.formUnion(allIds)
+                dismissedMessages.formUnion(actionable)
             }
-            viewModel.archiveThread(allIds)
+            // archiveThread reports back any ids it did NOT act on — un-hide
+            // exactly those (both dismissedMessages and swipeFadingMessages,
+            // see the formUnion above) so they don't vanish forever with no
+            // undo entry.
+            let skipped = viewModel.archiveThread(actionable)
+            if !skipped.isEmpty {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    dismissedMessages.subtract(skipped)
+                    swipeFadingMessages.subtract(skipped)
+                }
+            }
             viewModel.endInteraction()
         }
     }
 
     private func swipeAndDeleteThread(_ group: ThreadGroup) {
-        // Delete-from-Trash is a no-op — never hide the rows.
-        guard !viewModel.deleteIsNoOp(group.representative.id) else {
-            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndDeleteThread suppressed — already in trash: \(group.representative.id)")
+        // FU-1: per-member visibility (see dismissAndDeleteThread) — a
+        // trash-resident member stays VISIBLE (excluded from the hide/act
+        // set); only the genuinely-actionable members fade and delete.
+        let actionable = viewModel.actionableDeleteIds(group.members.map(\.id))
+        guard !actionable.isEmpty else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndDeleteThread suppressed — no actionable members (whole thread settled): \(group.representative.id)")
             return
         }
-        let allIds = group.members.map(\.id)
 
         viewModel.beginInteraction()
-        swipeFadingMessages.formUnion(allIds)
+        swipeFadingMessages.formUnion(actionable)
         Task { @MainActor in
             withAnimation(.easeIn(duration: 0.25)) {
-                dismissedMessages.formUnion(allIds)
+                dismissedMessages.formUnion(actionable)
             }
-            await viewModel.deleteThread(allIds)
+            // deleteThread reports back any ids it did NOT act on — un-hide
+            // exactly those (both dismissedMessages and swipeFadingMessages,
+            // see the formUnion above) so they don't vanish forever with no
+            // undo entry.
+            let skipped = await viewModel.deleteThread(actionable)
+            if !skipped.isEmpty {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    dismissedMessages.subtract(skipped)
+                    swipeFadingMessages.subtract(skipped)
+                }
+            }
             viewModel.endInteraction()
         }
     }
@@ -1482,7 +1572,15 @@ struct InboxView: View {
                     viewModel.evictAndRebuild(snapshot.id, collapseThread: group.id)
                 }
             }
-            viewModel.archive(snapshot.id)
+            // archive() returns false when nothing was recorded — un-hide
+            // the row (both dismissedMessages and swipeFadingMessages) rather
+            // than let it vanish forever with no undo entry.
+            if !viewModel.archive(snapshot.id) {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    dismissedMessages.remove(snapshot.id)
+                    swipeFadingMessages.remove(snapshot.id)
+                }
+            }
             viewModel.endInteraction()
         }
     }
@@ -1505,7 +1603,15 @@ struct InboxView: View {
                     viewModel.evictAndRebuild(snapshot.id, collapseThread: group.id)
                 }
             }
-            await viewModel.delete(snapshot.id)
+            // delete() returns false when nothing was recorded — un-hide the
+            // row (both dismissedMessages and swipeFadingMessages) rather
+            // than let it vanish forever with no undo entry.
+            if !(await viewModel.delete(snapshot.id)) {
+                withAnimation(.easeOut(duration: 0.35)) {
+                    dismissedMessages.remove(snapshot.id)
+                    swipeFadingMessages.remove(snapshot.id)
+                }
+            }
             viewModel.endInteraction()
         }
     }

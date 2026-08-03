@@ -11,6 +11,34 @@ import Synchronization
 @Observable
 @MainActor
 final class InboxViewModel {
+    #if DEBUG
+    /// Test-only interleaving seam: fires after `markAllAsRead` captures a
+    /// durable page and advances its cursor, but BEFORE that page enters
+    /// `AccountManager.markRead`.
+    ///
+    /// REFERENCE (`v2final`): PORTED verbatim in name, type and placement from
+    /// `InboxViewModel.markAllAsReadWillAdmitBatchForTesting` at the tag.
+    ///
+    /// It is load-bearing for T4.V20-A, not a convenience. `markAllAsRead`'s
+    /// page loop is otherwise **unassertable from a unit test**: the only
+    /// externally visible artefacts of a pass are the `messageHeader.isRead`
+    /// rows and the `PendingOperation` rows it produces, and the failure mode
+    /// this seam exists to pin — a page that is read, handed to `markRead`, and
+    /// comes back with `isRead` still `0` — produces *no* new artefact at all.
+    /// A test can therefore not distinguish "the loop terminated after N pages"
+    /// from "the loop is still spinning on page 1" by looking at the database;
+    /// it can only distinguish them by counting admissions, which is what this
+    /// hook makes possible (and lets the test fail fast on a bound instead of
+    /// hanging the suite waiting for a loop that never ends).
+    ///
+    /// Placed AFTER the cursor advance on purpose: a hook that observed the
+    /// page before `lastVisitedID` moved could not tell a re-read of the same
+    /// page from progress.
+    nonisolated static let markAllAsReadWillAdmitBatchForTesting = Mutex<
+        (@Sendable ([MessageHeader]) async -> Void)?
+    >(nil)
+    #endif
+
     /// Short unique tag for this VM instance — used in logs to correlate
     /// init/deinit/onAppear/reloadMessages events across overlapping VMs
     /// (which we know happen during rapid nav — SwiftUI caches two view
@@ -1559,16 +1587,43 @@ final class InboxViewModel {
         return message.folderPath == trashPath
     }
 
-    func archive(_ messageId: String) {
-        guard let message = lookupMessage(messageId) else { return }
+    /// FU-1 (no-op-elimination half): the members an ARCHIVE thread-gesture
+    /// should act on and HIDE — the members that are NOT a per-member archive
+    /// no-op. A thread can span folders of different roles; deciding the whole
+    /// thread from the REPRESENTATIVE drops the intention of every member that
+    /// lives in a different role folder. An archive-resident member is a SETTLED
+    /// no-op — nothing happens to it, so it stays VISIBLE and is excluded here;
+    /// only the genuinely-actionable members are hidden and passed to
+    /// `archiveThread`. Order-preserving. Extracted so the View is both correct
+    /// AND unit-testable.
+    func actionableArchiveIds(_ messageIds: [String]) -> [String] {
+        messageIds.filter { !archiveIsNoOp($0) }
+    }
+
+    /// FU-1 (no-op-elimination half): the members a DELETE thread-gesture should
+    /// act on and HIDE. See `actionableArchiveIds` for the full rationale — a
+    /// trash-resident member stays VISIBLE and is excluded here.
+    /// Order-preserving.
+    func actionableDeleteIds(_ messageIds: [String]) -> [String] {
+        messageIds.filter { !deleteIsNoOp($0) }
+    }
+
+    /// Returns false when nothing was recorded (lookup miss, no archive folder
+    /// for the account, or already-at-destination no-op) — callers (InboxView's
+    /// single-message dismiss/swipe sites) MUST NOT leave the row hidden when
+    /// this returns false, or it vanishes forever with no undo entry (same
+    /// defect class `archiveThread`'s skipped-ids contract guards against).
+    @discardableResult
+    func archive(_ messageId: String) -> Bool {
+        guard let message = lookupMessage(messageId) else { return false }
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
         // move. Role check first — see archiveIsNoOp.
-        guard lookupFolderRole(message.folderId) != .archive else { return }
+        guard lookupFolderRole(message.folderId) != .archive else { return false }
         guard let archivePath = lookupFolderPath(accountId: message.accountId, role: .archive) else {
             print("[Queue] ERROR: no archive folder for account \(message.accountId)")
-            return
+            return false
         }
-        guard message.folderPath != archivePath else { return }
+        guard message.folderPath != archivePath else { return false }
         let destFolderId = "\(message.accountId):\(archivePath)"
         // Capture the undo snapshot BEFORE this action's own retain/
         // registerMutation below — see overlayAdjustedForUndo's doc comment.
@@ -1589,19 +1644,29 @@ final class InboxViewModel {
             await manager.move([message], to: archivePath)
             manager.releaseOverlayEntry(id: messageId)
         }}
+        return true
     }
 
-    func archiveThread(_ messageIds: [String]) {
+    /// Returns the ids of `messageIds` that were NOT acted upon (nothing
+    /// resolved for them, or the whole call aborted) — the caller (InboxView)
+    /// optimistically hides the actionable members (`actionableArchiveIds`)
+    /// BEFORE calling this, so it MUST un-hide exactly the ids returned here or
+    /// those rows vanish forever with no undo entry.
+    @discardableResult
+    func archiveThread(_ messageIds: [String]) -> [String] {
         let messages = messageIds.compactMap { lookupMessage($0) }
-        guard let first = messages.first else { return }
+        // Nothing resolved — every id reported skipped so the caller un-hides.
+        guard let first = messages.first else { return messageIds }
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
-        // move. Role check first — see archiveIsNoOp.
-        guard lookupFolderRole(first.folderId) != .archive else { return }
+        // move. Role check first — see archiveIsNoOp. Reached only if the
+        // caller's own `actionableArchiveIds` filter raced a concurrent move;
+        // nothing is recorded, so every id is reported skipped (un-hide).
+        guard lookupFolderRole(first.folderId) != .archive else { return messageIds }
         guard let archivePath = lookupFolderPath(accountId: first.accountId, role: .archive) else {
             print("[Queue] ERROR: no archive folder for account \(first.accountId)")
-            return
+            return messageIds
         }
-        guard first.folderPath != archivePath else { return }
+        guard first.folderPath != archivePath else { return messageIds }
         let destFolderId = "\(first.accountId):\(archivePath)"
         let compositeIds = messages.map(\.id)
         // Capture undo snapshots BEFORE the retain/registerMutation loop
@@ -1625,26 +1690,39 @@ final class InboxViewModel {
             await manager.move(messages, to: archivePath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
+        // Members that never resolved were never acted upon — report them
+        // skipped so the caller un-hides exactly those rows.
+        let recorded = Set(compositeIds)
+        return messageIds.filter { !recorded.contains($0) }
     }
 
-    func delete(_ messageId: String) async {
-        guard let message = lookupMessage(messageId) else { return }
+    /// Returns false when nothing was recorded (lookup miss, no trash folder for
+    /// the account, or already-at-destination no-op) — callers MUST NOT leave
+    /// the row hidden when this returns false. See `archive(_:)`'s doc comment
+    /// for the full contract; a Drafts-folder member propagates the
+    /// draft-specific path's own success.
+    @discardableResult
+    func delete(_ messageId: String) async -> Bool {
+        guard let message = lookupMessage(messageId) else { return false }
         // Drafts folder: use draft-specific deletion (DELETE /drafts or STORE+EXPUNGE)
         // instead of move-to-trash, which doesn't work for Gmail drafts.
         let folderRole = lookupFolderRole(message.folderId)
         if folderRole == .drafts {
-            await deleteDraftMessage(message)
-            return
+            // The draft-specific path fails CLOSED (unresolvable identity,
+            // failed durable write). Propagate its outcome so the caller
+            // un-hides the row instead of leaving the draft vanished while the
+            // server copy survives.
+            return await deleteDraftMessage(message)
         }
         AccountManager.logDeleteTrace(accountId: message.accountId, messages: [message], callSite: "InboxViewModel.delete")
         // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
         // move. Role check first — see deleteIsNoOp.
-        if folderRole == .trash { return }
+        if folderRole == .trash { return false }
         guard let trashPath = lookupFolderPath(accountId: message.accountId, role: .trash) else {
             print("[Queue] ERROR: no trash folder for account \(message.accountId)")
-            return
+            return false
         }
-        guard message.folderPath != trashPath else { return }
+        guard message.folderPath != trashPath else { return false }
         let destFolderId = "\(message.accountId):\(trashPath)"
         // Capture the undo snapshot BEFORE this action's own retain/
         // registerMutation below — see overlayAdjustedForUndo's doc comment.
@@ -1663,28 +1741,38 @@ final class InboxViewModel {
             await manager.move([message], to: trashPath)
             manager.releaseOverlayEntry(id: messageId)
         }}
+        return true
     }
 
-    func deleteThread(_ messageIds: [String]) async {
+    /// Returns the ids of `messageIds` that were NOT acted upon — see
+    /// `archiveThread`'s doc comment for the un-hide contract this satisfies.
+    @discardableResult
+    func deleteThread(_ messageIds: [String]) async -> [String] {
         let messages = messageIds.compactMap { lookupMessage($0) }
-        guard let first = messages.first else { return }
+        // Nothing resolved — every id reported skipped so the caller un-hides.
+        guard let first = messages.first else { return messageIds }
         // Drafts folder: delete each draft individually
         let folderRole = lookupFolderRole(first.folderId)
         if folderRole == .drafts {
+            // A draft whose provider-addressed cleanup fails closed is reported
+            // SKIPPED (row un-hides), never vanished with the server copy intact.
+            var settled = Set<String>()
             for message in messages {
-                await deleteDraftMessage(message)
+                if await deleteDraftMessage(message) { settled.insert(message.id) }
             }
-            return
+            return messageIds.filter { !settled.contains($0) }
         }
         AccountManager.logDeleteTrace(accountId: first.accountId, messages: messages, callSite: "InboxViewModel.deleteThread")
         // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
-        // move. Role check first — see deleteIsNoOp.
-        if folderRole == .trash { return }
+        // move. Role check first — see deleteIsNoOp. Reached only if the
+        // caller's own `actionableDeleteIds` filter raced a concurrent move;
+        // nothing is recorded, so every id is reported skipped (un-hide).
+        if folderRole == .trash { return messageIds }
         guard let trashPath = lookupFolderPath(accountId: first.accountId, role: .trash) else {
             print("[Queue] ERROR: no trash folder for account \(first.accountId)")
-            return
+            return messageIds
         }
-        guard first.folderPath != trashPath else { return }
+        guard first.folderPath != trashPath else { return messageIds }
         let destFolderId = "\(first.accountId):\(trashPath)"
         let compositeIds = messages.map(\.id)
         // Capture undo snapshots BEFORE the retain/registerMutation loop
@@ -1706,12 +1794,21 @@ final class InboxViewModel {
             await manager.move(messages, to: trashPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
+        // Members that never resolved were never acted upon — report them
+        // skipped so the caller un-hides exactly those rows.
+        let recorded = Set(compositeIds)
+        return messageIds.filter { !recorded.contains($0) }
     }
 
     /// Delete a draft message from the Drafts folder using the draft-specific deletion path.
     /// Provider-native identities only. An actual IMAP header has no source-bound
     /// UIDVALIDITY and therefore fails closed; the next sync preserves truth.
-    private func deleteDraftMessage(_ message: MessageHeader) async {
+    ///
+    /// Returns whether the draft was actually acted upon. `false` (fail-closed /
+    /// failed durable write) means the caller MUST NOT leave the row hidden — it
+    /// stays visible while the server copy is untouched.
+    @discardableResult
+    private func deleteDraftMessage(_ message: MessageHeader) async -> Bool {
         let drafts: [Draft]
         do {
             drafts = try await dbPool.read { db in
@@ -1720,7 +1817,7 @@ final class InboxViewModel {
                     .fetchAll(db)
             }
         } catch {
-            return
+            return false
         }
 
         let placeholderMatches = drafts.filter {
@@ -1728,12 +1825,15 @@ final class InboxViewModel {
                 draftId: $0.id, instanceEpoch: $0.instanceEpoch) == message.messageId
         }
         if placeholderMatches.count == 1, let owned = placeholderMatches.first {
-            guard let epoch = owned.instanceEpoch, !epoch.isEmpty else { return }
+            guard let epoch = owned.instanceEpoch, !epoch.isEmpty else { return false }
             if owned.serverDraftId == nil {
                 do {
-                    let dir = try await dbPool.write { db -> String? in
+                    // `deleted` is carried separately from `dir` because
+                    // `attachmentsDirName` is itself optional — a nil dir on a
+                    // SUCCESSFUL delete must not read as "nothing happened".
+                    let outcome = try await dbPool.write { db -> (deleted: Bool, dir: String?) in
                         guard let fresh = try Draft.fetchOne(db, key: owned.id),
-                              fresh.instanceEpoch == epoch else { return nil }
+                              fresh.instanceEpoch == epoch else { return (false, nil) }
                         _ = try MessageHeader.deleteOne(db, key: message.id)
                         _ = try MessageBody.deleteOne(
                             db, key: ContentKey(rawValue: message.id))
@@ -1741,16 +1841,17 @@ final class InboxViewModel {
                             id: owned.id,
                             expectedInstanceEpoch: epoch,
                             db: db)
-                        return fresh.attachmentsDirName
+                        return (true, fresh.attachmentsDirName)
                     }
-                    if let dir { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
+                    guard outcome.deleted else { return false }
+                    if let dir = outcome.dir { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
                     NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-                } catch { }
-                return
+                    return true
+                } catch { return false }
             }
             guard let serverId = owned.serverDraftId,
                   let runtimeKind = await manager.draftRuntimeIdentityKind(
-                    accountId: owned.accountId) else { return }
+                    accountId: owned.accountId) else { return false }
             let identity: DraftDeleteIdentity
             switch runtimeKind {
             case .gmail:
@@ -1762,34 +1863,65 @@ final class InboxViewModel {
             case .imap:
                 guard let folder = owned.serverDraftFolderPath,
                       let uidValidity = owned.serverDraftUidValidity,
-                      let uid = Int(serverId), uid > 0 else { return }
+                      let uid = Int(serverId), uid > 0 else { return false }
                 identity = .imap(
                     folder: folder, uidValidity: uidValidity, uid: uid)
             case .unknown:
-                return
+                return false
             }
-            _ = await manager.queueDraftDelete(
+            return await manager.queueDraftDelete(
                 identity: identity,
                 accountId: owned.accountId,
                 folderPath: owned.serverDraftFolderPath,
                 draftId: owned.id,
                 instanceEpoch: epoch,
                 deleteOwnedLocalDraft: true)
-            return
         }
 
         guard let runtimeKind = await manager.draftRuntimeIdentityKind(
-            accountId: message.accountId) else { return }
+            accountId: message.accountId) else { return false }
         let identity: DraftDeleteIdentity
         switch runtimeKind {
         case .gmail:
+            // PORT — `v2final:TabMail/Views/Compose/ComposeView.swift`
+            // `ServerDraftOpen.inboxDraftDeletePlan(...)`, its FIRST branch
+            // (`isSyntheticPlaceholderId(headerProviderMessageId) ⇒ failClosed`).
+            //
+            // A `draft-…` id is LOCAL bookkeeping written into
+            // `messageHeader.messageId` by `AccountManager.queueDraftSave` so the row
+            // shows up in Drafts before the server has assigned anything. It is not a
+            // Gmail address in any namespace. It reaches this arm because
+            // `placeholderMatches` above resolves a placeholder only against the
+            // draft's CURRENT `instanceEpoch`, while `queueDraftSave` keys the header
+            // on the epoch live at save time and never removes the previous epoch's
+            // row — so a reopened draft leaves a stale-epoch placeholder that matches
+            // nothing. (`DraftStore.applyPushCompletion` likewise leaves the
+            // placeholder unmigrated when Gmail returns no contained MESSAGE id.)
+            //
+            // Handing it to Gmail addresses NOTHING and is not merely wasted work:
+            // `GmailProvider.trashContainedDraftMessage` reads the resulting 404 as
+            // idempotent success, so the op RETIRES, the local header is already gone,
+            // and the real server draft — addressed by `Draft.serverDraftId`, which
+            // this arm never consulted — survives and re-syncs. The user is told a
+            // destructive action landed on a draft that was never touched.
+            //
+            // FAIL CLOSED. `false` reports this id SKIPPED to `delete`/`deleteThread`,
+            // which un-hide the row: nothing is deleted anywhere and the gesture stays
+            // RETRYABLE. An unknown provider address is an ABSENCE of evidence, never
+            // a licence to substitute a local id.
+            guard !isSyntheticPlaceholderId(message.messageId) else { return false }
             identity = .gmailContainedMessage(messageId: message.messageId)
         case .outlook:
+            // Same refusal, same reference: `inboxDraftDeletePlan`'s Outlook branch
+            // admits only `exactProviderIdentifier(headerProviderMessageId)`, which
+            // rejects synthetic placeholder ids. `ExchangeProvider.deleteDraft` also
+            // treats 404 as success, so an unaddressable id retires identically.
+            guard !isSyntheticPlaceholderId(message.messageId) else { return false }
             identity = .outlook(graphId: message.messageId)
         case .demo:
             identity = .demo(localId: message.messageId)
         case .imap, .unknown:
-            return
+            return false
         }
 
         let nativeMatches = drafts.filter { draft in
@@ -1806,7 +1938,7 @@ final class InboxViewModel {
             }
         }
         let owned = nativeMatches.count == 1 ? nativeMatches.first : nil
-        _ = await manager.queueDraftDelete(
+        return await manager.queueDraftDelete(
             identity: identity,
             accountId: message.accountId,
             folderPath: message.folderPath,
@@ -1923,6 +2055,47 @@ final class InboxViewModel {
         }}
     }
 
+    /// Sweep every currently-unread message in every loaded folder to read.
+    ///
+    /// The whole sweep runs inside ONE `enqueueWrite` closure, so it holds the
+    /// FIFO write queue for its entire duration — every other durable write in
+    /// the app is behind it. That makes TERMINATION a hard requirement, not a
+    /// nicety: a sweep that cannot finish is not a slow mark-all, it is a
+    /// permanently wedged application.
+    ///
+    /// Termination comes from the keyset cursor, exactly as in `v2final`. Each
+    /// page is bounded on BOTH sides:
+    ///
+    /// * `upperBound` — the greatest currently-unread `id` in this folder,
+    ///   read ONCE before the first page. It freezes the sweep's domain to the
+    ///   rows that were unread when the user asked. Mail that arrives (or is
+    ///   marked unread by a gesture that POSTDATES this one) while the sweep is
+    ///   running is deliberately outside the domain and stays unread — the
+    ///   user's later intent must win over an in-flight bulk action.
+    /// * `lastVisitedID` — the keyset cursor, advanced to the last `id` of the
+    ///   page just handed to `markRead`. Because `id` is the table's PRIMARY
+    ///   KEY, `id > cursor` is a STRICT total order, so the candidate set
+    ///   `{ id : cursor < id <= upperBound, isRead = 0 }` strictly shrinks on
+    ///   every iteration and is finite. That is the loop's variant, and it
+    ///   decreases whether or not the page's write landed.
+    ///
+    /// The pre-cursor loop re-ran the SAME unbounded query every pass, so a
+    /// page whose write did not clear `isRead` came back byte-identical
+    /// forever. That is reachable in production, not theoretical:
+    /// `AccountManager.markRead` -> `admittedOrdinaryActionTargets` refuses a
+    /// whole group (writing nothing, queueing nothing) whenever the folder's
+    /// epoch is not yet known — `lastKnownUidValidity == nil` before the first
+    /// sync completes, or `uidValidityResetPendingAt != nil` during a reset
+    /// reaction. Both are *retryable* refusals that persist for as long as the
+    /// condition holds, which is precisely long enough to spin forever.
+    ///
+    /// A refused page is NOT treated as read. The cursor moving past it writes
+    /// nothing: those rows stay `isRead = 0` in the database and stay unread on
+    /// screen, and the trailing recount + `reloadMessages` below republish that
+    /// truth, so the intention remains visible and the gesture re-issuable.
+    /// The refusal is never converted into "these are read now" — see the
+    /// retryable/terminal split documented on
+    /// `AccountManagerActions.roleMoveRejectDispositions`.
     func markAllAsRead() {
         let batchSize = SyncConfig.inboxPageSize
         let foldersCopy = folders
@@ -1933,17 +2106,61 @@ final class InboxViewModel {
                 for folder in foldersCopy {
                     let fid = folder.id
 
+                    // Freeze this folder's domain before the first page. No
+                    // unread row at all => nothing to sweep here.
+                    let upperBound: String
+                    do {
+                        guard let bound = try await dbPool.read({ db in
+                            try String.fetchOne(db, sql: """
+                            SELECT id FROM messageHeader
+                            WHERE folderId = ? AND isRead = 0
+                            ORDER BY id COLLATE BINARY DESC
+                            LIMIT 1
+                            """, arguments: [fid])
+                        }) else { continue }
+                        upperBound = bound
+                    } catch {
+                        continue
+                    }
+
+                    var lastVisitedID: String?
+
                     while true {
                         let batch: [MessageHeader]
+                        let cursor = lastVisitedID
                         do {
                             batch = try await dbPool.read { db in
-                                try MessageHeader
-                                    .filter(Column("folderId") == fid && Column("isRead") == false)
-                                    .limit(batchSize)
-                                    .fetchAll(db)
+                                if let cursor {
+                                    return try MessageHeader.fetchAll(db, sql: """
+                                    SELECT * FROM messageHeader
+                                    WHERE folderId = ? AND isRead = 0
+                                      AND id COLLATE BINARY > ? COLLATE BINARY
+                                      AND id COLLATE BINARY <= ? COLLATE BINARY
+                                    ORDER BY id COLLATE BINARY ASC
+                                    LIMIT ?
+                                    """, arguments: [fid, cursor, upperBound, batchSize])
+                                }
+                                return try MessageHeader.fetchAll(db, sql: """
+                                SELECT * FROM messageHeader
+                                WHERE folderId = ? AND isRead = 0
+                                  AND id COLLATE BINARY <= ? COLLATE BINARY
+                                ORDER BY id COLLATE BINARY ASC
+                                LIMIT ?
+                                """, arguments: [fid, upperBound, batchSize])
                             }
                         } catch { break }
                         guard !batch.isEmpty else { break }
+                        // Advance BEFORE the write. The page is now spent for
+                        // this sweep whatever `markRead` decides, which is what
+                        // makes the variant decrease unconditionally.
+                        lastVisitedID = batch.last?.id
+
+                        #if DEBUG
+                        if let hook = Self.markAllAsReadWillAdmitBatchForTesting.withLock({ $0 }) {
+                            await hook(batch)
+                        }
+                        #endif
+
                         await manager.markRead(batch)
                     }
                 }
@@ -2064,8 +2281,11 @@ final class InboxViewModel {
     /// one lookup on `messageUserLabel`'s composite primary key
     /// `(messageId, userLabelId)` — leading-column indexed, a handful of rows —
     /// on a path that has just awaited `drainPendingQueue`. Same reasoning and
-    /// same shape as `UserLabelMenuModel.reconcileAppliedIdsFromDatabase`,
-    /// `loadLabels` and `resolvedFolderPath`. If this ever has to go async, the
+    /// same shape as `UserLabelMenuModel.reconcileAppliedIdsFromDatabase` and
+    /// `loadLabels`. (This list used to name `resolvedFolderPath` too; T4.V13
+    /// deleted that helper — `applyLabel`/`removeLabel` now resolve the header
+    /// inside their own admission write transaction instead.) If this ever has
+    /// to go async, the
     /// atomicity has to be restored some other way (a generation token on the
     /// row, or reconciling under a serialising actor) — not dropped.
     private func reconcileUserLabels(forMessageId id: String) {
@@ -2080,10 +2300,15 @@ final class InboxViewModel {
         }
     }
 
-    func move(_ messageId: String, toFolderPath: String) {
+    /// Returns false when nothing was recorded (lookup miss) — callers
+    /// (InboxView's move-sheet site) MUST NOT leave the row hidden when this
+    /// returns false, or it vanishes forever with no undo entry. Same contract
+    /// and same defect class as `archive(_:)`; see its doc comment.
+    @discardableResult
+    func move(_ messageId: String, toFolderPath: String) -> Bool {
         guard let message = lookupMessage(messageId) else {
             print("[MoveTrace] ViewModel.move — lookupMessage FAILED for id=\(messageId)")
-            return
+            return false
         }
         print("[MoveTrace] ViewModel.move — msgId=\(message.messageId) from=\(message.folderPath) to=\(toFolderPath) folderId=\(message.folderId) headerDbId=\(message.id)")
         let destFolderId = "\(message.accountId):\(toFolderPath)"
@@ -2106,18 +2331,27 @@ final class InboxViewModel {
             await manager.move([message], to: toFolderPath)
             manager.releaseOverlayEntry(id: messageId)
         }}
+        return true
     }
 
     /// Move every member of a thread to `toFolderPath` as one grouped action.
     /// Pushes a single UndoableAction carrying all members so the whole thread
     /// restores in one undo — mirrors archiveThread/deleteThread.
-    func moveThread(_ messageIds: [String], toFolderPath: String) {
+    ///
+    /// Returns the ids of `messageIds` that were NOT acted upon (nothing
+    /// resolved for them, or the whole call aborted) — the caller (InboxView)
+    /// optimistically hides every member BEFORE calling this, so it MUST
+    /// un-hide exactly the ids returned here or those rows vanish forever with
+    /// no undo entry. See `archiveThread`'s doc comment for the full contract.
+    @discardableResult
+    func moveThread(_ messageIds: [String], toFolderPath: String) -> [String] {
         let messages = messageIds.compactMap { lookupMessage($0) }
+        // Nothing resolved — every id reported skipped so the caller un-hides.
         guard let first = messages.first else {
             if DebugModeManager.isLoggingEnabled() {
                 print("[MoveTrace] ViewModel.moveThread — no messages resolved for ids=\(messageIds)")
             }
-            return
+            return messageIds
         }
         if DebugModeManager.isLoggingEnabled() {
             print("[MoveTrace] ViewModel.moveThread — count=\(messages.count) from=\(first.folderPath) to=\(toFolderPath)")
@@ -2145,6 +2379,10 @@ final class InboxViewModel {
             await manager.move(messages, to: toFolderPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }}
+        // Members that never resolved were never acted upon — report them
+        // skipped so the caller un-hides exactly those rows.
+        let recorded = Set(compositeIds)
+        return messageIds.filter { !recorded.contains($0) }
     }
 
     /// Check if inbox qualifies as "large" (100+ messages with some older than 2 weeks).

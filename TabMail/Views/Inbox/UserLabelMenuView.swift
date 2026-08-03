@@ -50,9 +50,45 @@ final class UserLabelMenuModel {
     var sortedLabels: [UserLabel] = []
     /// Applied label IDs — mutated optimistically on toggle, drives checkmark display.
     var appliedIds: Set<String> = []
+    /// Whether this message's account can carry user labels REMOTELY. Set by
+    /// `loadLabels`, drives the sheet's disabled state. Presentation only — every
+    /// durable write re-asks the question inside its OWN transaction rather than
+    /// trusting this flag, because `applyLabel`/`removeLabel` are also entered
+    /// directly (tests, and any future non-menu caller).
+    var supportsRemoteUserLabels = false
 
     init(messageSnapshot: MessageSnapshot) {
         self.messageSnapshot = messageSnapshot
+    }
+
+    // MARK: - Provider Capability
+
+    /// Whether this provider's mail adapter implements REMOTE user-label
+    /// mutations. Outlook (Graph) and CalDAV do not, so a label op admitted for
+    /// them can never execute — it would sit in the queue being retried forever
+    /// while the menu showed a checkmark for a label the server will never carry.
+    /// Refusing at admission is the honest answer; nothing is queued and nothing
+    /// is shown.
+    ///
+    /// ⚑ PORT of `v2final`'s `AccountProvider.supportsRemoteUserLabels`
+    /// (declared on the enum in `TabMail/Models/Account.swift`), with ONE
+    /// deliberate difference: v3 carries no such member on `AccountProvider`, and
+    /// this change's file scope does not include `Account.swift`. The ladder
+    /// belongs on the enum beside `contentKeySpace` — lift it there when that file
+    /// is in scope, replace the four call sites, and delete this.
+    ///
+    /// ⚑ Exhaustive with no `default:` clause on purpose, exactly like
+    /// `AccountProvider.contentKeySpace`: a sixth provider must be a compile error
+    /// here, not a silent "labels work on it".
+    ///
+    /// `nonisolated` because three of its four call sites run inside a GRDB
+    /// database-queue closure, off the MainActor this type is isolated to — the
+    /// same treatment `AccountManager.newGestureRefusedForUnknownEpoch` gets.
+    nonisolated static func supportsRemoteUserLabels(_ provider: AccountProvider) -> Bool {
+        switch provider {
+        case .gmail, .imap, .icloud: return true
+        case .outlook, .caldav: return false
+        }
     }
 
     // MARK: - Data Loading
@@ -61,23 +97,36 @@ final class UserLabelMenuModel {
         do {
             let accountId = messageSnapshot.accountId
             let messageId = messageSnapshot.id
-            let inboxFolderIds = try AppDatabase.dbPool.read { db in
-                try String.fetchAll(db,
+            // ONE read, not two. The gate and the rows it gates must observe one
+            // consistent database state, and the two separate `dbPool.read` calls
+            // this replaced could not even guarantee that for the inbox-folder
+            // frequency input.
+            let state = try AppDatabase.dbPool.read { db -> (
+                supportsRemoteUserLabels: Bool,
+                entries: [(label: UserLabel, isApplied: Bool)]
+            ) in
+                // Provider gate — an account whose adapter cannot mutate labels
+                // remotely gets an EMPTY, disabled menu rather than a list of taps
+                // that could only ever queue an op nothing will execute.
+                guard let account = try Account.fetchOne(db, key: accountId),
+                      Self.supportsRemoteUserLabels(account.provider)
+                else { return (false, []) }
+                let inboxFolderIds = try String.fetchAll(db,
                     Folder.select(Column("id"))
                         .filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue)
                 )
-            }
-            let entries = try AppDatabase.dbPool.read { db in
-                try UserLabelStore.labelsSortedForMenu(
+                let entries = try UserLabelStore.labelsSortedForMenu(
                     accountId: accountId,
                     messageId: messageId,
                     inboxFolderIds: inboxFolderIds,
                     in: db
                 )
+                return (true, entries)
             }
+            supportsRemoteUserLabels = state.supportsRemoteUserLabels
             // Sort order set once — stable during session
-            sortedLabels = entries.map(\.label)
-            appliedIds = Set(entries.filter(\.isApplied).map(\.label.id))
+            sortedLabels = state.entries.map(\.label)
+            appliedIds = Set(state.entries.filter(\.isApplied).map(\.label.id))
         } catch {
             print("[UserLabelMenu] Failed to load labels: \(error)")
         }
@@ -144,35 +193,56 @@ final class UserLabelMenuModel {
         }
     }
 
-    /// The message's REAL folder path, or nil when its header row is gone.
+    /// 🚨 **THE OP'S TARGET IS THE ROW, READ INSIDE THIS TRANSACTION — there is no
+    /// default folder and there must never be one.**
     ///
-    /// This used to fall back to `?? "INBOX"`. It must not: that guess is what made
-    /// the admission guard's missing-`Folder`-row case unsafe to fail closed, and a
-    /// guessed path is wrong in exactly the situation it fires — the header has
-    /// vanished, so there is no message here to label. Callers abort on nil.
-    private func resolvedFolderPath() -> String? {
-        (try? AppDatabase.dbPool.read { db in
-            try MessageHeader.fetchOne(db, key: messageSnapshot.id)?.folderPath
-        }) ?? nil
-    }
-
+    /// This replaced a `resolvedFolderPath()` helper that read the header in its
+    /// own EARLIER `dbPool.read`, and whose first form defaulted to `?? "INBOX"`
+    /// when the row was missing. Both halves of that were wrong, and the second
+    /// outlives the first:
+    ///
+    /// * *The default.* A guessed `"INBOX"` queued a label op against a folder the
+    ///   user was not acting on. On IMAP the op resolves a UID inside that folder,
+    ///   so it mutates whichever message that mailbox's numbering put there —
+    ///   `C3`, the wrong-message mutation this codebase refuses outright. An
+    ///   unknown folder is an ABSENCE of evidence; it may fail closed, but it may
+    ///   never become a silent default.
+    /// * *The separate transaction.* Even returning the honest path, reading it in
+    ///   a prior transaction meant the value could be stale by the time the op was
+    ///   written: `MessageIdentity.headerId` embeds `folderPath`, so a MOVE
+    ///   landing in between retires this row and re-inserts the message under a
+    ///   DIFFERENT id — and the op would have named the folder the message has
+    ///   since LEFT. Same C3 outcome by a slower route. Reading the row here makes
+    ///   the guard, the local join row and the queued op observe one state.
+    ///
+    /// A vanished row therefore fails CLOSED — nothing queued, nothing written
+    /// locally — and the refusal is **RETRYABLE**: it latches nothing, so the
+    /// user's next tap re-runs this whole transaction. `AccountManager
+    /// .newGestureRefusedForUnknownEpoch` cites this caller as the reason its
+    /// missing-`Folder`-row case is safe to fail closed.
+    ///
     /// Returns whether the write was ADMITTED. `false` means nothing was queued and
     /// nothing changed locally, so the caller must reconcile its optimistic UI.
     func applyLabel(_ label: UserLabel) async -> Bool {
-        guard let folderPath = resolvedFolderPath() else { return false }
         do {
             let admitted = try await AppDatabase.dbPool.write { db -> Bool in
+                guard let header = try MessageHeader.fetchOne(db, key: messageSnapshot.id) else { return false }
+                // Provider gate — the last of the three, and the only one a direct
+                // (non-menu) caller passes through. See `supportsRemoteUserLabels(_:)`.
+                guard let account = try Account.fetchOne(db, key: header.accountId),
+                      Self.supportsRemoteUserLabels(account.provider)
+                else { return false }
                 // T1.3 — see InboxViewModel.removeUserLabel. Refuse before the local
                 // insert so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return false }
-                try MessageUserLabel(messageId: messageSnapshot.id, userLabelId: label.id)
+                    accountId: header.accountId, folderPath: header.folderPath, db: db) else { return false }
+                try MessageUserLabel(messageId: header.id, userLabelId: label.id)
                     .insert(db, onConflict: .ignore)
                 let op = PendingOperation(
                     type: .addUserLabel,
-                    messageIds: [messageSnapshot.stableId],
-                    accountId: messageSnapshot.accountId,
-                    folderPath: folderPath,
+                    messageIds: [header.stableId],
+                    accountId: header.accountId,
+                    folderPath: header.folderPath,
                     userLabelId: label.id
                 )
                 try op.insert(db)
@@ -188,23 +258,29 @@ final class UserLabelMenuModel {
         }
     }
 
-    /// Returns whether the write was ADMITTED — see `applyLabel`.
+    /// Returns whether the write was ADMITTED — see `applyLabel`, whose doc comment
+    /// also states why this transaction resolves the target row itself instead of
+    /// being handed a folder path read earlier.
     func removeLabel(_ label: UserLabel) async -> Bool {
-        guard let folderPath = resolvedFolderPath() else { return false }
         do {
             let admitted = try await AppDatabase.dbPool.write { db -> Bool in
+                guard let header = try MessageHeader.fetchOne(db, key: messageSnapshot.id) else { return false }
+                // Provider gate — see `applyLabel`'s identical guard.
+                guard let account = try Account.fetchOne(db, key: header.accountId),
+                      Self.supportsRemoteUserLabels(account.provider)
+                else { return false }
                 // T1.3 — see InboxViewModel.removeUserLabel. Refuse before the local
                 // delete so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
-                    accountId: messageSnapshot.accountId, folderPath: folderPath, db: db) else { return false }
+                    accountId: header.accountId, folderPath: header.folderPath, db: db) else { return false }
                 try MessageUserLabel
-                    .filter(Column("messageId") == messageSnapshot.id && Column("userLabelId") == label.id)
+                    .filter(Column("messageId") == header.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
                 let op = PendingOperation(
                     type: .removeUserLabel,
-                    messageIds: [messageSnapshot.stableId],
-                    accountId: messageSnapshot.accountId,
-                    folderPath: folderPath,
+                    messageIds: [header.stableId],
+                    accountId: header.accountId,
+                    folderPath: header.folderPath,
                     userLabelId: label.id
                 )
                 try op.insert(db)
@@ -229,12 +305,18 @@ final class UserLabelMenuModel {
             let accountId = messageSnapshot.accountId
             let labelId: String
 
-            // Check provider type from account
-            let account = try await AppDatabase.dbPool.read { db in
+            // Provider gate — an account whose adapter cannot mutate labels
+            // remotely must not even get the local `UserLabel` row created below:
+            // nothing would ever carry it to the server, so it would be a label
+            // that exists on this device only, silently. Returning false keeps the
+            // user's typed text in the field rather than clearing it on a
+            // create that did not happen.
+            guard let account = try await AppDatabase.dbPool.read({ db in
                 try Account.fetchOne(db, key: accountId)
-            }
+            }), Self.supportsRemoteUserLabels(account.provider) else { return false }
 
-            if account?.provider == .gmail {
+            switch account.provider {
+            case .gmail:
                 // Gmail: create label on server synchronously (with timeout)
                 let provider = await AccountManager.shared.providers[accountId]
                 guard let gmail = provider as? GmailProvider else { return false }
@@ -255,9 +337,15 @@ final class UserLabelMenuModel {
                     group.cancelAll()
                     return result
                 }
-            } else {
+            case .imap, .icloud:
                 // IMAP: keyword name (lowercased) IS the ID — no server call needed
                 labelId = name.lowercased()
+            case .outlook, .caldav:
+                // Unreachable — the gate above already returned for these. Spelled
+                // as explicit cases rather than `default:` for the same reason
+                // `supportsRemoteUserLabels(_:)` is exhaustive: a sixth provider
+                // must be a compile error here, not a silent keyword-id guess.
+                return false
             }
 
             // Insert locally
@@ -299,7 +387,7 @@ struct UserLabelMenuView: View {
         NavigationStack {
             List {
                 // Search / create field
-                if !searchText.isEmpty && !matchesExisting {
+                if model.supportsRemoteUserLabels && !searchText.isEmpty && !matchesExisting {
                     createRow
                 }
 
@@ -320,6 +408,10 @@ struct UserLabelMenuView: View {
                 }
             }
             .searchable(text: $searchText, prompt: "Search or create label...")
+            // Provider gate — on an account whose adapter cannot mutate labels
+            // remotely the list is empty anyway (`loadLabels` returns no entries),
+            // and this makes the sheet visibly inert rather than merely blank.
+            .disabled(!model.supportsRemoteUserLabels)
             .navigationTitle("Labels")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

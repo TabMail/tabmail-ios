@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -1601,5 +1602,407 @@ struct InboxGestureActionTests {
         #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded after the skipped-tag cycle")
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount entry stranded after the skipped-tag cycle")
         #expect(AccountManager.shared.pendingIntentCyclesForTesting()[id] == nil, "intent cycle stranded after the skipped-tag cycle")
+    }
+
+    // MARK: - (q) T4.V20-A — markAllAsRead must TERMINATE
+
+    /// An IMAP account whose folder epoch is UNKNOWN
+    /// (`lastKnownUidValidity == nil`, i.e. its first sync has not completed).
+    ///
+    /// That is the cheapest *production-reachable* way to make
+    /// `AccountManagerActions.admittedOrdinaryActionTargets` refuse a whole
+    /// group: it bails at the folder guard, so `markRead` writes no row and
+    /// queues no op and the page comes back still `isRead = 0`. The refusal is
+    /// RETRYABLE, not authoritative (an unread epoch is an ABSENCE of evidence
+    /// — see `roleMoveRejectDispositions`), and it persists for exactly as long
+    /// as the condition holds, which is what turns "a page that did not land"
+    /// into "the same page forever" for an uncursored loop.
+    private func makeEpochlessIMAPFolder(pool: DatabasePool) throws -> Folder {
+        var account = Account(emailAddress: "unsynced@example.com", displayName: "Unsynced", provider: .imap)
+        account.id = "acc-epochless"
+        let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+        let accountToInsert = account
+        let folderToInsert = folder
+        try pool.writeWithoutTransaction { db in
+            try accountToInsert.insert(db)
+            try folderToInsert.insert(db)
+        }
+        return folder
+    }
+
+    @Test("T4.V20-A — markAllAsRead terminates when a page's durable write never lands: the keyset cursor retires each page whether or not markRead admitted it, so a folder whose admission is refused for as long as its epoch is unknown ends the sweep instead of re-reading the identical page forever and holding the FIFO write queue")
+    func markAllAsReadTerminatesWhenABatchWriteNeverLands() async throws {
+        let (pool, _, _, dir, previous) = try makeTestDB()
+        defer {
+            InboxViewModel.markAllAsReadWillAdmitBatchForTesting.withLock { $0 = nil }
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+        InboxViewModel.markAllAsReadWillAdmitBatchForTesting.withLock { $0 = nil }
+
+        let folder = try makeEpochlessIMAPFolder(pool: pool)
+        let folderId = folder.id
+        let header = makeDurableHeader(folder: folder, messageId: "1001", isRead: false)
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let headerId = header.id
+
+        // BOUNDED SAFETY VALVE — why this test cannot simply await the sweep.
+        //
+        // The livelock this pins is not slow, it is non-terminating, and it
+        // holds `AccountManager`'s FIFO write queue while it spins. A test that
+        // just awaited `drainWriteQueue()` would therefore hang the whole test
+        // PROCESS (Swift Testing has no per-test timeout that can reclaim a
+        // blocked serial queue), taking thousands of unrelated results with it.
+        //
+        // So the admission seam counts pages and, if the count ever exceeds a
+        // small bound, reaches in from OUTSIDE the loop and clears the folder's
+        // unread rows — which starves even the broken implementation and lets
+        // the process finish. Whether the valve had to fire IS the assertion:
+        // production has no such valve.
+        let admissionBound = 8
+        let admissions = Mutex(0)
+        let valveFired = Mutex(false)
+        let admissionHook: @Sendable ([MessageHeader]) async -> Void = { _ in
+            let seen = admissions.withLock { (count: inout Int) -> Int in
+                count += 1
+                return count
+            }
+            guard seen > admissionBound else { return }
+            valveFired.withLock { $0 = true }
+            try? await AppDatabase.dbPool.write { db in
+                try db.execute(
+                    sql: "UPDATE messageHeader SET isRead = 1 WHERE folderId = ?",
+                    arguments: [folderId])
+            }
+        }
+        InboxViewModel.markAllAsReadWillAdmitBatchForTesting.withLock { $0 = admissionHook }
+
+        let vm = InboxViewModel(folders: [folder])
+        #expect(vm.loadedMessages.count == 1)
+
+        vm.markAllAsRead()
+        try await Task.sleep(for: .milliseconds(50)) // let its closure append to the FIFO
+        await drainWriteQueue()
+
+        // (1) TERMINATION. The sweep must run out of work on its own. The valve
+        // firing means it did not — it kept handing the same page to a
+        // `markRead` that admits nothing, which in production is an
+        // unkillable loop holding every other durable write behind it.
+        #expect(valveFired.withLock { $0 } == false, "markAllAsRead did not terminate on its own — the bounded safety valve had to starve it. That is the uncursored re-read-the-identical-page livelock, and in production nothing releases the valve: the FIFO write queue stays held forever")
+
+        // (2) A REFUSED WRITE IS NOT AUTHORITATIVE. Retiring a page from the
+        // sweep must never be equivalent to marking it read: the row stays
+        // unread on disk (and therefore on screen, via the trailing recount +
+        // reloadMessages), so the user can see it and act again.
+        let finalIsRead = try await pool.read { db in try MessageHeader.fetchOne(db, key: headerId)?.isRead }
+        #expect(finalIsRead == false, "the cursor advancing past a page that markRead refused must not be equivalent to marking it read — the refused row must stay unread and re-actionable")
+
+        // (3) …and it must not fabricate a durable op for work that never landed.
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "a refused admission queues nothing; the sweep must not invent a .markRead op for a page the admission rejected")
+    }
+
+    @Test("T4.V20-A — the all-succeeds sweep still marks EVERY unread message read, across multiple folders and multiple pages: the keyset cursor must retire the PAGE, never the folder and never the sweep")
+    func markAllAsReadSweepsEveryUnreadAcrossFoldersAndPages() async throws {
+        let (pool, firstInbox, _, dir, previous) = try makeTestDB()
+        defer {
+            InboxViewModel.markAllAsReadWillAdmitBatchForTesting.withLock { $0 = nil }
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+        InboxViewModel.markAllAsReadWillAdmitBatchForTesting.withLock { $0 = nil }
+
+        // TWO folders, and they must both be `.inbox`-role: the VM self-heals
+        // `folders` from the DB for a `.unified(.inbox)` selection
+        // (`resolveFoldersFromDB`), so a second folder of any other role would
+        // simply be dropped before `markAllAsRead` ever saw it.
+        //
+        // The second account id sorts BELOW the first ON PURPOSE. Header ids are
+        // `<accountId>:<folderPath>:<messageId>`, so every id in the second
+        // folder is BINARY-less-than every id in the first. A cursor (or an
+        // upper bound) hoisted out of the per-folder loop therefore excludes the
+        // whole second folder — which is exactly the regression this asserts on.
+        var secondAccount = Account(emailAddress: "second@example.com", displayName: "Second", provider: .gmail)
+        secondAccount.id = "acc0"
+        let secondInbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: secondAccount.id)
+        let accountToInsert = secondAccount
+        let folderToInsert = secondInbox
+        try await pool.writeWithoutTransaction { db in
+            try accountToInsert.insert(db)
+            try folderToInsert.insert(db)
+        }
+
+        // Sized off the production page size so both folders MUST paginate,
+        // with a ragged final page in each (a whole-page-multiple count would
+        // not distinguish "stopped on the empty page" from "stopped early").
+        let pageSize = SyncConfig.inboxPageSize
+        let firstCount = pageSize * 2 + 3
+        let secondCount = pageSize + 7
+        let expectedPages = 3 + 2
+
+        let now = Date()
+        var headers: [MessageHeader] = []
+        for i in 0..<firstCount {
+            headers.append(makeDurableHeader(
+                folder: firstInbox, messageId: String(format: "i-%05d", i),
+                date: now.addingTimeInterval(-Double(i) * 60), isRead: false))
+        }
+        for i in 0..<secondCount {
+            headers.append(makeDurableHeader(
+                folder: secondInbox, messageId: String(format: "j-%05d", i),
+                date: now.addingTimeInterval(-Double(i) * 60), isRead: false))
+        }
+        let seeded = headers
+        try await pool.writeWithoutTransaction { db in
+            for header in seeded { try header.insert(db) }
+        }
+
+        // Same bounded valve as the termination test — a cursor that never
+        // ADVANCES (rather than one that is absent) would spin here too, and no
+        // completeness assertion is worth hanging the suite for.
+        let pageBound = expectedPages * 3
+        let pageSizes = Mutex<[Int]>([])
+        let valveFired = Mutex(false)
+        let firstId = firstInbox.id
+        let secondId = secondInbox.id
+        let admissionHook: @Sendable ([MessageHeader]) async -> Void = { batch in
+            let seen = pageSizes.withLock { (sizes: inout [Int]) -> Int in
+                sizes.append(batch.count)
+                return sizes.count
+            }
+            guard seen > pageBound else { return }
+            valveFired.withLock { $0 = true }
+            try? await AppDatabase.dbPool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET isRead = 1")
+            }
+        }
+        InboxViewModel.markAllAsReadWillAdmitBatchForTesting.withLock { $0 = admissionHook }
+
+        let vm = InboxViewModel(folders: [firstInbox, secondInbox])
+        #expect(Set(vm.folders.map(\.id)) == [firstId, secondId], "fixture guard: the VM must actually be sweeping BOTH folders (self-heal resolves `.unified(.inbox)` from the DB)")
+
+        vm.markAllAsRead()
+        try await Task.sleep(for: .milliseconds(50)) // let its closure append to the FIFO
+        await drainWriteQueue()
+
+        #expect(valveFired.withLock { $0 } == false, "the sweep did not terminate on its own — a cursor that never advances livelocks exactly like no cursor at all")
+
+        // COMPLETENESS is the invariant. The user asked for all of it.
+        let unreadInFirst = try await pool.read { db in
+            try MessageHeader.filter(Column("folderId") == firstId && Column("isRead") == false).fetchCount(db)
+        }
+        let unreadInSecond = try await pool.read { db in
+            try MessageHeader.filter(Column("folderId") == secondId && Column("isRead") == false).fetchCount(db)
+        }
+        #expect(unreadInFirst == 0, "\(unreadInFirst) of \(firstCount) messages left unread in the first folder — a sweep that retires the FOLDER after its first page drops the tail of the user's mark-all")
+        #expect(unreadInSecond == 0, "\(unreadInSecond) of \(secondCount) messages left unread in the second folder — each folder must start its own cursor and its own upper bound; hoisting either out of the folder loop excludes every id that sorts outside the first folder's range")
+
+        // Coverage guard: the two-sidedness above is only meaningful if the
+        // sweep really paginated. It also pins that no page is admitted twice.
+        let pages = pageSizes.withLock { $0 }
+        #expect(pages.count == expectedPages, "expected \(expectedPages) pages at page size \(pageSize) for \(firstCount)+\(secondCount) unread, saw \(pages) — if this is 1 the test is vacuous, if it is larger a page was re-read")
+        #expect(pages.reduce(0, +) == firstCount + secondCount, "every unread row must be admitted exactly once across the sweep, saw \(pages.reduce(0, +)) admissions for \(firstCount + secondCount) rows")
+    }
+
+    // MARK: - (h) T4.D10 — a Drafts swipe-delete addresses the tapped draft, or nothing
+    //
+    // THE INVARIANT (the system end state, not the guard's spelling): a Drafts
+    // swipe-delete either removes the draft the user tapped — at the provider,
+    // by that row's OWN provider-issued address — or it removes nothing anywhere
+    // and reports the gesture unacted so the row un-hides and stays retryable.
+    // There is no third outcome, and in particular no outcome in which a LOCAL
+    // identifier is handed to the provider as if it were a provider address.
+    //
+    // 🚨 THE DEFECT THESE PIN. `deleteDraftMessage`'s header-only arm built its
+    // provider identity straight from `message.messageId`. That field holds a
+    // synthetic `draft-<id>:<epoch>:<len>` placeholder for any Drafts row minted
+    // by `AccountManager.queueDraftSave` before the server assigned an id, and a
+    // stale one survives indefinitely: `queueDraftSave` keys the placeholder on
+    // the draft's CURRENT `instanceEpoch` and never removes the previous
+    // generation's row, so the placeholder-ownership census above resolves
+    // nothing and the gesture falls through to the header-only arm. Gmail then
+    // received `POST /messages/draft-…/trash`, answered 404, and
+    // `trashContainedDraftMessage` reads 404 as idempotent success — so the op
+    // RETIRED, the local header was already deleted at queue time, and the real
+    // server draft (addressed by `Draft.serverDraftId`, which that arm never
+    // consulted) survived and re-synced. A destructive gesture reported as done
+    // that never touched its target.
+    //
+    // Reference: `v2final:TabMail/Views/Compose/ComposeView.swift`
+    // `ServerDraftOpen.inboxDraftDeletePlan(...)`, whose FIRST branch is exactly
+    // this refusal (and whose Outlook branch admits only
+    // `exactProviderIdentifier`, which rejects the same ids).
+
+    /// A Drafts-folder header for `acc1`, shaped like the rows the Drafts list
+    /// actually renders (read, not in the inbox, query-visible).
+    private func makeDraftsHeader(messageId: String) -> MessageHeader {
+        var h = MessageHeader(
+            messageId: messageId, subject: "Quarterly notes", from: "Test",
+            fromAddress: "test@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "snip",
+            folderId: "acc1:Drafts", accountId: "acc1", folderPath: "Drafts",
+            isInInbox: false
+        )
+        h.headerComplete = true
+        h.isRead = true
+        return h
+    }
+
+    /// A local draft row already pushed to Gmail, so its only provider address
+    /// is the RESOURCE id it carries.
+    private func makePushedGmailDraft(id: String, epoch: String, resourceId: String) -> Draft {
+        let now = Date().timeIntervalSince1970
+        var draft = Draft(
+            id: id, accountId: "acc1",
+            toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Quarterly notes", body: "Body the user authored.",
+            replyToId: nil, isForward: false, editHistoryJSON: nil,
+            createdAt: now, updatedAt: now,
+            serverDraftId: resourceId, serverPushStatus: "pushed",
+            rfc822MessageId: nil, attachmentsDirName: nil
+        )
+        draft.instanceEpoch = epoch
+        return draft
+    }
+
+    @Test("A stale-generation Drafts placeholder is never handed to Gmail as a delete address — nothing is deleted anywhere and the gesture stays retryable")
+    @MainActor
+    func staleGenerationDraftsPlaceholderDeletesNothingAndStaysRetryable() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        // A FakeHTTP-backed Gmail provider: `draftRuntimeIdentityKind` is a
+        // CONCRETE-TYPE check, so the real class is required — and the scoped
+        // session is what guarantees no request can escape to the live endpoint.
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let gmail = GmailProvider(
+            userEmail: "test@example.com", accessToken: { _ in "tok" }, session: http.session)
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: gmail)
+        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1") } }
+
+        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in let d = drafts; try d.insert(db) }
+
+        let draftId = Draft.draftKey(
+            replyTo: nil, isForward: false, newId: "t4d10-stale-\(UUID().uuidString)")
+        let liveEpoch = "E-live-\(UUID().uuidString)"
+        let staleEpoch = "E-stale-\(UUID().uuidString)"
+        let resourceId = "r-gmail-resource-1"
+        let draft = makePushedGmailDraft(id: draftId, epoch: liveEpoch, resourceId: resourceId)
+        try await pool.writeWithoutTransaction { db in let d = draft; try d.insert(db) }
+
+        // The row still on screen is the placeholder minted under the PREVIOUS
+        // compose generation — the one `queueDraftSave` leaves behind. Built
+        // through the production helper so the fixture cannot drift from the id
+        // shape production actually mints.
+        let stalePlaceholderId = PendingOperation.draftPlaceholderMessageId(
+            draftId: draftId, instanceEpoch: staleEpoch)
+        let header = makeDraftsHeader(messageId: stalePlaceholderId)
+        try await pool.writeWithoutTransaction { db in let h = header; try h.insert(db) }
+        let headerId = header.id
+
+        // Fixture guard: this scenario is only meaningful if the placeholder
+        // census really misses, i.e. the row's id is NOT the live generation's.
+        #expect(
+            stalePlaceholderId != PendingOperation.draftPlaceholderMessageId(
+                draftId: draftId, instanceEpoch: liveEpoch),
+            "fixture is vacuous — the on-screen placeholder matches the draft's live generation, so the owned-draft arm would handle it and the header-only arm is never reached")
+
+        let vm = InboxViewModel(folders: [inbox])
+        let acted = await vm.delete(headerId)
+
+        // 1. The gesture is reported UNACTED, which is what makes the swipe
+        //    un-hide the row (`InboxView`'s dismissed-id contract) and keeps the
+        //    user's intention alive and repeatable.
+        #expect(acted == false, "the swipe reported success for a draft it could not address — the row stays hidden while the server copy survives, and the user has no way to retry")
+
+        // 2. Nothing was destroyed locally.
+        let survivingHeader = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: headerId)
+        }
+        #expect(survivingHeader != nil, "the tapped Drafts row was deleted locally even though no provider delete could be addressed — it vanishes from the list while the server copy re-syncs")
+        let survivingDraft = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
+        #expect(survivingDraft?.serverDraftId == resourceId, "the authored draft row and its Gmail resource address must be untouched by a refused delete")
+
+        // 3. No durable destructive op was admitted at all — in particular none
+        //    carrying the local placeholder as if it were a Gmail address.
+        let allOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let deleteOps = allOps.filter { $0.type == .deleteDraft }
+        #expect(deleteOps.isEmpty, "a .deleteDraft op was admitted for an unaddressable row: \(deleteOps.map(\.messageIds))")
+
+        // 4. Wire oracle: nothing naming the local placeholder reached Gmail.
+        let placeholderTraffic = http.servedCallSequence().filter { $0.contains(stalePlaceholderId) }
+        #expect(placeholderTraffic.isEmpty, "a local placeholder id was sent to Gmail as a provider address: \(placeholderTraffic)")
+    }
+
+    @Test("A real Gmail Drafts row is queued for deletion under the tapped row's own byte-exact message id, not a same-account local draft's")
+    @MainActor
+    func realGmailDraftsRowIsDeletedByItsOwnProviderAddress() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            restoreTestDB(previous: previous, pool: pool, dir: dir)
+            clearOverlay(); resetStagedGlobal()
+        }
+        clearOverlay(); resetStagedGlobal()
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let gmail = GmailProvider(
+            userEmail: "test@example.com", accessToken: { _ in "tok" }, session: http.session)
+        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: gmail)
+        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1") } }
+
+        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in let d = drafts; try d.insert(db) }
+
+        // A DECOY: an unrelated local draft on the SAME account, carrying its own
+        // Gmail resource id. Nothing about the tapped row may resolve to it.
+        let decoyId = Draft.draftKey(
+            replyTo: nil, isForward: false, newId: "t4d10-decoy-\(UUID().uuidString)")
+        let decoy = makePushedGmailDraft(
+            id: decoyId, epoch: "E-decoy-\(UUID().uuidString)", resourceId: "r-gmail-decoy")
+        try await pool.writeWithoutTransaction { db in let d = decoy; try d.insert(db) }
+
+        // The tapped row: a genuine Gmail Drafts header with a real, byte-exact
+        // provider message id and no local Draft of its own.
+        let tappedProviderId = "18f0c9d2e4b6a1c3"
+        let header = makeDraftsHeader(messageId: tappedProviderId)
+        try await pool.writeWithoutTransaction { db in let h = header; try h.insert(db) }
+        let headerId = header.id
+
+        let vm = InboxViewModel(folders: [inbox])
+        let acted = await vm.delete(headerId)
+
+        // NON-VACUITY: the addressable case must still delete. A "fix" that
+        // refuses every header-only Drafts delete fails right here.
+        #expect(acted == true, "an addressable Gmail Drafts row was refused — the fail-closed guard is over-refusing and the user can no longer delete drafts at all")
+
+        let deletedHeader = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: headerId)
+        }
+        #expect(deletedHeader == nil, "the tapped row is still on screen after an admitted delete")
+
+        let allOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        let deleteOps = allOps.filter { $0.type == .deleteDraft }
+        #expect(deleteOps.count == 1, "expected exactly one queued draft delete, got \(deleteOps.count)")
+        guard deleteOps.count == 1 else { return }
+        let op = deleteOps[0]
+        // The address handed to Gmail is the TAPPED row's own id, byte for byte —
+        // never the decoy's resource id, and never a normalized/trimmed variant.
+        #expect(op.messageIds == [tappedProviderId], "the queued delete names \(op.messageIds) instead of the tapped row's own provider id")
+        #expect(op.draftDeleteAddressKind == DraftDeleteAddressKind.gmailContainedMessage.rawValue, "a Drafts-folder header carries Gmail's contained MESSAGE id, never a draft RESOURCE id — mistyping the namespace sends it to the wrong Gmail route")
+        #expect(op.accountId == "acc1")
+        #expect(op.folderPath == "Drafts")
+
+        // The decoy is untouched: sharing an account never donates authority.
+        let survivingDecoy = try await pool.read { db in try Draft.fetchOne(db, key: decoyId) }
+        #expect(survivingDecoy?.serverDraftId == "r-gmail-decoy", "an unrelated same-account draft was consumed by another row's delete")
     }
 }

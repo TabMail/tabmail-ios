@@ -880,9 +880,23 @@ extension AccountManager {
     ///     code=1` (the enum case ordinal), NOT `code=400`. So the NSError-domain check
     ///     below would never match this shape — pattern-match the enum directly.
     ///   - `NSError(domain: "Gmail"|"Exchange", code: 400)` — thrown by retry-aware paths.
+    ///   - `HTTPError.networkErrorWithBody(statusCode: 400, body:)` — thrown by the
+    ///     body-preserving opt-in (`AuthedHTTP.requestPreservingBadRequestBody`) that
+    ///     action-path call sites use so they can STRUCTURALLY classify a `400` instead
+    ///     of guessing from the status code. It is the SAME failure as
+    ///     `.networkError(400)`, carrying the raw body in addition — so it MUST classify
+    ///     identically. When `GmailProvider.modifyMessage` switched to that helper, a
+    ///     matcher that only knew `.networkError` would have silently stopped matching
+    ///     and every unclassified Gmail action `400` would have been retried forever
+    ///     instead of dropped. Ordinal-appended enum case + status-only matcher is the
+    ///     "half-port drops the guard" shape; the two arms are kept deliberately
+    ///     symmetric so this cannot depend on which port lands first.
     nonisolated func isPermanentlyInvalidError(_ error: Error) -> Bool {
         if case ProviderError.networkError(let underlying) = error {
             if case HTTPError.networkError(let statusCode) = underlying, statusCode == 400 {
+                return true
+            }
+            if case HTTPError.networkErrorWithBody(let statusCode, _) = underlying, statusCode == 400 {
                 return true
             }
             let ns = underlying as NSError

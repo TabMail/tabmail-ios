@@ -200,7 +200,9 @@ struct SameFolderNoOpTests {
         UndoService.shared.dismissAll()
         defer { UndoService.shared.dismissAll() }
 
-        vm.archive(id)
+        // The RECORDED side of the un-hide contract: the caller hid this row
+        // optimistically, and a `true` return is what lets it stay hidden.
+        #expect(vm.archive(id) == true)
 
         #expect(UndoService.shared.undoStack.count == 1)
         #expect(AccountManager.shared.snapshotOverlay()[id]?.folderId == archive.id)
@@ -279,7 +281,8 @@ struct SameFolderNoOpTests {
         UndoService.shared.dismissAll()
         defer { UndoService.shared.dismissAll() }
 
-        await vm.delete(id)
+        // The RECORDED side of the un-hide contract — see archiveFromInboxStillWorks.
+        #expect(await vm.delete(id) == true)
 
         #expect(UndoService.shared.undoStack.count == 1)
         #expect(AccountManager.shared.snapshotOverlay()[id]?.folderId == trash.id)
@@ -415,5 +418,480 @@ struct SameFolderNoOpTests {
             try MessageHeader.filter(Column("messageId") == "a1").fetchOne(db)
         }
         #expect(untouched?.folderId == archive.id)
+    }
+
+    // MARK: - Un-hide contract (T4.V1): a NOT-RECORDED action must not leave
+    // the row hidden. The swipe/dismiss sites insert the id into
+    // `dismissedMessages` BEFORE calling the ViewModel, so a call that records
+    // nothing and reports nothing back makes the message vanish from the list
+    // forever with no undo entry to bring it back. These pin the report, which
+    // is the only signal the View has.
+
+    /// Drop `folder`'s row so the account genuinely has no folder of that role.
+    /// This is the un-hide contract's live (non-racy) trigger: `archiveIsNoOp` /
+    /// `deleteIsNoOp` both return FALSE with no destination folder, so the
+    /// View's pre-check PASSES and the row is hidden — only the return value
+    /// can bring it back.
+    @MainActor
+    private func dropFolder(_ pool: DatabasePool, _ folder: Folder) throws {
+        try pool.writeWithoutTransaction { db in
+            _ = try Folder.filter(Column("id") == folder.id).deleteAll(db)
+        }
+    }
+
+    @Test("archive() reports NOT-recorded when the account has no archive folder — the hidden row must come back, and no undo entry is stranded")
+    @MainActor func archiveWithNoArchiveFolderReportsNotRecorded() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try dropFolder(pool, archive)
+
+        let id = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        // Non-vacuity: the View's own pre-check does NOT suppress this gesture,
+        // so the row IS hidden before the ViewModel call runs.
+        #expect(vm.archiveIsNoOp(id) == false)
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(vm.archive(id) == false)
+
+        // Nothing recorded: no undo entry to strand, no overlay mutation, and
+        // the message is exactly where it was.
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+        let stored = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(stored?.folderId == inbox.id)
+    }
+
+    @Test("delete() reports NOT-recorded when the account has no trash folder — the hidden row must come back, and no undo entry is stranded")
+    @MainActor func deleteWithNoTrashFolderReportsNotRecorded() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try dropFolder(pool, trash)
+
+        let id = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        #expect(vm.deleteIsNoOp(id) == false)
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(await vm.delete(id) == false)
+
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+        let stored = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(stored?.folderId == inbox.id)
+    }
+
+    @Test("archiveThread reports EVERY member skipped when the account has no archive folder — every hidden row comes back, none stranded")
+    @MainActor func archiveThreadWithNoArchiveFolderReportsAllSkipped() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try dropFolder(pool, archive)
+
+        let id1 = try insertMessage(pool, messageId: "t1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+        let id2 = try insertMessage(pool, messageId: "t2", folder: inbox, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        // Non-vacuity: both members classify as actionable, so both are hidden.
+        #expect(vm.actionableArchiveIds([id1, id2]) == [id1, id2])
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        let skipped = vm.archiveThread([id1, id2])
+
+        #expect(Set(skipped) == Set([id1, id2]))
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[id1] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[id2] == nil)
+    }
+
+    @Test("deleteThread reports EVERY member skipped when the account has no trash folder — every hidden row comes back, none stranded")
+    @MainActor func deleteThreadWithNoTrashFolderReportsAllSkipped() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try dropFolder(pool, trash)
+
+        let id1 = try insertMessage(pool, messageId: "t1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+        let id2 = try insertMessage(pool, messageId: "t2", folder: inbox, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        #expect(vm.actionableDeleteIds([id1, id2]) == [id1, id2])
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        let skipped = await vm.deleteThread([id1, id2])
+
+        #expect(Set(skipped) == Set([id1, id2]))
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[id1] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[id2] == nil)
+    }
+
+    @Test("archiveThread reports NOTHING skipped when every member is actionable — the hidden rows legitimately stay hidden under one undo entry")
+    @MainActor func archiveThreadReportsNothingSkippedWhenRecorded() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let id1 = try insertMessage(pool, messageId: "t1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+        let id2 = try insertMessage(pool, messageId: "t2", folder: inbox, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer { AccountManager.shared.removeOverlayEntries(ids: [id1, id2]) }
+
+        let skipped = vm.archiveThread([id1, id2])
+
+        // Two-sided against the "always report skipped" degenerate fix: an
+        // un-hide-everything implementation fails HERE.
+        #expect(skipped.isEmpty)
+        #expect(UndoService.shared.undoStack.count == 1)
+        #expect(AccountManager.shared.snapshotOverlay()[id1]?.folderId == archive.id)
+        #expect(AccountManager.shared.snapshotOverlay()[id2]?.folderId == archive.id)
+    }
+
+    @Test("archiveThread reports an unresolvable member skipped while still recording the resolvable one")
+    @MainActor func archiveThreadReportsUnresolvableMemberSkipped() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let realId = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+        let ghostId = "acc1:INBOX:does-not-exist"
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        // Non-vacuity: an unresolvable id is NOT a no-op, so the View hides it
+        // too — only the skipped report can bring that row back.
+        #expect(vm.actionableArchiveIds([realId, ghostId]) == [realId, ghostId])
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer { AccountManager.shared.removeOverlayEntries(ids: [realId]) }
+
+        let skipped = vm.archiveThread([realId, ghostId])
+
+        #expect(skipped == [ghostId])
+        #expect(UndoService.shared.undoStack.count == 1)
+        #expect(AccountManager.shared.snapshotOverlay()[realId]?.folderId == archive.id)
+    }
+
+    // MARK: - Per-member thread classification (T4.V16)
+    //
+    // A thread can span folders of different roles. Deciding the whole thread
+    // from the REPRESENTATIVE's folder role turned a mixed [Archive, Inbox]
+    // thread into a whole-thread NO-OP, silently dropping the inbox member's
+    // archive/delete intention. Classification is per member; a settled member
+    // stays VISIBLE and is never mutated (C3).
+
+    @Test("a thread spanning Inbox and Archive archives its inbox member instead of no-opping the whole thread — and never touches the archived member")
+    @MainActor func mixedInboxArchiveThreadArchivesItsInboxMember() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        // The ARCHIVE-resident member is first, i.e. the thread representative —
+        // exactly the shape the old whole-thread guard short-circuited on.
+        let archivedId = try insertMessage(pool, messageId: "a1", folder: archive, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+        let inboxId = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [inbox, archive])
+        vm.start()
+        vm.loadInitialPage()
+
+        // The pre-fix whole-thread guard consulted exactly this predicate on the
+        // representative and returned early for the WHOLE thread.
+        #expect(vm.archiveIsNoOp(archivedId) == true)
+
+        // Per-member: only the inbox member is actionable, and it is the only
+        // row the caller hides.
+        let actionable = vm.actionableArchiveIds([archivedId, inboxId])
+        #expect(actionable == [inboxId])
+        guard actionable == [inboxId] else { return }
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer { AccountManager.shared.removeOverlayEntries(ids: [inboxId]) }
+
+        let skipped = vm.archiveThread(actionable)
+
+        // The inbox member's intention SURVIVES the mixed thread.
+        #expect(skipped.isEmpty)
+        #expect(UndoService.shared.undoStack.count == 1)
+        guard UndoService.shared.undoStack.count == 1 else { return }
+        #expect(UndoService.shared.undoStack[0].messages.map(\.id) == [inboxId])
+        #expect(AccountManager.shared.snapshotOverlay()[inboxId]?.folderId == archive.id)
+
+        // C3: the settled member was never classified, never hidden, never
+        // mutated — no overlay entry and no folder change.
+        #expect(AccountManager.shared.snapshotOverlay()[archivedId] == nil)
+        let untouched = try await pool.read { db in try MessageHeader.fetchOne(db, key: archivedId) }
+        #expect(untouched?.folderId == archive.id)
+    }
+
+    @Test("a thread whose every member is already archived stays a whole-thread archive no-op — nothing is classified actionable, nothing is recorded")
+    @MainActor func fullyArchivedThreadStaysAWholeThreadNoOp() async throws {
+        let (pool, _, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let id1 = try insertMessage(pool, messageId: "a1", folder: archive, date: baseDate, computedThreadId: "thread-1")
+        let id2 = try insertMessage(pool, messageId: "a2", folder: archive, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [archive], selection: .folder(archive))
+        vm.start()
+        vm.loadInitialPage()
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        // The CONTROL for the mixed-thread case: an empty actionable set is the
+        // caller's "hide nothing, do nothing" signal.
+        #expect(vm.actionableArchiveIds([id1, id2]).isEmpty)
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[id1] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[id2] == nil)
+    }
+
+    @Test("a thread spanning Inbox and Trash deletes its inbox member instead of no-opping the whole thread — and never touches the trashed member")
+    @MainActor func mixedInboxTrashThreadDeletesItsInboxMember() async throws {
+        let (pool, inbox, _, trash, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let trashedId = try insertMessage(pool, messageId: "t1", folder: trash, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+        let inboxId = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [inbox, trash])
+        vm.start()
+        vm.loadInitialPage()
+
+        #expect(vm.deleteIsNoOp(trashedId) == true)
+
+        let actionable = vm.actionableDeleteIds([trashedId, inboxId])
+        #expect(actionable == [inboxId])
+        guard actionable == [inboxId] else { return }
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer { AccountManager.shared.removeOverlayEntries(ids: [inboxId]) }
+
+        let skipped = await vm.deleteThread(actionable)
+
+        #expect(skipped.isEmpty)
+        #expect(UndoService.shared.undoStack.count == 1)
+        guard UndoService.shared.undoStack.count == 1 else { return }
+        #expect(UndoService.shared.undoStack[0].messages.map(\.id) == [inboxId])
+        #expect(AccountManager.shared.snapshotOverlay()[inboxId]?.folderId == trash.id)
+
+        // C3: the trash-resident member is untouched.
+        #expect(AccountManager.shared.snapshotOverlay()[trashedId] == nil)
+        let untouched = try await pool.read { db in try MessageHeader.fetchOne(db, key: trashedId) }
+        #expect(untouched?.folderId == trash.id)
+    }
+
+    @Test("a thread whose every member is already in trash stays a whole-thread delete no-op — nothing is classified actionable, nothing is recorded")
+    @MainActor func fullyTrashedThreadStaysAWholeThreadNoOp() async throws {
+        let (pool, _, _, trash, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let id1 = try insertMessage(pool, messageId: "t1", folder: trash, date: baseDate, computedThreadId: "thread-1")
+        let id2 = try insertMessage(pool, messageId: "t2", folder: trash, date: baseDate.addingTimeInterval(60), computedThreadId: "thread-1")
+
+        let vm = InboxViewModel(folders: [trash], selection: .folder(trash))
+        vm.start()
+        vm.loadInitialPage()
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(vm.actionableDeleteIds([id1, id2]).isEmpty)
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[id1] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[id2] == nil)
+    }
+
+    // MARK: - Un-hide contract on the MOVE path
+    //
+    // The same defect class the archive/delete un-hide contract above closes,
+    // on the move-sheet path: `InboxView.performSingleMove` /
+    // `performThreadMove` hide the row(s) BEFORE calling the ViewModel, and the
+    // ViewModel used to return Void — so a call that recorded nothing left the
+    // message vanished from the list forever with no undo entry to bring it
+    // back. Unlike archive/delete the move sheet has NO no-op pre-check at all,
+    // so the return value is the ONLY signal the View has.
+
+    @Test("move() reports NOT-recorded when the message no longer resolves — the hidden row must come back, and no undo entry is stranded")
+    @MainActor func moveWithUnresolvableMessageReportsNotRecorded() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        // A real sibling keeps the list state realistic; the gesture targets an
+        // id that vanished between the picker opening and the tap — the live
+        // (non-racy) trigger for this path.
+        _ = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
+        let ghostId = "acc1:INBOX:does-not-exist"
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        // Non-vacuity: nothing suppresses this gesture at the View layer, so
+        // the row IS hidden before the ViewModel call runs.
+        #expect(vm.lookupMessage(ghostId) == nil)
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(vm.move(ghostId, toFolderPath: archive.path) == false)
+
+        // Nothing recorded: no undo entry to strand and no overlay mutation.
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[ghostId] == nil)
+    }
+
+    @Test("move() reports RECORDED for a resolvable message — the hidden row legitimately stays hidden and an undo entry exists")
+    @MainActor func moveReportsRecordedForResolvableMessage() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let id = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate)
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer { AccountManager.shared.removeOverlayEntries(ids: [id]) }
+
+        // Two-sided against the degenerate "always report not-recorded"
+        // (un-hide always) fix: that implementation fails HERE, and it would
+        // also strand the undo entry this asserts against a visible row.
+        #expect(vm.move(id, toFolderPath: archive.path) == true)
+        #expect(UndoService.shared.undoStack.count == 1)
+        #expect(AccountManager.shared.snapshotOverlay()[id]?.folderId == archive.id)
+    }
+
+    @Test("moveThread reports an unresolvable member skipped while still recording the resolvable one — and never touches the skipped member")
+    @MainActor func moveThreadReportsUnresolvableMemberSkipped() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let realId = try insertMessage(pool, messageId: "i1", folder: inbox, date: baseDate, computedThreadId: "thread-1")
+        let ghostId = "acc1:INBOX:does-not-exist"
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        // Non-vacuity: `performThreadMove` hides EVERY member unconditionally,
+        // so the unresolvable one is hidden too — only the skipped report can
+        // bring that row back.
+        #expect(vm.lookupMessage(ghostId) == nil)
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer { AccountManager.shared.removeOverlayEntries(ids: [realId]) }
+
+        let skipped = vm.moveThread([realId, ghostId], toFolderPath: archive.path)
+
+        // EXACTLY the un-recorded member is reported (so exactly its row
+        // un-hides); the recorded one legitimately stays hidden under an undo
+        // entry — the mixed case is two-sided on its own.
+        #expect(skipped == [ghostId])
+        #expect(UndoService.shared.undoStack.count == 1)
+        guard UndoService.shared.undoStack.count == 1 else { return }
+        #expect(UndoService.shared.undoStack[0].messages.map(\.id) == [realId])
+        #expect(AccountManager.shared.snapshotOverlay()[realId]?.folderId == archive.id)
+        // C3: the skipped member was never mutated.
+        #expect(AccountManager.shared.snapshotOverlay()[ghostId] == nil)
+    }
+
+    @Test("moveThread reports EVERY member skipped when nothing resolves — every hidden row comes back, none stranded")
+    @MainActor func moveThreadWithNothingResolvableReportsAllSkipped() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let ghost1 = "acc1:INBOX:gone-1"
+        let ghost2 = "acc1:INBOX:gone-2"
+
+        let vm = InboxViewModel(folders: [inbox])
+        vm.start()
+        vm.loadInitialPage()
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        // The whole-call abort leg: `guard let first = messages.first` used to
+        // `return` with the caller holding every id hidden.
+        let skipped = vm.moveThread([ghost1, ghost2], toFolderPath: archive.path)
+
+        #expect(Set(skipped) == Set([ghost1, ghost2]))
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[ghost1] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[ghost2] == nil)
     }
 }

@@ -4,6 +4,25 @@
 
 import SwiftUI
 
+/// Single source of truth for "which action tag does this row DISPLAY".
+///
+/// ADR-IOS-036: action tags are LOCAL-ONLY and are RETAINED across folders, so
+/// every renderer that paints a tag (stripe, chip, row tint) must gate on
+/// `isInInbox` — otherwise a retained tag leaks a stale color onto a row that
+/// has since left the inbox: a Sent/Archived reply rendered as a thread child,
+/// or a row still on screen mid-drain of an optimistic move. Retention is
+/// deliberate (the tag must survive a round trip back to the inbox); only the
+/// DISPLAY is gated, and no server round-trip is involved.
+///
+/// `nonisolated static` so unit tests can pin the rule directly instead of
+/// asserting on SwiftUI view internals.
+enum ActionTagDisplay {
+    nonisolated static func displayedTag(for message: MessageSnapshot) -> ActionTag? {
+        guard message.isInInbox else { return nil }
+        return message.actionTag
+    }
+}
+
 /// Compact triage row: sender, date, subject — tinted with tag color.
 /// No preview, no attachment icon — only reply/forward indicators.
 struct TriageRowView: View {
@@ -23,8 +42,9 @@ struct TriageRowView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Tag color stripe on far left
-            if let tag = message.actionTag {
+            // Tag color stripe on far left — inbox only (ADR-IOS-036); see
+            // ActionTagDisplay.displayedTag for why display is gated.
+            if let tag = ActionTagDisplay.displayedTag(for: message) {
                 tagStripe(tag: tag)
             } else if message.isInInbox && anyAISourceEnabled {
                 Theme.textSecondary.opacity(0.2)
@@ -77,7 +97,7 @@ struct TriageRowView: View {
                             .fontWeight(.regular)
                             .foregroundStyle(Theme.textUnread)
                             .lineLimit(1)
-                        if let tag = message.actionTag {
+                        if let tag = ActionTagDisplay.displayedTag(for: message) {
                             Spacer(minLength: 4)
                             Text(tag.displayName)
                                 .font(.caption2)

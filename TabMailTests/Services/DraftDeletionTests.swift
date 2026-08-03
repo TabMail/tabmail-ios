@@ -115,6 +115,63 @@ struct DraftDeletionTests {
         #expect(!manager.isPermanentlyInvalidError(error))
     }
 
+    // MARK: - isPermanentlyInvalidError — body-preserving HTTPError shape (T4.H1 / T3.5)
+    //
+    // `AuthedHTTP.requestPreservingBadRequestBody` is an opt-in used by action-path
+    // call sites that must STRUCTURALLY classify a 400 (Gmail's "Invalid id value")
+    // instead of guessing from the status code. On a final 400 it throws
+    // `HTTPError.networkErrorWithBody(statusCode:body:)` — the SAME failure as
+    // `.networkError(400)`, with the raw body attached — so the classifier must
+    // treat the two identically. `GmailProvider.modifyMessage` switched to that
+    // helper in T3.5; a matcher that only knew `.networkError` would have silently
+    // stopped matching and every unclassified Gmail action 400 would have been
+    // retried forever instead of dropped.
+
+    @Test("isPermanentlyInvalidError: HTTPError.networkErrorWithBody(400) returns true")
+    func permanentlyInvalidHTTPErrorWithBody400() {
+        let body = Data(#"{"error":{"code":400,"message":"Precondition check failed."}}"#.utf8)
+        let error = ProviderError.networkError(
+            underlying: HTTPError.networkErrorWithBody(statusCode: 400, body: body)
+        )
+        let manager = AccountManager.shared
+        #expect(manager.isPermanentlyInvalidError(error))
+    }
+
+    @Test("isPermanentlyInvalidError: networkErrorWithBody classifies identically to networkError for the same status")
+    func permanentlyInvalidWithBodyMatchesBodylessForSameStatus() {
+        // The property is EQUIVALENCE, not "400 is true": a body-carrying failure
+        // and a bodyless one describing the same HTTP status must never disagree.
+        // Asserted across the terminal status AND the transient ones, so a matcher
+        // that answered `true` for every `networkErrorWithBody` fails here.
+        let manager = AccountManager.shared
+        let body = Data(#"{"error":{"code":0,"message":"x"}}"#.utf8)
+        for statusCode in [400, 404, 429, 500, 503] {
+            let bodyless = ProviderError.networkError(
+                underlying: HTTPError.networkError(statusCode: statusCode)
+            )
+            let withBody = ProviderError.networkError(
+                underlying: HTTPError.networkErrorWithBody(statusCode: statusCode, body: body)
+            )
+            #expect(
+                manager.isPermanentlyInvalidError(bodyless)
+                    == manager.isPermanentlyInvalidError(withBody),
+                "status \(statusCode): body-preserving and bodyless shapes must classify identically"
+            )
+        }
+    }
+
+    @Test("isPermanentlyInvalidError: HTTPError.networkErrorWithBody(503) returns false")
+    func permanentlyInvalidHTTPErrorWithBody503() {
+        // Non-vacuity control for the 400 case above: the widened arm must be
+        // status-gated, not "any body-carrying failure is permanent".
+        let body = Data(#"{"error":{"code":503,"message":"Backend Error"}}"#.utf8)
+        let error = ProviderError.networkError(
+            underlying: HTTPError.networkErrorWithBody(statusCode: 503, body: body)
+        )
+        let manager = AccountManager.shared
+        #expect(!manager.isPermanentlyInvalidError(error))
+    }
+
     // MARK: - PendingOperation messageIds for .saveDraft
 
     @Test("saveDraft PendingOperation includes placeholder messageId for pendingAllIds protection")
