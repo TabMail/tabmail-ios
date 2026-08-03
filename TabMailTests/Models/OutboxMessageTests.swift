@@ -67,12 +67,13 @@ struct OutboxMessageTests {
         #expect(msg.bcc == ["g@h.com"])
     }
 
-    @Test("outboxStatus computed property falls back to .queued")
+    @Test("outboxStatus computed property FAILS CLOSED to .failed on unknown raw values")
     func outboxStatusFallback() {
+        // F2b §1.3 fail-closed decode: never the drainable .queued.
         let draft = DraftMessage()
         var msg = OutboxMessage(accountId: "acc1", draft: draft)
         msg.status = "invalid_status"
-        #expect(msg.outboxStatus == .queued)
+        #expect(msg.outboxStatus == .failed)
     }
 
     @Test("isForward preserved")

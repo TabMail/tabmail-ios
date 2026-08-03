@@ -129,12 +129,15 @@ struct DraftMessageTests {
         #expect(msg.outboxStatus == .failed)
     }
 
-    @Test("OutboxMessage outboxStatus falls back to queued for invalid status")
+    @Test("OutboxMessage outboxStatus FAILS CLOSED (.failed, non-drainable) for invalid status")
     func outboxStatusFallback() {
+        // F2b §1.3: unknown/garbled status must NEVER decode to the drainable
+        // .queued (the pre-F2b fallback would auto-send a row whose status
+        // this build cannot decode). .failed = visible, explicit-retry.
         let draft = DraftMessage()
         var msg = OutboxMessage(accountId: "acc1", draft: draft)
         msg.status = "invalid_status"
-        #expect(msg.outboxStatus == .queued)
+        #expect(msg.outboxStatus == .failed)
     }
 
     @Test("OutboxMessage inReplyTo from DraftMessage")

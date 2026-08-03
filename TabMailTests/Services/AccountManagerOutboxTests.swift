@@ -99,12 +99,13 @@ struct OutboxStatusStateMachineTests {
         #expect(OutboxStatus(rawValue: "QUEUED") == nil)
     }
 
-    @Test("outboxStatus falls back to .queued for unknown status string")
+    @Test("outboxStatus FAILS CLOSED to .failed for an unknown status string")
     func outboxStatusFallback() {
+        // F2b §1.3: an unknown status is NON-DRAINABLE — .failed, never .queued.
         let draft = DraftMessage(to: ["a@b.com"], subject: "Test", body: "Body")
         var msg = OutboxMessage(accountId: "acc1", draft: draft)
         msg.status = "unknown_status"
-        #expect(msg.outboxStatus == .queued)
+        #expect(msg.outboxStatus == .failed)
     }
 }
 

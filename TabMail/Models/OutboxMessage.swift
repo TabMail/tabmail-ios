@@ -127,8 +127,15 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
         set { referencesJSON = encodeStringArray(newValue) }
     }
 
+    /// F2b §1.3 FAIL-CLOSED decoding: an unknown/garbled stored status maps to
+    /// `.failed` (visible, NON-drainable, explicit-user-retry) — NEVER
+    /// `.queued` (the pre-F2b fallback, which would auto-send a row carrying a
+    /// status this build's `OutboxStatus` does not know — a garbled value, or
+    /// one a newer schema version writes that older code cannot decode). The
+    /// SQL drain/claim selectors filter the RAW string `== queued`, so they
+    /// were already closed; this closes the Swift-side branch too.
     var outboxStatus: OutboxStatus {
-        OutboxStatus(rawValue: status) ?? .queued
+        OutboxStatus(rawValue: status) ?? .failed
     }
 
     // MARK: - Init
