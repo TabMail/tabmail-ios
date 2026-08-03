@@ -68,7 +68,10 @@ struct NotificationTapResolveTests {
         let row = stagedRow(messageId: "m-prov-staged")
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
 
-        let resolved = await MessageDetailViewModel.resolveProviderTap("m-prov-staged")
+        // Account-scoped: a tap with no accountId fails closed by contract
+        // (see NotificationTapAccountScopeTests), so the tier tests must carry
+        // the account the fixture staged the row under.
+        let resolved = await MessageDetailViewModel.resolveProviderTap("m-prov-staged", accountId: "acc1")
         #expect(resolved == row.headerId)
     }
 
@@ -85,7 +88,7 @@ struct NotificationTapResolveTests {
         let row = stagedRow(messageId: "m-prov-durable")
         let durable = try insertDurableInboxHeader(from: row, subject: "Durable", into: pool)
 
-        let resolved = await MessageDetailViewModel.resolveProviderTap("m-prov-durable")
+        let resolved = await MessageDetailViewModel.resolveProviderTap("m-prov-durable", accountId: "acc1")
         #expect(resolved == durable.id)
     }
 
@@ -100,9 +103,12 @@ struct NotificationTapResolveTests {
         }
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
 
-        // Short wait keeps the bounded poll from slowing the suite.
+        // Short wait keeps the bounded poll from slowing the suite. The account
+        // is supplied so this exercises the EXHAUSTED ladder — without it the
+        // nil-account fail-closed guard would return nil at the door and the
+        // assertion would hold vacuously.
         let resolved = await MessageDetailViewModel.resolveProviderTap(
-            "m-prov-gone", waitSeconds: 0.1, pollMs: 20
+            "m-prov-gone", accountId: "acc1", waitSeconds: 0.1, pollMs: 20
         )
         #expect(resolved == nil)
     }
@@ -122,7 +128,7 @@ struct NotificationTapResolveTests {
         NSEDataBridge.latestStagedRows.withLock { $0 = [row] }
 
         let vm = MessageDetailViewModel(
-            messageId: MessageDetailViewModel.notificationTapIdPrefix + "m-tap-sentinel",
+            messageId: MessageDetailViewModel.notificationTapIdPrefix + "acc1::m-tap-sentinel",
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )
@@ -144,7 +150,7 @@ struct NotificationTapResolveTests {
         let durable = try insertDurableInboxHeader(from: row, subject: "Durable tap", into: pool)
 
         let vm = MessageDetailViewModel(
-            messageId: MessageDetailViewModel.notificationTapIdPrefix + "m-tap-durable",
+            messageId: MessageDetailViewModel.notificationTapIdPrefix + "acc1::m-tap-durable",
             dbPool: pool,
             fetchBodyOverride: { _ in }
         )

@@ -32,6 +32,11 @@ import Testing
 /// 5. Same UID in two folders (IMAP UIDs are folder-scoped): ARCHIVE acts on
 ///    the INBOX row only — the other folder's unrelated row is untouched
 ///    (the round-3 `isInInbox = 1` scoping regression pin).
+/// 6. A THROWN durable read is uncertainty, not absence: the tap survives as
+///    durable intention, is never dispatched against a staged row the failed
+///    read could not corroborate, is scoped to the folder the row was actually
+///    OBSERVED in, and recovers to the normal dispatch path when the retry
+///    succeeds.
 ///
 /// `.serialized`: tests swap `AppDatabase.shared` and drive `AccountManager
 /// .shared`'s write paths — mirrors `CoordinatedToolActionTests`.
@@ -256,5 +261,139 @@ struct NotificationActionRouterTests {
         guard ops.count == 1 else { return }
         #expect(ops[0].folderPath == inbox.path, "source folderPath must be the inbox path, not the archive row's")
         #expect(ops[0].destinationPath == archive.path)
+    }
+
+    // MARK: - (6) A thrown durable read is uncertainty, never absence (T4.V6)
+
+    /// The property pinned is the SYSTEM END STATE, not the enum's shape: after
+    /// a database read that THREW, (a) the user's tap still exists as durable
+    /// intention, and (b) nothing was mutated on the strength of a row the
+    /// failed read could not confirm. A fix that merely renames the result but
+    /// still laundders a throw into "absent" does not turn these green.
+    private func resetDurableLookupFault() {
+        NotificationActionRouter.armDurableLookupFailuresForTesting(0)
+    }
+
+    @Test("a thrown durable read is not absence — the ARCHIVE tap survives as exactly one durable .move operation, and the fault counter proves both the initial read and the post-merge retry actually ran")
+    func thrownDurableReadRetainsTheActionDurably() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal(); resetDurableLookupFault() }
+        resetStagedGlobal()
+
+        // Both the initial lookup and the post-merge retry throw: the router
+        // never learns whether the message is local.
+        NotificationActionRouter.armDurableLookupFailuresForTesting(2)
+
+        await NotificationActionRouter.execute(actionId: "ARCHIVE", messageId: "m-thrown-read", accountId: "acc1")
+
+        // (a) durable end state: the intention survives.
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "a thrown read must never drop the user's action")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].folderPath == inbox.path, "no observed source evidence → the canonical inbox")
+        #expect(ops[0].destinationPath == archive.path)
+        #expect(ops[0].messageIds == ["m-thrown-read"])
+
+        // (b) non-vacuity, wire side: the injected faults were actually consumed,
+        // so the durable tier really was attempted twice (initial + retry).
+        #expect(
+            NotificationActionRouter.durableLookupAttemptsForTesting == 2,
+            "the thrown-read path must run one real merge + retry, not give up on the first throw"
+        )
+    }
+
+    @Test("a thrown durable read never dispatches a staged row, and retains the action against the folder that row was OBSERVED in — never a bare UID against the canonical inbox")
+    func thrownDurableReadScopesRetentionToTheObservedFolder() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal(); resetDurableLookupFault() }
+        resetStagedGlobal()
+
+        // The NSE staged this message in a mailbox whose path is NOT the
+        // account's inbox-role path. The durable read — the only tier that
+        // could have shown a contradicting row — throws on both attempts, so
+        // the staged row is source EVIDENCE, never a dispatch target.
+        let observedPath = "INBOX.Priority"
+        let staged = StagedInboxRow(
+            accountId: "acc1", folderPath: observedPath, messageId: "m-thrown-staged",
+            rfc822MessageId: "<staged-observed@example.com>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "Observed elsewhere", senderName: "Sender", senderAddress: "s@example.com",
+            to: "me@example.com", snippet: "snip", date: Date(),
+            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
+            isForwarded: false, actionTag: nil, summaryBlurb: nil
+        )
+        NSEDataBridge.latestStagedRows.withLock { $0 = [staged] }
+        NotificationActionRouter.armDurableLookupFailuresForTesting(2)
+
+        await NotificationActionRouter.execute(actionId: "ARCHIVE", messageId: "m-thrown-staged", accountId: "acc1")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "the tap must survive as exactly one durable operation")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(
+            ops[0].folderPath == observedPath,
+            "the op carries a bare UID, so it must address the mailbox the UID was OBSERVED in"
+        )
+        #expect(ops[0].folderPath != inbox.path, "never the merely-assumed canonical inbox path")
+        #expect(ops[0].destinationPath == archive.path)
+        #expect(ops[0].messageIds == ["m-thrown-staged"])
+
+        // No local mutation happened on the strength of an unreadable database:
+        // the staged row was never synthesized into a durable header, and
+        // nothing was moved.
+        let headerCount = try await pool.read { db in try MessageHeader.fetchCount(db) }
+        #expect(headerCount == 0, "a thrown read must not dispatch a mutation against the staged row")
+    }
+
+    @Test("one thrown read is not sticky — when the post-merge retry succeeds, the resolved header dispatches normally and no cold operation is manufactured")
+    func thrownDurableReadRecoversOnRetry() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal(); resetDurableLookupFault() }
+        resetStagedGlobal()
+
+        let header = makeDurableHeader(folder: inbox, messageId: "m-thrown-recovers")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        // ONLY the first attempt throws.
+        NotificationActionRouter.armDurableLookupFailuresForTesting(1)
+
+        await NotificationActionRouter.execute(actionId: "ARCHIVE", messageId: "m-thrown-recovers", accountId: "acc1")
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == archive.id, "the recovered header must dispatch through the normal action path")
+        #expect(final?.folderPath == archive.path)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "exactly one op — the recovery must not ALSO manufacture a cold retention op")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .move)
+        #expect(ops[0].folderPath == inbox.path, "source folderPath is the resolved header's own folder")
+        #expect(ops[0].destinationPath == archive.path)
+        #expect(
+            NotificationActionRouter.durableLookupAttemptsForTesting == 2,
+            "one throw + one healthy retry"
+        )
+    }
+
+    @Test("a thrown durable read retains MARK_READ too — the read failure never converts a read intent into silence")
+    func thrownDurableReadRetainsMarkRead() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal(); resetDurableLookupFault() }
+        resetStagedGlobal()
+
+        NotificationActionRouter.armDurableLookupFailuresForTesting(2)
+
+        await NotificationActionRouter.execute(actionId: "MARK_READ", messageId: "m-thrown-markread", accountId: "acc1")
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .markRead)
+        #expect(ops[0].folderPath == inbox.path)
+        #expect(ops[0].destinationPath == nil)
+        #expect(ops[0].messageIds == ["m-thrown-markread"])
+        #expect(NotificationActionRouter.durableLookupAttemptsForTesting == 2)
     }
 }

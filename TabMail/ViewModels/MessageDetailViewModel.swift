@@ -16,7 +16,10 @@ final class MessageDetailViewModel {
     /// navigation on the resolve ladder; the VM resolves it asynchronously
     /// (`resolveTapIfNeeded`) and rewrites `messageId` to the composite.
     /// Cannot collide with real composite ids — those start with an accountId.
-    static let notificationTapIdPrefix = "notifTap::"
+    /// `nonisolated`: a plain immutable literal with no actor-dependent
+    /// initialization, read by the nonisolated `notificationOpenId` routing seam
+    /// as well as by main-actor callers.
+    nonisolated static let notificationTapIdPrefix = "notifTap::"
 
     private(set) var messageId: String
     private(set) var message: MessageHeader?
@@ -171,8 +174,9 @@ final class MessageDetailViewModel {
     /// The account the pending notification tap belongs to, decoded from the
     /// sentinel (`notifTap::<accountId>::<providerId>`). Disambiguates the
     /// resolve when the same provider id (an IMAP UID) exists in more than one
-    /// account. `nil` for legacy sentinels (`notifTap::<providerId>`) → the
-    /// resolve falls back to messageId-only (today's behavior).
+    /// account. `nil` for legacy sentinels (`notifTap::<providerId>`) → every
+    /// tap tier FAILS CLOSED (no messageId-only global match), so the ladder
+    /// exhausts and the tap pops back to the inbox.
     @ObservationIgnored private var pendingTapAccountId: String?
     /// Single-flight resolve for `pendingProviderTapId` — UNSTRUCTURED so a
     /// cancelled `loadBody` (deep-link nav churn cancels `.task`) doesn't kill
@@ -202,6 +206,35 @@ final class MessageDetailViewModel {
     nonisolated static func shouldPopForUnresolvedTap(postedId: String?, selectedId: String?) -> Bool {
         guard let postedId, let selectedId else { return false }
         return postedId == selectedId
+    }
+
+    /// Pure routing decision for a notification message deep-link tap: the id
+    /// `MailNavigationView` opens. A staged row matches ONLY when the tap
+    /// carries an accountId and that row belongs to it — a nil accountId
+    /// (legacy tray payload, bare watchdog fallback, scheduled/overdue
+    /// proactive reminder) must never take the global messageId-only fast path,
+    /// because a provider id is not globally unique (an IMAP UID is a
+    /// per-mailbox small integer) and the opened row is what
+    /// `markReadOnOpenIfNeeded` durably marks read. A refused/absent staged
+    /// match falls through to the sentinel, whose ladder re-checks (and itself
+    /// fails closed on a nil accountId), so the tap ends at the inbox rather
+    /// than on another account's message. Extracted so the nav layer's decision
+    /// is unit-testable without a live View.
+    nonisolated static func notificationOpenId(
+        messageId: String,
+        accountId: String?,
+        stagedRows: [StagedInboxRow]
+    ) -> String {
+        let stagedComposite = stagedRows.first {
+            $0.messageId == messageId && accountId != nil && $0.accountId == accountId
+        }?.headerId
+        if let stagedComposite { return stagedComposite }
+        // Sentinel carries accountId so the async resolve ladder stays
+        // account-scoped: `notifTap::<accountId>::<providerId>` (accountId is
+        // `:`-free per MessageIdentity, so the first `::` is the boundary).
+        // Legacy shape `notifTap::<providerId>` when accountId is absent.
+        let sentinelPayload = accountId.map { "\($0)::\(messageId)" } ?? messageId
+        return notificationTapIdPrefix + sentinelPayload
     }
 
     init(messageId: String) {
@@ -268,9 +301,14 @@ final class MessageDetailViewModel {
         if messageId.hasPrefix(Self.notificationTapIdPrefix) {
             let payload = String(messageId.dropFirst(Self.notificationTapIdPrefix.count))
             let (tapAccountId, providerId) = Self.decodeTapSentinel(payload)
+            // Fail closed on a nil sentinel account (legacy shape): this seed
+            // becomes `self.message`, which `markReadOnOpenIfNeeded` can
+            // durably mark read, so a global messageId-only match could
+            // mark-read ANOTHER account's row. A miss leaves the tap pending
+            // for the (equally account-scoped) ladder → pop to inbox.
             let stagedRow = NSEDataBridge.latestStagedRows.withLock { rows in
                 rows.first {
-                    $0.messageId == providerId && (tapAccountId == nil || $0.accountId == tapAccountId)
+                    $0.messageId == providerId && tapAccountId != nil && $0.accountId == tapAccountId
                 }
             }
             if var m = stagedRow?.toMessageHeader() {
@@ -281,7 +319,10 @@ final class MessageDetailViewModel {
                 self.pendingProviderTapId = providerId
                 self.pendingTapAccountId = tapAccountId
             }
-        } else if var m = stagedRowFallback(compositeId: messageId) {
+        } else if var m = stagedRowFallback(compositeId: messageId, exactOnly: true) {
+            // exactOnly: this seed becomes `self.message`, which
+            // markReadOnOpenIfNeeded can durably mark read BEFORE loadBody
+            // re-resolves — never seed it from a folder-blind fuzzy match.
             applyOverlay(to: &m)
             self.message = m
         }
@@ -354,20 +395,23 @@ final class MessageDetailViewModel {
         }
         // accountId disambiguates the same provider id (an IMAP UID is a
         // per-mailbox small integer → COLLIDES across accounts) so account A's
-        // push never opens account B's message. `nil` (legacy sentinel) →
-        // messageId-only match, today's behavior.
+        // push never opens account B's message. A `nil` accountId (legacy tray,
+        // bare watchdog fallback, scheduled/overdue proactive) must FAIL CLOSED —
+        // a messageId-only global match could open + durably mark-read the wrong
+        // account's row. The tap then pops to inbox (UID sweep).
+        guard let accountId else { return nil }
         func stagedMatch() -> String? {
             NSEDataBridge.latestStagedRows.withLock { rows in
                 rows.first {
-                    $0.messageId == providerId && (accountId == nil || $0.accountId == accountId)
+                    $0.messageId == providerId && $0.accountId == accountId
                 }?.headerId
             }
         }
         @Sendable func durableMatch(_ db: Database) throws -> String? {
-            var request = MessageHeader
+            try MessageHeader
                 .filter(Column("messageId") == providerId && Column("isInInbox") == true)
-            if let accountId { request = request.filter(Column("accountId") == accountId) }
-            return try request.fetchOne(db)?.id
+                .filter(Column("accountId") == accountId)
+                .fetchOne(db)?.id
         }
         if let id = stagedMatch() { mark("staged", hit: true); return id }
         if let id = (try? await AppDatabase.rawPool.read(durableMatch)) ?? nil {
@@ -539,10 +583,14 @@ final class MessageDetailViewModel {
         guard message == nil else { return }
         var seeded: MessageHeader?
         if let providerId = pendingProviderTapId {
+            // Account-scoped, and FAILS CLOSED on a nil sentinel account: this
+            // seed rewrites `messageId` and re-arms `markReadOnOpenIfNeeded`
+            // below, so a global messageId-only match would durably mark-read
+            // another account's row (an IMAP UID collides across accounts).
             let row = NSEDataBridge.latestStagedRows.withLock { rows in
                 rows.first {
                     $0.messageId == providerId
-                        && (pendingTapAccountId == nil || $0.accountId == pendingTapAccountId)
+                        && pendingTapAccountId != nil && $0.accountId == pendingTapAccountId
                 }
             }
             seeded = row?.toMessageHeader()
@@ -555,8 +603,8 @@ final class MessageDetailViewModel {
             // sticky wrong identity + wrong message read-flipped (review round,
             // 2026-07-07). The composite branch only serves the resolved-tap
             // case, where `messageId` IS the staged row's headerId — exact match
-            // is sufficient. (`seedAtInit`'s fuzzy match stays display-only and
-            // self-heals via loadBody's durable resolve; this one must be exact.)
+            // is sufficient. (`seedAtInit` is exact for the same reason; only
+            // `resolveMessageAsync`'s display-only self-heal keeps the fuzzy arm.)
             seeded = NSEDataBridge.latestStagedRows.withLock { rows in
                 rows.first { $0.headerId == messageId }
             }?.toMessageHeader()
@@ -1743,14 +1791,22 @@ final class MessageDetailViewModel {
     /// the synthesized header with the durable one. On the ASYNC resolve GRDB
     /// always wins (this runs only on a GRDB miss); `init` seeds from this
     /// directly (its only zero-I/O source — init never touches the DB).
-    private func stagedRowFallback(compositeId: String) -> MessageHeader? {
+    /// `exactOnly`: when true, ONLY an exact `headerId == compositeId` staged
+    /// row matches — the fuzzy `(accountId, messageId)` arm is suppressed.
+    /// Required for any seed that can feed a DURABLE mutation (see
+    /// `seedAtInit`): the fuzzy arm ignores folderPath, so for a per-folder
+    /// IMAP UID it can seed a DIFFERENT folder's same-UID message, which
+    /// `markReadOnOpenIfNeeded` would then durably mark read. The fuzzy arm
+    /// stays available (default) for the display-only self-heal in
+    /// `resolveMessageAsync`, which runs only after the durable read missed.
+    private func stagedRowFallback(compositeId: String, exactOnly: Bool = false) -> MessageHeader? {
         let parts = compositeId.split(separator: ":", maxSplits: 2)
         let accountId = parts.count == 3 ? String(parts[0]) : nil
         let msgId = parts.count == 3 ? String(parts[2]) : nil
         return NSEDataBridge.latestStagedRows.withLock { rows in
             rows.first {
                 $0.headerId == compositeId ||
-                (accountId != nil && $0.accountId == accountId && $0.messageId == msgId)
+                (!exactOnly && accountId != nil && $0.accountId == accountId && $0.messageId == msgId)
             }
         }?.toMessageHeader()
     }

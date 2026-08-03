@@ -716,14 +716,19 @@ struct MailNavigationView: View {
         // `accountId` disambiguates the provider id: an IMAP UID is a per-mailbox
         // small integer that COLLIDES across accounts, so without it a tap on
         // account A's push could open account B's message. Present in the push
-        // payload (proven by MARK_READ, `AppDelegate.swift:124`); `nil` only for
-        // legacy payloads, which fall back to messageId-only (today's behavior).
+        // payload (proven by MARK_READ, `AppDelegate.swift:124`). A `nil`
+        // accountId (legacy tray, bare watchdog fallback, scheduled/overdue
+        // proactive) now FAILS CLOSED — no messageId-only global match; the tap
+        // falls through to the sentinel, whose ladder also fails closed, so it
+        // lands on the inbox instead of risking a cross-account open (UID sweep).
+        // The routing decision itself is the pure, testable `notificationOpenId`.
         let accountId = userInfo?["accountId"] as? String
-        let stagedComposite = NSEDataBridge.latestStagedRows.withLock { rows in
-            rows.first {
-                $0.messageId == messageId && (accountId == nil || $0.accountId == accountId)
-            }?.headerId
-        }
+        let openId = MessageDetailViewModel.notificationOpenId(
+            messageId: messageId,
+            accountId: accountId,
+            stagedRows: NSEDataBridge.latestStagedRows.withLock { $0 }
+        )
+        let isSentinel = openId.hasPrefix(MessageDetailViewModel.notificationTapIdPrefix)
         // Commit both state changes in the same tick. Raise the flag first so
         // `.onChange(of: selection)` skips its `selectedMessageId = nil` wipe —
         // otherwise the wipe fires between the two assignments and the detail
@@ -737,18 +742,10 @@ struct MailNavigationView: View {
             isHandlingNotificationDeepLink = true
             selection = .unified(.inbox)
         }
-        if let id = stagedComposite {
-            BootProfiler.mark("notifTap: pushed instantly (staged) \(messageId.prefix(24))")
-            selectedMessageId = id
-        } else {
-            BootProfiler.mark("notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))")
-            // Sentinel carries accountId so the async resolve ladder stays
-            // account-scoped: `notifTap::<accountId>::<providerId>` (accountId is
-            // `:`-free per MessageIdentity, so the first `::` is the boundary).
-            // Legacy shape `notifTap::<providerId>` when accountId is absent.
-            let sentinelPayload = accountId.map { "\($0)::\(messageId)" } ?? messageId
-            selectedMessageId = MessageDetailViewModel.notificationTapIdPrefix + sentinelPayload
-        }
+        BootProfiler.mark(isSentinel
+            ? "notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))"
+            : "notifTap: pushed instantly (staged) \(messageId.prefix(24))")
+        selectedMessageId = openId
         print("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
 

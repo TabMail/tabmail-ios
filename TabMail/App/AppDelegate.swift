@@ -100,45 +100,184 @@ enum PendingConsentErrorStore {
 /// queued `.move` carries a raw numeric UID plus the source folder's admitted
 /// UIDVALIDITY. The drain applies it only while that epoch still matches; an
 /// absent or changed epoch fails closed and sync reconciles the local state.
+///
+/// A THROWN durable read is uncertainty, never proof of absence. The lookup is
+/// three-state (`.found` / `.absent` / `.readFailed`): a read that threw never
+/// dispatches a mutation (the message it could not read may contradict what the
+/// staged cache shows), and it never claims the clean-miss path either. It
+/// preserves the user's intention durably — the never-drop contract — scoped to
+/// the exact folder the message was observed in when that evidence exists,
+/// instead of addressing a bare UID against the canonical inbox where the same
+/// UID may belong to a different message.
 enum NotificationActionRouter {
+    #if DEBUG
+    private struct DurableLookupFault: Sendable {
+        var remaining = 0
+        var attempts = 0
+    }
+
+    private static let durableLookupFaultForTesting = Mutex(DurableLookupFault())
+
+    /// Test seam: make the next `count` durable lookups throw, so the
+    /// thrown-read path is reachable without corrupting a real database.
+    /// Absence (the default, `remaining == 0`) injects nothing — the seam's
+    /// unset state is exactly production behavior.
+    static func armDurableLookupFailuresForTesting(_ count: Int) {
+        durableLookupFaultForTesting.withLock {
+            $0.remaining = max(0, count)
+            $0.attempts = 0
+        }
+    }
+
+    static var durableLookupAttemptsForTesting: Int {
+        durableLookupFaultForTesting.withLock { $0.attempts }
+    }
+
+    private static func consumeDurableLookupFailureForTesting() -> Bool {
+        durableLookupFaultForTesting.withLock {
+            $0.attempts += 1
+            guard $0.remaining > 0 else { return false }
+            $0.remaining -= 1
+            return true
+        }
+    }
+    #endif
+
+    /// Three-state local lookup result. `.readFailed` is NOT `.absent`: the
+    /// database could not answer, so neither dispatch nor the clean-miss cold
+    /// path is authorized. `stagedHeader` carries the row observed in the
+    /// in-memory staging cache during the failed attempt — evidence of the
+    /// message's source folder only, never a dispatch target.
+    private enum HeaderResolution {
+        case found(MessageHeader)
+        case absent
+        case readFailed(stagedHeader: MessageHeader?)
+    }
+
+    /// Which folder a cold/retained `PendingOperation` is scoped to.
+    private enum ColdSourceScope {
+        case canonicalInbox
+        case exactFolder(String)
+    }
+
+    private static func log(_ message: @autoclosure () -> String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        print(message())
+    }
+
     /// Durable lookup scoped to the account's inbox — see the enum doc for why.
-    private static func resolveDurableInboxHeader(messageId: String, accountId: String) async -> MessageHeader? {
+    private static func resolveDurableInboxHeader(messageId: String, accountId: String) async -> HeaderResolution {
         do {
-            return try await AppDatabase.dbPool.read { db -> MessageHeader? in
-                try MessageHeader.fetchOne(db, sql: """
+            #if DEBUG
+            if consumeDurableLookupFailureForTesting() {
+                throw DatabaseError(
+                    resultCode: .SQLITE_IOERR,
+                    message: "injected notification durable-lookup failure"
+                )
+            }
+            #endif
+            return try await AppDatabase.dbPool.read { db -> HeaderResolution in
+                let row = try MessageHeader.fetchOne(db, sql: """
                     SELECT * FROM messageHeader
                     WHERE messageId = ? AND accountId = ? AND folderId != '' AND isInInbox = 1
                     LIMIT 1
                     """, arguments: [messageId, accountId])
+                return row.map(HeaderResolution.found) ?? .absent
             }
         } catch {
             print("[NotificationActionRouter] header lookup failed: \(error)")
-            return nil
+            return .readFailed(stagedHeader: nil)
+        }
+    }
+
+    private static func resolveStagedInboxHeader(messageId: String, accountId: String) -> MessageHeader? {
+        NSEDataBridge.latestStagedRows.withLock { rows in
+            rows.first(where: { $0.messageId == messageId && $0.accountId == accountId })
+        }?.toMessageHeader()
+    }
+
+    /// Durable tier first, staged tier only on a durable non-hit — the same
+    /// precedence the dispatch has always used.
+    private static func resolveLocalInboxHeader(messageId: String, accountId: String) async -> HeaderResolution {
+        let durable = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
+        switch durable {
+        case .found:
+            return durable
+        case .absent:
+            return resolveStagedInboxHeader(messageId: messageId, accountId: accountId)
+                .map(HeaderResolution.found) ?? .absent
+        case .readFailed:
+            // The durable read THREW. A staged row is real evidence of where
+            // the message was observed, but it cannot rule out a contradicting
+            // durable row the failed read would have returned, so it must not
+            // become a dispatch target. Carry it as source evidence instead.
+            return .readFailed(
+                stagedHeader: resolveStagedInboxHeader(messageId: messageId, accountId: accountId)
+            )
+        }
+    }
+
+    private static func resolveAfterMerge(messageId: String, accountId: String) async -> HeaderResolution {
+        let initial = await resolveLocalInboxHeader(messageId: messageId, accountId: accountId)
+        switch initial {
+        case .found:
+            return initial
+        case .absent:
+            // Cold-launch gap: the NSE already staged this row to the on-disk
+            // staging table (app-group), but nothing has drained it into GRDB
+            // yet — only the in-memory staged-row cache is empty. Run the
+            // SAME merge `ensureDurable` uses, then re-check. This is a
+            // normal-path recovery, distinct from the "message not local at
+            // all" cold fallback below.
+            await NSEMergeCoordinator.shared.merge()
+            return await resolveLocalInboxHeader(messageId: messageId, accountId: accountId)
+        case .readFailed(let initialStagedHeader):
+            // One real merge + retry: a transient failure (lock contention,
+            // suspension, I/O) usually clears, and recovering the header is
+            // strictly better than retaining a cold operation.
+            await NSEMergeCoordinator.shared.merge()
+            let retry = await resolveLocalInboxHeader(messageId: messageId, accountId: accountId)
+            return reconcileRetryAfterReadFailure(
+                initialStagedHeader: initialStagedHeader,
+                retry: retry
+            )
+        }
+    }
+
+    /// A real NSE merge may replace the staged cache before the retry, so the
+    /// initially observed staged row is kept as comparison/source evidence.
+    /// v3 keys durable actions by the composite provider address, and that
+    /// address embeds the folder and the (reusable) UID — so the only proof
+    /// that the retry found the same message the failed read was asked about is
+    /// address equality. A changed address still preserves the user's action,
+    /// but only through cold admission scoped to the originally observed
+    /// source; it must never dispatch against either row.
+    private static func reconcileRetryAfterReadFailure(
+        initialStagedHeader: MessageHeader?,
+        retry: HeaderResolution
+    ) -> HeaderResolution {
+        switch retry {
+        case .found(let header):
+            guard let initialStagedHeader else { return .found(header) }
+            return header.id == initialStagedHeader.id
+                ? .found(header)
+                : .readFailed(stagedHeader: initialStagedHeader)
+        case .absent:
+            // A healthy retry with no staged evidence is clean absence again —
+            // restore the ordinary cold-miss path rather than letting a
+            // superseded earlier throw keep the result uncertain forever. When
+            // the merge replaced an initially observed staged row, retain that
+            // source evidence instead of silently switching mailboxes.
+            guard let initialStagedHeader else { return .absent }
+            return .readFailed(stagedHeader: initialStagedHeader)
+        case .readFailed(let retryStagedHeader):
+            return .readFailed(stagedHeader: initialStagedHeader ?? retryStagedHeader)
         }
     }
 
     static func execute(actionId: String, messageId: String, accountId: String) async {
-        let durableHeader = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
-
-        let stagedHeader: MessageHeader? = durableHeader == nil
-            ? NSEDataBridge.latestStagedRows.withLock { rows in
-                rows.first(where: { $0.messageId == messageId && $0.accountId == accountId })
-            }?.toMessageHeader()
-            : nil
-        var header = durableHeader ?? stagedHeader
-
-        if header == nil {
-            // Cold-launch gap: the NSE already staged this row to the on-disk
-            // staging table (app-group), but nothing has drained it into GRDB
-            // yet — only the in-memory staged-row cache is empty. Run the
-            // SAME merge `ensureDurable` uses, then re-check durable. This is
-            // a normal-path recovery, distinct from the "message not local at
-            // all" cold fallback below.
-            await NSEMergeCoordinator.shared.merge()
-            header = await resolveDurableInboxHeader(messageId: messageId, accountId: accountId)
-        }
-
-        if let header {
+        switch await resolveAfterMerge(messageId: messageId, accountId: accountId) {
+        case .found(let header):
             switch actionId {
             case "MARK_READ":
                 await AccountManager.shared.markRead([header])
@@ -152,25 +291,60 @@ enum NotificationActionRouter {
             default:
                 break
             }
-            return
+        case .absent:
+            // No header anywhere — even after the merge retry above (header not
+            // local yet — push arrived but sync hasn't landed). Queue a
+            // correctly-shaped PendingOperation so sync reconciles local state
+            // when the message arrives. See the enum doc for the epoch guard.
+            await queueColdPendingOperation(
+                actionId: actionId, messageId: messageId, accountId: accountId, source: .canonicalInbox
+            )
+        case .readFailed(let stagedHeader):
+            // A database read failure is uncertainty, never proof of absence:
+            // dispatching is unsafe, but dropping the tap would violate
+            // never-drop-user-intention. Retain it durably, scoped to the exact
+            // folder the message was observed in when that evidence exists —
+            // addressing a bare UID against the canonical inbox is precisely
+            // how an op lands on a different message at the same UID.
+            let observedPath = stagedHeader?.folderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let source: ColdSourceScope
+            if let observedPath, !observedPath.isEmpty {
+                source = .exactFolder(observedPath)
+            } else {
+                source = .canonicalInbox
+            }
+            log("[NotificationActionRouter] durable lookup unresolved (read failure) — retaining \(actionId) for \(messageId)")
+            await queueColdPendingOperation(
+                actionId: actionId, messageId: messageId, accountId: accountId, source: source
+            )
         }
-
-        // No header anywhere — even after the merge retry above (header not
-        // local yet — push arrived but sync hasn't landed). Queue a
-        // correctly-shaped PendingOperation so sync reconciles local state
-        // when the message arrives. See the enum doc for the epoch guard.
-        await queueColdPendingOperation(actionId: actionId, messageId: messageId, accountId: accountId)
     }
 
-    /// Cold fallback: no durable OR staged header exists for this message.
-    /// Builds a `PendingOperation` via the record type against the account's
-    /// role folders — never raw SQL.
-    private static func queueColdPendingOperation(actionId: String, messageId: String, accountId: String) async {
+    /// Durable fallback and retention path: no durable OR staged header could
+    /// be dispatched for this message. Builds a `PendingOperation` via the
+    /// record type against the requested source and the account's role folders
+    /// — never raw SQL. `source` is `.canonicalInbox` for a clean cold miss and
+    /// `.exactFolder` when a thrown read left a byte-exact observed source: the
+    /// operation carries a bare UID, so it must address the mailbox the UID was
+    /// actually observed in.
+    private static func queueColdPendingOperation(
+        actionId: String,
+        messageId: String,
+        accountId: String,
+        source: ColdSourceScope
+    ) async {
         do {
             let folders = try await AppDatabase.dbPool.read { db in
                 try Folder.filter(Column("accountId") == accountId).fetchAll(db)
             }
-            guard let inboxPath = folders.first(where: { $0.role == .inbox })?.path else {
+            let sourcePath: String?
+            switch source {
+            case .canonicalInbox:
+                sourcePath = folders.first(where: { $0.role == .inbox })?.path
+            case .exactFolder(let path):
+                sourcePath = path
+            }
+            guard let inboxPath = sourcePath, !inboxPath.isEmpty else {
                 print("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
                 return
             }
