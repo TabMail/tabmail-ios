@@ -24,19 +24,50 @@ struct DraftDeletionTests {
     }
 
     // MARK: - isPermanentlyInvalidError
+    //
+    // 🚨 THIS WHOLE BLOCK WAS CORRECTED (audit round 1, finding B-3), and the
+    // three tests that changed verdict were the ones blessing the defect.
+    //
+    // The classifier decides ONE thing: may this failure retire a durable
+    // `PendingOperation`? Under the never-drop rule that is exit 2 — a
+    // PROVIDER-AUTHORITATIVE stale/no-op result — and nothing else. The old
+    // implementation answered it from the STATUS CODE (`400` from a REST
+    // provider ⇒ terminal), binding any response body to `_`. So Gmail
+    // replying `"Precondition check failed."` — a `failedPrecondition` that a
+    // later retry can resolve — silently destroyed the user's archive, move or
+    // flag, indistinguishable from Gmail saying the id was never valid.
+    //
+    // The corrected property, which every test below is an instance of:
+    //
+    //   TERMINAL  ⟺  the provider's own structured body PROVES the request can
+    //                never succeed.
+    //   Everything else — a bodyless 400, an unparseable body, a structured
+    //   body with an unrecognised reason or message — is an ABSENCE OF
+    //   EVIDENCE and stays retryable forever.
+    //
+    // RED PROOF for the inverted cases, recorded: restoring the pre-fix arms
+    //     case .networkError(400), .networkErrorWithBody(400, _): return true
+    // (plus the NSError `domain == "Gmail"/"Exchange" && code == 400` arms) makes
+    // `bareStatus400IsNotAuthoritative`, `exchangeBareStatus400IsNotAuthoritative`
+    // and `unparseableBody400IsNotAuthoritative` fail on their `#expect(!…)`.
+    // `structuredInvalidIdBody400IsAuthoritative` is the non-vacuity partner and
+    // passes in BOTH states, so the suite cannot be satisfied by a classifier
+    // that simply answers `false` to everything.
 
-    @Test("isPermanentlyInvalidError: Gmail 400 returns true")
-    func permanentlyInvalidGmail400() {
+    @Test("isPermanentlyInvalidError: a bare Gmail 400 with no body is NOT authoritative")
+    func bareStatus400IsNotAuthoritative() {
+        // The provider rejected the request and told us nothing about why.
+        // A status code is not a classification.
         let error = ProviderError.networkError(underlying: NSError(domain: "Gmail", code: 400))
         let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
+        #expect(!manager.isPermanentlyInvalidError(error))
     }
 
-    @Test("isPermanentlyInvalidError: Exchange 400 returns true")
-    func permanentlyInvalidExchange400() {
+    @Test("isPermanentlyInvalidError: a bare Exchange 400 with no body is NOT authoritative")
+    func exchangeBareStatus400IsNotAuthoritative() {
         let error = ProviderError.networkError(underlying: NSError(domain: "Exchange", code: 400))
         let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
+        #expect(!manager.isPermanentlyInvalidError(error))
     }
 
     @Test("isPermanentlyInvalidError: non-REST domain 400 returns false")
@@ -80,15 +111,21 @@ struct DraftDeletionTests {
     // `ProviderError.networkError(underlying: HTTPError.networkError(statusCode: N))`.
     // The classifier must enum-pattern-match the underlying directly — bridging
     // HTTPError to NSError gives `domain="TabMail.HTTPError" code=<case ordinal>`,
-    // NOT the HTTP status code. The previous NSError-only check silently missed
-    // every Gmail/Exchange 400 thrown this way, which is why a stuck `.move` op
-    // (Gmail "Invalid label: Deleted Messages") retried for 9 days.
+    // NOT the HTTP status code.
+    //
+    // ⚑ The original rationale for this block ended "...which is why a stuck
+    // `.move` op (Gmail 'Invalid label: Deleted Messages') retried for 9 days".
+    // That real incident is still the motivating case and is still fixed — but
+    // by RECOGNISING that body (`reason == invalidArgument`, message prefix
+    // `"Invalid label"`), not by treating its status code as terminal. See
+    // `structuredInvalidLabelBody400IsAuthoritative` below.
 
-    @Test("isPermanentlyInvalidError: HTTPError.networkError(400) returns true")
-    func permanentlyInvalidHTTPError400() {
+    @Test("isPermanentlyInvalidError: a bodyless HTTPError 400 is NOT authoritative")
+    func bodylessHTTPError400IsNotAuthoritative() {
+        // Same absence of evidence as the NSError shape: no body, no proof.
         let error = ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 400))
         let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
+        #expect(!manager.isPermanentlyInvalidError(error))
     }
 
     @Test("isPermanentlyInvalidError: HTTPError.networkError(404) returns false")
@@ -120,16 +157,38 @@ struct DraftDeletionTests {
     // `AuthedHTTP.requestPreservingBadRequestBody` is an opt-in used by action-path
     // call sites that must STRUCTURALLY classify a 400 (Gmail's "Invalid id value")
     // instead of guessing from the status code. On a final 400 it throws
-    // `HTTPError.networkErrorWithBody(statusCode:body:)` — the SAME failure as
-    // `.networkError(400)`, with the raw body attached — so the classifier must
-    // treat the two identically. `GmailProvider.modifyMessage` switched to that
-    // helper in T3.5; a matcher that only knew `.networkError` would have silently
-    // stopped matching and every unclassified Gmail action 400 would have been
-    // retried forever instead of dropped.
+    // `HTTPError.networkErrorWithBody(statusCode:body:)`.
+    //
+    // 🚨 CORRECTED (audit round 1, finding B-3). The block that stood here
+    // asserted the OPPOSITE of what the helper exists for: that a body-carrying
+    // 400 and a bodyless one "must classify identically". Under that equivalence
+    // the preserved body could not possibly change any verdict — the classifier
+    // was still deciding on the status alone, and the helper's whole purpose was
+    // nullified. The body is the evidence; it MUST be able to change the answer.
 
-    @Test("isPermanentlyInvalidError: HTTPError.networkErrorWithBody(400) returns true")
-    func permanentlyInvalidHTTPErrorWithBody400() {
-        let body = Data(#"{"error":{"code":400,"message":"Precondition check failed."}}"#.utf8)
+    @Test("isPermanentlyInvalidError: a structured 400 whose reason is unrecognised is NOT authoritative")
+    func unparseableBody400IsNotAuthoritative() {
+        // Gmail's real `failedPrecondition` wording. Structurally a valid error
+        // body, but it does not say the request can never succeed — a retry may
+        // well work, so the user's action must survive.
+        let body = Data(#"""
+        {"error":{"errors":[{"domain":"global","reason":"failedPrecondition","message":"Precondition check failed."}],"code":400,"message":"Precondition check failed."}}
+        """#.utf8)
+        let error = ProviderError.networkError(
+            underlying: HTTPError.networkErrorWithBody(statusCode: 400, body: body)
+        )
+        let manager = AccountManager.shared
+        #expect(!manager.isPermanentlyInvalidError(error))
+    }
+
+    @Test("isPermanentlyInvalidError: Gmail's structured 'Invalid id value' 400 IS authoritative")
+    func structuredInvalidIdBody400IsAuthoritative() {
+        // NON-VACUITY. Gmail stating the id is malformed is a fact no retry
+        // changes — exit 2, the one shape permitted to retire the op. Without
+        // this the suite would pass with a classifier that always says `false`.
+        let body = Data(#"""
+        {"error":{"errors":[{"domain":"global","reason":"invalidArgument","message":"Invalid id value abc123"}],"code":400,"message":"Invalid id value abc123"}}
+        """#.utf8)
         let error = ProviderError.networkError(
             underlying: HTTPError.networkErrorWithBody(statusCode: 400, body: body)
         )
@@ -137,33 +196,37 @@ struct DraftDeletionTests {
         #expect(manager.isPermanentlyInvalidError(error))
     }
 
-    @Test("isPermanentlyInvalidError: networkErrorWithBody classifies identically to networkError for the same status")
-    func permanentlyInvalidWithBodyMatchesBodylessForSameStatus() {
-        // The property is EQUIVALENCE, not "400 is true": a body-carrying failure
-        // and a bodyless one describing the same HTTP status must never disagree.
-        // Asserted across the terminal status AND the transient ones, so a matcher
-        // that answered `true` for every `networkErrorWithBody` fails here.
+    @Test("isPermanentlyInvalidError: Gmail's structured 'Invalid label' 400 IS authoritative")
+    func structuredInvalidLabelBody400IsAuthoritative() {
+        // The 9-day stuck `.move` from the original incident, now retired for
+        // the right reason: Gmail named the label and said it cannot be applied.
+        let body = Data(#"""
+        {"error":{"errors":[{"domain":"global","reason":"invalidArgument","message":"Invalid label: Label_9999"}],"code":400,"message":"Invalid label: Label_9999"}}
+        """#.utf8)
+        let error = ProviderError.networkError(
+            underlying: HTTPError.networkErrorWithBody(statusCode: 400, body: body)
+        )
         let manager = AccountManager.shared
-        let body = Data(#"{"error":{"code":0,"message":"x"}}"#.utf8)
-        for statusCode in [400, 404, 429, 500, 503] {
-            let bodyless = ProviderError.networkError(
-                underlying: HTTPError.networkError(statusCode: statusCode)
-            )
-            let withBody = ProviderError.networkError(
-                underlying: HTTPError.networkErrorWithBody(statusCode: statusCode, body: body)
-            )
-            #expect(
-                manager.isPermanentlyInvalidError(bodyless)
-                    == manager.isPermanentlyInvalidError(withBody),
-                "status \(statusCode): body-preserving and bodyless shapes must classify identically"
-            )
-        }
+        #expect(manager.isPermanentlyInvalidError(error))
+    }
+
+    @Test("isPermanentlyInvalidError: an authoritative-shaped body on a non-400 status is NOT authoritative")
+    func authoritativeBodyOnNon400StatusIsNotAuthoritative() {
+        // Status gate, asserted from the other side: the exact wording that IS
+        // terminal on a 400 must not be terminal on a 503, or a backend blip
+        // that happens to echo the message could retire the op.
+        let body = Data(#"""
+        {"error":{"errors":[{"domain":"global","reason":"invalidArgument","message":"Invalid id value abc123"}],"code":503,"message":"Invalid id value abc123"}}
+        """#.utf8)
+        let error = ProviderError.networkError(
+            underlying: HTTPError.networkErrorWithBody(statusCode: 503, body: body)
+        )
+        let manager = AccountManager.shared
+        #expect(!manager.isPermanentlyInvalidError(error))
     }
 
     @Test("isPermanentlyInvalidError: HTTPError.networkErrorWithBody(503) returns false")
     func permanentlyInvalidHTTPErrorWithBody503() {
-        // Non-vacuity control for the 400 case above: the widened arm must be
-        // status-gated, not "any body-carrying failure is permanent".
         let body = Data(#"{"error":{"code":503,"message":"Backend Error"}}"#.utf8)
         let error = ProviderError.networkError(
             underlying: HTTPError.networkErrorWithBody(statusCode: 503, body: body)

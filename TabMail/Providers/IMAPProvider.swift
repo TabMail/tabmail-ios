@@ -3876,6 +3876,35 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// and its description carries none of the substrings
     /// `AccountManagerQueue.isMessageNotFoundError` matches, so it cannot be
     /// mistaken for a confirmed-stale message.
+    /// B-1 — the MOVE path's evidence refusals, which are RETRYABLE.
+    ///
+    /// Both cases mean "this attempt could not obtain the `COPYUID` evidence
+    /// that is the only thing allowed to authorize destroying the source". That
+    /// is an ABSENCE OF EVIDENCE about the SERVER, never a verdict on the ids —
+    /// which are well-formed UIDs the drain admitted under a proven epoch — and
+    /// never the provider telling us the work is already done. They therefore
+    /// must not reach `ProviderError.actionIdentityResolutionFailed`, whose
+    /// drain arm DELETES the op and whose stated premises ("refused before
+    /// touching the wire", "the same string will be refused on every future
+    /// drain", "`.deleteDraft` — the only op that raises this error") are each
+    /// false for a move. Before this split, every archive/delete/move gesture on
+    /// a non-UIDPLUS server was a permanent, silent no-op.
+    ///
+    /// `private` and unclassified — exactly like `IMAPDestinationEpochRefusal` —
+    /// so it can never become a classification input anywhere else and lands in
+    /// the drain's generic requeue-and-retry arm. Its description carries none
+    /// of the substrings `AccountManagerQueue.isMessageNotFoundError` matches.
+    private enum IMAPMoveEvidenceUnavailable: Error {
+        /// The server does not advertise UIDPLUS, so it can never send
+        /// `COPYUID` (RFC 4315 §3). Raised BEFORE the COPY: zero wire mutation,
+        /// so a retry costs one SELECT and can never manufacture a duplicate.
+        case noUidPlusCapability(source: String, destination: String)
+        /// A UIDPLUS server issued the COPY and then reported no usable
+        /// per-member mapping. RFC 4315 §3 makes sending the response code a
+        /// MAY, so this is server behaviour and can differ on the next attempt.
+        case noCopyUidEvidence(source: String, destination: String, requested: Int)
+    }
+
     private enum IMAPDestinationEpochRefusal: Error {
         /// The destination SELECT reported no usable UIDVALIDITY (SwiftMail
         /// defaults `Mailbox.Selection.uidValidity` to `UIDValidity(0)` when the
@@ -3908,18 +3937,63 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             live: selection.uidValidity.value, expected: expected, folder: folder)
     }
 
+    /// The SOURCE-side counterpart of `IMAPDestinationEpochRefusal` — an epoch
+    /// that was never reported is an ABSENCE OF EVIDENCE, not a turnover.
+    ///
+    /// SwiftMail types `Mailbox.Selection.uidValidity` as non-optional with a
+    /// `UIDValidity(0)` default, so a server that omits the REQUIRED
+    /// `* OK [UIDVALIDITY n]` untagged response (RFC 3501 §6.3.1) hands us a
+    /// zero. RFC 3501 §2.3.1.1 types UIDVALIDITY as `nz-number`, so zero cannot
+    /// be an epoch and must never be COMPARED — but it must equally never be
+    /// reported as a turnover: `ProviderError.uidValidityChanged` is exit 4 of
+    /// `Companion/Rules/Active/never-drop-user-intention.md` and the drain
+    /// RETIRES the durable op on it. Raising exit 4 for "the server did not tell
+    /// us" would drop the user's gesture on an unknown — precisely the widening
+    /// exit 4 forbids.
+    ///
+    /// The asymmetry that proved this was a defect: T3.14's DESTINATION side of
+    /// this exact hazard already raises the retryable private
+    /// `IMAPDestinationEpochRefusal.unknownAtProbe` for the same zero, "because a
+    /// zero is absence of evidence". The source side was left on exit 4.
+    ///
+    /// `private` and unclassified, exactly like its destination sibling, so it
+    /// lands in the drain's generic arm — requeue, bump `retryCount`, retry
+    /// forever if the server never conforms. Its description carries none of the
+    /// substrings `AccountManagerQueue.isMessageNotFoundError` matches, so it
+    /// cannot be mistaken for a confirmed-stale message.
+    private enum IMAPEpochEvidenceMissing: Error {
+        /// The SELECT reported no usable UIDVALIDITY for `folder`.
+        case unknownLiveEpoch(folder: String, expected: UInt32)
+        /// The caller supplied no usable admitted epoch to compare against.
+        case unknownAdmittedEpoch(folder: String, live: UInt32)
+    }
+
     /// The single epoch comparison in this file. `live` is what the server just
     /// reported for `folder`; `expected` is the epoch the operation is
-    /// authorized under. Zero on EITHER side is not an epoch (RFC 3501
-    /// §2.3.1.1 types UIDVALIDITY as `nz-number`) and is refused rather than
-    /// compared, so an unreported epoch can never satisfy the guard by matching
-    /// another unreported epoch.
+    /// authorized under.
+    ///
+    /// THREE outcomes, not two, and the split is the whole point:
+    ///  - both epochs real and EQUAL ⇒ proceed;
+    ///  - both epochs real and DIFFERENT ⇒ a PROVEN turnover in this operation's
+    ///    own address space: `ProviderError.uidValidityChanged`, which the drain
+    ///    treats as exit 4 and retires, because every retry would fail
+    ///    identically and forever and executing under unobserved numbering is C3;
+    ///  - either epoch missing (zero) ⇒ `IMAPEpochEvidenceMissing`, retryable.
+    ///    Nothing is proven, so nothing may be retired.
     private func requireUidValidity(
         live: UInt32,
         expected: UInt32,
         folder: String
     ) throws {
-        guard expected > 0, live > 0, live == expected else {
+        guard live > 0 else {
+            throw IMAPEpochEvidenceMissing.unknownLiveEpoch(
+                folder: folder, expected: expected)
+        }
+        guard expected > 0 else {
+            throw IMAPEpochEvidenceMissing.unknownAdmittedEpoch(
+                folder: folder, live: live)
+        }
+        guard live == expected else {
             throw ProviderError.uidValidityChanged(
                 folderPath: folder, stored: expected, live: live)
         }
@@ -3930,9 +4004,34 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
+    /// A1 RESTORATION of `v1.6.38`'s working IMAP `markReplied`. The shipped
+    /// sequence was `selectMailbox` → `resolveUID` (an rfc822 Message-ID SEARCH)
+    /// → `store(flags: [.answered], operation: .add)`. v3 removed RFC as
+    /// mutation authority (D4) and `resolveUID` no longer exists, so the
+    /// resolution step is replaced by the op's own proven provider address plus
+    /// its admitted epoch — the SAME substitution `markRead`/`markFlagged`
+    /// already made. The STORE itself is the shipped one, unchanged.
+    func markReplied(
+        ids: [String], folder: String, admittedUidValidity: UInt32
+    ) async throws {
+        try await mutateAdmittedUIDs(
+            ids: ids, folder: folder, admittedUidValidity: admittedUidValidity,
+            flags: [.answered], add: true)
+    }
+
     /// Set $Forwarded keyword on IMAP messages (called after forwarding).
     func markForwarded(ids: [String], folder: String) async throws {
         throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
+    }
+
+    /// A1 RESTORATION of `v1.6.38`'s working IMAP `markForwarded` — same
+    /// substitution as `markReplied` above, same shipped `$Forwarded` keyword.
+    func markForwarded(
+        ids: [String], folder: String, admittedUidValidity: UInt32
+    ) async throws {
+        try await mutateAdmittedUIDs(
+            ids: ids, folder: folder, admittedUidValidity: admittedUidValidity,
+            flags: [.custom("$Forwarded")], add: true)
     }
 
     /// Action tags are local-only (see ADR-IOS-036). No IMAP STORE.
@@ -3945,6 +4044,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Add or remove a user label (IMAP custom keyword) on a message.
     func setUserLabel(messageId: String, keyword: String, add: Bool, folder: String) async throws {
         throw ProviderError.actionIdentityResolutionFailed(messageId)
+    }
+
+    /// A1 RESTORATION of `v1.6.38`'s working IMAP `setUserLabel`. The shipped
+    /// sequence was `selectMailbox` → `resolveUID` → `store(flags: [.custom(
+    /// keyword)], operation: add ? .add : .remove)`; the resolution step is
+    /// replaced by the op's proven provider address + admitted epoch exactly as
+    /// in `markReplied`. Without this the queue admitted every label gesture on
+    /// an IMAP account and then deleted it unexecuted at checkpoint A — a
+    /// silent, deterministic loss of a user action the shipped release performed.
+    func setUserLabel(
+        messageId: String, keyword: String, add: Bool, folder: String,
+        admittedUidValidity: UInt32
+    ) async throws {
+        try await mutateAdmittedUIDs(
+            ids: [messageId], folder: folder,
+            admittedUidValidity: admittedUidValidity,
+            flags: [.custom(keyword)], add: add)
     }
 
     func move(ids: [String], from source: String, to destination: String) async throws {
@@ -4000,15 +4116,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// atomicity of `UID MOVE` on a MOVE-capable server — an accepted,
     /// owner-decided trade — and buys an epoch assertion immediately before
     /// each of the three steps.
+    ///
+    /// RETURNS the subset of `ids` whose move this attempt PROVED — the members
+    /// the server's own `COPYUID` named and whose source copy was therefore
+    /// soft-deleted and purged. An unproven member was never mutated anywhere,
+    /// so it is not this call's to retire: the caller keeps it queued and
+    /// retries. Retirement is per MEMBER, never per batch (B-2). A whole-op
+    /// no-op — a LIST-confirmed absent source or destination — returns `ids`,
+    /// because that IS provider authority that nothing remains to do.
+    @discardableResult
     func move(
         ids: [String],
         from source: String,
         to destination: String,
         admittedUidValidity: UInt32
-    ) async throws {
+    ) async throws -> [String] {
         let sourceUIDs = try nativeUIDSet(ids)
         do {
-            try await withActionConnectionSelection(folder: source) { server, wrapperSelection in
+            return try await withActionConnectionSelection(folder: source) { server, wrapperSelection -> [String] in
                 // A1 — the wrapper's own SELECT of the source.
                 try self.requireUidValidity(
                     wrapperSelection, expected: admittedUidValidity, folder: source)
@@ -4042,13 +4167,26 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 //    connection already gathered at login; it is not itself a
                 //    wire command.
                 //
-                // Same terminal signal as the post-COPY evidence gate below:
-                // deterministic, unchanged by retrying, so the drain drops it
-                // rather than wedging the lane. `IOS-IMAP-004`.
+                // ⚠ RETRYABLE, NOT TERMINAL (audit round 1, finding B-1). This
+                // used to throw `ProviderError.actionIdentityResolutionFailed`,
+                // whose drain arm DELETES the op — so every archive, delete and
+                // move gesture made by a user on a non-UIDPLUS server became a
+                // permanent, silent no-op. That arm's premises are all
+                // `.deleteDraft`-specific and none of them holds here: this
+                // refusal is not a verdict on an IDENTITY (the ids are perfectly
+                // well-formed UIDs), and it is not deterministic in the id — it
+                // is a fact about the SERVER's advertised capabilities, which can
+                // change under us and which the user can change by moving hosts.
+                // `v1.6.38` called `server.move` here and worked on such servers;
+                // v3 will not re-issue that call (its no-MOVE fallback degrades
+                // to a mailbox-wide EXPUNGE — C3, owner-decided, see this
+                // function's doc), so the honest disposition is the one the rule
+                // prescribes for "we cannot prove it": keep the intention queued.
+                // Nothing has reached the wire, so a retry costs one SELECT.
                 guard await server.supportsUIDPlus else {
-                    print("[IMAP] move \(source)→\(destination): server does not advertise UIDPLUS, so no COPYUID can ever authorize the source cleanup — REFUSING before any wire mutation (fail closed; nothing copied, nothing deleted) and dropping the op")
-                    throw ProviderError.actionIdentityResolutionFailed(
-                        ids.joined(separator: ","))
+                    print("[IMAP] move \(source)→\(destination): server does not advertise UIDPLUS, so no COPYUID can ever authorize the source cleanup — REFUSING before any wire mutation (fail closed; nothing copied, nothing deleted) and keeping the op queued")
+                    throw IMAPMoveEvidenceUnavailable.noUidPlusCapability(
+                        source: source, destination: destination)
                 }
 
                 // T3.3 PORT — `v2final:…:IMAPProvider.move`'s destination
@@ -4219,21 +4357,32 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // the "it copied nothing because those UIDs are already
                     // gone" case, where there is equally nothing to clean.
                     //
-                    // TERMINAL, not retryable: `actionIdentityResolutionFailed`
-                    // is the drain's drop-now signal (see
-                    // `AccountManagerQueue`'s arm for it). A retry would
-                    // re-issue the COPY and add a SECOND unproven copy at the
-                    // destination on every pass, without ever gaining the
-                    // evidence that would let it finish. The op drops and sync
-                    // reconciles the source/destination pair — the fail-closed
-                    // trade recorded as `IOS-IMAP-004`.
-                    print("[IMAP] move \(source)→\(destination): COPY returned no per-member COPYUID evidence for \(ids.count) requested uid(s) — REFUSING all source cleanup (fail closed; the copy is unproven, so nothing may be deleted) and dropping the op")
-                    throw ProviderError.actionIdentityResolutionFailed(
-                        ids.joined(separator: ","))
+                    // ⚠ RETRYABLE, NOT TERMINAL (audit round 1, finding B-1).
+                    // This threw `actionIdentityResolutionFailed`, and the
+                    // drain DELETED the op. Whether a UIDPLUS server chooses to
+                    // send `COPYUID` is SERVER behaviour, not a property of the
+                    // ids — so "the same string will be refused on every future
+                    // drain", the premise that arm rests on, is false here. An
+                    // absence of evidence may not retire a durable intention.
+                    // The accepted cost, stated plainly: a retry re-issues the
+                    // COPY, so a server that never reports `COPYUID` accumulates
+                    // one unproven duplicate at the destination per drain while
+                    // the source stays intact. Duplicated mail is recoverable by
+                    // the user; a silently discarded archive/delete is not, and
+                    // the never-drop rule ranks them in that order.
+                    print("[IMAP] move \(source)→\(destination): COPY returned no per-member COPYUID evidence for \(ids.count) requested uid(s) — REFUSING all source cleanup (fail closed; the copy is unproven, so nothing may be deleted) and keeping the op queued")
+                    throw IMAPMoveEvidenceUnavailable.noCopyUidEvidence(
+                        source: source, destination: destination, requested: ids.count)
                 }
-                if authorizedUIDs.count != sourceUIDs.count,
-                   DebugModeManager.isLoggingEnabled() {
-                    print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): COPYUID proves \(authorizedUIDs.count) of \(sourceUIDs.count) requested uid(s); the unproven remainder is left untouched in the source")
+                // B-2 — the PROVEN subset, computed here and returned to the
+                // caller. An unproven member is untouched in the source and
+                // unmoved at the destination: this attempt completed NOTHING for
+                // it, so it may not ride out of the queue on its siblings'
+                // success. `copyProvenSourceUIDs` already filtered to the
+                // REQUESTED set, so every element maps back to an input id.
+                let provenIds = authorizedUIDs.toArray().map { String($0.value) }
+                if authorizedUIDs.count != sourceUIDs.count {
+                    print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): COPYUID proves \(authorizedUIDs.count) of \(sourceUIDs.count) requested uid(s); the unproven remainder is left untouched in the source and stays queued")
                 }
 
                 // A4 — immediately before the source soft-delete.
@@ -4291,13 +4440,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): server lacks UIDPLUS — copied and marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
                     }
                 }
+                return provenIds
             }
         } catch is IMAPActionMailboxAbsent {
             // Source or destination CONFIRMED gone (LIST probe, T3.3) — the op
             // is terminally satisfied, not transiently failed. Nothing left to
             // do: for an absent source there is nothing to move, and for an
             // absent destination the message is untouched in the source and
-            // sync reconciles the user's view.
+            // sync reconciles the user's view. This IS provider authority, so
+            // every member is reported complete and the whole op retires.
+            return ids
         }
     }
 

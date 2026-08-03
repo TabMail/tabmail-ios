@@ -168,12 +168,24 @@ struct IMAPMoveWireContractTests {
         defer { Task { try? await provider.disconnect() } }
 
         // COPYUID is a UIDPLUS response code, so this server can never furnish
-        // the evidence T3.4 requires. Terminal refusal the drain drops
-        // (`IOS-IMAP-004`), not a retry.
-        await #expect(throws: ProviderError.self) {
+        // the evidence T3.4 requires.
+        //
+        // 🚨 CORRECTED (audit round 1, finding B-1). This used to assert
+        // `throws: ProviderError.self` under a comment calling the refusal a
+        // "Terminal refusal the drain drops (`IOS-IMAP-004`), not a retry" —
+        // which is the defect stated as the specification. `v1.6.38` called
+        // `server.move` and this move WORKED on a non-UIDPLUS server; v3 cannot
+        // prove the copy landed, but "we cannot prove it" is an absence of
+        // evidence, not the provider telling us the move is moot. Dropping the
+        // op here silently discarded an archive the shipped release performed.
+        var thrown: Error?
+        do {
             try await provider.move(
                 ids: ["22"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
+        } catch {
+            thrown = error
         }
+        #expect(thrown != nil, "a move that cannot be proven must refuse, not report success")
 
         // NON-VACUITY: the fixture provably reaches the gate rather than
         // failing earlier for an unrelated reason — the action connection got
@@ -198,6 +210,19 @@ struct IMAPMoveWireContractTests {
         // there — the mailbox-wide-EXPUNGE property this test has always held.
         #expect(server.flags(in: "INBOX", uid: 21).contains("\\Deleted"))
         #expect(server.wrongMessageViolations().isEmpty)
+
+        // Absence of evidence is RETRYABLE FOREVER, never a drop — the same
+        // check `unknownDestinationEpochRefusesBeforeAnyWireMutation` makes on
+        // the destination side. Neither typed signal the drain retires on may
+        // escape this refusal.
+        if let thrown {
+            if case ProviderError.uidValidityChanged = thrown {
+                Issue.record("a missing UIDPLUS capability is not a proven epoch turnover")
+            }
+            if case ProviderError.actionIdentityResolutionFailed = thrown {
+                Issue.record("a missing UIDPLUS capability must not be dropped as an unverifiable identity — the op stays queued")
+            }
+        }
     }
 
     // MARK: - T3.4 — only COPYUID may authorize source cleanup
@@ -225,9 +250,25 @@ struct IMAPMoveWireContractTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await #expect(throws: ProviderError.self) {
+        // 🚨 CORRECTED (audit round 1, finding B-1) — same reasoning as the
+        // non-UIDPLUS sibling above. A server that declines to send COPYUID,
+        // which RFC 4315 §3 permits, has told us nothing about whether the move
+        // should happen; it has only failed to tell us that it did.
+        var thrown: Error?
+        do {
             try await provider.move(
                 ids: ["92"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+        } catch {
+            thrown = error
+        }
+        #expect(thrown != nil, "a copy the server refuses to name must not report success")
+        if let thrown {
+            if case ProviderError.uidValidityChanged = thrown {
+                Issue.record("a withheld COPYUID is not a proven epoch turnover")
+            }
+            if case ProviderError.actionIdentityResolutionFailed = thrown {
+                Issue.record("a withheld COPYUID must not be dropped as an unverifiable identity — the op stays queued")
+            }
         }
 
         // NON-VACUITY, wire side: the copy was issued AND landed, so the server

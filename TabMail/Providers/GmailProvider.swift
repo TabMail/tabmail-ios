@@ -1295,15 +1295,61 @@ actor GmailProvider: EmailProvider {
     /// `GmailProvider.isGmailInvalidIdError(_:)` (commit `a75196398`), taken
     /// verbatim.
     private func isGmailInvalidIdError(_ error: Error) -> Bool {
+        guard let rejection = Self.structuredBadRequestRejection(error) else { return false }
+        return rejection.reason == "invalidArgument"
+            && rejection.message.hasPrefix("Invalid id value")
+    }
+
+    /// The `(reason, message)` pair of a Gmail `400` whose STRUCTURED body we
+    /// actually parsed, or `nil` for every other error — including a `400` whose
+    /// body is absent, unparseable, or shaped differently. Factored out of
+    /// `isGmailInvalidIdError` so the queue's terminal classifier and this
+    /// provider's own stale-no-op arm read the SAME bytes the SAME way; two
+    /// independent decoders of one wire shape is how a half-port drops a guard.
+    private static func structuredBadRequestRejection(
+        _ error: Error
+    ) -> (reason: String, message: String)? {
         guard case ProviderError.networkError(let underlying) = error,
               case HTTPError.networkErrorWithBody(let statusCode, let body) = underlying,
               statusCode == 400,
               let decoded = try? JSONDecoder().decode(GmailAPIErrorBody.self, from: body)
-        else { return false }
+        else { return nil }
         let detail = decoded.error.errors?.first
-        let reason = detail?.reason ?? ""
-        let message = detail?.message ?? decoded.error.message ?? ""
-        return reason == "invalidArgument" && message.hasPrefix("Invalid id value")
+        return (
+            reason: detail?.reason ?? "",
+            message: detail?.message ?? decoded.error.message ?? ""
+        )
+    }
+
+    /// True only when Gmail's own structured `400` body PROVES this request can
+    /// never succeed, whatever we do — the sole `400` shape that may retire a
+    /// durable `PendingOperation` (exit 2: a provider-authoritative no-op).
+    ///
+    /// 🚨 THE NEGATIVE CASE IS THE POINT. A `400` with no body, an unparseable
+    /// body, a body whose `reason` is not `invalidArgument`, or a recognised
+    /// reason with an unrecognised message all return **false** and keep the
+    /// operation retryable. "The server rejected it and did not say why" is an
+    /// absence of evidence; treating it as authority is the clause-2 conflation
+    /// `Companion/Rules/Active/never-drop-user-intention.md` names as the single
+    /// most repeated defect in this codebase's history, and
+    /// `AccountManagerQueue.isPermanentlyInvalidError` committed it for EVERY
+    /// `400` — bare status codes included — until this classifier replaced it.
+    ///
+    /// The two recognised messages are Gmail's own literal wordings, both of
+    /// which name something structurally impossible rather than something that
+    /// might work later:
+    ///   * `"Invalid id value"` — the message id is malformed; no retry resolves
+    ///     it (this is also the arm `modifyMessage` absorbs locally, and the
+    ///     mirror of Exchange's `ErrorInvalidIdMalformed`);
+    ///   * `"Invalid label"` — the label named cannot be modified on this
+    ///     message, e.g. the system `DRAFT` label. This is the case the queue's
+    ///     terminal arm was originally written for; before the body survived to
+    ///     be read, it could only be guessed at from the status line.
+    nonisolated static func isAuthoritativeActionRejection(_ error: Error) -> Bool {
+        guard let rejection = structuredBadRequestRejection(error),
+              rejection.reason == "invalidArgument" else { return false }
+        return rejection.message.hasPrefix("Invalid id value")
+            || rejection.message.hasPrefix("Invalid label")
     }
 
     /// Apply a label add/remove batch to one Gmail message by its native
@@ -1326,21 +1372,35 @@ actor GmailProvider: EmailProvider {
     /// without the lane would be strictly WORSE than not porting it: an
     /// unrecognized case falls through to the queue's generic transient branch
     /// and retries forever — the exact wedge the reference's arm exists to
-    /// prevent. Rethrowing unchanged keeps v3's shipped terminal disposition
-    /// for a Gmail action `400` (`AccountManagerQueue.isPermanentlyInvalidError`
-    /// → drop the op), which is what this tree does today and is why that
-    /// matcher had to be widened to `.networkErrorWithBody` in the same change.
+    /// prevent. Rethrowing unchanged sends the unclassified `400` to the queue's
+    /// generic transient branch.
+    ///
+    /// ⚠ CORRECTED (audit round 1, finding B-3). This paragraph used to end
+    /// "Rethrowing unchanged keeps v3's shipped terminal disposition for a Gmail
+    /// action `400` (`AccountManagerQueue.isPermanentlyInvalidError` → drop the
+    /// op)". That disposition was itself the defect: the matcher bound the body
+    /// to `_` and retired the op on the bare STATUS, so an unrecognised `400`
+    /// destroyed the user's action rather than wedging. It no longer does —
+    /// `isPermanentlyInvalidError` now delegates to
+    /// `isAuthoritativeActionRejection`, and an unclassified `400` retries.
+    ///
+    /// **The wedge the reference's demote lane prevents is therefore REAL on v3
+    /// and remains unaddressed**: a chain whose head takes an unrecognised
+    /// permanent-shaped `400` blocks its lane on every drain. That is a bounded,
+    /// visible, retryable park rather than a silent discard, which is the trade
+    /// the never-drop rule explicitly prefers — but it is a known gap, not a
+    /// solved problem, and closing it needs the demote lane (F2b L4), not a
+    /// widened terminal matcher.
     ///
     /// SUBTRACT — the reference also handles `isGmailInvalidLabelError` here
-    /// (invalid/gone label → stale no-op). Not ported: on v3 that `400` reaches
-    /// the queue and `isPermanentlyInvalidError` already drops the op, so the
-    /// end state (op removed, never retried) is the same one the reference
-    /// reaches by returning. Porting the classifier without the reference's
-    /// demote lane would only change WHICH terminal branch retires the op, not
-    /// whether it is retired. ⚑ Note the brief's stated premise for dropping it
-    /// — "it only ever classified failures of the deleted RFC search" — is
-    /// FALSE: the reference calls it from `modifyMessage` too. The drop is
-    /// justified by the equivalent end state above, not by that premise.
+    /// (invalid/gone label → stale no-op). Not ported as a local `return`,
+    /// because `isAuthoritativeActionRejection` recognises that exact body on
+    /// the queue side: the `400` reaches the queue and retires the op there, the
+    /// same end state the reference reaches by returning. ⚑ Note the brief's
+    /// stated premise for dropping it — "it only ever classified failures of the
+    /// deleted RFC search" — is FALSE: the reference calls it from
+    /// `modifyMessage` too. The drop is justified by the equivalent end state
+    /// above, not by that premise.
     ///
     /// SUBTRACT — the reference's leading `guard !isHttpGoneStatus(error)`.
     /// A `404`/`410` is not a `400`, so `requestPreservingBadRequestBody`
