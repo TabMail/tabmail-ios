@@ -435,4 +435,180 @@ struct DatabaseNSEStagingTests {
         #expect(row?["icsText"] == "BEGIN:VCALENDAR")
         #expect(row?["hasUnresolvedCIDs"] == 1)
     }
+
+    // MARK: - T5.10 — the NSE staged-row epoch stamp (`observedUidValidity`)
+    //
+    // The NSE writes staged rows keyed by a mailbox-local UID. If the folder's
+    // UIDVALIDITY turns over between staging and merge, that UID names a
+    // DIFFERENT physical message and the merge would land this notification's
+    // body/summary on it — a C3 misattribution. The closure has two halves: the
+    // NSE stamps the epoch its own SELECT observed at fetch time
+    // (`NSEIMAPConnection.performFetch` → `NSEMessageMetadata
+    // .observedUidValidity` → `NSEStagingDB.stageHeader` /
+    // `persistProcessedMessage`), and the main-app merge compares that stamp
+    // against the folder's current epoch.
+    //
+    // ⚑ THE STAMP IS ONLY USEFUL IF IT IS DURABLE. The NSE is a SEPARATE
+    // PROCESS with its own memory and its own connection to this file; the
+    // merge that reads the stamp usually runs in the MAIN APP, often after the
+    // NSE process is gone. Nothing process-local can carry it. The two tests
+    // below pin exactly that — the stamp survives the writing handle closing
+    // and reads back through a fresh connection, and the main app's own schema
+    // pass does not disturb it — using the REAL production migrator
+    // (`AppDatabase.createNSEStagingDB`) and the REAL re-entrant column-ensure
+    // idiom the NSE runs (`NSEStagingDB.ensureObservedUidValidityColumn`, which
+    // lives in the extension target and so is not linkable from here; the SQL
+    // is reproduced verbatim by `applyNSEObservedUidValidityColumnEnsure`).
+    //
+    // ⚠ WHAT THESE TESTS DO NOT COVER. The merge-side disposition — drop a
+    // staged row whose stamp POSITIVELY disagrees with the folder's current
+    // epoch, merge one that agrees, scope the drop to that folder/account, and
+    // whatever is decided for a NULL stamp — lives in `NSEDataBridge` and does
+    // not exist on this branch yet. Nothing here asserts that a staged row
+    // merges irrespective of its epoch, deliberately: such a test would BLESS
+    // the misattribution and go red the day the guard lands.
+
+    /// Temp-directory staging file built by the REAL production schema
+    /// migrator, so these tests can never drift from the shipping schema.
+    private func makeStagingFile() throws -> (path: String, dir: URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nse-staging-epoch-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        #expect(AppDatabase.createNSEStagingDB(atPath: path))
+        return (path, dir)
+    }
+
+    /// Byte-for-byte the statement `NSEStagingDB.ensureObservedUidValidityColumn`
+    /// runs in the extension process: `PRAGMA table_info` first, `ALTER TABLE …
+    /// ADD COLUMN` only on absence. Re-entrant — this sidecar has no GRDB
+    /// `DatabaseMigrator` and no numbered `vNN` (same idiom, same reason, as
+    /// `BodyAssetStore.migrateAttachmentIdentitySchema`).
+    private func applyNSEObservedUidValidityColumnEnsure(_ db: DatabaseQueue) throws {
+        try db.write { db in
+            guard try db.tableExists("nse_processed_message") else { return }
+            let columns = Set(
+                try Row.fetchAll(db, sql: "PRAGMA table_info(nse_processed_message)")
+                    .map { $0["name"] as String }
+            )
+            guard !columns.contains("observedUidValidity") else { return }
+            try db.execute(
+                sql: "ALTER TABLE nse_processed_message ADD COLUMN observedUidValidity INTEGER"
+            )
+        }
+    }
+
+    private func stagingColumns(_ path: String) throws -> Set<String> {
+        let db = try DatabaseQueue(path: path)
+        return try db.read { db in
+            Set(try Row.fetchAll(db, sql: "PRAGMA table_info(nse_processed_message)")
+                .map { $0["name"] as String })
+        }
+    }
+
+    /// Stage one row the way the NSE does — naming `observedUidValidity`
+    /// explicitly, so a missing column would fail the INSERT rather than
+    /// silently dropping the stamp. `processedAt`/`date` derive from `Date()`;
+    /// never a literal date.
+    private func stageRowWithEpoch(
+        _ db: DatabaseQueue, id: String, accountId: String, folderPath: String,
+        messageId: String, observedUidValidity: Int?
+    ) throws {
+        let now = Date().timeIntervalSince1970
+        try db.write { db in
+            try db.execute(sql: """
+                INSERT INTO nse_processed_message
+                    (id, accountId, accountEmail, provider, messageId, rfc822MessageId,
+                     folderPath, subject, senderName, senderEmail, snippet, date,
+                     processedAt, aiCompleted, notified, observedUidValidity, populated)
+                VALUES (?, ?, ?, 'imap', ?, ?, ?, 'staged subject', 'Sender',
+                        'sender@example.com', 'staged snippet', ?, ?, 0, 0, ?, 1)
+                """, arguments: [
+                    id, accountId, "\(accountId)@example.com", messageId,
+                    "staged-\(messageId)@example.com", folderPath, now, now,
+                    observedUidValidity
+                ])
+        }
+    }
+
+    @Test("A staged row's UIDVALIDITY stamp is durable across processes: it reads back through a fresh connection after the writing handle is gone, and an unstamped row reads back NULL — distinguishable, never conflated with a stamped one")
+    func observedUidValidityStampIsDurableAcrossConnections() throws {
+        let (path, dir) = try makeStagingFile()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // ── The NSE process: ensure the column, stage two rows, then go away.
+        do {
+            let nseHandle = try DatabaseQueue(path: path)
+            try applyNSEObservedUidValidityColumnEnsure(nseHandle)
+            try stageRowWithEpoch(
+                nseHandle, id: "acct-a:401", accountId: "acct-a",
+                folderPath: "INBOX", messageId: "401", observedUidValidity: 710_001
+            )
+            // The pre-upgrade / non-IMAP population: no epoch was observed.
+            try stageRowWithEpoch(
+                nseHandle, id: "acct-a:402", accountId: "acct-a",
+                folderPath: "INBOX", messageId: "402", observedUidValidity: nil
+            )
+        }
+
+        // ── The main app: a brand-new connection, as the merge would open.
+        let mergeHandle = try DatabaseQueue(path: path)
+        let rows = try mergeHandle.read { db in
+            try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM nse_processed_message WHERE populated = 1 ORDER BY id"
+            )
+        }
+        #expect(rows.count == 2)
+        guard rows.count == 2 else { return }
+
+        // Two-sided: the stamped row carries EXACTLY the epoch the NSE
+        // observed, and the unstamped row is NULL — the merge can therefore
+        // tell "observed epoch 710001" from "no epoch was ever observed". A
+        // stamp that decayed to NULL, or a NULL that materialised as 0, would
+        // make every later comparison either impossible or vacuously true.
+        let stamped: Int? = rows[0]["observedUidValidity"]
+        let unstamped: Int? = rows[1]["observedUidValidity"]
+        #expect(stamped == 710_001)
+        #expect(unstamped == nil)
+    }
+
+    @Test("The main app's staging schema pass is a no-op over the NSE-added observedUidValidity column — it reports success, keeps every pre-existing column, and leaves an already-written stamp untouched")
+    func mainAppSchemaPassPreservesNSEAddedEpochColumn() throws {
+        let (path, dir) = try makeStagingFile()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let beforeEnsure = try stagingColumns(path)
+        #expect(!beforeEnsure.contains("observedUidValidity"))
+
+        // The extension adds the column and stamps a row.
+        do {
+            let nseHandle = try DatabaseQueue(path: path)
+            try applyNSEObservedUidValidityColumnEnsure(nseHandle)
+            try stageRowWithEpoch(
+                nseHandle, id: "acct-b:77", accountId: "acct-b",
+                folderPath: "INBOX", messageId: "77", observedUidValidity: 820_500
+            )
+        }
+
+        // The user opens the app: the main-app migrator runs over the very same
+        // file. It must SUCCEED (it rethrows anything that isn't a duplicate
+        // column, and a throw here would leave the schema half-applied and the
+        // version marker unset), and it must not disturb the extension's work.
+        #expect(AppDatabase.createNSEStagingDB(atPath: path))
+
+        let afterPass = try stagingColumns(path)
+        #expect(afterPass.contains("observedUidValidity"))
+        // Additive only: convergence means the union, never a replacement.
+        #expect(beforeEnsure.isSubset(of: afterPass))
+
+        let survivingStamp: Int? = try DatabaseQueue(path: path).read { db -> Int? in
+            guard let row = try Row.fetchOne(
+                db, sql: "SELECT * FROM nse_processed_message WHERE id = ?",
+                arguments: ["acct-b:77"]
+            ) else { return nil }
+            return row["observedUidValidity"]
+        }
+        #expect(survivingStamp == 820_500)
+    }
 }

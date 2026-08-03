@@ -14,13 +14,65 @@ enum NSEStagingDB {
 
         var config = Configuration()
         config.busyMode = .timeout(NSEConfig.stagingDBBusyTimeoutSeconds)
-        return try? DatabaseQueue(path: url.path, configuration: config)
+        guard let queue = try? DatabaseQueue(path: url.path, configuration: config) else { return nil }
+        ensureObservedUidValidityColumn(db: queue)
+        return queue
     }
 
-    // Note: schema creation lives in `AppDatabase.createNSEStagingDBIfNeeded`
+    // Note: TABLE creation lives in `AppDatabase.createNSEStagingDBIfNeeded`
     // (main-app-only). The main app always creates the DB + schema before the
     // NSE can run (NSE is a bundled extension — can't launch without the host
     // app having been installed + launched). No duplicate creator here.
+    // `ensureObservedUidValidityColumn` below is the ONE exception, and why is
+    // stated at it.
+
+    /// Add `nse_processed_message.observedUidValidity` when the column is
+    /// missing. Re-entrant and idempotent: `PRAGMA table_info` first, `ALTER
+    /// TABLE … ADD COLUMN` only on absence — the same schema-evolution idiom
+    /// `BodyAssetStore.migrateAttachmentIdentitySchema` uses for the OTHER
+    /// App-Group sidecar the NSE writes, and for the same reason: this file is
+    /// a SEPARATE database from `AppDatabase`, so it has no GRDB
+    /// `DatabaseMigrator` and no numbered `vNN`.
+    ///
+    /// ⚑ WHY THE NSE ADDS IT AND NOT THE MAIN APP. `AppDatabase
+    /// .createNSEStagingDBIfNeeded` gates its whole `ALTER` list behind a
+    /// version marker in the App Group suite, so its schema only advances on a
+    /// main-app LAUNCH. A push can reach the NSE before the first launch after
+    /// an update — a window in which `stageHeader`/`persistProcessedMessage`
+    /// would name a column that does not exist and lose the entire staged row.
+    /// Running the ensure here, in the process that names the column, closes
+    /// that window by construction.
+    ///
+    /// CONVERGENCE: a DB whose main-app migrator later gains this column in its
+    /// own `ALTER` list finds it already present — that migrator swallows
+    /// "duplicate column" by design — and a DB that only ever meets this
+    /// function gets it here. Both end at the identical schema. Two processes
+    /// racing the `ALTER` are serialized by SQLite's writer lock; the loser's
+    /// `PRAGMA` re-read on its next open sees the column.
+    ///
+    /// Best-effort, matching every other writer in this type: a failure is
+    /// logged, never thrown. There is deliberately NO fallback that writes the
+    /// row without the stamp — an unstamped row is indistinguishable from a
+    /// pre-upgrade one and would silently launder an unproven UID into the
+    /// merge. A failure here fails this push's staging write instead, which the
+    /// next push retries (the NSE is best-effort by policy).
+    private static func ensureObservedUidValidityColumn(db: DatabaseQueue) {
+        do {
+            try db.write { db in
+                guard try db.tableExists("nse_processed_message") else { return }
+                let columns = Set(
+                    try Row.fetchAll(db, sql: "PRAGMA table_info(nse_processed_message)")
+                        .map { $0["name"] as String }
+                )
+                guard !columns.contains("observedUidValidity") else { return }
+                try db.execute(
+                    sql: "ALTER TABLE nse_processed_message ADD COLUMN observedUidValidity INTEGER"
+                )
+            }
+        } catch {
+            NSELog.error("ensureObservedUidValidityColumn failed: \(error)")
+        }
+    }
 
     /// Check if a message was already AI-processed (by a previous NSE run).
     /// Returns the cached result if aiCompleted, nil otherwise.
@@ -90,7 +142,7 @@ enum NSEStagingDB {
                      summaryBlurb, summaryTodos, actionTag, reminderDate, reminderTime, reminderContent,
                      processedAt, historyId, aiCompleted, notified,
                      htmlContent, textContent, attachmentsJSON, icsText, hasUnresolvedCIDs,
-                     populated)
+                     observedUidValidity, populated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
@@ -98,7 +150,7 @@ enum NSEStagingDB {
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
                             ?, ?, ?, ?, ?,
-                            1)
+                            ?, 1)
                     """, arguments: [
                         // `folderPath` stores the provider-canonical folder path
                         // (Gmail: "INBOX"; Graph: parentFolderId; IMAP: "INBOX").
@@ -127,7 +179,12 @@ enum NSEStagingDB {
                         aiCompleted ? 1 : 0, notified ? 1 : 0,
                         renderedBody?.htmlContent, renderedBody?.textContent,
                         attachmentsJSON, renderedBody?.icsText,
-                        (renderedBody?.hasUnresolvedCIDs ?? false) ? 1 : 0
+                        (renderedBody?.hasUnresolvedCIDs ?? false) ? 1 : 0,
+                        // The epoch the NSE's own SELECT observed for this
+                        // row's folder (nil for Gmail/Graph and whenever the
+                        // server reported none) — see
+                        // `NSEMessageMetadata.observedUidValidity`.
+                        message.observedUidValidity
                     ])
             }
         } catch {
@@ -166,15 +223,22 @@ enum NSEStagingDB {
         let providerLabelsJSON = encodeJSONArray(message.providerLabels)
         do {
             try db.write { db in
+                // `observedUidValidity` is on the ON CONFLICT SET list below
+                // because it is IDENTITY, not payload: a re-push must overwrite
+                // it with the epoch THIS run's SELECT observed, exactly as the
+                // list already overwrites `rfc822MessageId` / `folderPath`. The
+                // columns this UPSERT deliberately RETAINS are the body/AI
+                // payload; keeping a PREVIOUS run's epoch beside a re-read UID
+                // is precisely what would misattribute the row.
                 try db.execute(sql: """
                     INSERT INTO nse_processed_message
                     (id, accountId, accountEmail, provider, messageId, rfc822MessageId, threadId,
                      folderPath, subject, senderName, senderEmail, snippet, date,
                      toRaw, ccRaw, bccRaw, replyToRaw, inReplyTo, referencesJSON,
                      isRead, isFlagged, hasAttachments, providerLabelsJSON,
-                     isReplied, isForwarded, processedAt, historyId, populated)
+                     isReplied, isForwarded, processedAt, historyId, observedUidValidity, populated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     ON CONFLICT(id) DO UPDATE SET
                         accountEmail = excluded.accountEmail, provider = excluded.provider,
                         rfc822MessageId = excluded.rfc822MessageId, threadId = excluded.threadId,
@@ -187,7 +251,8 @@ enum NSEStagingDB {
                         isFlagged = excluded.isFlagged, hasAttachments = excluded.hasAttachments,
                         providerLabelsJSON = excluded.providerLabelsJSON,
                         isReplied = excluded.isReplied, isForwarded = excluded.isForwarded,
-                        historyId = excluded.historyId, populated = 1
+                        historyId = excluded.historyId,
+                        observedUidValidity = excluded.observedUidValidity, populated = 1
                     """, arguments: [
                         id, accountId, accountEmail, provider, message.messageId,
                         message.rfc822MessageId, message.threadId, message.folderPath,
@@ -198,7 +263,8 @@ enum NSEStagingDB {
                         message.isRead ? 1 : 0, message.isFlagged ? 1 : 0,
                         message.hasAttachments ? 1 : 0, providerLabelsJSON,
                         message.isReplied ? 1 : 0, message.isForwarded ? 1 : 0,
-                        Date().timeIntervalSince1970, historyId
+                        Date().timeIntervalSince1970, historyId,
+                        message.observedUidValidity
                     ])
             }
         } catch {

@@ -81,4 +81,40 @@ struct NSEMessageMetadata: Sendable {
     /// merge-side `MessageHeader.id` matches what sync later constructs —
     /// without it, sync produces a duplicate row that lacks NSE's AI fields.
     let folderPath: String
+
+    /// The UIDVALIDITY the NSE's OWN live SELECT observed for `folderPath` at
+    /// fetch time — IMAP/iCloud only. `nil` for Gmail/Graph (no UIDVALIDITY
+    /// concept) and for every row staged before this field existed.
+    ///
+    /// PORT of `v2final`'s `NSEMessageMetadata.observedUidValidity` (tag
+    /// `e28dd4edb`, ADR-IOS-061 item A / R5 F-2).
+    ///
+    /// Captured directly from the wire (`Mailbox.Selection.uidValidity`), never
+    /// from a cached or mirrored value: this is the ONLY signal that binds the
+    /// UID-addressed `messageId` on this row to the numbering it was read
+    /// under. `processedAt` cannot substitute — an NSE run that SELECTed
+    /// pre-reset but whose merge lands after a reset stamped the folder carries
+    /// a wall-clock timestamp that looks perfectly fresh, so wall-clock order
+    /// can lose a race this comparison cannot.
+    ///
+    /// ⚑ NIL IS NOT A MISMATCH — IT IS AN UNANSWERED QUESTION. It means the
+    /// address is unproven, exactly as `MessageHeader.observedUidValidity`
+    /// documents for the durable side. No consumer may delete, skip, or
+    /// re-attribute a row on the strength of a nil alone; only a POSITIVE
+    /// disagreement with the folder's current epoch is evidence.
+    ///
+    /// `0` never enters this field. RFC 3501 §2.3.1.1 types UIDVALIDITY as
+    /// `nz-number`; SwiftMail's `Mailbox.Selection.uidValidity` is non-optional
+    /// only because it DEFAULTS to `UIDValidity(0)`, so a `0` can only mean
+    /// "the server did not report one" — recorded as unknown, the same
+    /// convention `IMAPProvider.selectMailboxTracked` enforces main-app side.
+    ///
+    /// `Int?` (not `UInt32?`) mirrors `MessageHeader.observedUidValidity` and
+    /// `PendingOperation.observedUidValidity`, this value's established storage
+    /// convention. `var` with a default — unlike every other field here —
+    /// because a `let` with a default is excluded from the synthesized
+    /// memberwise initializer entirely, whereas a `var` participates in it with
+    /// that default, letting the two non-IMAP construction sites
+    /// (`GmailNSEClient`, `OutlookNSEClient`) compile unchanged.
+    var observedUidValidity: Int? = nil
 }

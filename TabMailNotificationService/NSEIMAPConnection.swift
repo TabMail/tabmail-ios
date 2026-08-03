@@ -95,8 +95,23 @@ enum NSEIMAPConnection {
             return nil
         }
 
+        // Keep the epoch THIS SELECT reported — the UID the SEARCH below returns
+        // is only meaningful under it, and it is the one signal that survives to
+        // the merge in a different process. PORT of `v2final`'s identical
+        // capture in `NSEIMAPConnection.performFetch` (tag `e28dd4edb`,
+        // ADR-IOS-061 item A / R5 F-2).
+        //
+        // Nonzero only: `Mailbox.Selection.uidValidity` is non-optional purely
+        // because SwiftMail defaults it to `UIDValidity(0)`, so a `0` means the
+        // server reported none and is recorded as UNKNOWN (nil), never as an
+        // epoch — the same convention `IMAPProvider.selectMailboxTracked`
+        // enforces main-app side. Recording the `0` would make every later
+        // comparison `0 == 0`, i.e. vacuously true.
+        let observedUidValidity: Int?
         do {
-            _ = try await server.selectMailbox(folderPath)
+            let selection = try await server.selectMailbox(folderPath)
+            let value = selection.uidValidity.value
+            observedUidValidity = value != 0 ? Int(value) : nil
         } catch {
             NSELog.step("NSE IMAP SELECT \(folderPath) failed: \(String(describing: error))")
             return nil
@@ -142,7 +157,10 @@ enum NSEIMAPConnection {
         // through `IMAPFetchMapping.renderBody(info:message:)` so
         // attachment/inline-image/ICS/embedded-.eml handling is byte-
         // identical to `IMAPProvider.buildFullMessageInfo`.
-        guard let meta = mapInfoToMetadata(info: info, message: message, folderPath: folderPath) else {
+        guard let meta = mapInfoToMetadata(
+            info: info, message: message, folderPath: folderPath,
+            observedUidValidity: observedUidValidity
+        ) else {
             NSELog.step("NSE IMAP: mapInfoToMetadata returned nil (parse failure)")
             return nil
         }
@@ -207,7 +225,8 @@ enum NSEIMAPConnection {
     private static func mapInfoToMetadata(
         info: MessageInfo,
         message: Message,
-        folderPath: String
+        folderPath: String,
+        observedUidValidity: Int?
     ) -> NSEMessageMetadata? {
         // Sender — SwiftMail's `info.from` is a raw RFC5322 string like
         // `"Alice" <alice@example.com>`. Use shared EmailAddress.parse.
@@ -272,7 +291,11 @@ enum NSEIMAPConnection {
             // handles it (`IMAPProvider.mapMessageInfo`'s `userLabelKeywords`
             // extraction; symbol-cited, no line number).
             providerLabels: IMAPFetchMapping.customKeywords(from: info),
-            folderPath: folderPath
+            folderPath: folderPath,
+            // The epoch the SELECT that served this UID reported (nil when the
+            // server reported none) — see `NSEMessageMetadata
+            // .observedUidValidity`.
+            observedUidValidity: observedUidValidity
         )
     }
 

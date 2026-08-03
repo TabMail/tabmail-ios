@@ -166,6 +166,31 @@ enum NotificationActionRouter {
     }
 
     /// Durable lookup scoped to the account's inbox — see the enum doc for why.
+    ///
+    /// R16-F1 (ADR-IOS-061), the FOLDER-NATIVE guard: address ≠ identity. An
+    /// `(messageId, accountId, isInInbox)` match can be a DIFFERENT message that
+    /// was optimistically moved INTO the inbox. `AccountManager
+    /// .optimisticMoveToFolder` rewrites `folderId`/`folderPath`/`isInInbox` to
+    /// the DESTINATION but deliberately keeps the SOURCE folder's primary key
+    /// (`SyncEngine.canonicalizeLocalRows`'s doc states this outright, and notes
+    /// the stale PK can survive indefinitely on stable-id
+    /// providers). So such a row carries the source folder's UID while claiming
+    /// inbox membership: at a coinciding UID it becomes the UNIQUE address match,
+    /// and a durable archive/delete/mark-read would land on a message the user
+    /// never tapped (C3).
+    ///
+    /// Every NSE-built notification's true target is FOLDER-NATIVE by
+    /// construction — the NSE mints the row id as `MessageIdentity.headerId(
+    /// accountId, inboxPath, uid)` — so requiring the row's own PK to be native
+    /// to its CURRENT `(accountId, folderPath, messageId)` excludes moved-in
+    /// impostors with zero false negatives. The predicate is expressed through
+    /// `MessageIdentity.headerId` itself rather than re-concatenated in SQL, so
+    /// there is exactly one definition of the key format to drift from.
+    ///
+    /// A rejection returns `.absent`, which is the existing clean-miss path: one
+    /// merge + retry, then `queueColdPendingOperation(source: .canonicalInbox)`.
+    /// The user's intention is retained, addressed at the mailbox the push was
+    /// FOR — never dispatched against the impostor.
     private static func resolveDurableInboxHeader(messageId: String, accountId: String) async -> HeaderResolution {
         do {
             #if DEBUG
@@ -177,12 +202,23 @@ enum NotificationActionRouter {
             }
             #endif
             return try await AppDatabase.dbPool.read { db -> HeaderResolution in
-                let row = try MessageHeader.fetchOne(db, sql: """
+                // No LIMIT: the folder-native filter runs in Swift (single
+                // source of truth for the key format), so an impostor must not
+                // be able to occupy the one row a `LIMIT 1` would return.
+                // Cardinality is bounded by the account's folder count —
+                // `messageHeader_messageId_accountId` covers the predicate.
+                let candidates = try MessageHeader.fetchAll(db, sql: """
                     SELECT * FROM messageHeader
                     WHERE messageId = ? AND accountId = ? AND folderId != '' AND isInInbox = 1
-                    LIMIT 1
                     """, arguments: [messageId, accountId])
-                return row.map(HeaderResolution.found) ?? .absent
+                let native = candidates.first { row in
+                    row.id == MessageIdentity.headerId(
+                        accountId: row.accountId,
+                        folderPath: row.folderPath,
+                        messageId: row.messageId
+                    )
+                }
+                return native.map(HeaderResolution.found) ?? .absent
             }
         } catch {
             print("[NotificationActionRouter] header lookup failed: \(error)")
@@ -283,11 +319,31 @@ enum NotificationActionRouter {
                 await AccountManager.shared.markRead([header])
                 print("[NotificationActionRouter] markRead via manager for \(messageId)")
             case "ARCHIVE":
-                await AccountManager.shared.performCoordinatedRoleMove(ids: [header.id], role: .archive)
-                print("[NotificationActionRouter] archive via performCoordinatedRoleMove for \(messageId)")
+                // T4.V8 (PORT of `v2final:NotificationActionRouter.execute`,
+                // commit `b1c89ad4a`): this line used to log a success-shaped
+                // string for an admission that may never have landed. Log the
+                // three dispositions distinctly so a refused or rolled-back tap
+                // is diagnosable from a device log instead of reading like a
+                // completed archive.
+                let archiveOutcome = await AccountManager.shared.performCoordinatedRoleMove(
+                    ids: [header.id], role: .archive)
+                if archiveOutcome.admittedIds.contains(header.id) {
+                    log("[NotificationActionRouter] archive durably admitted for \(messageId)")
+                } else if archiveOutcome.pendingIds.contains(header.id) {
+                    log("[NotificationActionRouter] archive outstanding (unconfirmed) for \(messageId)")
+                } else {
+                    log("[NotificationActionRouter] archive terminal-stale for \(messageId)")
+                }
             case "DELETE":
-                await AccountManager.shared.performCoordinatedRoleMove(ids: [header.id], role: .trash)
-                print("[NotificationActionRouter] delete via performCoordinatedRoleMove for \(messageId)")
+                let deleteOutcome = await AccountManager.shared.performCoordinatedRoleMove(
+                    ids: [header.id], role: .trash)
+                if deleteOutcome.admittedIds.contains(header.id) {
+                    log("[NotificationActionRouter] delete durably admitted for \(messageId)")
+                } else if deleteOutcome.pendingIds.contains(header.id) {
+                    log("[NotificationActionRouter] delete outstanding (unconfirmed) for \(messageId)")
+                } else {
+                    log("[NotificationActionRouter] delete terminal-stale for \(messageId)")
+                }
             default:
                 break
             }

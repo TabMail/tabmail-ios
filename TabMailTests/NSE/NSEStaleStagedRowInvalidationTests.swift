@@ -596,3 +596,462 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(newHeader?.isInInbox == true)
     }
 }
+
+/// T5.10 MERGE HALF — the UIDVALIDITY epoch guard in `NSEDataBridge.performMerge`
+/// (`uidValidityStagingRowStatus` + `nseMergeIdentityConfirmed`, ADR-IOS-061).
+///
+/// THE INVARIANT, stated once: **the NSE's staged content may only ever land on the
+/// message it was actually about.** A staged row is addressed by a MAILBOX-LOCAL UID
+/// (`nse_processed_message.messageId`). If the folder's UIDVALIDITY turns over
+/// between staging and merge, that UID names a DIFFERENT physical message — and
+/// `DurableIdentityLookup.find`'s step 1 (exact-folder `(accountId, folderPath,
+/// messageId)`) carries no RFC check and no epoch input at all, so it returns the new
+/// occupant without hesitation. Merging onto it writes this notification's body,
+/// summary, action tag and `notified` flag onto a message the notification was never
+/// about: C3.
+///
+/// The NSE stamps the epoch its own SELECT observed (`NSEIMAPConnection.performFetch`
+/// → `NSEMessageMetadata.observedUidValidity` → the `nse_processed_message
+/// .observedUidValidity` column); this suite covers the MERGE-side disposition of
+/// that stamp, in four arms:
+///  1. positive epoch mismatch, folder settled ⇒ DROP (skip-and-delete);
+///  2. folder QUARANTINED ⇒ KEEP for retry, never delete (the stored epoch is still
+///     the old one by construction, so nothing is decidable yet);
+///  3. EXISTING durable row + identity not positively confirmed ⇒ DROP;
+///  4. NEW-header arm + NULL stamp ⇒ the ARRIVAL still surfaces — with no durable
+///     row occupying the UID there is nothing to misattribute, so the header is
+///     created and made inbox-visible — while the row's unprovable CONTENT (body,
+///     summary, action tag) is refused and the message is left honestly
+///     `bodyComplete = 0` for the ordinary body queue. Refusing a write is not
+///     dropping an arrival, and arm 4 pins exactly that distinction.
+///
+/// Every assertion is on the END STATE — what landed on which durable row, and what
+/// is still in the staging file — never on a disposition enum or which helper ran.
+/// Each drop arm is paired with a case that MERGES, so a guard that refused
+/// everything would fail this suite rather than pass it vacuously.
+///
+/// Drives the REAL `NSEDataBridge.mergeNSEStagingData` against a real pool-backed
+/// `AppDatabase` + a real staging file. `.serialized, .processGlobalState` — replaces
+/// `AppDatabase.shared` and mutates the process-wide `NSEDataBridge.latestStagedRows`
+/// / `latestStagedBodies` / `stageMemo`.
+@Suite("NSE merge — staged-row UIDVALIDITY epoch guard (T5.10)", .serialized, .processGlobalState)
+@MainActor
+struct NSEStagedRowEpochGuardTests {
+
+    // MARK: - Fixture
+
+    private static let epochA = 710_001      // what the NSE observed
+    private static let epochB = 710_002      // what the folder settled on afterwards
+    private static let siblingEpoch = 810_005
+    private static let otherAccountEpoch = 910_009
+
+    private struct World {
+        let dir: URL
+        let pool: DatabasePool
+        let previous: AppDatabase?
+        let stagingPath: String
+        let stagingQueue: DatabaseQueue
+    }
+
+    /// Real pool-backed `AppDatabase` with two accounts: `acc1` (INBOX + Archive)
+    /// and `acc2` (INBOX). Folder epochs are set explicitly by each test.
+    private func makeWorld() throws -> World {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.journalMode = .wal
+        config.busyMode = .timeout(5)
+        config.foreignKeysEnabled = true
+        config.maximumReaderCount = 64
+        let pool = try DatabasePool(path: dir.appendingPathComponent("tabmail.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current
+            current = appDb
+            return prev
+        }
+        try pool.writeWithoutTransaction { db in
+            var acc1 = Account(emailAddress: "one@example.com", displayName: "One", provider: .imap)
+            acc1.id = "acc1"
+            try acc1.insert(db)
+            var acc2 = Account(emailAddress: "two@example.com", displayName: "Two", provider: .imap)
+            acc2.id = "acc2"
+            try acc2.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc2").insert(db)
+        }
+
+        // Real production staging schema, then the column the NSE adds for itself
+        // (`NSEStagingDB.ensureObservedUidValidityColumn` lives in the extension
+        // target and is not linkable from here; the statement is reproduced
+        // verbatim, `PRAGMA table_info` first, `ALTER TABLE` only on absence —
+        // `AppDatabase.createNSEStagingDB` deliberately does NOT create it).
+        let stagingPath = dir.appendingPathComponent("nse_staging.sqlite").path
+        _ = AppDatabase.createNSEStagingDB(atPath: stagingPath)
+        let q = try DatabaseQueue(path: stagingPath)
+        try q.write { db in
+            let columns = Set(
+                try Row.fetchAll(db, sql: "PRAGMA table_info(nse_processed_message)")
+                    .map { $0["name"] as String }
+            )
+            guard !columns.contains("observedUidValidity") else { return }
+            try db.execute(sql: "ALTER TABLE nse_processed_message ADD COLUMN observedUidValidity INTEGER")
+        }
+        return World(dir: dir, pool: pool, previous: previous, stagingPath: stagingPath, stagingQueue: q)
+    }
+
+    private func teardown(_ world: World) {
+        AppDatabase.shared.withLock { $0 = world.previous }
+        TestDatabaseTeardown.retire(
+            pools: [world.pool], queues: [world.stagingQueue], directory: world.dir
+        )
+    }
+
+    private func resetGlobals() {
+        NSEDataBridge.resetStageMemoForTesting()
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        NSEDataBridge.latestStagedBodies.withLock { $0 = [:] }
+    }
+
+    /// Set a folder's stored epoch and (optionally) arm its reset quarantine —
+    /// exactly the two columns `uidValidityStagingRowStatus` reads.
+    private func setFolderEpoch(
+        _ pool: DatabasePool, accountId: String, folderPath: String,
+        epoch: Int?, quarantinedAt: Date? = nil
+    ) async throws {
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE folder SET lastKnownUidValidity = ?, uidValidityResetPendingAt = ? WHERE id = ?",
+                arguments: [epoch, quarantinedAt, MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)]
+            )
+        }
+    }
+
+    /// A TERMINAL staged row (`populated=1, aiCompleted=1`) carrying a body, a
+    /// summary and an action tag — so a merge that lands leaves four independently
+    /// observable marks (`messageBody` row, `summaryBlurb`, `actionTag`, `notified`)
+    /// and a merge that is refused leaves none of them. `processedAt`/`date` derive
+    /// from `Date()`; never a literal.
+    private func stageRow(
+        _ q: DatabaseQueue, accountId: String = "acc1", folderPath: String = "INBOX",
+        messageId: String, rfc822: String?, observedUidValidity: Int?, subject: String = "Staged subject"
+    ) throws {
+        let now = Date().timeIntervalSince1970
+        try q.write { db in
+            try db.execute(sql: """
+                INSERT OR REPLACE INTO nse_processed_message
+                    (id, accountId, accountEmail, provider, messageId, rfc822MessageId,
+                     folderPath, subject, senderName, senderEmail, snippet, date,
+                     processedAt, aiCompleted, notified, populated,
+                     htmlContent, textContent, hasUnresolvedCIDs,
+                     summaryBlurb, summaryTodos, actionTag, observedUidValidity)
+                VALUES (?, ?, ?, 'imap_new_mail', ?, ?, ?,
+                        ?, 'Sender', 'sender@example.com', 'staged snippet', ?,
+                        ?, 1, 1, 1,
+                        '<p>Staged body</p>', 'Staged body', 0,
+                        'Staged summary', 'Staged todo', 'reply', ?)
+                """, arguments: [
+                    "\(accountId):\(messageId)", accountId, "\(accountId)@example.com",
+                    messageId, rfc822, folderPath, subject, now, now, observedUidValidity
+                ])
+        }
+    }
+
+    /// A durable header already occupying `accountId:folderPath:messageId`, with
+    /// EMPTY snippet and no body/summary/action/notified — so every mark a merge
+    /// would leave is observable by its absence.
+    private func insertOccupant(
+        _ pool: DatabasePool, accountId: String = "acc1", folderPath: String = "INBOX",
+        messageId: String, rfc822: String?, subject: String = "Occupant"
+    ) async throws {
+        try await pool.write { db in
+            var header = MessageHeader(
+                messageId: messageId, subject: subject, from: "Other", fromAddress: "other@example.com",
+                to: "one@example.com", date: Date(), snippet: "",
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath),
+                accountId: accountId, folderPath: folderPath, isInInbox: true
+            )
+            header.rfc822MessageId = rfc822
+            header.headerComplete = true
+            try header.insert(db)
+        }
+    }
+
+    /// Everything the merge would have written for one staged row, read back off the
+    /// durable row that occupies its address. Asserting on this whole shape (rather
+    /// than on any one column) is what makes "landed on nothing" mean nothing.
+    private struct Landed: Equatable, Sendable {
+        var exists: Bool
+        var subject: String?
+        var snippet: String?
+        var summaryBlurb: String?
+        var actionTag: String?
+        var notified: Bool?
+        var hasBody: Bool
+    }
+
+    private func landed(_ pool: DatabasePool, headerId: String) async throws -> Landed {
+        try await pool.read { db in
+            guard let h = try MessageHeader.fetchOne(db, key: headerId) else {
+                return Landed(exists: false, subject: nil, snippet: nil, summaryBlurb: nil,
+                              actionTag: nil, notified: nil, hasBody: false)
+            }
+            let hasBody = try Bool.fetchOne(
+                db, sql: "SELECT EXISTS(SELECT 1 FROM messageBody WHERE id = ?)", arguments: [headerId]
+            ) ?? false
+            return Landed(
+                exists: true, subject: h.subject, snippet: h.snippet, summaryBlurb: h.summaryBlurb,
+                actionTag: h.actionTag?.rawValue, notified: h.notified, hasBody: hasBody
+            )
+        }
+    }
+
+    private func stagingRowExists(_ q: DatabaseQueue, id: String) throws -> Bool {
+        try q.read { db in
+            try Bool.fetchOne(
+                db, sql: "SELECT EXISTS(SELECT 1 FROM nse_processed_message WHERE id = ?)", arguments: [id]
+            ) ?? false
+        }
+    }
+
+    // MARK: - ARM 1: positive epoch mismatch ⇒ DROP
+
+    @Test("A staged row whose observed epoch positively differs from its folder's current epoch is dropped at merge and lands on nothing — no body, no summary, no action, no notified flag on the durable row occupying its UID")
+    func positiveEpochMismatchLandsOnNothing() async throws {
+        let world = try makeWorld()
+        defer { teardown(world) }
+        resetGlobals()
+
+        // The folder has SETTLED on a new epoch. The durable row occupying UID 5 is
+        // whatever the resync put there. Its rfc822 deliberately AGREES with the
+        // staged row's, so the identity door would CONFIRM — the epoch is therefore
+        // the only thing that can refuse this merge, and the drop is unambiguously
+        // attributable to it (the sibling test below flips exactly that one value).
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "INBOX", epoch: Self.epochB)
+        try await insertOccupant(world.pool, messageId: "5", rfc822: "rfc-shared@example.com")
+        try stageRow(world.stagingQueue, messageId: "5",
+                     rfc822: "rfc-shared@example.com", observedUidValidity: Self.epochA)
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let after = try await landed(world.pool, headerId: "acc1:INBOX:5")
+        #expect(after == Landed(
+            exists: true, subject: "Occupant", snippet: "", summaryBlurb: nil,
+            actionTag: nil, notified: false, hasBody: false
+        ), "the row occupying UID 5 must be untouched by a staged row from a different epoch")
+
+        // Skip-AND-delete: permanently stale (the stamp is immutable staged data),
+        // so it must not be left to re-attempt the same refusal every wake.
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc1:5") == false)
+        // And scrubbed from the snapshot the pre-guard publish already posted.
+        let staged = NSEDataBridge.latestStagedRows.withLock { $0 }
+        #expect(!staged.contains { $0.headerId == "acc1:INBOX:5" })
+
+        try? await Task.sleep(for: .milliseconds(300))
+    }
+
+    @Test("A staged row whose observed epoch equals its folder's current epoch still merges in full — the drop is evidence-driven, not a blanket refusal")
+    func matchingEpochStillMergesInFull() async throws {
+        let world = try makeWorld()
+        defer { teardown(world) }
+        resetGlobals()
+
+        // Byte-identical to the test above except for ONE value: the staged stamp.
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "INBOX", epoch: Self.epochB)
+        try await insertOccupant(world.pool, messageId: "5", rfc822: "rfc-shared@example.com")
+        try stageRow(world.stagingQueue, messageId: "5",
+                     rfc822: "rfc-shared@example.com", observedUidValidity: Self.epochB)
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let after = try await landed(world.pool, headerId: "acc1:INBOX:5")
+        #expect(after.exists)
+        #expect(after.hasBody, "the staged body must land when the epochs agree")
+        #expect(after.summaryBlurb == "Staged summary")
+        #expect(after.actionTag == "reply")
+        #expect(after.notified == true)
+        #expect(after.snippet?.isEmpty == false, "phase 1 must seed the empty snippet")
+
+        try? await Task.sleep(for: .milliseconds(300))
+    }
+
+    // MARK: - Scoping
+
+    @Test("The epoch drop is scoped to its own folder and account — a sibling folder's and another account's staged rows merge untouched in the same pass")
+    func epochDropIsScopedToItsOwnFolderAndAccount() async throws {
+        let world = try makeWorld()
+        defer { teardown(world) }
+        resetGlobals()
+
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "INBOX", epoch: Self.epochB)
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "Archive", epoch: Self.siblingEpoch)
+        try await setFolderEpoch(world.pool, accountId: "acc2", folderPath: "INBOX", epoch: Self.otherAccountEpoch)
+
+        // Only this one disagrees with its own folder.
+        try stageRow(world.stagingQueue, accountId: "acc1", folderPath: "INBOX", messageId: "5",
+                     rfc822: "rfc-inbox@example.com", observedUidValidity: Self.epochA)
+        // Same UID, sibling folder, agreeing epoch.
+        try stageRow(world.stagingQueue, accountId: "acc1", folderPath: "Archive", messageId: "5",
+                     rfc822: "rfc-archive@example.com", observedUidValidity: Self.siblingEpoch,
+                     subject: "Sibling folder subject")
+        // Same UID again, different ACCOUNT, agreeing epoch.
+        try stageRow(world.stagingQueue, accountId: "acc2", folderPath: "INBOX", messageId: "5",
+                     rfc822: "rfc-other-account@example.com", observedUidValidity: Self.otherAccountEpoch,
+                     subject: "Other account subject")
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let dropped = try await landed(world.pool, headerId: "acc1:INBOX:5")
+        #expect(dropped.exists == false, "the old-epoch row must not create a header at the UID it no longer owns")
+
+        let sibling = try await landed(world.pool, headerId: "acc1:Archive:5")
+        #expect(sibling.exists, "a sibling folder's staged row must be unaffected by another folder's turnover")
+        #expect(sibling.subject == "Sibling folder subject")
+        #expect(sibling.hasBody)
+
+        let otherAccount = try await landed(world.pool, headerId: "acc2:INBOX:5")
+        #expect(otherAccount.exists, "another account's staged row must be unaffected")
+        #expect(otherAccount.subject == "Other account subject")
+        #expect(otherAccount.hasBody)
+
+        try? await Task.sleep(for: .milliseconds(300))
+    }
+
+    // MARK: - ARMS 3 & 4: the NULL-stamp tail
+
+    @Test("A NULL-stamped staged row is never written onto an EXISTING durable row it cannot claim; with no durable row to poison the arrival still surfaces as a visible header whose body stays honestly unfetched and refetchable")
+    func nullStampDropsOnExistingRowAndInsertsOnNewHeader() async throws {
+        let world = try makeWorld()
+        defer { teardown(world) }
+        resetGlobals()
+
+        // The folder HAS an epoch; the staged rows do not. With no usable rfc822 on
+        // either side, neither identity door can open — which is exactly the tail
+        // arms 1/2 alone leave uncovered.
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "INBOX", epoch: Self.epochB)
+
+        // (a) EXISTING durable row occupies UID 10 — content would land ON it.
+        try await insertOccupant(world.pool, messageId: "10", rfc822: nil, subject: "Occupant A")
+        try stageRow(world.stagingQueue, messageId: "10", rfc822: nil, observedUidValidity: nil)
+
+        // (b) No durable row anywhere for UID 11 — nothing to poison.
+        try stageRow(world.stagingQueue, messageId: "11", rfc822: nil, observedUidValidity: nil,
+                     subject: "Brand new arrival")
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let occupied = try await landed(world.pool, headerId: "acc1:INBOX:10")
+        #expect(occupied == Landed(
+            exists: true, subject: "Occupant A", snippet: "", summaryBlurb: nil,
+            actionTag: nil, notified: false, hasBody: false
+        ), "an unprovable staged row must not write onto the durable row already holding its address")
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc1:10") == false)
+
+        // (b) The NEW-header arm. The ARRIVAL is never dropped — with no durable
+        // row occupying UID 11 there is nothing to misattribute, so the header is
+        // created from this same staged row and made inbox-VISIBLE. What IS
+        // refused is the staged row's unprovable CONTENT: by the time the body/AI
+        // pass runs, the row just created is itself the durable occupant of that
+        // address, and an rfc-nil + epoch-nil pair proves nothing about it.
+        //
+        // That refusal is only tolerable because it leaves the message honestly
+        // UNFETCHED instead of marked complete — so the ordinary body queue
+        // fetches it and the AI recomputes. The staged row is scratch; the
+        // message is not lost.
+        let fresh = try await landed(world.pool, headerId: "acc1:INBOX:11")
+        #expect(fresh.exists,
+                "the arrival itself was dropped — there was no durable row to poison, so nothing justified refusing it")
+        #expect(fresh.subject == "Brand new arrival")
+        #expect(fresh.snippet?.isEmpty == false,
+                "the visible row must carry a preview, not an empty snippet")
+        #expect(fresh.hasBody == false,
+                "unprovable staged CONTENT was written anyway — the epoch/rfc pair proves nothing about the occupant")
+        #expect(fresh.summaryBlurb == nil, "unprovable staged AI was applied")
+        #expect(fresh.actionTag == nil, "unprovable staged AI was applied")
+
+        // 🚨 THE RETENTION HALF — this is what separates "refused a write" from
+        // "dropped an arrival", and it is asserted through the body queue's OWN
+        // selection predicate (`ActiveBodyQueue`: `headerComplete = 1 AND
+        // bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1`) rather
+        // than through any single column. A row that satisfies it is one the body
+        // fetch WILL pick up; any one of those four columns being wrong strands
+        // the message body-less indefinitely, with its staging row already
+        // consumed — and THAT would be a never-drop violation, not hardening.
+        let refetchable = try await world.pool.read { db in
+            try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(
+                    SELECT 1 FROM messageHeader
+                     WHERE id = ? AND headerComplete = 1 AND bodyComplete = 0
+                       AND bodyEmptyConfirmed = 0 AND isInInbox = 1
+                )
+                """, arguments: ["acc1:INBOX:11"]) ?? false
+        }
+        #expect(refetchable, """
+                the staged row was consumed while its message was left neither visible nor \
+                eligible for a body fetch. Nothing else will ever fill that body in, so the \
+                arrival is DROPPED rather than merely unproven — which the never-drop rule \
+                forbids (an unresolvable identity is retryable, never authoritative).
+                """)
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc1:11") == false,
+                """
+                the scratch staging row must be consumed rather than kept: `observedUidValidity` \
+                is immutable staged data, so every retry re-reads the same NULL and can never \
+                become provable. Deleting it is safe ONLY because the durable header above \
+                carries the arrival and its body is still armed for fetch.
+                """)
+
+        try? await Task.sleep(for: .milliseconds(300))
+    }
+
+    // MARK: - ARM 2: quarantine ⇒ KEEP for retry, never delete
+
+    @Test("A staged row in a QUARANTINED folder is kept for retry, never deleted, however its epochs compare")
+    func quarantinedFolderKeepsTheStagedRowForRetry() async throws {
+        let world = try makeWorld()
+        defer { teardown(world) }
+        resetGlobals()
+
+        // Mid-reaction: the quarantine flag is armed and the STORED epoch is still
+        // the OLD one (the reaction does not advance it until its step-5 stamp), so
+        // the staged row's newer observation "disagrees" without that disagreement
+        // proving anything yet.
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "INBOX",
+                           epoch: Self.epochA, quarantinedAt: Date())
+        try stageRow(world.stagingQueue, messageId: "20",
+                     rfc822: "rfc-quarantined@example.com", observedUidValidity: Self.epochB)
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
+        try await Task.sleep(for: .milliseconds(200))
+
+        // NEVER DROP: the row is still in staging, and nothing was written into the
+        // folder being reset.
+        #expect(try stagingRowExists(world.stagingQueue, id: "acc1:20") == true,
+                "a quarantined folder's staged row must be KEPT for retry, not deleted")
+        let duringQuarantine = try await landed(world.pool, headerId: "acc1:INBOX:20")
+        #expect(duringQuarantine.exists == false,
+                "nothing may be inserted into a folder that is mid-UIDVALIDITY-reset")
+
+        // The reaction completes: quarantine cleared and the fresh epoch stamped in
+        // the same write (`AccountManager.uidValidityResetStampFreshEpoch`). The
+        // SAME kept row must now merge — this is what makes the KEEP a retry rather
+        // than a stall.
+        try await setFolderEpoch(world.pool, accountId: "acc1", folderPath: "INBOX",
+                           epoch: Self.epochB, quarantinedAt: nil)
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: world.stagingPath)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let afterReset = try await landed(world.pool, headerId: "acc1:INBOX:20")
+        #expect(afterReset.exists, "the retained row must merge once the reset settles on the epoch it observed")
+        #expect(afterReset.hasBody)
+        #expect(afterReset.summaryBlurb == "Staged summary")
+        #expect(afterReset.actionTag == "reply")
+
+        try? await Task.sleep(for: .milliseconds(300))
+    }
+}

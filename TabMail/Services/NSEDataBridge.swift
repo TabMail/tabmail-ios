@@ -517,6 +517,124 @@ enum NSEDataBridge {
         return try? DatabaseQueue(path: stagingPath, configuration: config)
     }
 
+    // MARK: - UIDVALIDITY reset purges (T4.S4)
+
+    /// Purge NSE-staged state for ONE folder, as step 4 of the UIDVALIDITY
+    /// purge-and-resync reaction (`AccountManager.runUidValidityResetReaction`).
+    /// PORTED from `v2final`'s `NSEDataBridge.purgeStagedStateForFolder`
+    /// (commit `4d34ee864`). Idempotent: filtering an already-clean snapshot and
+    /// deleting already-gone staging rows are both no-ops, so a crash re-drive may
+    /// call this again freely.
+    ///  - In-memory: filters `latestStagedRows` / `latestStagedBodies`, the same
+    ///    `Mutex.withLock` shape the stale-by-move scrub in `performMerge` uses.
+    ///  - Staging DB: `nse_processed_message WHERE accountId = ? AND folderPath = ?`.
+    ///
+    /// ⚑ THIS PURGE IS BEST-EFFORT AND MUST STAY THAT WAY — it is deliberately
+    /// non-throwing, so the reaction has no failure to abort on. That is NOT an
+    /// exception carved out of an "every purge must succeed" rule; the reaction has
+    /// no such rule (exactly ONE of its step-4 purges aborts, the FTS one, and the
+    /// reasoning is stated at that call site). A staged row this purge misses
+    /// re-inserts a header the reaction removed — which is precisely the RESIDUAL
+    /// the reaction already accepted and bounded BEFORE this helper existed: the
+    /// NSE stages only inbox arrivals, and the next ordinary sync pass stale-sweeps
+    /// a UID the server no longer returns. Aborting the reaction here would trade
+    /// that bounded, self-healing residue for a folder left quarantined with its
+    /// mail already gone.
+    ///
+    /// ⚠ `v2final` justifies the swallow by its D-6 merge epoch guard
+    /// (`detectOldEpochStagedRows`), which v3 does NOT have — the sync-pass sweep
+    /// above is v3's weaker second line. Stated so a later reader does not cite a
+    /// guard this tree lacks.
+    ///
+    /// `stagingPathOverride` mirrors `mergeNSEStagingData`'s test seam — production
+    /// callers never pass it and fall back to `openStagingDB()`, the real App-Group
+    /// file.
+    static func purgeStagedStateForFolder(
+        accountId: String, folderPath: String, stagingPathOverride: String? = nil
+    ) {
+        latestStagedRows.withLock { rows in
+            rows.removeAll { $0.accountId == accountId && $0.folderPath == folderPath }
+        }
+        // `headerIdBelongsToFolder` — NOT a bare `hasPrefix`: on an IMAP server whose
+        // hierarchy delimiter is ':', a nested sibling ("acct:Work:Sub:123") shares
+        // this folder's prefix and must NOT be swept up by its purge.
+        latestStagedBodies.withLock { bodies in
+            let victims = bodies.keys.filter {
+                MessageIdentity.headerIdBelongsToFolder($0, accountId: accountId, folderPath: folderPath)
+            }
+            for key in victims { bodies.removeValue(forKey: key) }
+        }
+        guard let queue = stagingQueueForPurge(stagingPathOverride: stagingPathOverride) else { return }
+        do {
+            try queue.write { db in
+                guard try db.tableExists("nse_processed_message") else { return }
+                try db.execute(
+                    sql: "DELETE FROM nse_processed_message WHERE accountId = ? AND folderPath = ?",
+                    arguments: [accountId, folderPath]
+                )
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[NSEDataBridge] purgeStagedStateForFolder nse_processed_message delete failed for \(accountId.prefix(8)):\(folderPath): \(error)")
+            }
+        }
+    }
+
+    /// Clear `nse_inbox_removal` rows for ONE account. PORTED from `v2final`'s
+    /// `NSEDataBridge.purgeInboxRemovalMarkersForAccount` (commit `4d34ee864`).
+    ///
+    /// ⚑ CALL ONLY WHEN THE FOLDER BEING RESET IS THE ACCOUNT'S INBOX-ROLE FOLDER.
+    /// The table is (account, UID)-keyed with NO folderPath column, so it cannot be
+    /// scoped any narrower — and a removal instruction minted in the OLD epoch would
+    /// otherwise delete a NEW-epoch row that merely reused the same UID (C3). The
+    /// inbox-role gate is what keeps this account-wide delete from firing for a
+    /// non-inbox folder's reset, whose staged removals it has no claim over.
+    ///
+    /// Runs adjacent to (never inside) the main purge transaction — the staging DB
+    /// is a separate file — and is idempotent and best-effort for the same reason
+    /// `purgeStagedStateForFolder` is.
+    static func purgeInboxRemovalMarkersForAccount(accountId: String, stagingPathOverride: String? = nil) {
+        guard let queue = stagingQueueForPurge(stagingPathOverride: stagingPathOverride) else { return }
+        do {
+            try queue.write { db in
+                guard try db.tableExists("nse_inbox_removal") else { return }
+                try db.execute(sql: "DELETE FROM nse_inbox_removal WHERE accountId = ?", arguments: [accountId])
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[NSEDataBridge] purgeInboxRemovalMarkersForAccount failed for \(accountId.prefix(8)): \(error)")
+            }
+        }
+    }
+
+    #if DEBUG
+    /// ⚑ NO REFERENCE — INVENTED (T4.S4). `v2final` threads `stagingPathOverride`
+    /// only through call sites that HAVE one; its reaction calls both purges with no
+    /// override, so on that tree the inbox-role gate and the best-effort swallow are
+    /// unobservable end-to-end and are pinned at the helper only. This ambient
+    /// redirection makes both observable THROUGH the reaction without changing
+    /// `runUidValidityResetReaction`'s signature or any production behaviour: it is
+    /// `nil` in production, compiled out of release entirely, and consulted only when
+    /// the caller passed no explicit override.
+    ///
+    /// `Mutex` rather than `nonisolated(unsafe)` (iOS resilience rule 5).
+    static let purgeStagingPathOverrideForTesting = Mutex<String?>(nil)
+    #endif
+
+    /// Shared resolution for the two purge helpers above — an explicit override
+    /// path (tests) or the real staging DB (`openStagingDB()`).
+    private static func stagingQueueForPurge(stagingPathOverride: String?) -> DatabaseQueue? {
+        if let stagingPathOverride {
+            return try? DatabaseQueue(path: stagingPathOverride)
+        }
+        #if DEBUG
+        if let injected = purgeStagingPathOverrideForTesting.withLock({ $0 }) {
+            return try? DatabaseQueue(path: injected)
+        }
+        #endif
+        return openStagingDB()
+    }
+
     // NOTE (2026-07-07): a `readStagedForDisplay` direct staging-FILE read for the
     // notification-tap path existed here briefly and was REMOVED: consumers reading
     // the file directly RACE the merge's in-memory snapshot publish
@@ -739,6 +857,229 @@ enum NSEDataBridge {
             return stale
         }) ?? []
     }
+
+    // MARK: - Stale-by-EPOCH (T5.10 merge half — ADR-IOS-061)
+    //
+    // The NSE stages a row keyed by a MAILBOX-LOCAL UID (`messageId`). If the
+    // folder's UIDVALIDITY turns over between staging and merge, that UID names a
+    // DIFFERENT physical message — and `DurableIdentityLookup.find`'s STEP 1
+    // (exact-folder `(accountId, folderPath, messageId)`) has no RFC check and no
+    // epoch input at all, so it happily returns the new occupant. Merging onto it
+    // writes this notification's body/summary/action/notified flag onto a message
+    // that is not the one the notification was about: a direct C3 violation.
+    //
+    // Step 2 (folder-blind) already rejects a POSITIVE RFC disagreement, and step 3
+    // is rfc-equality — so the hole this closes is specifically step 1, plus the
+    // rfc-nil tail of step 2. Nothing else on v3 compares a staged row's epoch to
+    // its folder's.
+
+    /// The staged row's epoch disposition against its folder's CURRENT state,
+    /// callable from INSIDE a write transaction. `cache` is a per-TXN memo (a fresh
+    /// dictionary per call site) so repeat rows in one folder cost a single
+    /// `Folder.fetchOne` for the whole pass.
+    ///
+    /// PORT of `v2final`'s `NSEDataBridge.uidValidityStagingRowStatus` (commit
+    /// `4d34ee864`), MINUS its `processedAt < lastUidValidityResetAt` wall-clock
+    /// proxy — SUBTRACT: v3's `Folder` has no `lastUidValidityResetAt` column at
+    /// all. It was deliberately not ported (see `Folder.uidValidityResetPendingAt`'s
+    /// doc: "its sole purpose there is to be the monotonic authority sidecar
+    /// producers compare against, and v3 has no such producer"), so the premise of
+    /// that proxy is absent, not merely unused. What remains is the reference's
+    /// SECOND, timing-immune signal, which is the stronger one anyway: it compares
+    /// EPOCHS directly and never wall-clock order.
+    ///
+    /// Returns both signals because callers treat them differently:
+    ///  - `isOldEpoch` (ARM 1) — the row's observed epoch POSITIVELY disagrees with
+    ///    the folder's stored epoch while the folder is settled. Permanently stale:
+    ///    `observedUidValidity` is immutable staged data, so no retry can ever make
+    ///    it agree. Skipped AND deleted.
+    ///  - `isQuarantined` (ARM 2) — the folder is mid-reaction
+    ///    (`uidValidityResetPendingAt != nil`). KEPT for retry, NEVER deleted: while
+    ///    quarantined the STORED epoch is by construction still the OLD one (the
+    ///    reaction does not advance it until step 5, `uidValidityResetStampFreshEpoch`),
+    ///    so a mismatch here cannot yet distinguish "permanently stale" from
+    ///    "correctly observed the NEW epoch ahead of our own stamp". Deleting on
+    ///    that would be a never-drop violation the instant the stamp lands. Hence
+    ///    the `!entry.isQuarantined` term inside `isOldEpoch`: during quarantine the
+    ///    row is skipped by the caller's own `isQuarantined` guard and re-evaluated
+    ///    next wake, when the stamp has settled and the comparison is decisive.
+    ///
+    /// Fails open (neither signal) when EITHER epoch is `nil` — an unobserved epoch
+    /// (Gmail/Graph, pre-upgrade rows) or a folder that never recorded one. That
+    /// tail is not left uncovered: on the EXISTING-durable-row arm it is caught by
+    /// `nseMergeIdentityConfirmed` instead.
+    ///
+    /// TRI-STATE FOLDER READ (PORT of the reference's Finding-1). A read FAILURE
+    /// (transient `SQLITE_INTERRUPT`, decode error) must NOT collapse to "not
+    /// quarantined" — that would let a genuinely quarantined row merge, or be
+    /// skip-DELETED, on an absence of evidence. An unknown folder state is treated
+    /// as QUARANTINED so the caller KEEPS the row for the next pass, and the failure
+    /// is deliberately NOT cached (a later row in the same folder re-reads and may
+    /// succeed). A successful read returning `nil` (folder genuinely absent) keeps
+    /// the pre-existing not-quarantined behaviour.
+    static func uidValidityStagingRowStatus(
+        msg: StagedMessage,
+        cache: inout [String: (isQuarantined: Bool, lastKnownUidValidity: Int?)],
+        db: Database
+    ) -> (isQuarantined: Bool, isOldEpoch: Bool) {
+        let folderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
+        let entry: (isQuarantined: Bool, lastKnownUidValidity: Int?)
+        if let cached = cache[folderId] {
+            entry = cached
+        } else {
+            let folder: Folder?
+            do {
+                folder = try Folder.fetchOne(db, key: folderId)
+            } catch {
+                return (isQuarantined: true, isOldEpoch: false)
+            }
+            entry = (
+                isQuarantined: folder?.uidValidityResetPendingAt != nil,
+                lastKnownUidValidity: folder?.lastKnownUidValidity
+            )
+            cache[folderId] = entry
+        }
+        let isOldEpoch: Bool = {
+            guard let observed = msg.observedUidValidity,
+                  let stored = entry.lastKnownUidValidity,
+                  observed != stored
+            else { return false }
+            // ARM 2 wins over ARM 1 while the reaction is in flight — see above.
+            return !entry.isQuarantined
+        }()
+        return (entry.isQuarantined, isOldEpoch)
+    }
+
+    /// May this staged row's content be written ONTO the durable row currently
+    /// occupying its composite key? Returns `true` ONLY on POSITIVE evidence, never
+    /// on absence of contradiction.
+    ///
+    /// PORT of `v2final`'s `NSEDataBridge.nseMergeIdentityConfirmed` (commit
+    /// `4d34ee864`) — its (a) RFC / (b) epoch semantics exactly. SUBTRACT: the
+    /// reference delegates to `MessageIdentity.fetchedContentIdentityConfirmed`,
+    /// which does NOT exist on v3 (no such symbol tree-wide), so the two doors are
+    /// expressed directly here. The RFC normalization goes through v3's
+    /// `MessageIdentity.comparableRfc822Identity` — the tree's single
+    /// identity-COMPARISON normalizer (deliberately NOT `usableRfc822Tail`, whose
+    /// extra `':'` rejection exists for key MINTING and would answer "never the same
+    /// message" for a legitimate `no-fold-literal` domain).
+    ///
+    /// Confirmed when EITHER:
+    ///  (a) RFC MATCH — both sides' normalized RFC Message-IDs are present and
+    ///      EQUAL. Present-and-DISAGREE ⇒ NOT confirmed, and RFC disagreement WINS
+    ///      even when the epochs agree (evaluated first, unconditionally).
+    ///  (b) EPOCH CONFIRMED (the rfc-less door) — the staged `observedUidValidity`
+    ///      and the folder's `lastKnownUidValidity` are both present and EQUAL and
+    ///      the folder is NOT quarantined ⇒ the UID is provably meaningful under the
+    ///      folder's CURRENT epoch.
+    ///
+    /// Anything else — rfc unusable on either side AND no epoch agreement — is NOT
+    /// confirmed. Provider-blind by design: Gmail/Graph rows leave
+    /// `observedUidValidity` nil but always carry an RFC, so they confirm through
+    /// (a); the only population this refuses is the rfc-less IMAP/iCloud row with no
+    /// epoch baseline.
+    static func nseMergeIdentityConfirmed(
+        msg: StagedMessage, existingRfc: String?, folderEpoch: Int?, folderQuarantined: Bool
+    ) -> Bool {
+        // (a) RFC door — unconditional and first: a positive disagreement is proof
+        // of two different messages and no epoch agreement may override it.
+        if let stagedRfc = MessageIdentity.comparableRfc822Identity(msg.rfc822MessageId),
+           let durableRfc = MessageIdentity.comparableRfc822Identity(existingRfc) {
+            return stagedRfc == durableRfc
+        }
+        // (b) Epoch door — only for rows the RFC door could not adjudicate.
+        guard !folderQuarantined,
+              let observed = msg.observedUidValidity,
+              let stored = folderEpoch
+        else { return false }
+        return observed == stored
+    }
+
+    /// Pre-transaction ARM-1 sweep: the staged rows whose observed epoch positively
+    /// disagrees with their folder's settled epoch. PORT of `v2final`'s
+    /// `NSEDataBridge.detectOldEpochStagedRows` (commit `4d34ee864`), delegating the
+    /// per-row decision to `uidValidityStagingRowStatus` — the SINGLE disposition
+    /// this pass and the in-txn re-checks both consult, so they cannot drift.
+    ///
+    /// ⚑ THIS PASS IS NOT THE GUARD. It runs before `partitionByStageMemo` so an
+    /// old-epoch row never enters `writeSet`/`skipSet` (a `skipSet` row reaches
+    /// NEITHER write transaction, so only this pass can catch that one) — but it is
+    /// TOCTOU-open on its own: a reset completing between this read and the write
+    /// transactions would slip past. The actual guard is the per-row
+    /// `uidValidityStagingRowStatus` call INSIDE each phase's write closure.
+    ///
+    /// Reuses `StaleByMoveRow` — same shape (staging-row id + STAGED headerId), same
+    /// skip-and-delete contract.
+    static func detectOldEpochStagedRows(_ processed: [StagedMessage]) async -> [StaleByMoveRow] {
+        guard !processed.isEmpty else { return [] }
+        return (try? await AppDatabase.rawPool.read { db -> [StaleByMoveRow] in
+            var stale: [StaleByMoveRow] = []
+            var cache: [String: (isQuarantined: Bool, lastKnownUidValidity: Int?)] = [:]
+            for msg in processed {
+                let (_, isOldEpoch) = uidValidityStagingRowStatus(msg: msg, cache: &cache, db: db)
+                guard isOldEpoch else { continue }
+                stale.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
+                    accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+                )))
+            }
+            return stale
+        }) ?? []
+    }
+
+    /// Shared skip-and-delete cleanup for epoch-stale / identity-unconfirmed staged
+    /// rows: deletes them from `nse_processed_message` and scrubs them out of the
+    /// already-published in-memory snapshots + the stage memo. PORT of `v2final`'s
+    /// `NSEDataBridge.applyOldEpochStagingCleanup` (commit `4d34ee864`). Called by
+    /// the pre-txn pass AND by phase 1/2's in-txn discoveries, so every disposition
+    /// that drops a row drops it the same way.
+    ///
+    /// The staging delete is idempotent — a failure just leaves the row for the next
+    /// wake, which re-evaluates and re-drops it.
+    static func applyOldEpochStagingCleanup(_ rows: [StaleByMoveRow], nseDB: DatabaseQueue) async {
+        guard !rows.isEmpty else { return }
+        let stagingIds = Set(rows.map(\.id))
+        let headerIds = Set(rows.map(\.headerId))
+        do {
+            try await nseDB.write { db in
+                for id in stagingIds {
+                    try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                }
+            }
+        } catch {
+            if !error.isDatabaseSuspensionAbort {
+                print("[NSEDataBridge] Old-epoch staged row delete failed: \(error) — retried next wake (idempotent)")
+            }
+        }
+        latestStagedRows.withLock { rowsBox in
+            rowsBox.removeAll { headerIds.contains($0.headerId) }
+        }
+        latestStagedBodies.withLock { bodies in
+            for hid in headerIds { bodies.removeValue(forKey: hid) }
+        }
+        stageMemo.withLock { memo in
+            for id in stagingIds { memo.removeValue(forKey: id) }
+        }
+    }
+
+    /// Thrown from inside a phase-1/phase-2 per-message savepoint when
+    /// `nseMergeIdentityConfirmed` refuses the EXISTING durable row (ARM 3). Rolls
+    /// the savepoint back — so NOTHING of this staged row's content lands on a row
+    /// it cannot claim — and routes to the same skip-and-delete disposition as an
+    /// ARM-1 discovery rather than the ordinary "left in staging for retry" path.
+    /// PORT of `v2final`'s `NSEDataBridge.NSERfcMismatchDiscovered`.
+    ///
+    /// ⚑ DELIBERATE DEVIATION, and it is why this carries NO payload where the
+    /// reference's carries the durable `headerId`: `v2final` builds the resulting
+    /// `StaleByMoveRow` from the DURABLE row's id, but every consumer of
+    /// `StaleByMoveRow.headerId` (`applyOldEpochStagingCleanup`'s `latestStagedRows`
+    /// / `latestStagedBodies` scrub) keys off the STAGED headerId —
+    /// `StaleByMoveRow`'s own doc comment says so explicitly ("NOT the durable row's
+    /// id"). The two coincide for a `DurableIdentityLookup.find` STEP-1 hit and
+    /// diverge for a step-2 rfc-nil hit, where the reference's scrub would silently
+    /// miss the published phantom. The staged headerId is therefore rebuilt at the
+    /// catch site, and the durable id — needed only for the diagnostic — is logged
+    /// at the throw site, where it is already in hand.
+    private struct NSERfcMismatchDiscovered: Error {}
 
     /// Test-only seam: reset the process-global stage memo between tests so
     /// state can't leak across cases. Internal (not `#if DEBUG`) — same
@@ -1001,6 +1342,40 @@ enum NSEDataBridge {
             BootProfiler.mark("merge: invalidated \(staleByMove.count) stale staged row(s) — durable header moved out of staged folder")
         }
 
+        // ============================================================
+        // STALE-BY-EPOCH DETECTION (T5.10 merge half, ADR-IOS-061 — ARM 1).
+        //
+        // Same shape as STALE-BY-MOVE above, but the signal is "this folder's
+        // UIDVALIDITY turned over after this row was staged" instead of "this
+        // message moved out of the staged folder". The row's UID now names a
+        // DIFFERENT physical message, so merging it would land this
+        // notification's content on a message it was never about (C3). See
+        // `detectOldEpochStagedRows` / `uidValidityStagingRowStatus` for the
+        // full rationale, including why a QUARANTINED folder's rows are KEPT
+        // here rather than dropped.
+        //
+        // Runs AFTER stale-by-move (independent checks; a row caught by both is
+        // harmlessly excluded once) and BEFORE the stage-memo partition — so an
+        // old-epoch row never enters `writeSet`/`skipSet`. That ordering is
+        // load-bearing for one case the in-txn guards structurally cannot see: a
+        // `skipSet` row reaches NEITHER write transaction.
+        //
+        // NOTE (TOCTOU): this pre-txn read is a FIRST PASS, not the guard. A
+        // reset completing after this read but before phase 1/2's write txns is
+        // caught independently by the per-row `uidValidityStagingRowStatus`
+        // check inside each phase's own write closure, which reports its finds
+        // to `applyOldEpochStagingCleanup` for the identical treatment.
+        // ============================================================
+        let oldEpochStaged = await Self.detectOldEpochStagedRows(processed)
+        if !oldEpochStaged.isEmpty {
+            scrubbedStaleStagedRows = true
+            let oldEpochStagingIds = Set(oldEpochStaged.map(\.id))
+            // Exclude from every subsequent merge step this wake.
+            processed = processed.filter { !oldEpochStagingIds.contains($0.id) }
+            await Self.applyOldEpochStagingCleanup(oldEpochStaged, nseDB: nseDB)
+            BootProfiler.mark("merge: discarded \(oldEpochStaged.count) old-epoch staged row(s) — observed UIDVALIDITY disagrees with the folder's settled epoch")
+        }
+
         if !processed.isEmpty {
             // ============================================================
             // STAGE-MEMO SKIP.
@@ -1068,11 +1443,50 @@ enum NSEDataBridge {
             // queue behind / hold the single GRDB writer for nothing.
             if !writeSet.isEmpty {
             do {
-                phase1HeaderIds = try await AppDatabase.dbPool.write(label: "merge.phase1") { db -> [String] in
+                let phase1Result: (
+                    headerIds: [String],
+                    discoveredOldEpoch: [StaleByMoveRow]
+                ) = try await AppDatabase.dbPool.write(label: "merge.phase1") { db in
                     // Writer acquired — everything before here was queue + writer-lock wait.
                     phase1LoopStart.withLock { $0 = CFAbsoluteTimeGetCurrent() }
                     var localIds: [String] = []
+                    var localDiscoveredOldEpoch: [StaleByMoveRow] = []
+                    // T5.10 IN-TXN epoch guard (ADR-IOS-061 — this, not the
+                    // pre-txn pass above, is the guard). Memoized per folderId
+                    // for this pass. Re-reading the folder INSIDE the write txn
+                    // is what closes the TOCTOU window: a reset that completed
+                    // after `detectOldEpochStagedRows`' read still gets caught
+                    // right here, before anything durable is written.
+                    var folderEpochCache: [String: (isQuarantined: Bool, lastKnownUidValidity: Int?)] = [:]
                     for msg in writeSet {
+                        let msgFolderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
+                        let (isQuarantined, isOldEpoch) = Self.uidValidityStagingRowStatus(
+                            msg: msg, cache: &folderEpochCache, db: db
+                        )
+                        // ARM 1 — the observed epoch POSITIVELY disagrees with the
+                        // folder's settled epoch. Permanently stale (the stamp is
+                        // immutable staged data), so skip AND delete.
+                        if isOldEpoch {
+                            localDiscoveredOldEpoch.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
+                                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+                            )))
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[NSEDataBridge] Merge phase 1: \(msg.id) OLD-EPOCH in-txn (folder \(msgFolderId) turned over after this row was staged) — skip-and-delete")
+                            }
+                            continue
+                        }
+                        // ARM 2 — the folder is mid-reaction. KEEP for retry,
+                        // NEVER delete: the stored epoch is still the OLD one by
+                        // construction, so no comparison is decisive yet. Same
+                        // contract as a savepoint failure — the row stays staged
+                        // and is re-evaluated once the reaction's step-5 stamp
+                        // lands (or a later wake finds the quarantine cleared).
+                        guard !isQuarantined else {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[NSEDataBridge] Merge phase 1 skipping \(msg.id) — folder \(msgFolderId) in UIDVALIDITY quarantine (kept for retry)")
+                            }
+                            continue
+                        }
                         // Per-message savepoint: a failure leaves THIS row in
                         // staging for retry (same contract as phase 2's loop) —
                         // siblings still commit.
@@ -1085,7 +1499,50 @@ enum NSEDataBridge {
                                     db: db, accountId: msg.accountId, folderPath: msg.folderPath,
                                     messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId
                                 )
-                                if let id = existingRef?.id {
+                                if let ref = existingRef {
+                                    let id = ref.id
+                                    // ARM 3 — seed onto an EXISTING durable row ONLY
+                                    // on POSITIVE identity evidence: an RFC match, or
+                                    // (rfc-less) an epoch-confirmed folder. Both
+                                    // rfc-DISAGREE and the rfc-nil + epoch-nil NULL
+                                    // tail fail here and route to skip-and-delete.
+                                    // This is where misattribution actually happens —
+                                    // `DurableIdentityLookup.find` step 1 matches on a
+                                    // bare `(accountId, folderPath, UID)` with no RFC
+                                    // and no epoch input, so after a turnover it hands
+                                    // back the NEW occupant of that UID.
+                                    //
+                                    // ⚑ THIS DOES NOT WEAKEN "a NULL identity stamp
+                                    // means RE-FETCH, NEVER DESTROY". That rule forbids
+                                    // destroying DURABLE USER DATA on the strength of a
+                                    // NULL. Nothing durable is destroyed here: the arm
+                                    // REFUSES TO WRITE without positive proof, and then
+                                    // deletes only a STAGING-SCRATCH row that can never
+                                    // become provable — `observedUidValidity` is
+                                    // immutable staged data, so a retry re-reads the
+                                    // same NULL, and `stageHeader`'s on-conflict
+                                    // retains the old payload, meaning a KEPT row would
+                                    // re-poison whatever later message occupies the
+                                    // same address. The user's mail is not lost:
+                                    // ordinary sync re-fetches it. The cost is wasted
+                                    // NSE AI work plus one main-app recompute — which
+                                    // is exactly what that rule prescribes, and the NSE
+                                    // is best-effort by policy while C3 is not.
+                                    //
+                                    // The folder is provably NOT quarantined here (ARM
+                                    // 2 `continue`d those rows above), so the epoch
+                                    // door is being asked against a settled epoch.
+                                    let folderStatus = folderEpochCache[msgFolderId]
+                                    guard Self.nseMergeIdentityConfirmed(
+                                        msg: msg, existingRfc: ref.rfc822MessageId,
+                                        folderEpoch: folderStatus?.lastKnownUidValidity,
+                                        folderQuarantined: folderStatus?.isQuarantined ?? false
+                                    ) else {
+                                        if DebugModeManager.isLoggingEnabled() {
+                                            print("[NSEDataBridge] Merge phase 1: \(msg.id) identity NOT confirmed vs existing row \(id) (rfc/epoch) — refusing snippet seed, skip-and-delete")
+                                        }
+                                        throw NSERfcMismatchDiscovered()
+                                    }
                                     // Already visible (sync or a prior merge). SEED
                                     // the snippet ONLY if the header has none yet —
                                     // so the fast header render has something to
@@ -1131,6 +1588,21 @@ enum NSEDataBridge {
                                 }
                                 return .commit
                             }
+                        } catch is NSERfcMismatchDiscovered {
+                            // ARM 3. The savepoint rolled back, so NOTHING of this
+                            // staged row landed on the row it could not claim.
+                            // Route to the SAME skip-and-delete disposition as an
+                            // ARM-1 discovery — never "left in staging for retry",
+                            // which would re-attempt the identical unprovable match
+                            // against the identical (correct, unrelated) header on
+                            // every future wake.
+                            //
+                            // The STAGED headerId — see `NSERfcMismatchDiscovered`'s
+                            // doc for why the durable id (logged at the throw site)
+                            // must not be used for the snapshot scrub.
+                            localDiscoveredOldEpoch.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
+                                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+                            )))
                         } catch {
                             // Savepoint rolled back + re-threw; outer tx still
                             // alive. Row stays in staging (phase 2 re-attempts it
@@ -1139,7 +1611,12 @@ enum NSEDataBridge {
                         }
                     }
                     phase1BodyEnd.withLock { $0 = CFAbsoluteTimeGetCurrent() }
-                    return localIds
+                    return (localIds, localDiscoveredOldEpoch)
+                }
+                phase1HeaderIds = phase1Result.headerIds
+                if !phase1Result.discoveredOldEpoch.isEmpty {
+                    scrubbedStaleStagedRows = true
+                    await Self.applyOldEpochStagingCleanup(phase1Result.discoveredOldEpoch, nseDB: nseDB)
                 }
                 if DebugModeManager.isLoggingEnabled() {
                     let loopStart = phase1LoopStart.withLock { $0 }
@@ -1267,7 +1744,7 @@ enum NSEDataBridge {
                 // late-surfacing residual is writer contention, not the write itself.
                 let writeReqT0 = CFAbsoluteTimeGetCurrent()
                 BootProfiler.mark("merge: requesting GRDB writer for \(writeSet.count) staged msg(s)")
-                let writeResult: (ids: [String], committed: Int, fts: [NSEFTSBodyItem], headers: [String], realChanged: Bool, committedIds: [String]) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
+                let writeResult: (ids: [String], committed: Int, fts: [NSEFTSBodyItem], headers: [String], realChanged: Bool, committedIds: [String], discoveredOldEpoch: [StaleByMoveRow]) = try await AppDatabase.dbPool.write(label: "merge.body") { db in
                     BootProfiler.mark("merge: GRDB writer ACQUIRED after \(Int((CFAbsoluteTimeGetCurrent() - writeReqT0) * 1000))ms wait")
                     // Connection-level write counter snapshot. The delta over this
                     // whole transaction tells us whether phase 2 changed anything
@@ -1283,7 +1760,38 @@ enum NSEDataBridge {
                     var localCommittedMsgIds: [String] = []
                     var localFtsAccumulator: [NSEFTSBodyItem] = []
                     var localHeaderAccumulator: [String] = []
+                    var localDiscoveredOldEpoch: [StaleByMoveRow] = []
+                    // T5.10 IN-TXN epoch guard, phase 2's own copy. Phase 1's
+                    // per-message skip is NOT sufficient on its own: a row phase 1
+                    // SKIPPED (ARM 2, quarantine) is indistinguishable here from a
+                    // row whose phase-1 savepoint merely FAILED, and phase 2's
+                    // new-header branch is the documented fallback for exactly that
+                    // case — so without this guard phase 2 would cheerfully insert
+                    // the row phase 1 correctly refused. Same per-txn memo shape.
+                    var folderEpochCache: [String: (isQuarantined: Bool, lastKnownUidValidity: Int?)] = [:]
                     for msg in writeSet {
+                        let msgFolderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
+                        let (isQuarantined, isOldEpoch) = Self.uidValidityStagingRowStatus(
+                            msg: msg, cache: &folderEpochCache, db: db
+                        )
+                        // ARM 1 — positive epoch disagreement, folder settled.
+                        // Permanently stale: skip AND delete.
+                        if isOldEpoch {
+                            localDiscoveredOldEpoch.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
+                                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+                            )))
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[NSEDataBridge] Merge phase 2: \(msg.id) OLD-EPOCH in-txn (folder \(msgFolderId) turned over after this row was staged) — skip-and-delete")
+                            }
+                            continue
+                        }
+                        // ARM 2 — folder mid-reaction: KEEP for retry, never delete.
+                        guard !isQuarantined else {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[NSEDataBridge] Merge phase 2 skipping \(msg.id) — folder \(msgFolderId) in UIDVALIDITY quarantine (kept for retry)")
+                            }
+                            continue
+                        }
                         // Per-message savepoint: a single bad row (FK
                         // violation, ThreadUtils throw, FTS contention, etc.)
                         // rolls back JUST that row, not the entire batch. The
@@ -1338,6 +1846,42 @@ enum NSEDataBridge {
                                     // case (no drift) these are identical.
                                     let existingFolderPath: String = ref.folderPath
                                     let existingRfc822: String? = ref.rfc822MessageId
+
+                                    // ARM 3 — merge body / summary / actionTag /
+                                    // notified / reach-out / AI-cache onto an
+                                    // EXISTING durable row ONLY on POSITIVE identity
+                                    // evidence: an RFC match, or (rfc-less) an
+                                    // epoch-confirmed folder. rfc-DISAGREE and the
+                                    // rfc-nil + epoch-nil NULL tail BOTH fail here.
+                                    // This arm is strictly heavier than phase 1's:
+                                    // phase 1 only seeds a snippet, whereas an
+                                    // unproven match HERE stamps a whole foreign body
+                                    // (and `bodyComplete`) plus AI cache onto a
+                                    // reset-reused row, permanently — and that row's
+                                    // own later summary job then reads the poisoned
+                                    // value as a cache HIT.
+                                    //
+                                    // ⚑ NOT A WEAKENING OF "a NULL identity stamp
+                                    // means RE-FETCH, NEVER DESTROY" — see phase 1's
+                                    // ARM-3 comment for the full argument. Nothing
+                                    // durable is destroyed: the write is REFUSED for
+                                    // want of proof, and only a staging-scratch row
+                                    // that can never become provable is deleted, with
+                                    // ordinary sync re-fetching the message.
+                                    //
+                                    // The folder is provably NOT quarantined here
+                                    // (ARM 2 `continue`d those rows above).
+                                    let folderStatus = folderEpochCache[msgFolderId]
+                                    guard Self.nseMergeIdentityConfirmed(
+                                        msg: msg, existingRfc: existingRfc822,
+                                        folderEpoch: folderStatus?.lastKnownUidValidity,
+                                        folderQuarantined: folderStatus?.isQuarantined ?? false
+                                    ) else {
+                                        if DebugModeManager.isLoggingEnabled() {
+                                            print("[NSEDataBridge] Merge phase 2: \(msg.id) identity NOT confirmed vs existing row \(headerId) (rfc/epoch) — refusing merge, skip-and-delete")
+                                        }
+                                        throw NSERfcMismatchDiscovered()
+                                    }
 
                                     // GRADUAL MERGE (header→body→summary→action):
                                     // apply each staged piece as it becomes present
@@ -1562,6 +2106,20 @@ enum NSEDataBridge {
                             if msg.aiCompleted || msg.processedAt < abandonedCutoff {
                                 localMergedIds.append(msg.id)
                             }
+                        } catch is NSERfcMismatchDiscovered {
+                            // ARM 3. The savepoint rolled back — no body, no
+                            // summary, no action, no notified flag, no AI cache
+                            // entry landed on the row this staged content could
+                            // not claim. Skip-and-delete, NOT retry: the staged
+                            // stamp is immutable, so the identical unprovable
+                            // match would recur on every future wake.
+                            //
+                            // The STAGED headerId — the id logged at the throw
+                            // site is the DURABLE row's, which the snapshot scrub
+                            // must not key off. See `NSERfcMismatchDiscovered`.
+                            localDiscoveredOldEpoch.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
+                                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
+                            )))
                         } catch {
                             // inSavepoint already rolled back the savepoint
                             // and re-threw the error; the outer transaction
@@ -1572,7 +2130,7 @@ enum NSEDataBridge {
                         }
                     }
                     let tcEnd = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
-                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart, committedIds: localCommittedMsgIds)
+                    return (ids: localMergedIds, committed: localCommitted, fts: localFtsAccumulator, headers: localHeaderAccumulator, realChanged: tcEnd > tcStart, committedIds: localCommittedMsgIds, discoveredOldEpoch: localDiscoveredOldEpoch)
                 }
                 // Reaching this line means dbPool.write returned normally —
                 // GRDB has committed the outer tx and every released savepoint
@@ -1586,6 +2144,13 @@ enum NSEDataBridge {
                 allMergedHeaderIds = writeResult.headers
                 mainWriteChanged = writeResult.realChanged
                 outerCommitted = true
+                // ARM 1 / ARM 3 discoveries made INSIDE this write txn. Applied
+                // only after the outer commit returned normally — the same gate
+                // every other post-tx cleanup here observes.
+                if !writeResult.discoveredOldEpoch.isEmpty {
+                    scrubbedStaleStagedRows = true
+                    await Self.applyOldEpochStagingCleanup(writeResult.discoveredOldEpoch, nseDB: nseDB)
+                }
                 // Main tx done. With the "writer ACQUIRED after Xms" mark above this
                 // decomposes the merge: START→found = read; found→ACQUIRED = writer
                 // wait (contention); ACQUIRED→here = the actual main write; here→DONE
@@ -2710,6 +3275,22 @@ enum NSEDataBridge {
         let attachmentsJSON: String?
         let icsText: String?
         let hasUnresolvedCIDs: Bool
+        /// The UIDVALIDITY the NSE's OWN live SELECT observed at fetch time
+        /// (IMAP only; `nil` for Gmail/Graph, and for any row staged before the
+        /// `nse_processed_message.observedUidValidity` column existed). Written by
+        /// `NSEStagingDB.stageHeader` / `persistProcessedMessage` in the extension
+        /// process; read HERE, in the main app, usually after that process is gone
+        /// — which is why it had to be a durable column and not process-local
+        /// state. Consumed by `uidValidityStagingRowStatus` and
+        /// `nseMergeIdentityConfirmed`.
+        ///
+        /// PORT of `v2final`'s `NSEDataBridge.StagedMessage.observedUidValidity`
+        /// (commit `4d34ee864`), including its `var`-not-`let` rationale: a `let`
+        /// with a default is EXCLUDED from the synthesized memberwise initializer
+        /// entirely, whereas a `var` with one participates with that default — so
+        /// every pre-existing `StagedMessage(...)` construction site (merge helpers
+        /// and their tests) compiles unchanged.
+        var observedUidValidity: Int? = nil
     }
 
     /// Body of the "insert new MessageHeader from NSE staging" branch of
@@ -3024,6 +3605,20 @@ extension NSEDataBridge.StagedMessage {
     /// Decode a `nse_processed_message` staging row. Any column change lands
     /// HERE once (see `StagedMessage`'s keep-in-sync doc).
     init(row: GRDB.Row) {
+        // ⚠ NULL-SAFE BY CONSTRUCTION, and it must stay that way. GRDB's `Row`
+        // subscript is overloaded on the RESULT type: `-> Value` TRAPS on a NULL
+        // (and on a missing column), `-> Value?` returns `nil` for both. Binding
+        // through an explicitly-typed `Int?` local forces the optional overload to
+        // be selected regardless of how the call site is later refactored. A trap
+        // here would crash the whole merge on the first unstamped row — and an
+        // unstamped row is the COMMON case (every Gmail/Graph row, and every row
+        // staged by an NSE that predates the column). The MISSING-column case is
+        // equally real and equally must decode `nil`: the column is added by
+        // `NSEStagingDB.ensureObservedUidValidityColumn` in the EXTENSION process,
+        // so a device whose NSE has never run still has a table without it — the
+        // same "tolerate a column this DB may not have yet" contract the
+        // `folderPath`/`folderId` fallback just below already relies on.
+        let observedEpoch: Int? = row["observedUidValidity"]
         self.init(
             id: row["id"],
             accountId: row["accountId"],
@@ -3068,7 +3663,8 @@ extension NSEDataBridge.StagedMessage {
             textContent: row["textContent"],
             attachmentsJSON: row["attachmentsJSON"],
             icsText: row["icsText"],
-            hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1
+            hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1,
+            observedUidValidity: observedEpoch
         )
     }
 
