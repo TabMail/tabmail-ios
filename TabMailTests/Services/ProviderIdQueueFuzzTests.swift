@@ -283,7 +283,14 @@ struct ProviderIdQueueFuzzTests {
     /// runs), so the queue sees a connection error and REQUEUES — the transient
     /// leg, never a drop leg.
     ///
-    private static let killFragments = ["LOGIN", "SELECT", "UID STORE", "UID MOVE"]
+    /// ⚠ `UID COPY`, not `UID MOVE`. T3.15 stopped the action path from calling
+    /// `SwiftMail.IMAPServer.move` at all (it reaches an uninstrumentable
+    /// COPY→STORE→EXPUNGE with no epoch check between steps, and a bare
+    /// mailbox-wide `EXPUNGE` on its no-UIDPLUS leg), so `IMAPProvider.move` now
+    /// issues its own `UID COPY` + `UID STORE` + `UID EXPUNGE`. A `UID MOVE`
+    /// fragment would never match again — leaving this step a silent no-op and
+    /// the move path's transient-kill coverage quietly dead.
+    private static let killFragments = ["LOGIN", "SELECT", "UID STORE", "UID COPY"]
 
     // MARK: - Round identities
 

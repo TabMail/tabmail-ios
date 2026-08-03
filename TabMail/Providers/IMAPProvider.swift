@@ -664,6 +664,68 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - Action Connection API
 
+    /// T3.3 — marker for "the mailbox this action names is CONFIRMED gone".
+    ///
+    /// PORT — `v2final:TabMail/Providers/IMAPProvider.swift`,
+    /// `IMAPProvider.IMAPActionMailboxAbsent`. Deliberately `private`: nothing
+    /// outside this file can name the type, so it can never become a
+    /// classification input anywhere except the swallow sites in this file.
+    ///
+    /// Under the provider-id queue every propagated throw means "transient —
+    /// retry", so a mailbox that no longer exists would otherwise pin its lane
+    /// forever behind a command no server can ever satisfy. A caller with a
+    /// defined "the mailbox is gone ⇒ nothing left to do" outcome catches this
+    /// and returns normally. Callers with no such outcome
+    /// (`fetchAttachment`, `appendToSentFolder`, `saveDraft`) let it propagate
+    /// exactly like the SELECT failure it stands in for — same throw, same
+    /// retry classification, only a different error value.
+    private struct IMAPActionMailboxAbsent: Error {}
+
+    /// T3.3 — authoritative existence probe, used ONLY after a SELECT has
+    /// already failed on an ACTION path.
+    ///
+    /// PORT — `v2final:…:IMAPProvider.mailboxConfirmedAbsent(_:server:)`,
+    /// body and policy unchanged. `IMAPError.selectFailed`'s reason text is
+    /// server-defined and not machine-parseable, so this never inspects it: a
+    /// LIST for the exact mailbox name is the only authority.
+    ///   - LIST succeeds and no mailbox carries this exact name → confirmed
+    ///     absent (authoritative stale — the whole op is a no-op).
+    ///   - LIST succeeds and the mailbox IS present → the original SELECT
+    ///     failure was transient (permissions hiccup, momentary server
+    ///     glitch); the caller rethrows it and the op retries.
+    ///   - LIST itself fails → uncertainty, NOT absence; the caller rethrows
+    ///     the original SELECT failure. Fail-closed in the safe direction:
+    ///     "don't know" never becomes "gone".
+    /// Runs on the SAME connection that just failed SELECT — a tagged NO/BAD
+    /// response does not kill an IMAP connection (only a connection-level
+    /// failure does, and the caller's release classifies that separately).
+    /// `folder` is passed as the literal LIST pattern (it carries no wildcard
+    /// characters), which servers treat as an exact-match query, and the
+    /// result is STILL matched on the exact name so a server that answers with
+    /// a prefix/substring neighbour cannot be misread as presence.
+    private func mailboxConfirmedAbsent(_ folder: String, server: IMAPServer) async -> Bool {
+        guard let mailboxes = try? await server.listMailboxes(wildcard: folder) else {
+            return false
+        }
+        return !mailboxes.contains { $0.name == folder }
+    }
+
+    /// Health classification + release for a failed action checkout, extracted
+    /// so the SELECT leg and the body leg of `withActionConnectionSelection`
+    /// share ONE implementation (T3.3 gave the SELECT its own leg).
+    ///
+    /// Deliberately NOT shared with `withActionConnectionNoSelect`: that
+    /// wrapper does not call `parseAndApplyServerLimit`, and reusing this
+    /// helper there would silently change its behaviour.
+    private func releaseActionConnectionAfterFailure(_ error: Error) {
+        let desc = "\(error)"
+        let isUnhealthy = SyncEngine.isConnectionError(error)
+            || desc.contains("PayloadTooLargeError")
+            || desc.contains("IMAPDecoderError")
+        if isUnhealthy { parseAndApplyServerLimit(from: error) }
+        releaseActionConnection(healthy: !isUnhealthy)
+    }
+
     /// Execute a user-initiated operation on the reserved action connection.
     /// SELECTs the folder per-operation (~150ms). Never blocked by background work.
     private func withActionConnection<T>(
@@ -693,8 +755,29 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         _ body: (IMAPServer, Mailbox.Selection) async throws -> T
     ) async throws -> T {
         let server = try await acquireActionConnection()
+        let selection: Mailbox.Selection
         do {
-            let selection = try await server.selectMailbox(folder)
+            selection = try await server.selectMailbox(folder)
+        } catch {
+            // T3.3 PORT — `v2final`'s `withActionConnectionSelection` SELECT
+            // catch. A SELECT failure here can mean the mailbox this action
+            // names was deleted remotely between enqueue and drain (terminal:
+            // nothing to act on), or it can be transient (auth hiccup,
+            // connection drop, malformed response — must retry). Only the LIST
+            // probe can tell the two apart; the NO response's own text never
+            // decides it. The connection is released with the ORIGINAL error so
+            // pool-health classification is unchanged either way.
+            let confirmedAbsent = await mailboxConfirmedAbsent(folder, server: server)
+            releaseActionConnectionAfterFailure(error)
+            if confirmedAbsent {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[IMAP] Action SELECT failed and LIST confirms '\(folder)' is absent — terminal, not transient")
+                }
+                throw IMAPActionMailboxAbsent()
+            }
+            throw error
+        }
+        do {
             #if DEBUG
             // T0.6(a) test seam — action-pool sibling of
             // `folderConnectionTestHook`. Fires once per checkout, after the
@@ -707,12 +790,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             releaseActionConnection(healthy: true)
             return result
         } catch {
-            let desc = "\(error)"
-            let isUnhealthy = SyncEngine.isConnectionError(error)
-                || desc.contains("PayloadTooLargeError")
-                || desc.contains("IMAPDecoderError")
-            if isUnhealthy { parseAndApplyServerLimit(from: error) }
-            releaseActionConnection(healthy: !isUnhealthy)
+            releaseActionConnectionAfterFailure(error)
             throw error
         }
     }
@@ -1806,14 +1884,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         add: Bool
     ) async throws {
         let uidSet = try nativeUIDSet(ids)
-        try await withActionConnectionSelection(folder: folder) { server, wrapperSelection in
-            try self.requireUidValidity(
-                wrapperSelection, expected: admittedUidValidity, folder: folder)
-            let mutationSelection = try await self.selectMailboxTracked(server, folder: folder)
-            try self.requireUidValidity(
-                mutationSelection, expected: admittedUidValidity, folder: folder)
-            try await server.store(
-                flags: flags, on: uidSet, operation: add ? .add : .remove)
+        do {
+            try await withActionConnectionSelection(folder: folder) { server, wrapperSelection in
+                try self.requireUidValidity(
+                    wrapperSelection, expected: admittedUidValidity, folder: folder)
+                let mutationSelection = try await self.selectMailboxTracked(server, folder: folder)
+                try self.requireUidValidity(
+                    mutationSelection, expected: admittedUidValidity, folder: folder)
+                try await server.store(
+                    flags: flags, on: uidSet, operation: add ? .add : .remove)
+            }
+        } catch is IMAPActionMailboxAbsent {
+            // T3.3 PORT — `v2final:…:IMAPProvider.mutateActionMessages`' catch
+            // arm. The mailbox holding these UIDs is CONFIRMED gone, so the
+            // messages are gone with it: there is nothing to flag, and the flag
+            // state of a destroyed mailbox is not a thing a retry can ever
+            // reach. Terminal no-op rather than a lane pinned on an
+            // unsatisfiable STORE.
         }
     }
 
@@ -1871,11 +1958,40 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         throw ProviderError.actionIdentityResolutionFailed(ids.first ?? "")
     }
 
-    /// T2.7 provider-native move. The native source UID has no cross-mailbox
-    /// identity, so v2final's RFC destination recovery/probe is SUBTRACTED.
-    /// Source selections are attempt-local and reasserted before every
-    /// source mutation; non-UIDPLUS falls back to COPY + scoped soft-delete,
-    /// never mailbox-wide EXPUNGE.
+    /// T2.7 provider-native move, hardened by T3.1 / T3.2 / T3.3 / T3.12 / T3.15.
+    ///
+    /// The native source UID has no cross-mailbox identity, so v2final's RFC
+    /// destination recovery/probe is SUBTRACTED — `idempotentMove`'s `.exact` /
+    /// `.ambiguous` arms, its `resolveActionMessage` destination resolution and
+    /// its post-move verification all rest on an rfc822 Message-ID this path
+    /// deliberately never carries. What IS ported is everything in that
+    /// function that does not depend on RFC identity:
+    ///
+    ///  - T3.3: the destination is probed for EXISTENCE before any source
+    ///    mutation, and a confirmed-absent destination makes the whole op a
+    ///    terminal no-op instead of an unsatisfiable retry.
+    ///  - T3.1: the source epoch is reasserted immediately before EVERY source
+    ///    mutation — five assertions, structurally one per step boundary, not a
+    ///    list to be shortened.
+    ///  - T3.12: `Task.checkCancellation()` between mutation steps, so an
+    ///    abandoned (timed-out) Task dies at a step boundary instead of
+    ///    completing a second mutation.
+    ///  - T3.2: the purge tail is UID EXPUNGE or NOTHING. Never a bare EXPUNGE.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED (owner-directed): **this does not call
+    /// `server.move`.** SwiftMail's `IMAPServer.move(messages:to:)` issues a
+    /// real `UID MOVE` only when the server advertises MOVE; otherwise it runs
+    /// COPY → STORE `\Deleted` → `expungeMoveFallback` as three separate wire
+    /// commands with NO epoch check between them, and `expungeMoveFallback`
+    /// degrades to a BARE, mailbox-wide `EXPUNGE` whenever the identifier set
+    /// is not a UIDPLUS-backed `UIDSet`. Neither hazard is guardable from
+    /// outside the call: we cannot assert the epoch between steps we do not
+    /// issue, and we cannot stop a fallback we do not own. `v2final` accepted
+    /// that risk (`idempotentMove` calls `server.move` on its UIDPLUS arm);
+    /// this path does not. Issuing our own COPY/STORE/EXPUNGE costs the
+    /// atomicity of `UID MOVE` on a MOVE-capable server — an accepted,
+    /// owner-decided trade — and buys an epoch assertion immediately before
+    /// each of the three steps.
     func move(
         ids: [String],
         from source: String,
@@ -1883,40 +1999,126 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         admittedUidValidity: UInt32
     ) async throws {
         let sourceUIDs = try nativeUIDSet(ids)
-        try await withActionConnectionSelection(folder: source) { server, wrapperSelection in
-            try self.requireUidValidity(
-                wrapperSelection, expected: admittedUidValidity, folder: source)
+        do {
+            try await withActionConnectionSelection(folder: source) { server, wrapperSelection in
+                // A1 — the wrapper's own SELECT of the source.
+                try self.requireUidValidity(
+                    wrapperSelection, expected: admittedUidValidity, folder: source)
 
-            let preMutation = try await self.selectMailboxTracked(server, folder: source)
-            try self.requireUidValidity(
-                preMutation, expected: admittedUidValidity, folder: source)
-
-            if source.uppercased() == "INBOX" {
-                let legacyFlags: [Flag] = [
-                    .custom("tm_reply"), .custom("tm_archive"),
-                    .custom("tm_delete"), .custom("tm_none"),
-                ]
+                // T3.3 PORT — `v2final:…:IMAPProvider.move`'s destination
+                // SELECT + `mailboxConfirmedAbsent` guard. Probed BEFORE any
+                // source mutation, so a destination that no longer exists
+                // costs the source nothing: the message stays where it is and
+                // sync/delta-sync reconciles.
+                //
+                // ⚠ The returned `Mailbox.Selection` is DISCARDED on purpose.
+                // Capturing the destination's epoch is T3.14 and is INVENTED
+                // there — `v2final` discards it at both of its own destination
+                // SELECTs, and nothing in this function may start depending on
+                // a destination epoch. `server.selectMailbox` rather than
+                // `selectMailboxTracked` for the same reason: recording the
+                // destination in the shared observed-epoch mirror from an
+                // action SELECT would widen that mirror for no consumer in
+                // this scope (see `selectMailboxTracked`'s doc comment —
+                // action SELECTs stay out, and narrower stays safer).
                 do {
-                    try await server.store(flags: legacyFlags, on: sourceUIDs, operation: .remove)
+                    _ = try await server.selectMailbox(destination)
                 } catch {
-                    print("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
+                    guard await self.mailboxConfirmedAbsent(destination, server: server) else {
+                        throw error
+                    }
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MoveTrace] IMAPProvider.move — destination '\(destination)' confirmed absent — whole-op no-op")
+                    }
+                    throw IMAPActionMailboxAbsent()
                 }
-            }
 
-            let finalSourceSelection = try await self.selectMailboxTracked(server, folder: source)
-            try self.requireUidValidity(
-                finalSourceSelection, expected: admittedUidValidity, folder: source)
+                // A2 — the destination probe above moved this connection's
+                // selected mailbox. Re-SELECT the source and reassert before
+                // anything touches it again.
+                let preMutation = try await self.selectMailboxTracked(server, folder: source)
+                try self.requireUidValidity(
+                    preMutation, expected: admittedUidValidity, folder: source)
 
-            if await server.supportsUIDPlus {
-                try await server.move(messages: sourceUIDs, to: destination)
-            } else {
+                if source.uppercased() == "INBOX" {
+                    let legacyFlags: [Flag] = [
+                        .custom("tm_reply"), .custom("tm_archive"),
+                        .custom("tm_delete"), .custom("tm_none"),
+                    ]
+                    do {
+                        try await server.store(flags: legacyFlags, on: sourceUIDs, operation: .remove)
+                    } catch {
+                        print("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
+                    }
+                }
+
+                // A3 — immediately before the COPY.
+                let preCopy = try await self.selectMailboxTracked(server, folder: source)
+                try self.requireUidValidity(
+                    preCopy, expected: admittedUidValidity, folder: source)
                 try await server.copy(messages: sourceUIDs, to: destination)
+
+                // T3.12 PORT (`a75196398`) — mutation-step checkpoint. The
+                // reference also carried checkpoints inside its per-member
+                // resolution loops; those loops do not exist here (the batch
+                // is one UIDSet resolved before any I/O), so those sites are
+                // NOT ported.
                 try Task.checkCancellation()
+
+                // A4 — immediately before the source soft-delete.
                 let preDelete = try await self.selectMailboxTracked(server, folder: source)
                 try self.requireUidValidity(
                     preDelete, expected: admittedUidValidity, folder: source)
                 try await server.store(flags: [.deleted], on: sourceUIDs, operation: .add)
+
+                try Task.checkCancellation()
+
+                // T3.2 — the purge tail. PORT of `v2final`'s
+                // `deleteActionSource` no-UIDPLUS early return and of
+                // `storeDeletedAndMaybeExpunge`'s fail-closed arm; the local
+                // precedent is `expungeScopedToTargets` in this same file.
+                //
+                // The UIDPLUS gate is deliberately checked BEFORE assertion A5
+                // rather than after: on a server without UIDPLUS nothing
+                // destructive follows, so asserting there would be able to
+                // refuse an op that is already complete — and a refusal after a
+                // successful COPY is retried, producing a DUPLICATE in the
+                // destination. This is also why the tail is written out here
+                // instead of delegating to `expungeScopedToTargets`, whose
+                // UIDPLUS check is internal and therefore cannot have A5
+                // sequenced inside it.
+                if await server.supportsUIDPlus {
+                    // A5 — immediately before the purge. `v2final` asserts here
+                    // too (`deleteActionSource`'s `finalSourceSelection`): STORE
+                    // and UID EXPUNGE are distinct awaits, and a UID resolved
+                    // under one epoch is mutation authority only within that
+                    // epoch.
+                    let preExpunge = try await self.selectMailboxTracked(server, folder: source)
+                    try self.requireUidValidity(
+                        preExpunge, expected: admittedUidValidity, folder: source)
+                    try await server.expunge(messages: sourceUIDs)
+                } else {
+                    // A bare EXPUNGE is MAILBOX-WIDE (RFC 3501 §6.4.3): it
+                    // names no UID and removes EVERY `\Deleted` message in the
+                    // selected mailbox — another client's soft-deleted mail, or
+                    // a copy a crashed prior attempt left marked but
+                    // unexpunged. That is a wrong-message deletion (C3), with
+                    // or without any UIDVALIDITY change, and the invariant is
+                    // unconditional rather than UIDPLUS-gated. FAIL CLOSED: the
+                    // `\Deleted` STORE above already records the intent, the
+                    // destination already has the copy, and a UIDPLUS-capable
+                    // client or the server's own policy completes the purge.
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): server lacks UIDPLUS — copied and marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
+                    }
+                }
             }
+        } catch is IMAPActionMailboxAbsent {
+            // Source or destination CONFIRMED gone (LIST probe, T3.3) — the op
+            // is terminally satisfied, not transiently failed. Nothing left to
+            // do: for an absent source there is nothing to move, and for an
+            // absent destination the message is untouched in the source and
+            // sync reconciles the user's view.
         }
     }
 
@@ -2102,8 +2304,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard case .imap(let folder, let uidValidity, let uid) = identity else {
             throw ProviderError.actionIdentityResolutionFailed("IMAPProvider received a non-IMAP draft identity")
         }
-        try await deleteDraftStrong(
-            uid: uid, uidValidity: uidValidity, draftsFolderPath: folder)
+        do {
+            try await deleteDraftStrong(
+                uid: uid, uidValidity: uidValidity, draftsFolderPath: folder)
+        } catch is IMAPActionMailboxAbsent {
+            // T3.3 PORT — `v2final:…:IMAPProvider.deleteDraft`'s catch arm. The
+            // Drafts mailbox is CONFIRMED gone (LIST probe), so the server copy
+            // of this draft went with it. Terminal no-op; propagating would pin
+            // the lane behind a delete no server can ever satisfy.
+            //
+            // This changes ONLY the mailbox-absent classification. It does not
+            // touch draft IDENTITY handling (T3.9/T3.10) — an unknown,
+            // malformed or stale address still fails closed in
+            // `deleteDraftStrong` exactly as before.
+            print("[IMAP] Drafts mailbox absent — draft delete completed as no-op (mailbox '\(folder)' confirmed gone)")
+        }
     }
 
     /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its exact epoch/UID
