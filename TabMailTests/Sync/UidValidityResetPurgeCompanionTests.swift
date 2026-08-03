@@ -623,6 +623,111 @@ struct UidValidityResetPurgeCompanionTests {
         await Self.resetProcessGlobals()
     }
 
+    // MARK: - Could-not-READ is not could-not-find
+
+    /// 🚨 AUDIT ROUND 2 — the sibling of the leg-1 case above, for the OTHER way a
+    /// purge can fail to learn anything. `stagingPurgeFailureLeavesTheFolderRetryable…`
+    /// covers "we opened the staging state and the DELETE would not commit". This
+    /// covers "we never got to look at all": the App Group container did not resolve,
+    /// so there was no place to read.
+    ///
+    /// That case was mapped to `.nothingStaged` — a PURGE SUCCESS — by `209a55cdf`,
+    /// the very commit whose purpose was to stop reporting "we could not determine the
+    /// answer" as an authoritative negative. A nil container is not evidence that
+    /// nothing was staged: the NSE is a separate process with its own entitlements and
+    /// may have staged rows into a container this process cannot currently resolve.
+    /// Reporting that as a completed purge lets the reaction advance the durable epoch
+    /// over staging it never read, which is exactly the C3 the leg-1 test describes —
+    /// a surviving old-epoch `nse_inbox_removal` instruction executing against whatever
+    /// message the resync seats at the reused UID.
+    ///
+    /// **Pinned as the system property, not the mapping:** the assertions are on the
+    /// folder's END STATE — old epoch, still quarantined, no occupant seated — which is
+    /// what a caller actually depends on. A test asserting `stagingPurgeTarget`
+    /// returned `.unreachable` would pass on a broken system that then ignored the
+    /// value.
+    @Test("A purge whose container will not resolve reports failure and leaves the folder at the OLD epoch")
+    @MainActor
+    func unresolvableStagingContainerIsNotAnEmptyStagingArea() async throws {
+        Self.resetStagingGlobals()
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 9411, id: "post-reset-9411@example.com")]
+        ])
+        server.setUidValidity(Self.newEpoch, for: "INBOX")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.purgeStagingPathOverrideForTesting.withLock { $0 = nil }
+            NSEDataBridge.simulateUnresolvableStagingContainerForTesting.withLock { $0 = false }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [], directory: dir)
+        }
+        await ChatIdTranslator.shared.clearAll()
+
+        let accountId = "t4s4-nocontainer"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
+            totalCount: 1, lastKnownUidValidity: Self.oldEpoch)
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "INBOX", uids: [1311], pool: pool)
+
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX")
+
+        // No explicit staging path: the purge must fall through to the App-Group
+        // container branch, which we then make unresolvable. Both must hold, or the
+        // test exercises the override branch instead and proves nothing.
+        NSEDataBridge.purgeStagingPathOverrideForTesting.withLock { $0 = nil }
+        NSEDataBridge.simulateUnresolvableStagingContainerForTesting.withLock { $0 = true }
+
+        // Non-vacuity, checked BEFORE the reaction: with the container unresolvable the
+        // helpers must report FAILURE. If these read `true`, the reaction below would be
+        // asserting nothing about the could-not-read path.
+        #expect(NSEDataBridge.purgeStagedStateForFolder(
+            accountId: accountId, folderPath: "INBOX") == false,
+                """
+                purgeStagedStateForFolder reported SUCCESS for a container it could not resolve — \
+                "we could not look" recorded as "there was nothing there".
+                """)
+        #expect(NSEDataBridge.purgeInboxRemovalMarkersForAccount(accountId: accountId) == false,
+                """
+                purgeInboxRemovalMarkersForAccount reported SUCCESS for a container it could not \
+                resolve, so the reaction is free to advance the epoch over unread staged state.
+                """)
+
+        let provider = Self.imapProvider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.runUidValidityResetReaction(
+                accountId: accountId, folderPath: "INBOX")
+        }
+
+        let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        #expect(after?.lastKnownUidValidity == Self.oldEpoch,
+                """
+                the folder was advanced to the NEW epoch on the strength of a purge that never read \
+                anything. Any staged old-epoch instruction still exists and now has a new-epoch \
+                address space to act in.
+                """)
+        #expect(after?.uidValidityResetPendingAt != nil,
+                "the quarantine was cleared without the staged state ever having been read — nothing re-drives, and the guards disarm")
+
+        let seated = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ?",
+                arguments: [folderId]) ?? 0
+        }
+        #expect(seated == 0,
+                "a new-epoch row was seated while the staged state was never read")
+
+        await Self.resetProcessGlobals()
+    }
+
     // MARK: - (iii) + (v) — inbox-role only, account-scoped
 
     /// 🚨 `nse_inbox_removal` is (account, UID)-keyed with NO folderPath column, so

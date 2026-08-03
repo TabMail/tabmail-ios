@@ -659,6 +659,22 @@ enum NSEDataBridge {
     ///
     /// `Mutex` rather than `nonisolated(unsafe)` (iOS resilience rule 5).
     static let purgeStagingPathOverrideForTesting = Mutex<String?>(nil)
+
+    /// Forces App-Group container resolution to report failure, making the "we could
+    /// not LOOK" branch of `stagingPurgeTarget` reachable from tests. Without it that
+    /// branch has no coverage at all: the unit tests run inside the TabMail host app,
+    /// which carries the `group.ai.tabmail` entitlement, so the real
+    /// `containerURL(forSecurityApplicationGroupIdentifier:)` always resolves in the
+    /// simulator and the nil case can never be observed.
+    ///
+    /// **Defaulted to the SAFE direction on purpose.** `false` means "use the real
+    /// resolution", and only an explicit `true` simulates the failure — so a dropped
+    /// or forgotten injection yields exactly production behaviour, never a silently
+    /// weakened guard. (A seam whose default is the permissive value is
+    /// fail-DANGEROUS; this one fails toward production.)
+    ///
+    /// `Mutex` rather than `nonisolated(unsafe)` (iOS resilience rule 5).
+    static let simulateUnresolvableStagingContainerForTesting = Mutex<Bool>(false)
     #endif
 
     /// What a purge has to work with. The three cases exist because "there is
@@ -668,12 +684,26 @@ enum NSEDataBridge {
     private enum StagingPurgeTarget {
         /// Open. The DELETE decides.
         case queue(DatabaseQueue)
-        /// No App Group container, or no staging file: nothing was ever staged, so a
-        /// purge over it is vacuously COMPLETE.
+        /// No staging FILE at a container we could actually resolve: nothing was ever
+        /// staged, so a purge over it is vacuously COMPLETE. This is a POSITIVE
+        /// observation — we looked in the right place and found nothing.
         case nothingStaged
-        /// A staging file exists but could not be opened. Its contents are unknown,
-        /// which is a FAILURE — never a silent success.
+        /// We could not READ the staging state: a staging file exists but will not
+        /// open, or the App Group container itself could not be resolved so there was
+        /// no place to look. Its contents are unknown, which is a FAILURE — never a
+        /// silent success.
         case unreachable
+    }
+
+    /// The App-Group container the staging file lives in, or `nil` when it cannot be
+    /// resolved. Extracted so the unresolvable case is reachable under test; the
+    /// DISPOSITION of a nil result is decided by the caller, not here, so the mapping
+    /// that matters stays under test rather than being short-circuited by the seam.
+    private static func stagingContainerURL() -> URL? {
+        #if DEBUG
+        if simulateUnresolvableStagingContainerForTesting.withLock({ $0 }) { return nil }
+        #endif
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId)
     }
 
     /// Shared resolution for the two purge helpers above — an explicit override
@@ -690,9 +720,18 @@ enum NSEDataBridge {
             guard let queue = try? DatabaseQueue(path: explicitPath) else { return .unreachable }
             return .queue(queue)
         }
-        guard let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroupId
-        ) else { return .nothingStaged }
+        // 🚨 AUDIT ROUND 2 — was `.nothingStaged`, which is the exact conflation the
+        // enclosing commit (`209a55cdf`) exists to forbid: a nil container is "we could
+        // not LOOK", not "there was nothing there". The NSE runs as its own process with
+        // its own entitlements, so it may well have staged rows into a container this
+        // process cannot currently resolve; reporting that as a completed purge lets
+        // `runUidValidityResetReaction` advance the durable epoch over staged state it
+        // never read. The sibling condition one line down — a file that exists but will
+        // not open — already returns `.unreachable`; both are the same question ("can we
+        // read the staged state?") with the same answer ("no"), so they get the same
+        // disposition. Only the POSITIVE observation "we resolved the container and there
+        // is no staging file" may report nothing-staged.
+        guard let containerURL = stagingContainerURL() else { return .unreachable }
         let stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
         guard FileManager.default.fileExists(atPath: stagingPath) else { return .nothingStaged }
         guard let queue = openStagingDB() else { return .unreachable }

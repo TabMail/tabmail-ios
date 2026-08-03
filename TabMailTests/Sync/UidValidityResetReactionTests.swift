@@ -150,10 +150,16 @@ struct UidValidityResetReactionTests {
     ///    reinterpret or split it. T2.8's action checkpoint later refuses this
     ///    legacy RFC payload whole; T2.9 owns replacing undo's producer with a
     ///    native destination identity;
-    ///  - **the address-only op is gone** — its every id is a bare UID in the
-    ///    discarded numbering, so executing it would mutate whichever message the
-    ///    new epoch put there (C3). Constraint C5 makes dropping it the correct
+    ///  - **the address-only op that PROVED its own invalidation is gone** — its
+    ///    every id is a canonical bare UID and its own recorded epoch disagrees with
+    ///    the fresh one, so executing it would mutate whichever message the new
+    ///    epoch put there (C3). Constraint C5 makes dropping it the correct
     ///    resolution at an identity-reset boundary;
+    ///  - **the address-only op that recorded NO epoch survives** — nothing
+    ///    established which numbering its UID was observed under, so nothing proved
+    ///    it invalid. Exit 4 requires a POSITIVE fact and this is an absence of one.
+    ///    (Audit round 2: this pair used to be a single UNSTAMPED op that the test
+    ///    required to be DELETED, which is the defect stated as the specification.);
     ///  - **the op belonging to another folder is untouched** — the sweep is
     ///    folder-scoped, and a wider one would be a mass intention drop.
     @Test("A reaction purges the old epoch, stamps the new one, and keeps every intention it can still resolve")
@@ -186,8 +192,21 @@ struct UidValidityResetReactionTests {
                           messageIds: ["epoch-fixture-101@example.com"],
                           accountId: accountId, folderPath: "INBOX",
                           destinationPath: "Archive", pool: pool)
+        // 🚨 AUDIT ROUND 2 — this op now carries the epoch it was admitted under.
+        // It did not, and this test REQUIRED it to be deleted anyway, so it passed
+        // BECAUSE OF the defect: the sweep classified on the id SHAPE and never
+        // compared the op's own epoch, destroying an intention on an absence of
+        // evidence. Stamping it here makes the deletion genuinely PROVEN — the op's
+        // recorded epoch disagrees with the fresh one — so the assertion below now
+        // asserts exit 4 rather than the bug's premise.
         try Self.insertOp(id: "op-address-only", type: .markRead,
                           messageIds: ["102"],
+                          accountId: accountId, folderPath: "INBOX",
+                          observedUidValidity: Self.oldEpoch, pool: pool)
+        // Its counterpart, added in the same round: identical in every way EXCEPT
+        // that nothing ever recorded which numbering its UID was observed under.
+        try Self.insertOp(id: "op-address-only-unstamped", type: .markRead,
+                          messageIds: ["103"],
                           accountId: accountId, folderPath: "INBOX", pool: pool)
         try Self.insertOp(id: "op-other-folder", type: .markRead,
                           messageIds: ["55"],
@@ -231,9 +250,18 @@ struct UidValidityResetReactionTests {
                 """)
         #expect(!remaining.contains("op-address-only"),
                 """
-                an address-only op (every id a bare UID) survived the epoch stamp. Executing it \
-                now mutates whichever message the NEW numbering placed at that UID — C3. C5 makes \
-                dropping it at an identity-reset boundary the correct resolution.
+                an address-only op survived the epoch stamp even though its OWN recorded epoch \
+                disagrees with the fresh one. Executing it now mutates whichever message the NEW \
+                numbering placed at that UID — C3. That is a PROVEN turnover in the op's own \
+                address space, which is exit 4, and C5 makes dropping it correct.
+                """)
+        #expect(remaining.contains("op-address-only-unstamped"),
+                """
+                an address-only op with NO recorded epoch was deleted. Nothing established that \
+                this op's UID was ever observed under the numbering the server discarded, so \
+                nothing proved it invalid — that is an ABSENCE of evidence, which exit 4 \
+                explicitly is not, and which stays retryable forever. It is the same shape as its \
+                stamped sibling above, differing only in the one fact that authorizes retirement.
                 """)
         #expect(remaining.contains("op-other-folder"),
                 "the sweep reached a folder the reaction was not resetting — that is a mass intention drop")
@@ -779,6 +807,78 @@ struct UidValidityResetReactionTests {
                 "an op with no ids has nothing to be wrong about — deleting it drops intention for free")
         #expect(!AccountManager.opIsAddressOnly(op(["3F5A-DRAFT-UUID"])),
                 "a local draft key is not a UID and survives every epoch")
+        // AUDIT ROUND 2 — `UInt32(id) != nil` alone accepted both of these.
+        #expect(!AccountManager.opIsAddressOnly(op(["0"])),
+                """
+                RFC 3501 §2.3.1.1 types a UID as nz-number, so "0" is a MALFORMED id, not a UID in \
+                the discarded numbering. An id we cannot account for is an unknown, and an unknown \
+                may not authorize destroying an intention.
+                """)
+        #expect(!AccountManager.opIsAddressOnly(op(["001"])),
+                """
+                no admission site writes a non-canonical id, so "001" came from somewhere \
+                unaccounted for — again an unknown, not a proven bare address.
+                """)
+        #expect(!AccountManager.opIsAddressOnly(op(["101", "0"])),
+                "one unaccountable id in the set is enough — the op is not provably address-only")
+    }
+
+    /// 🚨 AUDIT ROUND 2 / MUST FIX 4 — the closure this reaction's own normative
+    /// document asserts, applied to the reaction itself.
+    ///
+    /// The sweep retired ops on `opIsAddressOnly` ALONE — on the SHAPE of the ids —
+    /// and never compared the op's own recorded epoch to anything. So an op that had
+    /// never recorded an epoch was destroyed exactly as if a turnover had been
+    /// proven for it. Exit 4 requires a POSITIVE fact: two real, non-zero epochs
+    /// that disagree in the op's OWN source address space. Absence of evidence is
+    /// clause 2, is disjoint from exit 4, and stays retryable forever.
+    ///
+    /// This pins the CLOSURE, not the instances: every way a component can fail to
+    /// be positive evidence — nil, zero on either side, non-canonical, or simply
+    /// equal — leaves the intention durable. Only the fully-proven disagreement
+    /// retires. `reactionPurgesStampsAndPreservesResolvableIntentions` runs the two
+    /// headline cases through the real reaction end-to-end; this enumerates the
+    /// boundary.
+    @Test("Only two positive, non-zero, disagreeing epochs may retire an op at a reset boundary")
+    func resetRetirementRequiresPositiveEpochProof() {
+        func op(_ ids: [String], _ recorded: Int?) -> PendingOperation {
+            PendingOperation(
+                type: .markRead, messageIds: ids, accountId: "a", folderPath: "INBOX",
+                observedUidValidity: recorded)
+        }
+        let fresh: UInt32 = 700_002
+        let stale = 700_001
+
+        // The ONE case that retires: canonical ids, a real recorded epoch, a real
+        // fresh epoch, and they disagree.
+        #expect(AccountManager.opIsProvenInvalidatedByReset(op(["102"], stale), fresh: fresh),
+                "a proven turnover in the op's own address space must still retire it, or the reset reaction can never converge")
+        #expect(AccountManager.opIsProvenInvalidatedByReset(op(["102", "103"], stale), fresh: fresh))
+
+        // Every other shape leaves the intention durable.
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["102"], nil), fresh: fresh),
+                """
+                an op that never recorded an epoch was retired. Nothing established which numbering \
+                its UID was observed under, so nothing proved it invalid — this is the absence of \
+                evidence that clause 2 keeps retryable, and conflating it with exit 4 is the single \
+                most repeated defect in this codebase's history.
+                """)
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["102"], 0), fresh: fresh),
+                "zero is not an epoch (RFC 3501 §2.3.1.1 nz-number) — it is a value the server never reported")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["102"], -1), fresh: fresh),
+                "an unreadable stored epoch is an unknown, not a disagreement")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["102"], stale), fresh: 0),
+                "a fresh observation of zero means the server told us nothing — it cannot prove a turnover")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["102"], Int(fresh)), fresh: fresh),
+                "the epochs AGREE — the op's UID belongs to the numbering still in force, so it must execute, not be dropped")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["0"], stale), fresh: fresh),
+                "a malformed id is an unknown; a proven epoch change says nothing about an address we cannot parse")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["001"], stale), fresh: fresh),
+                "a non-canonical id is an unknown for the same reason")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op(["msg-1@example.com"], stale), fresh: fresh),
+                "an rfc822 identity re-resolves under any numbering — a turnover does not invalidate it")
+        #expect(!AccountManager.opIsProvenInvalidatedByReset(op([], stale), fresh: fresh),
+                "an op with no ids has nothing to be wrong about")
     }
 }
 

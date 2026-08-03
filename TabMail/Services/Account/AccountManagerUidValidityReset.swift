@@ -624,12 +624,19 @@ extension AccountManager {
     ///    epoch is refused outright, so no numbering is ever assumed. The stamp
     ///    stays: it is provider-agnostic and stops the op before it reaches any
     ///    executor;
-    ///  - an op every one of whose `messageIds` is a BARE NUMERIC UID has no
-    ///    identity beyond an ADDRESS in a numbering the server has just discarded.
-    ///    Executing it would mutate an unrelated message. C5 states that dropping
-    ///    intention at an identity-reset boundary is correct — sync reconciles and
-    ///    the user redoes it — and it is the only alternative to a C3 violation or
-    ///    a permanent park;
+    ///  - an op every one of whose `messageIds` is a CANONICAL BARE UID **and whose
+    ///    own recorded `observedUidValidity` is a positive epoch that DISAGREES
+    ///    with the fresh one** has no identity beyond an ADDRESS in a numbering the
+    ///    server has demonstrably discarded. Executing it would mutate an unrelated
+    ///    message. C5 states that dropping intention at an identity-reset boundary
+    ///    is correct — sync reconciles and the user redoes it — and it is the only
+    ///    alternative to a C3 violation or a permanent park.
+    ///    ⚠ BOTH CONJUNCTS ARE REQUIRED (audit round 2). This used to delete on the
+    ///    id SHAPE alone, so an op with NO recorded epoch — an absence of evidence —
+    ///    was destroyed as though a turnover had been proven for it. See
+    ///    `opIsProvenInvalidatedByReset`, which is now the only predicate allowed to
+    ///    authorize a deletion here, and which states why refusing more cannot stall
+    ///    the reaction;
     ///  - ops for ANY OTHER folder are never considered.
     ///
     /// The write closure returns a `Bool` so a vanished `Folder` row stays a
@@ -648,9 +655,9 @@ extension AccountManager {
                 let ops = try PendingOperation
                     .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
                     .fetchAll(db)
-                for op in ops where Self.opIsAddressOnly(op) {
+                for op in ops where Self.opIsProvenInvalidatedByReset(op, fresh: fresh) {
                     _ = try PendingOperation.deleteOne(db, key: op.id)
-                    BackgroundSyncLogger.log("[UIDValidity] dropped address-only op \(op.type.rawValue) \(op.id.prefix(8)) on \(folderId) — its UIDs belong to the epoch the server discarded (C5)")
+                    BackgroundSyncLogger.log("[UIDValidity] dropped address-only op \(op.type.rawValue) \(op.id.prefix(8)) on \(folderId) — recorded under UIDVALIDITY \(op.observedUidValidity.map(String.init) ?? "?"), server now \(fresh); its UIDs belong to the epoch the server discarded (exit 4)")
                 }
                 folder.lastKnownUidValidity = Int(fresh)
                 folder.uidValidityResetPendingAt = nil
@@ -667,17 +674,79 @@ extension AccountManager {
         }
     }
 
-    /// True when EVERY id this op targets is a bare numeric UID — i.e. the op
-    /// carries no durable identity that could be re-resolved under a new epoch.
+    /// True when EVERY id this op targets is a CANONICAL, non-zero bare UID — i.e.
+    /// the op carries no durable identity that could be re-resolved under a new
+    /// epoch.
     ///
     /// The discriminator mirrors `MessageHeader.stableId`, which is what the
     /// admission sites store: an rfc822 Message-ID when one exists, the raw UID
     /// otherwise. An op with NO ids at all is not address-only — there is nothing
     /// to be wrong about, and deleting it would drop intention for free.
+    ///
+    /// ⚠ SHAPE ONLY — NOT AUTHORITY TO RETIRE. This answers "could these ids mean
+    /// anything under a different numbering?", which is a necessary condition and
+    /// not a sufficient one. The sufficient one is
+    /// `opIsProvenInvalidatedByReset(_:fresh:)`; call that, not this.
+    ///
+    /// ⚠ CANONICAL AND NON-ZERO (audit round 2). `UInt32(id) != nil` alone accepted
+    /// `"0"` — which RFC 3501 §2.3.1.1 types as impossible, so it is a malformed id,
+    /// not a UID in the discarded epoch — and `"001"`, which no admission site ever
+    /// writes and which therefore came from somewhere unaccounted for. Both are
+    /// unknowns, and an unknown may never authorize destroying a user intention.
+    /// Same predicate the drain's checkpoint A uses (`idsAreCanonicalUIDs`).
     nonisolated static func opIsAddressOnly(_ op: PendingOperation) -> Bool {
         let ids = op.messageIds
         guard !ids.isEmpty else { return false }
-        return ids.allSatisfy { UInt32($0) != nil }
+        return ids.allSatisfy { id in
+            guard let uid = UInt32(id), uid > 0 else { return false }
+            return id == String(uid)
+        }
+    }
+
+    /// 🚨 THE ONLY PREDICATE THAT MAY RETIRE AN OP AT A RESET BOUNDARY.
+    ///
+    /// Exit 4 of `Companion/Rules/Active/never-drop-user-intention.md` — invalidation
+    /// by a PROVEN id reset in the operation's OWN source address space — and it
+    /// demands the same positive proof everywhere it is claimed: **two positive,
+    /// non-zero epochs that disagree**. The op's own recorded
+    /// `observedUidValidity` is one; the epoch the server just reported is the
+    /// other. Missing, zero, non-canonical or unreadable on either side ⇒ `false` ⇒
+    /// the op stays durably queued.
+    ///
+    /// ⚠ AUDIT ROUND 2. The sweep used to delete on `opIsAddressOnly` ALONE — on the
+    /// SHAPE of the ids, never comparing the op's own epoch at all. So a legacy op
+    /// with `observedUidValidity == nil` was destroyed on an ABSENCE of evidence:
+    /// the one conflation this codebase's history says is its most repeated defect,
+    /// sitting inside the very reaction whose normative document asserts the
+    /// closure. Exit 4 fires on a POSITIVE fact; clause 2's *unknown* epoch is its
+    /// opposite and stays retryable forever. The two are disjoint and nothing may
+    /// blur them.
+    ///
+    /// ⚠ THE OPPOSITE FAILURE — "now nothing is ever retired and the reaction cannot
+    /// converge" — is NOT reachable here, and this is why:
+    ///  - the sweep is not load-bearing for convergence.
+    ///    `uidValidityResetStampFreshEpoch` writes `lastKnownUidValidity = fresh`
+    ///    and clears `uidValidityResetPendingAt` UNCONDITIONALLY after the loop, and
+    ///    returns `true` on that, not on how many rows it deleted. A reaction that
+    ///    sweeps nothing still stamps, still unquarantines, still resyncs;
+    ///  - a provably-stale op is still retired, one step later. Once the fresh epoch
+    ///    is stamped, the drain's checkpoint A sees `stamped != live` in its claim
+    ///    transaction and takes exit 4 there, BEFORE any provider I/O. The queue
+    ///    converges whether or not this sweep ran;
+    ///  - an op this predicate refuses is one checkpoint A also refuses to claim, so
+    ///    it never reaches an executor and can never mutate a message under a
+    ///    numbering it did not observe. It parks — unclaimable, visible in
+    ///    `[QueueDiag]`, costing nothing but a row. That is the accepted
+    ///    `IOS-EPOCH-001` posture, not a livelock: nothing retries it, nothing
+    ///    spins, and the reaction never waits on it.
+    nonisolated static func opIsProvenInvalidatedByReset(
+        _ op: PendingOperation, fresh: UInt32
+    ) -> Bool {
+        guard opIsAddressOnly(op) else { return false }
+        guard fresh > 0 else { return false }
+        guard let recorded = op.observedUidValidity,
+              let recordedUInt = UInt32(exactly: recorded), recordedUInt > 0 else { return false }
+        return recordedUInt != fresh
     }
 
     /// Step 6 — the identical code path account-add uses for a folder's initial
