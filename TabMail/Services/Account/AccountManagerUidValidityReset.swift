@@ -46,18 +46,30 @@ import UserNotifications
 ///  - `Folder.lastUidValidityResetAt`: its only job in the reference is to be the
 ///    monotonic authority sidecar producers compare against, and v3 has no such
 ///    producer (0 references in the tree);
-///  - the NSE staging purges (`NSEDataBridge.purgeInboxRemovalMarkersForAccount`,
-///    `.purgeStagedStateForFolder`): v3 exposes no per-folder or per-account
-///    staging-DB purge, and adding one is a separate item. RESIDUAL, stated: a
-///    staged old-epoch row merged after this reaction re-inserts a header the purge
-///    removed. It is bounded — the NSE stages only inbox arrivals, and the next
-///    ordinary sync pass stale-sweeps a UID the server no longer returns;
 ///  - `redriveDurableQueue` / `redriveParkedOutboxFlags` / the intention journal
 ///    barrier: none exist in v3 (its queue is the simpler provider-id action
-///    queue). The barrier below uses the v3 write-queue drain instead;
-///  - the `ChatIdTranslator` in-memory companion clear and the body queues'
-///    oversized-deferred clear: neither `purgeMappingsForFolder` nor
-///    `clearOversizedDeferred` exists in v3.
+///    queue). The barrier below uses the v3 write-queue drain instead.
+///
+/// LANDED AFTER THE PORT (T4.S4 / T4.V11), each previously listed above as an
+/// omission and now present:
+///  - the NSE staging purges (`NSEDataBridge.purgeStagedStateForFolder`,
+///    `.purgeInboxRemovalMarkersForAccount`). Both are BEST-EFFORT and neither may
+///    abort the reaction — see their call sites below and the helpers' own doc
+///    comments. The residual this omission used to carry (a staged old-epoch row
+///    merging after the reaction) is now narrowed to the case where the staging
+///    purge itself could not run, where it degrades to exactly the previously
+///    accepted bound: the next ordinary sync pass stale-sweeps a UID the server no
+///    longer returns;
+///  - the `ChatIdTranslator` companion purge
+///    (`ChatIdTranslator.purgeMappingsForFolder`), which pairs with — and does not
+///    replace — the `chatIdMapping` DELETE already inside the step-3 transaction;
+///  - the body queues' oversized-deferred RELEASE
+///    (`ActiveBodyQueue`/`BackfillBodyQueue.clearOversizedDeferred`). Both methods
+///    now exist in v3, and this reaction is their ONLY caller: without it the
+///    oversized quarantine never lifts for a renumbered folder, which turns a
+///    bounded, retryable deferral into a permanent discard — the thing the absolute
+///    rule forbids. Best-effort like the NSE purges, and for a stronger reason: they
+///    release a deferral rather than delete anything.
 extension AccountManager {
 
     #if DEBUG
@@ -166,6 +178,10 @@ extension AccountManager {
                 return
             }
         }
+        // Read from the SAME snapshot the validation above used, before anything
+        // this reaction does can change it. Consumed by the `nse_inbox_removal`
+        // purge, which is account-wide and therefore inbox-role-only.
+        let isInboxRole = folder.role == .inbox
 
         // Step 1: enter reset state. Authoritative — if this fails to persist, the
         // drain-park and admission guards never arm, so the reaction must not
@@ -191,6 +207,26 @@ extension AccountManager {
             return
         }
 
+        // Step 3b — the COMPANION to step 3's `chatIdMapping` DELETE, not a
+        // replacement for it. That statement matches by the exact
+        // `messageHeader.folderId` relation INSIDE the transaction, which by
+        // construction cannot see a mapping whose header row was already gone; this
+        // one matches by the composite `accountId:folderPath:` prefix over the
+        // translator's own (DB-superset) map, and drops the in-memory pill caches so
+        // nothing serves impostor content from memory either. Porting only one half
+        // leaves the other's misses behind.
+        await ChatIdTranslator.shared.purgeMappingsForFolder(accountId: accountId, folderPath: folderPath)
+
+        // Step 3c — `nse_inbox_removal` is (account, UID)-keyed with NO folderPath
+        // column, so it can only be purged account-wide, and is therefore purged ONLY
+        // when the folder being reset IS this account's inbox-role folder: for any
+        // other folder's reset these markers are not ours to delete. Adjacent to (not
+        // inside) the transaction above — the staging DB is a separate file — and
+        // BEST-EFFORT, like every NSE staging purge here.
+        if isInboxRole {
+            NSEDataBridge.purgeInboxRemovalMarkersForAccount(accountId: accountId)
+        }
+
         // Step 4: out-of-transaction purges, in order and with DIFFERING failure
         // policies. Exactly ONE of them aborts: the FTS purge. Letting step 5 clear
         // the flag over a search index that still answers with old-epoch rows would
@@ -198,6 +234,18 @@ extension AccountManager {
         // on after the headers are gone. The delivered-notification clear cannot fail
         // (UNUserNotificationCenter's removal API is fire-and-forget) and the
         // orphan-file prune is a best-effort disk sweep on its own schedule.
+        //
+        // The NSE staging purge below is likewise NON-ABORTING, and deliberately so
+        // rather than by omission: it is a non-throwing call, so there is no failure
+        // for this function to observe. A staged row it misses re-inserts a header the
+        // purge removed — which is the residual this reaction ALREADY accepted and
+        // bounded before the purge existed (the NSE stages only inbox arrivals, and
+        // the next ordinary sync pass stale-sweeps a UID the server no longer
+        // returns). Failing the purge therefore returns the system to a state that was
+        // already deemed acceptable, whereas aborting would leave a quarantined folder
+        // whose mail is already gone. ⚠ This is NOT an exception to a rule — there is
+        // no "every purge must succeed" rule here; exactly one purge aborts and its
+        // reason is stated above.
         //
         // DEVIATION from the reference, deliberate: there the body-asset purge is a
         // THROWING folder-scoped call and aborts like the FTS one. v3 has no
@@ -218,11 +266,41 @@ extension AccountManager {
             releaseUidValidityReaction(accountId: accountId, folderPath: folderPath, folderId: folderId)
             return
         }
+        NSEDataBridge.purgeStagedStateForFolder(accountId: accountId, folderPath: folderPath)
         clearDeliveredNotificationsForPurgedMessages(accountId: accountId, messageIds: purgeResult.purgedMessageIds)
         // LAST — a manifest-QUERY delete, never the captured id list: recomputable
         // on a crash re-drive even though the headers are already gone.
         purgeBodyAssetsForFolder(accountId: accountId, folderPath: folderPath)
         BodyAssetStore.pruneOrphanFiles()
+
+        // Step 4b — RELEASE the body queues' oversized quarantine for this folder.
+        // PORTED from the reference, which calls the same two methods from this same
+        // step ("post-purge, pre-resync").
+        //
+        // ⚠ WITHOUT THIS THE QUARANTINE IS A PERMANENT DISCARD BY ANOTHER NAME, which
+        // the absolute rule forbids. Both sets key by headerId —
+        // `accountId:folderPath:UID`, a mutable ADDRESS. A UIDVALIDITY turnover
+        // renumbers the mailbox, so step 6's resync inserts fresh-epoch rows that MAY
+        // reuse a deferred header's UID; the stale key then makes `admit()` reject a
+        // message that was never oversized, starving it of its body until relaunch.
+        // The renumber is precisely the moment the deferral stops being about the
+        // message it was recorded for, so it is the correct invalidation point.
+        //
+        // PLACED HERE, at the END of step 4, rather than at the reference's exact line:
+        // every abort-capable purge above has already succeeded, so a release can no
+        // longer be spent on a reaction that goes on to abort. That is the reference's
+        // STATED intent ("post-purge") rather than its literal position, and it keeps
+        // the one ordering rule this function has — purge first, stamp last.
+        //
+        // BEST-EFFORT, like the NSE staging purges and for a stronger reason: these
+        // calls RELEASE a deferral, they never delete user data. Both are non-throwing,
+        // so there is no failure to abort on; the worst case of a release that turns out
+        // to be premature is one extra fetch attempt that fails identically and
+        // re-quarantines. Their own generation guard closes the converse race — a batch
+        // that captured the pre-clear generation cannot re-quarantine a renumbered UID
+        // after the clear.
+        await ActiveBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: folderPath)
+        await BackfillBodyQueue.shared.clearOversizedDeferred(accountId: accountId, folderPath: folderPath)
 
         // Display: reload after the purge (rows vanish honestly).
         Task { @MainActor in
