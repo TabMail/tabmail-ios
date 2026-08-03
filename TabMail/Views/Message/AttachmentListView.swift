@@ -191,6 +191,14 @@ struct AttachmentListView: View {
         error = nil
         print("[Attachment] Starting download: section=\(attachment.section) contentType=\(attachment.contentType) filename=\(attachment.filename) encoding=\(attachment.encoding ?? "nil")")
         Task {
+            // Reserve the one global QuickLook slot before the network fetch or
+            // staging. A second scene therefore cannot materialize or mutate any
+            // path while the active presentation is reading it.
+            guard AttachmentQuickLook.reservePresentation() else {
+                downloadingSection = nil
+                return
+            }
+
             // Freeze UI BEFORE any work that could precede the QL presentation, so
             // the sync cascade is quiet by the time QuickLook first lays out.
             // `defer` guarantees release on every exit path that does NOT end in a
@@ -198,83 +206,90 @@ struct AttachmentListView: View {
             // `AttachmentQuickLook` owns the release (via its dismiss delegate)
             // once QuickLook is dismissed. `present()` re-raising the gate is a
             // no-op (idempotent), so a single dismiss balances both begins.
+            // The reservation is released on exactly the same condition, so no
+            // failure, throw, or cancellation can strand the slot and wedge every
+            // later preview.
             PreviewFreezeGate.shared.begin()
             var presented = false
             defer {
                 if !presented {
+                    AttachmentQuickLook.cancelReservedPresentation()
                     PreviewFreezeGate.shared.end()
                 }
             }
 
-            // Store-first: if BodyAssetStore has this attachment cached, skip the network.
-            // User tap on a cached attachment counts as a message access, so bump LRU.
-            if let assetId = BodyAssetStore.attachmentAssetId(
-                contentKey: ContentKey(rawValue: message.id), section: attachment.section),
-               let storedURL = BodyAssetStore.urlOnDisk(assetId: assetId) {
-                print("[Attachment] Cache HIT for \(attachment.filename) — skipping network")
-                BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
-                let fileURL = makePreviewURL(from: storedURL, originalFilename: attachment.filename)
-                downloadedFiles[attachment.section] = fileURL
-                AttachmentQuickLook.present(url: fileURL)
-                presented = true
-                downloadingSection = nil
-                return
-            }
+            // The identity these bytes belong to, minted ONCE and used for BOTH the
+            // cache read below and the cache write further down — so the thing we
+            // check is definitionally the thing we recorded. `nil` means this
+            // message's identity cannot be proven, in which case the cache is
+            // neither read nor written and the attachment is simply fetched.
+            let identityStamp = AttachmentCacheIdentity.stamp(for: message)
 
             do {
-                let data = try await manager.fetchAttachment(for: message, section: attachment.section, encoding: attachment.encoding)
-                print("[Attachment] Downloaded \(data.count) bytes for \(attachment.filename)")
-                // Cache to BodyAssetStore — best-effort. If write fails, fall back
-                // to a tmp file so the preview still works.
-                let cachedAssetId = BodyAssetStore.writeAttachment(
-                    contentKey: ContentKey(rawValue: message.id),
-                    section: attachment.section,
-                    contentType: attachment.contentType,
-                    data: data
-                )
-                BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
-                let fileURL: URL
-                if let cachedAssetId, let storedURL = BodyAssetStore.urlOnDisk(assetId: cachedAssetId) {
-                    fileURL = makePreviewURL(from: storedURL, originalFilename: attachment.filename)
+                // Both sources converge on bytes, so ONE staging + presentation path
+                // serves them. Store-first: if BodyAssetStore has this attachment
+                // cached FOR THIS MESSAGE, skip the network. User tap on a cached
+                // attachment counts as a message access, so bump LRU.
+                let data: Data
+                if let identityStamp,
+                   let assetId = BodyAssetStore.attachmentAssetId(
+                    contentKey: ContentKey(rawValue: message.id), section: attachment.section,
+                    identityStamp: identityStamp),
+                   let storedURL = BodyAssetStore.urlOnDisk(assetId: assetId) {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Attachment] Cache HIT for \(attachment.filename) — skipping network")
+                    }
+                    BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
+                    data = try Data(contentsOf: storedURL)
                 } else {
-                    let tempDir = FileManager.default.temporaryDirectory
-                    let tmpURL = tempDir.appendingPathComponent(attachment.filename)
-                    try data.write(to: tmpURL)
-                    fileURL = tmpURL
+                    data = try await manager.fetchAttachment(for: message, section: attachment.section, encoding: attachment.encoding)
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Attachment] Downloaded \(data.count) bytes for \(attachment.filename)")
+                    }
+                    // Cache to BodyAssetStore — best-effort, and only for a message whose
+                    // identity we can prove. An unstamped row would be unreadable by
+                    // construction (`attachmentAssetId` requires a positive match), so
+                    // writing one would consume the user's attachment budget to store
+                    // bytes nothing could ever serve. The preview is served from the
+                    // staged copy below either way, so a refused cache write costs
+                    // nothing beyond the next tap re-fetching.
+                    _ = identityStamp.flatMap { stamp in
+                        BodyAssetStore.writeAttachment(
+                            contentKey: ContentKey(rawValue: message.id),
+                            section: attachment.section,
+                            contentType: attachment.contentType,
+                            data: data,
+                            identityStamp: stamp
+                        )
+                    }
+                    BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
                 }
-                print("[Attachment] Written to \(fileURL.path), presenting QuickLook")
+
+                // Stage into a fresh per-attempt directory, then complete the slot
+                // reserved above. Synchronous on the MainActor from materializing the
+                // file through handing it to QuickLook — there is no suspension point
+                // in between, so neither another scene nor a cancellation can
+                // interleave. `nil` means the slot was lost before presentation; the
+                // stager has already removed the attempt directory it created.
+                guard let fileURL = try AttachmentPreviewStager.stageAndPresent(
+                    data: data,
+                    messageId: message.id,
+                    originalFilename: attachment.filename,
+                    presenter: { AttachmentQuickLook.presentReserved(url: $0) }
+                ) else {
+                    downloadingSection = nil
+                    return
+                }
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Attachment] Staged at \(fileURL.path), QuickLook presented")
+                }
                 downloadedFiles[attachment.section] = fileURL
-                AttachmentQuickLook.present(url: fileURL)
                 presented = true
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
                 print("[Attachment] Download failed: \(error)")
             }
             downloadingSection = nil
-        }
-    }
-
-    /// Materializes a QuickLook-friendly URL from a stored asset.
-    ///
-    /// We always copy to `NSTemporaryDirectory()` rather than handing QuickLook the
-    /// raw App Group path for two reasons:
-    /// 1. The store path is `<headerHash>/<assetHash>` (no extension, no friendly
-    ///    name) — QuickLook would show the asset hash as the title and lose its
-    ///    UTType-from-extension hint.
-    /// 2. iOS Simulator (iOS 13+) has a documented bug where QLPreviewController's
-    ///    `quicklookd` XPC service can't issue sandbox extensions for paths outside
-    ///    `Documents/`/`tmp/`/`Caches/`, rendering App-Group-located previews as a
-    ///    blank gray sheet.
-    private func makePreviewURL(from storedURL: URL, originalFilename: String) -> URL {
-        let tempDir = FileManager.default.temporaryDirectory
-        let tmpURL = tempDir.appendingPathComponent(originalFilename)
-        try? FileManager.default.removeItem(at: tmpURL)
-        do {
-            try FileManager.default.copyItem(at: storedURL, to: tmpURL)
-            return tmpURL
-        } catch {
-            print("[Attachment] copy-to-tmp failed for preview, falling back to stored URL: \(error)")
-            return storedURL
         }
     }
 
@@ -297,6 +312,158 @@ struct AttachmentListView: View {
         if bytes < 1024 { return "\(bytes) B" }
         if bytes < 1024 * 1024 { return "\(bytes / 1024) KB" }
         return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
+    }
+}
+
+/// Produces immutable, QuickLook-friendly staging paths.
+///
+/// Every attempt lives under:
+/// `<tmp>/TabMailAttachmentPreviews/<message hash>/<attempt UUID>/<display name>`.
+/// The final component therefore remains meaningful to the user and QuickLook,
+/// while neither another message with the same filename nor a second scene can
+/// overwrite a file an active preview is already reading.
+///
+/// Rooting under `tmp/` is load-bearing rather than incidental, and staging is
+/// what lets the cached path be previewed at all:
+/// 1. The `BodyAssetStore` path is `<headerHash>/<assetHash>` (no extension, no
+///    friendly name) — QuickLook would show the asset hash as the title and lose
+///    its UTType-from-extension hint.
+/// 2. iOS Simulator (iOS 13+) has a documented bug where `QLPreviewController`'s
+///    `quicklookd` XPC service can't issue sandbox extensions for paths outside
+///    `Documents/`/`tmp/`/`Caches/`, rendering App-Group-located previews as a
+///    blank gray sheet.
+///
+/// **Attempt lifetime.** A directory is created only after the QuickLook slot is
+/// reserved, and exactly one of three things happens to it: staging fails and
+/// `stage` removes it; presentation is refused and `finishPresentation` removes
+/// it; or presentation succeeds and it is retained deliberately — QuickLook
+/// reads it for the life of the preview, and `downloadedFiles[section]` keeps
+/// referencing it afterwards for re-present and `ShareLink`. That retention is
+/// bounded: once `downloadedFiles[section]` is set, every later tap takes the
+/// re-present branch, so a given attachment stages at most once per view, and
+/// the surviving directories are reclaimed with the rest of `tmp/`.
+enum AttachmentPreviewStager {
+    private static let stagingDirectoryName = "TabMailAttachmentPreviews"
+
+    static func stage(
+        data: Data,
+        messageId: String,
+        originalFilename: String,
+        rootDirectory: URL = FileManager.default.temporaryDirectory,
+        fileManager: FileManager = .default,
+        writeData: (Data, URL) throws -> Void = { data, url in
+            try data.write(to: url, options: .atomic)
+        }
+    ) throws -> URL {
+        let destination = try destinationURL(
+            messageId: messageId,
+            originalFilename: originalFilename,
+            rootDirectory: rootDirectory,
+            fileManager: fileManager
+        )
+        do {
+            try writeData(data, destination)
+        } catch {
+            // `destinationURL` has already created the attempt directory, so a
+            // failed write would otherwise strand an empty directory in tmp/
+            // forever. Remove it, then report the real failure unchanged.
+            discardAttempt(at: destination, fileManager: fileManager)
+            throw error
+        }
+        return destination
+    }
+
+    @MainActor
+    static func stageAndPresent(
+        data: Data,
+        messageId: String,
+        originalFilename: String,
+        rootDirectory: URL = FileManager.default.temporaryDirectory,
+        fileManager: FileManager = .default,
+        writeData: (Data, URL) throws -> Void = { data, url in
+            try data.write(to: url, options: .atomic)
+        },
+        presenter: (URL) -> Bool
+    ) throws -> URL? {
+        try finishPresentation(
+            staging: {
+                try stage(
+                    data: data,
+                    messageId: messageId,
+                    originalFilename: originalFilename,
+                    rootDirectory: rootDirectory,
+                    fileManager: fileManager,
+                    writeData: writeData
+                )
+            },
+            fileManager: fileManager,
+            presenter: presenter
+        )
+    }
+
+    /// Removes ONE attempt — the `<attempt UUID>` directory, i.e. exactly what
+    /// `destinationURL` created. Never a sibling attempt, never the per-message
+    /// namespace, never the shared root, so it cannot touch a file another
+    /// preview is reading. Best-effort: failing to delete leaks one directory
+    /// into `tmp/`, which is strictly better than failing an operation that
+    /// otherwise succeeded.
+    static func discardAttempt(at stagedURL: URL, fileManager: FileManager = .default) {
+        try? fileManager.removeItem(at: stagedURL.deletingLastPathComponent())
+    }
+
+    @MainActor
+    private static func finishPresentation(
+        staging: () throws -> URL,
+        fileManager: FileManager,
+        presenter: (URL) -> Bool
+    ) rethrows -> URL? {
+        let stagedURL = try staging()
+        guard presenter(stagedURL) else {
+            // The slot was lost between reservation and presentation, or there
+            // was no view controller to present from. Nothing will ever read
+            // these bytes, so the attempt must not outlive the failed attempt.
+            discardAttempt(at: stagedURL, fileManager: fileManager)
+            return nil
+        }
+        return stagedURL
+    }
+
+    private static func destinationURL(
+        messageId: String,
+        originalFilename: String,
+        rootDirectory: URL,
+        fileManager: FileManager
+    ) throws -> URL {
+        // `messageId` IS this message's content key — the same value the cache
+        // read and write re-hydrate — so hashing it through the store's own
+        // helper reuses one hashing rule instead of introducing a second. The
+        // section deliberately does not enter the namespace: the per-attempt
+        // UUID already makes every attempt of every section a distinct path
+        // (including two same-named attachments on one message), and cleanup
+        // removes the exact directory it created rather than enumerating a
+        // namespace, so nothing needs to locate "all attempts for this section".
+        let namespace = BodyAssetStore.headerHash(ContentKey(rawValue: messageId))
+        let directory = rootDirectory
+            .appendingPathComponent(stagingDirectoryName, isDirectory: true)
+            .appendingPathComponent(namespace, isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        return directory.appendingPathComponent(
+            displayFilename(originalFilename)
+        )
+    }
+
+    /// Reduces an attachment filename to a single safe path component, so a
+    /// crafted name containing separators cannot escape the attempt directory.
+    private static func displayFilename(_ originalFilename: String) -> String {
+        let candidate = URL(fileURLWithPath: originalFilename).lastPathComponent
+        guard !candidate.isEmpty, candidate != ".", candidate != ".." else {
+            return "Attachment"
+        }
+        return candidate
     }
 }
 
@@ -329,16 +496,48 @@ enum AttachmentQuickLook {
     /// single static slot is sufficient.
     private static var activeController: QLPreviewController?
     private static var activeSource: PreviewSource?
+    private static var presentationReserved = false
+
+    /// Claims the single presentation slot before network or filesystem work.
+    /// Main-actor isolation makes the check-and-set atomic across scenes.
+    static func reservePresentation() -> Bool {
+        guard activeController == nil, !presentationReserved else {
+            return false
+        }
+        presentationReserved = true
+        return true
+    }
+
+    /// Releases a reservation whose download/staging path failed. It never
+    /// releases the reservation represented by an active controller.
+    static func cancelReservedPresentation() {
+        guard activeController == nil else { return }
+        presentationReserved = false
+    }
 
     /// Present `url` in QuickLook. No-op if a preview is already on screen.
-    static func present(url: URL) {
-        guard activeController == nil else {
+    @discardableResult
+    static func present(url: URL) -> Bool {
+        guard reservePresentation() else {
             print("[Attachment] QuickLook already presented — ignoring tap")
-            return
+            return false
+        }
+        return presentReserved(url: url)
+    }
+
+    /// Completes a slot reserved before download/staging. Every leg releases the
+    /// reservation: a refusal clears it outright, and a success transfers it to
+    /// `activeController`, which `handleDismiss` clears.
+    @discardableResult
+    static func presentReserved(url: URL) -> Bool {
+        guard presentationReserved, activeController == nil else {
+            presentationReserved = false
+            return false
         }
         guard let presenter = topViewController() else {
+            presentationReserved = false
             print("[Attachment] QuickLook: no view controller to present from")
-            return
+            return false
         }
         let source = PreviewSource(url: url)
         let controller = QLPreviewController()
@@ -346,15 +545,18 @@ enum AttachmentQuickLook {
         controller.delegate = DismissDelegate.shared
         activeController = controller
         activeSource = source
+        presentationReserved = false
         PreviewFreezeGate.shared.begin()
         print("[Attachment] QuickLook presenting \(url.lastPathComponent) from \(type(of: presenter))")
         presenter.present(controller, animated: true)
+        return true
     }
 
     /// Release the freeze gate + retained refs once the preview dismisses.
     /// Idempotent — guarded so a stray call can't unbalance the gate.
     fileprivate static func handleDismiss() {
         guard activeController != nil else { return }
+        presentationReserved = false
         activeController = nil
         activeSource = nil
         PreviewFreezeGate.shared.end()

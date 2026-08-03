@@ -12,10 +12,90 @@ struct FastSyncView: View {
     @State private var refreshTick = 0
     private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
+    // MARK: - Keep-awake state
+
+    /// Polled snapshots of each body queue's idle state (`ActiveBodyQueue.isIdle` /
+    /// `BackfillBodyQueue.isIdle` — queue empty AND no active batch). Start `false`
+    /// so the screen holds awake until the first poll confirms idle (fail-safe: an
+    /// un-polled screen never sleeps mid-fetch). The keep-awake lock follows the
+    /// queues' RUNNABLE state directly — an oversized-only-incomplete account no
+    /// longer pins the device awake, because `handlePayloadTooLarge` takes the
+    /// quarantined item out of the queue (`QueueStorage.removeFromQueue`) and
+    /// `admit` never re-admits it, so the queues go idle.
+    ///
+    /// Deliberately NO repopulation on poll and no admission latch: re-running both
+    /// full work-remaining scans every poll tick
+    /// (`BackfillBodyQueue.repopulateFromDatabase` is a ~200K-row scan) would drain
+    /// CPU/DB — the opposite of this screen's battery goal — and the
+    /// "repopulation-not-yet-run → lock releases" edge is acceptable (the device
+    /// sleeps; bodies fetch on the next foreground, no data loss). `SyncScheduler`
+    /// owns (re)populating the queues on wake.
+    @State private var activeBodyIdle = false
+    @State private var backfillBodyIdle = false
+
     /// True when all accounts have progress AND all are fully complete.
+    ///
+    /// This is a TRUTH CLAIM about the mailbox and deliberately stays gated on
+    /// `BackfillProgress.isFullyComplete` (`pendingBodyCount == 0`): an account
+    /// holding a quarantined oversized body genuinely does not have every body
+    /// indexed, so the "Sync Complete" label stays withheld rather than lying.
+    /// Only the wake lock moved to the runnable-state predicate below.
     private var isAllComplete: Bool {
         let values = Array(state.backfillProgressByAccount.values)
         return !values.isEmpty && values.allSatisfy(\.isFullyComplete)
+    }
+
+    /// Keep-awake predicate. The device stays awake while there is RUNNABLE body
+    /// work, NOT while durable completeness is < 100%.
+    ///
+    /// `ActiveBodyQueue.handlePayloadTooLarge` / `BackfillBodyQueue
+    /// .handlePayloadTooLarge` leave an oversized (`PayloadTooLargeError`) row
+    /// honestly `bodyComplete = 0 / bodyEmptyConfirmed = 0` — the body demonstrably
+    /// exists, it merely did not fit — so `BackfillProgress.pendingBodyCount` keeps
+    /// counting it and never reaches 0 for that account. The old
+    /// `keepScreenAwake(while: !isAllComplete)` gate therefore pinned the wake lock
+    /// indefinitely on any account holding a single oversized message. This
+    /// predicate instead follows the header walk plus the two body queues' idle
+    /// state, releasing once the walk is complete and the queues drain — the
+    /// quarantined rows are `removeFromQueue`'d and never re-admitted, so an
+    /// oversized-only remainder goes idle. Pure and `nonisolated` so it is
+    /// assertable without driving SwiftUI. Holds awake when:
+    ///  - any account's header walk is not done (`headersDone != true`, including a
+    ///    missing progress entry — mapped to `false` by the caller), OR
+    ///  - either body queue is non-idle (queued / in-flight / active batch).
+    nonisolated static func keepScreenAwakeWhileWorking(
+        accountHeadersDone: [Bool],
+        activeBodyIdle: Bool,
+        backfillBodyIdle: Bool
+    ) -> Bool {
+        if accountHeadersDone.contains(false) { return true }
+        if !activeBodyIdle { return true }
+        if !backfillBodyIdle { return true }
+        return false
+    }
+
+    /// Live keep-awake value — maps the current SwiftUI state into the pure
+    /// predicate. `state.backfillProgressByAccount[$0.id]?.headersDone == true`
+    /// preserves the `?.headersDone != true` semantics (a missing progress entry ⇒
+    /// not-done ⇒ hold awake).
+    private var holdAwake: Bool {
+        Self.keepScreenAwakeWhileWorking(
+            accountHeadersDone: navigationStore.accounts.map {
+                state.backfillProgressByAccount[$0.id]?.headersDone == true
+            },
+            activeBodyIdle: activeBodyIdle,
+            backfillBodyIdle: backfillBodyIdle
+        )
+    }
+
+    /// Poll both body queues' idle state into `@State` for the keep-awake predicate.
+    /// No repopulation here — `SyncScheduler` owns (re)populating the queues on
+    /// foreground/wake; this screen only OBSERVES their runnable state so the wake
+    /// lock releases once the header walk is done and the queues drain (the
+    /// quarantined oversized rows having been removed from the queue).
+    private func refreshBodyQueueIdleState() async {
+        activeBodyIdle = await ActiveBodyQueue.shared.isIdle
+        backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
     }
 
     private func formatETA(_ seconds: Double) -> String {
@@ -158,7 +238,7 @@ struct FastSyncView: View {
                 }
             }
         }
-        .keepScreenAwake(while: !isAllComplete)
+        .keepScreenAwake(while: holdAwake)
         .onAppear {
             Task { await manager.setFastSyncMode(true) }
             Task {
@@ -170,6 +250,8 @@ struct FastSyncView: View {
                     await manager.syncEngine.startBackfill(account: account)
                 }
             }
+            // Poll queue idle state for the keep-awake predicate.
+            Task { await refreshBodyQueueIdleState() }
         }
         .onDisappear { Task { await manager.setFastSyncMode(false) } }
         .onReceive(refreshTimer) { _ in
@@ -180,6 +262,9 @@ struct FastSyncView: View {
                     await manager.syncEngine.updateBackfillProgressForAccount(account)
                 }
             }
+            // Re-poll queue idle state so the keep-awake lock releases once the walk
+            // is done and the queues drain (quarantined oversized rows removed).
+            Task { await refreshBodyQueueIdleState() }
         }
     }
 }

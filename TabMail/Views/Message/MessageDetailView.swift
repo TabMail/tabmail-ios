@@ -634,11 +634,14 @@ struct MessageDetailView: View {
     }
 
     private func handleMove(_ msg: MessageHeader, toFolderPath: String) {
+        // move()/moveMessage() return false when nothing was recorded — don't
+        // dismiss or flash then, or the message is hidden from the list with
+        // no undo entry (same contract as handleArchive/handleDelete).
         if msg.id == viewModel.message?.id {
-            viewModel.move(toFolderPath: toFolderPath)
-            dismissMessage()
-        } else {
-            viewModel.moveMessage(msg, toFolderPath: toFolderPath)
+            if viewModel.move(toFolderPath: toFolderPath) {
+                dismissMessage()
+            }
+        } else if viewModel.moveMessage(msg, toFolderPath: toFolderPath) {
             flashedCardId = msg.id
         }
     }

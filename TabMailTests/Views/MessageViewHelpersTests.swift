@@ -129,4 +129,53 @@ struct MessageViewHelpersTests {
         header.cachedReply = "Some reply text"
         #expect(MessageViewHelpers.showShimmer(header) == false)
     }
+
+    // MARK: - ActionTagDisplay (ADR-IOS-036 retained-tag display gate)
+
+    /// Build an in-memory snapshot; no DB needed — the display rule is pure.
+    /// `folderPath`/`isInInbox` are the only fields that matter here.
+    private func snapshot(tag: ActionTag?, isInInbox: Bool, folderPath: String) -> MessageSnapshot {
+        var header = MessageHeader(
+            messageId: "m1",
+            subject: "Subject",
+            from: "Alice <alice@example.com>",
+            fromAddress: "alice@example.com",
+            to: "bob@example.com",
+            date: Date(),
+            snippet: "Snippet",
+            folderId: "acc1:\(folderPath)",
+            accountId: "acc1",
+            folderPath: folderPath,
+            isInInbox: isInInbox
+        )
+        header.actionTag = tag
+        return MessageSnapshot(from: header)
+    }
+
+    @Test("an inbox row displays its action tag's color")
+    func displayedTagShownForInboxRow() {
+        let row = snapshot(tag: ActionTag.reply, isInInbox: true, folderPath: "INBOX")
+        #expect(ActionTagDisplay.displayedTag(for: row) == ActionTag.reply)
+    }
+
+    @Test("a row that has left the inbox displays NO color for its retained action tag")
+    func displayedTagHiddenForNonInboxRow() {
+        // ADR-IOS-036: the tag is RETAINED on the row after it leaves the inbox
+        // (Sent reply, archived thread member, mid-drain optimistic move) — it
+        // must simply not be painted. Retention is asserted alongside the gate
+        // so a "clear the tag instead" regression cannot pass this test.
+        let sent = snapshot(tag: ActionTag.reply, isInInbox: false, folderPath: "Sent")
+        #expect(sent.actionTag == ActionTag.reply, "the tag is retained, only its DISPLAY is gated")
+        #expect(ActionTagDisplay.displayedTag(for: sent) == nil)
+
+        let archived = snapshot(tag: ActionTag.archive, isInInbox: false, folderPath: "Archive")
+        #expect(archived.actionTag == ActionTag.archive, "the tag is retained, only its DISPLAY is gated")
+        #expect(ActionTagDisplay.displayedTag(for: archived) == nil)
+    }
+
+    @Test("an inbox row with no action tag displays no color")
+    func displayedTagNilWhenUntagged() {
+        let row = snapshot(tag: nil, isInInbox: true, folderPath: "INBOX")
+        #expect(ActionTagDisplay.displayedTag(for: row) == nil)
+    }
 }
