@@ -1002,21 +1002,46 @@ extension AccountManager {
             // Both flag ops below used to name `original.stableId` — an rfc822
             // Message-ID on IMAP — with no `observedUidValidity`. That is exactly
             // the shape the drain's checkpoint A exists to refuse, so on IMAP the
-            // `\Answered` / `$Forwarded` keyword was queued and then deleted
-            // unexecuted on the next drain, every time: a silently accepted,
-            // deterministically dropped action.
+            // `\Answered` / `$Forwarded` keyword was queued and never executed,
+            // every time: a silently accepted, deterministically lost action.
+            // ⚠ CORRECTED (audit round 2): this said "deleted unexecuted on the
+            // next drain", which was checkpoint A's behaviour when the defect
+            // shipped. It now SKIPS rather than deletes — an absence of evidence is
+            // not an exit — so the same shape today leaves a permanently
+            // unclaimable row. Same loss to the user, different wreckage.
             //
             // `nil` here means the account row, the folder row or its epoch is
             // missing — an ABSENCE of evidence. We refuse to queue rather than
-            // queue an op that can only be refused. The LOCAL flags below are set
-            // either way: the user provably replied/forwarded, and that fact does
-            // not depend on whether we can address the message on the wire.
+            // queue an op that can only be refused. That refusal is the documented
+            // `IOS-EPOCH-001` fail-closed window and it STAYS.
+            //
+            // 🚨 THE LOCAL FLAG AND THE DURABLE OP SHARE ONE FATE (audit round 2).
+            // `original.isReplied` / `.isForwarded` used to be set OUTSIDE these
+            // guards, so when the admission was nil the local flag was written and
+            // no durable op was queued — no retry, no record, no disposition to the
+            // caller. `isReplied` is not a private note that the user composed
+            // something; it is the local mirror of the server's `\Answered`, and
+            // every reader treats it as such. Writing it while withholding the
+            // gesture makes the UI assert a server-side flag that was never queued
+            // and never will be — a claim about the SERVER, made on the strength of
+            // evidence we just admitted we do not have. The two siblings that
+            // decide the same question — `UserLabelMenuModel.applyLabel` /
+            // `removeLabel` and `InboxViewModel.removeUserLabel` — both refuse
+            // BEFORE the local mutation ("Refuse before the local insert so neither
+            // half lands"), and this site now has the same shape rather than a
+            // third one.
+            //
+            // ⚠ The FIX IS NOT to admit the gesture anyway. Withholding an
+            // unaddressable durable op is the specified disposition; the defect was
+            // only the local lie about what that withholding meant. When the
+            // admission returns, the ordinary reply-detect sweep re-establishes the
+            // flag from the server's own state.
             let flagAdmission = try AccountManager.admittedOrdinaryActionTargets(
                 [original], accountId: original.accountId,
                 folderPath: original.folderPath, db: db)
             if outbox.isForward {
-                original.isForwarded = true
                 if let flagAdmission {
+                    original.isForwarded = true
                     try PendingOperation(
                         type: .markForwarded,
                         messageIds: flagAdmission.providerIds,
@@ -1025,8 +1050,8 @@ extension AccountManager {
                         observedUidValidity: flagAdmission.observedUidValidity).insert(db)
                 }
             } else {
-                original.isReplied = true
                 if let flagAdmission {
+                    original.isReplied = true
                     try PendingOperation(
                         type: .markReplied,
                         messageIds: flagAdmission.providerIds,
@@ -1034,6 +1059,12 @@ extension AccountManager {
                         folderPath: original.folderPath,
                         observedUidValidity: flagAdmission.observedUidValidity).insert(db)
                 }
+                // ⚑ DELIBERATELY OUTSIDE the admission guard. An action tag is
+                // LOCAL-ONLY (ADR-IOS-036) — clearing `reply` claims nothing about
+                // the server, so an unaddressable parent is no reason to leave a
+                // stale "needs reply" badge on a message the user just replied to.
+                // Its `.setTag` op is excluded from checkpoint A for the same
+                // reason, which is why it carries `stableId` and no epoch.
                 if original.actionTag == .reply {
                     // `ActionTag.none` is the real tag VALUE "none", not
                     // Optional.none — so this STAMPS `actionTagSetAt`, it does
