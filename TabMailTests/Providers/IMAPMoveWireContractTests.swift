@@ -16,13 +16,18 @@ import Testing
 ///    separate `deleteActionSource`: the source delete leg IS the tail of `move`,
 ///    so the "delete-source" half of this property is covered by the same two
 ///    cases (UIDPLUS purges exactly the named UID; no-UIDPLUS purges nothing).
-///  - T3.4 — a source message is only ever soft-deleted or purged when the
-///    server's own `COPYUID` named it as copied. A server that cannot produce
-///    `COPYUID` at all is refused before anything reaches the wire; a server
-///    that can is held to per-member evidence, so a member it did not name
-///    survives while its named sibling is cleaned. Stated as an end state
-///    (which messages exist where, and with which flags), never as "the
-///    provider read the response code".
+///  - T3.4, as amended by audit round 3 — a source message is only ever
+///    soft-deleted or purged on evidence the server itself supplied, AT THE
+///    STRONGEST RESOLUTION THAT SERVER CAN EXPRESS. A server that advertises
+///    UIDPLUS is held to per-member `COPYUID`, so a member it did not name
+///    survives while its named sibling is cleaned, and a server that names none
+///    of them cleans nothing. A server that does NOT advertise UIDPLUS can
+///    never produce `COPYUID`, so its evidence is the COPY's own tagged OK
+///    (RFC 3501 §6.4.7 — an unsuccessful COPY MUST restore the destination),
+///    and its move completes. Refusing that class outright was a permanent
+///    wedge, not a safety property; see `nonUidPlusMoveCompletesWithoutAnyExpunge`.
+///    Stated as an end state (which messages exist where, and with which
+///    flags), never as "the provider read the response code".
 ///  - T3.1 — a UIDVALIDITY change observed between any two mutation steps
 ///    refuses the remaining steps instead of completing them against a
 ///    renumbered mailbox.
@@ -125,30 +130,45 @@ struct IMAPMoveWireContractTests {
         #expect(server.wrongMessageViolations().isEmpty)
     }
 
-    /// ⚠ REWRITTEN TWICE BY T3.4 — record both prior display names, because a
+    /// ⚠ REWRITTEN THREE TIMES — record every prior display name, because a
     /// stale entry on the expected-name list silently reads as ABSENT.
     ///  1. Originally *"A move on a server without UIDPLUS copies and
-    ///     soft-deletes but issues no EXPUNGE at all"*, asserting
-    ///     `deletedStores(server).count == 1` and
-    ///     `flags(in: "INBOX", uid: 22).contains("\\Deleted")`. That pinned the
-    ///     pre-T3.4 behaviour in which an UNPROVEN copy still authorized a
-    ///     source mutation — the very thing T3.4 forbids, kept alive and green.
+    ///     soft-deletes but issues no EXPUNGE at all"*.
     ///  2. Then *"A move on a server without UIDPLUS gets no COPYUID and never
     ///     touches the source"*, which asserted one `UID COPY` on the wire and
-    ///     the copy landing at the destination. That matched the first cut of
-    ///     the gate, which refused only AFTER the COPY.
+    ///     the copy landing at the destination but no source mutation.
+    ///  3. Then *"A move on a server without UIDPLUS is refused before the COPY
+    ///     and mutates nothing at all"*, matching T3.4's capability refusal.
     ///
-    /// The gate now refuses at assertion A1, before the destination probe, the
-    /// legacy `tm_*` strip and the COPY, so the property is strictly stronger
-    /// and is asserted as such below: **nothing reaches the wire at all.**
-    /// A refusal after a successful COPY guarantees a destination duplicate on
-    /// every gesture; a refusal before it cannot manufacture one.
+    /// 🚨 **AUDIT ROUND 3 — NAME 3 WAS A BLESSING TEST AND IS NOW INVERTED.**
+    /// It asserted that a non-UIDPLUS move reaches the wire not at all. That
+    /// reads as maximal safety and was in fact a permanent, unresolvable wedge:
+    /// the missing capability can never appear, so the refusal fired on every
+    /// attempt forever, the user's archive could never happen by any route, and
+    /// the refusal's `.haltLane` drain arm starved every later gesture on the
+    /// same message. `v1.6.38` moved mail on these servers perfectly well. The
+    /// gate is deleted; what authorizes the source cleanup on this class of
+    /// server is the COPY's own tagged OK, which RFC 3501 §6.4.7 makes a
+    /// positive statement that the whole named set copied (an unsuccessful COPY
+    /// MUST restore the destination mailbox). Name 1 is therefore close to what
+    /// is asserted again below.
     ///
-    /// The surviving half of the original — the purge is UID-scoped or absent,
-    /// never mailbox-wide, so a co-resident `\Deleted` bystander is spared — is
-    /// unchanged and still asserted.
-    @Test("A move on a server without UIDPLUS is refused before the COPY and mutates nothing at all")
-    func nonUidPlusMoveIsRefusedBeforeAnyWireMutation() async throws {
+    /// THE PROPERTIES, all end state at the server:
+    ///  - the move COMPLETES — the copy is at the destination and the named
+    ///    source UID is soft-deleted;
+    ///  - **no EXPUNGE of any kind**, so the co-resident soft-deleted bystander
+    ///    survives. That is `KNOWN_ISSUES.md` `IOS-IMAP-001`: a server without
+    ///    UIDPLUS has no narrower purge than a mailbox-wide `EXPUNGE`, which
+    ///    would irreversibly destroy unrelated mail, and incomplete VISIBLE
+    ///    cleanup is preferred over that AND over the wedge. This half has been
+    ///    asserted by this test under every one of its names and is the one
+    ///    thing that never changed;
+    ///  - only the NAMED UID is mutated, so the bystander is bit-identical.
+    ///
+    /// RED PROOF (recorded): with the `supportsUIDPlus` refusal restored, this
+    /// fails at the `UID COPY` count and at `messageIDs(in: "Archive")`.
+    @Test("A move on a server without UIDPLUS completes by copy plus soft delete and never expunges")
+    func nonUidPlusMoveCompletesWithoutAnyExpunge() async throws {
         let target = "soft-target@example.com"
         let bystander = "soft-bystander@example.com"
         let server = FakeIMAPServer(
@@ -167,74 +187,57 @@ struct IMAPMoveWireContractTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        // COPYUID is a UIDPLUS response code, so this server can never furnish
-        // the evidence T3.4 requires.
-        //
-        // 🚨 CORRECTED (audit round 1, finding B-1). This used to assert
-        // `throws: ProviderError.self` under a comment calling the refusal a
-        // "Terminal refusal the drain drops (`IOS-IMAP-004`), not a retry" —
-        // which is the defect stated as the specification. `v1.6.38` called
-        // `server.move` and this move WORKED on a non-UIDPLUS server; v3 cannot
-        // prove the copy landed, but "we cannot prove it" is an absence of
-        // evidence, not the provider telling us the move is moot. Dropping the
-        // op here silently discarded an archive the shipped release performed.
-        var thrown: Error?
-        do {
-            try await provider.move(
-                ids: ["22"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
-        } catch {
-            thrown = error
-        }
-        #expect(thrown != nil, "a move that cannot be proven must refuse, not report success")
+        let proven = try await provider.move(
+            ids: ["22"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
 
-        // NON-VACUITY: the fixture provably reaches the gate rather than
-        // failing earlier for an unrelated reason — the action connection got
-        // as far as SELECTing the source, which is where A1 (and therefore the
-        // gate immediately after it) runs. Its two-sided partner is
-        // `uidPlusMovePurgesOnlyTheNamedUID`, the SAME INBOX/Archive/bystander
-        // shape with UIDPLUS advertised, which runs the full sequence.
-        #expect(Self.commands(server, containing: "SELECT").contains {
-            $0.uppercased().contains("INBOX")
-        })
-        // THE PROPERTY: zero wire mutation. No COPY, so nothing at the
-        // destination — the refusal cannot create the duplicate that refusing
-        // after the COPY would have.
-        #expect(Self.commands(server, containing: "UID COPY").isEmpty)
-        #expect(server.messageIDs(in: "Archive").isEmpty)
-        #expect(Self.deletedStores(server).isEmpty)
+        // The member is reported complete, so the drain retires it and releases
+        // its lane. The queue-level partner is
+        // `NeverDropExitClosureTests.aNonUidPlusMoveCompletesAndReleasesItsLane`.
+        #expect(proven == ["22"])
+
+        // THE MOVE HAPPENED.
+        #expect(Self.commands(server, containing: "UID COPY").count == 1)
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(Self.deletedStores(server).count == 1)
+        #expect(server.flags(in: "INBOX", uid: 22).contains("\\Deleted"))
+
+        // NO EXPUNGE OF ANY KIND — IOS-IMAP-001. Not UID-scoped (the server
+        // cannot), and emphatically not mailbox-wide.
         #expect(Self.anyExpunges(server).isEmpty)
-        // The source is exactly as it was found.
-        #expect(server.messageIDs(in: "INBOX").count == 2)
-        #expect(server.flags(in: "INBOX", uid: 22).isEmpty)
+        #expect(Self.bareExpunges(server).isEmpty)
         // Somebody else's soft-deleted message is still soft-deleted and still
-        // there — the mailbox-wide-EXPUNGE property this test has always held.
+        // there — the property this test has held under every one of its names.
+        #expect(server.messageIDs(in: "INBOX").count == 2)
         #expect(server.flags(in: "INBOX", uid: 21).contains("\\Deleted"))
+        // No `UID MOVE` either: the provider issues its own instrumented
+        // sequence, so SwiftMail's fallback — whose UID branch degrades to a
+        // bare, mailbox-wide `expunge()` without UIDPLUS — is never reached.
+        #expect(Self.commands(server, containing: "UID MOVE").isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
-
-        // Absence of evidence is RETRYABLE FOREVER, never a drop — the same
-        // check `unknownDestinationEpochRefusesBeforeAnyWireMutation` makes on
-        // the destination side. Neither typed signal the drain retires on may
-        // escape this refusal.
-        if let thrown {
-            if case ProviderError.uidValidityChanged = thrown {
-                Issue.record("a missing UIDPLUS capability is not a proven epoch turnover")
-            }
-            if case ProviderError.actionIdentityResolutionFailed = thrown {
-                Issue.record("a missing UIDPLUS capability must not be dropped as an unverifiable identity — the op stays queued")
-            }
-        }
     }
 
-    // MARK: - T3.4 — only COPYUID may authorize source cleanup
+    // MARK: - T3.4 — a UIDPLUS server is held to its own COPYUID
 
+    /// ⚠ **THE COMMENT BELOW WAS INVERTED BY AUDIT ROUND 3 — record it, because
+    /// it was the reasoning that produced the wedge.** It read: *"Both shapes
+    /// must produce the same refusal, or the gate would be a capability check
+    /// dressed up as an evidence check."* The two shapes are NOT the same and
+    /// must NOT produce the same outcome. A server that advertises UIDPLUS and
+    /// withholds `COPYUID` has made a CHOICE it can unmake on the next attempt
+    /// (RFC 4315 §3 makes sending it a MAY), so refusing is a bounded wait for
+    /// evidence. A server that does not advertise UIDPLUS has no choice to
+    /// unmake, so the identical refusal is permanent and starves the whole lane
+    /// — which is why that case now completes on the COPY's tagged OK instead.
+    /// Requiring both to behave alike is what turned a capability gap into an
+    /// unresolvable one; the pair `nonUidPlusMoveCompletesWithoutAnyExpunge` /
+    /// this test is deliberately two-sided now.
     @Test("A UIDPLUS server that withholds COPYUID leaves the source untouched and refuses the move")
     func withheldCopyUidRefusesAllSourceCleanup() async throws {
         let target = "withheld-target@example.com"
         let bystander = "withheld-bystander@example.com"
-        // UIDPLUS IS advertised here — the difference from the test above is
-        // only that this server declines to send the response code, which
-        // RFC 4315 §3 permits. Both shapes must produce the same refusal, or
-        // the gate would be a capability check dressed up as an evidence check.
+        // UIDPLUS IS advertised here, and that is the whole difference: this
+        // server CAN name what it copied and declined to, which RFC 4315 §3
+        // permits and which the next attempt may not repeat.
         let server = FakeIMAPServer(mailboxes: [
             "Work": [Self.message(91, bystander), Self.message(92, target)],
             "Archive": [],

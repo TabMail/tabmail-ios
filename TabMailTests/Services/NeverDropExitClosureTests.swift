@@ -378,13 +378,28 @@ struct NeverDropExitClosureTests {
 
     // MARK: - B-1 — an unprovable move is retryable, not terminal
 
-    /// B-1. Both of `IMAPProvider.move`'s refusals — no UIDPLUS advertised, and
-    /// a COPYUID the server declined to send — threw
+    /// B-1. `IMAPProvider.move`'s evidence refusal threw
     /// `ProviderError.actionIdentityResolutionFailed`, which lands in a drain
     /// arm that DELETES the op. Every premise in that arm's comment was
-    /// `.deleteDraft`-specific. `v1.6.38` called `server.move` and this worked
-    /// on non-UIDPLUS servers, so the effect was that upgrading silently
+    /// `.deleteDraft`-specific, so the effect was that upgrading silently
     /// discarded archives on exactly the servers least able to prove anything.
+    ///
+    /// ⚠ **RE-SCOPED (audit round 3) — the fixture changed from a NON-UIDPLUS
+    /// server to a UIDPLUS server that WITHHOLDS `COPYUID`, and the change is
+    /// the point.** This test used to be a BLESSING TEST: it pinned "a move on a
+    /// non-UIDPLUS server leaves the source untouched and the op queued" as
+    /// correct, when that shape was in fact a permanent, unresolvable wedge —
+    /// the capability can never appear, so the op could never complete on any
+    /// future drain either, and its `.haltLane` disposition starved every later
+    /// gesture on the same message forever. Round 3 deleted that refusal; a
+    /// non-UIDPLUS move now COMPLETES (see
+    /// `aNonUidPlusMoveCompletesAndReleasesItsLane`, the two-sided partner).
+    ///
+    /// What survives, and what this now pins, is the case that genuinely cannot
+    /// be proved and genuinely may be provable on the next attempt: a server
+    /// that DOES advertise UIDPLUS and still declines to send the response code
+    /// (RFC 4315 §3 makes it a MAY). That is an absence of evidence about a
+    /// server that could have furnished it, so the intention must survive.
     ///
     /// ACCEPTED COST, documented at the production site: each retry re-issues
     /// the COPY, so such a server accumulates an unproven duplicate at the
@@ -392,19 +407,21 @@ struct NeverDropExitClosureTests {
     /// recoverable; a silently discarded archive is not.
     ///
     /// RED PROOF (recorded): restoring
-    /// `throw ProviderError.actionIdentityResolutionFailed` on the no-UIDPLUS
+    /// `throw ProviderError.actionIdentityResolutionFailed` on the evidence
     /// gate fails this at `after.count == 1` — the row is deleted by the generic
     /// identity-resolution arm.
     @Test("A move on a server that cannot prove COPYUID keeps the op queued")
     @MainActor
     func unprovableMoveKeepsTheOpQueued() async throws {
         let target = "unprovable-move@example.com"
-        let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
-            mailboxes: [
-                "INBOX": [Self.message(uid: 77, id: target)],
-                "Archive": [],
-            ])
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: target)],
+            "Archive": [],
+        ])
+        // UIDPLUS IS advertised; the server simply declines to name what it
+        // copied. That is server behaviour, not a capability gap, so it may
+        // differ on the next attempt — which is exactly why the op stays.
+        server.withholdCopyUID(forSourceUIDs: [77])
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Archive")
         server.expectMutation(rfc822MessageId: target)
@@ -480,17 +497,30 @@ struct NeverDropExitClosureTests {
     /// `failedAccounts`, `evidenceRefused` or any other drain internal — all
     /// mechanism, and a test written against them would keep passing if the poison
     /// simply moved somewhere else.
+    ///
+    /// ⚠ **RE-SCOPED (audit round 3), same change and same reason as
+    /// `unprovableMoveKeepsTheOpQueued` above.** The fixture was a NON-UIDPLUS
+    /// server, which made property 2 a BLESSING TEST: it required the lane-mate
+    /// never to reach the wire, and on that fixture the predecessor could never
+    /// complete on any drain ever, so what it actually pinned as correct was
+    /// PERMANENT STARVATION of a gesture the user made. Property 2 is only a
+    /// lane-ordering property when the predecessor is genuinely unresolved-FOR-NOW,
+    /// so the fixture is now a UIDPLUS server that withholds `COPYUID` — an
+    /// absence of evidence that can end. The non-UIDPLUS case is asserted from the
+    /// other side by `aNonUidPlusMoveCompletesAndReleasesItsLane`, where the
+    /// lane-mate MUST execute.
     @Test("An op the server will never prove wedges only its own lane, not the account")
     @MainActor
     func unprovableOpDoesNotWedgeTheAccountsOtherGestures() async throws {
         let unprovable = "wedge-unprovable@example.com"
         let bystander = "wedge-bystander@example.com"
-        let server = FakeIMAPServer(
-            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
-            mailboxes: [
-                "INBOX": [Self.message(uid: 77, id: unprovable), Self.message(uid: 88, id: bystander)],
-                "Archive": [],
-            ])
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 77, id: unprovable), Self.message(uid: 88, id: bystander)],
+            "Archive": [],
+        ])
+        // UIDPLUS advertised, `COPYUID` withheld for the move's source UID: the
+        // op cannot be proven THIS attempt, but could be on the next one.
+        server.withholdCopyUID(forSourceUIDs: [77])
         server.setUidValidity(10, for: "INBOX")
         server.setUidValidity(10, for: "Archive")
         server.expectMutation(rfc822MessageId: unprovable)
@@ -501,7 +531,7 @@ struct NeverDropExitClosureTests {
         let f = try fixture(accountId: "closure-wedge")
         let provider = try await registeredIMAPProvider(server: server, fixture: f)
 
-        // The op no server without UIDPLUS can ever furnish evidence for.
+        // The op this attempt cannot obtain evidence for.
         var unprovableMove = PendingOperation(
             type: .move, messageIds: ["77"], accountId: f.accountId,
             folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
@@ -567,6 +597,112 @@ struct NeverDropExitClosureTests {
             flags: \(laneMate)
             """)
         // C3 holds throughout: nothing was mutated on a message no gesture named.
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - AUDIT ROUND 3 — a capability the server lacks is not "unproven yet"
+
+    /// 🚨 AUDIT ROUND 3. `IMAPProvider.move` opened with
+    /// `guard await server.supportsUIDPlus else { throw … }`, so on a
+    /// standards-valid non-UIDPLUS server the move threw before any wire
+    /// mutation — on EVERY attempt, forever, because the missing capability is
+    /// not evidence that can arrive later. The refusal's drain arm returns
+    /// `.haltLane`, and `buildLanes` unions ops that share a message id, so the
+    /// user's every LATER gesture on that same message was held behind an op
+    /// that could never resolve. Neither row had any user-visible resolution
+    /// path: nothing lists or clears `PendingOperation`.
+    ///
+    /// **That is the never-drop WEDGE corollary — an op that stays queued but
+    /// prevents every intention behind it from executing has not been
+    /// preserved** — and three tests were BLESSING it as correct
+    /// (`unprovableMoveKeepsTheOpQueued`, `unprovableOpDoesNotWedgeThe…`, and
+    /// `IMAPMoveWireContractTests.nonUidPlusMove…`); all three are re-scoped to
+    /// the UIDPLUS-withholding case, which is the genuinely-unprovable one.
+    ///
+    /// THE PROPERTY, asserted as end state at the server and in the queue —
+    /// never as "the provider did not throw a particular error":
+    ///  1. the user's move COMPLETED: the message is at the destination and its
+    ///     source copy is soft-deleted;
+    ///  2. the queue is EMPTY, so the op retired and nothing is starved;
+    ///  3. a LANE-MATE gesture the user issued afterwards on the same message
+    ///     EXECUTED — the half that makes this a wedge test rather than a move
+    ///     test.
+    ///
+    /// The source copy is `\Deleted` but still present, which is deliberate and
+    /// is the accepted cost recorded in `KNOWN_ISSUES.md` `IOS-IMAP-001`: a
+    /// server without UIDPLUS has no narrower purge than a mailbox-wide
+    /// `EXPUNGE`, which would irreversibly destroy unrelated mail that already
+    /// carries `\Deleted`. Incomplete VISIBLE cleanup is preferred over both
+    /// that and the permanent wedge. Asserting the `\Deleted` mark (rather than
+    /// the source being gone) pins exactly that decision.
+    ///
+    /// RED PROOF (recorded): with the `supportsUIDPlus` refusal restored, this
+    /// fails at property 1 — `Archive` is empty — and at properties 2 and 3.
+    @Test("A move on a server without UIDPLUS completes and releases its lane")
+    @MainActor
+    func aNonUidPlusMoveCompletesAndReleasesItsLane() async throws {
+        let target = "nouidplus-target@example.com"
+        let bystander = "nouidplus-bystander@example.com"
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: [
+                "INBOX": [Self.message(uid: 77, id: target), Self.message(uid: 88, id: bystander)],
+                "Archive": [],
+            ])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Archive")
+        server.expectMutation(rfc822MessageId: target)
+        server.expectMutation(rfc822MessageId: bystander)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-nouidplus-completes")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        var move = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 10)
+        move.createdAt = Date().addingTimeInterval(-60)
+        // Issued AFTER the move and naming the SAME message, so `buildLanes` puts
+        // it in the move's lane, behind it. This is the gesture the wedge starved.
+        var laneMate = PendingOperation(
+            type: .markFlagged, messageIds: ["77"], accountId: f.accountId,
+            folderPath: "INBOX", observedUidValidity: 10)
+        laneMate.createdAt = Date().addingTimeInterval(-40)
+        try insert([move, laneMate], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // PROPERTY 1 — the move completed on the wire.
+        #expect(
+            server.messageIDs(in: "Archive") == ["<\(target)>"],
+            """
+            the user's archive never reached the destination on a server whose only defect is that \
+            it does not advertise a MAY-level extension — Archive: \(server.messageIDs(in: "Archive"))
+            """)
+        let sourceFlags = server.flags(in: "INBOX", uid: 77)
+        #expect(
+            sourceFlags.contains("\\Deleted"),
+            "the source copy was not soft-deleted, so the move only half happened — flags: \(sourceFlags)")
+        // IOS-IMAP-001: no mailbox-wide EXPUNGE, so the bystander is untouched.
+        #expect(server.messageIDs(in: "INBOX").contains("<\(bystander)>"))
+
+        // PROPERTY 2 — nothing is starved: both ops retired.
+        #expect(
+            try operations(f.pool).isEmpty,
+            "an op remained queued after a move that completed, so the lane is still held")
+
+        // PROPERTY 3 — the lane-mate the user issued afterwards EXECUTED. This is
+        // the half the deleted refusal made impossible forever.
+        #expect(
+            sourceFlags.contains("\\Flagged"),
+            """
+            the lane-mate gesture never reached the server. Its predecessor completed, so nothing \
+            legitimately holds it — this is the permanent starvation the capability refusal caused \
+            — flags: \(sourceFlags)
+            """)
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
         await finish(f)
