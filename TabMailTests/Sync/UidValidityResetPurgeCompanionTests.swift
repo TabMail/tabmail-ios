@@ -27,11 +27,13 @@ import Synchronization
 /// called or which flag was written.
 ///
 /// WHAT ABORTS THE REACTION AND WHAT DOES NOT — the second thing under test here.
-/// Exactly ONE step-4 purge aborts, the FTS one, and its abort leg is already pinned
-/// by `UidValidityResetReactionTests.abortBeforeStampLeavesTheFolderRetryable`. The
-/// NSE staging purges are BEST-EFFORT by design; `stagingPurgeFailureDoesNotAbort`
-/// below is the two-sided proof that a purge which genuinely could not write leaves
-/// the reaction free to complete.
+/// The FTS purge aborts (pinned by
+/// `UidValidityResetReactionTests.abortBeforeStampLeavesTheFolderRetryable`) and, as
+/// of audit round 1 / C-4, so do BOTH NSE staging purges:
+/// `stagingPurgeFailureLeavesTheFolderRetryableAtTheOldEpoch` below is the
+/// two-legged proof that a purge which genuinely could not write leaves the folder
+/// at its OLD epoch and quarantined — so no new-epoch occupant is ever created for
+/// the surviving instruction to hit — and that a re-drive then heals it.
 ///
 /// `.serialized, .processGlobalState` — replaces `AppDatabase.shared`, mutates
 /// `AccountManager.shared`'s provider table, the process-wide
@@ -488,22 +490,33 @@ struct UidValidityResetPurgeCompanionTests {
         await Self.resetProcessGlobals()
     }
 
-    // MARK: - (ii) — best-effort: a failing staging purge must not abort
+    // MARK: - (ii) — a staging purge that cannot commit must not advance the epoch
 
-    /// 🚨 The NSE staging purge is BEST-EFFORT. A staging DB that cannot be written
-    /// must not strand the folder in quarantine with its mail already deleted.
+    /// 🚨 AUDIT ROUND 1 / C-4. This test previously asserted the OPPOSITE — "A
+    /// staging purge that cannot write leaves the reaction free to complete, and the
+    /// unpurged rows behind", stamping the fresh epoch and clearing the quarantine —
+    /// and so BLESSED the defect. Its stated justification was that a missed staged
+    /// row "degrades to the residual the reaction already accepted (the next sync
+    /// pass stale-sweeps the UID)". **That premise is false in exactly the situation
+    /// this reaction exists for**: the new epoch re-issues the same UID space and
+    /// legitimately RETURNS those UIDs, so nothing sweeps them.
     ///
-    /// TWO-SIDED, because "nothing threw" is trivially satisfiable by a purge that
-    /// SUCCEEDED: the staged row must still be in the file afterwards (proving the
-    /// write genuinely failed) AND the reaction must still have stamped the fresh
-    /// epoch and cleared the quarantine.
+    /// THE INVARIANT NOW PINNED: *once E1→E2 has been detected, no E1 staging
+    /// instruction may reach an E2 occupant.* The reaction guarantees it by refusing
+    /// to CREATE an E2 occupant while an E1 instruction may survive — the epoch is
+    /// not stamped, the quarantine is not cleared, and the resync does not run.
     ///
-    /// WHAT DOES ABORT: the FTS purge, and every durable step (arm, purge txn, fresh
-    /// observation, stamp) — pinned by
-    /// `UidValidityResetReactionTests.abortBeforeStampLeavesTheFolderRetryable`.
-    @Test("A staging purge that cannot write leaves the reaction free to complete, and the unpurged rows behind")
+    /// TWO-LEGGED, because failing closed alone is satisfiable by a reaction that
+    /// never completes at all:
+    ///  - leg 1 (staging file unwritable): the marker survives (non-vacuity — the
+    ///    write really did fail), and the folder is still at the OLD epoch, still
+    ///    quarantined, with NO row seated for the surviving instruction to hit;
+    ///  - leg 2 (staging file writable again): the very same folder re-drives to
+    ///    completion — new epoch stamped, quarantine cleared, staged instructions
+    ///    gone. Quarantine is a bounded, retryable state, not a strand.
+    @Test("A staging purge that cannot commit leaves the folder retryable at the OLD epoch, and a re-drive heals it")
     @MainActor
-    func stagingPurgeFailureDoesNotAbort() async throws {
+    func stagingPurgeFailureLeavesTheFolderRetryableAtTheOldEpoch() async throws {
         Self.resetStagingGlobals()
 
         let server = FakeIMAPServer(mailboxes: [
@@ -543,6 +556,7 @@ struct UidValidityResetPurgeCompanionTests {
             $0 = [Self.stagedRow(accountId: accountId, folderPath: "INBOX", messageId: "1301")]
         }
         let victimId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: "1301")
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX")
 
         // Make every WRITE to the staging file fail (SQLITE_READONLY) while leaving it
         // readable, so the assertions below can still inspect it.
@@ -552,38 +566,59 @@ struct UidValidityResetPurgeCompanionTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
+        // ── Leg 1: the staging DB cannot be written.
         await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
 
-        // Non-vacuity: the write really did fail, so the green below is not a
-        // successful purge wearing a failure's clothes.
-        let survivors = try Self.stagedProcessedIds(stagingQueue)
-        #expect(survivors.contains("\(accountId):1301"),
-                """
-                the staging write SUCCEEDED, so this test proves nothing about the failure path. \
-                The read-only permission did not take effect.
-                """)
+        // Non-vacuity: the write really did fail, so what follows is about a surviving
+        // instruction and not about an already-clean staging file.
         #expect(try Self.stagedRemovalIds(stagingQueue).contains("\(accountId):1301"),
-                "the nse_inbox_removal write succeeded — same vacuity problem")
+                """
+                the nse_inbox_removal write SUCCEEDED, so this leg proves nothing about the failure \
+                path. The read-only permission did not take effect.
+                """)
 
-        // Best-effort: the reaction completed anyway.
-        let folder = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
-        #expect(folder?.lastKnownUidValidity == Self.newEpoch,
+        let afterFailure = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        #expect(afterFailure?.lastKnownUidValidity == Self.oldEpoch,
                 """
-                a staging-DB write failure ABORTED the reaction before its stamp. The staging purge \
-                is best-effort on purpose: its miss degrades to the residual the reaction already \
-                accepted (the next sync pass stale-sweeps the UID), whereas aborting leaves the \
-                folder quarantined with its mail already deleted.
+                the folder was advanced to the NEW epoch while an OLD-epoch staging instruction \
+                survived. The next resync then seats a different message at the reused UID and the \
+                next merge executes that instruction against it — for nse_inbox_removal, a DELETE of \
+                a message the user never touched (C3).
                 """)
-        #expect(folder?.uidValidityResetPendingAt == nil,
-                "the quarantine outlived a reaction that only failed a BEST-EFFORT purge")
+        #expect(afterFailure?.uidValidityResetPendingAt != nil,
+                "the quarantine was cleared over an unpurged staging instruction — nothing re-drives, and the guards disarm")
+
+        // The property stated directly: no occupant exists for the surviving
+        // instruction to act on, because the reaction refused to seat one.
+        let seatedAfterFailure = try await pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ?",
+                arguments: [folderId]) ?? 0
+        }
+        #expect(seatedAfterFailure == 0,
+                "a new-epoch row was seated while an old-epoch staging instruction was still executable")
+
+        // ── Leg 2: the staging DB becomes writable — the SAME folder must heal.
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: stagingPath)
+        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.runUidValidityResetReaction(
+                accountId: accountId, folderPath: "INBOX")
+        }
+
+        let afterRetry = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        #expect(afterRetry?.lastKnownUidValidity == Self.newEpoch,
+                "the re-drive never completed — quarantine must be a retryable state, not a strand")
+        #expect(afterRetry?.uidValidityResetPendingAt == nil,
+                "the folder stayed quarantined after a successful re-drive")
+        #expect(!(try Self.stagedRemovalIds(stagingQueue).contains("\(accountId):1301")),
+                "the re-drive stamped the new epoch without clearing the old-epoch removal marker")
+        #expect(!(try Self.stagedProcessedIds(stagingQueue).contains("\(accountId):1301")),
+                "the re-drive left an old-epoch nse_processed_message row behind")
         #expect(!Self.stagedRowKeys().contains(victimId),
-                """
-                the in-memory snapshot purge was skipped because the DB half failed. The two are \
-                independent: the memory scrub cannot fail and must happen regardless.
-                """)
+                "the in-memory staged snapshot still resolves an old-epoch headerId after a completed reaction")
 
         await Self.resetProcessGlobals()
     }

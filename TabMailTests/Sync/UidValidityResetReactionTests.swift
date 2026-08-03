@@ -76,14 +76,23 @@ struct UidValidityResetReactionTests {
 
     /// Insert a `PendingOperation` verbatim (bypassing the admission guards, which
     /// have their own tests) so the queue's CONTENTS are the thing under test.
+    ///
+    /// `observedUidValidity` is the folder's epoch AT ADMISSION. Leave it nil for
+    /// the reaction tests (whose subject is the reset sweep, which does not read
+    /// it); pass it wherever a test actually runs `drainPendingQueue`, because
+    /// checkpoint A treats an UNSTAMPED IMAP op as an absence of evidence and
+    /// leaves it queued without claiming it — an unstamped op can therefore never
+    /// serve as a positive control that "a runnable op still executes".
     private static func insertOp(
         id: String, type: OperationType, messageIds: [String],
         accountId: String, folderPath: String, destinationPath: String? = nil,
+        observedUidValidity: Int? = nil,
         pool: DatabasePool
     ) throws {
         var op = PendingOperation(
             type: type, messageIds: messageIds, accountId: accountId,
-            folderPath: folderPath, destinationPath: destinationPath)
+            folderPath: folderPath, destinationPath: destinationPath,
+            observedUidValidity: observedUidValidity)
         op.id = id
         let toInsert = op
         try pool.write { db in try toInsert.insert(db) }
@@ -695,10 +704,24 @@ struct UidValidityResetReactionTests {
             folder.uidValidityResetPendingAt = Date()
             try folder.update(db)
         }
+        // BOTH ops are stamped with the epoch their folder was admitted under —
+        // which is what a real gesture records, and what makes this test
+        // discriminate anything. Checkpoint A refuses to CLAIM an unstamped IMAP
+        // op (absence of evidence: "provider address or UIDVALIDITY not
+        // established; op stays queued"), so an unstamped fixture parks for a
+        // reason that has nothing to do with the quarantine under test:
+        //  - `op-parked` stamped ⇒ it is admissible in every respect EXCEPT its
+        //    folder's quarantine, so "it was not executed" is attributable to
+        //    the quarantine rather than to a missing stamp;
+        //  - `op-runnable` stamped ⇒ it is genuinely claimable and EXECUTES,
+        //    which is the only thing that makes it a control for "the park is
+        //    per-folder, not per-account".
         try Self.insertOp(id: "op-parked", type: .markRead, messageIds: ["801"],
-                          accountId: accountId, folderPath: "INBOX", pool: pool)
+                          accountId: accountId, folderPath: "INBOX",
+                          observedUidValidity: Self.oldEpoch, pool: pool)
         try Self.insertOp(id: "op-runnable", type: .markRead, messageIds: ["802"],
-                          accountId: accountId, folderPath: "Archive", pool: pool)
+                          accountId: accountId, folderPath: "Archive",
+                          observedUidValidity: Self.oldEpoch, pool: pool)
 
         let mock = MockEmailProvider()
         await Self.withRegisteredProvider(accountId: accountId, provider: mock) {
@@ -718,11 +741,21 @@ struct UidValidityResetReactionTests {
         let calls = await mock.callLogSnapshot()
         #expect(!calls.contains { $0.contains("801") },
                 "the parked op was EXECUTED against the folder being reset — its UID belongs to the discarded numbering (C3)")
+        // A POSITIVE execution witness, not a disjunction. This used to read
+        // `!runnableStillQueued || calls.contains("802")`, which the control's
+        // mere ABSENCE satisfied — and an unstamped op was exactly what
+        // checkpoint A deleted, so the control discriminated nothing: the whole
+        // expectation passed vacuously while the op was being DROPPED. Now the
+        // unrelated folder's op must actually reach the provider, so this half
+        // and the `801` half together state the real property — the quarantine
+        // stops the op whose folder is being reset AND ONLY that one.
+        #expect(calls.contains { $0.contains("802") },
+                "the park leaked to an unrelated folder — quarantine is per-folder, not per-account")
         let runnableStillQueued = try await pool.read { db in
             try PendingOperation.fetchOne(db, key: "op-runnable") != nil
         }
-        #expect(!runnableStillQueued || calls.contains { $0.contains("802") },
-                "the park leaked to an unrelated folder — quarantine is per-folder, not per-account")
+        #expect(!runnableStillQueued,
+                "the control op completed at the provider but its durable row survived — it would re-execute forever")
     }
 
     // MARK: - The address-only classifier

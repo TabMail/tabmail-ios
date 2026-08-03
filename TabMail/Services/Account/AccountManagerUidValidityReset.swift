@@ -53,13 +53,15 @@ import UserNotifications
 /// LANDED AFTER THE PORT (T4.S4 / T4.V11), each previously listed above as an
 /// omission and now present:
 ///  - the NSE staging purges (`NSEDataBridge.purgeStagedStateForFolder`,
-///    `.purgeInboxRemovalMarkersForAccount`). Both are BEST-EFFORT and neither may
-///    abort the reaction — see their call sites below and the helpers' own doc
-///    comments. The residual this omission used to carry (a staged old-epoch row
-///    merging after the reaction) is now narrowed to the case where the staging
-///    purge itself could not run, where it degrades to exactly the previously
-///    accepted bound: the next ordinary sync pass stale-sweeps a UID the server no
-///    longer returns;
+///    `.purgeInboxRemovalMarkersForAccount`). Both REPORT whether they committed and
+///    both ABORT the reaction when they did not (audit round 1 / C-4). They were
+///    documented here as BEST-EFFORT — "neither may abort" — on the premise that a
+///    missed staged row degrades to "the next ordinary sync pass stale-sweeps a UID
+///    the server no longer returns". That premise does not hold for the only event
+///    this function reacts to: the new epoch RE-ISSUES the same UIDs and returns
+///    them, so a surviving old-epoch instruction is executed against the new epoch's
+///    occupant (populate/update, or an `nse_inbox_removal` DELETE). The corrected
+///    rule is at the step-4 comment;
 ///  - the `ChatIdTranslator` companion purge
 ///    (`ChatIdTranslator.purgeMappingsForFolder`), which pairs with — and does not
 ///    replace — the `chatIdMapping` DELETE already inside the step-3 transaction;
@@ -221,31 +223,53 @@ extension AccountManager {
         // column, so it can only be purged account-wide, and is therefore purged ONLY
         // when the folder being reset IS this account's inbox-role folder: for any
         // other folder's reset these markers are not ours to delete. Adjacent to (not
-        // inside) the transaction above — the staging DB is a separate file — and
-        // BEST-EFFORT, like every NSE staging purge here.
-        if isInboxRole {
-            NSEDataBridge.purgeInboxRemovalMarkersForAccount(accountId: accountId)
+        // inside) the transaction above — the staging DB is a separate file.
+        //
+        // 🚨 ABORTS ON FAILURE (audit round 1 / C-4). A surviving marker is an
+        // executable DELETE naming a bare UID in the numbering the server just
+        // discarded. If this reaction went on to stamp E2 and clear the quarantine,
+        // step 6's resync would seat a DIFFERENT message at that reused UID and the
+        // next NSE merge would delete it — the wrong message, destroyed. So the
+        // durable epoch is NOT advanced over a purge whose result is unknown: the
+        // flag stays set, the folder stays quarantined and retryable, and the
+        // re-drive tries again. See the failure-policy paragraph at step 4.
+        if isInboxRole,
+           !NSEDataBridge.purgeInboxRemovalMarkersForAccount(accountId: accountId) {
+            BackgroundSyncLogger.log("[UIDValidity] step 3c (NSE inbox-removal purge) could not commit for \(folderId) — aborting, flag stays set; re-drive will retry")
+            releaseUidValidityReaction(accountId: accountId, folderPath: folderPath, folderId: folderId)
+            return
         }
 
         // Step 4: out-of-transaction purges, in order and with DIFFERING failure
-        // policies. Exactly ONE of them aborts: the FTS purge. Letting step 5 clear
-        // the flag over a search index that still answers with old-epoch rows would
-        // leave no re-drive, and FTS is the one surface a user can still SEE and act
-        // on after the headers are gone. The delivered-notification clear cannot fail
-        // (UNUserNotificationCenter's removal API is fire-and-forget) and the
+        // policies. The ones that ABORT are the FTS purge and the two NSE staging
+        // purges (this one and step 3c's). The delivered-notification clear cannot
+        // fail (UNUserNotificationCenter's removal API is fire-and-forget) and the
         // orphan-file prune is a best-effort disk sweep on its own schedule.
         //
-        // The NSE staging purge below is likewise NON-ABORTING, and deliberately so
-        // rather than by omission: it is a non-throwing call, so there is no failure
-        // for this function to observe. A staged row it misses re-inserts a header the
-        // purge removed — which is the residual this reaction ALREADY accepted and
-        // bounded before the purge existed (the NSE stages only inbox arrivals, and
-        // the next ordinary sync pass stale-sweeps a UID the server no longer
-        // returns). Failing the purge therefore returns the system to a state that was
-        // already deemed acceptable, whereas aborting would leave a quarantined folder
-        // whose mail is already gone. ⚠ This is NOT an exception to a rule — there is
-        // no "every purge must succeed" rule here; exactly one purge aborts and its
-        // reason is stated above.
+        // FTS: letting step 5 clear the flag over a search index that still answers
+        // with old-epoch rows would leave no re-drive, and FTS is the one surface a
+        // user can still SEE and act on after the headers are gone.
+        //
+        // 🚨 NSE STAGING (audit round 1 / C-4 — THIS POLICY WAS REVERSED). The text
+        // that stood here called the staging purge non-aborting "deliberately rather
+        // than by omission", on the grounds that a missed staged row degrades to an
+        // already-accepted residual because "the next ordinary sync pass stale-sweeps
+        // a UID the server no longer returns". THAT PREMISE IS FALSE FOR A UIDVALIDITY
+        // TURNOVER, which is the only situation this function runs in: the new epoch
+        // re-issues the same UID space and legitimately RETURNS those UIDs, so the
+        // stale-sweep never fires. A surviving old-epoch instruction is then executed
+        // against a NEW-epoch occupant — an `nse_processed_message` row re-populates
+        // or updates it, and an `nse_inbox_removal` marker DELETES it. Both are C3
+        // wrong-message mutations, and the deletion is unrecoverable.
+        //
+        // The rule this now follows: once E1→E2 has been detected, no E1 staging
+        // instruction may reach an E2 occupant. The reaction guarantees that by
+        // refusing to CREATE an E2 occupant while any such instruction may survive —
+        // it does not stamp the fresh epoch, does not clear the quarantine, and does
+        // not resync. Quarantine is bounded, visible and retryable; a deleted message
+        // is not. The cost of the trade (a folder that stays quarantined with its
+        // rows already purged while the staging DB is unwritable) is the same cost
+        // the FTS abort leg has always accepted.
         //
         // DEVIATION from the reference, deliberate: there the body-asset purge is a
         // THROWING folder-scoped call and aborts like the FTS one. v3 has no
@@ -266,7 +290,11 @@ extension AccountManager {
             releaseUidValidityReaction(accountId: accountId, folderPath: folderPath, folderId: folderId)
             return
         }
-        NSEDataBridge.purgeStagedStateForFolder(accountId: accountId, folderPath: folderPath)
+        guard NSEDataBridge.purgeStagedStateForFolder(accountId: accountId, folderPath: folderPath) else {
+            BackgroundSyncLogger.log("[UIDValidity] step 4 (NSE staged-state purge) could not commit for \(folderId) — aborting, flag stays set; re-drive will retry")
+            releaseUidValidityReaction(accountId: accountId, folderPath: folderPath, folderId: folderId)
+            return
+        }
         clearDeliveredNotificationsForPurgedMessages(accountId: accountId, messageIds: purgeResult.purgedMessageIds)
         // LAST — a manifest-QUERY delete, never the captured id list: recomputable
         // on a crash re-drive even though the headers are already gone.
