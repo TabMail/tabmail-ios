@@ -396,6 +396,36 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         }
     }
 
+    /// How many rows sharing one `(accountId, rfc822MessageId)` Strategy 2 will examine
+    /// before refusing outright. It exists to bound the fetch, not to express a belief
+    /// about how many copies a message "should" have: the resolver needs to see every
+    /// candidate to prove they agree, so an unbounded `fetchAll` is the only
+    /// alternative and this cap is what replaces it. Sized well above any plausible
+    /// number of folder/label copies of one message so the cap is a safety valve rather
+    /// than a routine outcome; exceeding it refuses, which is the same fail-closed
+    /// direction as disagreement.
+    private static let replyTargetCandidateCap = 32
+
+    /// The identity witness Strategy 2 compares candidates on. These are exactly the
+    /// fields that drive the resolver's output — the reply address and the attribution
+    /// line — so two rows that agree here are interchangeable for this resolver's
+    /// purposes whatever their folder, UID or label. Two genuinely different messages
+    /// that collided on a Message-ID would have to agree on sender, subject AND
+    /// timestamp to slip through, which is not a collision any more.
+    ///
+    /// Deliberately NOT keyed on folder, UID, headerId or `observedUidValidity`: those
+    /// differ between legitimate copies of one message, which is the case this guard
+    /// must admit rather than refuse.
+    private static func replyTargetIdentityWitness(_ header: MessageHeader) -> String {
+        // U+001F (unit separator) cannot occur in any of these header fields, so the
+        // join is unambiguous and no field boundary can be forged from another's text.
+        [
+            header.fromAddress,
+            header.subject,
+            String(header.date.timeIntervalSince1970)
+        ].joined(separator: "\u{1F}")
+    }
+
     /// PORT — `v2final:Draft.resolveReplyToHeader(draftKey:replyToId:isForward:db:)`.
     /// The `db`-scoped resolver (and the testable seam).
     ///
@@ -407,8 +437,9 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// Strategy 2 is deliberately NOT re-checked against the v80 address stamp: a
     /// legitimate MOVE gives the same message a new UID, so the stamp would refuse
     /// the very case Strategy 2 exists to recover. Its own `accountId` + normalized
-    /// `rfc822MessageId` predicate is the positive identity proof — but ONLY when it
-    /// names exactly ONE row; see the cardinality guard at that query.
+    /// `rfc822MessageId` predicate is the positive identity proof — but only when the
+    /// rows it names AGREE about which message they are; see the identity-agreement
+    /// guard at that query.
     static func resolveReplyToHeader(
         draftKey: String,
         replyToId: String?,
@@ -443,30 +474,64 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         // a wrong-message resolution (C3). `DraftStore.evictImpl`'s twin of this query
         // already carries the same guard.
         guard !normalized.isEmpty else { return nil }
-        // 🚨 AUDIT ROUND 1 / C-2 — CARDINALITY IS PART OF THE PROOF. This was a bare
-        // `fetchOne`, which silently picked an ARBITRARY row whenever more than one
-        // matched. `(accountId, rfc822MessageId)` has no uniqueness constraint and is
-        // genuinely non-unique in practice: one Gmail message lives under several
-        // labels as several header rows, and a Message-ID collision (a buggy sender,
-        // a list rewriter) puts two DIFFERENT messages under one identity. What this
-        // resolver returns is not content — it drives the reply ADDRESS, the
-        // attribution line, the quoted body and the forwarded attachments — so
-        // picking "one of them" is exactly the header-specific decision the RFC
-        // (content) key cannot make. Two candidates therefore fail CLOSED: the draft
-        // and its authored body are untouched, the quote is simply omitted, and the
-        // user can still send. `limit(2)` because the only question is one-or-more
-        // than-one.
+        // 🚨 AUDIT ROUND 2 — IDENTITY AGREEMENT, NOT CARDINALITY.
+        //
+        // What this resolver returns is not content: it drives the reply ADDRESS, the
+        // attribution line, the quoted body and the forwarded attachments. So a bare
+        // `fetchOne` was genuinely wrong — it let SQLite pick an arbitrary row when
+        // more than one matched (audit round 1 / C-2, and that part still stands).
+        //
+        // But round 1 fixed it with the WRONG PREDICATE. `guard count == 1` asks "is
+        // there exactly one candidate ROW?", and every candidate here already shares
+        // `(accountId, rfc822MessageId)` by construction — so that count measures how
+        // many FOLDERS hold this message, not how many MESSAGES are in play. It was
+        // justified by an unverified premise ("one Gmail message lives under several
+        // labels as several header rows"), and either horn of that premise is bad: if
+        // it is true, the guard refuses exactly the common Gmail case Strategy 2 exists
+        // to recover, silently dropping the quote from ordinary replies; if it is
+        // false, the justification was fiction. Neither horn needs settling, because
+        // cardinality is not the question.
+        //
+        // The question is whether the candidates AGREE about which message they are.
+        // Several rows for the SAME message (label copies, a message present in both
+        // All Mail and a folder) are not ambiguity — they are interchangeable for every
+        // field this resolver reads, so picking among them is safe. Rows for DIFFERENT
+        // messages that collided on one Message-ID (a buggy sender, a list rewriter)
+        // ARE ambiguity and must refuse. The witness below is exactly the set of fields
+        // that drive this resolver's output, which is also the set a collision would
+        // differ on; label copies of one message agree on all of them. This is correct
+        // regardless of which horn of the Gmail premise is true.
+        //
+        // Refusal still fails CLOSED: the draft and its authored body are untouched,
+        // the quote is simply omitted, and the user can still send.
+        //
+        // BOUND, re-derived rather than inherited. `limit(2)` was correct for a
+        // one-or-more-than-one question and is NOT correct here: proving agreement
+        // requires seeing every candidate, and with `limit(2)` a third, disagreeing row
+        // would be invisible and wrongly accepted. So the query takes a small fixed cap
+        // and fetches ONE MORE than it, which makes "we could not see them all"
+        // observable; that case refuses, because agreement over a truncated set is not
+        // agreement. Index coverage is unchanged (`messageHeader_rfc822MessageId`), and
+        // the shape is still one indexed fetch.
         let candidates = try MessageHeader
             .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
-            .limit(2)
+            .limit(Self.replyTargetCandidateCap + 1)
             .fetchAll(db)
-        guard candidates.count == 1 else {
-            if candidates.count > 1, DebugModeManager.isLoggingEnabled() {
-                print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — \(candidates.count)+ rows share this account's RFC identity; no single physical copy is proven")
+        guard let representative = candidates.first else { return nil }
+        guard candidates.count <= Self.replyTargetCandidateCap else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — more than \(Self.replyTargetCandidateCap) rows share this account's RFC identity; agreement cannot be proven over a truncated set")
             }
             return nil
         }
-        return candidates[0]
+        let witness = Self.replyTargetIdentityWitness(representative)
+        guard candidates.allSatisfy({ Self.replyTargetIdentityWitness($0) == witness }) else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — \(candidates.count) rows share this account's RFC identity but DISAGREE on sender/subject/date; a Message-ID collision, not label copies")
+            }
+            return nil
+        }
+        return representative
     }
 
     /// PORT — `v2final:Draft.ReplyQuote`.

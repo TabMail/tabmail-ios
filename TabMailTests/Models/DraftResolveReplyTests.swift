@@ -248,15 +248,21 @@ struct ReplyQuoteIdentityTests {
         rfc822MessageId: String?,
         observedUidValidity: Int?,
         from: String = "sender@example.com",
-        snippet: String = "snippet"
+        snippet: String = "snippet",
+        subject: String = "Original subject",
+        // Explicit so a test can give two rows the SAME timestamp. Two `Date()` calls
+        // differ by microseconds, and `date` is part of Strategy 2's identity witness —
+        // so genuine copies of one message must be inserted with one shared value, the
+        // way production stores them (both parsed from the same RFC822 Date header).
+        date: Date = Date()
     ) throws -> MessageHeader {
         var header = MessageHeader(
             messageId: messageId,
-            subject: "Original subject",
+            subject: subject,
             from: from,
             fromAddress: from,
             to: "user@example.com",
-            date: Date(),
+            date: date,
             snippet: snippet,
             folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath),
             accountId: accountId,
@@ -581,10 +587,18 @@ struct ReplyQuoteIdentityTests {
     /// 🚨 AUDIT ROUND 1 / C-2. `(accountId, rfc822MessageId)` carries no uniqueness
     /// constraint, and Strategy 2 used a bare `fetchOne` — so with two matching rows
     /// SQLite's arbitrary choice decided which correspondent's body, attribution and
-    /// attachments went into the outgoing reply. Two rows share an RFC identity for
-    /// benign reasons (one Gmail message under several labels) and for hostile ones
-    /// (a Message-ID collision), and this resolver cannot tell them apart — so it
-    /// must refuse. The draft's own authored body is untouched either way.
+    /// attachments went into the outgoing reply.
+    ///
+    /// ⚠ RE-SCOPED (audit round 2), still GREEN and still load-bearing. Round 1 made
+    /// this pass via a cardinality guard (`count == 1`); the guard is now identity
+    /// AGREEMENT instead, and this case still refuses — but for the right reason. The
+    /// two rows here differ in `fromAddress` ("sender@example.com" vs
+    /// "someone-else@domain.com"), so they are a genuine Message-ID COLLISION: two
+    /// different messages under one identity, which is precisely what must fail closed.
+    /// The old doc claimed the resolver "cannot tell them apart"; it now can, and that
+    /// is what its sibling
+    /// `severalCopiesOfOneMessageStillResolveTheReplyTarget` pins from the other side.
+    /// The draft's own authored body is untouched either way.
     @Test("Two rows sharing one RFC identity yield no reply target, never an arbitrary one")
     func ambiguousRfcIdentityResolvesToNothing() throws {
         let db = try TestDatabase.make()
@@ -632,6 +646,73 @@ struct ReplyQuoteIdentityTests {
                 """)
         #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
         #expect(quote?.bodyHTML?.contains(Self.genuineMarker) != true)
+    }
+
+    /// 🚨 AUDIT ROUND 2 — the OTHER side of the guard, and the case round 1's
+    /// cardinality predicate got wrong. Two rows that share an RFC identity AND agree
+    /// on sender, subject and timestamp are copies of ONE message (the same mail held
+    /// in two folders, or under two Gmail labels). They are interchangeable for every
+    /// field this resolver reads, so refusing them is pure loss: the user's reply
+    /// silently loses its quoted body and attribution in the exact situation Strategy 2
+    /// exists to recover — a message whose PK was re-keyed by a folder move.
+    ///
+    /// `guard candidates.count == 1` refused this, because it counted ROWS (how many
+    /// folders hold the message) when the question was MESSAGES (how many distinct
+    /// messages are in play). This test pins the system property — a resolvable reply
+    /// target with the RIGHT correspondent's body — not the predicate's shape.
+    @Test("Several copies of one message still resolve the reply target")
+    func severalCopiesOfOneMessageStillResolveTheReplyTarget() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        // ONE message, two folder copies: identical sender, subject and timestamp,
+        // differing only in the things a copy legitimately differs in — folder, UID,
+        // headerId and observed epoch.
+        let sharedDate = Date(timeIntervalSince1970: 1_760_000_000)
+        let inboxId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "shared@example.com",
+            observedUidValidity: 100, date: sharedDate)
+        try TestDatabase.insertMessageBody(
+            db, headerId: inboxId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let archiveId = "acc1:Archive:77"
+        try Self.insertHeader(
+            db, messageId: "77", folderPath: "Archive",
+            rfc822MessageId: "shared@example.com", observedUidValidity: 900,
+            date: sharedDate)
+        try TestDatabase.insertMessageBody(
+            db, headerId: archiveId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        // Strategy 1 cannot answer: the PK the draft names no longer exists, which is
+        // precisely when Strategy 2 runs.
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:shared@example.com", replyToId: "acc1:INBOX:999",
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        // NON-VACUITY: both copies really are present, so a resolution below is the
+        // multi-row case being ADMITTED and not a single-row query trivially passing.
+        let matching = try db.read { conn in
+            try MessageHeader
+                .filter(Column("accountId") == "acc1" && Column("rfc822MessageId") == "shared@example.com")
+                .fetchCount(conn)
+        }
+        #expect(matching == 2)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote != nil,
+                """
+                two interchangeable copies of ONE message were treated as ambiguity, so the reply \
+                lost its quoted body and attribution entirely. Cardinality counted folders, not \
+                messages.
+                """)
+        #expect(quote?.header.rfc822MessageId == "shared@example.com")
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true,
+                "the resolved copy did not carry the message's own body")
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
     }
 
     @Test("A draft key with an empty stableId resolves to no reply target")
