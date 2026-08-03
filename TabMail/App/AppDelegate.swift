@@ -415,7 +415,18 @@ enum NotificationActionRouter {
                     // exactly the shape an unknown epoch can misresolve.
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                         accountId: accountId, folderPath: inboxPath, db: db) else { return false }
-                    try PendingOperation(type: .markRead, messageIds: [messageId], accountId: accountId, folderPath: inboxPath).insert(db)
+                    // 🚨 RECORD THE EPOCH THE GUARD ABOVE JUST PROVED (audit A-1).
+                    // Read in THIS transaction so the stamp and the row observe one
+                    // consistent epoch. Omitting it made the insert self-refuting:
+                    // admission proved the folder's epoch was known and then wrote a
+                    // bare-UID op without it, which the drain's checkpoint A deleted
+                    // — so an ARCHIVE/DELETE/MARK_READ tapped on a push banner for a
+                    // not-yet-synced IMAP/iCloud message did nothing, silently.
+                    try PendingOperation(
+                        type: .markRead, messageIds: [messageId], accountId: accountId,
+                        folderPath: inboxPath,
+                        observedUidValidity: AccountManager.admissionEpochForNewGesture(
+                            accountId: accountId, folderPath: inboxPath, db: db)).insert(db)
                     return true
                 }
                 print("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") markRead PendingOperation for \(messageId)")
@@ -429,7 +440,12 @@ enum NotificationActionRouter {
                     // T1.3 — see the MARK_READ arm above. Source-scoped.
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                         accountId: accountId, folderPath: inboxPath, db: db) else { return false }
-                    try PendingOperation(type: .move, messageIds: [messageId], accountId: accountId, folderPath: inboxPath, destinationPath: destinationPath).insert(db)
+                    // Record the proven epoch — see the MARK_READ arm (audit A-1).
+                    try PendingOperation(
+                        type: .move, messageIds: [messageId], accountId: accountId,
+                        folderPath: inboxPath, destinationPath: destinationPath,
+                        observedUidValidity: AccountManager.admissionEpochForNewGesture(
+                            accountId: accountId, folderPath: inboxPath, db: db)).insert(db)
                     return true
                 }
                 print("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") \(actionId) (.move) PendingOperation for \(messageId)")

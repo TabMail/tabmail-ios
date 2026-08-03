@@ -803,8 +803,24 @@ struct UnknownEpochAdmissionRefusalTests {
                 never acting on
                 """)
         #expect(queued[0].accountId == "acc1")
-        #expect(queued[0].messageIds == [msg.stableId],
-                "the op must name the row it mutated locally, not some other identity")
+        // The id half of this test, corrected after audit A-6. It asserted
+        // `[msg.stableId]` — the rfc822 CONTENT id — which is precisely the shape
+        // the producer was fixed to stop enqueueing: no provider arm can execute an
+        // rfc822 string as an address, so such an op is queued, checkmarked, and
+        // never performed. The op must carry the PROVIDER's native address for the
+        // row it mutated.
+        #expect(msg.stableId != msg.messageId,
+                """
+                precondition: this row's content id and provider address must DIFFER \
+                (messageId '\(msg.messageId)' parses as a UID and the row carries an RFC id), \
+                or the assertion below cannot tell the two shapes apart
+                """)
+        #expect(queued[0].messageIds == [msg.messageId],
+                """
+                the op names \(queued[0].messageIds) — it must name the provider address of \
+                the row it mutated locally, not that row's rfc822 content id and not some \
+                other identity
+                """)
         #expect(queued[0].type == .addUserLabel)
     }
 

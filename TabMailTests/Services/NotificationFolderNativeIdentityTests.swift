@@ -44,7 +44,17 @@ private enum MovedInImpostorFixture {
 
     /// Mirrors `NotificationActionRouterTests.makeTestDB` — one account, the
     /// three role folders the notification-action paths resolve against.
-    static func make() throws -> Env {
+    ///
+    /// `provider` and `folderEpoch` default to the original `.gmail` / no-epoch
+    /// shape, so every pre-existing caller is unchanged. They exist for the
+    /// audit A-1 test, which needs an IMAP account with a KNOWN inbox
+    /// UIDVALIDITY — the only configuration in which the cold op's admission
+    /// stamp is observable at all.
+    static func make(
+        provider: AccountProvider = .gmail,
+        folderEpoch: Int? = nil,
+        accountId: String = "acc1"
+    ) throws -> Env {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
@@ -55,13 +65,16 @@ private enum MovedInImpostorFixture {
             let prev = current; current = appDb; return prev
         }
         try pool.writeWithoutTransaction { db in
-            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
-            acc.id = "acc1"
+            var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: provider)
+            acc.id = accountId
             try acc.insert(db)
         }
-        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
-        let trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
+        var inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+        var archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId)
+        var trash = Folder(name: "Trash", path: "Trash", role: .trash, accountId: accountId)
+        inbox.lastKnownUidValidity = folderEpoch
+        archive.lastKnownUidValidity = folderEpoch
+        trash.lastKnownUidValidity = folderEpoch
         try pool.writeWithoutTransaction { db in
             let i = inbox; try i.insert(db)
             let a = archive; try a.insert(db)
@@ -239,6 +252,96 @@ struct NotificationActionFolderNativeIdentityTests {
         #expect(ops[0].type == .markRead)
         #expect(ops[0].folderPath == env.inbox.path)
         #expect(ops[0].messageIds == ["collide-9"])
+    }
+
+    /// 🚨 AUDIT A-1 — the retention half of the two tests above, completed.
+    ///
+    /// Those two stop at `ops.count == 1` on a `.gmail` fixture and never drain.
+    /// On Gmail that is the whole story, because checkpoint A does not judge a
+    /// Gmail op. On IMAP it is not: `queueColdPendingOperation` ran its inserts
+    /// inside a write transaction that had ALREADY called
+    /// `AccountManager.newGestureRefusedForUnknownEpoch` — which PROVES the
+    /// folder epoch is known and readable right there — and then inserted
+    /// without `observedUidValidity`. So "the intention survives" was true for
+    /// one transaction and false for the lifetime that matters: the very next
+    /// drain could not admit the row.
+    ///
+    /// THE PROPERTY, and the reason this drains rather than counting rows:
+    /// after a full drain cycle the intention has EXECUTED — the flag is on the
+    /// server. A row that exists but no drain can ever claim is not a retained
+    /// intention.
+    ///
+    /// RED PROOF (recorded): removing the `observedUidValidity:` argument from
+    /// the MARK_READ insert in `NotificationActionRouter.queueColdPendingOperation`
+    /// fails this at the `\Seen` assertion — the server records no STORE at all,
+    /// because checkpoint A cannot admit an unstamped IMAP op (and, before
+    /// A-3 landed, deleted it outright).
+    @Test("AUDIT A-1: a cold IMAP notification action survives a real drain and reaches the server")
+    func coldImapNotificationActionExecutesOnTheNextDrain() async throws {
+        let accountId = "acc-cold-imap"
+        let target = "cold-imap-target@example.com"
+        let env = try MovedInImpostorFixture.make(
+            provider: .imap, folderEpoch: 10, accountId: accountId)
+        defer { MovedInImpostorFixture.finish(env); MovedInImpostorFixture.resetStagedGlobal() }
+        MovedInImpostorFixture.resetStagedGlobal()
+
+        // The push's real target is not in GRDB yet and the only address match
+        // is a moved-in impostor — the clean-miss cold path, exactly as in
+        // `markReadNeverMarksTheMovedInImpostorRead`. The id is a canonical UID
+        // because that is what an IMAP push carries.
+        let impostor = MovedInImpostorFixture.movedInImpostor(
+            source: env.archive, inbox: env.inbox, messageId: "7"
+        )
+        try await env.pool.writeWithoutTransaction { db in try impostor.insert(db) }
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [FakeIMAPServer.makeMessage(uid: 7, rfc822Text: """
+            From: Sender <sender@example.com>\r
+            To: Receiver <receiver@example.com>\r
+            Subject: cold\r
+            Date: Thu, 01 Jan 2026 00:00:00 +0000\r
+            Message-ID: <\(target)>\r
+            Content-Type: text/plain; charset=utf-8\r
+            \r
+            cold body\r
+
+            """)],
+        ])
+        server.setUidValidity(10, for: "INBOX")
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: accountId, provider: provider)
+        defer {
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+        }
+
+        await NotificationActionRouter.execute(
+            actionId: "MARK_READ", messageId: "7", accountId: accountId)
+
+        // C3 is unchanged: the impostor the user never tapped is untouched.
+        let finalImpostor = try await env.pool.read { db in
+            try MessageHeader.fetchOne(db, key: impostor.id)
+        }
+        #expect(finalImpostor?.isRead == false)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(
+            server.flags(in: "INBOX", uid: 7).contains("\\Seen"),
+            "the cold intention must EXECUTE, not merely exist: \(server.flags(in: "INBOX", uid: 7))"
+        )
+        #expect(server.wrongMessageViolations().isEmpty)
+        let ops = try await env.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "a completed op is retired by provider success")
+        try? await provider.disconnect()
     }
 }
 

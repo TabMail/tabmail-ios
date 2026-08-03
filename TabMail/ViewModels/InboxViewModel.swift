@@ -2219,15 +2219,26 @@ final class InboxViewModel {
                 // delete so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                     accountId: message.accountId, folderPath: message.folderPath, db: db) else { return false }
+                // 🚨 ADMIT THROUGH THE PROVIDER-ADDRESS PREDICATE (audit A-6).
+                // `stableId` is an rfc822 Message-ID on IMAP and carried no epoch,
+                // so the drain's checkpoint A could only refuse this op: the label
+                // vanished from the row, the op was written, and the very next
+                // drain deleted it unexecuted. Admitting the same way every other
+                // ordinary action does records the provider's native address and
+                // the epoch that proved it.
+                guard let admission = try AccountManager.admittedOrdinaryActionTargets(
+                    [message], accountId: message.accountId,
+                    folderPath: message.folderPath, db: db) else { return false }
                 try MessageUserLabel
                     .filter(Column("messageId") == snapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
                 let op = PendingOperation(
                     type: .removeUserLabel,
-                    messageIds: [message.stableId],
+                    messageIds: admission.providerIds,
                     accountId: message.accountId,
                     folderPath: message.folderPath,
-                    userLabelId: label.id
+                    userLabelId: label.id,
+                    observedUidValidity: admission.observedUidValidity
                 )
                 try op.insert(db)
                 return true

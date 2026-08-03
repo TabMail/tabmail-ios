@@ -236,14 +236,26 @@ final class UserLabelMenuModel {
                 // insert so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                     accountId: header.accountId, folderPath: header.folderPath, db: db) else { return false }
+                // 🚨 ADMIT THROUGH THE PROVIDER-ADDRESS PREDICATE (audit A-6).
+                // This used to enqueue `header.stableId` — an rfc822 Message-ID on
+                // IMAP — with no epoch. The drain's checkpoint A can only refuse
+                // that shape, so every IMAP label gesture was accepted here,
+                // checkmarked in the UI, and then DELETED unexecuted: a
+                // deterministic loss of an action `v1.6.38` performed. Admitting
+                // through the same helper the other ordinary actions use records
+                // the provider's native address and the epoch that proved it.
+                guard let admission = try AccountManager.admittedOrdinaryActionTargets(
+                    [header], accountId: header.accountId,
+                    folderPath: header.folderPath, db: db) else { return false }
                 try MessageUserLabel(messageId: header.id, userLabelId: label.id)
                     .insert(db, onConflict: .ignore)
                 let op = PendingOperation(
                     type: .addUserLabel,
-                    messageIds: [header.stableId],
+                    messageIds: admission.providerIds,
                     accountId: header.accountId,
                     folderPath: header.folderPath,
-                    userLabelId: label.id
+                    userLabelId: label.id,
+                    observedUidValidity: admission.observedUidValidity
                 )
                 try op.insert(db)
                 return true
@@ -273,15 +285,23 @@ final class UserLabelMenuModel {
                 // delete so neither half lands.
                 guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                     accountId: header.accountId, folderPath: header.folderPath, db: db) else { return false }
+                // 🚨 ADMIT THROUGH THE PROVIDER-ADDRESS PREDICATE (audit A-6) —
+                // see the identical comment in `applyLabel`. An rfc822 id with no
+                // epoch is a shape checkpoint A can only refuse, so this gesture
+                // was accepted, un-checkmarked in the UI, and then dropped.
+                guard let admission = try AccountManager.admittedOrdinaryActionTargets(
+                    [header], accountId: header.accountId,
+                    folderPath: header.folderPath, db: db) else { return false }
                 try MessageUserLabel
                     .filter(Column("messageId") == header.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
                 let op = PendingOperation(
                     type: .removeUserLabel,
-                    messageIds: [header.stableId],
+                    messageIds: admission.providerIds,
                     accountId: header.accountId,
                     folderPath: header.folderPath,
-                    userLabelId: label.id
+                    userLabelId: label.id,
+                    observedUidValidity: admission.observedUidValidity
                 )
                 try op.insert(db)
                 return true

@@ -363,6 +363,36 @@ extension AccountManager {
         return true
     }
 
+    /// The UIDVALIDITY a NEW gesture admitted in THIS transaction must record on
+    /// its `PendingOperation`, or `nil` for a provider family that does not
+    /// address messages by epoch-scoped UID (Gmail, Graph, Demo).
+    ///
+    /// Call it immediately after `newGestureRefusedForUnknownEpoch` returned
+    /// `false`, in the SAME write transaction: that guard PROVES the epoch is
+    /// known for the IMAP family, and this reads the value it proved. Splitting
+    /// the proof from the recording is what produced audit finding A-1 — the
+    /// notification cold path called the guard and then inserted the op without
+    /// the stamp, so checkpoint A deleted the op for lacking exactly the datum
+    /// admission had just established.
+    ///
+    /// Same provider classification as `admittedOrdinaryActionTargets` and
+    /// `roleMoveRejectDispositions` below (`.imap`/`.icloud`, minus the Demo
+    /// account, which is stored as IMAP but served by `DemoProvider`).
+    nonisolated static func admissionEpochForNewGesture(
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> Int? {
+        guard let account = try Account.fetchOne(db, key: accountId) else { return nil }
+        guard account.provider == .imap || account.provider == .icloud else { return nil }
+        guard accountId != DemoSeed.demoAccountId else { return nil }
+        guard let folder = try Folder.fetchOne(
+            db, key: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)),
+              let epoch = folder.lastKnownUidValidity,
+              let epochUInt = UInt32(exactly: epoch), epochUInt > 0 else { return nil }
+        return epoch
+    }
+
     /// T2.4 provider-address admission. This is the v3 provider-ID adaptation
     /// of the inverse re-key in v2final commit `a75196398`: ordinary actions
     /// persist the provider's native address, while IMAP additionally proves
@@ -371,7 +401,15 @@ extension AccountManager {
     /// ⚑ NO REFERENCE — INVENTED adaptation after the direct-constructor,
     /// call-site, and history census. v2final has no provider-ID admission
     /// helper because it deliberately re-keyed in the opposite direction.
-    private nonisolated static func admittedOrdinaryActionTargets(
+    ///
+    /// `internal` rather than `private`: the user-label producers
+    /// (`UserLabelMenuModel.applyLabel`/`removeLabel`,
+    /// `InboxViewModel.removeUserLabel`) and the outbox's
+    /// `deleteCompletedSendAtomic` reply/forward flags live in other files and
+    /// must admit through this exact predicate. They previously enqueued
+    /// `MessageHeader.stableId` — an rfc822 string on IMAP — with no epoch, which
+    /// checkpoint A could only ever refuse (audit finding A-6).
+    nonisolated static func admittedOrdinaryActionTargets(
         _ messages: [MessageHeader],
         accountId: String,
         folderPath: String,
