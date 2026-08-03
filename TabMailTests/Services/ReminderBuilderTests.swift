@@ -572,12 +572,11 @@ struct ReminderBuilderTaskIntegrationTests {
         #expect(items[2].content == "Task")
     }
 
-    @Test("invalidateCache clears both parser and list caches")
-    func invalidateCacheClearsAll() {
-        // This tests that invalidateCache doesn't crash and can be called multiple times
+    @Test("invalidateCache clears both parser and list caches with explicit lazy rebuild")
+    func invalidateCacheClearsAll() async {
         ReminderBuilder.invalidateCache()
         ReminderBuilder.invalidateCache()
-        // No crash = success
+        _ = await ReminderBuilder.buildReminderList(includeDisabled: true)
     }
 
     @Test("formatRemindersJSON includes task fields when present")
@@ -599,3 +598,28 @@ struct ReminderBuilderTaskIntegrationTests {
         #expect(item["source"] as? String == "kb")
     }
 }
+
+#if DEBUG
+@Suite("ReminderBuilder rebuild policy", .serialized)
+struct ReminderBuilderRebuildPolicyTests {
+    @Test("injected XCTest environments skip only the proactive warm-up")
+    func injectedEnvironmentDecision() {
+        #expect(ReminderRebuildPolicy.decision(environment: [:]) == .proactive)
+        #expect(ReminderRebuildPolicy.decision(environment: [
+            "XCTestConfigurationFilePath": "/tmp/test.xctestconfiguration"
+        ]) == .skippedUnitTestHost)
+        #expect(ReminderRebuildPolicy.decision(environment: [
+            "XCTestBundlePath": "/tmp/TabMailTests.xctest"
+        ]) == .skippedUnitTestHost)
+    }
+
+    @Test("ordinary app-hosted unit-test host skips proactive warm-up")
+    func unitTestHostSkipsProactiveWarmup() {
+        let environment = ProcessInfo.processInfo.environment
+        let isXCTestHost = environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        #expect(isXCTestHost, "this invariant must run in the ordinary XCTest app host")
+        #expect(ReminderRebuildPolicy.hostDecision == .skippedUnitTestHost)
+    }
+}
+#endif

@@ -57,6 +57,9 @@ enum ReminderBuilder {
         // (epoch-zero-timestamped entries are >90d old → GC'd). Detached → the rebuild
         // reads the real `.standard` store, matching production (where the override is
         // always nil) and no longer racing/clobbering an isolated test store.
+        #if DEBUG
+        guard ReminderRebuildPolicy.hostDecision == .proactive else { return }
+        #endif
         Task.detached { _ = await buildReminderList(includeDisabled: true) }
     }
 
@@ -533,3 +536,27 @@ enum ReminderBuilder {
         }
     }
 }
+
+#if DEBUG
+/// DEBUG-only policy for the proactive reminder-cache warm-up. Ordinary unit-test
+/// hosts still invalidate every cache, then build lazily when a test needs one.
+/// Release retains the exact detached warm-up above without XCTest environment access.
+enum ReminderRebuildPolicy {
+    enum Decision: Equatable, Sendable {
+        case skippedUnitTestHost
+        case proactive
+    }
+
+    static func decision(environment: [String: String]) -> Decision {
+        if environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil {
+            return .skippedUnitTestHost
+        }
+        return .proactive
+    }
+
+    /// Resolve once: invalidation is posted from many hot paths and must not
+    /// rebuild `ProcessInfo.environment` for each cache clear.
+    static let hostDecision = decision(environment: ProcessInfo.processInfo.environment)
+}
+#endif
