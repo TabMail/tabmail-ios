@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 @Suite("Draft key parsing")
@@ -136,5 +137,422 @@ struct LocallyAuthoredDraftOpenAuthorityTests {
                 draft(serverId: original.serverDraftId == nil ? "unexpected" : "replacement"),
                 runtimeKind: authority.runtimeKind))
         }
+    }
+}
+
+// MARK: - T5.8 — a reply's quoted body must belong to the message the user replied to
+//
+// The SYSTEM PROPERTY under test, stated once: whatever a reply/forward draft
+// quotes, attributes, or forwards attachments from must be the message the USER
+// replied to — never whatever row happens to occupy the mutable `replyToId`
+// primary key at reopen time. `replyToId` is `accountId:folderPath:messageId`; a
+// folder move re-keys it and a UIDVALIDITY reset + purge-and-resync can seat a
+// DIFFERENT physical message at the identical key.
+//
+// These tests assert that property (what comes back), never the mechanism (which
+// column was consulted).
+
+/// The pure address baseline. No database — these pin the three-valued verdict
+/// itself, in particular that "cannot tell" is NOT "different".
+@Suite("Reply-target address verdict (T5.8)")
+struct ReplyTargetAddressVerdictTests {
+
+    @Test("A UIDVALIDITY turnover at the same UID is a proven mismatch")
+    func epochTurnoverAtSameUidIsMismatch() {
+        // The reset case: the mailbox re-numbered, so UID 42 now addresses a
+        // DIFFERENT message. The provider id alone still compares equal — only the
+        // epoch disagrees, which is exactly why the epoch is stored.
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "42", expectedUidValidity: 100,
+            hitProviderMessageId: "42", hitUidValidity: 200) == .mismatch)
+    }
+
+    @Test("A different provider id is a proven mismatch")
+    func differentProviderIdIsMismatch() {
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "42", expectedUidValidity: 100,
+            hitProviderMessageId: "43", hitUidValidity: 100) == .mismatch)
+    }
+
+    @Test("The same address under the same epoch is confirmed")
+    func sameAddressSameEpochIsConfirmed() {
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "42", expectedUidValidity: 100,
+            hitProviderMessageId: "42", hitUidValidity: 100) == .confirmed)
+    }
+
+    @Test("A stable-provider-id account, which has no epoch at all, is confirmed")
+    func stableProviderIdWithNoEpochIsConfirmed() {
+        // Gmail/Graph never observe a UIDVALIDITY, so both sides are nil forever.
+        // Treating that as unverifiable would refuse every Gmail reply quote.
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "18c9abc", expectedUidValidity: nil,
+            hitProviderMessageId: "18c9abc", hitUidValidity: nil) == .confirmed)
+    }
+
+    @Test("A one-sided unknown epoch is unverifiable, never a mismatch")
+    func oneSidedUnknownEpochIsUnverifiable() {
+        // "We could not determine the answer" must never be laundered into a
+        // positive disagreement, in either direction.
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "42", expectedUidValidity: 100,
+            hitProviderMessageId: "42", hitUidValidity: nil) == .unverifiable)
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: "42", expectedUidValidity: nil,
+            hitProviderMessageId: "42", hitUidValidity: 100) == .unverifiable)
+    }
+
+    @Test("An absent address stamp is unverifiable, never a mismatch")
+    func absentStampIsUnverifiable() {
+        // Every pre-v80 draft row. Absence of a stamp is absence of evidence.
+        #expect(Draft.replyTargetAddressVerdict(
+            expectedProviderMessageId: nil, expectedUidValidity: nil,
+            hitProviderMessageId: "42", hitUidValidity: 200) == .unverifiable)
+    }
+}
+
+/// The end-to-end property, over a real migrated database.
+@Suite("Reply quote identity (T5.8)")
+struct ReplyQuoteIdentityTests {
+
+    /// Content markers deliberately unmistakable in a failure message.
+    private static let foreignMarker = "CONFIDENTIAL-FOREIGN-BODY-MUST-NEVER-BE-QUOTED"
+    private static let genuineMarker = "GENUINE-REPLY-TARGET-BODY"
+
+    @discardableResult
+    private static func insertHeader(
+        _ db: DatabaseQueue,
+        messageId: String,
+        folderPath: String = "INBOX",
+        accountId: String = "acc1",
+        rfc822MessageId: String?,
+        observedUidValidity: Int?,
+        from: String = "sender@example.com",
+        snippet: String = "snippet"
+    ) throws -> MessageHeader {
+        var header = MessageHeader(
+            messageId: messageId,
+            subject: "Original subject",
+            from: from,
+            fromAddress: from,
+            to: "user@example.com",
+            date: Date(),
+            snippet: snippet,
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath),
+            accountId: accountId,
+            folderPath: folderPath,
+            isInInbox: folderPath == "INBOX"
+        )
+        header.rfc822MessageId = rfc822MessageId
+        header.observedUidValidity = observedUidValidity
+        try db.write { try header.insert($0) }
+        return header
+    }
+
+    private static func insertReplyDraft(
+        _ db: DatabaseQueue,
+        draftKey: String,
+        replyToId: String?,
+        stampProviderMessageId: String?,
+        stampUidValidity: Int?,
+        accountId: String = "acc1"
+    ) throws -> Draft {
+        var draft = Draft(
+            id: draftKey,
+            accountId: accountId,
+            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Re: Original subject",
+            body: "the words the user actually typed",
+            replyToId: replyToId,
+            isForward: false,
+            editHistoryJSON: nil,
+            createdAt: Date().timeIntervalSince1970,
+            updatedAt: Date().timeIntervalSince1970
+        )
+        draft.replyToProviderMessageId = stampProviderMessageId
+        draft.replyToUidValidity = stampUidValidity
+        try db.write { try draft.insert($0) }
+        return draft
+    }
+
+    private static func resolve(_ db: DatabaseQueue, _ draft: Draft) throws -> Draft.ReplyQuote? {
+        try db.read { conn in
+            try Draft.resolveReplyQuote(
+                draftKey: draft.id, replyToId: draft.replyToId, isForward: draft.isForward,
+                expectedProviderMessageId: draft.replyToProviderMessageId,
+                expectedUidValidity: draft.replyToUidValidity,
+                db: conn)
+        }
+    }
+
+    // MARK: - The headline property
+
+    @Test("A substituted PK yields no quote, never a foreign body")
+    func substitutedPrimaryKeyYieldsNoQuoteNeverAForeignBody() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        // The user replied to <original@example.com>, which lived at UID 42 under
+        // UIDVALIDITY 100. The server then re-numbered the mailbox and a resync put
+        // a DIFFERENT correspondent's message at the very same UID 42.
+        let impostorId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "impostor@domain.com",
+            observedUidValidity: 200, from: "someone-else@domain.com",
+            snippet: "impostor snippet")
+        try TestDatabase.insertMessageBody(
+            db, headerId: impostorId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:original@example.com", replyToId: impostorId,
+            stampProviderMessageId: "42", stampUidValidity: 100)
+
+        // NON-VACUITY: the hazard really was reachable — the foreign body IS sitting
+        // at the exact key the pre-fix code fetched from.
+        let planted = try db.read { conn in
+            try MessageBody.fetchOne(conn, key: impostorId)?.htmlContent
+        }
+        #expect(planted?.contains(Self.foreignMarker) == true)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil)
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
+        #expect(quote?.header.id != impostorId)
+    }
+
+    @Test("An ordinary reopen still quotes the message the user replied to")
+    func ordinaryReopenStillQuotesTheGenuineTarget() throws {
+        // The two-sided twin of the headline test: a guard that refuses everything
+        // would pass that one and fail this one.
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        let targetId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "original@example.com",
+            observedUidValidity: 100)
+        try TestDatabase.insertMessageBody(
+            db, headerId: targetId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:original@example.com", replyToId: targetId,
+            stampProviderMessageId: "42", stampUidValidity: 100)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote?.header.id == targetId)
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true)
+    }
+
+    @Test("After a folder move the quote follows the message, not the stale PK")
+    func folderMoveStillQuotesTheMovedMessage() throws {
+        // The address stamp must not over-refuse: an IMAP MOVE gives the SAME
+        // message a new UID in a new mailbox, so the stamped address legitimately
+        // stops matching and the account+RFC lookup is what recovers it.
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        let movedId = "acc1:Archive:77"
+        try Self.insertHeader(
+            db, messageId: "77", folderPath: "Archive",
+            rfc822MessageId: "original@example.com", observedUidValidity: 900)
+        try TestDatabase.insertMessageBody(
+            db, headerId: movedId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        // The draft still names the pre-move address, which no longer exists.
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:original@example.com", replyToId: "acc1:INBOX:42",
+            stampProviderMessageId: "42", stampUidValidity: 100)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote?.header.id == movedId)
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true)
+    }
+
+    // MARK: - Pre-v80 (legacy) rows: neither a permanent casualty nor a laundered pass
+
+    @Test("A legacy draft with no address stamp still refuses an RFC-mismatched PK hit")
+    func legacyDraftStillRefusesAnImpostorAtItsPrimaryKey() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        let impostorId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "impostor@domain.com",
+            observedUidValidity: 200, from: "someone-else@domain.com")
+        try TestDatabase.insertMessageBody(
+            db, headerId: impostorId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        // nil stamp = every row written before v80 (no backfill, on purpose).
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:original@example.com", replyToId: impostorId,
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil)
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
+    }
+
+    @Test("A legacy draft with no address stamp still quotes its genuine reply target")
+    func legacyDraftStillQuotesItsGenuineTarget() throws {
+        // The other half of the legacy rule: an unstamped row must not lose its
+        // quote forever just because it predates v80.
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        let targetId = "acc1:INBOX:42"
+        try Self.insertHeader(
+            db, messageId: "42", rfc822MessageId: "original@example.com",
+            observedUidValidity: 100)
+        try TestDatabase.insertMessageBody(
+            db, headerId: targetId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:original@example.com", replyToId: targetId,
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote?.header.id == targetId)
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true)
+    }
+
+    @Test("A stable-provider-id draft with no RFC baseline and no stamp still quotes its target")
+    func stableProviderIdDraftWithNeitherBaselineStillResolves() throws {
+        // Gmail/Graph: the draft key's stableId is the PROVIDER id, which yields no
+        // RFC baseline, and a pre-v80 row has no stamp. Those ids are stable and
+        // never reused, so there is no hazard here and refusing would be pure loss.
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .gmail)
+        try TestDatabase.insertFolder(db)
+
+        let targetId = "acc1:INBOX:18c9abc"
+        try Self.insertHeader(
+            db, messageId: "18c9abc", rfc822MessageId: nil, observedUidValidity: nil)
+        try TestDatabase.insertMessageBody(
+            db, headerId: targetId, htmlContent: "<p>\(Self.genuineMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:18c9abc", replyToId: targetId,
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote?.header.id == targetId)
+        #expect(quote?.bodyHTML?.contains(Self.genuineMarker) == true)
+    }
+
+    // MARK: - The account+RFC recovery must not itself resolve to an arbitrary row
+
+    @Test("A draft key with an empty stableId resolves to no reply target")
+    func emptyStableIdInDraftKeyResolvesToNothing() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com", provider: .imap)
+        try TestDatabase.insertFolder(db)
+
+        // A header carrying an EMPTY rfc822MessageId — what an empty normalized
+        // stableId would otherwise compare equal to.
+        let unrelatedId = "acc1:INBOX:9"
+        try Self.insertHeader(
+            db, messageId: "9", rfc822MessageId: "", observedUidValidity: 300,
+            from: "someone-else@domain.com")
+        try TestDatabase.insertMessageBody(
+            db, headerId: unrelatedId, htmlContent: "<p>\(Self.foreignMarker)</p>")
+
+        let draft = try Self.insertReplyDraft(
+            db, draftKey: "reply:acc1:", replyToId: nil,
+            stampProviderMessageId: nil, stampUidValidity: nil)
+
+        let quote = try Self.resolve(db, draft)
+
+        #expect(quote == nil)
+        #expect(quote?.bodyHTML?.contains(Self.foreignMarker) != true)
+    }
+
+    // MARK: - The outbound-quote seam
+
+    @Test("An unconfirmed reply target contributes no snippet to the outbound quote")
+    func unconfirmedTargetContributesNoSnippetToTheOutboundQuote() {
+        // A snippet is a cached preview of whatever row the PK named, so it bypasses
+        // the identity guard entirely. No confirmed body ⇒ no quote at all.
+        #expect(ComposeDraftGuards.outboundQuoteBody(
+            confirmedBodyHTML: nil,
+            capturedSnippet: Self.foreignMarker) == nil)
+    }
+
+    @Test("A confirmed body does populate the outbound quote")
+    func confirmedBodyDoesPopulateTheOutboundQuote() {
+        #expect(ComposeDraftGuards.outboundQuoteBody(
+            confirmedBodyHTML: "<p>\(Self.genuineMarker)</p>",
+            capturedSnippet: "unused") == "<p>\(Self.genuineMarker)</p>")
+    }
+}
+
+@Suite("Draft reply-target address migration (v80)")
+struct DraftReplyTargetAddressMigrationTests {
+
+    @Test("v80 adds nullable reply-target address columns without backfilling existing drafts")
+    func v80AddsNullableReplyTargetAddressWithoutBackfill() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var beforeMigrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &beforeMigrator)
+        try beforeMigrator.migrate(db, upTo: "v79_addDraftLastTouchedSeq")
+        try TestDatabase.insertAccount(db)
+        try db.write { conn in
+            try conn.execute(sql: """
+                INSERT INTO draft
+                    (id, accountId, toJSON, ccJSON, bccJSON, subject, body,
+                     replyToId, isForward, editHistoryJSON, createdAt, updatedAt)
+                VALUES ('reply:acc1:original@example.com', 'acc1', '[]', '[]', '[]',
+                        'Re: Original subject', 'authored body',
+                        'acc1:INBOX:42', 0, NULL, 1, 2)
+                """)
+        }
+
+        var afterMigrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &afterMigrator)
+        try afterMigrator.migrate(db, upTo: "v80_addDraftReplyTargetAddress")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(draft)") }
+        let providerColumn = try #require(
+            columns.first { ($0["name"] as String) == "replyToProviderMessageId" })
+        let epochColumn = try #require(
+            columns.first { ($0["name"] as String) == "replyToUidValidity" })
+        #expect((providerColumn["notnull"] as Int) == 0)
+        #expect((epochColumn["notnull"] as Int) == 0)
+
+        // NON-VACUITY: the pre-v80 row really did survive the migration, so the two
+        // nil assertions below are about a row that exists, not about no rows.
+        let surviving = try db.read {
+            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM draft WHERE id = ?",
+                             arguments: ["reply:acc1:original@example.com"])
+        }
+        #expect(surviving == 1)
+
+        // NO BACKFILL, deliberately: adopting whatever row sits at `replyToId` today
+        // would bless an already-substituted impostor as "the expected identity".
+        let stampedProviderId: String? = try db.read {
+            try String.fetchOne($0, sql: """
+                SELECT replyToProviderMessageId FROM draft WHERE id = ?
+                """, arguments: ["reply:acc1:original@example.com"])
+        }
+        #expect(stampedProviderId == nil)
+        let stampedEpoch: Int? = try db.read {
+            try Int.fetchOne($0, sql: """
+                SELECT replyToUidValidity FROM draft WHERE id = ?
+                """, arguments: ["reply:acc1:original@example.com"])
+        }
+        #expect(stampedEpoch == nil)
     }
 }

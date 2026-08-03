@@ -59,8 +59,24 @@ struct DraftComposePresenter: View {
     @Environment(\.dismiss) private var dismiss
 
     private enum LoadResult {
-        case loaded(draft: Draft, replyTo: MessageHeader?, account: Account?)
+        /// The account is non-optional: a persisted `Draft` only ever opens bound to
+        /// the exact account that OWNS the row (`ComposeDraftGuards
+        /// .mayBindPersistedDraft`). There is no nil-account open, because a nil
+        /// account is what let the inner `ComposeView` fall back to
+        /// `navigationStore.accounts.first`.
+        case loaded(draft: Draft, replyTo: MessageHeader?, account: Account)
         case notFound
+        /// PORT — v2final `DraftComposePresenter.LoadResult.accountUnavailable`
+        /// (D-OPEN #5, commits `a8eb813b5` / `69a9bae88`). The draft's exact owning
+        /// account could not be resolved. FAIL CLOSED — never open on a fallback
+        /// account, which would send from / attach to the WRONG account.
+        case accountUnavailable
+        /// ⚑ NO REFERENCE — INVENTED. The `Draft`/`Account` read THREW. The
+        /// reference (and this forward-port before this change) collapsed that into
+        /// `.notFound`, which AUTO-DISMISSES — so a momentarily busy/suspended
+        /// database made the user's "open draft" tap silently do nothing at all. A
+        /// thrown read is NOT absence: offer a retry instead of vanishing.
+        case loadFailed
     }
 
     var body: some View {
@@ -77,6 +93,12 @@ struct DraftComposePresenter: View {
             case .notFound:
                 // Draft doesn't exist (yet) — auto-dismiss
                 Color.clear.onAppear { dismiss() }
+            case .accountUnavailable:
+                failClosedView(
+                    message: "This draft's account couldn't be verified. Please try again in a moment.")
+            case .loadFailed:
+                failClosedView(
+                    message: "This draft didn't finish loading. Please try again in a moment.")
             case nil:
                 Color(.systemBackground)
                     .ignoresSafeArea()
@@ -103,7 +125,41 @@ struct DraftComposePresenter: View {
         }
     }
 
-    /// Synchronous load — GRDB reads are fast on DatabasePool.
+    /// PORT — v2final `DraftComposePresenter.accountUnavailableView` (D-OPEN #5),
+    /// generalized over the message so the thrown-read arm shares the scaffold.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED: the "Try Again" button. The reference offered
+    /// only "Close", which throws away the user's intent to open the draft on what
+    /// is usually a transient condition (an account row not yet materialized, a busy
+    /// database). Retry re-runs the exact same fail-closed load; it grants no
+    /// authority of its own.
+    private func failClosedView(message: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("Couldn't open this draft")
+                .font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            HStack(spacing: 12) {
+                Button("Close") { dismiss() }
+                    .buttonStyle(.bordered)
+                Button("Try Again") {
+                    loadResult = nil
+                    Task { loadResult = await loadDraft() }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground))
+    }
+
+    /// Load the draft and its owning account, FAIL CLOSED on both axes.
     private func loadDraft() async -> LoadResult {
         print("[DraftComposePresenter] Loading draft: \(draftId)")
         let loaded: (Draft, Account?)?
@@ -113,16 +169,54 @@ struct DraftComposePresenter: View {
                 return (draft, try Account.fetchOne(db, key: draft.accountId))
             }
         } catch {
-            return .notFound
+            // A THROWN read is NOT absence. The superseded `return .notFound` here
+            // auto-dismissed the presenter, so a busy/suspended database silently
+            // swallowed the user's tap on an existing draft.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftComposePresenter] ⚠ Draft/Account read THREW for \(draftId) — offering retry, not dismissal: \(error)")
+            }
+            return .loadFailed
         }
         guard let (draft, account) = loaded else {
             print("[DraftComposePresenter] Draft NOT FOUND: \(draftId)")
             return .notFound
         }
 
+        // PORT — v2final `ServerDraftOpen.mayBindPersistedDraft` (commits
+        // `a8eb813b5` / `69a9bae88`), via `ComposeDraftGuards`. EVERY persisted
+        // `Draft` open requires the row's exact owning `Account`; there is no
+        // accounts-first fallback. Previously a nil `account` was handed to
+        // `ComposeView` as `account: nil`, whose `resolvedAccount` then fell through
+        // to `navigationStore.accounts.first` — a silent bind to the WRONG account,
+        // which sends from the wrong address and pushes the server draft into the
+        // wrong mailbox. `ComposeView` repeats this binding at its own handoff.
+        //
+        // SUBTRACT — v2final's `serverDraftHeader` arm (`mayOpenWithAccount`) and
+        // the Gmail/Outlook `mayReuseAtComposeHandoff` RFC/RESOURCE revalidation are
+        // NOT ported. `DraftComposePresenter` here has no `serverDraftHeader` and no
+        // `backSeed` parameter: this forward-port's server-draft open path is
+        // `LocallyAuthoredDraftOpenAuthority`, whose `matches(_:runtimeKind:)`
+        // already requires the exact provider-native address (`serverDraftId ==
+        // resourceId` / `graphId` / `localId`) plus accountId, instanceEpoch and
+        // serverPushStatus equality against the freshly-read row — a STRICTER check
+        // than the reference's RFC-corroborated union, and re-run inside
+        // `ComposeView.loadDraftOrPrepopulate` at the second handoff. The
+        // reference's premise (a Gmail row whose RESOURCE must be recovered from a
+        // contained MESSAGE id, matched by rotating RFC) has no producer here:
+        // nothing in this tree constructs a `ServerDraftOpen.Identity` or opens a
+        // compose from a bare server header.
+        guard ComposeDraftGuards.mayBindPersistedDraft(
+            draftAccountId: draft.accountId, resolvedAccountId: account?.id
+        ), let account else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftComposePresenter] Persisted-draft account unavailable — fail closed (draft.accountId=\(draft.accountId.prefix(20)) account=\(account == nil ? "nil" : "set"))")
+            }
+            return .accountUnavailable
+        }
+
         if let openAuthority {
             guard openAuthority.draftId == draftId,
-                  account?.id == openAuthority.accountId,
+                  account.id == openAuthority.accountId,
                   let runtimeKind = await AccountManager.shared.draftRuntimeIdentityKind(
                       accountId: openAuthority.accountId),
                   openAuthority.matches(draft, runtimeKind: runtimeKind) else {
@@ -137,7 +231,20 @@ struct DraftComposePresenter: View {
         return .loaded(draft: draft, replyTo: replyTo, account: account)
     }
 
+    /// T5.8 — resolve through the GUARDED resolver. `draft.replyToId` is a
+    /// `MessageHeader` PRIMARY KEY and that key is MUTABLE
+    /// (`accountId:folderPath:messageId`), so a folder move re-keys it and a
+    /// UIDVALIDITY reset + purge-and-resync can seat a DIFFERENT physical message at
+    /// the identical PK. The header this returns is handed straight to
+    /// `ComposeView(replyTo:)`, where it drives the reply address, the subject and
+    /// the quote attribution — so an unguarded hit here is a wrong-correspondent
+    /// reply, not merely a wrong quote. The v80 stamp names the address the user
+    /// actually replied to; nil (a pre-v80 row) falls to the draft key's RFC
+    /// baseline inside the resolver, never to an unconditional accept.
     private func resolveReplyTo(draft: Draft) -> MessageHeader? {
-        Draft.resolveReplyToHeader(draftKey: draftId, replyToId: draft.replyToId, isForward: draft.isForward)
+        Draft.resolveReplyToHeader(
+            draftKey: draftId, replyToId: draft.replyToId, isForward: draft.isForward,
+            expectedProviderMessageId: draft.replyToProviderMessageId,
+            expectedUidValidity: draft.replyToUidValidity)
     }
 }

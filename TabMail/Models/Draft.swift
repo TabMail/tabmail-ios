@@ -86,6 +86,47 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// Ported from `v2final:TabMail/Models/Draft.swift`'s `serverDraftUidValidity`.
     var serverDraftUidValidity: Int?
 
+    /// v80 — the PROVIDER's own id (`MessageHeader.messageId`: an IMAP UID, a Gmail
+    /// message id, a Graph message id) for the copy the user actually pressed
+    /// Reply/Forward on. Written once, beside `replyToId`, when the reply draft is
+    /// first created; never rewritten (`DraftStore.applySave`'s update path starts
+    /// from the stored row and does not copy it forward from an incoming snapshot).
+    ///
+    /// ⚑ NO REFERENCE — INVENTED **key**. The reference (`v2final:Draft
+    /// .expectedReplyToRfc` / `acceptStrategy1ReplyHit`) discriminates the reply
+    /// target by RFC 822 Message-ID, which only recovers a baseline for a
+    /// numeric-IMAP source. This column belongs to the **provider-id (action)**
+    /// keying scheme, not the RFC (content) one, because the question it answers is
+    /// action-shaped: *which physical copy did the user reply to* — not *which
+    /// content*. See `MessageIdentity`'s `ContentKeySpace` doc for why the two
+    /// schemes coexist on purpose.
+    ///
+    /// WHY IT IS NEEDED AT ALL. `replyToId` is a `MessageHeader` PRIMARY KEY, and
+    /// that PK is MUTABLE: it is `accountId:folderPath:messageId`, so a folder move
+    /// re-keys it, and a UIDVALIDITY reset + purge-and-resync can seat a DIFFERENT
+    /// physical message at the very same PK. Accepting the PK hit unconditionally
+    /// and then quoting the body found there is how another correspondent's mail
+    /// gets quoted into the user's OUTGOING reply.
+    ///
+    /// nil means UNKNOWN — never "matches", never "differs". Every row written
+    /// before v80 has nil here (see `v80_addDraftReplyTargetAddress`: no backfill,
+    /// deliberately).
+    var replyToProviderMessageId: String? = nil
+
+    /// v80 — the IMAP UIDVALIDITY epoch that was OBSERVED for the reply target when
+    /// this draft was created (`MessageHeader.observedUidValidity`, itself set by
+    /// the exact SELECT/FETCH that supplied that row's UID).
+    ///
+    /// This is the half that actually catches the dangerous case: a UIDVALIDITY
+    /// reset re-seats a DIFFERENT message at the SAME `(mailbox, uid)` address, so
+    /// the provider id alone still compares equal and only the epoch disagrees.
+    ///
+    /// nil for every non-IMAP provider (Gmail/Graph ids are stable and epoch-free),
+    /// for an IMAP row whose address was never proven, and for every pre-v80 row.
+    /// nil means UNKNOWN — an *unknown* epoch is retryable/inconclusive, NEVER a
+    /// proven mismatch (`CLAUDE.md` "Never Drop User Intention", exit 4 vs clause 2).
+    var replyToUidValidity: Int? = nil
+
     // MARK: - JSON Helpers
 
     var toArray: [String] {
@@ -142,16 +183,196 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         return "new:\(newId ?? UUID().uuidString)"
     }
 
-    /// Resolve the reply-to MessageHeader from a draft key + replyToId.
-    /// Tries PK lookup first, then parses stableId from the draftKey ("reply:{accountId}:{stableId}")
-    /// and looks up by rfc822MessageId. Handles stale PKs after IMAP moves.
-    static func resolveReplyToHeader(draftKey: String, replyToId: String?, isForward: Bool) -> MessageHeader? {
-        // Strategy 1: direct PK lookup
+    // MARK: - Reply-target identity guard (T5.8)
+    //
+    // ONE mechanism, four parts, and reading any part alone will mislead:
+    //   `expectedReplyToRfc` + `acceptStrategy1ReplyHit`  — PORT of the reference's
+    //       RFC baseline, which is the ONLY baseline a pre-v80 row has;
+    //   `ReplyTargetVerdict` + `replyTargetAddressVerdict` — ⚑ INVENTED, v3's
+    //       (provider id, UIDVALIDITY) baseline, which is the ONLY baseline that
+    //       catches a UIDVALIDITY reset on an RFC-less IMAP message;
+    //   `acceptsReplyTargetHit` — the composition, and the whole predicate;
+    //   `resolveReplyToHeader` / `resolveReplyQuote` — the ONE-SNAPSHOT consumers.
+
+    /// The verdict of the v80 ADDRESS baseline about a candidate row.
+    ///
+    /// Three cases, not two, deliberately: "we could not determine the answer" is
+    /// NOT a mismatch. Collapsing the two is, per `CLAUDE.md`, "the single most
+    /// repeated defect in this codebase's history".
+    enum ReplyTargetVerdict: Sendable, Equatable {
+        /// The candidate row is PROVABLY the address the draft was stamped against.
+        case confirmed
+        /// The candidate row PROVABLY names a different address (or a different
+        /// UIDVALIDITY epoch at the same address). This — and only this — authorizes
+        /// dropping the quote.
+        case mismatch
+        /// No stamp, or one side's epoch is unknown. Carries no authority in either
+        /// direction; the RFC baseline decides.
+        case unverifiable
+    }
+
+    /// ⚑ NO REFERENCE — INVENTED. The v3 address baseline: does the row now at the
+    /// draft's `replyToId` still name the SAME provider copy, under the SAME
+    /// UIDVALIDITY epoch, that the user actually replied to?
+    ///
+    /// - A nil `expectedProviderMessageId` (every pre-v80 row) is `.unverifiable` —
+    ///   absence of a stamp is absence of evidence, never evidence of substitution.
+    /// - Different provider ids ⇒ `.mismatch` (a positive, proven disagreement).
+    /// - Same provider id, both epochs nil ⇒ `.confirmed`. Both nil is the NORMAL,
+    ///   correct state for Gmail/Graph, whose ids are stable and never reused, so
+    ///   the address itself is durable identity there.
+    /// - Same provider id, both epochs present ⇒ equality decides. THIS is the cell
+    ///   that catches the UIDVALIDITY reset: the resynced row keeps UID 42 and
+    ///   changes only the epoch.
+    /// - Same provider id, exactly ONE epoch present ⇒ `.unverifiable`. An unknown
+    ///   epoch is retryable/inconclusive, never a proven turnover (`CLAUDE.md`:
+    ///   exit 4 requires a PROVEN epoch change and "does not widen clause 2").
+    static func replyTargetAddressVerdict(
+        expectedProviderMessageId: String?,
+        expectedUidValidity: Int?,
+        hitProviderMessageId: String,
+        hitUidValidity: Int?
+    ) -> ReplyTargetVerdict {
+        guard let expectedProviderMessageId else { return .unverifiable }
+        guard expectedProviderMessageId == hitProviderMessageId else { return .mismatch }
+        switch (expectedUidValidity, hitUidValidity) {
+        case (nil, nil):
+            return .confirmed
+        case let (expected?, hit?):
+            return expected == hit ? .confirmed : .mismatch
+        default:
+            return .unverifiable
+        }
+    }
+
+    /// PORT — `v2final:Draft.expectedReplyToRfc(draftKey:isForward:)`.
+    ///
+    /// Recover the EXPECTED reply-to RFC 822 Message-ID encoded in a reply/forward
+    /// draft key (`"reply:{accountId}:{stableId}"` / `"forward:…"` — `ComposeView`
+    /// builds them from `reply.accountId:reply.stableId`). For a numeric-IMAP source
+    /// the `stableId` IS the RFC Message-ID (`MessageHeader.stableId`), so this
+    /// recovers a real baseline; for Gmail/Graph the `stableId` is the provider
+    /// message id, which does not normalize as an RFC Message-ID → nil (the accepted
+    /// RFC-less tail — those providers' ids are stable and never reused).
+    ///
+    /// Because the baseline is EXTERNAL to the mutable `replyToId` PK and to any
+    /// candidate row, the guard built on it is not self-referential. It is also
+    /// present on EVERY row including pre-v80 ones, which is exactly why the v80
+    /// stamp does not replace it.
+    ///
+    /// ⚑ v3 uses `MessageIdentity.comparableRfc822Identity`, this branch's rename of
+    /// the reference's `durableActionRFC822MessageId`. `usableRfc822Tail` is the
+    /// WRONG helper here: it additionally rejects a `':'` for CONTENT-KEY folder
+    /// scoping, and a server-originated no-fold-literal domain (`<a@[IPv6:…]>`) would
+    /// then read as "never the same message" for a message that plainly is.
+    static func expectedReplyToRfc(draftKey: String, isForward: Bool) -> String? {
+        let prefix = isForward ? "forward:" : "reply:"
+        guard draftKey.hasPrefix(prefix) else { return nil }
+        let rest = String(draftKey.dropFirst(prefix.count))
+        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
+        let stableId = String(rest[rest.index(after: colonIdx)...])
+        return MessageIdentity.comparableRfc822Identity(stableId)
+    }
+
+    /// PORT — `v2final:Draft.acceptStrategy1ReplyHit(expectedRfc:hitRfc:)`.
+    ///
+    /// The RFC half of the impostor guard. When an `expectedRfc` was recovered from
+    /// the draft key, accept the candidate ONLY IF its OWN `rfc822MessageId`
+    /// normalizes to the SAME identity — a nil / malformed / different hit RFC means
+    /// a purge-and-resync (or a re-key) may have put a DIFFERENT physical message at
+    /// that PK. Fail-open belongs ONLY to the RFC-less case (`expectedRfc == nil`),
+    /// which is Gmail/Graph plus RFC-less IMAP.
+    static func acceptStrategy1ReplyHit(expectedRfc: String?, hitRfc: String?) -> Bool {
+        guard let expectedRfc else { return true }
+        return MessageIdentity.comparableRfc822Identity(hitRfc) == expectedRfc
+    }
+
+    /// THE PREDICATE. May the row currently at the draft's `replyToId` be accepted
+    /// as the message the user replied to?
+    ///
+    /// **Accept iff NEITHER baseline positively disagrees.** Both baselines are
+    /// independent positive-identity checks over data external to the candidate; a
+    /// baseline that cannot decide (no v80 stamp, unknown epoch, RFC-less source)
+    /// contributes nothing rather than laundering its silence into either verdict.
+    /// This is not a "fallback chain" (`CLAUDE.md` rule 4) — nothing here retries a
+    /// failed operation, and no branch re-attempts a rejected candidate a laxer way.
+    ///
+    /// Where each baseline is load-bearing:
+    /// - pre-v80 (legacy) row, IMAP with an RFC id → stamp `.unverifiable`, RFC
+    ///   baseline decides. Exactly the reference's behaviour; NOT a laundered pass.
+    /// - pre-v80 row, Gmail/Graph → both baselines silent → accept. Correct: the
+    ///   provider id IS durable identity there, so there is no hazard to guard.
+    /// - stamped row, RFC-less IMAP, UIDVALIDITY reset → RFC baseline silent, stamp
+    ///   says `.mismatch` → reject. This is what v80 adds over the reference.
+    static func acceptsReplyTargetHit(
+        expectedRfc: String?,
+        expectedProviderMessageId: String?,
+        expectedUidValidity: Int?,
+        hit: MessageHeader
+    ) -> Bool {
+        let addressVerdict = replyTargetAddressVerdict(
+            expectedProviderMessageId: expectedProviderMessageId,
+            expectedUidValidity: expectedUidValidity,
+            hitProviderMessageId: hit.messageId,
+            hitUidValidity: hit.observedUidValidity)
+        guard addressVerdict != .mismatch else { return false }
+        return acceptStrategy1ReplyHit(expectedRfc: expectedRfc, hitRfc: hit.rfc822MessageId)
+    }
+
+    /// Resolve the reply-to `MessageHeader` from a draft key + `replyToId`, guarding
+    /// the PK hit against an impostor. Production entry point — opens ONE DB read
+    /// and delegates to the `db`-scoped resolver.
+    ///
+    /// PORT — `v2final:Draft.resolveReplyToHeader(draftKey:replyToId:isForward:)`,
+    /// plus the v80 stamp parameters (⚑ INVENTED).
+    static func resolveReplyToHeader(
+        draftKey: String,
+        replyToId: String?,
+        isForward: Bool,
+        expectedProviderMessageId: String?,
+        expectedUidValidity: Int?
+    ) -> MessageHeader? {
+        try? AppDatabase.dbPool.read { db in
+            try resolveReplyToHeader(
+                draftKey: draftKey, replyToId: replyToId, isForward: isForward,
+                expectedProviderMessageId: expectedProviderMessageId,
+                expectedUidValidity: expectedUidValidity, db: db)
+        }
+    }
+
+    /// PORT — `v2final:Draft.resolveReplyToHeader(draftKey:replyToId:isForward:db:)`.
+    /// The `db`-scoped resolver (and the testable seam).
+    ///
+    /// Strategy 1 = direct PK lookup, GUARDED by `acceptsReplyTargetHit`; on a
+    /// refusal it falls through to Strategy 2 = account + RFC scoped lookup, which
+    /// is a POSITIVE identity match and therefore survives the IMAP folder move that
+    /// re-keys the PK. Both strategies run inside the SAME `db` snapshot.
+    ///
+    /// Strategy 2 is deliberately NOT re-checked against the v80 address stamp: a
+    /// legitimate MOVE gives the same message a new UID, so the stamp would refuse
+    /// the very case Strategy 2 exists to recover. Its own `accountId` + normalized
+    /// `rfc822MessageId` predicate is the positive identity proof.
+    static func resolveReplyToHeader(
+        draftKey: String,
+        replyToId: String?,
+        isForward: Bool,
+        expectedProviderMessageId: String?,
+        expectedUidValidity: Int?,
+        db: Database
+    ) throws -> MessageHeader? {
+        let expectedRfc = expectedReplyToRfc(draftKey: draftKey, isForward: isForward)
+        // Strategy 1: direct PK lookup — accepted only when it cannot be an impostor.
         if let replyId = replyToId,
-           let header = try? AppDatabase.dbPool.read({ db in try MessageHeader.fetchOne(db, key: replyId) }) {
+           let header = try MessageHeader.fetchOne(db, key: replyId),
+           acceptsReplyTargetHit(
+               expectedRfc: expectedRfc,
+               expectedProviderMessageId: expectedProviderMessageId,
+               expectedUidValidity: expectedUidValidity,
+               hit: header) {
             return header
         }
-        // Strategy 2: parse stableId from draftKey
+        // Strategy 2: parse accountId + stableId from the draft key, look up by
+        // account + rfc822MessageId.
         let prefix = isForward ? "forward:" : "reply:"
         guard draftKey.hasPrefix(prefix) else { return nil }
         let rest = String(draftKey.dropFirst(prefix.count))
@@ -159,11 +380,72 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         let accountId = String(rest[rest.startIndex..<colonIdx])
         let stableId = String(rest[rest.index(after: colonIdx)...])
         let normalized = EmailFilter.normalizeMessageId(stableId)
-        return try? AppDatabase.dbPool.read { db in
-            try MessageHeader
-                .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
-                .fetchOne(db)
-        }
+        // An EMPTY normalized id is not an identity — without this it would match any
+        // header in the account whose `rfc822MessageId` is the empty string, which is
+        // a wrong-message resolution (C3). `DraftStore.evictImpl`'s twin of this query
+        // already carries the same guard.
+        guard !normalized.isEmpty else { return nil }
+        return try MessageHeader
+            .filter(Column("accountId") == accountId && Column("rfc822MessageId") == normalized)
+            .fetchOne(db)
+    }
+
+    /// PORT — `v2final:Draft.ReplyQuote`.
+    ///
+    /// The verified reply target paired with its own quoted body — the FULL
+    /// `MessageBody`, so callers can also carry forward its attachments (never an
+    /// impostor's). `body` is nil when the row simply has no stored body; it is
+    /// NEVER an unconfirmed row's body.
+    /// `Sendable` because `PrioritizedDatabase`'s ASYNC `read` requires `T: Sendable`
+    /// — both stored members already are.
+    struct ReplyQuote: Sendable {
+        let header: MessageHeader
+        let body: MessageBody?
+        var bodyHTML: String? { body?.htmlContent }
+    }
+
+    /// PORT — `v2final:Draft.resolveReplyQuote(draftKey:replyToId:isForward:providedReplyTo:db:)`,
+    /// minus its `providedReplyTo` parameter (see SUBTRACT below) and plus the v80
+    /// stamp parameters (⚑ INVENTED).
+    ///
+    /// Resolve the reply target AND fetch its quoted body in ONE `db` snapshot, so a
+    /// reset / re-key landing BETWEEN two independent reads can never pair a
+    /// verified header with an impostor's body. Quoting another correspondent's
+    /// content into the user's OUTGOING reply is a cross-correspondent leak, which
+    /// is why the body is DROPPED rather than guessed.
+    ///
+    /// Returns nil when no reply target can be positively established. Callers must
+    /// render NO attribution and NO quote in that case — the attribution line
+    /// carries the correspondent's display name and date, so an unconfirmed
+    /// attribution is the same class of leak as an unconfirmed body.
+    ///
+    /// **SUBTRACT — the reference's `providedReplyTo:` arm is not ported.**
+    /// Unreachability proof: the reference's own note records that "every PRODUCTION
+    /// caller currently passes `providedReplyTo: nil`", and its two call sites
+    /// (`v2final:ComposeView.loadDraftOrPrepopulate` and
+    /// `v2final:ComposeView.prepopulate`) both pass nil with the comment "do NOT
+    /// trust the pre-captured `replyTo` param, which may be stale". This
+    /// forward-port's two call sites are the same two functions and both pass the
+    /// stored/held identity through `replyToId` + the stamp instead. A parameter no
+    /// caller can supply is dead code (`CLAUDE.md` Code Quality rule 5).
+    static func resolveReplyQuote(
+        draftKey: String,
+        replyToId: String?,
+        isForward: Bool,
+        expectedProviderMessageId: String?,
+        expectedUidValidity: Int?,
+        db: Database
+    ) throws -> ReplyQuote? {
+        guard let header = try resolveReplyToHeader(
+            draftKey: draftKey, replyToId: replyToId, isForward: isForward,
+            expectedProviderMessageId: expectedProviderMessageId,
+            expectedUidValidity: expectedUidValidity, db: db)
+        else { return nil }
+        // The resolver already validated identity (Strategy-1 guarded, or Strategy-2's
+        // exact account+RFC match). The body is read from the RESOLVED header's own id
+        // in THIS SAME snapshot — never from the caller's mutable `replyToId`.
+        let body = try MessageBody.fetchOne(db, key: header.id)
+        return ReplyQuote(header: header, body: body)
     }
 
     /// Whether this draft key represents a reply or forward (vs new compose).
@@ -243,6 +525,36 @@ enum DraftAttachmentStorage {
     /// tests inject a temporary directory so they can create/mutate real files.
     static func dirURL(for dirName: String, root: URL? = nil) -> URL {
         (root ?? baseDir).appendingPathComponent(dirName, isDirectory: true)
+    }
+
+    /// PORT — `v2final:TabMail/Models/Draft.swift`'s
+    /// `DraftAttachmentStorage.newStagingDirName()` (F0f), verbatim.
+    ///
+    /// The ONE source of truth for a copy-on-write staging directory name. An
+    /// OPAQUE UUID: a single filesystem path component containing no `/`, `:` or
+    /// any other path character. This is what makes the COW staging safe on TWO
+    /// axes:
+    ///
+    /// 1. **Copy-on-write.** A fresh, never-referenced name means the new
+    ///    attachment set is written somewhere the durable row does not point at,
+    ///    so a save that fails or is superseded can be cleaned up without ever
+    ///    touching the LIVE directory (persist-before-destroy).
+    /// 2. **Path containment.** The superseded call sites derived the directory
+    ///    name from `draftId`, and a `draftId` is NOT a safe path component: a
+    ///    reply/forward key is `reply:<accountId>:<stableId>` where `stableId` is
+    ///    an RFC 822 Message-ID whose local part may legally contain `/` (RFC 5322
+    ///    `atext` includes `/`), and an Exchange/Graph resource id is base64 which
+    ///    also contains `/`. `appendingPathComponent` treats those as SEPARATORS,
+    ///    so the "directory" silently NESTS under an attacker/provider-chosen
+    ///    subpath — escaping the intended `draft_attachments/<name>` slot, and
+    ///    leaving `deleteAttachments` unable to reclaim the parent. A UUID has no
+    ///    separator, so `dirURL(for:root:)` always resolves to exactly ONE child
+    ///    of the storage root and every consumer (save, load, delete, eviction)
+    ///    can treat the on-disk directory as exactly its stored name.
+    ///
+    /// Both `ComposeView` COW staging sites (close-Save and Send) call this.
+    static func newStagingDirName() -> String {
+        UUID().uuidString
     }
 
     /// Save attachments to disk. Throws if any write fails.

@@ -303,3 +303,287 @@ struct DraftGenerationSafetyTests {
         fence.finishAgent()
     }
 }
+
+// MARK: - T4.D6 / T4.D7 / T4.D8 — compose fail-closed invariants
+//
+// These pin SYSTEM PROPERTIES of the compose close / save / discard / open paths,
+// not the mechanisms that implement them:
+//
+//   D6  a THROWN `Draft.fetchOne` is NOT absence — it authorizes NO delete, NO
+//       overwrite and NO insert, and the draft on disk SURVIVES. Two-sided: a
+//       genuine absence, and a successful read, still authorize the ordinary paths
+//       (a guard that refused everything would satisfy the first half alone).
+//   D7  emptiness counts Cc/Bcc and the uncommitted recipient text; a LOADED row
+//       cleared to nothing PROMPTS instead of vanishing; dismiss happens only
+//       AFTER the delete has landed.
+//   D8  a persisted draft binds ONLY to the account that owns the row; an
+//       unresolvable owner binds NOTHING.
+//
+// `ComposeView` is a SwiftUI value with `@State`/`@Environment` storage and cannot
+// be instantiated headlessly, so each test drives the PRODUCTION decision seam
+// (`ComposeDraftGuards`) and then performs the real database / filesystem effect
+// that the production call site performs for that decision. The dispatch is the
+// only test-local part; every predicate under test is the shipping one.
+@Suite("Compose draft fail-closed guards", .serialized, .processGlobalState)
+@MainActor
+struct ComposeDraftGuardTests {
+
+    private struct SuspendedReadFailure: Error {}
+    private struct BusyWriterFailure: Error {}
+
+    private func emptyDraft(id: String = "draft-fc", accountId: String = "acc1", epoch: String = "E1") -> Draft {
+        var value = Draft(
+            id: id, accountId: accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "", body: "", replyToId: nil, isForward: false,
+            editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+            serverDraftId: nil, serverPushStatus: nil,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        value.instanceEpoch = epoch
+        return value
+    }
+
+    // MARK: D6 — a thrown read is not absence
+
+    @Test("A thrown draft read authorizes no delete, no overwrite and no insert")
+    func thrownReadAuthorizesNoMutation() {
+        let thrown: Result<Draft?, Error> = .failure(SuspendedReadFailure())
+        let state = ComposeDraftGuards.readState(thrown)
+        #expect(state == .error)
+        // Save-merge and discard-delete authority are both REFUSED. Without this,
+        // the save path rebuilt its merge base from a read that never saw the row
+        // (clobbering stored edit history and server linkage) and the discard path
+        // deleted locally without the remote cleanup the row's identity funds.
+        #expect(!ComposeDraftGuards.saveMayMutate(readState: state))
+        #expect(!ComposeDraftGuards.discardMayDelete(readState: state))
+        // …and NO combination of content/changes turns the close into a mutation.
+        for hasContent in [true, false] {
+            for hasChanges in [true, false] {
+                #expect(ComposeDraftGuards.closeAction(
+                    readState: state, hasContent: hasContent, hasChanges: hasChanges) == .dismiss)
+            }
+        }
+        // The sticky firewall: a later SUCCESSFUL per-op read does not reopen it.
+        #expect(ComposeDraftGuards.effectiveMutationState(
+            initialLoad: state, perOp: .loaded) == .error)
+    }
+
+    @Test("A draft whose read threw survives the close that would otherwise have deleted it")
+    func thrownReadLeavesDraftOnDisk() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let row = emptyDraft()
+        try db.write { try row.insert($0) }
+
+        // The compose emptied to nothing (the exact shape that authorizes a delete)
+        // but the initial read THREW, so the compose never saw the row.
+        let state = ComposeDraftGuards.readState(
+            Result<Draft?, Error>.failure(SuspendedReadFailure()))
+        let action = ComposeDraftGuards.closeAction(
+            readState: state, hasContent: false, hasChanges: true)
+        // Perform exactly what the production close does for each decision.
+        switch action {
+        case .deleteThenDismiss, .promptDelete:
+            try db.write {
+                try DraftStore.applyDelete(id: row.id, expectedInstanceEpoch: "E1", db: $0)
+            }
+        case .promptSave, .dismiss:
+            break
+        }
+        #expect(try db.read { try Draft.fetchOne($0, key: row.id) } != nil)
+    }
+
+    @Test("A genuine absence and a successful read still authorize the ordinary compose paths")
+    func nonVacuousPositiveLeg() throws {
+        // NON-VACUITY for the test above: the guards do not simply refuse everything.
+        let absent = ComposeDraftGuards.readState(Result<Draft?, Error>.success(nil))
+        #expect(absent == .notFound)
+        #expect(ComposeDraftGuards.saveMayMutate(readState: absent))
+        #expect(ComposeDraftGuards.discardMayDelete(readState: absent))
+        #expect(ComposeDraftGuards.closeAction(
+            readState: absent, hasContent: false, hasChanges: true) == .deleteThenDismiss)
+
+        let present = ComposeDraftGuards.readState(Result<Draft?, Error>.success(emptyDraft()))
+        #expect(present == .loaded)
+        #expect(ComposeDraftGuards.saveMayMutate(readState: present))
+        #expect(ComposeDraftGuards.discardMayDelete(readState: present))
+        #expect(ComposeDraftGuards.closeAction(
+            readState: present, hasContent: true, hasChanges: true) == .promptSave)
+
+        // …and the CONFIRMED delete of a cleared loaded row really removes it.
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let row = emptyDraft()
+        try db.write { try row.insert($0) }
+        #expect(ComposeDraftGuards.closeAction(
+            readState: present, hasContent: false, hasChanges: true) == .promptDelete)
+        try db.write {
+            try DraftStore.applyDelete(id: row.id, expectedInstanceEpoch: "E1", db: $0)
+        }
+        #expect(try db.read { try Draft.fetchOne($0, key: row.id) } == nil)
+    }
+
+    // MARK: D7 — emptiness, the cleared-row prompt, and delete-before-dismiss
+
+    @Test("A draft holding only Cc, Bcc or half-typed recipients is not empty")
+    func recipientsOnlyDraftIsNotEmpty() {
+        func empty(
+            to: [String] = [], cc: [String] = [], bcc: [String] = [],
+            toInput: String = "", ccInput: String = "", bccInput: String = ""
+        ) -> Bool {
+            !ComposeDraftGuards.hasContent(
+                subject: "", body: "", to: to, cc: cc, bcc: bcc,
+                toInput: toInput, ccInput: ccInput, bccInput: bccInput,
+                hasAttachments: false)
+        }
+        // Each of these was read as EMPTY by the superseded inline test (which
+        // looked at subject/body/To/attachments only) and therefore routed to a
+        // silent delete on close.
+        #expect(!empty(cc: ["cc@example.com"]))
+        #expect(!empty(bcc: ["bcc@example.com"]))
+        #expect(!empty(toInput: "half-typed@example.com"))
+        #expect(!empty(ccInput: "half-typed@example.com"))
+        #expect(!empty(bccInput: "half-typed@example.com"))
+        // NEGATIVE leg: a genuinely empty compose is still empty, so the guard has
+        // not simply been made to answer "not empty" for everything.
+        #expect(empty())
+        #expect(empty(toInput: "   ", ccInput: "\t", bccInput: " "))
+
+        // The close CONSEQUENCE: a loaded Cc-only draft never routes to a delete.
+        let ccOnly = ComposeDraftGuards.hasContent(
+            subject: "", body: "", to: [], cc: ["cc@example.com"], bcc: [],
+            toInput: "", ccInput: "", bccInput: "", hasAttachments: false)
+        let action = ComposeDraftGuards.closeAction(
+            readState: .loaded, hasContent: ccOnly, hasChanges: true)
+        #expect(action == .promptSave)
+        #expect(action != .promptDelete)
+        #expect(action != .deleteThenDismiss)
+    }
+
+    @Test("An uncommitted recipient is flushed into the tokens close and save persist")
+    func pendingRecipientIsCommitted() {
+        #expect(ComposeDraftGuards.committedRecipients(
+            tokens: [], input: "  late@example.com  ") == ["late@example.com"])
+        #expect(ComposeDraftGuards.committedRecipients(
+            tokens: ["first@example.com"], input: "second@example.com")
+            == ["first@example.com", "second@example.com"])
+        // Whitespace-only input must not add a bogus recipient.
+        #expect(ComposeDraftGuards.committedRecipients(
+            tokens: ["first@example.com"], input: "   ") == ["first@example.com"])
+    }
+
+    @Test("A loaded draft cleared to nothing prompts instead of silently vanishing")
+    func clearedLoadedRowPrompts() {
+        // The load-bearing distinction: an EXISTING row the user emptied must ask
+        // first; a brand-new/absent one is delete-eligible without a prompt.
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .loaded, hasContent: false, hasChanges: true) == .promptDelete)
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .loaded, hasContent: false, hasChanges: false) == .promptDelete)
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .notFound, hasContent: false, hasChanges: true) == .deleteThenDismiss)
+        #expect(ComposeDraftGuards.closeAction(
+            readState: .notFound, hasContent: false, hasChanges: false) == .deleteThenDismiss)
+    }
+
+    @Test("A cleared loaded draft still exists while its confirmation prompt is on screen")
+    func clearedRowSurvivesUntilConfirmed() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let row = emptyDraft()
+        try db.write { try row.insert($0) }
+        // Reaching the decision must have NO durable effect of its own.
+        let action = ComposeDraftGuards.closeAction(
+            readState: .loaded, hasContent: false, hasChanges: true)
+        #expect(action == .promptDelete)
+        #expect(try db.read { try Draft.fetchOne($0, key: row.id) } != nil)
+    }
+
+    @Test("A failed local delete keeps the compose open instead of dismissing")
+    func failedDeleteDoesNotDismiss() async {
+        var dismissed = false
+        var surfaced: Error?
+        await ComposeDraftGuards.runCheckedLocalDeleteThenDismiss(
+            delete: { throw BusyWriterFailure() },
+            dismiss: { dismissed = true },
+            onDeleteFailure: { surfaced = $0 })
+        #expect(!dismissed)
+        guard let surfaced else {
+            Issue.record("expected the failed delete to surface an error")
+            return
+        }
+        #expect(surfaced is BusyWriterFailure)
+    }
+
+    @Test("Dismiss runs only after the delete has landed durably")
+    func dismissRunsAfterTheDeleteLands() async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        let row = emptyDraft()
+        try await db.write { try row.insert($0) }
+
+        var rowStillPresentAtDismiss: Bool?
+        var dismissed = false
+        await ComposeDraftGuards.runCheckedLocalDeleteThenDismiss(
+            delete: {
+                try db.write {
+                    try DraftStore.applyDelete(
+                        id: row.id, expectedInstanceEpoch: "E1", db: $0)
+                }
+            },
+            dismiss: {
+                // ORDER, not just outcome: at the instant the UI acknowledges, the
+                // durable delete must already have committed.
+                rowStillPresentAtDismiss =
+                    ((try? db.read { try Draft.fetchOne($0, key: row.id) }) ?? nil) != nil
+                dismissed = true
+            },
+            onDeleteFailure: { _ in })
+        #expect(dismissed)
+        #expect(rowStillPresentAtDismiss == false)
+        #expect(try await db.read { try Draft.fetchOne($0, key: row.id) } == nil)
+    }
+
+    // MARK: D8 — fail-closed account binding
+
+    @Test("A persisted draft whose owning account is unresolvable binds nothing")
+    func unresolvableOwnerBindsNothing() throws {
+        let db = try TestDatabase.make()
+        // A DIFFERENT account exists — the exact fallback the removed
+        // `navigationStore.accounts.first` / `resolvedAccount` chain would have
+        // bound the draft to.
+        try TestDatabase.insertAccount(db, id: "other-acct", email: "other@example.com")
+        let orphan = emptyDraft(id: "draft-orphan", accountId: "missing-acct")
+
+        // Resolution is exactly what the presenter performs.
+        let resolved = try db.read { try Account.fetchOne($0, key: orphan.accountId) }
+        #expect(resolved == nil)
+        #expect(!ComposeDraftGuards.mayBindPersistedDraft(
+            draftAccountId: orphan.accountId, resolvedAccountId: resolved?.id))
+
+        // Non-vacuity of the hazard: a wrong account WAS available to bind to, and
+        // it is not the row's owner — so the refusal is doing real work.
+        let fallbackCandidates = try db.read { try Account.fetchAll($0) }
+        #expect(fallbackCandidates.count == 1)
+        guard fallbackCandidates.count == 1 else { return }
+        #expect(fallbackCandidates[0].id != orphan.accountId)
+        #expect(!ComposeDraftGuards.mayBindPersistedDraft(
+            draftAccountId: orphan.accountId, resolvedAccountId: fallbackCandidates[0].id))
+    }
+
+    @Test("A persisted draft whose owning account resolves opens bound to that exact account")
+    func resolvableOwnerBindsNormally() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "owner-acct", email: "owner@example.com")
+        try TestDatabase.insertAccount(db, id: "other-acct", email: "other@example.com")
+        let owned = emptyDraft(id: "draft-owned", accountId: "owner-acct")
+
+        let resolved = try db.read { try Account.fetchOne($0, key: owned.accountId) }
+        #expect(resolved?.id == "owner-acct")
+        #expect(ComposeDraftGuards.mayBindPersistedDraft(
+            draftAccountId: owned.accountId, resolvedAccountId: resolved?.id))
+        // …and the sibling account is still refused, so the predicate is an
+        // equality on the OWNER, not a non-nil check.
+        #expect(!ComposeDraftGuards.mayBindPersistedDraft(
+            draftAccountId: owned.accountId, resolvedAccountId: "other-acct"))
+    }
+}

@@ -273,9 +273,14 @@ extension AccountManager {
                     // Clear "Reply" action tag — user already committed to replying.
                     // PendingOperation(.setTag) for server sync stays in finalizeOutboxMessage.
                     if original.actionTag == .reply {
+                        // Raw SQL (not `MessageHeader.setActionTag`) because this
+                        // path deliberately updates by id without materialising the
+                        // row — so it stamps `actionTagSetAt` explicitly to keep
+                        // `actionTag != nil ⇒ actionTagSetAt != nil`. `ActionTag.none`
+                        // here is the real tag VALUE "none", not Optional.none.
                         try db.execute(
-                            sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
-                            arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, original.id]
+                            sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ?, actionTagSetAt = ? WHERE id = ?",
+                            arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, Date(), original.id]
                         )
                     }
                 }
@@ -434,14 +439,53 @@ extension AccountManager {
                 guard let fetched = try OutboxMessage.fetchOne(db, key: msg.id) else {
                     return nil // vanished (discarded)
                 }
+                // D12: `sentAt` is THE double-send firewall (Outbox Reliability
+                // Rule 3). It is stamped only after `provider.send()` returned
+                // SUCCESS (`sendSingleOutboxMessage`), so a row carrying it has
+                // already left the server — claiming it would transmit the
+                // user's email a second time. Refuse it under EVERY status, and
+                // check that BEFORE the status guard so no future status
+                // transition can reopen the hole.
+                //
+                // This strands nothing: rows with `sentAt` belong exclusively to
+                // Sent-append / finalization recovery, which selects on
+                // `sentAt != nil AND appendedToSent == false` with NO status
+                // predicate (`drainPendingSentAppends`) and runs as phase 1 of
+                // every drain — before this send phase.
+                guard fetched.sentAt == nil else {
+                    print("[Outbox] Refusing to claim \(fetched.id) — sentAt is already stamped (double-send firewall); Sent-append/finalization recovery owns this row")
+                    return nil
+                }
                 guard fetched.outboxStatus == .queued else {
                     return nil // already claimed
                 }
+                // F0a: re-check the undo-hold window IN-TXN. drainOutbox's
+                // non-atomic Swift pre-filter (`($0.holdUntil ?? .distantPast)
+                // <= Date()`) already skips future-hold rows, but a bypassed or
+                // racing caller must never claim a row before its hold elapses —
+                // the claim (status→.sending) is the irreversible start of send.
+                guard (fetched.holdUntil ?? .distantPast) <= Date() else {
+                    return nil // hold window not yet elapsed
+                }
                 let messageId = fetched.sentMessageId ?? AccountManager.generateMessageId(senderEmail: senderEmail ?? "user@tabmail.local")
+                // D12: the claim write is itself a compare-and-swap carrying the
+                // same two admission conditions (`status = 'queued'` AND
+                // `sentAt IS NULL`), and must transition EXACTLY one row. The
+                // firewall therefore travels with the UPDATE and cannot be
+                // bypassed by a later refactor that moves the re-read out of
+                // this transaction. A 0-row CAS fails CLOSED — no claim, the row
+                // stays `.queued` for the next drain — never a send.
                 try db.execute(
-                    sql: "UPDATE outboxMessage SET status = ?, sentMessageId = ? WHERE id = ?",
-                    arguments: [OutboxStatus.sending.rawValue, messageId, fetched.id]
+                    sql: """
+                        UPDATE outboxMessage SET status = ?, sentMessageId = ?
+                        WHERE id = ? AND status = ? AND sentAt IS NULL
+                        """,
+                    arguments: [OutboxStatus.sending.rawValue, messageId, fetched.id, OutboxStatus.queued.rawValue]
                 )
+                guard db.changesCount == 1 else {
+                    print("[Outbox] CRITICAL: claim CAS did not transition exactly one row for \(fetched.id) — NOT sending; row left for the next drain")
+                    return nil
+                }
                 return (fetched, messageId)
             }
         } catch {
@@ -946,8 +990,10 @@ extension AccountManager {
                     accountId: original.accountId,
                     folderPath: original.folderPath).insert(db)
                 if original.actionTag == .reply {
-                    original.actionTag = ActionTag.none
-                    original.tagSortOrder = ActionTag.none.sortOrder
+                    // `ActionTag.none` is the real tag VALUE "none", not
+                    // Optional.none — so this STAMPS `actionTagSetAt`, it does
+                    // not clear it.
+                    original.setActionTag(ActionTag.none)
                     try PendingOperation(
                         type: .setTag,
                         messageIds: [original.stableId],
@@ -1280,16 +1326,54 @@ extension AccountManager {
         }
     }
 
-    /// Retry a failed outbox message. Resets status to queued and clears retryCount
-    /// so the message gets a fresh set of automatic retries. Returns true if reset succeeded.
+    /// Retry a failed outbox message: reset it to `.queued` and clear
+    /// `retryCount` so it gets a fresh set of automatic retries. Returns true
+    /// only when the reset ACTUALLY landed on exactly one row.
+    ///
+    /// D1 — the UPDATE is a compare-and-swap on `status = 'failed' AND sentAt IS
+    /// NULL`, not a blind write keyed on id alone. Without the predicate the
+    /// only gate was the SwiftUI row snapshot in `OutboxView` (`== .failed`),
+    /// which `NavigationStore`'s 100 ms refresh debounce leaves visible after a
+    /// first Retry already queued the row and the drain claimed it `.sending` —
+    /// so a second activation off that stale snapshot reset a LIVE send back to
+    /// `.queued`. `sentAt IS NULL` is equally load-bearing: `sentAt` set means
+    /// the provider send already succeeded, so the row belongs exclusively to
+    /// Sent-append/finalization recovery and must never re-enter the send phase
+    /// (it is the double-send firewall marker — same reason
+    /// `discardOutboxMessageConfirmed` refuses on it).
+    ///
+    /// This does NOT narrow the user's intention: a manual Retry of any unsent
+    /// `.failed` row is still admitted, which is the whole protected flow. A row
+    /// already `.queued`/`.sending` is *already carrying* the requested retry,
+    /// so refusing a second activation drops nothing. Automatic retries never
+    /// come through here (the send-failure path writes `.queued`/`.failed`
+    /// directly, and reconciliation handles `.sending` rows itself).
+    ///
+    /// Side effects are gated on the committed change, mirroring
+    /// `discardOutboxMessageConfirmed`: a refused retry must not signal success
+    /// and must not kick a drain.
     @discardableResult
     nonisolated func retryOutboxMessage(_ messageId: String) -> Bool {
         do {
-            try AppDatabase.dbPool.write { db in
+            let admitted: Bool = try AppDatabase.dbPool.write { db in
                 try db.execute(
-                    sql: "UPDATE outboxMessage SET status = ?, errorMessage = NULL, retryCount = 0 WHERE id = ?",
-                    arguments: [OutboxStatus.queued.rawValue, messageId]
+                    sql: """
+                        UPDATE outboxMessage SET status = ?, errorMessage = NULL, retryCount = 0
+                        WHERE id = ? AND status = ? AND sentAt IS NULL
+                        """,
+                    arguments: [
+                        OutboxStatus.queued.rawValue,
+                        messageId,
+                        OutboxStatus.failed.rawValue,
+                    ]
                 )
+                return db.changesCount == 1
+            }
+            guard admitted else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Outbox] Cannot retry \(messageId) — absent, not failed, or already sent")
+                }
+                return false
             }
             NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
             Task { await self.drainOutbox() }

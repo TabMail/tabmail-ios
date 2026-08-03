@@ -661,6 +661,18 @@ actor DraftStore {
                 // Strategy 1: lookup by GRDB PK (replyToId).
                 // Strategy 2: if PK stale (IMAP MOVE), extract stableId from draft key
                 //             and search by rfc822MessageId.
+                //
+                // T5.8 — THE REPLY-TARGET IDENTITY GUARD DELIBERATELY DOES NOT RUN HERE,
+                // and must never be "completed" by adding it. `Draft.acceptsReplyTargetHit`
+                // exists to stop an impostor row AUTHORIZING something (a quote, an
+                // attribution, a carried-forward attachment). This lookup authorizes
+                // nothing: it decides only whether to KEEP the draft alive. Its safe
+                // direction is therefore the opposite one — a permissive hit costs at
+                // most one retained row, while a REFUSAL makes an authored draft
+                // eligible for eviction, i.e. it DELETES the user's own bytes on the
+                // strength of an identity doubt. Same predicate, inverted consumer
+                // direction; porting it across would turn a leak guard into a data-loss
+                // mechanism.
                 if let replyToId = draft.replyToId {
                     if let header = try MessageHeader.fetchOne(db, key: replyToId), header.isInInbox {
                         continue

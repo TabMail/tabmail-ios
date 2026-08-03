@@ -152,13 +152,30 @@ struct PostSendServerDraftCleanupTests {
         }
     }
 
+    /// Registers the provider on the shared `AccountManager` and cleans up.
+    ///
+    /// The unregister MUST be awaited on BOTH exits — never `defer { Task { … } }`.
+    /// `AccountManager` is an actor, so an unstructured teardown task is merely
+    /// ENQUEUED when the helper returns, not applied. In a two-leg test, leg 2
+    /// re-registers the provider and then leg 1's stale unregister finally runs at
+    /// leg 2's very first `await`, removing the provider mid-operation. The code
+    /// under test then silently early-returns at its provider guard, whose only
+    /// witness is a `DebugModeManager.isLoggingEnabled()`-gated print (false under
+    /// test), so the leg reads as "the cleanup did nothing" when it never started.
+    /// Awaiting both exits makes the teardown a contract: when this returns, the
+    /// registry is settled and no queued job from it can land inside a later leg.
     @MainActor
     private static func withRegisteredProvider(
         accountId: String, provider: any EmailProvider, _ body: () async throws -> Void
     ) async rethrows {
         await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) } }
-        try await body()
+        do {
+            try await body()
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
     }
 
     /// Drain until the queue is EMPTY *and* no drain is in flight, or the bound is

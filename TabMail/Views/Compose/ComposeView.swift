@@ -9,9 +9,22 @@ import PhotosUI
 import TipKit
 import UniformTypeIdentifiers
 
-/// PORT — the v2final sticky initial-read firewall, reduced to the decisions
-/// exercised by this forward-port.
+/// PORT — the v2final `ComposeDraftGuards` fail-closed family
+/// (`v2final:TabMail/Views/Compose/ComposeView.swift`), carrying the decisions
+/// this forward-port's compose load / save / send / close paths exercise.
+///
+/// Pure, testable decision seams: deliberately free of any SwiftUI or DB
+/// dependency so the reopen / save / send / close fail-closed invariants can be
+/// pinned without the live compose UI (Testing Rule 12).
 enum ComposeDraftGuards {
+    /// PORT — `v2final:ComposeDraftGuards.ReadState`.
+    ///
+    /// Outcome of a `Draft.fetchOne` on a compose path. A THROWN read (DB
+    /// suspended on foreground / lock contention) is `.error` — categorically
+    /// distinct from a genuine `.notFound` (nil) — and blocks EVERY mutation (no
+    /// delete, no overwrite, no insert): the real draft merely failed to load and
+    /// must never be deleted or clobbered because of it. **A thrown read is NOT
+    /// absence.**
     enum ReadState: Equatable { case loaded, notFound, error }
 
     static func readState(_ result: Result<Draft?, Error>) -> ReadState {
@@ -21,8 +34,181 @@ enum ComposeDraftGuards {
         }
     }
 
+    /// PORT — `v2final:ComposeDraftGuards.effectiveMutationState`. The STICKY
+    /// firewall: a failed INITIAL load (the compose never saw the existing draft)
+    /// blocks every later mutation regardless of a later successful per-op read.
     static func effectiveMutationState(initialLoad: ReadState, perOp: ReadState) -> ReadState {
         initialLoad == .error || perOp == .error ? .error : perOp
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.hasContent`.
+    ///
+    /// Whether the compose holds ANY user content. Counts Cc/Bcc (not just To)
+    /// AND the uncommitted in-progress recipient inputs, so a bodyless draft whose
+    /// only content is a Cc address, a Bcc address, or a half-typed recipient is
+    /// NOT read as empty and silently deleted on close.
+    static func hasContent(
+        subject: String, body: String,
+        to: [String], cc: [String], bcc: [String],
+        toInput: String, ccInput: String, bccInput: String,
+        hasAttachments: Bool
+    ) -> Bool {
+        if !subject.isEmpty || !body.isEmpty || hasAttachments { return true }
+        return !to.isEmpty || !cc.isEmpty || !bcc.isEmpty
+            || !toInput.trimmingCharacters(in: .whitespaces).isEmpty
+            || !ccInput.trimmingCharacters(in: .whitespaces).isEmpty
+            || !bccInput.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.CloseAction`.
+    enum CloseAction: Equatable {
+        case promptSave        // unsaved changes → Save/Discard/Cancel prompt
+        case dismiss           // nothing to persist / read-error → dismiss, no mutation
+        case deleteThenDismiss // brand-new / absent empty draft → safe to delete on close
+        case promptDelete      // loaded EXISTING draft cleared to nothing → confirm before delete
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.closeAction`.
+    static func closeAction(readState: ReadState, hasContent: Bool, hasChanges: Bool) -> CloseAction {
+        // .error blocks EVERY mutation — never delete/overwrite a draft that
+        // merely failed to load. Dismiss, leaving the row intact.
+        if readState == .error { return .dismiss }
+        if hasContent && hasChanges { return .promptSave }
+        if !hasContent {
+            // Emptied to nothing: a LOADED existing row must PROMPT before delete
+            // (never silently vanish a "clear everything" edit); a genuinely
+            // absent / new draft is delete-eligible.
+            return readState == .loaded ? .promptDelete : .deleteThenDismiss
+        }
+        return .dismiss // hasContent && !hasChanges
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.saveMayMutate`.
+    ///
+    /// Save-path preflight. `false` = FAIL CLOSED: a thrown read means the current
+    /// on-disk state is unknown, so perform NO attachment-dir mutation and NO
+    /// save-merge (which would clobber stored edit history / server linkage with a
+    /// snapshot built from a read that never saw them). A genuine nil (absent) or a
+    /// successful read may proceed — so an ordinary save the user asked for is
+    /// never blocked by this guard.
+    static func saveMayMutate(readState: ReadState) -> Bool {
+        readState != .error
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.discardMayDelete`.
+    ///
+    /// Whether the discard path may delete the local draft. A THROWN metadata read
+    /// means we cannot recover the server-draft identity for the remote cleanup;
+    /// deleting locally anyway would leave the server copy to RE-SYNC and reappear.
+    /// So on `.error` DEFER the discard (do not delete); a genuine nil / loaded row
+    /// may proceed.
+    static func discardMayDelete(readState: ReadState) -> Bool {
+        readState != .error
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.committedRecipients`.
+    ///
+    /// Commit a pending (uncommitted) recipient input into its token array — the
+    /// same "flush the in-progress text" transform `send()` applies inline — so
+    /// close / save also SEE and PERSIST an in-progress recipient instead of
+    /// dropping it. Empty / whitespace-only input leaves the tokens unchanged.
+    static func committedRecipients(tokens: [String], input: String) -> [String] {
+        let trimmed = input.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? tokens : tokens + [trimmed]
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.runCheckedLocalDeleteThenDismiss` (R5).
+    ///
+    /// The CHECKED "local delete then dismiss" contract shared by every draft-close
+    /// delete path. The local delete is CHECKED — `dismiss` runs ONLY when the
+    /// delete SUCCEEDS. On a THROWN delete (DB busy / suspended) `onDeleteFailure`
+    /// surfaces the error and the compose is KEPT OPEN: never dismiss-and-lose a
+    /// draft that merely failed to delete locally.
+    @MainActor
+    static func runCheckedLocalDeleteThenDismiss(
+        delete: () async throws -> Void,
+        dismiss: () -> Void,
+        onDeleteFailure: (Error) -> Void
+    ) async {
+        do {
+            try await delete()
+            dismiss()
+        } catch {
+            onDeleteFailure(error)
+        }
+    }
+
+    /// PORT — `v2final:ServerDraftOpen.mayBindPersistedDraft` (commits `a8eb813b5`,
+    /// `69a9bae88`), relocated here because this forward-port has no
+    /// `ServerDraftOpen` enum.
+    ///
+    /// A successfully loaded persisted `Draft` may bind ONLY to the exact account
+    /// that owns that row. There is no accounts-first, reply-derived or
+    /// caller-snapshot fallback: binding a draft to a foreign account would send
+    /// from the wrong address and queue the server draft into the wrong mailbox.
+    static func mayBindPersistedDraft(draftAccountId: String, resolvedAccountId: String?) -> Bool {
+        resolvedAccountId == draftAccountId
+    }
+
+    /// PORT — `v2final:ComposeDraftGuards.outboundQuoteBody(confirmedBodyHTML:capturedSnippet:)`
+    /// (its C-FIX-1).
+    ///
+    /// The OUTBOUND quote body for a reply/forward. ONLY a positively
+    /// identity-confirmed body (from `Draft.resolveReplyQuote`) may populate it.
+    /// When there is no confirmed body the quote is OMITTED — the captured
+    /// `MessageHeader.snippet` must NEVER enter the outbound message, because it is
+    /// a *cached preview of whatever row the PK pointed at* and so bypasses the
+    /// impostor guard entirely. The snippet is accepted as a parameter precisely to
+    /// make its NON-use explicit and testable rather than invisible.
+    static func outboundQuoteBody(confirmedBodyHTML: String?, capturedSnippet: String) -> String? {
+        confirmedBodyHTML
+    }
+
+    /// ⚑ NO REFERENCE — INVENTED **shape**; the BEHAVIOUR is a PORT of
+    /// `v2final:ComposeView.saveDraftAndDismiss`'s post-commit `switch saveResult`
+    /// (F0d), which consumed `v2final:DraftStore.SaveResult.applied(previousDir:)`.
+    ///
+    /// This forward-port's `DraftStore.SaveResult` is a bare `.applied` /
+    /// `.notApplied` and `DraftStore` is outside this change's scope, so the
+    /// superseded directory is carried by the CALLER (read fail-closed from the row
+    /// before the save) instead of being returned from inside the write
+    /// transaction, and the disposition is decided by this pure function.
+    ///
+    /// The invariant is identical to the reference's: files are destroyed ONLY
+    /// after the database has durably committed, and the directory destroyed is
+    /// never the one the durable row now points at.
+    enum AttachmentDisposition: Equatable {
+        /// The save COMMITTED and the row now points at the staging dir (or at nil
+        /// for a drop-all). The SUPERSEDED dir may be destroyed. Never emitted when
+        /// it equals the dir the row adopted.
+        case deleteSuperseded(dirName: String)
+        /// The save did NOT adopt our snapshot (a newer snapshot won, or the write
+        /// threw/rolled back). Destroy ONLY our own orphaned staging dir — NEVER
+        /// the live dir, which the winner is still using.
+        case deleteStaging(dirName: String)
+        /// Nothing to destroy. Deliberately NOT spelled `none`: a bare `.none` in a
+        /// `switch` over this type is ambiguous with `Optional.none` (a repeat trap
+        /// in this codebase).
+        case noCleanup
+    }
+
+    /// The post-save attachment-directory disposition. `stagingDir` is the fresh
+    /// copy-on-write dir this save wrote (nil when the save carries no
+    /// attachments); `previousDir` is the dir the row held BEFORE the save.
+    static func attachmentDisposition(
+        saveApplied: Bool, stagingDir: String?, previousDir: String?
+    ) -> AttachmentDisposition {
+        guard saveApplied else {
+            // Not adopted: our staging dir is an orphan; the live dir is untouched.
+            guard let stagingDir else { return .noCleanup }
+            return .deleteStaging(dirName: stagingDir)
+        }
+        // Committed: the row now points at `stagingDir` (or nil). Anything the row
+        // held before is superseded — unless it IS what the row now points at,
+        // which `newStagingDirName()`'s fresh UUID makes impossible but which is
+        // checked anyway so this can never destroy the live dir.
+        guard let previousDir, previousDir != stagingDir else { return .noCleanup }
+        return .deleteSuperseded(dirName: previousDir)
     }
 }
 
@@ -40,6 +226,11 @@ struct ComposeView: View {
         let authoredBody: String
         let attachments: [DraftAttachment]
         let replyToHeaderId: String?
+        /// T5.8 — the reply target's PROVIDER id and observed UIDVALIDITY, captured
+        /// in the SAME MainActor turn as `replyToHeaderId` so the durable address
+        /// stamp can never describe a different message than the PK beside it.
+        let replyToProviderMessageId: String?
+        let replyToUidValidity: Int?
         let isForward: Bool
         let outbound: DraftMessage
     }
@@ -103,6 +294,11 @@ struct ComposeView: View {
     /// keeps the editor at opacity 0 indefinitely). Logging only.
     @State private var stuckFadeWatchTask: Task<Void, Never>?
     @State private var showDiscardPrompt = false
+    /// PORT — v2final `ComposeView.showClearedDraftDeletePrompt` (N2), the
+    /// confirmation for `ComposeDraftGuards.CloseAction.promptDelete`: a LOADED
+    /// existing draft the user emptied to nothing. Closing must never make that row
+    /// silently vanish — the user is asked first.
+    @State private var showClearedDraftDeletePrompt = false
     @State private var showEmptyBodyPrompt = false
     @State private var isSavingDraft = false
     @State private var loadedDraft = false
@@ -597,6 +793,11 @@ struct ComposeView: View {
                         composeContext: buildComposeEditContext(),
                         draftId: draftId,
                         draftReplyToId: replyTo?.id,
+                        // T5.8 — the reply target's ADDRESS travels with its PK, from
+                        // the SAME header, so a Draft row first created by the agent's
+                        // auto-save is stamped exactly like one created by Save/Send.
+                        draftReplyToProviderMessageId: replyTo?.messageId,
+                        draftReplyToUidValidity: replyTo?.observedUidValidity,
                         composeGenerationCursor: admissionCursor,
                         composeAgentSendFence: agentSendFence,
                         composeMutationAllowed: draftReadState != .error,
@@ -668,56 +869,15 @@ struct ComposeView: View {
             .background(Palette.previewPaneBg)
             .toolbar(.hidden, for: .navigationBar)
             .animation(.spring(response: 0.45, dampingFraction: 0.82), value: chatExpanded)
-            .onChange(of: chatExpanded) { _, expanded in
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] chatExpanded -> \(expanded) instance=\(instanceToken) draftId=\(draftId)")
-                }
-                if expanded {
-                    bodyFocused = false
-                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                }
-            }
+            .onChange(of: chatExpanded) { _, expanded in handleChatExpandedChange(expanded) }
             // Pulse driver — hoisted off the editor so it runs while the bubble is up too.
-            .onChange(of: aiWorking) { _, working in
-                if working {
-                    withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                        bodyBlink = true
-                    }
-                } else {
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        bodyBlink = false
-                    }
-                }
-            }
-            .onChange(of: isSavingDraft) { _, saving in
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] isSavingDraft -> \(saving) instance=\(instanceToken) draftId=\(draftId)")
-                }
-            }
+            .onChange(of: aiWorking) { _, working in handleAIWorkingChange(working) }
+            .onChange(of: isSavingDraft) { _, saving in handleSavingDraftChange(saving) }
             // Stuck-fade detector: `isApplyingEdit` is the black-screen suspect —
             // it drives the editor's opacity to 0 during applyInlineEdit's fade-out
             // and should flip back to false ~0.65s later. If it doesn't, the editor
             // stays invisible forever. Logging only — never force-resets state.
-            .onChange(of: isApplyingEdit) { _, applying in
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] isApplyingEdit -> \(applying) instance=\(instanceToken) draftId=\(draftId) chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft)")
-                }
-                stuckFadeWatchTask?.cancel()
-                stuckFadeWatchTask = nil
-                guard applying else { return }
-                stuckFadeWatchTask = Task { @MainActor in
-                    var elapsedSeconds = 0
-                    while !Task.isCancelled {
-                        try? await Task.sleep(for: .seconds(3))
-                        if Task.isCancelled { return }
-                        elapsedSeconds += 3
-                        guard isApplyingEdit else { return }
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[ComposeView] ⚠ STUCK FADE: isApplyingEdit still true after \(elapsedSeconds)s — editor invisible; chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft) instance=\(instanceToken) draftId=\(draftId)")
-                        }
-                    }
-                }
-            }
+            .onChange(of: isApplyingEdit) { _, applying in handleApplyingEditChange(applying) }
             .overlay {
                 if isSavingDraft {
                     Color.black.opacity(0.7)
@@ -750,6 +910,15 @@ struct ComposeView: View {
             } message: {
                 Text("You have unsaved changes. Save as draft?")
             }
+            // PORT — v2final `ComposeView.showClearedDraftDeletePrompt` (N2). A
+            // LOADED existing draft emptied to nothing: CONFIRM before deleting.
+            // Cancel leaves the compose open and the row intact.
+            .alert("Delete Draft?", isPresented: $showClearedDraftDeletePrompt) {
+                Button("Delete", role: .destructive) { Task { await deleteClearedDraftAndDismiss() } }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("This draft is now empty. Delete it?")
+            }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
                 if showingSuggestion, currentSuggestion != nil {
                     Button("Use Suggestion & Send") {
@@ -767,87 +936,16 @@ struct ComposeView: View {
                     Text("The message body is empty. Send anyway?")
                 }
             }
-            .onAppear {
-                // Use prefillDraftId if provided (reopening an existing draft).
-                if let prefillDraftId {
-                    draftId = prefillDraftId
-                } else if let reply = replyTo {
-                    // Compute deterministic draftKey for reply/forward (new compose keeps UUID).
-                    // Uses stableId (rfc822MessageId for IMAP, messageId for Gmail/Exchange)
-                    // so the draft key survives IMAP folder moves.
-                    let stableKey = "\(reply.accountId):\(reply.stableId)"
-                    draftId = Draft.draftKey(replyTo: stableKey, isForward: isForward, newId: nil)
-                }
-                // PORT — mark this compose OPEN so background maintenance (draft
-                // eviction, orphan compose-session cleanup) never deletes it or its
-                // authored chat turns while it is on screen. Refcounted; balanced by
-                // the `.onDisappear` unregister. Registered AFTER `draftId` is
-                // resolved above, and `draftId` is never reassigned outside this
-                // block, so the two calls always name the same id.
-                DraftSessionRegistry.shared.register(draftId)
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
-                }
-                contactSearch.requestAccess()
-                Task { await loadDraftOrPrepopulate() }
-                resolveContactNames()
-                withAnimation(.spring(response: 0.5, dampingFraction: 0.7).delay(0.15)) {
-                    pillAppeared = true
-                }
-            }
+            .onAppear { performInitialAppear() }
             // ADR-IOS-030: Track ComposeView lifecycle so AgentToolRouter's FIFO queue
             // knows when the compose UI is busy. Counts every presentation path
             // (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
-            .onAppear {
-                AgentToolRouter.shared.composePresentationDidBegin()
-                // Arm the deinit fallback with the compose-scope outcome
-                // closure. Captured by value so it stays alive even if
-                // `onAgentOutcome` is later nil'd by the view graph.
-                let outcomeAtAppear = onAgentOutcome
-                lifecycleTracker.armFallback {
-                    // Deinit runs on the thread that releases the tracker.
-                    // Dispatch to MainActor for router + closure access.
-                    Task { @MainActor in
-                        AgentToolRouter.shared.composePresentationDidEnd()
-                        outcomeAtAppear?(.cancelled)
-                    }
-                }
-            }
-            .onDisappear {
-                if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
-                }
-                // PORT — this compose closed; drop its eviction guard (refcounted, so
-                // a sibling view replying to the same message stays protected). A
-                // missed `.onDisappear` over-RETAINS, which is the safe direction, and
-                // self-heals at launch when the registry starts empty.
-                DraftSessionRegistry.shared.unregister(draftId)
-                // Normal teardown path: mark the tracker so its deinit
-                // fallback is a no-op, then fire the outcome/hooks directly
-                // (synchronous — faster than the deinit path).
-                lifecycleTracker.markDisappearedNormally()
-                AgentToolRouter.shared.composePresentationDidEnd()
-                // Default outcome for agent-initiated compose. No-op if
-                // `.sent` or `.failed(...)` already fired inside `send()` —
-                // `ComposeOutcomeState.tryResolve` guards against re-entry.
-                onAgentOutcome?(.cancelled)
-            }
+            .onAppear { performLifecycleAppear() }
+            .onDisappear { performDisappear() }
             .onChange(of: selectedAccount) {
                 currentSignature = selectedAccount?.signature ?? ""
             }
-            .onChange(of: photoPickerItems) { _, items in
-                Task {
-                    for item in items {
-                        if let data = try? await item.loadTransferable(type: Data.self) {
-                            let mimeType = item.supportedContentTypes.first?.preferredMIMEType ?? "application/octet-stream"
-                            let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "dat"
-                            let filename = "photo_\(attachments.count + 1).\(ext)"
-                            attachments.append(DraftAttachment(filename: filename, mimeType: mimeType, data: data))
-                        }
-                    }
-                    photoPickerItems = []
-                }
-            }
+            .onChange(of: photoPickerItems) { _, items in handlePhotoPickerItemsChange(items) }
             .photosPicker(isPresented: $showPhotoPicker, selection: $photoPickerItems, matching: .any(of: [.images, .videos]))
             .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
                 handleFileImport(result)
@@ -864,6 +962,158 @@ struct ComposeView: View {
                 }
             }
             .dismissKeyboardOnTap()
+        }
+    }
+
+    // MARK: - Lifecycle / onChange handlers
+    //
+    // COMPILE REPAIR (build gate): the bodies below were multi-statement closures
+    // inline in `body`'s modifier chain. Under SE-0326 a multi-statement closure is
+    // type-checked as PART OF its enclosing expression, so every statement here was
+    // spending `body`'s single solver budget. Once this file grew, that budget ran
+    // out and the compiler reported "unable to type-check this expression in
+    // reasonable time" — landing on whichever statement happened to cross the line
+    // (it migrated from `.onAppear` to `.onDisappear` as each was moved out). Calling
+    // a method takes the statements out of that constraint system. Every body below
+    // is its original text, verbatim and in order; no statement was added, removed,
+    // reordered or altered, and each is still invoked from the same modifier.
+
+    private func handleChatExpandedChange(_ expanded: Bool) {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] chatExpanded -> \(expanded) instance=\(instanceToken) draftId=\(draftId)")
+        }
+        if expanded {
+            bodyFocused = false
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        }
+    }
+
+    private func handleAIWorkingChange(_ working: Bool) {
+        if working {
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                bodyBlink = true
+            }
+        } else {
+            withAnimation(.easeInOut(duration: 0.3)) {
+                bodyBlink = false
+            }
+        }
+    }
+
+    private func handleSavingDraftChange(_ saving: Bool) {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] isSavingDraft -> \(saving) instance=\(instanceToken) draftId=\(draftId)")
+        }
+    }
+
+    private func handleApplyingEditChange(_ applying: Bool) {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] isApplyingEdit -> \(applying) instance=\(instanceToken) draftId=\(draftId) chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft)")
+        }
+        stuckFadeWatchTask?.cancel()
+        stuckFadeWatchTask = nil
+        guard applying else { return }
+        stuckFadeWatchTask = Task { @MainActor in
+            var elapsedSeconds = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                if Task.isCancelled { return }
+                elapsedSeconds += 3
+                guard isApplyingEdit else { return }
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] ⚠ STUCK FADE: isApplyingEdit still true after \(elapsedSeconds)s — editor invisible; chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft) instance=\(instanceToken) draftId=\(draftId)")
+                }
+            }
+        }
+    }
+
+    private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) {
+        Task {
+            for item in items {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    let mimeType = item.supportedContentTypes.first?.preferredMIMEType ?? "application/octet-stream"
+                    let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "dat"
+                    let filename = "photo_\(attachments.count + 1).\(ext)"
+                    attachments.append(DraftAttachment(filename: filename, mimeType: mimeType, data: data))
+                }
+            }
+            photoPickerItems = []
+        }
+    }
+
+    /// ADR-IOS-030: Track ComposeView lifecycle so AgentToolRouter's FIFO queue
+    /// knows when the compose UI is busy. Counts every presentation path
+    /// (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
+    private func performLifecycleAppear() {
+        AgentToolRouter.shared.composePresentationDidBegin()
+        // Arm the deinit fallback with the compose-scope outcome
+        // closure. Captured by value so it stays alive even if
+        // `onAgentOutcome` is later nil'd by the view graph.
+        let outcomeAtAppear = onAgentOutcome
+        lifecycleTracker.armFallback {
+            // Deinit runs on the thread that releases the tracker.
+            // Dispatch to MainActor for router + closure access.
+            Task { @MainActor in
+                AgentToolRouter.shared.composePresentationDidEnd()
+                outcomeAtAppear?(.cancelled)
+            }
+        }
+    }
+
+    private func performDisappear() {
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
+        }
+        // PORT — this compose closed; drop its eviction guard (refcounted, so
+        // a sibling view replying to the same message stays protected). A
+        // missed `.onDisappear` over-RETAINS, which is the safe direction, and
+        // self-heals at launch when the registry starts empty.
+        DraftSessionRegistry.shared.unregister(draftId)
+        // Normal teardown path: mark the tracker so its deinit
+        // fallback is a no-op, then fire the outcome/hooks directly
+        // (synchronous — faster than the deinit path).
+        lifecycleTracker.markDisappearedNormally()
+        AgentToolRouter.shared.composePresentationDidEnd()
+        // Default outcome for agent-initiated compose. No-op if
+        // `.sent` or `.failed(...)` already fired inside `send()` —
+        // `ComposeOutcomeState.tryResolve` guards against re-entry.
+        onAgentOutcome?(.cancelled)
+    }
+
+    /// COMPILE REPAIR (build gate): this is the FIRST `.onAppear` closure body,
+    /// moved out of `body` verbatim. Under SE-0326 a multi-statement closure is
+    /// type-checked as part of its enclosing expression, so these statements were
+    /// spending `body`'s solver budget; once this file grew, the budget ran out and
+    /// the compiler reported "unable to type-check this expression in reasonable
+    /// time" on whichever statement happened to cross the line. Calling a method
+    /// takes the statements out of that constraint system. Behaviour is unchanged:
+    /// same statements, same order, still on `.onAppear`, still on the MainActor.
+    private func performInitialAppear() {
+        // Use prefillDraftId if provided (reopening an existing draft).
+        if let prefillDraftId {
+            draftId = prefillDraftId
+        } else if let reply = replyTo {
+            // Compute deterministic draftKey for reply/forward (new compose keeps UUID).
+            // Uses stableId (rfc822MessageId for IMAP, messageId for Gmail/Exchange)
+            // so the draft key survives IMAP folder moves.
+            let stableKey = "\(reply.accountId):\(reply.stableId)"
+            draftId = Draft.draftKey(replyTo: stableKey, isForward: isForward, newId: nil)
+        }
+        // PORT — mark this compose OPEN so background maintenance (draft
+        // eviction, orphan compose-session cleanup) never deletes it or its
+        // authored chat turns while it is on screen. Refcounted; balanced by
+        // the `.onDisappear` unregister. Registered AFTER `draftId` is
+        // resolved above, and `draftId` is never reassigned outside this
+        // block, so the two calls always name the same id.
+        DraftSessionRegistry.shared.register(draftId)
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
+        }
+        contactSearch.requestAccess()
+        Task { await loadDraftOrPrepopulate() }
+        resolveContactNames()
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.7).delay(0.15)) {
+            pillAppeared = true
         }
     }
 
@@ -1325,6 +1575,34 @@ struct ComposeView: View {
                     return
                 }
             }
+            // PORT — v2final `loadDraftOrPrepopulate`'s persisted-draft account bind
+            // (`ServerDraftOpen.mayBindPersistedDraft`, commits `a8eb813b5` /
+            // `69a9bae88`). The presenter and this inner view are SEPARATE SwiftUI
+            // handoffs, so the binding is repeated here against the row this view
+            // actually read. `resolvedAccount` is deliberately NOT authority here:
+            // it derives from the mutable From picker, the reply parent's account,
+            // or a caller snapshot, and the two `resolvedAccount ??
+            // navigationStore.accounts.first` assignments this branch used to make
+            // could land on an ARBITRARY account — which for a persisted draft means
+            // composing, saving and SENDING from an address that does not own the
+            // row. An unresolvable owner FAILS CLOSED: the row is left completely
+            // untouched and the user retries by reopening.
+            let persistedDraftAccount = account?.id == draft.accountId
+                ? account
+                : navigationStore.accounts.first(where: { $0.id == draft.accountId })
+            guard ComposeDraftGuards.mayBindPersistedDraft(
+                draftAccountId: draft.accountId,
+                resolvedAccountId: persistedDraftAccount?.id
+            ), let persistedDraftAccount else {
+                draftReadState = .error
+                sendError = "This draft's account couldn't be verified. Close and reopen it to try again."
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] ⚠ Persisted-draft account bind FAILED for draftId=\(draftId) accountId=\(draft.accountId.prefix(20)) — failing closed, binding nothing")
+                }
+                return
+            }
+            selectedAccount = persistedDraftAccount
+            currentSignature = persistedDraftAccount.signature ?? ""
             let observed = draft.instanceEpoch.flatMap { $0.isEmpty ? nil : $0 }
             let epoch = observed ?? UUID().uuidString
             admissionCursor = ComposeGenerationCursor(
@@ -1357,26 +1635,59 @@ struct ComposeView: View {
             }
 
             // For reply/forward: set up quoted text and attribution (but NOT AI suggestion).
-            // Resolve reply from replyTo param OR from draft record (PK + stableId fallback).
-            let resolvedReply: MessageHeader? = replyTo
-                ?? Draft.resolveReplyToHeader(draftKey: draftId, replyToId: draft.replyToId, isForward: draft.isForward)
-            if let reply = resolvedReply {
+            //
+            // T5.8: resolve the reply header AND fetch its quoted body in ONE DB
+            // snapshot through the GUARDED resolver, keyed on the draft's own stored
+            // reply-target ADDRESS (`replyToProviderMessageId` + `replyToUidValidity`,
+            // v80) and the RFC baseline encoded in the draft KEY. The superseded code
+            // did three unsafe things at once: it preferred the pre-captured `replyTo`
+            // param (which may be STALE — the reference's own call sites say "do NOT
+            // trust" it), it accepted the `replyToId` PK hit UNCONDITIONALLY, and it
+            // then read the body in a SECOND, independent `dbPool.read` that a
+            // concurrent purge-and-resync could interleave with. Any of the three can
+            // quote a different correspondent's mail into the user's outgoing reply.
+            // Hoisted into locals so the `@Sendable` read closure captures plain
+            // values instead of `self`.
+            let quoteDraftKey = draftId
+            let quoteReplyToId = draft.replyToId
+            let quoteIsForward = draft.isForward
+            let quoteExpectedProviderMessageId = draft.replyToProviderMessageId
+            let quoteExpectedUidValidity = draft.replyToUidValidity
+            let quote: Draft.ReplyQuote? = try? await AppDatabase.dbPool.read { db in
+                try Draft.resolveReplyQuote(
+                    draftKey: quoteDraftKey, replyToId: quoteReplyToId,
+                    isForward: quoteIsForward,
+                    expectedProviderMessageId: quoteExpectedProviderMessageId,
+                    expectedUidValidity: quoteExpectedUidValidity,
+                    db: db)
+            }
+            // D8: the From account is ALREADY bound above, to the exact owner of the
+            // row this view read. The two `resolvedAccount ?? navigationStore
+            // .accounts.first` assignments that stood here are deliberately gone —
+            // for a persisted draft they could silently REBIND the compose to an
+            // arbitrary account (the fallback fires whenever `account`, the picker
+            // and the reply parent all fail to resolve), which is the exact
+            // wrong-account send this item exists to prevent.
+            if let quote {
+                let reply = quote.header
                 let resolvedForward = replyTo != nil ? isForward : draft.isForward
-                selectedAccount = resolvedAccount ?? navigationStore.accounts.first
-                currentSignature = resolvedAccount?.signature ?? ""
                 let dateStr = reply.date.formatted(date: .abbreviated, time: .shortened)
                 if resolvedForward {
                     quotedAttribution = "---------- Forwarded message ----------\nFrom: \(reply.from)\nDate: \(dateStr)\nSubject: \(reply.subject)"
                 } else {
                     quotedAttribution = "On \(dateStr), \(reply.from) wrote:"
                 }
-                let body = try? await AppDatabase.dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-                if let html = body?.htmlContent { quotedHTML = EmailFilter.stripEmbeddedEmlSections(html) }
-                else if !reply.snippet.isEmpty { quotedHTML = "<p>\(reply.snippet)</p>" }
-            } else {
-                // New compose: restore account
-                selectedAccount = resolvedAccount ?? navigationStore.accounts.first
-                currentSignature = resolvedAccount?.signature ?? ""
+                // ONLY an identity-confirmed body may populate the OUTBOUND quote. The
+                // superseded `else if !reply.snippet.isEmpty` snippet fallback is
+                // deliberately gone: a snippet is a cached preview of whatever row the
+                // PK named, so it re-opens the exact hole the guard just closed.
+                if let html = ComposeDraftGuards.outboundQuoteBody(
+                    confirmedBodyHTML: quote.bodyHTML, capturedSnippet: reply.snippet
+                ) {
+                    quotedHTML = EmailFilter.stripEmbeddedEmlSections(html)
+                }
+            } else if draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
+                print("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED (authored body untouched)")
             }
 
             print("[ComposeView] Loaded draft: id=\(draftId) subject=\(subject.prefix(40))")
@@ -1422,40 +1733,88 @@ struct ComposeView: View {
 
     // MARK: - Close / Discard
 
-    /// Handle close button: prompt Save/Discard/Cancel when there are actual changes.
-    /// Draft is saved BEFORE dismiss (persist before acknowledge).
+    /// PORT — v2final `ComposeView.commitPendingRecipientInput` (F3).
+    ///
+    /// Flush any uncommitted in-progress recipient text (`toInput`/`ccInput`/
+    /// `bccInput`) into the token arrays — the same flush `send()` applies to its
+    /// outbound payload — so close / save also SEE it (`hasChanges`) and PERSIST it
+    /// instead of silently dropping the address the user was mid-way through
+    /// typing. Empty / whitespace-only input is a no-op on the tokens.
+    private func commitPendingRecipientInput() {
+        toTokens = ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput)
+        toInput = ""
+        ccTokens = ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput)
+        ccInput = ""
+        bccTokens = ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput)
+        bccInput = ""
+    }
+
+    /// PORT — v2final `ComposeView.closeCompose` + `applyCloseDecision`, routed
+    /// through `ComposeDraftGuards.hasContent` / `.closeAction` instead of the
+    /// inline emptiness test this forward-port carried.
+    ///
+    /// Handle close button: prompt Save/Discard/Cancel when there are actual
+    /// changes. Draft is saved BEFORE dismiss (persist before acknowledge).
     private func closeCompose() async {
-        let hasContent = !subject.isEmpty || !messageBody.isEmpty || !toTokens.isEmpty
-            || !attachments.isEmpty
+        // F3: commit any pending in-progress recipient BEFORE the emptiness /
+        // changes checks, so it is seen (hasChanges) and later persisted (save).
+        commitPendingRecipientInput()
+        // B1: an attachment-load failure leaves `attachments` EMPTY in memory, so a
+        // draft whose only content WAS its attachments would read as empty and be
+        // routed to a delete — destroying the very files we failed to read. The row
+        // genuinely HAS attachments; we merely could not read them, so report
+        // `hasAttachments: true` and let the unchanged-content branch dismiss with
+        // the row intact.
+        let hasContent = ComposeDraftGuards.hasContent(
+            subject: subject, body: messageBody,
+            to: toTokens, cc: ccTokens, bcc: bccTokens,
+            toInput: toInput, ccInput: ccInput, bccInput: bccInput,
+            hasAttachments: !attachments.isEmpty || attachmentLoadFailed)
         let hasChanges = subject != initialSubject || messageBody != initialBody
             || toTokens != initialToTokens || ccTokens != initialCcTokens || bccTokens != initialBccTokens
             || attachmentsFingerprint(attachments) != initialAttachmentsFingerprint
-        if hasContent && hasChanges {
+        switch ComposeDraftGuards.closeAction(
+            readState: draftReadState, hasContent: hasContent, hasChanges: hasChanges
+        ) {
+        case .promptSave:
             showDiscardPrompt = true
-        } else {
-            // No content or no changes — just dismiss (delete empty draft if it exists).
-            // Async delete so the main actor isn't blocked behind a busy writer.
-            // B1 / PORT of v2final `ComposeCloseState.closeAction`'s ".error blocks
-            // EVERY mutation — never delete/overwrite a draft that merely failed to
-            // load": an attachment load failure leaves `attachments` EMPTY in memory,
-            // so a draft whose only content WAS its attachments reads as
-            // `hasContent == false` and would be silently DELETED here — destroying
-            // the very files we failed to read. Fail closed: dismiss, row intact.
-            if !hasContent, draftReadState == .loaded, !attachmentLoadFailed {
-                do {
-                    guard try await DraftStore.shared.deleteAsync(
-                        id: draftId,
-                        expectedInstanceEpoch: admissionCursor.newEpoch) else {
-                        sendError = "This draft changed in another compose window and was not deleted."
-                        return
-                    }
-                } catch {
+        case .promptDelete:
+            // A LOADED existing draft cleared to nothing — confirm before delete.
+            showClearedDraftDeletePrompt = true
+        case .deleteThenDismiss:
+            // Brand-new / absent empty draft — safe to delete on close. R5: the
+            // delete is CHECKED and `dismiss` runs only after it lands. `false`
+            // (no row under this generation — the ordinary "opened New, typed
+            // nothing, closed" case) is not a failure: there is nothing to lose,
+            // so dismiss. Only a THROWN delete keeps the compose open.
+            await ComposeDraftGuards.runCheckedLocalDeleteThenDismiss(
+                delete: {
+                    _ = try await DraftStore.shared.deleteAsync(
+                        id: draftId, expectedInstanceEpoch: admissionCursor.newEpoch)
+                },
+                dismiss: { dismiss() },
+                onDeleteFailure: { error in
                     sendError = "The draft could not be deleted: \(error.localizedDescription)"
-                    return
-                }
-            }
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ComposeView] R5: deleteAsync failed on close for draftId=\(draftId): \(error)")
+                    }
+                })
+        case .dismiss:
+            // Nothing to persist, no changes, OR a read-error (every mutation
+            // blocked) — dismiss, leaving any on-disk draft intact.
             dismiss()
         }
+    }
+
+    /// PORT — v2final `ComposeView.deleteClearedDraftAndDismiss` (N2/F5).
+    ///
+    /// The confirmed-delete arm of the "cleared draft" prompt. Routed through the
+    /// SAME safe path as an explicit Discard: a cleared LOADED draft may already
+    /// have been pushed to the server, so the durable row must be read fail-closed
+    /// and the remote server-draft cleanup queued. A local-only delete would let
+    /// the server copy re-sync and REAPPEAR.
+    private func deleteClearedDraftAndDismiss() async {
+        await discardDraftAndDismiss()
     }
 
     private func saveDraftAndDismiss() async {
@@ -1474,7 +1833,10 @@ struct ComposeView: View {
             return
         }
         guard let account = resolvedAccount else { dismiss(); return }
-        withAnimation(.easeIn(duration: 0.15)) { isSavingDraft = true }
+        // F3: commit any pending in-progress recipient so it is PERSISTED (not
+        // dropped) by this save. Reached directly from the close prompt's "Save",
+        // which does not go back through `closeCompose`.
+        commitPendingRecipientInput()
         let now = Date().timeIntervalSince1970
         // Capture MainActor-isolated properties before entering Sendable closure
         let capDraftId = draftId
@@ -1485,30 +1847,72 @@ struct ComposeView: View {
         let capBody = messageBody
         let capAttachments = attachments
 
-        // Persist attachments to disk BEFORE the DB write (file I/O outside
-        // GRDB transactions; failure here shouldn't leave a Draft row pointing
-        // at a half-written dir). Existing draft's attachmentsDirName is reused
-        // if present; otherwise we use capDraftId for a deterministic path.
-        let existingDirName: String? = (try? await AppDatabase.dbPool.read { db in
-            try Draft.fetchOne(db, key: capDraftId)?.attachmentsDirName
-        }) ?? nil
-        let dirNameToUse: String? = {
-            if capAttachments.isEmpty { return nil }
-            return existingDirName ?? capDraftId
-        }()
+        // PORT — v2final `saveDraftAndDismiss`'s "N2: ONE throwing draft read at
+        // the TOP, BEFORE any disk or DB mutation". This replaces the TWO separate
+        // `try?` reads this forward-port carried (one for `attachmentsDirName`, one
+        // for the merge base), each of which turned a THROWN read into "absent":
+        //   - the dir read fell through to the raw `draftId` path and DELETED the
+        //     live attachment directory it had merely failed to see;
+        //   - the merge read fell through to the INSERT branch, whose
+        //     `editHistoryJSON: nil` then clobbered the row's stored AI edit history
+        //     through `DraftStore.applySave`'s merge.
+        // A thrown read is NOT absence: FAIL CLOSED with nothing written, and let
+        // the user retry. A genuine nil still takes the normal first-save path.
+        let readResult: Result<Draft?, Error>
         do {
-            if let dir = dirNameToUse {
-                // Wipe previous attachments (user may have removed one) then rewrite all.
-                DraftAttachmentStorage.deleteAttachments(dirName: dir)
-                try DraftAttachmentStorage.saveAttachments(capAttachments, dirName: dir)
-            } else if let oldDir = existingDirName {
-                // Going from N attachments to zero — clean up the old dir.
-                DraftAttachmentStorage.deleteAttachments(dirName: oldDir)
-            }
+            readResult = .success(try await AppDatabase.dbPool.read { db in
+                try Draft.fetchOne(db, key: capDraftId)
+            })
         } catch {
-            isSavingDraft = false
-            sendError = "Failed to save attachments: \(error.localizedDescription)"
+            readResult = .failure(error)
+        }
+        guard ComposeDraftGuards.saveMayMutate(
+            readState: ComposeDraftGuards.readState(readResult)) else {
+            sendError = "Couldn't save this draft — the database was busy. Try again in a moment."
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ComposeView] ⚠ Save-path draft read THREW for draftId=\(capDraftId) — failing closed (no disk/DB write)")
+            }
             return
+        }
+        let existing: Draft?
+        if case .success(let value) = readResult { existing = value } else { existing = nil }
+        let previousDirName = existing?.attachmentsDirName
+
+        withAnimation(.easeIn(duration: 0.15)) { isSavingDraft = true }
+
+        // PORT — v2final `saveDraftAndDismiss`'s F0d COPY-ON-WRITE attachment
+        // staging. Persist attachments to disk BEFORE the DB write (file I/O
+        // outside GRDB transactions), but into a FRESH, opaque-UUID staging dir —
+        // NEVER the live dir. The superseded call site wrote into
+        // `existingDirName ?? capDraftId`, which (a) DELETED the live set before
+        // rewriting it, so a failed/rolled-back save left the row pointing at
+        // destroyed or half-written files, and (b) used the raw `draftId` as a path
+        // component — and a draftId may contain `/` (a `reply:<acct>:<Message-ID>`
+        // key, an Exchange base64 id), which `appendingPathComponent` treats as a
+        // SEPARATOR and silently nests outside the intended slot. See
+        // `DraftAttachmentStorage.newStagingDirName()`.
+        //
+        // ORPHAN-ON-CRASH: a kill after this staging write but before the row adopts
+        // it leaves an unreferenced opaque-UUID dir. That is a bounded disk leak —
+        // never data loss — and does not grow during crash-free operation.
+        let stagingDirName: String?
+        if capAttachments.isEmpty {
+            // N→0 (drop-all) or 0→0: the row will carry a nil dir; the OLD dir (if
+            // any) is destroyed ONLY post-commit. No staging dir here.
+            stagingDirName = nil
+        } else {
+            let staging = DraftAttachmentStorage.newStagingDirName()
+            do {
+                try DraftAttachmentStorage.saveAttachments(capAttachments, dirName: staging)
+            } catch {
+                // Staging write failed — nothing durable changed. Best-effort clean
+                // the partial staging dir; the live dir is UNTOUCHED.
+                DraftAttachmentStorage.deleteAttachments(dirName: staging)
+                isSavingDraft = false
+                sendError = "Failed to save attachments: \(error.localizedDescription)"
+                return
+            }
+            stagingDirName = staging
         }
 
         // Persist before dismiss — if save fails, show error and do NOT dismiss.
@@ -1519,56 +1923,91 @@ struct ComposeView: View {
         // doesn't early-return. Without this, a 2nd-save-onwards draft never
         // actually reaches the server — queueDraftSave drains but pushDraft
         // sees `serverPushStatus == "pushed"` (from the previous push) and
-        // bails before sending the update.
-        do {
-            // Load existing to preserve v24 server sync fields (serverDraftId,
-            // serverPushStatus, rfc822MessageId) before we overwrite user content.
-            let existing = try? await AppDatabase.dbPool.read { db in
-                try Draft.fetchOne(db, key: capDraftId)
+        // bails before sending the update. `existing` was read fail-closed above.
+        let draftToSave: Draft = {
+            if var e = existing {
+                e.toJSON = Draft.encodeStringArray(capTo)
+                e.ccJSON = Draft.encodeStringArray(capCc)
+                e.bccJSON = Draft.encodeStringArray(capBcc)
+                e.subject = capSubject
+                e.body = capBody
+                e.updatedAt = now
+                e.attachmentsDirName = stagingDirName
+                return e
             }
-            let draftToSave: Draft = {
-                if var e = existing {
-                    e.toJSON = Draft.encodeStringArray(capTo)
-                    e.ccJSON = Draft.encodeStringArray(capCc)
-                    e.bccJSON = Draft.encodeStringArray(capBcc)
-                    e.subject = capSubject
-                    e.body = capBody
-                    e.updatedAt = now
-                    e.attachmentsDirName = dirNameToUse
-                    return e
-                }
-                var d = Draft(
-                    id: capDraftId,
-                    accountId: account.id,
-                    toJSON: Draft.encodeStringArray(capTo),
-                    ccJSON: Draft.encodeStringArray(capCc),
-                    bccJSON: Draft.encodeStringArray(capBcc),
-                    subject: capSubject,
-                    body: capBody,
-                    replyToId: replyTo?.id,
-                    isForward: isForward,
-                    editHistoryJSON: nil,
-                    createdAt: now,
-                    updatedAt: now
-                )
-                d.attachmentsDirName = dirNameToUse
-                return d
-            }()
+            var d = Draft(
+                id: capDraftId,
+                accountId: account.id,
+                toJSON: Draft.encodeStringArray(capTo),
+                ccJSON: Draft.encodeStringArray(capCc),
+                bccJSON: Draft.encodeStringArray(capBcc),
+                subject: capSubject,
+                body: capBody,
+                replyToId: replyTo?.id,
+                isForward: isForward,
+                editHistoryJSON: nil,
+                createdAt: now,
+                updatedAt: now
+            )
+            d.attachmentsDirName = stagingDirName
+            // T5.8 — stamp the reply target's ADDRESS beside its (mutable) PK, from
+            // the SAME header `replyToId` was taken from one line above. Written only
+            // on the INSERT branch: the `existing` branch above carries the original
+            // stamp forward untouched, which is correct — the address the user
+            // actually replied to is decided once, at creation, and never re-derived
+            // from whatever happens to sit at that PK later.
+            d.replyToProviderMessageId = replyTo?.messageId
+            d.replyToUidValidity = replyTo?.observedUidValidity
+            return d
+        }()
 
-            guard try await saveThroughGeneration(draftToSave) == .applied else {
-                throw DraftStore.DraftEpochAdmissionError.staleOrReserved
-            }
-            print("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(existing?.serverPushStatus ?? "nil")")
-            // Queue server push via PendingOperation (crash-safe, retries on failure).
-            // queueDraftSave also refreshes the Drafts-folder MessageHeader's snippet
-            // so the row preview reflects the new body.
-            await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: account.id)
-            isSavingDraft = false
-            dismiss()
+        // The staging-cleanup catch covers ONLY the save. Once the save has
+        // COMMITTED (either result), the staging dir's fate is decided by the
+        // disposition below and NOTHING afterward (queueDraftSave, dismiss…) may
+        // delete it — deleting it post-commit would destroy the now-LIVE dir.
+        let saveResult: DraftStore.SaveResult
+        do {
+            saveResult = try await saveThroughGeneration(draftToSave)
         } catch {
+            // The save threw / rolled back — nothing durable adopted our staging
+            // dir. Delete ONLY the staging dir; leave the live dir UNTOUCHED
+            // (persist-before-destroy).
+            if case .deleteStaging(let dir) = ComposeDraftGuards.attachmentDisposition(
+                saveApplied: false, stagingDir: stagingDirName, previousDir: previousDirName) {
+                DraftAttachmentStorage.deleteAttachments(dirName: dir)
+            }
             isSavingDraft = false
             sendError = "Failed to save draft: \(error.localizedDescription)"
+            return
         }
+        // Disposition-driven attachment cleanup (persist-before-destroy). The DB
+        // has durably committed; only NOW is it safe to destroy files.
+        switch ComposeDraftGuards.attachmentDisposition(
+            saveApplied: saveResult == .applied,
+            stagingDir: stagingDirName, previousDir: previousDirName
+        ) {
+        case .deleteSuperseded(let dir), .deleteStaging(let dir):
+            DraftAttachmentStorage.deleteAttachments(dirName: dir)
+        case .noCleanup:
+            break
+        }
+        guard saveResult == .applied else {
+            // A newer snapshot already won on disk — our snapshot was NOT adopted.
+            // Its staging dir was destroyed above; the live dir is intact.
+            isSavingDraft = false
+            sendError = "Failed to save draft: \(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)"
+            return
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(existing?.serverPushStatus ?? "nil")")
+        }
+        // POST-COMMIT (outside the staging-cleanup catch). A throw here must NOT
+        // reach any attachment-dir delete. Queue server push via PendingOperation
+        // (crash-safe, retries on failure); queueDraftSave also refreshes the
+        // Drafts-folder MessageHeader's snippet so the row preview reflects the body.
+        await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: account.id)
+        isSavingDraft = false
+        dismiss()
     }
 
     private func discardDraftAndDismiss() async {
@@ -1581,18 +2020,30 @@ struct ComposeView: View {
         // Async read/write so the main actor isn't blocked behind a busy writer (compose-dismiss
         // freeze class) — this delete was a synchronous main-actor write on the discard path.
         // `draftId` (MainActor-isolated) is captured into a local for the @Sendable closure.
+        //
+        // PORT — v2final `discardDraftAndDismiss`'s F4 rule, now stated through
+        // `ComposeDraftGuards.discardMayDelete`: a THROWN metadata read is NOT
+        // absence. We need serverDraftId / folder / uidValidity to queue the remote
+        // cleanup; without them a local delete would let the server copy re-sync and
+        // REAPPEAR. DEFER the discard (row intact) and surface the error.
         let draftKey = draftId
-        let draftRecord: Draft?
+        let readResult: Result<Draft?, Error>
         do {
-            draftRecord = try await AppDatabase.dbPool.read { db in
+            readResult = .success(try await AppDatabase.dbPool.read { db in
                 try Draft.fetchOne(db, key: draftKey)
-            }
+            })
         } catch {
+            readResult = .failure(error)
+        }
+        guard ComposeDraftGuards.discardMayDelete(
+            readState: ComposeDraftGuards.readState(readResult)) else {
             sendError = "The draft could not be verified, so it was not discarded."
             return
         }
-
-        guard let draftRecord else { dismiss(); return }
+        guard case .success(let loadedRecord) = readResult, let draftRecord = loadedRecord else {
+            dismiss()
+            return
+        }
         let epoch = admissionCursor.newEpoch
         guard draftRecord.instanceEpoch == epoch else {
             sendError = "This draft changed in another compose window and was not discarded."
@@ -1630,6 +2081,19 @@ struct ComposeView: View {
                     id: draftRecord.id, expectedInstanceEpoch: epoch) else {
                     sendError = "This draft changed in another compose window and was not discarded."
                     return
+                }
+                // MATCHED-DIR cleanup (v2final F0f, applied at the caller). Under
+                // copy-on-write staging the on-disk directory is an opaque UUID, no
+                // longer the draftId, so `DraftStore.deleteAsync`'s own
+                // `deleteAttachments(dirName: id)` no longer names it. Destroy the
+                // dir the ROW actually pointed at, and only AFTER the row delete has
+                // committed (persist-before-destroy). Every other draft-delete site
+                // (`AccountManagerActions` queueDraftDelete drain,
+                // `AccountManagerOutbox` send finalize, `InboxViewModel` swipe,
+                // `DraftStore.evictImpl`) already deletes by the row's own
+                // `attachmentsDirName`, so this is the only gap.
+                if let dir = draftRecord.attachmentsDirName {
+                    DraftAttachmentStorage.deleteAttachments(dirName: dir)
                 }
             } catch {
                 sendError = "The draft could not be discarded: \(error.localizedDescription)"
@@ -1715,21 +2179,31 @@ struct ComposeView: View {
                 quotedAttribution = "On \(dateStr), \(reply.from) wrote:"
             }
 
-            let body = try? dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-            if let html = body?.htmlContent {
+            // T5.8: fetch the quote body (and any forward attachments) through the
+            // GUARDED atomic resolver, NOT a direct PK body fetch on the MUTABLE
+            // `reply.id`. On a fresh compose the in-hand `reply` IS the user's
+            // intent, so it supplies the expected address; a re-key or
+            // purge-and-resync that has since put a different physical message at
+            // that PK is then a positive mismatch and the body is DROPPED.
+            let quote: Draft.ReplyQuote? = try? dbPool.read { db in
+                try Draft.resolveReplyQuote(
+                    draftKey: draftId, replyToId: reply.id, isForward: isForward,
+                    expectedProviderMessageId: reply.messageId,
+                    expectedUidValidity: reply.observedUidValidity,
+                    db: db)
+            }
+            // ONLY a positively identity-confirmed body may populate the OUTBOUND
+            // quote. The superseded `else` branch rendered `reply.snippet` — a cached
+            // preview of whatever row the PK named — which bypasses the guard, so it
+            // is deliberately gone. No confirmed body ⇒ no quote (`quotedHTML` stays
+            // nil ⇒ `buildSendBody` emits the plain authored body).
+            if let html = ComposeDraftGuards.outboundQuoteBody(
+                confirmedBodyHTML: quote?.bodyHTML, capturedSnippet: reply.snippet
+            ) {
                 // Strip embedded .eml sections so reply/forward quotes only the
                 // primary body — nested attached emails should not leak into the
                 // quote (they're recipients' copies won't have our hide-CSS).
                 quotedHTML = EmailFilter.stripEmbeddedEmlSections(html)
-            } else {
-                let text = reply.snippet
-                let escaped = text
-                    .replacingOccurrences(of: "&", with: "&amp;")
-                    .replacingOccurrences(of: "<", with: "&lt;")
-                    .replacingOccurrences(of: ">", with: "&gt;")
-                    .replacingOccurrences(of: "\n", with: "<br>")
-                let quoteCSS = "<style>.tm-pq{color:rgba(0,122,255,0.55)!important}@media(prefers-color-scheme:dark){.tm-pq{color:rgba(10,132,255,0.6)!important}}</style>"
-                quotedHTML = "\(quoteCSS)<div class=\"tm-pq\" style=\"font-family: -apple-system, sans-serif; font-size: 16px; line-height: 1.5;\">\(escaped)</div>"
             }
 
             // Forward: carry original attachments over. Users expect Forward to include
@@ -1739,10 +2213,15 @@ struct ComposeView: View {
             // FILTER OUT nested attachments (parentEmlSection != nil): those live
             // inside a `.eml` that we're ALSO carrying, so re-attaching them would
             // duplicate (recipient gets the PDF standalone AND inside the .eml).
-            if isForward, let atts = body?.attachments, !atts.isEmpty {
+            //
+            // T5.8: the metadata AND the fetch target both come from the CONFIRMED
+            // `quote`, never from the captured `reply` whose PK may now name an
+            // impostor — attaching the old occupant's FILES to an outgoing forward is
+            // the same leak as quoting its body, one step worse.
+            if isForward, let confirmed = quote, let atts = confirmed.body?.attachments, !atts.isEmpty {
                 let topLevel = atts.filter { $0.parentEmlSection == nil }
                 if !topLevel.isEmpty {
-                    carryForwardAttachments(from: reply, attachments: topLevel)
+                    carryForwardAttachments(from: confirmed.header, attachments: topLevel)
                 }
             }
         } else {
@@ -1990,6 +2469,8 @@ struct ComposeView: View {
             authoredBody: messageBody,
             attachments: attachments,
             replyToHeaderId: replyTo?.id,
+            replyToProviderMessageId: replyTo?.messageId,
+            replyToUidValidity: replyTo?.observedUidValidity,
             isForward: isForward,
             outbound: outbound)
 
@@ -2035,22 +2516,41 @@ struct ComposeView: View {
         // The local draft is deleted on send COMPLETION
         // (AccountManagerOutbox.finalizeOutboxMessage), NOT at claim time —
         // transient SMTP failures leave the draft available for retry/edit.
+        // PORT — v2final `send()`'s F0d COPY-ON-WRITE staging. The superseded form
+        // wrote into `draftRecord?.attachmentsDirName ?? snapshot.draftId`: the LIVE
+        // directory, so a save that then failed left the row pointing at files this
+        // write had already overwritten, and the `?? snapshot.draftId` fallback used
+        // a raw draftId as a path component — a `reply:<acct>:<Message-ID>` key or an
+        // Exchange base64 id may contain `/`, which `appendingPathComponent` treats
+        // as a SEPARATOR, nesting the "directory" outside its intended slot. The
+        // staging name is now an opaque UUID (no separators; see
+        // `DraftAttachmentStorage.newStagingDirName()`), written fresh, adopted only
+        // by a committed save.
+        //
+        // The SEND itself never depends on this directory: the outbound attachment
+        // bytes travel in `snapshot.outbound` and `AccountManagerOutbox
+        // .persistQueuedSend` stages its OWN outbox copy. This staging exists solely
+        // so an Undo-Send reopen finds the attachments on the retained Draft row.
+        let previousDirName = draftRecord?.attachmentsDirName
+        let stagingDirName: String?
+        if snapshot.attachments.isEmpty {
+            stagingDirName = nil
+        } else {
+            let staging = DraftAttachmentStorage.newStagingDirName()
+            do {
+                try DraftAttachmentStorage.saveAttachments(
+                    snapshot.attachments, dirName: staging)
+            } catch {
+                // Nothing durable changed; the live dir is UNTOUCHED.
+                DraftAttachmentStorage.deleteAttachments(dirName: staging)
+                isSending = false
+                sendError = "The draft could not be saved before sending: \(error.localizedDescription)"
+                return
+            }
+            stagingDirName = staging
+        }
         do {
             let nowEpoch = Date().timeIntervalSince1970
-
-            // Save attachments to disk first (outside DB txn — file I/O
-            // failure shouldn't leave a Draft row pointing at a missing dir).
-            let dirName: String?
-            if !snapshot.attachments.isEmpty {
-                // Reuse existing dirName if set; else use draftId for a
-                // deterministic, collision-free path.
-                let target = draftRecord?.attachmentsDirName ?? snapshot.draftId
-                try DraftAttachmentStorage.saveAttachments(
-                    snapshot.attachments, dirName: target)
-                dirName = target
-            } else {
-                dirName = draftRecord?.attachmentsDirName
-            }
 
             var ownedDraft = Draft(
                 id: snapshot.draftId,
@@ -2076,12 +2576,40 @@ struct ComposeView: View {
             // later delete of this draft to the Message-ID-search arm.
             ownedDraft.serverDraftUidValidity = draftRecord?.serverDraftUidValidity
             ownedDraft.serverDraftFolderPath = draftRecord?.serverDraftFolderPath
-            ownedDraft.attachmentsDirName = dirName
+            // T5.8 — the reply-target ADDRESS stamp must be taken from the SAME
+            // source that supplied `replyToId` just above, branch for branch. An
+            // independent `snapshot.x ?? draftRecord?.x` coalesce could pair the
+            // snapshot's PK with the stored row's stamp (or the reverse), i.e. an
+            // address describing a DIFFERENT message than the PK beside it — which
+            // silently disarms the guard instead of tightening it.
+            if snapshot.replyToHeaderId != nil {
+                ownedDraft.replyToProviderMessageId = snapshot.replyToProviderMessageId
+                ownedDraft.replyToUidValidity = snapshot.replyToUidValidity
+            } else {
+                ownedDraft.replyToProviderMessageId = draftRecord?.replyToProviderMessageId
+                ownedDraft.replyToUidValidity = draftRecord?.replyToUidValidity
+            }
+            // N→0 leaves this nil and the superseded dir is destroyed post-commit.
+            ownedDraft.attachmentsDirName = stagingDirName
 
             guard try await saveThroughGeneration(ownedDraft) == .applied else {
                 throw DraftStore.DraftEpochAdmissionError.staleOrReserved
             }
+            // Disposition-driven cleanup, AFTER the durable commit
+            // (persist-before-destroy). `.applied` ⇒ the row now points at the
+            // staging dir (or nil), so the SUPERSEDED dir is safe to destroy and can
+            // never be the live one.
+            if case .deleteSuperseded(let dir) = ComposeDraftGuards.attachmentDisposition(
+                saveApplied: true, stagingDir: stagingDirName, previousDir: previousDirName) {
+                DraftAttachmentStorage.deleteAttachments(dirName: dir)
+            }
         } catch {
+            // The save threw / was not adopted — nothing durable references our
+            // staging dir. Destroy ONLY it; the live dir is UNTOUCHED.
+            if case .deleteStaging(let dir) = ComposeDraftGuards.attachmentDisposition(
+                saveApplied: false, stagingDir: stagingDirName, previousDir: previousDirName) {
+                DraftAttachmentStorage.deleteAttachments(dirName: dir)
+            }
             isSending = false
             sendError = "The draft could not be saved before sending: \(error.localizedDescription)"
             return
