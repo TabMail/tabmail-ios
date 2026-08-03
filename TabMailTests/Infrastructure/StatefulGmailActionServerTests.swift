@@ -738,4 +738,44 @@ struct StatefulGmailActionServerTests {
             "unexpected served sequence: \(server.http.servedCallSequence())"
         )
     }
+
+    /// SUBTRACT — keep `e0d3d30e0`'s removal of `v2final`'s unsafe
+    /// RESOURCE-404 fallback. A typed RESOURCE address may establish only that
+    /// the named draft resource is absent; it must never be reinterpreted as a
+    /// contained MESSAGE address.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED test-only trap scaffolding: the reference
+    /// has no assertion that a resource 404 cannot cross namespaces, because
+    /// its `deleteDraft` performs that unsafe reroute. The production behavior
+    /// itself is a subtraction, not an invention.
+    @Test("A Gmail draft RESOURCE 404 remains authoritative absence and never reroutes into the contained MESSAGE namespace")
+    func resource404NeverReroutesIntoContainedMessageNamespace() async throws {
+        let resourceId = "gmail-draft-resource-404"
+        let server = StatefulGmailActionServer(messages: [])
+        defer { server.close() }
+        let provider = server.provider()
+
+        let resourceDelete = FakeHTTP.ResponseScript([404])
+        server.http.register(path: "/drafts/\(resourceId)", method: "DELETE") { _ in
+            .status(resourceDelete.next())
+        }
+        server.http.register(
+            path: "/messages/\(resourceId)/trash",
+            method: "POST",
+            response: .json(raw: "{}")
+        )
+
+        try await provider.deleteDraft(identity: .gmail(resourceId: resourceId))
+
+        #expect(
+            resourceDelete.served == [404],
+            "the authoritative RESOURCE 404 must be consumed exactly once: \(resourceDelete.served)"
+        )
+        #expect(
+            server.http.servedCallSequence() == [
+                "DELETE /gmail/v1/users/me/drafts/\(resourceId)",
+            ],
+            "a RESOURCE 404 must not trigger a contained-MESSAGE trash request: \(server.http.servedCallSequence())"
+        )
+    }
 }
