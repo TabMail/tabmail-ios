@@ -455,7 +455,13 @@ extension AccountManager {
     /// (retry on next drain), permanent failures increment retryCount and
     /// eventually flip to .failed (user-visible, manual retry).
     private func sendSingleOutboxMessage(_ current: OutboxMessage, messageId: String) async {
-        guard let queue = workQueues[current.accountId] else { return }
+        guard let queue = workQueues[current.accountId] else {
+            let requeued = await requeueClaimedOutboxMessage(current.id)
+            if !requeued {
+                print("[Outbox] CRITICAL: missing-provider rollback did not transition exactly one row for \(current.id) — a newer durable state won or the write failed")
+            }
+            return
+        }
         let provider = queue.provider
 
         print("[Outbox] Sending message \(current.id) to \(current.to.joined(separator: ", "))")
@@ -556,6 +562,34 @@ extension AccountManager {
             } else {
                 print("[Outbox] Send failed for \(current.id) after \(newRetryCount) permanent failures — marked as failed: \(error)")
             }
+        }
+    }
+
+    /// Return one exact, definitely-unsent claim to the ordinary drain after
+    /// its runtime provider disappears between `atomicClaim` and send.
+    ///
+    /// The SQL fence is the ownership proof: a stale caller cannot overwrite a
+    /// failed/requeued row, and `sentAt IS NULL` prevents a completed provider
+    /// send from ever being made drainable again. No other field is changed.
+    private func requeueClaimedOutboxMessage(_ outboxId: String) async -> Bool {
+        do {
+            return try await retryWrite(dbPool, label: "Outbox") { db in
+                try db.execute(
+                    sql: """
+                        UPDATE outboxMessage SET status = ?
+                        WHERE id = ? AND status = ? AND sentAt IS NULL
+                        """,
+                    arguments: [
+                        OutboxStatus.queued.rawValue,
+                        outboxId,
+                        OutboxStatus.sending.rawValue,
+                    ]
+                )
+                return db.changesCount == 1
+            }
+        } catch {
+            print("[Outbox] WARNING: Could not requeue missing-provider claim \(outboxId): \(error)")
+            return false
         }
     }
 
@@ -1233,4 +1267,25 @@ extension AccountManager {
     nonisolated func discardOutboxMessage(_ messageId: String) {
         _ = discardOutboxMessageConfirmed(messageId)
     }
+
+    #if DEBUG
+    /// Test seam: returns whether atomicClaim admitted the row (non-nil).
+    func atomicClaimForTesting(_ msg: OutboxMessage) async -> Bool {
+        await atomicClaim(msg) != nil
+    }
+
+    /// Exercises the exact post-claim send owner, including its runtime-provider
+    /// guard, without an app-launch or scheduler timing harness.
+    func sendClaimedOutboxMessageForTesting(
+        _ message: OutboxMessage,
+        messageId: String
+    ) async {
+        await sendSingleOutboxMessage(message, messageId: messageId)
+    }
+
+    /// Exercises the rollback ownership fence independently of provider state.
+    func requeueClaimedOutboxMessageForTesting(_ outboxId: String) async -> Bool {
+        await requeueClaimedOutboxMessage(outboxId)
+    }
+    #endif
 }
