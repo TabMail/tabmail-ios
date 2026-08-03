@@ -129,6 +129,15 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// so this models the one wire shape that can hand the app a `0` and let
         /// it be mistaken for a real epoch. Empty for every pre-existing test.
         var selectUidValiditySuppressed: Set<String> = []
+        /// T3.4 — source UIDs this server COPIES normally but deliberately
+        /// leaves OUT of its `COPYUID` response code. RFC 4315 §3 makes sending
+        /// `COPYUID` a MAY, so a real UIDPLUS server withholding it (for some
+        /// or all of a set) is conformant, and the app must treat an unreported
+        /// member as unproven rather than as copied. Withholding EVERY member
+        /// leaves nothing to report, and the response code is then omitted
+        /// entirely — the shape a non-UIDPLUS server always produces. Empty for
+        /// every pre-existing test.
+        var copyUidWithheldSourceUIDs: Set<Int> = []
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -610,6 +619,20 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// with `setUidValidity` and post-response mailbox replacement.
     func uidValidity(for mailbox: String) -> Int {
         withState { $0.uidValidityByMailbox[mailbox] ?? 1 }
+    }
+
+    /// Test seam (T3.4): `UID COPY` still copies these source UIDs, but leaves
+    /// them OUT of its `COPYUID` response code — the "the server did it and
+    /// did not say so" shape RFC 4315 §3 permits by making the code a MAY.
+    ///
+    /// It separates the two things a naive fixture conflates: whether the copy
+    /// LANDED (assert on `messageIDs(in:)`) and whether the server PROVED which
+    /// destination UID it landed on (the only thing allowed to authorize
+    /// deleting the source). Withholding every member of a set makes the fake
+    /// omit the response code altogether, which is also what a server without
+    /// UIDPLUS always does.
+    func withholdCopyUID(forSourceUIDs uids: Set<Int>) {
+        withState { $0.copyUidWithheldSourceUIDs = uids }
     }
 
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
@@ -1583,7 +1606,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             guard components.count == 2 else { return "\(tag) BAD Invalid UID COPY\r\n" }
             let uids = Set(parseUIDSet(components[0], in: mailbox))
             let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
-            withState { state in
+            let (copied, destinationUidValidity, withheld) = withState {
+                state -> ([(source: Int, destination: Int)], Int, Set<Int>) in
                 recordOracleCheck(command: "UID COPY", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
                 let copying = sourceMessages.filter { uids.contains($0.uid) }
@@ -1591,15 +1615,38 @@ final class FakeIMAPServer: @unchecked Sendable {
                 var nextUID = (destinationMessages.map(\.uid).max() ?? 0) + 1
                 let sourceFlags = state.flagsByMailbox[mailbox] ?? [:]
                 var destinationFlags = state.flagsByMailbox[destination] ?? [:]
+                var pairs: [(source: Int, destination: Int)] = []
                 for message in copying {
                     destinationMessages.append(message.replacingUID(nextUID))
                     destinationFlags[nextUID] = sourceFlags[message.uid] ?? []
+                    pairs.append((source: message.uid, destination: nextUID))
                     nextUID += 1
                 }
                 state.messagesByMailbox[destination] = destinationMessages
                 state.flagsByMailbox[destination] = destinationFlags
+                return (
+                    pairs,
+                    state.uidValidityByMailbox[destination] ?? 1,
+                    state.copyUidWithheldSourceUIDs
+                )
             }
-            return "\(tag) OK UID COPY completed\r\n"
+            // RFC 4315 §3 — `COPYUID`. Mirrors the `APPENDUID` branch in
+            // `handleAppend` exactly: the response code is only advertisable by
+            // a server that implements UIDPLUS, the mailbox bookkeeping above
+            // is IDENTICAL either way, and only the wire advertisement changes.
+            // A no-UIDPLUS fixture therefore faithfully drives `IMAPProvider`'s
+            // move into its "no evidence ⇒ no source cleanup" arm instead of
+            // silently still being handed proof it would never get from such a
+            // server. `COPYUID` is also omitted when the server copied nothing:
+            // the grammar's two `uid-set`s cannot be empty, and a server with
+            // nothing to report reports nothing.
+            let reported = copied.filter { !withheld.contains($0.source) }
+            guard capabilities.contains("UIDPLUS"), !reported.isEmpty else {
+                return "\(tag) OK UID COPY completed\r\n"
+            }
+            let sourceSet = reported.map { String($0.source) }.joined(separator: ",")
+            let destinationSet = reported.map { String($0.destination) }.joined(separator: ",")
+            return "\(tag) OK [COPYUID \(destinationUidValidity) \(sourceSet) \(destinationSet)] UID COPY completed\r\n"
         default:
             return "\(tag) BAD Unknown UID subcommand\r\n"
         }

@@ -101,6 +101,28 @@ struct MessageHeaderInfo: Sendable {
     /// Excludes tm_* labels (handled by ActionTag) and system labels.
     /// Empty for providers that don't support labels.
     var userLabelIds: [String] = []
+    /// Whether `userLabelIds` is a complete provider-authoritative set. Gmail
+    /// cannot classify opaque `Label_N` IDs until its label catalog has loaded;
+    /// fail closed so an early delta cannot erase valid local membership.
+    ///
+    /// PORT — `v2final:TabMail/Providers/EmailProvider.swift`
+    /// `MessageHeaderInfo.userLabelIdsAreAuthoritative` (commit `a75196398`).
+    /// The `false` default IS the fail-closed direction: a provider that has
+    /// not proven its remote set is exact must never be read as one that has.
+    ///
+    /// ⚑ CURRENTLY UNCONSUMED ON v3. The reference reads it in
+    /// `SyncEngineFullSync` as `remoteSetIsAuthoritative:`, which gates a
+    /// reconcile that REPLACES local membership with the remote set. v3's
+    /// label writers are insert-only (`MessageUserLabel(...).insert(db,
+    /// onConflict: .ignore)` in `SyncEngineFullSync`, `SyncEngineDeltaSync`,
+    /// `SyncEngineBackfillDeep`) and never delete a junction row, so there is
+    /// nothing here yet that could erase membership. The flag lands with the
+    /// catalog it describes so the guard exists BEFORE a reconcile does — a
+    /// reconcile added later against a defaulted-true or absent flag is the
+    /// half-port shape. `IMAPProvider` must set it `true` (its keyword FETCH
+    /// is authoritative, as in the reference) at the same time any consumer
+    /// lands, or IMAP labels fail closed forever.
+    var userLabelIdsAreAuthoritative = false
 }
 
 struct AttachmentInfo: Sendable, Codable {
