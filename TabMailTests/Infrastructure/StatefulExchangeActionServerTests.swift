@@ -45,7 +45,7 @@ import Testing
 /// does, which is precisely the vacuity trap this suite exists to avoid. The
 /// converse is NOT claimed: tests that assert nothing about the counter do not
 /// arm the hook, and FOUR of the seven tests in this file do exactly that —
-/// `opaqueDraftIdStaysOnePathSegment`,
+/// `opaqueDraftResourceLifecycle`,
 /// `moveReallocatesGraphIdWhilePreservingFields`,
 /// `transientMutationFailureLeavesStateUnchanged` and
 /// `deleteDraftRetriesOnTheInjectedSessionAfter401` drive full action sequences
@@ -76,45 +76,11 @@ import Testing
 /// `AccountManager.shared` — each test owns a private `FakeHTTP.Scenario`.
 @Suite("Stateful Exchange action transport (provider-id)")
 struct StatefulExchangeActionServerTests {
-    /// Partial port of the reference's `opaqueDraftResourceLifecycle`. TWO legs
-    /// of the reference test are blocked on `v3` PRODUCTION gaps that `v2final`
-    /// had already closed. Both are reported rather than worked around; neither
-    /// is fixable from a test file.
-    ///
-    /// **Gap 1 — no Graph path-segment encoder.** The reference seeds
-    /// `graph/draft+opaque=` — with a SLASH — and asserts it arrives as one
-    /// percent-encoded segment (`graph%2Fdraft%2Bopaque%3D`), via
-    /// `v2final`'s `encodedGraphPathSegment` / `graphPathSegmentAllowed`.
-    /// `v3`'s `ExchangeProvider` has no encoder at all and interpolates raw ids
-    /// into paths, so a slash-bearing id splits into extra path segments. This
-    /// test therefore seeds only the reserved characters `v3` does transmit
-    /// intact (`+`, `=`).
-    ///
-    /// **Gap 2 — CLOSED.** `ExchangeProvider.deleteDraft` used to escape the
-    /// injected session: it is the one method that bypasses the file's private
-    /// `request()` helper, calling the free `performHTTPRequestWithRetry` /
-    /// `performHTTPRequest` with no `session:`, so both fell back to
-    /// `sharedEphemeralSession` and issued LIVE requests to
-    /// `https://graph.microsoft.com` — omitting this leg was the only way to
-    /// keep the suite off the public internet, and including it failed with a
-    /// real `Error Domain=Exchange Code=401` from Microsoft. `v2final` passed
-    /// `session: testSession` at both call sites; `v3` had dropped it. Both are
-    /// restored, so the DELETE leg is now exercised below.
-    ///
-    /// That leg exercises the restoration, but it does NOT by itself pin either
-    /// line, and the distinction matters. If the FIRST request lost `session:`,
-    /// Microsoft would answer 401 for the fabricated token, control would fall
-    /// into the 401-retry leg, and that retry — still injected — would reach
-    /// this fixture with the same method and path, delete the draft, and leave
-    /// both assertions below green. If the RETRY lost `session:` it would never
-    /// run here at all, because the first DELETE succeeds. Pinning each line
-    /// separately needs a response script that forces both legs to run:
-    /// `deleteDraftRetriesOnTheInjectedSessionAfter401` does that.
-    ///
-    /// Exchange PATCHes only by its typed durable Graph resource identity.
-    @Test("an opaque Graph draft id stays one path segment for body GET, attachments, and PATCH")
-    func opaqueDraftIdStaysOnePathSegment() async throws {
-        let opaqueId = "graph-draft+opaque="
+    /// Port of `v2final`'s `opaqueDraftResourceLifecycle`, adapted only from its
+    /// RFC-keyed snapshot assertion to v3's durable provider-ID identity.
+    @Test("opaque Graph draft id stays one encoded segment for body, PATCH, and DELETE")
+    func opaqueDraftResourceLifecycle() async throws {
+        let opaqueId = "graph/draft+opaque="
         let rfc822 = "opaque-draft@example.com"
         let server = StatefulExchangeActionServer(messages: [.init(
             rfc822MessageId: rfc822,
@@ -133,35 +99,30 @@ struct StatefulExchangeActionServerTests {
             draftsFolderPath: "Drafts"
         )
 
-        // The PATCH addressed the SAME resource, read by provider id — not by
-        // RFC — so no second draft was created.
+        // The PATCH addressed the same durable provider resource, never RFC.
         #expect(server.snapshot(providerMessageId: opaqueId) != nil)
+
+        try await provider.deleteDraft(identity: .outlook(graphId: opaqueId))
+        #expect(server.snapshot(providerMessageId: opaqueId) == nil)
 
         let calls = server.http.recordedCalls()
         #expect(calls.contains {
-            $0.method == "GET" && $0.url.contains("/messages/\(opaqueId)?")
+            $0.method == "GET"
+                && $0.url.contains("/messages/graph%2Fdraft%2Bopaque%3D?")
         })
         #expect(calls.contains {
-            $0.method == "GET" && $0.url.contains("/messages/\(opaqueId)/attachments")
+            $0.method == "GET"
+                && $0.url.contains("/messages/graph%2Fdraft%2Bopaque%3D/attachments")
         })
         #expect(calls.contains {
-            $0.method == "PATCH" && $0.url.contains("/messages/\(opaqueId)")
+            $0.method == "PATCH"
+                && $0.url.contains("/messages/graph%2Fdraft%2Bopaque%3D")
         })
-        // Updating an existing draft must PATCH, never create a second resource.
+        #expect(calls.contains {
+            $0.method == "DELETE"
+                && $0.url.contains("/messages/graph%2Fdraft%2Bopaque%3D")
+        })
         #expect(!calls.contains { $0.method == "POST" })
-
-        // Gap 2's restored leg. `deleteDraft` addresses the same opaque id, and
-        // both of its request paths now carry `session: testSession`.
-        try await provider.deleteDraft(identity: .outlook(graphId: opaqueId))
-        #expect(
-            server.snapshot(providerMessageId: opaqueId) == nil,
-            "deleteDraft must remove the addressed resource from THIS fixture — a surviving snapshot means the DELETE never reached the injected session"
-        )
-        let afterDelete = server.http.recordedCalls()
-        #expect(
-            afterDelete.contains { $0.method == "DELETE" && $0.url.contains("/messages/\(opaqueId)") },
-            "the fake recorded no DELETE for the draft — the request escaped to the live Graph endpoint instead of the injected session"
-        )
     }
 
     /// Port of the reference's `actionFinalState`, converted to the v3 keying —
@@ -175,11 +136,6 @@ struct StatefulExchangeActionServerTests {
     /// the new id the way production would — from the provider's own listing,
     /// never from the RFC map.
     ///
-    /// Not ported: the reference's second, inverse move. The fixture allocates
-    /// reallocated ids of the form `graph/moved+N=`, and `v3`'s unencoded path
-    /// interpolation cannot address a slash-bearing id (see
-    /// `opaqueDraftIdStaysOnePathSegment`). Re-addressing a moved Graph message
-    /// is blocked on that production gap.
     @Test("a Graph move reallocates the resource id while preserving field state")
     func moveReallocatesGraphIdWhilePreservingFields() async throws {
         let rfc822MessageId = "exchange-stateful@example.com"

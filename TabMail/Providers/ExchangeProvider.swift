@@ -103,7 +103,8 @@ actor ExchangeProvider: EmailProvider {
     }
 
     private func fetchChildFolders(parentId: String, knownFolderIds: [String: FolderRole]) async throws -> [FolderInfo] {
-        let data = try await request(path: "/mailFolders/\(parentId)/childFolders?\(selectFolderFields)&\(topParam(50))")
+        let encodedParentId = try Self.encodedGraphPathSegment(parentId, context: "Graph parent folder id")
+        let data = try await request(path: "/mailFolders/\(encodedParentId)/childFolders?\(selectFolderFields)&\(topParam(50))")
         let response = try JSONDecoder().decode(GraphFolderListResponse.self, from: data)
         return response.value.map { folder in
             FolderInfo(
@@ -120,7 +121,8 @@ actor ExchangeProvider: EmailProvider {
 
     func fetchMessages(folder: String, limit: Int, offset: Int) async throws -> [MessageHeaderInfo] {
         let fields = selectMessageHeaderFields
-        var path = "/mailFolders/\(folder)/messages?\(fields)&\(topParam(limit))&\(orderByReceived)"
+        let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
+        var path = "/mailFolders/\(encodedFolder)/messages?\(fields)&\(topParam(limit))&\(orderByReceived)"
         if offset > 0 {
             path += "&$skip=\(offset)"
         }
@@ -130,7 +132,8 @@ actor ExchangeProvider: EmailProvider {
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
-        let data = try await request(path: "/messages/\(id)?\(selectFullMessageFields)")
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        let data = try await request(path: "/messages/\(encodedId)?\(selectFullMessageFields)")
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
 
         guard let header = parseGraphMessage(msg) else {
@@ -150,7 +153,7 @@ actor ExchangeProvider: EmailProvider {
         // Don't use $select here — contentId is a property of fileAttachment subtype,
         // not the base attachment type, so $select rejects it with HTTP 400.
         // Without $select, the API returns all properties including contentId.
-        let attData = try await request(path: "/messages/\(id)/attachments")
+        let attData = try await request(path: "/messages/\(encodedId)/attachments")
         let attResponse = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: attData)
         let hasCidRefs = htmlBody?.range(of: "cid:", options: .caseInsensitive) != nil
         for att in attResponse.value {
@@ -280,7 +283,9 @@ actor ExchangeProvider: EmailProvider {
         fallbackName: String?
     ) async throws -> (markerHtml: String, nestedAttachments: [AttachmentInfo]) {
         let expand = "microsoft.graph.itemattachment/item"
-        let path = "/messages/\(messageId)/attachments/\(itemAttachmentId)?$expand=\(expand)"
+        let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
+        let encodedAttachmentId = try Self.encodedGraphPathSegment(itemAttachmentId, context: "Graph attachment id")
+        let path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)?$expand=\(expand)"
         let data = try await request(path: path)
         let expanded = try JSONDecoder().decode(GraphItemAttachmentExpanded.self, from: data)
         let filename = expanded.name ?? fallbackName ?? "attached-email.eml"
@@ -352,7 +357,9 @@ actor ExchangeProvider: EmailProvider {
         messageId: String,
         itemAttachmentId: String
     ) async throws -> [GraphAttachmentMeta] {
-        let path = "/messages/\(messageId)/attachments/\(itemAttachmentId)/microsoft.graph.itemattachment/item/attachments"
+        let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
+        let encodedAttachmentId = try Self.encodedGraphPathSegment(itemAttachmentId, context: "Graph attachment id")
+        let path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)/microsoft.graph.itemattachment/item/attachments"
         let data = try await request(path: path)
         let response = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: data)
         return response.value
@@ -413,7 +420,8 @@ actor ExchangeProvider: EmailProvider {
     /// Uses header fields + body in a single $select.
     private func fetchSingleBackfill(id: String) async -> BackfillResult {
         do {
-            let data = try await request(path: "/messages/\(id)?\(selectBackfillFields)")
+            let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+            let data = try await request(path: "/messages/\(encodedId)?\(selectBackfillFields)")
             let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
             let header = parseGraphMessage(msg)
             let htmlBody = msg.body?.contentType == "html" ? msg.body?.content : nil
@@ -458,7 +466,8 @@ actor ExchangeProvider: EmailProvider {
     /// Fetch a single message's text body only (no header parse, no attachments, no inline images).
     private func fetchSingleTextBody(id: String) async -> TextBodyFetchResult {
         do {
-            let data = try await request(path: "/messages/\(id)?$select=id,body")
+            let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+            let data = try await request(path: "/messages/\(encodedId)?$select=id,body")
             let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
             let htmlBody = msg.body?.contentType == "html" ? msg.body?.content : nil
             let textBody = msg.body?.contentType == "text" ? msg.body?.content : nil
@@ -483,7 +492,13 @@ actor ExchangeProvider: EmailProvider {
         let queryParts = ["\(selectMessageHeaderFields)", "$search=\"\(query)\"", topParam(20)]
 
         // Scope to folder via Graph API mailFolders endpoint when folder ID is available
-        let basePath = folder.isEmpty ? "/messages" : "/mailFolders/\(folder)/messages"
+        let basePath: String
+        if folder.isEmpty {
+            basePath = "/messages"
+        } else {
+            let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
+            basePath = "/mailFolders/\(encodedFolder)/messages"
+        }
         let data = try await request(path: "\(basePath)?\(queryParts.joined(separator: "&"))")
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
         var results = response.value.compactMap { parseGraphMessage($0) }
@@ -543,7 +558,8 @@ actor ExchangeProvider: EmailProvider {
     /// the categories array in Graph, so we read-filter-write to preserve
     /// user-created categories. Skips the PATCH if no tm_* entries exist.
     private func stripLegacyCategories(id: String) async throws {
-        let data = try await request(path: "/messages/\(id)?$select=categories")
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        let data = try await request(path: "/messages/\(encodedId)?$select=categories")
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
         let existing = msg.categories ?? []
         let filtered = existing.filter { !$0.lowercased().hasPrefix("tm_") }
@@ -584,7 +600,10 @@ actor ExchangeProvider: EmailProvider {
         if let existingId = existingDraftId {
             // Update existing draft via PATCH
             let jsonData = try JSONSerialization.data(withJSONObject: message)
-            let response = try await request(path: "/messages/\(existingId)", method: "PATCH", body: jsonData)
+            let encodedExistingId = try Self.encodedGraphPathSegment(
+                existingId, context: "Graph draft message id"
+            )
+            let response = try await request(path: "/messages/\(encodedExistingId)", method: "PATCH", body: jsonData)
             if let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
                let msgId = dict["id"] as? String {
                 return .created(.outlook(graphId: msgId))
@@ -606,10 +625,13 @@ actor ExchangeProvider: EmailProvider {
         guard case .outlook(let draftId) = identity else {
             throw ProviderError.actionIdentityResolutionFailed("ExchangeProvider received a non-Outlook draft identity")
         }
+        let encodedDraftId = try Self.encodedGraphPathSegment(
+            draftId, context: "Graph draft message id"
+        )
         // Exchange may auto-delete drafts after send. A 404 means already gone — treat as success.
         let token = try await accessToken(false)
         let result = try await performHTTPRequestWithRetry(
-            url: baseURL + "/messages/\(draftId)", method: "DELETE", body: nil, token: token,
+            url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: token,
             retryableStatusCodes: [429], session: testSession, logLabel: "Exchange"
         )
         if result.statusCode == 404 {
@@ -619,7 +641,7 @@ actor ExchangeProvider: EmailProvider {
         if result.data != nil { return }
         if result.statusCode == 401 {
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(draftId)", method: "DELETE", body: nil, token: freshToken, session: testSession)
+            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: freshToken, session: testSession)
             if retry.statusCode == 404 || retry.data != nil { return }
             throw ProviderError.networkError(underlying: NSError(domain: "Exchange", code: retry.statusCode))
         }
@@ -656,13 +678,17 @@ actor ExchangeProvider: EmailProvider {
             return bytes
         }
 
+        let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
         let path: String
         if let sepRange = attachmentId.range(of: Self.nestedSeparator) {
             let outer = String(attachmentId[..<sepRange.lowerBound])
             let inner = String(attachmentId[sepRange.upperBound...])
-            path = "/messages/\(messageId)/attachments/\(outer)/microsoft.graph.itemattachment/item/attachments/\(inner)"
+            let encodedOuter = try Self.encodedGraphPathSegment(outer, context: "Graph attachment id")
+            let encodedInner = try Self.encodedGraphPathSegment(inner, context: "Graph nested attachment id")
+            path = "/messages/\(encodedMessageId)/attachments/\(encodedOuter)/microsoft.graph.itemattachment/item/attachments/\(encodedInner)"
         } else {
-            path = "/messages/\(messageId)/attachments/\(attachmentId)"
+            let encodedAttachmentId = try Self.encodedGraphPathSegment(attachmentId, context: "Graph attachment id")
+            path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)"
         }
         let data = try await request(path: path)
         let attachment = try JSONDecoder().decode(GraphAttachmentDetail.self, from: data)
@@ -687,7 +713,8 @@ actor ExchangeProvider: EmailProvider {
         var filter = "receivedDateTime ge \(iso8601DateTime(since))"
         if let before { filter += " and receivedDateTime lt \(iso8601DateTime(before))" }
         var allIds: [String] = []
-        var nextLink: String? = "/mailFolders/\(folder)/messages?$select=id&$filter=\(filter)&\(topParam(pageSize))&\(orderByReceived)"
+        let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
+        var nextLink: String? = "/mailFolders/\(encodedFolder)/messages?$select=id&$filter=\(filter)&\(topParam(pageSize))&\(orderByReceived)"
 
         repeat {
             try Task.checkCancellation()
@@ -723,7 +750,8 @@ actor ExchangeProvider: EmailProvider {
         for (i, id) in ids.enumerated() {
             try Task.checkCancellation()
             do {
-                let data = try await request(path: "/messages/\(id)?\(selectMessageHeaderFields)")
+                let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+                let data = try await request(path: "/messages/\(encodedId)?\(selectMessageHeaderFields)")
                 let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
                 if let header = parseGraphMessage(msg) {
                     allHeaders.append(header)
@@ -755,7 +783,8 @@ actor ExchangeProvider: EmailProvider {
             data = try await requestAbsolute(url: token)
         } else {
             // First call: build OData query
-            let path = "/mailFolders/\(folder)/messages?$select=id&\(topParam(pageSize))&\(orderByReceived)"
+            let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
+            let path = "/mailFolders/\(encodedFolder)/messages?$select=id&\(topParam(pageSize))&\(orderByReceived)"
             data = try await request(path: path)
         }
 
@@ -767,7 +796,8 @@ actor ExchangeProvider: EmailProvider {
     /// Fetch older messages before a given date for infinite scroll.
     func fetchOlderMessages(folder: String, before: Date, limit: Int) async throws -> [MessageHeaderInfo] {
         let filter = "receivedDateTime lt \(iso8601DateTime(before))"
-        let path = "/mailFolders/\(folder)/messages?\(selectMessageHeaderFields)&$filter=\(filter)&\(topParam(limit))&\(orderByReceived)"
+        let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
+        let path = "/mailFolders/\(encodedFolder)/messages?\(selectMessageHeaderFields)&$filter=\(filter)&\(topParam(limit))&\(orderByReceived)"
         let data = try await request(path: path)
         let response = try JSONDecoder().decode(GraphMessageListResponse.self, from: data)
         return response.value.compactMap { parseGraphMessage($0) }
@@ -846,7 +876,8 @@ actor ExchangeProvider: EmailProvider {
         var results: [ExchangeMessageDetail] = []
         for id in ids {
             do {
-                let data = try await request(path: "/messages/\(id)?\(selectMessageDetailFields)")
+                let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+                let data = try await request(path: "/messages/\(encodedId)?\(selectMessageDetailFields)")
                 let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
                 if let header = parseGraphMessage(msg) {
                     results.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
@@ -862,7 +893,8 @@ actor ExchangeProvider: EmailProvider {
     /// Get the current delta link for a folder (used to initialize the incremental sync cursor).
     func getCurrentDeltaLink(folderId: String) async throws -> String? {
         // Request delta with no changes to get the current delta link
-        var nextLink: String? = "/mailFolders/\(folderId)/messages/delta?$select=id&\(topParam(1))"
+        let encodedFolderId = try Self.encodedGraphPathSegment(folderId, context: "Graph folder id")
+        var nextLink: String? = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id&\(topParam(1))"
         var deltaLink: String?
 
         // Walk through all pages to get the final deltaLink
@@ -932,15 +964,36 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Helpers
 
+    /// Graph resource IDs are opaque. Encode them as one strict RFC 3986 path
+    /// segment before composing any resource URL so `/`, `?`, `#`, `+`, and `=`
+    /// cannot alter the route selected by the server.
+    private static let graphPathSegmentAllowed = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+
+    private static func encodedGraphPathSegment(
+        _ value: String,
+        context: String
+    ) throws -> String {
+        guard let encoded = value.addingPercentEncoding(
+            withAllowedCharacters: graphPathSegmentAllowed
+        ) else {
+            throw ProviderError.invalidURL(context)
+        }
+        return encoded
+    }
+
     private func patchMessage(id: String, body: [String: Any]) async throws {
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/\(id)", method: "PATCH", body: jsonData)
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        let _ = try await request(path: "/messages/\(encodedId)", method: "PATCH", body: jsonData)
     }
 
     private func moveMessage(id: String, destinationId: String) async throws {
         let body = ["destinationId": destinationId]
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/\(id)/move", method: "POST", body: jsonData)
+        let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        let _ = try await request(path: "/messages/\(encodedId)/move", method: "POST", body: jsonData)
     }
 
 
