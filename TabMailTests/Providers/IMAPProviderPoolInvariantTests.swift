@@ -1148,11 +1148,934 @@ struct IMAPProviderPoolInvariantTests {
         await joinBounded(waiterB)
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // MARK: - DEFERRED TO T3.7 — assertions the base cannot satisfy yet
-    // ────────────────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════════════════
+    // MARK: - T3.7 (stage b) — the pins that land WITH the pool race fixes
+    // ════════════════════════════════════════════════════════════════════════
     //
-    // Stage (b). Each line names an invariant from the reference contract
+    // Every case below was listed in the `DEFERRED TO T3.7` block that used to
+    // sit at the bottom of this file, and each lands in the same change as the
+    // production fix it pins. The block is now a RECORD of what shipped.
+    //
+    // Because the fixes and their pins land together, "red-first" is recorded
+    // per case as the exact production MUTATION that re-opens the defect, and
+    // what the case then reports. Where the pre-fix code could not even express
+    // the assertion (a seam that did not exist), that is said explicitly.
+
+    // MARK: Invariant 6: action-server creation is single-flighted (D-02 / D-07)
+
+    /// **The property.** Two concurrent action acquires that both find
+    /// `actionServer == nil` must converge on ONE `createServer()` call. The
+    /// loser of a racing pair does not merely waste a connection: it plants its
+    /// own instance over the winner's live slot, so the winner's logged-in
+    /// session is leaked (still counted against the server's per-user cap) while
+    /// its holder keeps using a connection the pool no longer points at.
+    ///
+    /// The detector is the WIRE: exactly one logged-in session exists once both
+    /// acquires have completed. The queue-length check is the mechanism-level
+    /// restatement and is asserted as a setup precondition, so a run in which
+    /// the second acquire never actually contended cannot pass vacuously.
+    ///
+    /// **Red-first evidence.** This is the case the deferred block named as
+    /// D-02's mandatory behavioural detector. The pre-fix pool could not express
+    /// it — `actionServerCreating` / `actionServerCreationWaiters` did not
+    /// exist. Its red proof is the MUTATION `guard !actionServerCreating` →
+    /// unconditional fall-through in `IMAPProvider.ensureServer()`: the second
+    /// acquire then runs its own `createServer()`, `liveSessionCount()` reads 2,
+    /// and (in a DEBUG build) the now-ARMED
+    /// `assertPoolSlotWasNil(actionServer, "actionServer (ensureServer create)")`
+    /// traps the process first. That trap was already observed on this base by
+    /// the T0.8 fuzzer at seed 8131249127217430530 — see the T3.7 record below,
+    /// which preserves the `mutLog` tail.
+    @Test("two concurrent action acquires open exactly ONE connection — the second queues behind the in-flight creation instead of racing its own createServer()")
+    func concurrentActionAcquiresOpenExactlyOneConnection() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 81, id: "t37-action-singleflight@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        // Park the CREATOR inside `ensureServer()`, after `createServer()`
+        // returned but BEFORE the plant. While it is parked the slot is still
+        // nil and the single-flight flag is the ONLY thing that can stop a
+        // second acquire from starting its own connection — exactly the window
+        // the pre-fix pool left open.
+        let creatorPark = ParkSlot(nil)
+        defer { unpark(creatorPark) }
+        let creatorEntries = Mutex<Int>(0)
+        await provider.setAcquireActionConnectionRaceTestHookForTesting {
+            let index = creatorEntries.withLock { (n: inout Int) -> Int in n += 1; return n }
+            guard index == 1 else { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                creatorPark.withLock { $0 = cont }
+            }
+        }
+
+        let creator = Task { _ = try await provider.folderStatus(path: "INBOX") }
+        let parked = await waitUntil { creatorPark.withLock { $0 } != nil }
+        #expect(parked, "setup: no task ever parked inside ensureServer()'s create window")
+        guard parked else { return }
+
+        let second = Task { _ = try await provider.folderStatus(path: "INBOX") }
+        let queued = await waitUntilAsync { await provider.actionServerCreationWaiterCountForTesting() == 1 }
+        let queuedSnapshot = await provider.poolStateSnapshotForTesting()
+        #expect(queued, "setup: the second acquire never contended with the in-flight creation, so this run proves nothing — \(queuedSnapshot)")
+
+        // THE EVENT: the creator plants and hands the SAME instance to the
+        // queued waiter.
+        unpark(creatorPark)
+        let creatorResult = await joinBounded(creator)
+        let secondResult = await joinBounded(second)
+
+        // THE INVARIANT.
+        let snapshot = await provider.poolStateSnapshotForTesting()
+        #expect(server.liveSessionCount() == 1, "two acquires opened \(server.liveSessionCount()) logged-in sessions — the action-server create path is not single-flighted, so one connection was planted over and leaked — \(snapshot)")
+        #expect(creatorEntries.withLock { $0 } == 1, "the create window was entered \(creatorEntries.withLock { $0 }) times — a SECOND createServer() ran for the action slot — \(snapshot)")
+        if case .failure(let error)? = creatorResult {
+            Issue.record("the creating acquire failed: \(error)")
+        }
+        if case .failure(let error)? = secondResult {
+            Issue.record("the queued acquire failed instead of receiving the creator's connection: \(error)")
+        }
+    }
+
+    // MARK: Invariant 7: a torn-down ACTION epoch never mutates its successor (D-01 / D-16)
+
+    /// The action-pool sibling of
+    /// `zombieFolderReleaseNeverTouchesSuccessorEpochHolder`.
+    ///
+    /// **The property.** When `markDirty()` tears the pool down while a task is
+    /// mid-`withActionConnection*`, that task is a zombie: a *different* task
+    /// may already hold a fresh action connection under the new epoch. The
+    /// zombie must release NOTHING — otherwise it strips the live holder's
+    /// `actionInUse` mark, and a third acquire then checks the SAME socket out
+    /// concurrently. SwiftMail serializes individual commands, not command
+    /// SEQUENCES, so a second SELECT can interpose between the live holder's
+    /// SELECT and its UID command: a wrong-mailbox mutation, i.e. a direct C3
+    /// violation with no epoch swap required.
+    ///
+    /// **Red-first evidence.** Delete `let acquiredGeneration = generation` and
+    /// both generation guards from `IMAPProvider.withActionConnectionNoSelect`
+    /// (the pre-fix shape — the wrapper had NO generation awareness at all). The
+    /// zombie's `releaseActionConnection(healthy: true)` then runs against the
+    /// successor epoch and clears its mark: the case fails on "the zombie's
+    /// release stripped the successor's actionInUse mark".
+    @Test("an action task whose epoch was torn down mid-body must release NOTHING — the successor epoch's holder keeps the action connection and its mark")
+    func zombieActionReleaseNeverTouchesSuccessorEpochHolder() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 82, id: "t37-action-zombie@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        let zombiePark = ParkSlot(nil)
+        defer { unpark(zombiePark) }
+        let successorPark = ParkSlot(nil)
+        defer { unpark(successorPark) }
+        let entrants = Mutex<Int>(0)
+
+        // Index-based parking rather than a self-disarming hook: each entrant
+        // parks a DISTINCT slot, so two entrants can never overwrite one
+        // another's `CheckedContinuation` (which would trap the whole process
+        // with SWIFT TASK CONTINUATION MISUSE rather than fail this case).
+        await provider.setActionConnectionTestHookForTesting {
+            let index = entrants.withLock { (n: inout Int) -> Int in n += 1; return n }
+            if index == 1 {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    zombiePark.withLock { $0 = cont }
+                }
+            } else if index == 2 {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    successorPark.withLock { $0 = cont }
+                }
+            }
+        }
+
+        let zombie = Task { _ = try await provider.folderStatus(path: "INBOX") }
+        let zombieParked = await waitUntil { zombiePark.withLock { $0 } != nil }
+        #expect(zombieParked, "setup: no action task ever parked inside its checkout window")
+        guard zombieParked else { return }
+
+        let epochBefore = await epoch(of: provider)
+        await provider.markDirty()
+        let epochAfter = await epoch(of: provider)
+        #expect(epochAfter != epochBefore, "setup: markDirty() did not advance the pool epoch")
+
+        // A successor takes the action lane under the NEW epoch and parks
+        // holding it.
+        let successor = Task { _ = try await provider.folderStatus(path: "INBOX") }
+        let successorParked = await waitUntil { successorPark.withLock { $0 } != nil }
+        #expect(successorParked, "setup: the successor never took the action connection under the new epoch")
+        guard successorParked else {
+            unpark(zombiePark)
+            _ = await joinBounded(zombie)
+            return
+        }
+        let successorInstance = await provider.currentActionServerForTesting()
+        #expect(successorInstance != nil, "setup: the successor holds no tracked action connection")
+
+        // THE EVENT: the zombie resumes into the successor's epoch.
+        unpark(zombiePark)
+        let zombieResult = await joinBounded(zombie)
+
+        // THE INVARIANT.
+        let snapshot = await provider.poolStateSnapshotForTesting()
+        let stillMarked = await provider.actionInUseForTesting()
+        #expect(stillMarked, "the zombie's release stripped the successor's actionInUse mark — the same socket is now checkable out twice — \(snapshot)")
+        let stillTracked = await provider.currentActionServerForTesting()
+        #expect(stillTracked === successorInstance, "the zombie's release dropped or replaced the successor's connection — \(snapshot)")
+        if case .success? = zombieResult {
+            Issue.record("the zombie completed as if its epoch were still current — the pre-body re-validation never fired — \(snapshot)")
+        }
+
+        unpark(successorPark)
+        _ = await joinBounded(successor)
+    }
+
+    // MARK: Invariant 8: a healthy release with nothing to hand off never wedges the lane (D-06)
+
+    /// **The property.** A healthy `releaseActionConnection` whose slot is NIL
+    /// under an UNCHANGED generation has nothing to transfer. Handing the queue
+    /// a fictitious transfer is the action-lane WEDGE: the dequeued waiter
+    /// correctly refuses (it cannot tell the bare `actionInUse` Bool from a
+    /// successor holder's mark, so releasing there would clobber a live
+    /// checkout — ADR-IOS-059), and the mark is then stuck `true` with no live
+    /// holder while every remaining waiter parks forever.
+    ///
+    /// The invariant is therefore two-sided and is asserted as such: the waiter
+    /// must get a RETRYABLE refusal, **and** the lane must be left free.
+    ///
+    /// **Red-first evidence.** Delete the `guard actionServer != nil` degenerate
+    /// cleanup from `IMAPProvider.releaseActionConnection`'s healthy branch (the
+    /// pre-fix shape). The release then dequeues and resumes the waiter, whose
+    /// own tail throws for retry — but nobody clears `actionInUse`, so the case
+    /// fails on "the action lane was left marked in use with no holder".
+    @Test("a healthy action release with a NIL slot refuses the handoff — every parked waiter is failed for retry and the lane is left FREE, never wedged")
+    func healthyActionReleaseWithNilSlotFailsWaitersInsteadOfWedgingTheLane() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 83, id: "t37-action-nilslot@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        let holderPark = ParkSlot(nil)
+        defer { unpark(holderPark) }
+        let entrants = Mutex<Int>(0)
+        await provider.setActionConnectionTestHookForTesting {
+            let index = entrants.withLock { (n: inout Int) -> Int in n += 1; return n }
+            guard index == 1 else { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                holderPark.withLock { $0 = cont }
+            }
+        }
+
+        let holder = Task { _ = try await provider.folderStatus(path: "INBOX") }
+        let held = await waitUntil { holderPark.withLock { $0 } != nil }
+        #expect(held, "setup: no task ever parked holding the action connection")
+        guard held else { return }
+
+        let waiter = Task { _ = try await provider.folderStatus(path: "INBOX") }
+        let queued = await waitUntilAsync { await provider.actionWaiterCountForTesting() == 1 }
+        #expect(queued, "setup: no waiter ever queued behind the action holder")
+        guard queued else {
+            unpark(holderPark)
+            _ = await joinBounded(holder)
+            _ = await joinBounded(waiter)
+            return
+        }
+
+        // Manufacture the bumpless nil slot the invariant-#5 backstop exists
+        // for. `clearActionServerForTesting()` performs NO teardown and NO
+        // generation bump — production reaches the same state through an
+        // unhealthy release or keepalive's failure leg, neither of which bumps.
+        // (This deliberately leaves the instance without an R12-F1 disposition;
+        // the object-lifecycle oracle is not installed in this case.)
+        await provider.clearActionServerForTesting()
+
+        // THE EVENT: the holder's healthy release finds nothing to hand over.
+        unpark(holderPark)
+        _ = await joinBounded(holder)
+        let waiterResult = await joinBounded(waiter)
+
+        // THE INVARIANT.
+        let snapshot = await provider.poolStateSnapshotForTesting()
+        let stillMarked = await provider.actionInUseForTesting()
+        #expect(stillMarked == false, "the action lane was left marked in use with no holder — every later acquire parks forever — \(snapshot)")
+        #expect(await provider.actionWaiterCountForTesting() == 0, "a waiter was left parked behind a connection that does not exist — \(snapshot)")
+        switch waiterResult {
+        case .success?:
+            Issue.record("the waiter was handed a transfer that could not exist — \(snapshot)")
+        case .failure(let error)?:
+            #expect(isNotConnected(error), "the refusal must be the RETRYABLE ProviderError.notConnected every fail-all sweep uses, not \(error)")
+        case nil:
+            break // joinBounded already recorded the missed deadline.
+        }
+    }
+
+    // MARK: Invariant 9: disconnect() is atomic between its bump and its wipe (D-15)
+
+    /// **The property.** `disconnect()` must advance `generation` and complete
+    /// its ENTIRE wipe — every slot, every mark, every waiter queue — in ONE
+    /// synchronous actor turn, before it awaits a single LOGOUT. Pre-fix it
+    /// bumped and then awaited each logout INLINE with the fields still
+    /// populated: an acquire landing in that window read the ALREADY-bumped
+    /// generation (so every one of its own guards was trivially satisfied) and
+    /// was handed a connection `disconnect()` was about to steal, with no
+    /// FURTHER bump to signal the theft. Worst tier: that stolen-mark holder's
+    /// later healthy release fires the ownership-reserving handoff on FICTITIOUS
+    /// ownership — two holders on one `IMAPServer`.
+    ///
+    /// `disconnectPostWipeTestHook` fires at the ONLY point that window can be
+    /// observed from: after the wipe, before the first awaited logout. On the
+    /// fixed code everything the contract tracks is already empty there.
+    ///
+    /// **Red-first evidence.** Move the hook call to immediately after
+    /// `generation += 1` (its pre-fix position, before the captures and the
+    /// wipe) and the observed snapshot still carries the action connection, the
+    /// folder connection and the in-use marks — the case fails on every field
+    /// assertion below. Reverting the bump itself fails the epoch assertion.
+    @Test("disconnect() advances the epoch and finishes its ENTIRE wipe before awaiting any logout — no task can observe a half-torn-down pool")
+    func disconnectWipesEveryFieldInOneSynchronousTurnBeforeAwaitingLogouts() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 84, id: "t37-disconnect-atomic@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        // One connection in EACH lane, so the observation covers both.
+        _ = try await provider.folderStatus(path: "INBOX")
+        _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        #expect(await provider.currentActionServerForTesting() != nil, "setup: no action connection")
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX"), "setup: no pinned INBOX connection")
+        let epochBefore = await epoch(of: provider) ?? -1
+
+        let observed = Mutex<String?>(nil)
+        await provider.setDisconnectPostWipeTestHookForTesting { [provider] in
+            let snapshot = await provider.poolStateSnapshotForTesting()
+            observed.withLock { $0 = snapshot }
+        }
+
+        // THE EVENT.
+        try await provider.disconnect()
+        // Uninstall before the `defer`'s second disconnect, so the observation
+        // below is unambiguously this one's (and the hook's capture of
+        // `provider` does not outlive the case).
+        await provider.setDisconnectPostWipeTestHookForTesting(nil)
+
+        // THE INVARIANT — read from the snapshot taken INSIDE disconnect().
+        guard let midTeardown = observed.withLock({ $0 }) else {
+            Issue.record("disconnect() never reached its post-wipe observation point")
+            return
+        }
+        let midEpoch = midTeardown
+            .split(separator: " ")
+            .first { $0.hasPrefix("generation=") }
+            .flatMap { Int($0.dropFirst("generation=".count)) }
+        #expect(midEpoch == epochBefore + 1, "disconnect() must advance the epoch BEFORE tearing anything down — \(midTeardown)")
+        #expect(midTeardown.contains("actionServer=nil"), "the action slot was still populated when the first logout was awaited — \(midTeardown)")
+        #expect(midTeardown.contains("actionInUse=false"), "an in-use mark survived into the awaited-logout window — \(midTeardown)")
+        #expect(midTeardown.contains("actionWaiters=0"), "an action waiter survived into the awaited-logout window — \(midTeardown)")
+        #expect(midTeardown.contains("folderServers=[]"), "a folder slot was still populated when the first logout was awaited — \(midTeardown)")
+        #expect(midTeardown.contains("folderInUse=[]"), "a folder in-use mark survived into the awaited-logout window — \(midTeardown)")
+        #expect(midTeardown.contains("folderCapacityWaiters=0"), "a capacity waiter survived into the awaited-logout window — \(midTeardown)")
+    }
+
+    // MARK: Invariant 10: a capacity-starved acquire is woken by ANY freed slot (D-14 / R10-F1)
+
+    /// **The property.** An acquire that reaches the connection cap with nothing
+    /// evictable must park where the event it is waiting for can reach it. The
+    /// event is *some OTHER folder's slot freeing*; `folderWaiters[its own
+    /// folder]` is served only by SAME-folder events, so a singleton acquire for
+    /// a traffic-less folder parked there is structurally unwakeable. That is a
+    /// liveness hole, not a scheduling artifact: nothing in the pool will ever
+    /// deliver the wake.
+    ///
+    /// **Red-first evidence.** Point the capacity branch in
+    /// `IMAPProvider.createFolderConnection` back at
+    /// `folderWaiters[folder, default: []].append(cont)` (its pre-fix queue).
+    /// The INBOX holder's healthy release then touches only
+    /// `folderWaiters["INBOX"]`, the Archive acquire is never resumed, and
+    /// `joinBounded` records "a spawned acquire never finished … it is still
+    /// parked". The `folderWaiterCountForTesting(folder: "Archive") == 0`
+    /// precondition below fails in the same run, naming the wrong queue
+    /// directly.
+    @Test("an acquire parked at the connection cap is woken when ANOTHER folder's slot frees — a capacity waiter is never queued behind same-folder-only events")
+    func capacityParkedAcquireIsWokenWhenAnotherFoldersSlotFrees() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: [
+                "INBOX": [Self.message(uid: 85, id: "t37-capacity-inbox@example.com")],
+                "Archive": [Self.message(uid: 86, id: "t37-capacity-archive@example.com")],
+            ]
+        )
+        try server.start()
+        defer { server.stop() }
+        // Exactly ONE folder slot: `maxFolderConnections` is
+        // `max(1, limit - (reservedConnections - 1))` while IDLE is off, and
+        // `IMAPProvider.init` seeds its limit from this host+username key.
+        IMAPProvider.persistServerLimit(2, host: "127.0.0.1", username: server.username)
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+        #expect(await provider.poolMaxConnections() == 1, "setup: the pool must have exactly one folder slot for this case")
+
+        let holderPark = ParkSlot(nil)
+        defer { unpark(holderPark) }
+        let entrants = Mutex<Int>(0)
+        await provider.setFolderConnectionTestHookForTesting { _ in
+            let index = entrants.withLock { (n: inout Int) -> Int in n += 1; return n }
+            guard index == 1 else { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                holderPark.withLock { $0 = cont }
+            }
+        }
+
+        let holder = Task { _ = try? await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0) }
+        let held = await waitUntil { holderPark.withLock { $0 } != nil }
+        #expect(held, "setup: no task ever parked holding the single folder slot")
+        guard held else { return }
+
+        // A DIFFERENT folder now needs that one slot. Nothing is evictable
+        // (INBOX is checked out) and IDLE is off, so this acquire must park.
+        let starved = Task { _ = try await provider.fetchMessages(folder: "Archive", limit: 1, offset: 0) }
+        let parked = await waitUntilAsync { await provider.folderCapacityWaiterCountForTesting() == 1 }
+        let parkedSnapshot = await provider.poolStateSnapshotForTesting()
+        #expect(parked, "the capacity-starved acquire never parked in the capacity queue — \(parkedSnapshot)")
+        let ownQueue = await provider.folderWaiterCountForTesting(folder: "Archive")
+        #expect(ownQueue == 0, "the capacity-starved acquire parked in its OWN folder's queue, which only same-folder events serve — nothing will ever wake it — \(parkedSnapshot)")
+        guard parked else {
+            unpark(holderPark)
+            await joinBounded(holder)
+            _ = await joinBounded(starved)
+            return
+        }
+
+        // THE EVENT: the OTHER folder's holder releases healthy with no
+        // same-folder waiter. That release is the only thing that can ever free
+        // the slot this acquire needs.
+        unpark(holderPark)
+        await joinBounded(holder)
+
+        // THE INVARIANT: the parked acquire is woken, re-runs its own eviction
+        // pass against the now-free slot, and completes.
+        let starvedResult = await joinBounded(starved)
+        let finalSnapshot = await provider.poolStateSnapshotForTesting()
+        switch starvedResult {
+        case .success?:
+            break
+        case .failure(let error)?:
+            Issue.record("the woken capacity waiter failed instead of claiming the freed slot: \(error) — \(finalSnapshot)")
+        case nil:
+            break // joinBounded already recorded the missed deadline.
+        }
+    }
+
+    // MARK: Invariant 11: a logged-in session is never abandoned (D-13 / R11-H2)
+
+    /// **The property.** `createFolderConnection` performs LOGIN and then SELECT.
+    /// When the SELECT fails, the connection is already logged in — abandoning it
+    /// leaks a live session nothing will ever track or tear down again, and it
+    /// still counts against the server's per-user connection cap, which makes the
+    /// very limit error the surrounding branch exists to handle WORSE.
+    ///
+    /// **Red-first evidence.** Delete the `if let createdServer { … logout() }`
+    /// block from `IMAPProvider.createFolderConnection`'s catch (the pre-fix
+    /// shape, which threw without ever naming the local). No LOGOUT reaches the
+    /// wire and the bounded wait below expires: "the SELECT-failed session was
+    /// abandoned without a logout attempt".
+    @Test("a folder creation whose LOGIN succeeded but whose SELECT failed logs that session out — it is never abandoned")
+    func folderCreationLogsOutTheSessionWhoseSelectFailed() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 87, id: "t37-select-fail-logout@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        // Object-layer disposition mark — the wire-level counters cannot make
+        // this claim (see `FakeIMAPServer.liveSessionCount()`'s own note).
+        let logoutAttempts = Mutex<Int>(0)
+        provider.setLogoutAttemptTestHookForTesting { _ in
+            logoutAttempts.withLock { $0 += 1 }
+        }
+        defer { provider.setLogoutAttemptTestHookForTesting(nil) }
+
+        server.failNextCommand(containing: "SELECT")
+
+        // THE EVENT.
+        let attempt = Task { _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0) }
+        let result = await joinBounded(attempt)
+        if case .success? = result {
+            Issue.record("the acquire succeeded even though its SELECT was rejected")
+        }
+
+        // THE INVARIANT.
+        #expect(server.consumedInjectedFailureCount() == 1, "non-vacuity: the injected SELECT failure never fired, so nothing about the abandon path was exercised")
+        let attempted = await waitUntil { logoutAttempts.withLock { $0 } >= 1 }
+        #expect(attempted, "the SELECT-failed session was abandoned without a logout attempt — it stays logged in and counted against the server's cap")
+        let sawWireLogout = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("LOGOUT") } }
+        #expect(sawWireLogout, "no LOGOUT reached the wire for the abandoned session")
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX") == false, "a folder whose SELECT failed must not be left tracked")
+    }
+
+    // MARK: Invariant 12: eviction never reports a PHANTOM success (D-18)
+
+    /// **The property.** `folderLastUsed` is DOUBLE-KEYED: besides real folders
+    /// it carries `"__action__"`, the action lane's own liveness timestamp,
+    /// which never has a `folderServers` entry. If that key can be chosen as the
+    /// LRU candidate, `evictLRUFolder()` returns `true` having freed NOTHING —
+    /// a phantom eviction that authorizes a doomed immediate retry in
+    /// `createFolderConnection`'s limit-retry caller and breaks the capacity
+    /// loop's variant, whose "eviction succeeded" arm requires the measured
+    /// quantity to have strictly decreased. It also deletes the action lane's
+    /// liveness stamp as a side effect.
+    ///
+    /// Two-sided by construction: with the only real folder checked out the
+    /// answer must be `false`; with it free the SAME call must evict it.
+    ///
+    /// **Red-first evidence.** Restore the pre-fix candidate filter
+    /// (`folderLastUsed.filter { !folderInUse.contains($0.key) }`, without the
+    /// `folderServers[$0.key] != nil` conjunct) in
+    /// `IMAPProvider.evictLRUFolder()`: `"__action__"` is the oldest key, the
+    /// call returns `true`, and the case fails on "eviction reported success
+    /// having freed no connection".
+    @Test("evictLRUFolder() never reports success for the action lane's `__action__` timestamp — a phantom eviction frees no slot")
+    func evictLRUFolderNeverPicksTheActionLaneTimestampKey() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 88, id: "t37-phantom-evict@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX"), "setup: INBOX has no pinned connection")
+        await provider.setFolderInUseForTesting(folder: "INBOX", inUse: true)
+
+        // Make `"__action__"` strictly the oldest key, so only the
+        // owns-a-connection filter can keep it out of the candidate set. Both
+        // stamps derive from the current clock (Testing Rule 7).
+        let now = Date()
+        await provider.setFolderLastUsedForTesting(now.addingTimeInterval(-7200), folder: "__action__")
+        await provider.setFolderLastUsedForTesting(now.addingTimeInterval(-60), folder: "INBOX")
+
+        // THE EVENT (phase 1) — nothing is evictable.
+        let phantom = await provider.evictLRUFolderForTesting()
+        var snapshot = await provider.poolStateSnapshotForTesting()
+        #expect(phantom == false, "eviction reported success having freed no connection — its caller reads that as a real slot and retries into the same cap — \(snapshot)")
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX"), "the checked-out connection was evicted — \(snapshot)")
+
+        // Phase 2 — non-vacuity: the same call must still evict a genuinely
+        // free folder, so phase 1's `false` cannot be "eviction never works".
+        await provider.setFolderInUseForTesting(folder: "INBOX", inUse: false)
+        let real = await provider.evictLRUFolderForTesting()
+        snapshot = await provider.poolStateSnapshotForTesting()
+        #expect(real, "eviction found no candidate even though a free pinned connection existed — \(snapshot)")
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX") == false, "the free folder was not the one evicted — \(snapshot)")
+    }
+
+    // MARK: Invariant 13: keepalive re-validates AFTER its own NOOP (D-08 / D-09)
+
+    /// **The property.** The keepalive pass filters on `!folderInUse` BEFORE its
+    /// NOOP await. A concurrent acquire's mark flip is synchronous with zero
+    /// intervening await of its own, so it lands entirely inside that NOOP
+    /// window: the failure leg must re-check the precondition AFTER the await or
+    /// it deletes the tracking of a checkout that began during the probe.
+    ///
+    /// **Red-first evidence.** Drop `!folderInUse.contains(folder)` from the
+    /// guard in `IMAPProvider.keepAlivePinnedConnections`'s folder failure leg
+    /// (leaving only the identity conjunct — the pre-fix shape, which tested
+    /// in-use ONLY in the loop's `where` clause). The connection is removed and
+    /// the case fails on "keepalive dropped a connection that was checked out
+    /// during its own probe".
+    @Test("keepalive re-checks the in-use mark AFTER its NOOP — a checkout that begins inside the probe window is never dropped")
+    func keepaliveRechecksInUseAfterItsOwnNoop() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 89, id: "t37-keepalive-inuse@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX"), "setup: INBOX has no pinned connection")
+
+        // A REAL socket death on the NOOP — `killConnectionOnNextCommand` is the
+        // only faithful way to drive a "dead connection" branch (a plain
+        // injected NO leaves the fake's session alive).
+        server.killConnectionOnNextCommand(containing: "NOOP")
+        await provider.setKeepAliveFolderRaceTestHookForTesting { [provider] folder in
+            await provider.setKeepAliveFolderRaceTestHookForTesting(nil)
+            // The concurrent acquire's zero-await mark flip, landing entirely
+            // inside the NOOP window.
+            await provider.setFolderInUseForTesting(folder: folder, inUse: true)
+        }
+
+        // THE EVENT.
+        await provider.keepAlivePinnedConnectionsForTesting()
+
+        // THE INVARIANT.
+        let snapshot = await provider.poolStateSnapshotForTesting()
+        #expect(server.consumedInjectedFailureCount() == 1, "non-vacuity: keepalive never NOOPed the connection, so its failure leg was never reached — \(snapshot)")
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX"), "keepalive dropped a connection that was checked out during its own probe — the holder's next command goes to a slot the pool no longer tracks — \(snapshot)")
+
+        await provider.setFolderInUseForTesting(folder: "INBOX", inUse: false)
+    }
+
+    /// The identity half of the same guard.
+    ///
+    /// **The property.** Keepalive must remove `folderServers[folder]` only when
+    /// the slot still holds the EXACT instance whose NOOP failed. A teardown +
+    /// recreate landing inside the probe window leaves a healthy SUCCESSOR under
+    /// the same key; removing it by key alone wipes a live entry with no logout
+    /// (a leaked socket) and no generation awareness.
+    ///
+    /// **Red-first evidence.** Replace the failure leg's guard in
+    /// `IMAPProvider.keepAlivePinnedConnections` with an unconditional
+    /// `folderServers.removeValue(forKey: folder)` (the pre-fix shape). The
+    /// successor is deleted and the case fails on "keepalive removed the
+    /// SUCCESSOR connection".
+    @Test("keepalive removes a dead folder connection ONLY when the slot still holds the instance it probed — a successor planted during the probe survives")
+    func keepaliveIdentityGuardSparesASuccessorPlantedDuringItsProbe() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 90, id: "t37-keepalive-identity@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        let probed = await provider.currentFolderServerForTesting(folder: "INBOX")
+        #expect(probed != nil, "setup: INBOX has no pinned connection")
+
+        server.killConnectionOnNextCommand(containing: "NOOP")
+        await provider.setKeepAliveFolderRaceTestHookForTesting { [provider] _ in
+            await provider.setKeepAliveFolderRaceTestHookForTesting(nil)
+            // A teardown-and-recreate landing entirely inside the NOOP window:
+            // the slot now holds a DIFFERENT, healthy instance. (The dropped
+            // instance is deliberately left without an R12-F1 disposition; the
+            // object-lifecycle oracle is not installed in this case.)
+            await provider.clearFolderServerForTesting(folder: "INBOX")
+            _ = try? await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        }
+
+        // THE EVENT.
+        await provider.keepAlivePinnedConnectionsForTesting()
+
+        // THE INVARIANT.
+        let snapshot = await provider.poolStateSnapshotForTesting()
+        #expect(server.consumedInjectedFailureCount() == 1, "non-vacuity: keepalive never NOOPed the probed connection — \(snapshot)")
+        let successor = await provider.currentFolderServerForTesting(folder: "INBOX")
+        #expect(successor != nil, "keepalive removed the SUCCESSOR connection — a healthy entry wiped by a probe that belonged to a different instance — \(snapshot)")
+        #expect(successor !== probed, "setup: the hook never actually replaced the tracked instance, so the identity guard was not exercised — \(snapshot)")
+    }
+
+    // MARK: Invariant 14: an in-flight creation survives a teardown's flag wipe (D-12)
+
+    /// **The property.** `markDirty()` does not cancel an in-flight
+    /// `createFolderConnection`; only that creation's own completion clears its
+    /// `folderCreating` entry. Wiping the flag mid-flight lets a fresh
+    /// same-folder caller see "nobody creating" and start a SECOND creation,
+    /// which then races the first to plant `folderServers[folder]` — the loser's
+    /// logged-in connection is planted over and leaked.
+    ///
+    /// The detector is the number of times `createFolderConnection` is ENTERED
+    /// for this folder, not the flag itself: it is the system property ("no
+    /// second creation was started") rather than the fix's mechanism.
+    ///
+    /// **Red-first evidence.** Re-add `folderCreating.removeAll()` to
+    /// `IMAPProvider.markDirty()` (the pre-fix shape). The second acquire then
+    /// takes the create branch instead of queueing: the creation-window counter
+    /// reads 2 and the case fails on "a SECOND createFolderConnection was
+    /// started for INBOX while the first was still in flight".
+    @Test("markDirty() leaves an in-flight folder creation single-flighted — a concurrent same-folder acquire still queues instead of racing a SECOND createServer()")
+    func markDirtyLeavesAnInFlightFolderCreationSingleFlighted() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 91, id: "t37-markdirty-creating@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        let creationPark = ParkSlot(nil)
+        defer { unpark(creationPark) }
+        let creationEntries = Mutex<Int>(0)
+        await provider.setCreateFolderConnectionCreationTestHookForTesting {
+            let index = creationEntries.withLock { (n: inout Int) -> Int in n += 1; return n }
+            guard index == 1 else { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                creationPark.withLock { $0 = cont }
+            }
+        }
+
+        let creator = Task { _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0) }
+        let creating = await waitUntil { creationPark.withLock { $0 } != nil }
+        #expect(creating, "setup: no task ever parked inside createFolderConnection")
+        guard creating else { return }
+
+        // THE EVENT.
+        await provider.markDirty()
+
+        let second = Task { _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0) }
+        let queued = await waitUntilAsync { await provider.folderWaiterCountForTesting(folder: "INBOX") == 1 }
+        let queuedSnapshot = await provider.poolStateSnapshotForTesting()
+        #expect(queued, "the second same-folder acquire did not queue behind the in-flight creation — \(queuedSnapshot)")
+
+        unpark(creationPark)
+        _ = await joinBounded(creator)
+        _ = await joinBounded(second)
+
+        // THE INVARIANT.
+        let entries = creationEntries.withLock { $0 }
+        let snapshot = await provider.poolStateSnapshotForTesting()
+        #expect(entries == 1, "a SECOND createFolderConnection was started for INBOX while the first was still in flight — markDirty() cleared folderCreating out from under it (\(entries) entries) — \(snapshot)")
+    }
+
+    // MARK: Invariant 15: the IDLE lane never clobbers itself (D-20 / D-21 / D-22)
+
+    /// **The property.** `launchIdleConnection` is deliberately callable
+    /// concurrently — `startIdle`, the stream-end retry timer and the
+    /// post-eviction relaunch are not mutually exclusive. Two launches that both
+    /// find `idleServer == nil` must therefore resolve at the CLAIM: exactly one
+    /// becomes the tracked connection and the loser logs ITSELF out. Planting
+    /// unconditionally leaks the winner's logged-in session, which still counts
+    /// against the server's per-user cap.
+    ///
+    /// **Red-first evidence.** Replace `claimIdleServerSlot(fresh)` with the
+    /// pre-fix unconditional `idleServer = fresh` in
+    /// `IMAPProvider.launchIdleConnection`. The parked (losing) launch then
+    /// overwrites the winner: the case fails on "the losing launch overwrote the
+    /// tracked IDLE connection" and no LOGOUT is ever attempted for it.
+    @Test("two overlapping IDLE launches leave exactly ONE tracked connection — the loser logs ITSELF out instead of clobbering the winner")
+    func overlappingIdleLaunchesResolveAtTheClaimAndTheLoserLogsItselfOut() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 92, id: "t37-idle-claim@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        let logoutAttempts = Mutex<Int>(0)
+        provider.setLogoutAttemptTestHookForTesting { _ in logoutAttempts.withLock { $0 += 1 } }
+        defer { provider.setLogoutAttemptTestHookForTesting(nil) }
+
+        let launchPark = ParkSlot(nil)
+        defer { unpark(launchPark) }
+        let launchEntries = Mutex<Int>(0)
+        await provider.setIdleLaunchPlantRaceTestHookForTesting {
+            let index = launchEntries.withLock { (n: inout Int) -> Int in n += 1; return n }
+            guard index == 1 else { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                launchPark.withLock { $0 = cont }
+            }
+        }
+
+        await provider.startIdle { _, _ in }
+        let firstParked = await waitUntil { launchPark.withLock { $0 } != nil }
+        #expect(firstParked, "setup: the first IDLE launch never reached its pre-claim window")
+        guard firstParked else {
+            await provider.stopIdle()
+            return
+        }
+        #expect(await provider.currentIdleServerForTesting() == nil, "setup: the parked launch already claimed the slot")
+
+        // A second, overlapping launch — the exact shape the retry timer and the
+        // post-eviction relaunch produce in production.
+        await provider.relaunchIdleConnectionForTesting()
+        let winnerClaimed = await waitUntilAsync { await provider.currentIdleServerForTesting() != nil }
+        #expect(winnerClaimed, "setup: the second launch never claimed the IDLE slot")
+        guard winnerClaimed else {
+            unpark(launchPark)
+            await provider.stopIdle()
+            return
+        }
+        let winner = await provider.currentIdleServerForTesting()
+        let attemptsBefore = logoutAttempts.withLock { $0 }
+
+        // THE EVENT: the losing launch resumes into an already-claimed slot.
+        unpark(launchPark)
+
+        // THE INVARIANT.
+        let loserDisposed = await waitUntil { logoutAttempts.withLock { $0 } > attemptsBefore }
+        #expect(loserDisposed, "the losing launch never attempted a logout — its logged-in session is leaked")
+        let tracked = await provider.currentIdleServerForTesting()
+        #expect(tracked === winner, "the losing launch overwrote the tracked IDLE connection — the winner's session is now untracked and leaked")
+
+        await provider.stopIdle()
+    }
+
+    /// **The property.** A superseded IDLE listener's stream-end must tear down
+    /// only its OWN connection. If it clears `idleServer` unconditionally it
+    /// kills a healthy successor that a LATER launch already planted, and then
+    /// schedules a redundant relaunch on top of it.
+    ///
+    /// **Red-first evidence.** Restore the pre-fix
+    /// `onIdleStreamEnded(delay:)` — read `idleServer` directly, log it out, nil
+    /// it — and the stale owner's stream-end wipes the successor: the case fails
+    /// on "a superseded listener tore down the healthy successor".
+    @Test("a superseded IDLE listener's stream-end tears down only its OWN connection — the healthy successor is left tracked")
+    func supersededIdleListenerStreamEndSparesTheSuccessor() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 93, id: "t37-idle-stale-owner@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        await provider.startIdle { _, _ in }
+        let firstReady = await waitUntilAsync { await provider.currentIdleServerForTesting() != nil }
+        #expect(firstReady, "setup: the IDLE lane never opened")
+        guard firstReady, let stale = await provider.currentIdleServerForTesting() else {
+            await provider.stopIdle()
+            return
+        }
+
+        // Manufacture the successor: free the slot without a teardown and let a
+        // fresh launch claim it. (The stale instance is deliberately left
+        // without an R12-F1 disposition; the object-lifecycle oracle is not
+        // installed in this case.)
+        await provider.clearIdleServerForTesting()
+        await provider.relaunchIdleConnectionForTesting()
+        let successorReady = await waitUntilAsync {
+            let current = await provider.currentIdleServerForTesting()
+            return current != nil && current !== stale
+        }
+        #expect(successorReady, "setup: no distinct successor IDLE connection was ever claimed")
+        guard successorReady, let successor = await provider.currentIdleServerForTesting() else {
+            await provider.stopIdle()
+            return
+        }
+
+        // THE EVENT: the SUPERSEDED listener's stream ends.
+        await provider.simulateIdleStreamEndedForTesting(owner: stale)
+
+        // THE INVARIANT.
+        let tracked = await provider.currentIdleServerForTesting()
+        #expect(tracked === successor, "a superseded listener tore down the healthy successor — the IDLE lane is now dark until an unrelated relaunch")
+
+        await provider.stopIdle()
+    }
+
+    /// **The property.** `markDirty()` must send DONE before LOGOUT on an ACTIVE
+    /// IDLE session. SwiftMail's `executeCommandBody` calls
+    /// `waitForIdleCompletionIfNeeded()` before EVERY command including LOGOUT,
+    /// so a bare LOGOUT against a live IDLE session stalls behind
+    /// `waitForIdleHandlerCompletion`'s hard-coded 15s internal timeout before
+    /// force-resetting the connection — blowing `markDirty()`'s own "costs 1-3s"
+    /// contract for that socket's cleanup. `stopIdle()` already did this;
+    /// `markDirty()` did not.
+    ///
+    /// **Red-first evidence.** Drop `sendDoneFirst: true` from `markDirty()`'s
+    /// IDLE teardown in `IMAPProvider` (the pre-fix shape). No DONE reaches the
+    /// wire and the bounded wait below expires.
+    @Test("markDirty() sends DONE before LOGOUT for an ACTIVE IDLE session — the logout never stalls behind SwiftMail's IDLE-completion timeout")
+    func markDirtySendsDoneBeforeLogoutForAnActiveIdleSession() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 94, id: "t37-idle-done@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        await provider.startIdle { _, _ in }
+        let idling = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("IDLE") } }
+        #expect(idling, "setup: the IDLE command never reached the wire")
+        guard idling else {
+            await provider.stopIdle()
+            return
+        }
+        #expect(server.recordedCommands().contains("DONE") == false, "setup: a DONE was already on the wire before markDirty() ran")
+
+        // THE EVENT.
+        await provider.markDirty()
+
+        // THE INVARIANT.
+        let sawDone = await waitUntil { server.recordedCommands().contains("DONE") }
+        #expect(sawDone, "markDirty() logged an ACTIVE IDLE session out without sending DONE first")
+        let commands = server.recordedCommands()
+        if let doneIndex = commands.firstIndex(of: "DONE"),
+           let logoutIndex = commands.firstIndex(where: { $0.hasPrefix("LOGOUT") }) {
+            #expect(doneIndex < logoutIndex, "DONE must precede LOGOUT on the IDLE session — observed \(commands)")
+        }
+
+        await provider.stopIdle()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MARK: - T3.7 LANDED RECORD (was: DEFERRED TO T3.7)
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Stage (b) has landed. Every D-xx filed below is now FIXED in
+    // `TabMail/Providers/IMAPProvider.swift`. The original filing is preserved
+    // verbatim underneath this table — it is the historical record of what the
+    // base looked like before T3.7 and the source of the banked red evidence
+    // (D-02), so it is deliberately NOT deleted or edited in place. Read every
+    // "is not"/"does not"/"UNARMED" below as PAST TENSE.
+    //
+    //  D-xx  fix landed in (symbol)                    pinned by
+    //  ────  ──────────────────────────────────────    ─────────────────────────
+    //  D-01  withActionConnection{Selection,NoSelect}  zombieActionRelease…
+    //  D-02  ensureServer (single-flight)              concurrentActionAcquires…
+    //  D-03  acquireActionConnection (post-liveness)   pool fuzzer (identity oracle)
+    //  D-04  acquireActionConnection (waiter tail)     pool fuzzer
+    //  D-05  acquireActionConnection (dead-recreate)   pool fuzzer + armed trap
+    //  D-06  releaseActionConnection (nil-slot)        healthyActionReleaseWithNilSlot…
+    //  D-07  ensureServer creation-waiter queue        concurrentActionAcquires…
+    //  D-08  keepAlivePinnedConnections (folder leg)   keepaliveRechecksInUseAfterItsOwnNoop
+    //  D-09  keepAlivePinnedConnections (identity)     keepaliveIdentityGuardSparesASuccessor…
+    //  D-10  acquireFolderConnection branch 1          pool fuzzer (double-checkout oracle)
+    //  D-11  createFolderConnection (limit retry)      pool fuzzer (contract §folderCreating)
+    //  D-12  markDirty (folderCreating survives)       markDirtyLeavesAnInFlightFolderCreation…
+    //  D-13  createFolderConnection (both catches)     folderCreationLogsOutTheSession…
+    //  D-14  createFolderConnection (capacity queue)   capacityParkedAcquireIsWoken…
+    //  D-15  disconnect (bump + wipe, one turn)        disconnectWipesEveryFieldInOne…
+    //  D-16  with*Connection* pre-body guards          zombieActionRelease… + zombieFolderRelease…
+    //  D-17  withFolderConnection (capture AFTER)      zombieFolderRelease… (pre-existing)
+    //  D-18  evictLRUFolder (candidate filter)         evictLRUFolderNeverPicksTheActionLane…
+    //  D-19  plant-over traps: 4 armed of 4            (assert — no case, by design)
+    //  D-20  claimIdleServerSlot                       overlappingIdleLaunchesResolveAtTheClaim…
+    //  D-21  onIdleStreamEnded(owner:)                 supersededIdleListenerStreamEnd…
+    //  D-22  markDirty (sendDoneFirst)                 markDirtySendsDoneBeforeLogout…
+    //  D-23  connect() → ensureServer()                (site eliminated; trap now covers it)
+    //
+    // D-19's inventory moved from "3 armed of 6" to "4 armed of 4": sites 5
+    // (`setIdleServer`) and 6 (`connect()`'s unconditional plant) were
+    // ELIMINATED rather than armed — `claimIdleServerSlot` makes the IDLE
+    // plant-over structurally impossible, and `connect()` now routes through
+    // the single-flighted `ensureServer()`, whose own plant is armed. The
+    // authoritative inventory lives at `assertPoolSlotWasNil`'s doc comment in
+    // `TabMail/Providers/IMAPProvider.swift`; this table is a pointer, not a
+    // second source of truth.
+    //
+    // ── ORIGINAL FILING (T0.6 stage a), PRESERVED VERBATIM ──────────────────
+    //
+    // Each line names an invariant from the reference contract
     // (`v2final`, `TabMailTests/Providers/IMAPProviderPoolInvariantTests.swift`
     // plus the pool-state table in `v2final`'s `TabMail/Providers/
     // IMAPProvider.swift`) that THIS base violates, and why. None of them is
@@ -1467,4 +2390,641 @@ struct IMAPProviderPoolInvariantTests {
     //        trapped there automatically, so no separate trap is ever needed.
     //        The `logMut("connect() PLANTED (UNGUARDED — D-23)")` journal entry
     //        is present so a post-mortem can still see this writer.
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MARK: - T3.7 — the adversarial pool fuzzer (Testing Rule 11)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The connection pool's correctness depends entirely on await-boundary
+/// ordering, so Testing Rule 11 requires it to carry a fuzz suite that is
+/// ADVERSARIAL rather than merely random. The deterministic cases above
+/// REPRODUCE the interleavings T3.7 already knows about; this suite is the only
+/// thing in the file that can DISCOVER one.
+///
+/// It lives in this file rather than a new one on purpose: adding a source file
+/// to `TabMailTests` requires re-running `./Scripts/xcodegen.sh` (the target
+/// materializes explicit file references from `project.yml`), which the item
+/// authoring this suite is not permitted to do.
+///
+/// ## What it randomizes
+/// A seeded `SplitMix64` (declared once at file scope in
+/// `InboxComposeScenarioTests.swift` — reused, never redeclared) draws, per
+/// round: the OPERATION SEQUENCE (weighted over 14 op kinds spanning both
+/// lanes, the IDLE lane, both teardowns, keepalive, eviction and four fault
+/// injections), each op's START OFFSET inside the round's spread window, and
+/// every chaos decision. The thread SCHEDULE is deliberately NOT pinned — the
+/// seed pins the operation sequence, not the interleaving, so repeated runs of
+/// one seed explore different schedules over the same plan.
+///
+/// ## Adversarial, not merely random — Testing Rule 11's three layers
+/// (a) **Seeded fault + latency injection.** `setSeededLatencyInjection`
+///     stretches every command's RTT (weighted to LOGIN/NOOP/SELECT), so the
+///     await windows the pool's failure legs live in become routinely
+///     reachable instead of vanishingly narrow. Four faults are drawn as
+///     ordinary ops: a real dead transport on the next NOOP
+///     (`killConnectionOnNextCommand` — the ONLY faithful way to drive the
+///     four "assume dead, discard without logout" branches), and protocol-level
+///     `NO`s on the next SELECT (D-13's abandon path), LOGIN (`createServer`
+///     failure, i.e. the creation-waiter fail-all) and STATUS (a body failure
+///     under a live checkout).
+/// (b) **PCT-style seeded parking.** ONE identical `chaos.point()` closure is
+///     installed on EVERY await/resume boundary the pool's invariant contract
+///     enumerates — all 16 of them. Per the reference's own reading, the
+///     "no bespoke reproduction hooks" rule forbids scenario CONSTRUCTION, not
+///     the physical boundary: an identical seeded coin flip at every boundary
+///     is generic PCT infrastructure, and no hook here is aimed at a
+///     particular defect.
+/// (c) **Plain yield jitter.** The seeded per-op start spread, plus
+///     `chaos.point()`'s yield branch.
+///
+/// ## What it checks — machine-checkable invariants ONLY
+/// Never an expected-value assertion on a particular schedule. Every op's own
+/// outcome is DISCARDED (`try?`): under injected faults any single op may
+/// legitimately fail, and a retryable refusal is a correct outcome, not a
+/// defect. The oracles are:
+///  1. **At most one holder per `IMAPServer`** — the C3 property. Fed by the
+///     four holder enter/exit seams, which are deliberately SYNCHRONOUS (a
+///     `nonisolated` Mutex write, no actor hop) so observing cannot perturb the
+///     interleaving being observed.
+///  2. **NO-LOGOUT-WHILE-HELD** — an external teardown may never log out a
+///     connection at the SAME generation a holder entered under. Comparing
+///     GENERATIONS rather than merely "is held" is what makes this sound: a
+///     teardown bumps before it logs out, so a pre-bump holder is expected and
+///     legal, while a same-generation match means the teardown reached a
+///     connection its own bump did not cover.
+///  3. **Object lifecycle (R12-F1)** — every `IMAPServer` this pool created
+///     must reach a DISPOSITION (an attempted logout, or a documented
+///     dead-drop) by the end of the round. This is the leak oracle, and it is
+///     the one that rediscovers D-02 (below). It keeps a strong reference to
+///     every created instance for the round's duration, which is what makes
+///     `ObjectIdentifier` keys sound here — no instance can deinit and let a
+///     later allocation reuse its address.
+///  4. **End-state convergence** — after the round's drain + teardown, every
+///     field the invariant contract tracks is empty: no tracked connection, no
+///     in-use mark, no waiter in any of the four queues, no creation flag.
+///  5. **The armed plant-over traps** — `assertPoolSlotWasNil` /
+///     `assertActionServerSelfReplace` fire inside the pool itself, so a
+///     plant-over kills the process with the `mutLog` journal attached. They
+///     are the reason this suite can find a defect the oracles above would only
+///     see indirectly.
+///
+/// The FakeIMAPServer WIRE counters (`liveSessionCount()`,
+/// `abandonedSessionCount()`) are recorded into failure messages as
+/// DIAGNOSTICS and are deliberately NOT asserted: under injected faults and
+/// task cancellation they cannot distinguish a provider leak from a simulated
+/// one (`liveSessionCount()`'s own doc comment says as much), which is why the
+/// reference moved this suite's leak oracle to the object layer in R12-F1.
+///
+/// ## Acceptance (Testing Rule 11's gate)
+/// Revert D-02's fix — make `ensureServer()`'s `if actionServerCreating`
+/// branch fall through unconditionally — and this suite goes red WITHOUT any
+/// bespoke reproduction hook: two acquires that both observe `actionServer ==
+/// nil` each create a connection, the loser plants over the winner, and the
+/// winner's instance never reaches a disposition, so oracle 3 reports it at
+/// end of round. On a DEBUG build the armed
+/// `assertPoolSlotWasNil(actionServer, "actionServer (ensureServer create)")`
+/// trap (oracle 5) fires first — which is exactly how that defect was
+/// originally observed on this base, at seed 8131249127217430530, by the T0.8
+/// fuzzer (`ProviderIdQueueFuzzTests`); the `mutLog` tail from that run is
+/// preserved in this file's T3.7 landed record under D-02.
+///
+/// ## Seeds / replay / soak
+/// - `POOL_FUZZ_REPLAY_SEED=0x…` replaces the whole seed list with one seed.
+/// - `POOL_FUZZ_ROUNDS` / `POOL_FUZZ_OPS` are the iteration knobs. The
+///   checked-in defaults are sized for an every-commit run; crank them for a
+///   soak. ⚠️ On the CLI these need the `TEST_RUNNER_` prefix to reach the
+///   simulator-hosted test process (`TEST_RUNNER_POOL_FUZZ_ROUNDS=40 …`).
+@Suite("IMAPProvider pool — adversarial fuzzer (T3.7, Testing Rule 11)", .serialized)
+struct IMAPProviderPoolFuzzTests {
+
+    // MARK: - Config
+    //
+    // Every tunable lives here rather than inline at its use site (repo rule:
+    // no hardcoded numeric values — use a per-module config).
+
+    enum FuzzConfig {
+        /// Fixed seeds run on every pass. The `0xFA22…` prefix is the pool
+        /// fuzzer's tag in the reference suite; reused so a seed quoted in
+        /// either tree means the same thing.
+        static var seeds: [UInt64] {
+            if let raw = ProcessInfo.processInfo.environment["POOL_FUZZ_REPLAY_SEED"],
+               let value = parseSeed(raw) {
+                return [value]
+            }
+            return [0xFA22_0000_0000_0001, 0xFA22_0000_0000_0002, 0xFA22_0000_0000_0003]
+        }
+
+        /// Rounds per seed. Each round builds its own server + provider.
+        static var rounds: Int {
+            if let raw = ProcessInfo.processInfo.environment["POOL_FUZZ_ROUNDS"],
+               let value = Int(raw), value > 0 { return value }
+            return 3
+        }
+
+        /// Concurrent operations per round.
+        static var opsPerRound: Int {
+            if let raw = ProcessInfo.processInfo.environment["POOL_FUZZ_OPS"],
+               let value = Int(raw), value > 0 { return value }
+            return 12
+        }
+
+        /// Bound on every injected per-command delay. Small on purpose: the
+        /// default pass has to stay inside an every-commit budget.
+        static let latencyMaxMilliseconds = 12
+
+        /// Seeded op START SPREAD, in ms. Without it every op fires at t=0 and
+        /// the fast ops (teardowns especially) all COMPLETE before any op with
+        /// a real-latency runway reaches its interesting window — the
+        /// contract's mid-op windows then become structurally unreachable by
+        /// collision.
+        static let startSpreadMs = 40
+
+        /// Chance, in percent, that a chaos point actually parks.
+        static let chaosFirePercent = 80
+
+        /// Chaos park shapes.
+        static let chaosMaxYields = 6
+        static let chaosShortParkMaxMs = 9
+        static let chaosWideParkMinMs = 12
+        static let chaosWideParkSpanMs = 48
+
+        /// Learned server limit seeded before the provider is built. Chosen to
+        /// create REAL capacity contention: with IDLE up this leaves exactly
+        /// one folder slot for three folders, and it is the minimum at which
+        /// `IMAPProvider.idleMinServerLimit` still allows the IDLE lane at all.
+        static let serverConnectionLimit = 3
+
+        /// Folders the ops draw from.
+        static let folders = ["INBOX", "Archive", "Sent"]
+
+        /// Liveness bounds. A fuzz round must never HANG — an unresumed waiter
+        /// has to surface as a recorded issue, not as a suite that never
+        /// returns (a hang takes every other result down with it).
+        static let opTimeoutSeconds: Double = 25
+        static let settleTimeoutSeconds: Double = 15
+
+        private static func parseSeed(_ raw: String) -> UInt64? {
+            if raw.hasPrefix("0x") || raw.hasPrefix("0X") {
+                return UInt64(raw.dropFirst(2), radix: 16)
+            }
+            return UInt64(raw) ?? UInt64(raw, radix: 16)
+        }
+    }
+
+    // MARK: - Adversarial layer (b): the chaos scheduler
+
+    /// A seeded, PCT-style ("priority change point") scheduling perturbation,
+    /// installed UNIFORMLY on every contract-enumerated race boundary. One
+    /// seeded coin flip, one shared park distribution, zero per-hook weighting
+    /// or ordering — nothing here knows which defect it is looking for.
+    ///
+    /// `Mutex` rather than a lock + `nonisolated(unsafe)` state: the RNG is
+    /// genuinely shared across isolation domains (every hook fires on whatever
+    /// task reached the boundary), and `Mutex` is the only sanctioned way to
+    /// express that here.
+    private final class ChaosScheduler: Sendable {
+        private let rng: Mutex<SplitMix64>
+        init(seed: UInt64) { rng = Mutex(SplitMix64(seed: seed)) }
+
+        private func roll(_ bound: Int) -> Int { rng.withLock { $0.pick(bound) } }
+
+        func point() async {
+            guard roll(100) < FuzzConfig.chaosFirePercent else { return }
+            switch roll(3) {
+            case 0:
+                // Job-hop park: re-orders resumption without wall-clock cost.
+                for _ in 0...roll(FuzzConfig.chaosMaxYields) { await Task.yield() }
+            case 1:
+                try? await Task.sleep(for: .milliseconds(roll(FuzzConfig.chaosShortParkMaxMs)))
+            default:
+                // Deliberately WIDER than the jitter band: a resume gap that a
+                // 0-9ms park usually misses is the window several of the pool's
+                // fixes exist for.
+                try? await Task.sleep(
+                    for: .milliseconds(FuzzConfig.chaosWideParkMinMs + roll(FuzzConfig.chaosWideParkSpanMs))
+                )
+            }
+        }
+    }
+
+    // MARK: - Oracles
+
+    /// One created `IMAPServer` and how the pool eventually accounted for it.
+    ///
+    /// Holds a STRONG reference for the round's lifetime. That is deliberate:
+    /// it is what makes `ObjectIdentifier` keys sound across the whole round
+    /// (no instance can deinit and let a later allocation reuse its address),
+    /// and the predicate this feeds — "every created instance reached a
+    /// disposition" — is strictly stronger than the reference's weak-boxed
+    /// "no instance deinited undisposed", because it also catches an instance
+    /// that is still ALIVE and untracked at end of round.
+    private struct LifecycleRecord: Sendable {
+        let server: IMAPServer
+        let site: String
+        var disposition: String?
+    }
+
+    private final class PoolOracle: Sendable {
+        private let created = Mutex<[LifecycleRecord]>([])
+        private let heldAtGeneration = Mutex<[ObjectIdentifier: Int]>([:])
+        private let concurrentHolders = Mutex<[ObjectIdentifier: Int]>([:])
+        private let violations = Mutex<[String]>([])
+
+        func noteCreated(_ server: IMAPServer, site: String) {
+            created.withLock { $0.append(LifecycleRecord(server: server, site: site, disposition: nil)) }
+        }
+
+        /// Marks EVERY still-undisposed record for this instance. A pool that
+        /// logs the same connection out twice (a teardown racing a holder's own
+        /// unhealthy release) is not a violation — double disposal is safe;
+        /// NON-disposal is the defect.
+        func noteDisposition(_ server: IMAPServer, _ disposition: String) {
+            created.withLock { records in
+                for index in records.indices
+                where records[index].server === server && records[index].disposition == nil {
+                    records[index].disposition = disposition
+                }
+            }
+        }
+
+        func noteEnter(_ server: IMAPServer, generation: Int, label: String) {
+            let identity = ObjectIdentifier(server)
+            heldAtGeneration.withLock { $0[identity] = generation }
+            let holders = concurrentHolders.withLock { (counts: inout [ObjectIdentifier: Int]) -> Int in
+                let next = (counts[identity] ?? 0) + 1
+                counts[identity] = next
+                return next
+            }
+            if holders > 1 {
+                record("DOUBLE CHECKOUT (\(label)) — \(holders) tasks hold the same IMAPServer at once; SwiftMail serializes individual COMMANDS, not command SEQUENCES, so a second SELECT can interpose before the first holder's UID command (C3)")
+            }
+        }
+
+        /// Tolerates an unmatched enter. `withFolderConnection` /
+        /// `withActionConnection*` deliberately skip their exit hook on the
+        /// PRE-BODY generation guard (the hold never reached `body`), and that
+        /// instance is by construction one a teardown already removed from the
+        /// pool — it can never be handed out again, so the residual count can
+        /// never produce a false DOUBLE CHECKOUT later.
+        func noteExit(_ server: IMAPServer) {
+            let identity = ObjectIdentifier(server)
+            concurrentHolders.withLock { counts in
+                let next = (counts[identity] ?? 1) - 1
+                counts[identity] = next > 0 ? next : nil
+            }
+        }
+
+        func noteExternalLogout(_ server: IMAPServer, generation: Int) {
+            let identity = ObjectIdentifier(server)
+            guard let entryGeneration = heldAtGeneration.withLock({ $0[identity] }),
+                  entryGeneration == generation
+            else { return }
+            record("NO-LOGOUT-WHILE-HELD — a connection a task entered at generation \(entryGeneration) was logged out by an external teardown at that SAME generation; the teardown's bump did not cover the holder it stole from")
+        }
+
+        func record(_ message: String) { violations.withLock { $0.append(message) } }
+
+        func undisposed() -> [String] {
+            created.withLock { records in
+                records.filter { $0.disposition == nil }.map(\.site)
+            }
+        }
+
+        func createdCount() -> Int { created.withLock { $0.count } }
+        func allViolations() -> [String] { violations.withLock { $0 } }
+    }
+
+    // MARK: - Operations
+
+    private enum FuzzOp: Sendable {
+        case fetchMessages(String)
+        case folderStatus(String)
+        case fetchFolders
+        case connect
+        case markDirty
+        case disconnect
+        case keepAlive
+        case evictLRU
+        case startIdle
+        case stopIdle
+        case killNextNoop
+        case failNextSelect
+        case failNextLogin
+        case failNextStatus
+    }
+
+    private static func planOp(_ rng: inout SplitMix64) -> FuzzOp {
+        let folder = FuzzConfig.folders[rng.pick(FuzzConfig.folders.count)]
+        switch rng.pick(100) {
+        case 0..<24: return .fetchMessages(folder)
+        case 24..<38: return .folderStatus(folder)
+        case 38..<46: return .fetchFolders
+        case 46..<54: return .connect
+        case 54..<64: return .markDirty
+        case 64..<69: return .disconnect
+        case 69..<76: return .keepAlive
+        case 76..<80: return .evictLRU
+        case 80..<85: return .startIdle
+        case 85..<88: return .stopIdle
+        case 88..<93: return .killNextNoop
+        case 93..<96: return .failNextSelect
+        case 96..<98: return .failNextLogin
+        default: return .failNextStatus
+        }
+    }
+
+    /// Every outcome is DISCARDED on purpose — see the suite's doc comment.
+    private static func execute(_ op: FuzzOp, provider: IMAPProvider, server: FakeIMAPServer) async {
+        switch op {
+        case .fetchMessages(let folder):
+            _ = try? await provider.fetchMessages(folder: folder, limit: 3, offset: 0)
+        case .folderStatus(let folder):
+            _ = try? await provider.folderStatus(path: folder)
+        case .fetchFolders:
+            _ = try? await provider.fetchFolders()
+        case .connect:
+            try? await provider.connect()
+        case .markDirty:
+            await provider.markDirty()
+        case .disconnect:
+            try? await provider.disconnect()
+        case .keepAlive:
+            await provider.keepAlivePinnedConnectionsForTesting()
+        case .evictLRU:
+            _ = await provider.evictLRUFolderForTesting()
+        case .startIdle:
+            await provider.startIdle { _, _ in }
+        case .stopIdle:
+            await provider.stopIdle()
+        case .killNextNoop:
+            server.killConnectionOnNextCommand(containing: "NOOP")
+        case .failNextSelect:
+            server.failNextCommand(containing: "SELECT")
+        case .failNextLogin:
+            server.failNextCommand(containing: "LOGIN")
+        case .failNextStatus:
+            server.failNextCommand(containing: "STATUS")
+        }
+    }
+
+    // MARK: - Bounded waits (a fuzz round must never hang)
+
+    private static func waitUntil(timeoutSeconds: Double, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !condition() {
+            if Date() >= deadline { return false }
+            await Task.yield()
+        }
+        return true
+    }
+
+    private static func waitUntilAsync(timeoutSeconds: Double, _ condition: () async -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while await !condition() {
+            if Date() >= deadline { return false }
+            await Task.yield()
+        }
+        return true
+    }
+
+    /// Never `await task.value`: a task the pool failed to resume would hang
+    /// the whole suite instead of failing one case.
+    private static func joinBounded(_ task: Task<Void, Never>) async -> Bool {
+        let done = Mutex(false)
+        let watcher = Task { await task.value; done.withLock { $0 = true } }
+        let finished = await waitUntil(timeoutSeconds: FuzzConfig.opTimeoutSeconds) { done.withLock { $0 } }
+        watcher.cancel()
+        return finished
+    }
+
+    // MARK: - The suite
+
+    @Test(
+        "pool fuzz — randomized adversarial pool traffic never double-checks-out a connection, never logs one out under its holder, never leaks a created session, and always converges to an empty pool",
+        arguments: FuzzConfig.seeds
+    )
+    func poolFuzz(seed: UInt64) async {
+        for round in 0..<FuzzConfig.rounds {
+            // Derive a distinct, reproducible sub-seed per round so a failure
+            // message can name (parent seed, round) and be replayed exactly.
+            let roundSeed = seed &+ (UInt64(round) &* 0x9E37_79B9_7F4A_7C15)
+            await Self.runRound(roundSeed: roundSeed, parentSeed: seed, round: round)
+        }
+    }
+
+    private static func runRound(roundSeed: UInt64, parentSeed: UInt64, round: Int) async {
+        let label = "seed=0x\(String(parentSeed, radix: 16)) round=\(round)"
+
+        // Message-ID domains are `example.com` ONLY, and the Date: header is
+        // derived from the current clock — never a literal (Testing Rules 7/10).
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let now = dateFormatter.string(from: Date())
+        func rfc822(_ identifier: String) -> String {
+            """
+            From: Test Sender <sender@example.com>\r
+            To: Recipient <recipient@example.com>\r
+            Subject: t3.7-pool-fuzz\r
+            Date: \(now)\r
+            Message-ID: <\(identifier)>\r
+            Content-Type: text/plain; charset=utf-8\r
+            \r
+            pool fuzz probe body.\r
+
+            """
+        }
+        var mailboxes: [String: [FakeIMAPServer.Message]] = [:]
+        for (index, folder) in FuzzConfig.folders.enumerated() {
+            mailboxes[folder] = (0..<2).map { offset in
+                FakeIMAPServer.makeMessage(
+                    uid: 100 + index * 10 + offset,
+                    rfc822Text: rfc822("t37-fuzz-\(index)-\(offset)@example.com")
+                )
+            }
+        }
+
+        let username = "t37fuzz-\(UUID().uuidString.lowercased())"
+        let server = FakeIMAPServer(username: username, mailboxes: mailboxes)
+        do {
+            try server.start()
+        } catch {
+            Issue.record("\(label): could not start the fake server: \(error)")
+            return
+        }
+        defer { server.stop() }
+        server.setSeededLatencyInjection(
+            seed: roundSeed ^ 0xA5A5_A5A5_A5A5_A5A5,
+            maxMilliseconds: FuzzConfig.latencyMaxMilliseconds
+        )
+
+        // Seeded BEFORE the provider is built — `IMAPProvider.init` reads the
+        // learned limit from `UserDefaults` keyed by host+username, and the
+        // username is unique per round so no other test can see this key.
+        IMAPProvider.persistServerLimit(
+            FuzzConfig.serverConnectionLimit,
+            host: "127.0.0.1",
+            username: username
+        )
+        let provider = IMAPProvider(
+            host: "127.0.0.1",
+            port: server.port,
+            username: username,
+            password: server.password,
+            smtpHost: "127.0.0.1",
+            smtpPort: 587,
+            useTLS: false
+        )
+
+        let oracle = PoolOracle()
+        let chaos = ChaosScheduler(seed: roundSeed ^ 0x5EED_5EED_5EED_5EED)
+
+        // ── Oracle seams. All five are SYNCHRONOUS by construction (a
+        // `nonisolated` Mutex write, no actor hop, no suspension), so
+        // observing the pool cannot perturb the interleaving being observed.
+        provider.setServerCreatedTestHookForTesting { created, site in
+            oracle.noteCreated(created, site: site)
+        }
+        provider.setLogoutAttemptTestHookForTesting { disposed in
+            oracle.noteDisposition(disposed, "logoutAttempt")
+        }
+        provider.setDeadDropTestHookForTesting { dropped in
+            oracle.noteDisposition(dropped, "deadDrop")
+        }
+        await provider.setActionConnectionHolderEnterTestHookForTesting { held, generation in
+            oracle.noteEnter(held, generation: generation, label: "action")
+        }
+        await provider.setActionConnectionHolderExitTestHookForTesting { held, _ in
+            oracle.noteExit(held)
+        }
+        await provider.setFolderConnectionHolderEnterTestHookForTesting { folder, held, generation in
+            oracle.noteEnter(held, generation: generation, label: "folder \(folder)")
+        }
+        await provider.setFolderConnectionHolderExitTestHookForTesting { _, held, _ in
+            oracle.noteExit(held)
+        }
+        await provider.setBeforeLogoutTestHookForTesting { loggedOut, generation in
+            oracle.noteExternalLogout(loggedOut, generation: generation)
+        }
+
+        // ── Chaos points: the SAME closure on all 16 contract-enumerated
+        // await/resume boundaries. Nothing below is aimed at a defect.
+        await provider.setAcquireActionConnectionRaceTestHookForTesting { await chaos.point() }
+        await provider.setAcquireActionConnectionLivenessRaceTestHookForTesting { await chaos.point() }
+        await provider.setAcquireActionConnectionDeadRecreateRaceTestHookForTesting { await chaos.point() }
+        await provider.setAcquireFolderConnectionLivenessRaceTestHookForTesting { await chaos.point() }
+        await provider.setReleaseActionConnectionHandoffTestHookForTesting { await chaos.point() }
+        await provider.setReleaseActionConnectionPostDequeueTestHookForTesting { await chaos.point() }
+        await provider.setEnsureServerCreationPostDequeueTestHookForTesting { await chaos.point() }
+        await provider.setCreateFolderConnectionLimitRetryTestHookForTesting { await chaos.point() }
+        await provider.setReleaseFolderConnectionPostDequeueTestHookForTesting { await chaos.point() }
+        await provider.setKeepAliveFolderRaceTestHookForTesting { _ in await chaos.point() }
+        await provider.setKeepAliveActionRaceTestHookForTesting { await chaos.point() }
+        await provider.setDisconnectPostWipeTestHookForTesting { await chaos.point() }
+        await provider.setIdleLaunchPlantRaceTestHookForTesting { await chaos.point() }
+        await provider.setFolderConnectionTestHookForTesting { _ in await chaos.point() }
+        await provider.setActionConnectionTestHookForTesting { await chaos.point() }
+        await provider.setCreateFolderConnectionCreationTestHookForTesting { await chaos.point() }
+
+        // ── Plan, then fire. The plan is drawn from the seed; the SCHEDULE is
+        // whatever the runtime produces.
+        var planner = SplitMix64(seed: roundSeed)
+        var plan: [(op: FuzzOp, startMs: Int)] = []
+        for _ in 0..<FuzzConfig.opsPerRound {
+            let op = planOp(&planner)
+            plan.append((op, planner.pick(FuzzConfig.startSpreadMs)))
+        }
+
+        var tasks: [Task<Void, Never>] = []
+        for entry in plan {
+            let op = entry.op
+            let startMs = entry.startMs
+            tasks.append(Task {
+                if startMs > 0 {
+                    try? await Task.sleep(for: .milliseconds(startMs))
+                }
+                await execute(op, provider: provider, server: server)
+            })
+        }
+
+        var unfinished = 0
+        for task in tasks {
+            if await !joinBounded(task) { unfinished += 1 }
+        }
+        if unfinished > 0 {
+            Issue.record("\(label): \(unfinished) of \(tasks.count) operations never finished within \(FuzzConfig.opTimeoutSeconds)s — the pool left a caller parked with nothing that could ever wake it (deadlock/starvation, the failure mode this contract exists to exclude)")
+        }
+
+        // ── Teardown. Uninstall the chaos points FIRST: the round's own
+        // teardown must not be parked by the scheduler it installed, or a
+        // settled pool would look like a hung one.
+        await provider.setAcquireActionConnectionRaceTestHookForTesting(nil)
+        await provider.setAcquireActionConnectionLivenessRaceTestHookForTesting(nil)
+        await provider.setAcquireActionConnectionDeadRecreateRaceTestHookForTesting(nil)
+        await provider.setAcquireFolderConnectionLivenessRaceTestHookForTesting(nil)
+        await provider.setReleaseActionConnectionHandoffTestHookForTesting(nil)
+        await provider.setReleaseActionConnectionPostDequeueTestHookForTesting(nil)
+        await provider.setEnsureServerCreationPostDequeueTestHookForTesting(nil)
+        await provider.setCreateFolderConnectionLimitRetryTestHookForTesting(nil)
+        await provider.setReleaseFolderConnectionPostDequeueTestHookForTesting(nil)
+        await provider.setKeepAliveFolderRaceTestHookForTesting(nil)
+        await provider.setKeepAliveActionRaceTestHookForTesting(nil)
+        await provider.setDisconnectPostWipeTestHookForTesting(nil)
+        await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+        await provider.setFolderConnectionTestHookForTesting(nil)
+        await provider.setActionConnectionTestHookForTesting(nil)
+        await provider.setCreateFolderConnectionCreationTestHookForTesting(nil)
+
+        await provider.stopIdle()
+        try? await provider.disconnect()
+
+        // ── Oracle 3: every created instance reached a disposition. Bounded,
+        // because a teardown's logouts are DETACHED by design — the
+        // `noteLogoutAttempt` mark itself is synchronous, but an IDLE launch
+        // still mid-`createServer()` at teardown time disposes of itself only
+        // once its own claim fails.
+        let disposed = await waitUntil(timeoutSeconds: FuzzConfig.settleTimeoutSeconds) {
+            oracle.undisposed().isEmpty
+        }
+        let wireDiagnostics = "live=\(server.liveSessionCount()) abandoned=\(server.abandonedSessionCount()) created=\(oracle.createdCount())"
+        if !disposed {
+            let leaked = oracle.undisposed()
+            Issue.record("\(label): \(leaked.count) created connection(s) never reached a disposition — created at \(leaked.sorted()) — a logged-in session the pool planted over, dropped or abandoned without ever attempting a logout (it still counts against the server's per-user cap) [\(wireDiagnostics)]")
+        }
+
+        // ── Oracles 1 + 2.
+        let violations = oracle.allViolations()
+        #expect(violations.isEmpty, "\(label): \(violations.count) pool-contract violation(s):\n  - \(violations.joined(separator: "\n  - "))\n[\(wireDiagnostics)]")
+
+        // ── Oracle 4: end-state convergence. Read once, asserted field by
+        // field so a failure names the field rather than dumping a blob.
+        let settled = await waitUntilAsync(timeoutSeconds: FuzzConfig.settleTimeoutSeconds) {
+            let snapshot = await provider.poolStateSnapshotForTesting()
+            return snapshot.contains("actionServer=nil")
+                && snapshot.contains("actionInUse=false")
+                && snapshot.contains("actionWaiters=0")
+                && snapshot.contains("actionServerCreating=false")
+                && snapshot.contains("actionServerCreationWaiters=0")
+                && snapshot.contains("folderServers=[]")
+                && snapshot.contains("folderInUse=[]")
+                && snapshot.contains("folderCreating=[]")
+                && snapshot.contains("folderWaiters=[]")
+                && snapshot.contains("folderCapacityWaiters=0")
+        }
+        if !settled {
+            let snapshot = await provider.poolStateSnapshotForTesting()
+            Issue.record("\(label): the pool did not converge after its own teardown — \(snapshot) [\(wireDiagnostics)]")
+        }
+
+        provider.setServerCreatedTestHookForTesting(nil)
+        provider.setLogoutAttemptTestHookForTesting(nil)
+        provider.setDeadDropTestHookForTesting(nil)
+        await provider.setActionConnectionHolderEnterTestHookForTesting(nil)
+        await provider.setActionConnectionHolderExitTestHookForTesting(nil)
+        await provider.setFolderConnectionHolderEnterTestHookForTesting(nil)
+        await provider.setFolderConnectionHolderExitTestHookForTesting(nil)
+        await provider.setBeforeLogoutTestHookForTesting(nil)
+    }
 }
