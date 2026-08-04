@@ -55,11 +55,49 @@ extension AccountManager {
         /// withheld-`COPYUID` refusal, is GONE (it was raised after the `UID COPY`,
         /// so each re-attempt seated another destination duplicate; RFC 4315 §3
         /// names servers for which the evidence never arrives, so it was a wedge).
-        /// The surviving producers — the destination-epoch and source-epoch
+        ///
+        /// ⚠ CENSUS CORRECTED (`IOS-QUEUE-004`). This paragraph used to claim
+        /// that "the surviving producers — the destination-epoch and source-epoch
         /// refusals — are raised BEFORE any wire mutation, so the bound is now
-        /// about round trips rather than duplicates. The skip stays: it is the
-        /// general contract for `ProviderEvidenceUnavailable`, not a patch for one
-        /// error case, and a future producer may again refuse post-mutation.
+        /// about round trips rather than duplicates". BOTH halves were false at
+        /// the tip, and the correction is recorded rather than silently applied
+        /// because this comment is precisely a case of documentation outliving
+        /// the code it describes. `ProviderEvidenceUnavailable` has THREE
+        /// conformers, all private enums in `IMAPProvider`:
+        /// `IMAPDestinationEpochRefusal`, `IMAPEpochEvidenceMissing` and
+        /// `IMAPLivenessProbeInconclusive` — the third was never enumerated.
+        /// Some refusal sites in `IMAPProvider.move` ARE pre-mutation
+        /// (assertions A1 and A2, and `IMAPDestinationEpochRefusal
+        /// .unknownAtProbe` at the destination probe), which is what made the
+        /// retracted sentence plausible. But FOUR sit AFTER the `UID COPY`:
+        ///  - `IMAPDestinationEpochRefusal.movedAcrossCopy` — from the `catch`
+        ///    around the destination-epoch comparison, whose whole input is the
+        ///    server's `COPYUID` response, so it cannot exist before the COPY.
+        ///  - `IMAPLivenessProbeInconclusive.unparsedUid` — thrown from
+        ///    `liveSourceUIDs`, which `move` calls ONLY on the
+        ///    `copyProvenUIDs.count != sourceUIDs.count` arm, i.e. after the COPY.
+        ///  - `IMAPEpochEvidenceMissing` at assertion A4 — after the COPY and
+        ///    after the liveness probe, immediately before the `\Deleted` STORE.
+        ///  - the same type at assertion A5 — after the COPY *and* after that
+        ///    STORE, immediately before the `UID EXPUNGE`.
+        /// (A3 is a fifth, sitting after the INBOX-only legacy `tm_*` flag
+        /// strip; that strip is idempotent and reversible, so it is the one
+        /// post-mutation site whose repetition costs nothing.)
+        /// `IMAPLivenessProbeInconclusive`'s own doc comment says it "is raised
+        /// AFTER the `UID COPY`, so bounding the op to one attempt per drain
+        /// bounds the destination duplicates a re-attempt would seat" — the
+        /// exact opposite of the retracted paragraph, in the same tree.
+        ///
+        /// So the bound is STILL about duplicates, not merely round trips: a
+        /// UIDPLUS server that stops reporting `UIDVALIDITY` on SELECT between
+        /// the COPY and A4 (SwiftMail defaults `Mailbox.Selection.uidValidity`
+        /// to `UIDValidity(0)`, which `requireUidValidity`'s `live > 0` guard
+        /// turns into `unknownLiveEpoch`) leaves the op copied to the
+        /// destination and requeued, and every re-attempt seats another copy.
+        /// The skip is what bounds that to one per drain. It stays for both
+        /// reasons: it is the general contract for `ProviderEvidenceUnavailable`,
+        /// not a patch for one error case, AND four of its refusal sites already
+        /// refuse post-mutation today.
         ///
         /// ⚠ AND IT IS CONSULTED IN THE LANE LOOP, NEVER THE CLAIM LOOP. The op must
         /// still be claimed and still enter `buildLanes`, or its lane-mates would
