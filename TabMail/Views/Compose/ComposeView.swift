@@ -1704,6 +1704,22 @@ struct ComposeView: View {
                     sendError = "This draft changed while it was opening. Close and reopen it to try again."
                     return
                 }
+                // The retained row is the authority on the reply/forward MODE too, and
+                // `UndoReopenCompose.composeView(for:)` reads that row to supply the
+                // `isForward` argument. A THROWN read there silently supplies `false`,
+                // which is exactly how an undone-and-resent forward came to be recorded
+                // as a reply — the compose still QUOTES from `draft.isForward` while
+                // `send()` captures this VIEW property. So a disagreement here is "we
+                // could not read the mode", never a fact about it: fail closed and let
+                // one reopen re-run both reads, rather than send under a mode the row
+                // contradicts. Scoped to this path deliberately — a row whose
+                // `isForward` was already flipped by the superseded bug must still open
+                // normally everywhere else.
+                guard draft.isForward == isForward else {
+                    draftReadState = .error
+                    sendError = "This draft did not finish loading. Close and reopen it to try again."
+                    return
+                }
             }
             if let openAuthority {
                 guard openAuthority.draftId == draftId,
@@ -1793,13 +1809,37 @@ struct ComposeView: View {
             let quoteIsForward = draft.isForward
             let quoteExpectedProviderMessageId = draft.replyToProviderMessageId
             let quoteExpectedUidValidity = draft.replyToUidValidity
-            let quote: Draft.ReplyQuote? = try? await AppDatabase.dbPool.read { db in
-                try Draft.resolveReplyQuote(
-                    draftKey: quoteDraftKey, replyToId: quoteReplyToId,
-                    isForward: quoteIsForward,
-                    expectedProviderMessageId: quoteExpectedProviderMessageId,
-                    expectedUidValidity: quoteExpectedUidValidity,
-                    db: db)
+            let quoteResult: Result<Draft.ReplyQuote?, Error>
+            do {
+                quoteResult = .success(try await AppDatabase.dbPool.read { db in
+                    try Draft.resolveReplyQuote(
+                        draftKey: quoteDraftKey, replyToId: quoteReplyToId,
+                        isForward: quoteIsForward,
+                        expectedProviderMessageId: quoteExpectedProviderMessageId,
+                        expectedUidValidity: quoteExpectedUidValidity,
+                        db: db)
+                })
+            } catch {
+                quoteResult = .failure(error)
+            }
+            // This read now GATES the send (see the row claim just below), so a `try?`
+            // here is the never-drop clause-2 conflation: a THROWN read — a GRDB
+            // suspension on a foreground boundary, `SQLITE_BUSY` behind a contended
+            // writer — and a genuine identity REFUSAL arrive as the same nil, and the
+            // user is told "the message this draft replies to can no longer be
+            // identified", an assertion about identity the database never made.
+            // "We could not look" is not an answer: classify it with the SAME guard
+            // the draft-row read three statements above uses, and take the SAME arm —
+            // block every mutation, say the load did not finish, and let one reopen
+            // re-run the read. The draft row is left completely untouched.
+            guard ComposeDraftGuards.readState(quoteResult) != .error,
+                  case .success(let quote) = quoteResult else {
+                draftReadState = .error
+                sendError = "This draft did not finish loading. Close and reopen it to try again."
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ComposeView] ⚠ Reply-target read THREW for draftId=\(draftId) — retryable, NOT an identity refusal; blocking all mutation until reopen")
+                }
+                return
             }
             // D8: the From account is ALREADY bound above, to the exact owner of the
             // row this view read. The two `resolvedAccount ?? navigationStore

@@ -57,7 +57,8 @@ private func insertHeader(
     rfc822MessageId: String?,
     references: [String] = [],
     observedUidValidity: Int? = nil,
-    subject: String = "Original subject"
+    subject: String = "Original subject",
+    actionTag: ActionTag? = nil
 ) async throws -> MessageHeader {
     var header = MessageHeader(
         messageId: uid,
@@ -75,6 +76,7 @@ private func insertHeader(
     header.rfc822MessageId = rfc822MessageId
     header.referencesJSON = MessageHeader.encodeReferences(references)
     header.observedUidValidity = observedUidValidity
+    if let actionTag { header.setActionTag(actionTag) }
     // Immutable copy for the escaping write closure (a captured `var` is a
     // concurrency hazard, not merely a style point).
     let toInsert = header
@@ -366,6 +368,87 @@ struct ComposeSendReplyTargetTests {
         #expect(state.parent?.isReplied == true,
                 "the parent bookkeeping this path used to skip must now happen")
     }
+
+    /// THE `IOS-OUTBOX-004` INVARIANT: a forward that is undone and re-sent is
+    /// recorded as a FORWARD — locally and, through `OutboxMessage.isForward`, on
+    /// the wire. Never as a reply.
+    ///
+    /// Driven through the PRODUCTION reopen function itself
+    /// (`UndoReopenCompose.composeView(for:)`), not through a reproduction of it, so
+    /// the test cannot pass merely by agreeing with a copy of the code under test.
+    /// Every assertion is an END STATE — what the queued send says it is, and what
+    /// the parent message ends up recorded as. None asserts that a particular
+    /// argument is passed.
+    ///
+    /// Why the end state and not the flag: `OutboxMessage.isForward` is what
+    /// `AccountManagerOutbox.deleteCompletedSendAtomic` reads on delivery to queue
+    /// `.markForwarded` rather than `.markReplied`, and `IMAPProvider.markReplied`
+    /// STOREs `\Answered` — a server-side flag the user has no in-app way to clear,
+    /// which sync then re-asserts over the locally-correct forwarded badge.
+    ///
+    /// RED PROOF (recorded): with the `isForward:` argument removed from
+    /// `UndoReopenCompose.composeView(for:)` — the pre-fix source — this fails at
+    /// `outbox[0].isForward`, at `parent.isForwarded`, at `parent.isReplied` and at
+    /// the surviving Reply action tag.
+    @Test("A forward reopened through Undo-Send is re-sent as a forward, not a reply")
+    func forwardReopenedThroughUndoIsResentAsAForward() async throws {
+        let (dir, pool, previous) = try makeReplyTargetTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let parent = try await insertHeader(
+            pool, uid: "42", rfc822MessageId: "orig@example.com",
+            references: ["root@example.com"], observedUidValidity: 100,
+            actionTag: .reply)
+        // A FORWARD draft: `forward:`-keyed and `isForward` on the row, which is what
+        // `PendingSendService.undo()` retains when the user taps Undo on the toast.
+        let draftId = "forward:acc1:orig@example.com"
+        try await insertDraft(
+            pool, id: draftId, replyToId: parent.id,
+            stampProviderMessageId: "42", stampUidValidity: 100,
+            isForward: true, epoch: "E1")
+
+        // NON-VACUITY: the parent starts flagged neither way and still carries a Reply
+        // action tag the user never acted on, so every assertion below is a state THIS
+        // send produced — not a seeded value the test read back.
+        let before = try await pool.read { db in try MessageHeader.fetchOne(db, key: parent.id) }
+        #expect(before?.isForwarded == false)
+        #expect(before?.isReplied == false)
+        #expect(before?.actionTag == .reply)
+
+        // THE PRODUCTION REOPEN. `PendingSendService.undo()` RETAINS the Draft row and
+        // returns this snapshot; `RootView` presents `UndoReopenCompose` with it.
+        let snapshot = PendingSendService.ReopenSnapshot(
+            id: "outbox-undo-1",
+            authority: PendingSendService.RetainedDraftAuthority(
+                draftId: draftId, accountId: "acc1", instanceEpoch: "E1"))
+        let reopened = UndoReopenCompose.composeView(for: snapshot)
+
+        // The user taps Send again. `ComposeView.send` captures the VIEW's mode into
+        // `AuthoredSendSnapshot.isForward`, and that snapshot is what both durable
+        // consumers read — so the reopened view's own mode is the input here.
+        let claim = try await loadClaim(pool, draftId: draftId)
+        let outcome = try await driveSend(
+            pool: pool, draftId: draftId, composeParameter: nil, claim: claim,
+            subject: "Fwd: Original subject",
+            isForward: reopened.isForward, instanceEpoch: "E1")
+
+        #expect(!outcome.blocked, "undo-then-resend of a forward must never dead-end")
+        let state = try await pool.read { db -> (outbox: [OutboxMessage], parent: MessageHeader?) in
+            (try OutboxMessage.fetchAll(db), try MessageHeader.fetchOne(db, key: parent.id))
+        }
+        #expect(state.outbox.count == 1)
+        guard state.outbox.count == 1 else { return }
+        #expect(state.outbox[0].isForward,
+                "the queued send must be recorded as a forward — delivery reads this to choose \\$Forwarded over \\Answered")
+        #expect(state.parent?.isForwarded == true,
+                "the parent must end up recorded as forwarded")
+        #expect(state.parent?.isReplied == false,
+                "a forward must never record its parent as replied-to")
+        #expect(state.parent?.actionTag == .reply,
+                "a forward must not clear a Reply action tag the user never acted on")
+    }
 }
 
 // MARK: - A thrown resolver read is not an absent reply target
@@ -387,6 +470,50 @@ private func swallowingResolveReplyToHeader(
             draftKey: draftKey, replyToId: replyToId, isForward: isForward,
             expectedProviderMessageId: expectedProviderMessageId,
             expectedUidValidity: expectedUidValidity, db: db)
+    }
+}
+
+/// `ComposeView.loadDraftOrPrepopulate`'s reply-target read as it stood BEFORE the
+/// `IOS-DRAFT-010` fix, verbatim. The control half of
+/// `thrownReplyTargetReadIsRetryableNotAnIdentityRefusal`: without it, "the guarded
+/// shape reports `.error`" says nothing about what the swallowing shape reported
+/// instead, and the conflation is invisible. Same job `swallowingResolveReplyToHeader`
+/// does above for the presenter's deleted overload.
+private func swallowingResolveReplyQuote(
+    draftKey: String,
+    replyToId: String?,
+    isForward: Bool,
+    expectedProviderMessageId: String?,
+    expectedUidValidity: Int?
+) async -> Draft.ReplyQuote? {
+    try? await AppDatabase.dbPool.read { db in
+        try Draft.resolveReplyQuote(
+            draftKey: draftKey, replyToId: replyToId, isForward: isForward,
+            expectedProviderMessageId: expectedProviderMessageId,
+            expectedUidValidity: expectedUidValidity, db: db)
+    }
+}
+
+/// The same read as the production call site classifies it now: the outcome is
+/// CARRIED as a `Result` so a throw stays a throw all the way to
+/// `ComposeDraftGuards.readState`, instead of being flattened into the nil a genuine
+/// refusal returns.
+private func guardedResolveReplyQuote(
+    draftKey: String,
+    replyToId: String?,
+    isForward: Bool,
+    expectedProviderMessageId: String?,
+    expectedUidValidity: Int?
+) async -> Result<Draft.ReplyQuote?, Error> {
+    do {
+        return .success(try await AppDatabase.dbPool.read { db in
+            try Draft.resolveReplyQuote(
+                draftKey: draftKey, replyToId: replyToId, isForward: isForward,
+                expectedProviderMessageId: expectedProviderMessageId,
+                expectedUidValidity: expectedUidValidity, db: db)
+        })
+    } catch {
+        return .failure(error)
     }
 }
 
@@ -478,5 +605,95 @@ struct ReplyTargetThrownReadTests {
         #expect(ComposeDraftGuards.readState(refused) == .notFound,
                 "a genuine refusal must still open compose, unquoted")
         #expect(ComposeDraftGuards.readState(resolved) == .loaded)
+    }
+
+    /// THE `IOS-DRAFT-010` INVARIANT, at the COMPOSE call site this time (the two
+    /// tests above cover the presenter's overload): a reply-target read that THROWS
+    /// leaves the draft in the RETRYABLE state, never in the terminal one that tells
+    /// the user "the message this draft replies to can no longer be identified" —
+    /// an assertion about identity a suspended or busy database never made. That
+    /// read now GATES the send, so the clause-2 conflation costs the user their
+    /// ability to send a draft whose parent is perfectly resolvable.
+    ///
+    /// Two-sided on ONE database and ONE set of inputs: readable first (the parent
+    /// really does resolve — so the refusal below is the failure firing and not an
+    /// empty-fixture trivial miss), then unreadable.
+    ///
+    /// RED PROOF (recorded): the control is the pre-fix production statement
+    /// verbatim, and on the unreadable database it yields `.unresolved` — the
+    /// authoritative "no such parent" — where the guarded shape yields `.error`.
+    @Test("A thrown reply-target read leaves the draft retryable, not declared unidentifiable")
+    func thrownReplyTargetReadIsRetryableNotAnIdentityRefusal() async throws {
+        let (dir, pool, previous) = try makeReplyTargetTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let parent = try await insertHeader(
+            pool, uid: "42", rfc822MessageId: "orig@example.com",
+            references: ["root@example.com"], observedUidValidity: 100)
+        let draftId = "reply:acc1:orig@example.com"
+        try await insertDraft(
+            pool, id: draftId, replyToId: parent.id,
+            stampProviderMessageId: "42", stampUidValidity: 100, epoch: "E1")
+
+        // NON-VACUITY / the positive side: while the database is readable this exact
+        // draft's parent resolves, so the draft is genuinely sendable.
+        let readable = await guardedResolveReplyQuote(
+            draftKey: draftId, replyToId: parent.id, isForward: false,
+            expectedProviderMessageId: "42", expectedUidValidity: 100)
+        #expect(ComposeDraftGuards.readState(readable) == .loaded)
+        guard case .success(let resolvedQuote) = readable else {
+            Issue.record("the readable half must resolve")
+            return
+        }
+        #expect(resolvedQuote?.header.id == parent.id,
+                "the readable half must resolve to the real parent")
+
+        // Make every read the resolver performs fail, the way a suspended or
+        // otherwise unreadable database does. The `draft` table is untouched — the
+        // row, and the user's authored text, are still there to be recovered.
+        try await pool.write { db in try db.execute(sql: "DROP TABLE messageHeader") }
+
+        // CONTROL — the pre-fix statement: `try?` flattens the throw into the same
+        // nil a genuine refusal returns, so the row's claim becomes `.unresolved`,
+        // Send is disabled, and the user is told the parent can no longer be
+        // identified. "We could not look" manufactured into an authoritative verdict.
+        let swallowed = await swallowingResolveReplyQuote(
+            draftKey: draftId, replyToId: parent.id, isForward: false,
+            expectedProviderMessageId: "42", expectedUidValidity: 100)
+        let swallowedClaim = ComposeDraftGuards.persistedReplyTargetClaim(
+            rowClaimsTarget: true, resolved: swallowed?.header)
+        #expect(swallowedClaim == .unresolved,
+                "a swallowing try? turns a failed read into an identity refusal")
+        #expect(ComposeDraftGuards.sendReplyTarget(
+            composeParameter: nil, persistedRowClaim: swallowedClaim) == .blocked,
+                "and that refusal is what blocks the send")
+
+        // THE FIX — same read, same inputs, carried as a Result and classified by the
+        // SAME guard the draft-row read uses: the failure survives as a failure.
+        let guarded = await guardedResolveReplyQuote(
+            draftKey: draftId, replyToId: parent.id, isForward: false,
+            expectedProviderMessageId: "42", expectedUidValidity: 100)
+        let state = ComposeDraftGuards.readState(guarded)
+        #expect(state == .error,
+                "'we could not look' must never be reported as 'there is no such parent'")
+
+        // END STATE — the retryable one: every mutation fails closed, close dismisses
+        // without touching the row, and nothing asserts anything about identity.
+        #expect(!ComposeDraftGuards.saveMayMutate(readState: state),
+                "no save may overwrite a row read from a database we could not read")
+        #expect(!ComposeDraftGuards.discardMayDelete(readState: state),
+                "no discard may delete it either")
+        #expect(ComposeDraftGuards.closeAction(
+            readState: state, hasContent: true, hasChanges: true) == .dismiss,
+                "close must dismiss without prompting to save over an unknown row")
+
+        // THE INTENTION SURVIVES: the draft row is untouched, so one reopen re-runs
+        // the read and the send proceeds.
+        let surviving = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
+        #expect(surviving?.body == authoredBody, "the authored text must be untouched")
+        #expect(surviving?.replyToId == parent.id,
+                "the row's own claim must be untouched by a failed read")
     }
 }
