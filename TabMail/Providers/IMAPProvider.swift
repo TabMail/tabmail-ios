@@ -5789,48 +5789,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - UID Resolution
 
-    /// Verify raw `searchByMessageId` HEADER SEARCH hits against
-    /// `expectedRawMessageId` by an exact, normalized identity comparison before a
-    /// caller treats one candidate as the APPEND's strong result.
-    ///
-    /// IMAP `SEARCH HEADER Message-ID` is RFC 3501 SUBSTRING matching, not equality:
-    /// a search for `a@example.com` also returns a message whose id is
-    /// `xa@example.com`. Acting on a raw hit set therefore destroys messages the
-    /// caller never identified. This FETCHes each hit's OWN `Message-ID` header and
-    /// keeps only the ones that canonicalize to the same value.
-    ///
-    /// Returns all exact matches; `saveDraft` owns the exactly-one cardinality rule.
-    /// Zero or multiple exact matches never become provider mutation authority.
-    ///
-    /// Fails to an EMPTY result (never a guess) when `expectedRawMessageId` itself
-    /// does not canonicalize, or when a hit's own FETCHed Message-ID does not.
-    ///
-    /// Ported from `v2final`'s `exactMessageIdMatches` (ADR-IOS-061 item E).
-    private func exactMessageIdMatches(
-        _ hits: UIDSet,
-        expectedRawMessageId: String,
-        server: IMAPServer
-    ) async throws -> UIDSet {
-        guard !hits.isEmpty else { return hits }
-        guard let expected = MessageIdentity.comparableRfc822Identity(expectedRawMessageId) else {
-            return UIDSet()
-        }
-        let hitValues = Set(hits.toArray().map(\.value))
-        let infos = try await server.fetchMessageInfosBulk(using: hits)
-        var exact = UIDSet()
-        for info in infos {
-            guard let uid = info.uid, hitValues.contains(uid.value),
-                  let returned = MessageIdentity.comparableRfc822Identity(
-                      IMAPFetchMapping.rfc822MessageId(from: info)
-                  )
-            else { continue }
-            if returned == expected {
-                exact.insert(uid)
-            }
-        }
-        return exact
-    }
-
     /// Search the currently selected mailbox for a message by its RFC 2822 Message-ID.
     /// Single point of resolution — all Message-ID lookups MUST use this method.
     /// Tries with angle brackets first (iCloud and other strict-match servers require them),
