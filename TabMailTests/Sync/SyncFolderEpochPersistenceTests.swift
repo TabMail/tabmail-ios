@@ -390,7 +390,52 @@ struct SyncFullSyncFolderEpochTests {
     /// a folder HEAD leaves untouched into one that loses its mail. It was
     /// reverted. Do not reintroduce an epoch term in `shouldSkipFolderFetch`'s
     /// caller until the merge pass is guarded.
-    @Test("OPEN: a turnover that gets fetched loses its mail to the unguarded merge pass")
+    ///
+    /// ## 2026-08-04 relabel — what this known issue actually pins
+    ///
+    /// The display name and `withKnownIssue` reason used to read *"OPEN: a
+    /// turnover that gets fetched loses its mail to the unguarded merge pass"* /
+    /// *"runSyncMessages has no UIDVALIDITY guard — needs the v2final §5.5 in-txn
+    /// merge guard"*. **Both statements became FALSE when T4.S6 landed that
+    /// guard**: `runSyncMessages` re-reads the folder row via `Folder.fetchOne`
+    /// INSIDE its own write transaction and returns the empty result on either
+    /// `uidValidityResetPendingAt != nil` or a stored-vs-observed mismatch with
+    /// both sides known (`SyncEngine.knownUidValidity`). A reader who met the old
+    /// strings would conclude the port never happened. What survives is the
+    /// narrower arm named above: **the guard is deliberately BOTH-KNOWN**, so a
+    /// turnover the fetch itself does not report is not refused — an anti-brick
+    /// choice, matching every other UIDVALIDITY guard in the tree.
+    ///
+    /// **That arm is reachable HERE only as a mock artifact.** `MockEmailProvider`
+    /// binds no fetch epoch unless `setMockedBoundFetchEpoch` is called, so
+    /// `fetchMessagesWithObservedEpoch` falls through to an unset
+    /// `lastObservedUidValidity` and reports `nil`. `OK [UIDVALIDITY n]` is core
+    /// IMAP4rev1 — every real server sends it on SELECT — and Gmail/Exchange have
+    /// no UIDVALIDITY at all (their stored epoch is nil forever, so both-known can
+    /// never hold). The production exposure is therefore a turnover visible ONLY in
+    /// the folder listing, which needs a folder-listing trigger neither this port
+    /// nor the reference has.
+    ///
+    /// **Why the known issue is not simply retired by binding the epoch here.**
+    /// Two concrete reasons, both checked against the code rather than reasoned
+    /// about. (1) `UidValidityResetReactionTests.mergePassAbandonsAndTriggersOnTurnover`
+    /// ALREADY pins the guarded case on a fixture of the same shape — `Archive`,
+    /// three seeded headers, an empty fetch, `setMockedBoundFetchEpoch` — so
+    /// binding the epoch here produces a duplicate, not coverage. (2) This case
+    /// installs no handler stub, and `AccountManager.defaultUidValidityChangeHandler`
+    /// spawns the REAL `runUidValidityResetReaction` on an unstructured `Task`; a
+    /// fired guard would hand the folder to a purge-and-resync racing the
+    /// assertion, so the case would have to stub the handler too — at which point
+    /// it IS the other test. The known issue is kept, correctly labelled.
+    ///
+    /// ⚠ **This fixture's SEVERITY is itself an artifact.** `setFetchMessagesResult([])`
+    /// makes the remote list empty, which is what makes the deletion total; on a
+    /// live turnover the remote list is non-empty and the RFC-822 UID-remap loop in
+    /// the same transaction (`newMessagesByRfc822` → `MessageHeaderRekey.apply`)
+    /// migrates rows in place rather than deleting them, so the production blast
+    /// radius of the both-known fail-open is smaller than the "loses its mail"
+    /// framing implies.
+    @Test("The merge guard is BOTH-KNOWN by design: a turnover the fetch does not report is not refused")
     func turnoverFetchIsAnUnguardedDeleter() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
@@ -423,7 +468,16 @@ struct SyncFullSyncFolderEpochTests {
 
         let survivors = try FolderEpochTestFixture.headerCount(
             accountId: accountId, path: "Archive", pool: pool)
-        withKnownIssue("runSyncMessages has no UIDVALIDITY guard — needs the v2final §5.5 in-txn merge guard") {
+        withKnownIssue("""
+            T4.S6 LANDED the v2final §5.5 in-txn merge guard — `runSyncMessages` re-reads the \
+            folder row inside its own write transaction and refuses on quarantine or on a \
+            stored-vs-observed epoch mismatch. The guard is BOTH-KNOWN by design (anti-brick), \
+            and this fixture supplies the turnover only through the folder listing: \
+            `MockEmailProvider` binds no fetch epoch, so the fetch reports nil and the guard \
+            correctly fails open. A real IMAP SELECT always reports `OK [UIDVALIDITY n]`, so \
+            what stays open is the narrower listing-only case, which needs a folder-listing \
+            trigger neither this port nor the reference has.
+            """) {
             #expect(survivors == 3,
                     "a UIDVALIDITY turnover must delete NO local mail (ADR-IOS-051)")
         }
