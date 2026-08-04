@@ -581,6 +581,18 @@ actor SyncEngine {
             let writeResult: (inserted: [MessageHeader], discoveredParents: [String]) = try await dbPool.write { db in
                 var inserted: [MessageHeader] = []
                 for info in headers {
+                    // IOS-IMAP-001 / D3 — a message the server reports with `\Deleted`
+                    // is NOT PRESENT for display (RFC 3501 §2.3.2). The merge enforces
+                    // that at `selectStaleHeaders` and `runSyncMessages`; this "load
+                    // older" pull materialises a `MessageHeader` from the same
+                    // `MessageHeaderInfo`s and never read the flag, so scrolling past
+                    // the end of a folder re-materialised the soft-deleted source copy
+                    // of a move the merge had already removed. Skipping the insert
+                    // reaches the merge's own end state — no local row. Nothing is
+                    // queued on this path, so no user intention is involved; and it is
+                    // insert-prevention only, so an existing row is left for the merge's
+                    // stale channel rather than deleted as a side effect of paging.
+                    if info.isDeletedOnServer { continue }
                     let exists = try MessageHeader
                         .filter(Column("messageId") == info.messageId && Column("folderId") == folder.id)
                         .fetchCount(db) > 0

@@ -168,13 +168,25 @@ struct DeletedFlagMergeVisibilityTests {
     /// `PendingOperation` is queued either, so neither protection can mask the
     /// result.
     private static func merge(
-        folderPath: String, accountId: String, provider: any EmailProvider, pool: DatabasePool
+        folderPath: String, accountId: String, provider: any EmailProvider, pool: DatabasePool,
+        limit: Int = SyncConfig.syncMessageLimit
     ) async throws {
         let folder = try #require(
             try FolderEpochTestFixture.readFolder(accountId: accountId, path: folderPath, pool: pool))
         _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
+            for: folder, provider: provider, limit: limit,
             dbPool: PrioritizedDatabase(pool: pool))
+    }
+
+    /// A `SyncEngine` wired to `provider`. The crawl and paging paths reach the
+    /// server through the engine's own `providers` / `workQueues` registry rather
+    /// than through an argument, so they cannot be driven without this.
+    private static func engine(accountId: String, provider: any EmailProvider) async -> SyncEngine {
+        let engine = SyncEngine()
+        await engine.register(
+            accountId: accountId, provider: provider,
+            workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+        return engine
     }
 
     // MARK: - The headline: no relist after the protections expire
@@ -461,5 +473,208 @@ struct DeletedFlagMergeVisibilityTests {
                 "the purge is UID-scoped, so the pre-deleted bystander survives on the server")
         #expect(server.flags(in: "INBOX", uid: 81).contains("\\Deleted"))
         #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    // MARK: - The OTHER materialisation paths (D3 covered 2 of 4)
+
+    /// **THE PROPERTY, asserted at the STORE and not at any one function's filter:
+    /// a message the server reports with `\Deleted` is not present locally after
+    /// ANY sync path that could observe it.**
+    ///
+    /// `MessageHeaderInfo.isDeletedOnServer` had exactly two consumers, both in
+    /// `SyncEngineFullSync` (`selectStaleHeaders`, `runSyncMessages`). Two further
+    /// paths build a `MessageHeader` from the same `MessageHeaderInfo`s and never
+    /// read the flag: `SyncEngine.insertBackfillBatchGuardable` — the single funnel
+    /// for `backfillWindow`, `deepBackfillFolder`, the header-crawl walk and
+    /// self-heal — and `SyncEngine.fetchOlderMessages`, the "load older" pull.
+    ///
+    /// The reachable scenario is the one this whole file is about: on a server
+    /// without UIDPLUS a move soft-deletes the source, `runSyncMessages` hides it
+    /// and the stale channel removes the local row, so `existingIds` no longer
+    /// contains that UID — and the next crawl window or paging pull covering it
+    /// re-materialises it as an ordinary visible row. The user archives, it comes
+    /// back, and the recovery gesture compounds the wrong state.
+    ///
+    /// ## A1 — shipped `v1.6.38`
+    ///
+    /// `git show v1.6.38:TabMail/Providers/EmailProvider.swift` contains **zero**
+    /// occurrences of `isDeletedOnServer`, and shipped `SyncEngineFullSync` builds
+    /// plain unfiltered `remoteIds` (`Set(fetched.map(\.messageId))`,
+    /// `Set(messages.map(\.messageId))`). The shipped architecture for this problem
+    /// is **NONEXISTENT** — it "solved" the relist by EXPUNGING the source copy
+    /// mailbox-wide, which is precisely what must not come back (see the file
+    /// header). Authoring is therefore the correct A1 branch, and this row is an
+    /// **incompleteness of new work**, not a regression.
+    @Test("A backfill crawl does not materialise a message the server reports as \\Deleted")
+    func aBackfillCrawlDoesNotMaterialiseASoftDeletedMessage() async throws {
+        let hidden = "d3-backfill-hidden@example.com"
+        let visible = "d3-backfill-visible@example.com"
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["Archive": [Self.message(31, visible), Self.message(32, hidden)]])
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        // The residue of a completed move on a server that can never furnish
+        // COPYUID: still there, still holding its UID, pending removal.
+        server.setFlags(["\\Deleted"], in: "Archive", uid: 32)
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "d3-backfill"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: 2, lastKnownUidValidity: Int(Self.epoch))
+        let folder = try #require(try FolderEpochTestFixture.readFolder(
+            accountId: accountId, path: "Archive", pool: pool))
+        // The folder holds NO local row for either UID — exactly the state the
+        // merge's stale channel leaves behind, and the state in which the crawl's
+        // `existingIds` dedup cannot help.
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let engine = await Self.engine(accountId: accountId, provider: provider)
+        _ = try await engine.backfillWindow(
+            folder: folder, account: account,
+            since: Date(timeIntervalSince1970: 0), before: Date().addingTimeInterval(86_400))
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(!listed.contains("32"), """
+                a backfill crawl re-materialised a message the server reports as \\Deleted. The \
+                merge hides it and the crawl puts it back, so the two paths disagree about \
+                whether the message exists — and the user sees a message they already archived \
+                (IOS-IMAP-001 / D3)
+                """)
+        #expect(listed.contains("31"),
+                "non-vacuity: the co-resident undeleted message must still be crawled in — otherwise this filter hid the window, not the flag")
+        #expect(Self.mutatingCommands(server.recordedCommands()).isEmpty,
+                "the crawl issued a server mutation — hiding is a LOCAL decision on every path")
+        #expect(Self.bareExpunges(server).isEmpty)
+    }
+
+    /// The same store-level property on the fourth path: `fetchOlderMessages`, the
+    /// pull the inbox issues when the user scrolls past the end of a folder. Its
+    /// dedupe loop tested only `messageId == && folderId ==` existence, so the same
+    /// soft-deleted source copy walked straight in.
+    @Test("Loading older messages does not materialise a message the server reports as \\Deleted")
+    func loadingOlderMessagesDoesNotMaterialiseASoftDeletedMessage() async throws {
+        let hidden = "d3-older-hidden@example.com"
+        let visible = "d3-older-visible@example.com"
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["Archive": [Self.message(51, visible), Self.message(52, hidden)]])
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.setFlags(["\\Deleted"], in: "Archive", uid: 52)
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "d3-older"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: 2, lastKnownUidValidity: Int(Self.epoch))
+        let folder = try #require(try FolderEpochTestFixture.readFolder(
+            accountId: accountId, path: "Archive", pool: pool))
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let engine = await Self.engine(accountId: accountId, provider: provider)
+        _ = try await engine.fetchOlderMessages(folders: [folder])
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(!listed.contains("52"), """
+                paging older mail re-materialised a message the server reports as \\Deleted — \
+                scrolling to the end of a folder undid what the merge decided (IOS-IMAP-001 / D3)
+                """)
+        #expect(listed.contains("51"),
+                "non-vacuity: the co-resident undeleted message must still be paged in")
+        #expect(Self.mutatingCommands(server.recordedCommands()).isEmpty)
+        #expect(Self.bareExpunges(server).isEmpty)
+    }
+
+    // MARK: - Coverage vs presence: the named data-loss direction, pinned
+
+    /// 🚨 **THE INVARIANT THE SPLIT BETWEEN `deletedRemoteIds` AND `remoteIds`
+    /// EXISTS FOR: a fetch's CARDINALITY and its UID FLOOR measure what the fetch
+    /// COVERED, and a `\Deleted` record was covered.** Both consumers say so in
+    /// their comments; nothing pinned it, so a "simplification" that filtered
+    /// `messages` at the fetch site instead of splitting the two id sets would have
+    /// been green across the whole suite while silently restoring the ADR-IOS-042 /
+    /// MIS-IOS-002 mass-deletion shape.
+    ///
+    /// The mechanism, stated once so the fixture reads: shrinking `messages` makes
+    /// `messages.count < limit` true, which is the COMPLETE-KNOWLEDGE branch —
+    /// "the whole folder came back, so anything local-but-not-remote is genuinely
+    /// gone". Every local row below the fetch's window is then classified stale and
+    /// deleted, including rows the fetch never went near.
+    ///
+    /// Asserted at the STORE: five local rows, a window of three, one of the three
+    /// `\Deleted`. The two rows below the floor are outside the covered slice and
+    /// must survive; the `\Deleted` row inside it must still be hidden, which is
+    /// what stops this passing vacuously by disabling the sweep.
+    ///
+    /// No blessing test exists here — nothing in the tree asserts that a `\Deleted`
+    /// record IS presented (`isDeletedOnServer` appears in the test tree only in
+    /// this file), so there was nothing to retire.
+    @Test("A full window containing a \\Deleted record stale-deletes nothing below the fetch's UID floor")
+    func aFullWindowContainingADeletedRecordSparesRowsBelowTheFloor() async throws {
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities,
+            mailboxes: ["Archive": [
+                Self.message(10, "d3-floor-10@example.com"),
+                Self.message(11, "d3-floor-11@example.com"),
+                Self.message(12, "d3-floor-12@example.com"),
+                Self.message(13, "d3-floor-13@example.com"),
+                Self.message(14, "d3-floor-14@example.com"),
+            ]])
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        // The newest record in the window is soft-deleted. It still COUNTS toward
+        // the window and still sets no floor of its own — that is the whole point.
+        server.setFlags(["\\Deleted"], in: "Archive", uid: 14)
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "d3-floor"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: 5, lastKnownUidValidity: Int(Self.epoch))
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "Archive", uids: [10, 11, 12, 13, 14], pool: pool)
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        // A window of exactly `limit`: the fetch returns the highest 3 UIDs
+        // (12, 13, 14), so it is a WINDOWED fetch, not complete knowledge.
+        try await Self.merge(
+            folderPath: "Archive", accountId: accountId, provider: provider, pool: pool, limit: 3)
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(listed.contains("10") && listed.contains("11"), """
+                rows BELOW the fetch's UID floor were stale-deleted. The fetch returned three \
+                records and the window was three, so it covered UIDs 12-14 and knows nothing \
+                about 10-11 — counting the \\Deleted record out of the fetch's cardinality \
+                turns a windowed pass into a false complete-knowledge pass and sweeps mail the \
+                server never reported on (ADR-IOS-042 / MIS-IOS-002). Surviving: \
+                \(listed.sorted())
+                """)
+        #expect(listed.contains("12") && listed.contains("13"),
+                "the undeleted records inside the window must stay listed")
+        #expect(!listed.contains("14"),
+                "non-vacuity: the \\Deleted record INSIDE the window is still not presented — otherwise this passes by doing nothing at all")
     }
 }

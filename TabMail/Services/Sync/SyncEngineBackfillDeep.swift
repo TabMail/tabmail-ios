@@ -473,6 +473,27 @@ extension SyncEngine {
 
                         let needsCcBccBackfill = !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
                         for info in chunk {
+                            // IOS-IMAP-001 / D3 — a message the server reports with
+                            // `\Deleted` is NOT PRESENT for display (RFC 3501 §2.3.2:
+                            // "deleted for removal by later EXPUNGE"). The merge already
+                            // enforces that at its two consumers — `selectStaleHeaders`
+                            // subtracts it from `remoteIds`, and `runSyncMessages` adds
+                            // it to the upsert loop's skip set — but this crawl
+                            // materialises a `MessageHeader` from the SAME
+                            // `MessageHeaderInfo`s and never read the flag. On a server
+                            // without UIDPLUS a completed move leaves the source copy
+                            // soft-deleted (the purge stays gated on `COPYUID`), the
+                            // merge removes the local row, and a later backfill window
+                            // or self-heal pass covering that UID then put it back as an
+                            // ordinary visible row.
+                            //
+                            // NOT INSERTING is the same end state the merge reaches — no
+                            // local row — so the two paths agree. Nothing is queued here,
+                            // so no user intention is involved and never-drop is not
+                            // engaged; and this is insert-prevention only, so an existing
+                            // row is left for the merge's stale channel to remove (a
+                            // crawl must never delete as a side effect).
+                            if info.isDeletedOnServer { continue }
                             if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId) { continue }
                             if existingIds.contains(info.messageId) {
                                 // v10 cc/bcc backfill: update existing messages with cc/bcc from server
