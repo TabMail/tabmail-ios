@@ -96,6 +96,39 @@ struct IMAPMoveWireContractTests {
         }
     }
 
+    /// The UIDs each issued `UID FETCH` NAMES, one set per command, read off
+    /// the wire log in issue order.
+    ///
+    /// The fake logs a command as `VERB ARGS`, so a UID fetch appears verbatim
+    /// as `UID FETCH <sequence-set> (UID FLAGS)`. The sequence-set is expanded
+    /// arithmetically (RFC 3501 §9: a `seq-range` is inclusive of both
+    /// endpoints and order-independent), NOT resolved against the mailbox —
+    /// the question these tests ask is how many UIDs one command NAMES, which
+    /// is a property of the bytes sent and is unaffected by which of them
+    /// happen to exist.
+    ///
+    /// A component that fails to parse contributes nothing, which cannot pass
+    /// silently: every caller also asserts that the union of these sets is
+    /// EXACTLY the requested set, so a dropped component fails that assertion.
+    private static func uidFetchNamedUIDs(_ server: FakeIMAPServer) -> [Set<Int>] {
+        let prefix = "UID FETCH "
+        return server.recordedCommands().compactMap { command -> Set<Int>? in
+            guard command.uppercased().hasPrefix(prefix) else { return nil }
+            let argument = command.dropFirst(prefix.count)
+                .split(separator: " ", maxSplits: 1)
+                .first.map(String.init) ?? ""
+            var named: Set<Int> = []
+            for component in argument.split(separator: ",") {
+                let parts = component.split(separator: ":")
+                let bounds = parts.compactMap { Int($0) }
+                guard bounds.count == parts.count, let first = bounds.first,
+                      let last = bounds.last else { continue }
+                named.formUnion(min(first, last)...max(first, last))
+            }
+            return named
+        }
+    }
+
     // MARK: - T3.2 / T3.15 — the purge is UID-scoped or absent, never mailbox-wide
 
     @Test("A UIDPLUS move purges only the named source UID and spares a co-resident deleted message")
@@ -525,6 +558,282 @@ struct IMAPMoveWireContractTests {
         #expect(Self.commands(server, containing: "UID EXPUNGE").count == 1)
         #expect(Self.bareExpunges(server).isEmpty)
         #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    // MARK: - Audit round 5 — the liveness probe is BOUNDED, and an
+    // unanswerable probe retires nobody
+
+    /// The number of members the two large-move cases below request. It must
+    /// EXCEED one streaming chunk, and SwiftMail derives that chunk size from
+    /// the fetch options (`.uidFlagsOnly`'s own `suggestedChunkSize`, an
+    /// internal value this suite deliberately does not restate as a literal —
+    /// the invariant is "bounded", not "exactly N").
+    ///
+    /// ⚠ If `aLargeMoveProbesTheSourceInBoundedChunks` ever fails because ONE
+    /// `UID FETCH` covered the whole set, the chunk bound GREW past this
+    /// number. Raise this constant. Do not delete the assertion — the property
+    /// it pins is that a batch cannot be issued as a single unbounded command.
+    private static let oversizedRequestCount = 5_001
+
+    /// The members of that oversized request the source mailbox actually still
+    /// holds, deliberately spanning BOTH chunks: three below the chunk bound
+    /// and one above it. A probe that consumed only the first chunk would find
+    /// three of them and silently retire the fourth.
+    private static let oversizedLiveUIDs = [1, 4_999, 5_000, Self.oversizedRequestCount]
+
+    private static func oversizedMoveServer() -> FakeIMAPServer {
+        // No UIDPLUS: the server can never send `COPYUID`, so every member is
+        // unnamed and the liveness probe runs over the WHOLE requested set —
+        // which is the arm the unbounded FETCH lived on.
+        FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: [
+                "Work": Self.oversizedLiveUIDs.map { Self.message($0, "oversized-\($0)@example.com") },
+                "Archive": [],
+            ])
+    }
+
+    /// 🚨 **AUDIT ROUND 5 — THE WEDGE, at the wire.** Round 4 issued the
+    /// liveness probe as ONE `fetchMessageInfosBulk`, which builds a single
+    /// `FetchMessageInfoCommand` for the entire set with no chunking whatever.
+    /// The set is unbounded — `AccountManager.move` puts every message sharing
+    /// an account and source folder into ONE `PendingOperation`, and
+    /// `SettingsView.archiveOldMessages` selects every inbox message older than
+    /// the cutoff with no limit — while
+    /// `SyncConfig.pendingOperationTimeoutSeconds` bounds the whole provider
+    /// operation at 15s. A large archive against a server that withholds
+    /// `COPYUID` therefore completed its `UID COPY` and then blew that deadline
+    /// inside the probe, throwing out of `move` AFTER the copy. The drain's
+    /// generic arm requeues the op, poisons the account and halts the lane, so
+    /// no source `\Deleted` is ever reached and the next drain REPEATS the
+    /// `UID COPY` — a destination duplicate per drain, forever, with every
+    /// later intention on that account starved behind it. That is the
+    /// never-drop WEDGE corollary.
+    ///
+    /// THE PROPERTY, stated without naming the mechanism or the chunk size:
+    /// **the probe splits an oversized request into several strictly smaller
+    /// commands that together name it exactly once.** No single command carries
+    /// the whole batch (so no single command's size grows without bound), the
+    /// parts are disjoint (nothing is asked twice), and their union is the
+    /// request (nothing is dropped — a probe that silently skipped a member
+    /// would retire it as absent, which is the defect the sibling case below
+    /// pins).
+    ///
+    /// NO BLESSING TEST HAD TO BE RE-SCOPED: nothing in this suite or elsewhere
+    /// in `TabMailTests` asserted the single-bulk-FETCH shape of the probe
+    /// (`rg 'fetchMessageInfosBulk' TabMailTests` returns nothing, and the only
+    /// other `UID FETCH` wire assertion — `PostSendServerDraftCleanupTests` —
+    /// is on the draft-cleanup path, not the move).
+    ///
+    /// RED PROOF (recorded): with `liveSourceUIDs` reverted to
+    /// `fetchMessageInfosBulk`, the probe issues exactly ONE `UID FETCH`
+    /// naming all 5,001 UIDs, and this fails at `probes.count > 1` and at the
+    /// "no single probe names the whole request" expectation.
+    @Test("A move larger than one fetch chunk probes the source in several bounded commands")
+    func aLargeMoveProbesTheSourceInBoundedChunks() async throws {
+        let server = Self.oversizedMoveServer()
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.expectMutations(Self.oversizedLiveUIDs.map { "oversized-\($0)@example.com" })
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let ids = (1...Self.oversizedRequestCount).map(String.init)
+        let proven = try await provider.move(
+            ids: ids, from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        // NON-VACUITY: the move really ran and really reached the probe arm —
+        // one COPY, and the members the source held really landed.
+        #expect(Self.commands(server, containing: "UID COPY").count == 1)
+        #expect(proven.count == ids.count)
+        #expect(
+            Set(server.messageIDs(in: "Archive"))
+                == Set(Self.oversizedLiveUIDs.map { "<oversized-\($0)@example.com>" }))
+
+        let probes = Self.uidFetchNamedUIDs(server)
+        // THE PROPERTY, part 1: more than one command. A single command for an
+        // unbounded set is the wedge.
+        #expect(
+            probes.count > 1,
+            """
+            the liveness probe issued \(probes.count) UID FETCH command(s) for a \(ids.count)-member \
+            move. An unbounded batch in ONE command is what exceeds the operation deadline after the \
+            COPY has already gone out, which requeues the op and re-COPIES on the next drain
+            """)
+        // THE PROPERTY, part 2: no single command carries the whole request.
+        #expect(probes.allSatisfy { $0.count < ids.count })
+        // THE PROPERTY, part 3: the commands PARTITION the request — disjoint,
+        // and covering it exactly. A chunked probe that lost or duplicated a
+        // member would be a different defect wearing this fix's shape.
+        let requested = Set(1...Self.oversizedRequestCount)
+        #expect(probes.reduce(into: Set<Int>()) { $0.formUnion($1) } == requested)
+        #expect(probes.reduce(0) { $0 + $1.count } == requested.count)
+
+        // AND the results of EVERY chunk are consumed: UID 5001 sits in the
+        // last chunk, and it is soft-deleted alongside its earlier-chunk
+        // siblings. A probe that read only the first chunk would have retired
+        // it as absent and left it unflagged.
+        let stores = Self.deletedStores(server)
+        #expect(stores.count == 1)
+        guard stores.count == 1 else { return }
+        for uid in Self.oversizedLiveUIDs {
+            #expect(
+                server.flags(in: "Work", uid: uid).contains("\\Deleted"),
+                "UID \(uid) was live in the source but was not soft-deleted: \(stores[0])")
+        }
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    /// The queue-facing half of the case above: **a completing attempt on an
+    /// oversized batch reaches a permitted never-drop exit for EVERY member**,
+    /// so the drain retires the op instead of requeueing it.
+    ///
+    /// The wedge is not "the row disappeared" — the row survives. It is that an
+    /// op which stays queued forever, re-issuing its `UID COPY` on every drain,
+    /// blocks every later intention in its lane and seats a destination
+    /// duplicate each time. The observable that closes it is this one: the move
+    /// RETURNS, it reports all `ids`, and exactly one `UID COPY` reached the
+    /// wire with exactly one copy per member at the destination.
+    ///
+    /// Members 2…4,998 and 5,000-odd others are not in the source at all: the
+    /// server itself says so (exit 2, `RFC 3501 §6.4.8` — a `UID COPY` naming
+    /// them is a silent no-op), which is why they retire with zero mutation.
+    /// The four the source still holds moved. No member is left undetermined,
+    /// which is the whole of the exit closure at batch scale.
+    @Test("An oversized move completes with every member dispositioned and one copy per member")
+    func anOversizedMoveClosesEveryMembersExit() async throws {
+        let server = Self.oversizedMoveServer()
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.expectMutations(Self.oversizedLiveUIDs.map { "oversized-\($0)@example.com" })
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let ids = (1...Self.oversizedRequestCount).map(String.init)
+        let proven = try await provider.move(
+            ids: ids, from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+
+        // EVERY member reached an exit — none is left for a later drain to
+        // re-attempt, which is what makes the re-COPY unreachable.
+        #expect(Set(proven) == Set(ids))
+        #expect(Self.commands(server, containing: "UID COPY").count == 1)
+        // Exactly one copy per moved member: a requeue-and-re-COPY shows up
+        // here as a duplicate long before it shows up anywhere else.
+        #expect(server.messageIDs(in: "Archive").count == Self.oversizedLiveUIDs.count)
+        #expect(
+            Set(server.messageIDs(in: "Archive"))
+                == Set(Self.oversizedLiveUIDs.map { "<oversized-\($0)@example.com>" }))
+        // The move happened reversibly, and nothing was destroyed: no UIDPLUS,
+        // so no purge is authorized at all (IOS-IMAP-001).
+        #expect(Self.deletedStores(server).count == 1)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(Self.bareExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Work").count == Self.oversizedLiveUIDs.count)
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    /// 🚨 **AUDIT ROUND 5 — A DROPPED INTENTION, fail-open.** Round 4's probe
+    /// loop read `guard let uid = info.uid, requestedValues.contains(uid.value)
+    /// else { continue }`, folding an UNPARSEABLE record into the same arm as a
+    /// UID the call never asked about. The two are opposites. Filtering a
+    /// UID we did not request NARROWS a destructive set; skipping a record we
+    /// could not read makes the member it described MISSING from the live set —
+    /// and the caller reads absence from that set as the server positively
+    /// stating the member has left the source mailbox, retires it as exit 2 and
+    /// mutates nothing. The member's move is dropped without ever being
+    /// performed.
+    ///
+    /// RFC 3501 §6.4.8 requires the UID data item in any FETCH response caused
+    /// by a UID command, so a nil `uid` is a MALFORMED response — *"we could
+    /// not determine the answer"*, which
+    /// `Companion/Rules/Active/never-drop-user-intention.md` names explicitly
+    /// as not one of the four exits. Absence of evidence is not evidence of
+    /// absence.
+    ///
+    /// THE PROPERTY, as an end state: **an unanswerable probe retires NOBODY
+    /// and mutates NOTHING.** Not the member whose record was unreadable, and
+    /// not its sibling whose record was perfectly fine either — a record with
+    /// no parseable UID does not say which member it describes, so there is no
+    /// member to exclude and the whole probe is inconclusive. The op stays
+    /// queued (the call throws) and the disposition is the RETRYABLE one.
+    ///
+    /// RED PROOF (recorded): with the `guard let uid = info.uid` arm reverted
+    /// to `continue`, the move RETURNS instead of throwing (failing
+    /// `thrown != nil`), soft-deletes UID 201 only, and reports both members
+    /// complete — UID 202 retired as "the server says it is gone" on the
+    /// strength of a response nobody could read.
+    @Test("A probe record with no parseable UID retires nobody and keeps the move retryable")
+    func anUnparseableProbeRecordRetiresNobody() async throws {
+        let readable = "unparsed-readable@example.com"
+        let unreadable = "unparsed-unreadable@example.com"
+        // No UIDPLUS, so no `COPYUID` and the probe runs over both members.
+        let server = FakeIMAPServer(
+            capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" },
+            mailboxes: [
+                "Work": [Self.message(201, readable), Self.message(202, unreadable)],
+                "Archive": [],
+            ])
+        server.setUidValidity(Int(Self.epoch), for: "Work")
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        // The nonconforming shape: UID 202's FETCH record omits the UID data
+        // item RFC 3501 §6.4.8 makes mandatory. The message is present, was
+        // copied, and the server simply failed to say which record is which.
+        server.suppressFetchUid(in: "Work", uids: [202])
+        server.expectMutations([readable, unreadable])
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        var thrown: Error?
+        do {
+            _ = try await provider.move(
+                ids: ["201", "202"], from: "Work", to: "Archive",
+                admittedUidValidity: Self.epoch)
+        } catch {
+            thrown = error
+        }
+
+        // NON-VACUITY, wire side: the COPY was issued and both copies landed,
+        // so the refusal below is caused by the unreadable probe record and not
+        // by a fixture that never got that far.
+        #expect(Self.commands(server, containing: "UID COPY").count == 1)
+        #expect(Set(server.messageIDs(in: "Archive")) == ["<\(readable)>", "<\(unreadable)>"])
+        #expect(!Self.uidFetchNamedUIDs(server).isEmpty)
+
+        // THE PROPERTY: nobody retired, nothing mutated in the source.
+        #expect(thrown != nil, "an unanswerable liveness probe must refuse, not complete")
+        #expect(Self.deletedStores(server).isEmpty)
+        #expect(Self.anyExpunges(server).isEmpty)
+        #expect(server.messageIDs(in: "Work").count == 2)
+        #expect(server.flags(in: "Work", uid: 201).isEmpty)
+        #expect(server.flags(in: "Work", uid: 202).isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+
+        // AND the disposition is the retryable one. `ProviderEvidenceUnavailable`
+        // is the drain arm that requeues, bumps `retryCount`, attempts the op at
+        // most once per drain and — the half that matters — does NOT insert the
+        // account into `failedAccounts`. The two typed signals the drain retires
+        // or drops on must not appear: nothing here proved an epoch moved, and
+        // nothing here is a verdict on an identity.
+        if let thrown {
+            #expect(
+                thrown is ProviderEvidenceUnavailable,
+                "an unanswerable probe must reach the retryable, account-preserving drain arm")
+            if case ProviderError.uidValidityChanged = thrown {
+                Issue.record("a malformed probe response is not a proven turnover and must never be retired as one")
+            }
+            if case ProviderError.actionIdentityResolutionFailed = thrown {
+                Issue.record("a malformed probe response is not a verdict on an identity and must never be dropped as one")
+            }
+        }
     }
 
     // MARK: - T3.1 — an epoch change between steps refuses the remaining steps

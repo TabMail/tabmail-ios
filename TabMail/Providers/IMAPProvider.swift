@@ -3885,26 +3885,110 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// `.uidFlagsOnly` is the smallest per-message payload SwiftMail offers, and
     /// RFC 3501 §6.4.8 requires the UID data item in any FETCH response caused
-    /// by a UID command, so one round trip answers the question for the whole
-    /// set. Filtering against `requested` is the same C3 guard
+    /// by a UID command, so the whole question is answered by FETCHing flags for
+    /// the requested set. Filtering against `requested` is the same C3 guard
     /// `copyProvenSourceUIDs` applies: a response naming a UID this call never
     /// asked about must never widen the destructive set.
+    ///
+    /// 🚨 AUDIT ROUND 5 — THE PROBE IS CHUNKED, AND THAT IS A WEDGE FIX RATHER
+    /// THAN AN OPTIMIZATION. Round 4 wrote this as ONE
+    /// `fetchMessageInfosBulk`, which builds a single `FetchMessageInfoCommand`
+    /// for the entire set and issues it as one `UID FETCH` with no chunking at
+    /// all. The set is unbounded: `AccountManager.move` groups every message
+    /// sharing an account and source folder into ONE `PendingOperation`
+    /// (`optimisticMoveToFolder` inserts one row carrying every provider id),
+    /// and `SettingsView.archiveOldMessages` selects every inbox message older
+    /// than the cutoff with no limit. `SyncConfig.pendingOperationTimeoutSeconds`
+    /// (15s, applied in `AccountManagerQueue.executeSingleOp`) bounds the whole
+    /// provider operation, so on a server that withholds `COPYUID` a large
+    /// archive completed its `UID COPY` and then blew that deadline inside this
+    /// probe. The throw lands in the drain's generic arm: the op is requeued,
+    /// the ACCOUNT is added to `failedAccounts`, and the lane halts — so no
+    /// source `\Deleted` is ever reached, the next drain REPEATS the `UID COPY`
+    /// and seats another destination duplicate, and every later intention on
+    /// that account is starved. That is the never-drop WEDGE corollary, not a
+    /// preserved intention.
+    ///
+    /// The streaming overload is the chunked path
+    /// (`identifierSet.chunked(size: chunkSize ?? options.suggestedChunkSize)`,
+    /// one `UID FETCH` per chunk). No chunk size is passed: it defaults from the
+    /// options, so `.uidFlagsOnly`'s own `suggestedChunkSize` decides, and the
+    /// bound moves with the payload weight instead of being restated here.
+    ///
+    /// 🚨 AUDIT ROUND 5 — A RECORD WITH NO PARSEABLE UID MAKES THE WHOLE PROBE
+    /// INCONCLUSIVE. Round 4 folded that case into the C3 filter
+    /// (`guard let uid = info.uid, requestedValues.contains(uid.value) else
+    /// { continue }`), so an unparseable record was SKIPPED — and a member
+    /// missing from the returned live set is read by the caller as the server
+    /// stating that member has left the source mailbox, which retires it as
+    /// exit 2 with zero mutation. A malformed response would therefore have
+    /// dropped that member's move outright. Requesting `UID FETCH` obliges the
+    /// server to return the UID data item (RFC 3501 §6.4.8), so a nil `uid` is
+    /// an RFC-violating response — *"we could not determine the answer"*, which
+    /// `Companion/Rules/Active/never-drop-user-intention.md` names explicitly as
+    /// NOT one of the four exits. Absence of evidence must never become
+    /// evidence of absence, so this fails CLOSED for the whole probe.
+    ///
+    /// It cannot fail closed for "just that member": a record carrying no
+    /// parseable UID does not say WHICH member it describes, so there is no
+    /// member to exclude. That is precisely why the refusal is whole-probe.
     private func liveSourceUIDs(
-        of requested: UIDSet, server: IMAPServer
+        of requested: UIDSet, folder: String, server: IMAPServer
     ) async throws -> UIDSet {
-        let infos = try await server.fetchMessageInfosBulk(
-            using: requested, options: .uidFlagsOnly)
         let requestedValues = Set(requested.toArray().map(\.value))
         var live: [UID] = []
-        // LOOP VARIANT: the number of unvisited elements of `infos`, a finite
-        // array fixed before the loop begins. It strictly decreases by one per
-        // iteration and is bounded below by 0; the `continue` arm advances the
-        // iteration exactly like the fall-through arm.
-        for info in infos {
-            guard let uid = info.uid, requestedValues.contains(uid.value) else { continue }
+        // LOOP VARIANT: the number of `MessageInfo` values the stream has yet to
+        // yield. It is NOT "a finite array fixed before the loop begins" any
+        // more — that was true of the bulk call this replaced and is false of a
+        // stream — but it is still finite and still strictly decreasing.
+        // `IMAPServer.fetchMessageInfos(using:options:headerFields:chunkSize:)`
+        // computes its chunk array BEFORE yielding anything, runs one
+        // `executeCommand` per chunk (each returning a finite `[MessageInfo]`),
+        // yields every returned record exactly once, and then finishes the
+        // continuation, so the total is the sum of a fixed number of finite
+        // per-chunk results and is bounded below by 0. Nothing in this body can
+        // add to it: the `continue` arm advances the iteration exactly like the
+        // fall-through arm, and the `throw` arm terminates it outright (which
+        // also cancels the producing Task through `onTermination`).
+        for try await info in server.fetchMessageInfos(
+            using: requested, options: .uidFlagsOnly) {
+            guard let uid = info.uid else {
+                print("[IMAP] liveness probe of '\(folder)': a UID FETCH response record carried no parseable UID (RFC 3501 §6.4.8 requires one), so this probe cannot say which of the \(requested.count) requested uid(s) the source still holds — REFUSING all source cleanup (fail closed; an unanswerable probe is not proof a member left the mailbox) and keeping the op retryable")
+                throw IMAPLivenessProbeInconclusive.unparsedUid(
+                    folder: folder, requested: requested.count)
+            }
+            guard requestedValues.contains(uid.value) else { continue }
             live.append(uid)
         }
         return UIDSet(live)
+    }
+
+    /// ⚑ NO REFERENCE — INVENTED (audit round 5). The liveness probe's own
+    /// refusal, and a `ProviderEvidenceUnavailable` for the same reason as its
+    /// two siblings below (`IMAPDestinationEpochRefusal`,
+    /// `IMAPEpochEvidenceMissing`): the provider asked the server for a fact its
+    /// safety gate needs and did not get a usable one, so nothing is determined
+    /// about this op — and nothing about the ACCOUNT either.
+    ///
+    /// That arm in `AccountManagerQueue.executeSingleOp` requeues the op, bumps
+    /// `retryCount`, inserts it into `evidenceRefused` and halts only this lane,
+    /// WITHOUT inserting the account into `failedAccounts`. Every one of those
+    /// properties is wanted here, and `evidenceRefused` especially: this refusal
+    /// is raised AFTER the `UID COPY`, so bounding the op to one attempt per
+    /// drain bounds the destination duplicates a re-attempt would seat.
+    ///
+    /// Deliberately NOT `ProviderError.uidValidityChanged` (exit 4 retires the
+    /// op, and no epoch was proven to have moved) and NOT
+    /// `ProviderError.actionIdentityResolutionFailed` (the drain DELETES on it,
+    /// and a malformed response is not a verdict on an identity). Its case name
+    /// and labels carry none of the substrings
+    /// `AccountManagerQueue.isMessageNotFoundError` matches, so it cannot be
+    /// mistaken for a confirmed-stale message — the same posture, with the same
+    /// server-supplied `folder` payload, as `IMAPEpochEvidenceMissing`.
+    private enum IMAPLivenessProbeInconclusive: ProviderEvidenceUnavailable {
+        /// A `UID FETCH` response record carried no parseable UID, so the probe
+        /// cannot answer which members the source mailbox still holds.
+        case unparsedUid(folder: String, requested: Int)
     }
 
     /// T3.14 — ⚑ NO REFERENCE — INVENTED. The DESTINATION-side epoch refusal.
@@ -4523,7 +4607,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // UIDs are already gone. Ask the source itself which of them
                     // it still holds, and authorize per member from that.
                     let live = try await self.liveSourceUIDs(
-                        of: sourceUIDs, server: server)
+                        of: sourceUIDs, folder: source, server: server)
                     authorizedUIDs = live
                     let liveValues = Set(live.toArray().map(\.value))
                     purgeAuthorizedUIDs = UIDSet(

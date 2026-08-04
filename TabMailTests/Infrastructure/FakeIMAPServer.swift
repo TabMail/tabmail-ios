@@ -138,6 +138,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// entirely — the shape a non-UIDPLUS server always produces. Empty for
         /// every pre-existing test.
         var copyUidWithheldSourceUIDs: Set<Int> = []
+        /// Audit round 5 — per-mailbox UIDs whose FETCH records omit the `UID`
+        /// data item entirely (`suppressFetchUid(in:uids:)`). RFC 3501 §6.4.8
+        /// makes that item MANDATORY in any FETCH response caused by a UID
+        /// command, so this is a NONCONFORMING wire shape modelled on purpose:
+        /// it is the only way to give the app a `MessageInfo` with a nil `uid`
+        /// and prove that an unanswerable probe never retires an operation.
+        /// Empty for every pre-existing test.
+        var fetchUidSuppressedByMailbox: [String: Set<Int>] = [:]
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -633,6 +641,29 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// UIDPLUS always does.
     func withholdCopyUID(forSourceUIDs uids: Set<Int>) {
         withState { $0.copyUidWithheldSourceUIDs = uids }
+    }
+
+    /// Test seam (audit round 5): these messages' FETCH records OMIT the `UID`
+    /// data item, in `mailbox`, even when the FETCH was a `UID FETCH`.
+    ///
+    /// ⚠ **THIS MODELS A NONCONFORMING SERVER, and that is the point** — the
+    /// same posture as `suppressSelectUidValidity(for:)`. RFC 3501 §6.4.8 is
+    /// unambiguous: *"a unique identifier data item MUST be included in any
+    /// FETCH response caused by a UID command"*. So no conformant server can
+    /// produce this shape, and it is the only deterministic way to hand the app
+    /// a `MessageInfo` whose `uid` is nil (SwiftMail's
+    /// `FetchMessageInfoHandler` creates one `MessageInfo` per `.start`
+    /// sequence number and only fills `uid` from a `.uid` attribute, so an
+    /// omitted item leaves the record present and its `uid` nil rather than
+    /// dropping the record).
+    ///
+    /// It exists because "we could not parse the answer" and "the server said
+    /// the message is gone" are the same ABSENCE downstream of a probe that
+    /// reads a live set, and only the first must never retire an operation.
+    /// Empty for every pre-existing test — while it stays empty the FETCH
+    /// handler's extra condition is one `isEmpty` branch.
+    func suppressFetchUid(in mailbox: String, uids: Set<Int>) {
+        withState { $0.fetchUidSuppressedByMailbox[mailbox] = uids }
     }
 
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
@@ -1915,7 +1946,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         let snapshot = withState { state in
             (
                 messages: state.messagesByMailbox[mailbox] ?? [],
-                flags: state.flagsByMailbox[mailbox] ?? [:]
+                flags: state.flagsByMailbox[mailbox] ?? [:],
+                uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? []
             )
         }
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
@@ -1925,7 +1957,11 @@ final class FakeIMAPServer: @unchecked Sendable {
             let seqnum = (snapshot.messages.firstIndex(where: { $0.uid == msg.uid }) ?? 0) + 1
             var fetchItems: [String] = []
 
-            if itemsStr.contains("UID") || uidMode {
+            // `suppressFetchUid(in:uids:)` — the nonconforming shape RFC 3501
+            // §6.4.8 forbids. Everything else about the record is unchanged, so
+            // the client still receives a FETCH record for this message; only
+            // the item that identifies WHICH message is missing.
+            if (itemsStr.contains("UID") || uidMode), !snapshot.uidSuppressed.contains(msg.uid) {
                 fetchItems.append("UID \(msg.uid)")
             }
             if itemsStr.contains("FLAGS") {
