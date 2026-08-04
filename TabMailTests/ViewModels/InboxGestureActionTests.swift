@@ -1881,11 +1881,24 @@ struct InboxGestureActionTests {
         // CONCRETE-TYPE check, so the real class is required — and the scoped
         // session is what guarantees no request can escape to the live endpoint.
         let http = FakeHTTP.Scenario()
-        defer { http.close() }
+        // 🚨 NO `defer { http.close() }`, and this is not an oversight —
+        // `IOS-TEST-009`. `InboxViewModel.delete` reaches
+        // `AccountManagerActions.queueDraftDelete`, which ends with an
+        // UNSTRUCTURED `Task { await drainPendingQueue() }` that outlives this
+        // test body BY DESIGN (a user gesture must not block on its wire
+        // drain). Invalidating this session while that drain is in flight makes
+        // its next request raise the Objective-C `NSGenericException` 'Task
+        // created in a session that has been invalidated' — uncatchable in
+        // Swift, so `libc++abi` terminates the WHOLE test process, every test
+        // not yet run in that launch is silently dropped, and xcodebuild blames
+        // whichever test was next rather than this one. The scope below closes
+        // the scenario only after that drain has settled, and does so while the
+        // provider is still registered, which is the order the drain needs to
+        // claim its operation at all. See `EscapedDrainTransport`.
         let gmail = GmailProvider(
             userEmail: "test@example.com", accessToken: { _ in "tok" }, session: http.session)
-        try await TestProviderRegistry.withRegisteredProvider(
-            accountId: "acc1", provider: gmail
+        try await EscapedDrainTransport.withProviderAndTransport(
+            accountId: "acc1", provider: gmail, transport: http, pool: pool
         ) {
 
             let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
@@ -1955,11 +1968,18 @@ struct InboxGestureActionTests {
         clearOverlay(); resetStagedGlobal()
 
         let http = FakeHTTP.Scenario()
-        defer { http.close() }
+        // 🚨 NO `defer { http.close() }` — see the sibling test above and
+        // `EscapedDrainTransport`. THIS is the leg that actually starts the
+        // escaped drain: it admits a `.deleteDraft` operation, so
+        // `queueDraftDelete` fires its unstructured
+        // `Task { await drainPendingQueue() }`, the drain reaches
+        // `GmailProvider.deleteDraft` → `trashContainedDraftMessage` →
+        // `performHTTPRequest` on THIS session, and closing the session first
+        // kills the whole test process (`IOS-TEST-009`).
         let gmail = GmailProvider(
             userEmail: "test@example.com", accessToken: { _ in "tok" }, session: http.session)
-        try await TestProviderRegistry.withRegisteredProvider(
-            accountId: "acc1", provider: gmail
+        try await EscapedDrainTransport.withProviderAndTransport(
+            accountId: "acc1", provider: gmail, transport: http, pool: pool
         ) {
 
             let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
