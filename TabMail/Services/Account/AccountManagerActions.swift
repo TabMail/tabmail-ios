@@ -1232,11 +1232,18 @@ extension AccountManager {
     /// annihilation, narrowed to provider-native identity. No RFC lookup,
     /// full-row resurrection, receipt, alias, or recovery lifecycle exists.
     ///
-    /// ⚑ NO REFERENCE — INVENTED: an IMAP move that has already reached the
-    /// provider cannot be reversed until a destination UID and positive
-    /// UIDVALIDITY are independently proven. v3 has no COPYUID/destination
-    /// receipt, so this path fails closed with no local or durable mutation;
-    /// sync/delta-sync reconciles server truth.
+    /// An IMAP move that has already reached the provider is reversed as an
+    /// ordinary forward move from the destination, because by the time this
+    /// runs the drain has re-keyed each row to the destination address
+    /// `COPYUID` proved (`MessageHeaderRekey.finishMove`) and
+    /// `UndoService.applyRekeys` has pointed the stacked members at it. The
+    /// inverse is therefore admitted through `admittedOrdinaryActionTargets`
+    /// like any other gesture — a destination UID and positive UIDVALIDITY are
+    /// still independently required, they are simply no longer missing. A
+    /// member `COPYUID` never named is not re-keyed, so its row still carries
+    /// the source address, admission refuses it, and the whole command fails
+    /// closed with no local or durable mutation; sync/delta-sync reconciles
+    /// server truth.
     @discardableResult
     func undoMove(
         accountId: String,
@@ -1330,19 +1337,54 @@ extension AccountManager {
                     if !related.isEmpty && !(related.count == 1 && exactPayload(related[0])) {
                         return UndoMoveWriteResult()
                     }
-                    // Stable providers retain one native id across a move,
-                    // so an exact ordinary inverse is safe. IMAP changes the
-                    // address and v3 has no destination receipt: fail closed.
-                    guard !isIMAP else { return UndoMoveWriteResult() }
+                    // UNDO IS JUST A REVERSE MOVE — it was never a rollback. The
+                    // inverse is admitted through the SAME predicate as any
+                    // ordinary forward gesture from `forwardDestinationPath`,
+                    // so IMAP needs no special case and no receipt: the drain
+                    // has already re-keyed each row to the destination address
+                    // `COPYUID` proved, and admission re-derives that address
+                    // from the row plus its folder's live epoch.
+                    //
+                    // WHOLE-COMMAND, never partial: a bundle that is only
+                    // partly admissible is refused entirely, exactly as the
+                    // non-exact-payload arm above refuses. A partly-reversed
+                    // move is a worse outcome than an unreversed one, because
+                    // the user cannot see which half moved.
+                    guard let admission = try Self.admittedOrdinaryActionTargets(
+                        currentRows, accountId: accountId,
+                        folderPath: forwardDestinationPath, db: db),
+                        admission.messages.count == currentRows.count
+                    else { return UndoMoveWriteResult() }
                     try PendingOperation(
                         type: .move,
-                        messageIds: providerIds,
+                        messageIds: admission.providerIds,
                         accountId: accountId,
                         folderPath: forwardDestinationPath,
-                        destinationPath: sourcePath
+                        destinationPath: sourcePath,
+                        observedUidValidity: admission.observedUidValidity
                     ).insert(db)
                 }
 
+                // 🚨 C3 — WHICH EPOCH THE OPTIMISTIC RESTORE MAY WRITE.
+                //
+                // Annihilated, or a stable-id provider: the message never left
+                // its source address (or has one address everywhere), so the
+                // captured source epoch still describes the row and restoring
+                // it is correct.
+                //
+                // A QUEUED IMAP INVERSE is the opposite case, and stamping the
+                // source epoch there would be a wrong-message mutation. That
+                // row now carries the DESTINATION address — the drain re-keyed
+                // its primary key and its `messageId` to the UID `COPYUID`
+                // proved in the destination folder — and this loop only moves
+                // the row's FOLDER back for display. Pairing a destination-space
+                // UID with the source folder's epoch is exactly the shape
+                // `admittedOrdinaryActionTargets` admits, so the user's next
+                // gesture would be issued against whatever message currently
+                // holds that UID in the source folder. Leaving the epoch unread
+                // fails closed instead: an absence of evidence is retryable, and
+                // the inverse move re-keys the row for real when it drains.
+                let restoreSourceEpoch = annihilate || !isIMAP
                 // ⚑ NO REFERENCE — INVENTED: smallest field-level restoration
                 // for v3's exact authenticated row. Preserve every unrelated
                 // field (notably current read/flag state); never `save` a stale
@@ -1353,7 +1395,8 @@ extension AccountManager {
                         Column("folderId").set(to: member.sourceFolderId),
                         Column("folderPath").set(to: member.sourceFolderPath),
                         Column("isInInbox").set(to: member.sourceIsInInbox),
-                        Column("observedUidValidity").set(to: member.sourceObservedUidValidity),
+                        Column("observedUidValidity").set(
+                            to: restoreSourceEpoch ? member.sourceObservedUidValidity : nil),
                         Column("actionTag").set(to: member.sourceActionTag?.rawValue),
                         Column("tagSortOrder").set(to: member.sourceTagSortOrder)
                     )

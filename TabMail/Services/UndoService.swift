@@ -15,7 +15,10 @@ enum UndoableActionType {
 /// PORT — the reference's command/member Undo shape, adapted from hybrid
 /// identity to the one native provider address plus its source epoch.
 struct UndoMember: Sendable, Equatable {
-    let providerMessageId: String
+    /// The message's address in the folder it is CURRENTLY in. On IMAP a move
+    /// changes that address, so this is re-pointed by `rekey` when the drain
+    /// finishes the move — it is not a stable identifier and never was.
+    private(set) var providerMessageId: String
     let sourceFolderId: String
     let sourceFolderPath: String
     let sourceObservedUidValidity: Int?
@@ -23,8 +26,9 @@ struct UndoMember: Sendable, Equatable {
     let sourceActionTag: ActionTag?
     let sourceTagSortOrder: Int
     /// UI-local only. It authenticates the exact still-present optimistic row;
-    /// it is never used as provider identity and is never resurrected.
-    let originalHeaderId: String
+    /// it is never used as provider identity and is never resurrected. It is
+    /// the row's PRIMARY KEY, which the drain's re-key changes — hence `rekey`.
+    private(set) var originalHeaderId: String
 
     init(header: MessageHeader) {
         providerMessageId = header.messageId
@@ -36,22 +40,37 @@ struct UndoMember: Sendable, Equatable {
         sourceTagSortOrder = header.tagSortOrder
         originalHeaderId = header.id
     }
+
+    /// Follow the row this member names to the destination address the drain
+    /// proved for it. **Only the two ADDRESS fields move.** Everything else on
+    /// this member describes where the message came FROM — the folder, epoch,
+    /// inbox flag and tag to restore — and undoing the move must still restore
+    /// exactly those, so re-keying must not touch them.
+    mutating func rekey(newHeaderId: String, newProviderMessageId: String) {
+        originalHeaderId = newHeaderId
+        providerMessageId = newProviderMessageId
+    }
 }
 
 struct UndoAccountCommand: Sendable, Equatable {
     let accountId: String
     let forwardDestinationPath: String
-    let members: [UndoMember]
+    var members: [UndoMember]
 }
 
 struct UndoableAction {
     let type: UndoableActionType
-    let messages: [MessageHeader]
+    /// The captured snapshot. Not the undo path's identity — `commands` is —
+    /// but `SyncEngine.scheduleMaintenanceInBackground` and
+    /// `SyncScheduler` derive `undoProtectedBodyIds` from these ids, so they
+    /// have to follow the drain's re-key too or the prune protection silently
+    /// starts naming a row that no longer exists.
+    var messages: [MessageHeader]
     let originalFolderId: String
     let originalFolderPath: String
     let accountId: String
     let timestamp: Date
-    let commands: [UndoAccountCommand]
+    var commands: [UndoAccountCommand]
 
     init(
         type: UndoableActionType,
@@ -141,6 +160,44 @@ final class UndoService {
             }
             let opsSummary = pendingOps?.map { "id=\($0.id.prefix(8)) type=\($0.type.rawValue) status=\($0.status) msgIds=\($0.messageIds)" } ?? ["<fetch failed>"]
             print("[UndoStack] PendingOps after push — [\(opsSummary.joined(separator: ", "))]")
+        }
+    }
+
+    /// Follow every stacked member whose row the drain just re-addressed.
+    ///
+    /// THE ADDRESS PROBLEM, from the undo stack's side: `originalHeaderId` IS
+    /// the row's primary key and `providerMessageId` IS its UID, so finishing a
+    /// move locally invalidates both for every member of that move. Without
+    /// this, `undoMove`'s member authentication looks up a key that no longer
+    /// exists and refuses the whole command — the re-key would BREAK undo
+    /// instead of enabling it.
+    ///
+    /// In memory, deliberately: the undo stack is itself in-memory and dies
+    /// with the process, so a durable pairing table would outlive the only
+    /// thing that consumes it. Nothing here is persisted, and nothing here is
+    /// authority for a mutation — `undoMove` re-authenticates the row against
+    /// the database before touching anything.
+    func applyRekeys(_ records: [HeaderRekeyRecord]) {
+        guard !records.isEmpty, !undoStack.isEmpty else { return }
+        let byOldId = Dictionary(
+            records.map { ($0.oldHeaderId, $0) }, uniquingKeysWith: { first, _ in first })
+        for actionIndex in undoStack.indices {
+            for messageIndex in undoStack[actionIndex].messages.indices {
+                guard let record = byOldId[undoStack[actionIndex].messages[messageIndex].id]
+                else { continue }
+                undoStack[actionIndex].messages[messageIndex].id = record.newHeaderId
+                undoStack[actionIndex].messages[messageIndex].messageId = record.newProviderMessageId
+            }
+            for commandIndex in undoStack[actionIndex].commands.indices {
+                for memberIndex in undoStack[actionIndex].commands[commandIndex].members.indices {
+                    let member = undoStack[actionIndex].commands[commandIndex].members[memberIndex]
+                    guard let record = byOldId[member.originalHeaderId] else { continue }
+                    undoStack[actionIndex].commands[commandIndex].members[memberIndex].rekey(
+                        newHeaderId: record.newHeaderId,
+                        newProviderMessageId: record.newProviderMessageId)
+                    print("[UndoStack] REKEY member \(record.oldHeaderId) → \(record.newHeaderId)")
+                }
+            }
         }
     }
 

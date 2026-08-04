@@ -479,4 +479,176 @@ struct FinishTheMoveLocallyTests {
         try? await provider.disconnect()
         await finish(f)
     }
+
+    // MARK: - Undo after the drain — an ordinary reverse move
+
+    /// Push the undo entry the way the UI does: BEFORE the gesture, from a
+    /// snapshot of the row at its source address. Everything the drain then does
+    /// to that address has to be followed by the stack, which is the point.
+    @MainActor
+    private func pushUndo(_ header: MessageHeader, to destinationPath: String) {
+        UndoService.shared.push(UndoableAction(
+            type: .move(fromPath: header.folderPath, toPath: destinationPath),
+            messages: [header],
+            originalFolderId: header.folderId,
+            originalFolderPath: header.folderPath,
+            accountId: header.accountId,
+            timestamp: Date()))
+    }
+
+    /// Undo dispatches its inverse through the write queue, so the operation it
+    /// inserts is not durable the instant `undo()` returns. `awaitWriteQueueDrain`
+    /// is that queue's own FIFO barrier — deterministic, not a poll — and only
+    /// after it can the pending queue be drained meaningfully.
+    ///
+    /// A settle loop keyed on "the message is back" would be WRONG here: a move
+    /// with no `COPYUID` leaves the source copy `\Deleted`-but-present, so in the
+    /// negative test below that condition is already true before undo runs and
+    /// the loop would exit before the undo write had landed — the test would
+    /// pass without ever exercising undo.
+    @MainActor
+    private func settleUndo(_ fixture: Fixture) async throws {
+        await AccountManager.shared.awaitWriteQueueDrain()
+        try await drainToQuiescence(fixture)
+    }
+
+    /// **THE PROPERTY: undoing a move that has already reached the server puts
+    /// the message back where it was — on the SERVER, not merely on screen.**
+    ///
+    /// Undo is just a reverse move and always was. Before this change it could
+    /// not be one on IMAP for a single reason: the move had changed the
+    /// message's address and nothing had recorded the new one, so undo could not
+    /// NAME the message in its new folder and fell back to a closed no-op. With
+    /// the drain finishing the move locally, the row already carries the
+    /// destination address `COPYUID` proved, and the inverse is admitted through
+    /// the same predicate as any ordinary forward gesture.
+    ///
+    /// Asserted as END STATE ON THE SERVER: where the mail actually is, not what
+    /// the local rows or the queue say about it.
+    ///
+    /// RED PROOF (recorded): restoring `guard !isIMAP` in `undoMove`'s
+    /// non-annihilate arm fails this — the message stays in `Archive`. So does
+    /// deleting the `UndoService.applyRekeys` call from the drain, which is the
+    /// sharper of the two: the re-key then invalidates the very key undo
+    /// authenticates by, and undo refuses a message that IS addressable.
+    @Test("Undo after the move has drained puts the message back on the server")
+    @MainActor
+    func undoAfterTheDrainMovesTheMessageBack() async throws {
+        let target = "undo-after-drain@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-undo")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+
+        pushUndo(seeded, to: "Archive")
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+
+        // NON-VACUITY: the forward move really did complete on the server, so
+        // what is undone below is a DRAINED move and not a queued one — the
+        // annihilate branch has always handled that case and is not under test.
+        #expect(server.messageIDs(in: "Archive") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "INBOX").isEmpty)
+
+        await UndoService.shared.undo()
+        try await settleUndo(f)
+
+        // THE PROPERTY.
+        #expect(
+            server.messageIDs(in: "INBOX") == ["<\(target)>"],
+            """
+            undo of an already-drained move did not reach the server — the message is still \
+            wherever the forward move left it. INBOX: \(server.messageIDs(in: "INBOX")), \
+            Archive: \(server.messageIDs(in: "Archive"))
+            """)
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: a member the server never named is never named by us
+    /// either — undo of it changes nothing, locally or on the wire.**
+    ///
+    /// `COPYUID` is a MAY (RFC 4315 §3) and a mailbox property, so a server can
+    /// copy a message perfectly well and report nothing about where it landed.
+    /// That member is not re-keyed, its row still carries the SOURCE address
+    /// with its epoch unread, and admission refuses it. The refusal is
+    /// WHOLE-COMMAND and silent, and it is the accepted limitation this change
+    /// registers rather than fixes: nothing is lost, the copy is still in the
+    /// destination, and a later sync repairs the row.
+    ///
+    /// This is the negative case of the test above, and it is built so that the
+    /// naive version of that fix — drop `guard !isIMAP`, queue the inverse
+    /// naming the SOURCE UIDs the command already holds — is a C3 wrong-message
+    /// mutation rather than a harmless no-op. `Archive` already contains an
+    /// unrelated message AT THE SOURCE UID (88), so an inverse that names 88 in
+    /// `Archive` moves the BYSTANDER to the inbox, and the user's undo of one
+    /// message silently relocates another. Re-admitting the row through
+    /// `admittedOrdinaryActionTargets` is what refuses it: the row still carries
+    /// the source address with its epoch unread, and an unread epoch is an
+    /// absence of evidence.
+    ///
+    /// RED PROOF (recorded): replacing the admission with the naive inverse
+    /// (`messageIds: providerIds`, `observedUidValidity: sourceEpoch`) fails
+    /// this — the bystander lands in `INBOX` and the wire oracle records the
+    /// mutation against a message the gesture never selected.
+    @Test("Undo does nothing for a member COPYUID never named")
+    @MainActor
+    func undoDoesNothingForAMemberCopyUidNeverNamed() async throws {
+        let target = "undo-unnamed@example.com"
+        let bystander = "undo-bystander@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            // Occupies the very UID the source address names, in the folder the
+            // inverse would be issued against.
+            "Archive": [Self.message(uid: 88, id: bystander)],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-undo-unnamed")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+
+        pushUndo(seeded, to: "Archive")
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+
+        // NON-VACUITY: the copy landed. The server did the work and simply did
+        // not say where — this is an evidence gap, not a failed move.
+        #expect(Set(server.messageIDs(in: "Archive")) == ["<\(target)>", "<\(bystander)>"])
+
+        await UndoService.shared.undo()
+        try await settleUndo(f)
+
+        // THE PROPERTY: nothing was reversed, and — the part that matters —
+        // nothing was reversed WRONGLY. The unpurged source copy is still
+        // `\Deleted`-but-present, which is the documented reversible outcome of
+        // a move with no COPYUID.
+        #expect(
+            Set(server.messageIDs(in: "Archive")) == ["<\(target)>", "<\(bystander)>"],
+            "undo mutated in a folder where it could not name its own message")
+        #expect(
+            server.messageIDs(in: "INBOX").contains("<\(bystander)>") == false,
+            """
+            undo of a member the server never named a destination for moved a DIFFERENT message \
+            that happened to hold the stale source UID: \(server.messageIDs(in: "INBOX"))
+            """)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
 }

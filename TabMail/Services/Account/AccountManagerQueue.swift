@@ -656,6 +656,10 @@ extension AccountManager {
                      newKey: ContentKey(rawValue: $0.newHeaderId),
                      newMessageId: $0.newProviderMessageId)
                 })
+                // The undo stack names its members by the SAME primary key and
+                // UID this re-key just changed, so it has to follow — otherwise
+                // finishing the move would break undo rather than enable it.
+                await UndoService.shared.applyRekeys(appliedRekeys)
             }
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
