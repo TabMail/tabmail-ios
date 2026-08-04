@@ -558,13 +558,88 @@ actor ExchangeProvider: EmailProvider {
     /// the categories array in Graph, so we read-filter-write to preserve
     /// user-created categories. Skips the PATCH if no tm_* entries exist.
     private func stripLegacyCategories(id: String) async throws {
+        try await mutateCategories(id: id) { existing in
+            existing.filter { !Self.isLegacyActionTagCategory($0) }
+        }
+    }
+
+    /// The ONE `tm_*` predicate over Graph categories, with two consumers that
+    /// must never disagree: `stripLegacyCategories`, which DELETES these from
+    /// the server, and `parseGraphMessage`, which must never surface as a user
+    /// label something the other one erases. Action tags are local-only
+    /// (ADR-IOS-036); a `tm_*` category on the server is pre-ADR pollution.
+    ///
+    /// Case-INsensitive, as the strip has always been — `tm_` is a reserved
+    /// namespace, not a literal string, and `UserLabelStore.shouldExcludeLabel`
+    /// lowercases before testing the same prefix.
+    static func isLegacyActionTagCategory(_ category: String) -> Bool {
+        category.lowercased().hasPrefix("tm_")
+    }
+
+    /// Read-filter-write on one message's `categories` — the ONLY shape a Graph
+    /// category mutation may take in this file.
+    ///
+    /// 🚨 **Graph's PATCH REPLACES the entire `categories` array.** A blind write
+    /// would silently clobber every category set by Outlook desktop, Outlook web
+    /// or a server-side rule, so `transform` is handed the server's CURRENT
+    /// array and its result is written back whole. The PATCH is skipped outright
+    /// when the transform changes nothing, so a redundant add/remove costs one
+    /// GET and no mutation.
+    ///
+    /// **ACCEPTED, PRE-EXISTING RACE — do not build a mechanism for it.** This is
+    /// a read-modify-write, so a category another client adds between the GET and
+    /// the PATCH is lost. `stripLegacyCategories` has had exactly this race since
+    /// it shipped; the recovery is one ordinary sync pass, which re-reads the
+    /// server's array wholesale. Graph exposes no ETag precondition on the
+    /// `categories` property that would close it without a new failure mode.
+    private func mutateCategories(
+        id: String, transform: ([String]) -> [String]
+    ) async throws {
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
         let data = try await request(path: "/messages/\(encodedId)?$select=categories")
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
         let existing = msg.categories ?? []
-        let filtered = existing.filter { !$0.lowercased().hasPrefix("tm_") }
-        guard filtered.count != existing.count else { return }
-        try await patchMessage(id: id, body: ["categories": filtered])
+        let updated = transform(existing)
+        guard updated != existing else { return }
+        try await patchMessage(id: id, body: ["categories": updated])
+    }
+
+    /// Add or remove a user label on one message. **On Graph a user label IS a
+    /// message `category`** — there is no separate label resource to create, so
+    /// unlike Gmail this needs no catalog round-trip: PATCHing a name onto a
+    /// message is what makes it exist there.
+    ///
+    /// `category` is the BARE provider value (`UserLabel.providerLabelId`), which
+    /// for Outlook is the category's display name VERBATIM — never
+    /// `UserLabel.id`, the account-prefixed surrogate, which would write a wrong
+    /// category name onto the user's real message.
+    ///
+    /// Mirrors `IMAPProvider.setUserLabel(messageId:keyword:add:folder:…)`, minus
+    /// the folder and the admitted epoch: a Graph id is a provider-stable
+    /// resource id that addresses the message directly, not a UID inside a
+    /// mailbox's numbering space, so there is no epoch to prove and no folder to
+    /// select. That is Gmail's situation, not IMAP's.
+    ///
+    /// **No master-category registration, and no OAuth scope for one.** Writing
+    /// `/me/outlook/masterCategories` needs `MailboxSettings.ReadWrite`, which
+    /// the app does not request; adding it would force every existing Outlook
+    /// user through re-consent. A category TabMail creates therefore may render
+    /// without an assigned colour in Outlook until the user adds it to their
+    /// master list — the same "registered nowhere" position an IMAP keyword is
+    /// in, fixed by one ordinary user gesture.
+    ///
+    /// `tm_*` cannot arrive here: `UserLabelStore.isReservedName` refuses that
+    /// prefix at the only creation site (`UserLabelMenuView.createAndApply`), and
+    /// the read path filters it back out. Refusing at creation is deliberate —
+    /// writing one would put a category on the server that
+    /// `stripLegacyCategories` later silently deletes.
+    func setUserLabel(messageId: String, category: String, add: Bool) async throws {
+        try await mutateCategories(id: messageId) { existing in
+            if add {
+                return existing.contains(category) ? existing : existing + [category]
+            }
+            return existing.filter { $0 != category }
+        }
     }
 
     // MARK: - Sending
@@ -1039,7 +1114,50 @@ actor ExchangeProvider: EmailProvider {
             isReplied: false,
             isForwarded: false,
             actionTag: nil,
-            userLabelIds: []  // Exchange category support is future work.
+            // A Graph message `category` IS Outlook's user label. The data was
+            // already on the wire and already decoded — `categories` is named in
+            // `GraphAPI.headerOnlyFields`, from which `metadataSelectFields`,
+            // `backfillSelectFields` and `fullSelectFields` all derive, and
+            // `GraphMessage.categories` has always been parsed. Only this mapping
+            // was missing.
+            //
+            // `tm_*` is filtered through the SAME predicate `stripLegacyCategories`
+            // uses to DELETE those categories from the server (ADR-IOS-036 keeps
+            // action tags local-only). A category that function erases must never
+            // be shown to the user as a label they own.
+            //
+            // 🚨 VERBATIM — do NOT lowercase. IMAP lowercases because RFC 3501
+            // keywords are case-INsensitive; Graph category names are
+            // case-SENSITIVE display strings. The write path
+            // (`UserLabelMenuModel.createAndApply`'s `.outlook` arm) mints the
+            // user's typed name unchanged, so this must map the server's echo
+            // unchanged too — otherwise `Receipts` typed here and `Receipts`
+            // echoed back derive two different `UserLabel.id`s and the menu grows
+            // a duplicate row for one category.
+            userLabelIds: (msg.categories ?? [])
+                .filter { !Self.isLegacyActionTagCategory($0) },
+            // AUTHORITATIVE — justified per construction site, and there is
+            // exactly one: this is the sole `MessageHeaderInfo` this file builds.
+            // Every one of its callers fetches through a `$select` derived from
+            // `GraphAPI.headerOnlyFields`, which names `categories`:
+            // `fetchMessages`, `fetchOlderMessages`, `search` and
+            // `fetchMessageHeaders` (`selectMessageHeaderFields`), `fetchMessage`
+            // (`selectFullMessageFields`), `fetchSingleBackfill`
+            // (`selectBackfillFields`) and `fetchMessageDetails`
+            // (`selectMessageDetailFields`) — seven call sites, all of them.
+            // Graph returns the complete `categories` array whenever it is
+            // selected, so the set really is exact. The lean `$select`s in this
+            // file — `$select=id` in `listBackfillMessageIds` and
+            // `listMessageIdsPage`, `$select=id,body` in `fetchSingleTextBody`,
+            // `$select=categories` in `mutateCategories` — decode into other
+            // types or read one field and never reach here.
+            //
+            // ⚠️ IF YOU ADD A `parseGraphMessage` CALLER, IT MUST SELECT
+            // `categories`. Read this flag's doc comment on `MessageHeaderInfo`:
+            // it is currently unconsumed on v3, but a reconcile added later
+            // REPLACES local membership with this set, so `true` on a path that
+            // fetched no categories would erase every label the user has.
+            userLabelIdsAreAuthoritative: true
         )
     }
 

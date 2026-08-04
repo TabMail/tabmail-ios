@@ -23,6 +23,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         let isRead: Bool
         let isFlagged: Bool
         let receivedAt: Date
+        /// Graph categories the server already holds for this message — the
+        /// stand-in for categories set by Outlook desktop, Outlook web or a
+        /// server-side rule. Defaults to empty so every pre-existing seed
+        /// keeps its meaning.
+        let categories: [String]
 
         init(
             rfc822MessageId: String,
@@ -30,7 +35,8 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             folderId: String,
             isRead: Bool = false,
             isFlagged: Bool = false,
-            receivedAt: Date = Date()
+            receivedAt: Date = Date(),
+            categories: [String] = []
         ) {
             self.rfc822MessageId = rfc822MessageId
             self.providerMessageId = providerMessageId
@@ -38,6 +44,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             self.isRead = isRead
             self.isFlagged = isFlagged
             self.receivedAt = receivedAt
+            self.categories = categories
         }
     }
 
@@ -55,6 +62,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var isRead: Bool
         var isFlagged: Bool
         let receivedAt: Date
+        var categories: [String] = []
     }
 
     private struct State: Sendable {
@@ -93,7 +101,8 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     folderId: $0.folderId,
                     isRead: $0.isRead,
                     isFlagged: $0.isFlagged,
-                    receivedAt: $0.receivedAt
+                    receivedAt: $0.receivedAt,
+                    categories: $0.categories
                 ))
             }
         )))
@@ -187,6 +196,19 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 )
             }
         }
+    }
+
+    /// The Graph categories the server currently holds for `providerMessageId`,
+    /// or `nil` if no such resource exists. Deliberately NOT folded into
+    /// `Snapshot`: that type is `Equatable` and compared whole by an existing
+    /// test, so widening it would silently change what that comparison asserts.
+    ///
+    /// This is the wire oracle for Outlook user labels — a label on Outlook IS a
+    /// message category, so "did the user's label reach the server, and did it
+    /// leave the server's other categories alone" is exactly a question about
+    /// this array.
+    func categories(providerMessageId: String) -> [String]? {
+        state.value.withLock { $0.messagesByProviderId[providerMessageId]?.categories }
     }
 
     /// Every copy currently sharing one RFC Message-ID. Under D4 this is an
@@ -294,6 +316,13 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                    let status = flag["flagStatus"] as? String {
                     message.isFlagged = status == "flagged"
                 }
+                // Graph REPLACES the whole `categories` array on PATCH — it is
+                // not a merge. Modeling the replacement is the entire point:
+                // an adapter that PATCHed blindly would visibly destroy a
+                // category this fixture was seeded with.
+                if let categories = body["categories"] as? [String] {
+                    message.categories = categories
+                }
                 model.messagesByProviderId[providerId] = message
                 return true
             }
@@ -335,7 +364,8 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     folderId: destination,
                     isRead: prior.isRead,
                     isFlagged: prior.isFlagged,
-                    receivedAt: prior.receivedAt
+                    receivedAt: prior.receivedAt,
+                    categories: prior.categories
                 )
                 model.messagesByProviderId[movedId] = next
                 return next
@@ -438,7 +468,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             "hasAttachments": false,
             "internetMessageId": "<\(message.rfc822MessageId)>",
             "conversationId": "conversation-\(message.rfc822MessageId)",
-            "categories": [],
+            "categories": message.categories,
             "bodyPreview": "",
             "body": ["contentType": "text", "content": "Stateful draft body"],
             "parentFolderId": message.folderId,

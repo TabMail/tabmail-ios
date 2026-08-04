@@ -861,14 +861,24 @@ struct UnknownEpochAdmissionRefusalTests {
         #expect(joined == 0, "the local half must not land either — the two must fail together")
     }
 
-    /// 12c — the provider gate, REFUSED side. Exchange's adapter implements no
-    /// remote user-label mutation, so an admitted op could never execute; the drain
-    /// would carry it forever while the menu showed a checkmark for a label the
-    /// server will never hold.
+    /// 12c — the provider gate, REFUSED side. CalDAV carries no mail at all, so
+    /// an admitted label op could never execute; the drain would carry it forever
+    /// while the menu showed a checkmark for a label the server will never hold.
+    ///
+    /// ⚑ RE-SCOPED, NOT REWRITTEN — this test was `.outlook` and its display name
+    /// was **"A provider with no remote user labels queues no label op and offers
+    /// no menu"** (unchanged; only the fixture's provider moved). It BLESSED the
+    /// Outlook refusal, which `IOS-LABEL-002` falsified: an Outlook user label is
+    /// a Graph message `category` and `ExchangeProvider.setUserLabel` now writes
+    /// it, so `.outlook` belongs on 12d's admitted side, not here. The invariant
+    /// 12c pins — *a provider whose adapter cannot mutate labels remotely queues
+    /// nothing and shows nothing* — is unchanged and still has a live subject in
+    /// `.caldav`. Deleting the test instead of re-pointing it would have retired
+    /// the only guard on that invariant.
     @Test("A provider with no remote user labels queues no label op and offers no menu")
     @MainActor
     func providerWithoutRemoteUserLabelsQueuesNoLabelOp() async throws {
-        let (pool, dir, previous) = try makeTestDB(provider: .outlook, inboxEpoch: nil)
+        let (pool, dir, previous) = try makeTestDB(provider: .caldav, inboxEpoch: nil)
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "912")

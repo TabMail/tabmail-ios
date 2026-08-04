@@ -1592,8 +1592,26 @@ extension AccountManager {
             guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return .allMembers }
             if let gmail = provider as? GmailProvider {
                 try await gmail.modifyMessage(id: msgId, addLabelIds: [labelId])
-            } else if provider is ExchangeProvider {
-                print("[Queue] addUserLabel not yet supported for Exchange")
+            } else if let exchange = provider as? ExchangeProvider {
+                // 🚨 CLOSES A LIVE NEVER-DROP VIOLATION. This arm used to be
+                // `print("[Queue] addUserLabel not yet supported for Exchange")`
+                // and then fall through to `return .allMembers` — the op was
+                // RETIRED AS SUCCESSFUL having done nothing. That is not a
+                // missing feature, it is exit-2 abuse: nothing provider-
+                // authoritative said the work was done or inapplicable.
+                //
+                // `labelId` is `PendingOperation.userLabelId`, the BARE
+                // `UserLabel.providerLabelId` (D10 / `IOS-LABEL-001`), which on
+                // Outlook is the Graph category name verbatim.
+                //
+                // GMAIL'S SHAPE, NOT IMAP'S — deliberately no
+                // `admittedUidValidity` guard. Graph ids are provider-stable
+                // resource ids, not UIDs in a numbering space; Exchange has no
+                // UIDVALIDITY, and `admittedOrdinaryActionTargets` records `nil`
+                // for it, so requiring one here would refuse every Outlook label
+                // op forever.
+                try await exchange.setUserLabel(
+                    messageId: msgId, category: labelId, add: true)
             } else if let imap = provider as? IMAPProvider,
                       let admitted = op.observedUidValidity,
                       let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
@@ -1607,8 +1625,12 @@ extension AccountManager {
             guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return .allMembers }
             if let gmail = provider as? GmailProvider {
                 try await gmail.modifyMessage(id: msgId, removeLabelIds: [labelId])
-            } else if provider is ExchangeProvider {
-                print("[Queue] removeUserLabel not yet supported for Exchange")
+            } else if let exchange = provider as? ExchangeProvider {
+                // See the identical comment in `.addUserLabel`, including why
+                // this follows Gmail's shape rather than IMAP's and why the
+                // `print`-and-retire it replaced was a never-drop violation.
+                try await exchange.setUserLabel(
+                    messageId: msgId, category: labelId, add: false)
             } else if let imap = provider as? IMAPProvider,
                       let admitted = op.observedUidValidity,
                       let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {

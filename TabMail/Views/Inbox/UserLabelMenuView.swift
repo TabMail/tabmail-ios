@@ -64,18 +64,33 @@ final class UserLabelMenuModel {
     // MARK: - Provider Capability
 
     /// Whether this provider's mail adapter implements REMOTE user-label
-    /// mutations. Outlook (Graph) and CalDAV do not, so a label op admitted for
-    /// them can never execute — it would sit in the queue being retried forever
-    /// while the menu showed a checkmark for a label the server will never carry.
-    /// Refusing at admission is the honest answer; nothing is queued and nothing
-    /// is shown.
+    /// mutations. CalDAV does not, so a label op admitted for it can never
+    /// execute — it would sit in the queue being retried forever while the menu
+    /// showed a checkmark for a label the server will never carry. Refusing at
+    /// admission is the honest answer; nothing is queued and nothing is shown.
+    ///
+    /// ⚑ `.outlook` USED TO BE IN THAT REFUSING ARM AND NO LONGER IS. Outlook's
+    /// user label is a Graph message `category` (`ExchangeProvider.setUserLabel`
+    /// / `parseGraphMessage`), so its adapter now mutates labels remotely exactly
+    /// as Gmail's and IMAP's do, and gating it hid an Outlook account's own
+    /// existing label rows behind an empty, disabled sheet. `.caldav` stays
+    /// `false` for a categorically different reason: it carries no mail at all,
+    /// so the question is inapplicable rather than merely unimplemented.
     ///
     /// ⚑ PORT of `v2final`'s `AccountProvider.supportsRemoteUserLabels`
-    /// (declared on the enum in `TabMail/Models/Account.swift`), with ONE
-    /// deliberate difference: v3 carries no such member on `AccountProvider`, and
-    /// this change's file scope does not include `Account.swift`. The ladder
-    /// belongs on the enum beside `contentKeySpace` — lift it there when that file
-    /// is in scope, replace the four call sites, and delete this.
+    /// (declared on the enum in `TabMail/Models/Account.swift`), with TWO
+    /// deliberate differences:
+    ///
+    /// 1. v3 carries no such member on `AccountProvider`, and this change's file
+    ///    scope does not include `Account.swift`. The ladder belongs on the enum
+    ///    beside `contentKeySpace` — lift it there when that file is in scope,
+    ///    replace the four call sites, and delete this.
+    /// 2. 🚨 **THE VALUES DIVERGE.** `v2final` returns `false` for `.outlook`
+    ///    (its `AccountProviderTests` assert it), because `v2final` never
+    ///    implemented a Graph category write either. v3 does
+    ///    (`IOS-LABEL-002`), so `.outlook` is `true` here. **A lift must NOT
+    ///    copy `v2final`'s arm** — doing so would silently re-hide every Outlook
+    ///    account's labels.
     ///
     /// ⚑ Exhaustive with no `default:` clause on purpose, exactly like
     /// `AccountProvider.contentKeySpace`: a sixth provider must be a compile error
@@ -86,8 +101,8 @@ final class UserLabelMenuModel {
     /// same treatment `AccountManager.newGestureRefusedForUnknownEpoch` gets.
     nonisolated static func supportsRemoteUserLabels(_ provider: AccountProvider) -> Bool {
         switch provider {
-        case .gmail, .imap, .icloud: return true
-        case .outlook, .caldav: return false
+        case .gmail, .imap, .icloud, .outlook: return true
+        case .caldav: return false
         }
     }
 
@@ -385,11 +400,37 @@ final class UserLabelMenuModel {
             case .imap, .icloud:
                 // IMAP: keyword name (lowercased) IS the ID — no server call needed
                 labelId = name.lowercased()
-            case .outlook, .caldav:
-                // Unreachable — the gate above already returned for these. Spelled
-                // as explicit cases rather than `default:` for the same reason
-                // `supportsRemoteUserLabels(_:)` is exhaustive: a sixth provider
-                // must be a compile error here, not a silent keyword-id guess.
+            case .outlook:
+                // Outlook: the Graph category's DISPLAY NAME is the ID. Mints
+                // locally like the IMAP arm above rather than blocking on a
+                // catalog round-trip like the Gmail arm, because Graph has no
+                // catalog to call: PATCHing a category name onto a message is
+                // what makes it exist there (`ExchangeProvider.setUserLabel`).
+                //
+                // 🚨 VERBATIM — deliberately NOT `.lowercased()`, the one place
+                // this arm diverges from the IMAP arm it otherwise copies. IMAP
+                // lowercases because RFC 3501 keywords are case-INsensitive;
+                // Graph category names are case-SENSITIVE display strings that
+                // must round-trip byte-identically. The read path
+                // (`ExchangeProvider.parseGraphMessage`) maps the server's
+                // `categories` strings verbatim into `userLabelIds`, and the sync
+                // arms mint a `UserLabel` from each, so lowercasing here would
+                // make the user's `Receipts` and the server's echoed `Receipts`
+                // derive two different `UserLabel.id`s — one category, two menu
+                // rows.
+                //
+                // `tm_*` never reaches here: `UserLabelStore.isReservedName`
+                // refuses that prefix at this function's only caller, which is
+                // deliberate — the server would accept such a category and
+                // `ExchangeProvider.stripLegacyCategories` would later silently
+                // delete it.
+                labelId = name
+            case .caldav:
+                // Unreachable — the gate above already returned for CalDAV.
+                // Spelled as an explicit case rather than `default:` for the same
+                // reason `supportsRemoteUserLabels(_:)` is exhaustive: a sixth
+                // provider must be a compile error here, not a silent keyword-id
+                // guess.
                 return false
             }
 
