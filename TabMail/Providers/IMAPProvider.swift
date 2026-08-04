@@ -3887,7 +3887,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard epoch > 0 else { return [] }
         guard Self.isStrictlyAscending(evidence.mapping.map(\.source.value)),
               Self.isStrictlyAscending(evidence.mapping.map(\.destination.value)) else {
-            print("[IMAP] COPYUID pairing REFUSED — the response's source/destination lists are not both strictly ascending, so the positional zip that produced this mapping cannot be trusted to have paired them correctly; no local re-key is admitted (fail closed; the move itself is unaffected and sync repairs the row)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[IMAP] COPYUID pairing REFUSED — the response's source/destination lists are not both strictly ascending, so the positional zip that produced this mapping cannot be trusted to have paired them correctly; no local re-key is admitted (fail closed; the move itself is unaffected and sync repairs the row)")
+            }
             return []
         }
         let requestedValues = Set(requested.toArray().map(\.value))
@@ -4022,7 +4024,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         for try await info in server.fetchMessageInfos(
             using: requested, options: .uidFlagsOnly) {
             guard let uid = info.uid else {
-                print("[IMAP] liveness probe of '\(folder)': a UID FETCH response record carried no parseable UID (RFC 3501 §6.4.8 requires one), so this probe cannot say which of the \(requested.count) requested uid(s) the source still holds — REFUSING all source cleanup (fail closed; an unanswerable probe is not proof a member left the mailbox) and keeping the op retryable")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[IMAP] liveness probe of '\(folder)': a UID FETCH response record carried no parseable UID (RFC 3501 §6.4.8 requires one), so this probe cannot say which of the \(requested.count) requested uid(s) the source still holds — REFUSING all source cleanup (fail closed; an unanswerable probe is not proof a member left the mailbox) and keeping the op retryable")
+                }
                 throw IMAPLivenessProbeInconclusive.unparsedUid(
                     folder: folder, requested: requested.count)
             }
@@ -4521,7 +4525,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // which is the correct disposition for "we do not know".
                 let observedDestinationUidValidity = destinationProbe.uidValidity.value
                 guard observedDestinationUidValidity > 0 else {
-                    print("[IMAP] move \(source)→\(destination): destination SELECT reported no UIDVALIDITY, so no COPYUID could ever be proven to belong to the mailbox we probed — REFUSING before any wire mutation (fail closed; nothing copied, nothing deleted) and keeping the op retryable")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[IMAP] move \(source)→\(destination): destination SELECT reported no UIDVALIDITY, so no COPYUID could ever be proven to belong to the mailbox we probed — REFUSING before any wire mutation (fail closed; nothing copied, nothing deleted) and keeping the op retryable")
+                    }
                     throw IMAPDestinationEpochRefusal.unknownAtProbe(destination: destination)
                 }
 
@@ -4540,7 +4546,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     do {
                         try await server.store(flags: legacyFlags, on: sourceUIDs, operation: .remove)
                     } catch {
-                        print("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
+                        }
                     }
                 }
 
@@ -4608,7 +4616,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // destination's, which the op never recorded, so the
                         // refusal is re-raised as the retryable one. See
                         // `IMAPDestinationEpochRefusal` for the full argument.
-                        print("[IMAP] move \(source)→\(destination): destination UIDVALIDITY moved from \(observedDestinationUidValidity) (probed) to \(copyEvidence.destinationUIDValidity.value) (COPYUID) across the COPY — REFUSING all source cleanup (fail closed; the copy landed in an address space this attempt never validated) and keeping the op retryable")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[IMAP] move \(source)→\(destination): destination UIDVALIDITY moved from \(observedDestinationUidValidity) (probed) to \(copyEvidence.destinationUIDValidity.value) (COPYUID) across the COPY — REFUSING all source cleanup (fail closed; the copy landed in an address space this attempt never validated) and keeping the op retryable")
+                        }
                         throw IMAPDestinationEpochRefusal.movedAcrossCopy(
                             destination: destination,
                             observed: observedDestinationUidValidity,
