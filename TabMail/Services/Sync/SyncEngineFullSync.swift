@@ -753,13 +753,23 @@ extension SyncEngine {
     ///
     /// `fetched.count < limit` ⇒ the whole folder came back ⇒ complete knowledge of
     /// all of it ⇒ anything local-but-not-remote is genuinely gone.
+    ///
+    /// **PRESENCE and COVERAGE are two different questions, and `\Deleted` answers
+    /// only the first (`IOS-IMAP-001` / D3).** A message the server reports with
+    /// `\Deleted` is pending removal (RFC 3501 §2.3.2) and is not presented, so it
+    /// does not keep a local row alive — it is subtracted from `remoteIds` below.
+    /// It is NOT subtracted from `fetched.count` or from the UID floor: those
+    /// measure what the FETCH covered, and a `\Deleted` record was covered. Taking
+    /// this flag into the window instead of into presence would raise the floor
+    /// (or trip the complete-knowledge branch) and stale-delete rows the fetch
+    /// never returned — the ADR-IOS-042 / MIS-IOS-002 Archive data-loss shape.
     nonisolated static func selectStaleHeaders(
         candidates: [MessageHeader],
         fetched: [MessageHeaderInfo],
         limit: Int,
         windowMode: StaleWindowMode
     ) -> [MessageHeader] {
-        let remoteIds = Set(fetched.map(\.messageId))
+        let remoteIds = Set(fetched.lazy.filter { !$0.isDeletedOnServer }.map(\.messageId))
         if fetched.count < limit {
             return candidates.filter { !remoteIds.contains($0.messageId) }
         }
@@ -905,7 +915,25 @@ extension SyncEngine {
         let accountId = folder.accountId
         let isInInbox = folder.role == .inbox
 
-        let remoteIds = Set(messages.map(\.messageId))
+        // IOS-IMAP-001 / D3 — a `\Deleted` remote message is NOT PRESENT for
+        // display. RFC 3501 §2.3.2 defines the flag as "deleted for removal by
+        // later EXPUNGE": still on the server, still holding its UID, pending
+        // removal. On a server without UIDPLUS that is exactly what a completed
+        // move leaves behind (`IMAPProvider.move` soft-deletes the source and the
+        // purge stays gated on `COPYUID`), and ingesting it as an ordinary message
+        // re-listed it in the Inbox after the protections expired.
+        //
+        // `messages` itself is deliberately NOT filtered. Every windowing decision
+        // below — `messages.count < limit`, the `CAST(messageId AS INTEGER)` floor,
+        // and `selectStaleHeaders`' own count/floor — must keep measuring the whole
+        // fetch, because they describe WHAT THE FETCH COVERED. Shrinking the fetch
+        // here would raise the floor and trip the complete-knowledge branch, and
+        // stale-delete rows the fetch never returned (ADR-IOS-042 / MIS-IOS-002).
+        let deletedRemoteIds = Set(messages.lazy.filter(\.isDeletedOnServer).map(\.messageId))
+        // Presence, not coverage: the id set every "does the server still have
+        // this?" question is answered from. Feeds the UID-remap target map, so a
+        // `\Deleted` UID can also never become the destination of a re-key.
+        let remoteIds = Set(messages.lazy.filter { !$0.isDeletedOnServer }.map(\.messageId))
 
         // Stale detection + deletion + upsert in one write block.
         // Pending ops are loaded INSIDE the write transaction to prevent TOCTOU races
@@ -1258,7 +1286,18 @@ extension SyncEngine {
             let skippedByRecent = messages.filter { isRecentlyCompleted($0) && !isPendingDestructive($0) }
             let skippedByPendingIds = Set(skippedByPending.map(\.messageId))
             let skippedByRecentIds = Set(skippedByRecent.map(\.messageId))
-            let allSkippedIds = skippedByPendingIds.union(skippedByRecentIds)
+            // IOS-IMAP-001 / D3 — the other half of "not present for display".
+            // Subtracting the id from `remoteIds` above lets the stale channel
+            // REMOVE a row that already exists (inheriting its pending/recent/outbox
+            // protections and its FTS cleanup); this stops the upsert loop
+            // RE-CREATING it in the same transaction, and stops a first sighting
+            // ever materialising one. No server-side operation is issued for either.
+            let allSkippedIds = skippedByPendingIds
+                .union(skippedByRecentIds)
+                .union(deletedRemoteIds)
+            if !deletedRemoteIds.isEmpty, DebugModeManager.isLoggingEnabled() {
+                print("[Sync] \(folder.name): \(deletedRemoteIds.count) remote message(s) carry \\Deleted — not presented (IOS-IMAP-001)")
+            }
             if !skippedByPendingIds.isEmpty {
                 print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByPendingIds.count) msgs with pending destructive ops: \(skippedByPendingIds)")
             }

@@ -123,6 +123,24 @@ struct MessageHeaderInfo: Sendable {
     /// is authoritative, as in the reference) at the same time any consumer
     /// lands, or IMAP labels fail closed forever.
     var userLabelIdsAreAuthoritative = false
+    /// The server reports this message with the `\Deleted` system flag — RFC 3501
+    /// §2.3.2, *"the message is 'deleted' for removal by later EXPUNGE"*. The
+    /// message is still ON the server and still owns its UID; it is **pending
+    /// removal**, and the sync merge therefore treats it as not present for
+    /// display (`IOS-IMAP-001`, decision D3).
+    ///
+    /// `false` for every provider with no such notion — Gmail and Exchange remove
+    /// a message from a folder outright rather than flagging it — and the default
+    /// IS that direction: a provider that cannot observe the flag must never be
+    /// read as one that observed its absence.
+    ///
+    /// ⚠ **This is a display-PRESENCE signal, never a windowing one.** A fetch's
+    /// cardinality and its UID floor must keep counting `\Deleted` records,
+    /// because they describe what the FETCH COVERED; narrowing either by this flag
+    /// would widen stale-deletion past the covered slice, which is the
+    /// ADR-IOS-042 / MIS-IOS-002 data-loss shape. See
+    /// `SyncEngine.selectStaleHeaders`, which separates the two deliberately.
+    var isDeletedOnServer = false
 }
 
 struct AttachmentInfo: Sendable, Codable {

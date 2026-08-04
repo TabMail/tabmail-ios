@@ -5992,7 +5992,22 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             isReplied: info.flags.contains(.answered),
             isForwarded: info.flags.contains(.custom("$Forwarded")),
             actionTag: tag,
-            userLabelIds: userLabelKeywords
+            userLabelIds: userLabelKeywords,
+            // IOS-IMAP-001 / D3. Until this line the mapping read `.seen`,
+            // `.flagged`, `.answered` and `$Forwarded` and never looked at
+            // `.deleted` at all, so a source copy left `\Deleted`-but-present by a
+            // move on a server without UIDPLUS was ingested as an ordinary
+            // message and re-listed in the Inbox once the ~30s `recentlyCompleted`
+            // and `pendingDestructiveIds` protections expired. Repeating the
+            // gesture then seated a SECOND destination copy and soft-deleted an
+            // already-soft-deleted source — a gesture-driven duplication loop.
+            //
+            // Surfacing the flag is all this provider does. It issues NO wire
+            // operation for it: the mailbox-wide `EXPUNGE` shipped `v1.6.38`
+            // reached is FORBIDDEN, and the `COPYUID`-gated source expunge's
+            // evidence is never widened. The decision to hide is the merge's
+            // (`SyncEngine.selectStaleHeaders` + `runSyncMessages`).
+            isDeletedOnServer: info.flags.contains(.deleted)
         )
     }
 
