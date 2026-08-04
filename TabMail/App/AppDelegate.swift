@@ -221,7 +221,7 @@ enum NotificationActionRouter {
                 return native.map(HeaderResolution.found) ?? .absent
             }
         } catch {
-            print("[NotificationActionRouter] header lookup failed: \(error)")
+            log("[NotificationActionRouter] header lookup failed: \(error)")
             return .readFailed(stagedHeader: nil)
         }
     }
@@ -317,7 +317,7 @@ enum NotificationActionRouter {
             switch actionId {
             case "MARK_READ":
                 await AccountManager.shared.markRead([header])
-                print("[NotificationActionRouter] markRead via manager for \(messageId)")
+                log("[NotificationActionRouter] markRead via manager for \(messageId)")
             case "ARCHIVE":
                 // T4.V8 (PORT of `v2final:NotificationActionRouter.execute`,
                 // commit `b1c89ad4a`): this line used to log a success-shaped
@@ -401,7 +401,7 @@ enum NotificationActionRouter {
                 sourcePath = path
             }
             guard let inboxPath = sourcePath, !inboxPath.isEmpty else {
-                print("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
+                log("[NotificationActionRouter] no inbox folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
                 return
             }
             switch actionId {
@@ -429,11 +429,11 @@ enum NotificationActionRouter {
                             accountId: accountId, folderPath: inboxPath, db: db)).insert(db)
                     return true
                 }
-                print("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") markRead PendingOperation for \(messageId)")
+                log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") markRead PendingOperation for \(messageId)")
             case "ARCHIVE", "DELETE":
                 let role: FolderRole = actionId == "ARCHIVE" ? .archive : .trash
                 guard let destinationPath = folders.first(where: { $0.role == role })?.path else {
-                    print("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
+                    log("[NotificationActionRouter] no \(role.rawValue) folder for account \(accountId) — cannot queue \(actionId) for \(messageId)")
                     return
                 }
                 let admitted = try await AppDatabase.dbPool.write { db -> Bool in
@@ -448,12 +448,12 @@ enum NotificationActionRouter {
                             accountId: accountId, folderPath: inboxPath, db: db)).insert(db)
                     return true
                 }
-                print("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") \(actionId) (.move) PendingOperation for \(messageId)")
+                log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") \(actionId) (.move) PendingOperation for \(messageId)")
             default:
                 break
             }
         } catch {
-            print("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(messageId): \(error)")
+            log("[NotificationActionRouter] cold PendingOperation queue failed for \(actionId)/\(messageId): \(error)")
         }
     }
 }
@@ -474,7 +474,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     ) async -> UNNotificationPresentationOptions {
         let userInfo = notification.request.content.userInfo
         let provider = userInfo["provider"] as? String
-        print("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
+        }
 
         // NSE email/task pushes: suppress in foreground, trigger sync instead.
         // Fan-out chain stops naturally — app's sync discovers all new messages.
@@ -532,7 +534,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
+        }
 
         // ObjC completion handler — inherently thread-safe one-shot callback,
         // but not marked @Sendable. Safe to send to main queue.
@@ -802,7 +806,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         guard shared.object(forKey: key) == nil else { return }
         if let legacy = UserDefaults.standard.object(forKey: key) as? Bool {
             shared.set(legacy, forKey: key)
-            print("[AppDelegate] Migrated opt-out flag to shared suite: \(legacy)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[AppDelegate] Migrated opt-out flag to shared suite: \(legacy)")
+            }
         }
     }
 

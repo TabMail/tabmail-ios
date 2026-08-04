@@ -112,7 +112,25 @@ struct ProviderNativeActionAdmissionTests {
         try pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
     }
 
-    @Test("Every ordinary IMAP producer persists the native UID and its source UIDVALIDITY")
+    /// ⚠️ RE-SCOPED (`IOS-QUEUE-003` item 7). **Previous display name: *"Every
+    /// ordinary IMAP producer persists the native UID and its source
+    /// UIDVALIDITY"*.** That name was universally quantified over "every ordinary
+    /// IMAP producer", but the body constructs and asserts exactly FOUR of them —
+    /// `markRead`, `markUnread`, `markFlagged` and `move`, all entered through
+    /// `AccountManagerActions`. The producer set is strictly larger: `archive` and
+    /// `delete` are covered by `archiveDeleteUseMove` below, and
+    /// `AppDelegate`'s two `NotificationActionRouter` cold-queue sites and
+    /// `AccountManagerOutbox`'s `markReplied` / `markForwarded` are NOT covered
+    /// here at all — they stamp their epoch through
+    /// `AccountManager.admissionEpochForNewGesture` and `flagAdmission
+    /// .observedUidValidity` respectively, and each is proved by its own suite.
+    /// A universally-quantified name that enumerates a subset reads to a later
+    /// reader as a proof it is not — the same hazard as `IOS-TEST-002`,
+    /// `IOS-TEST-005` and the `ActiveAIQueueTests` unstamped-row name, and it is
+    /// cited as the canonical example of that hazard in
+    /// `NeverDropExitClosureTests` and `ActiveAIQueueTests`; the retired text is
+    /// kept above so those citations stay greppable.
+    @Test("markRead, markUnread, markFlagged and move each persist the native UID and its source UIDVALIDITY")
     @MainActor
     func everyOrdinaryProducer() async throws {
         let f = try fixture()

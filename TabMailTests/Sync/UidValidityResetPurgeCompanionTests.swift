@@ -73,39 +73,6 @@ struct UidValidityResetPurgeCompanionTests {
         )
     }
 
-    /// Register `provider` for `accountId`, run `body`, then unregister — and
-    /// **AWAIT** the unregister rather than firing it off a `defer { Task { … } }`.
-    ///
-    /// 🚨 `AccountManager` is an `actor`, so an unregister launched from a `defer`
-    /// is an actor JOB that is merely ENQUEUED when this helper returns; the
-    /// registry is NOT yet quiescent. A test that registers a SECOND time then has
-    /// that stale first job still pending, and it runs at the next suspension —
-    /// which is inside the second reaction's very first `await`. It removes the
-    /// provider the reaction is about to read, `providers[accountId]` comes back
-    /// nil, and `runUidValidityResetReaction` returns at its provider guard whose
-    /// only witness is a `DebugModeManager.isLoggingEnabled()`-gated print (false
-    /// under test). The second leg then looks exactly like "the purge did not
-    /// happen" when in truth the reaction never started — which is precisely the
-    /// misreading a non-vacuity check exists to prevent, and one this file's own
-    /// `inboxRemovalMarkersArePurgedOnlyByAnInboxRoleReset` suffered.
-    ///
-    /// Awaiting on BOTH exits (normal and thrown) is what makes the teardown a
-    /// contract rather than a hope: when this returns, the registry state is
-    /// settled and no queued job from it can land inside a later leg.
-    @MainActor
-    private static func withRegisteredProvider(
-        accountId: String, provider: any EmailProvider, _ body: () async throws -> Void
-    ) async rethrows {
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
-        do {
-            try await body()
-        } catch {
-            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
-            throw error
-        }
-        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
-    }
-
     /// A staged row for `(accountId, folderPath, messageId)`. `date` is derived from
     /// `Date()` — never a literal (a hardcoded date silently goes stale).
     private static func stagedRow(
@@ -319,7 +286,7 @@ struct UidValidityResetPurgeCompanionTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
@@ -464,7 +431,7 @@ struct UidValidityResetPurgeCompanionTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
@@ -567,7 +534,7 @@ struct UidValidityResetPurgeCompanionTests {
         defer { Task { try? await provider.disconnect() } }
 
         // ── Leg 1: the staging DB cannot be written.
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
@@ -603,7 +570,7 @@ struct UidValidityResetPurgeCompanionTests {
 
         // ── Leg 2: the staging DB becomes writable — the SAME folder must heal.
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: stagingPath)
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
@@ -702,7 +669,7 @@ struct UidValidityResetPurgeCompanionTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
@@ -788,7 +755,7 @@ struct UidValidityResetPurgeCompanionTests {
         defer { Task { try? await provider.disconnect() } }
 
         // ── Leg 1: reset the ARCHIVE-role folder.
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "Archive")
         }
@@ -808,7 +775,7 @@ struct UidValidityResetPurgeCompanionTests {
                 "the Archive reaction never completed, so leg 1's survival proves nothing")
 
         // ── Leg 2: reset the INBOX-role folder.
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }
@@ -928,7 +895,7 @@ struct UidValidityResetPurgeCompanionTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await Self.withRegisteredProvider(accountId: accountId, provider: provider) {
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: accountId, folderPath: "INBOX")
         }

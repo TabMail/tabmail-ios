@@ -36,6 +36,25 @@ import UIKit
 /// - After max retries, job removed; repopulateFromDatabase catches on next foreground.
 /// - App crash loses in-memory queue; repopulateFromDatabase rebuilds from GRDB on next launch.
 /// - canProcessAI=false clears ephemeral queue; repopulateFromDatabase re-discovers when conditions change.
+/// Debug-gated diagnostic log for this file (global `CLAUDE.md` development
+/// rule 12). `DebugModeManager.isLoggingEnabled()` is false for every ordinary
+/// user — it requires the ten-tap unlock AND an allowed account — so in a
+/// shipping build this is a no-op.
+///
+/// `@autoclosure` so the interpolation itself is skipped when the gate is off:
+/// these fire per enqueue, per dispatch and per completed job, and building the
+/// string was previously paid on every one of them. Same shape as
+/// `NotificationActionRouter.log` and `MessageContentStore.log`.
+///
+/// Nothing here is kept ungated: every line in this file is queue tracing or a
+/// recomputable AI-derived-content failure, and an AI result that fails is
+/// re-derived by the next `repopulateFromDatabase` pass. No user intention and
+/// no wire side effect is witnessed only by these.
+private func activeAILog(_ message: @autoclosure () -> String) {
+    guard DebugModeManager.isLoggingEnabled() else { return }
+    print(message())
+}
+
 actor ActiveAIQueue {
     static let shared = ActiveAIQueue()
 
@@ -183,7 +202,7 @@ actor ActiveAIQueue {
         }
         let added = storage.enqueueBatch(allJobs.filter { !unattributableJobs.contains($0) })
         guard added > 0 else { return }
-        print("[ActiveAI] Enqueued \(added) jobs for \(items.count) messages (total: \(storage.count))")
+        activeAILog("[ActiveAI] Enqueued \(added) jobs for \(items.count) messages (total: \(storage.count))")
         BackgroundSyncLogger.logAIProcessing("Enqueued batch of \(added) jobs for \(items.count) messages (total: \(storage.count))")
         scheduleDispatch()
     }
@@ -226,14 +245,14 @@ actor ActiveAIQueue {
 
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if !items.isEmpty {
-                print("[ActiveAI] Repopulated \(items.count) messages from database in \(ms)ms")
+                activeAILog("[ActiveAI] Repopulated \(items.count) messages from database in \(ms)ms")
                 BackgroundSyncLogger.logAIProcessing("Repopulated \(items.count) messages from database")
                 enqueueBatch(items)
             } else {
-                print("[ActiveAI] Repopulate: 0 messages need AI (\(ms)ms)")
+                activeAILog("[ActiveAI] Repopulate: 0 messages need AI (\(ms)ms)")
             }
         } catch {
-            print("[ActiveAI] Repopulate failed: \(error)")
+            activeAILog("[ActiveAI] Repopulate failed: \(error)")
         }
     }
 
@@ -259,7 +278,7 @@ actor ActiveAIQueue {
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
         if taskCount > 0 || activeJobsBefore > 0 {
-            print("[ActiveAI] Cancelled \(taskCount) in-flight AI tasks (suspension recovery)")
+            activeAILog("[ActiveAI] Cancelled \(taskCount) in-flight AI tasks (suspension recovery)")
             BackgroundSyncLogger.logAIProcessing("Cancelled \(taskCount) in-flight AI tasks (suspension recovery) (activeJobs: \(activeJobsBefore)→0, depth=\(storage.count))")
         }
     }
@@ -382,7 +401,7 @@ actor ActiveAIQueue {
         let canProcessAI = hasSession && hasCompletedConsent && (!aiDisabled || deviceSyncConnected) && subscriptionActive
         guard canProcessAI else {
             if !storage.isEmpty {
-                print("[ActiveAI] Skipping dispatch — canProcessAI=false (session=\(hasSession), consent=\(hasCompletedConsent), aiDisabled=\(aiDisabled), deviceSync=\(deviceSyncConnected), subscription=\(subscriptionActive))")
+                activeAILog("[ActiveAI] Skipping dispatch — canProcessAI=false (session=\(hasSession), consent=\(hasCompletedConsent), aiDisabled=\(aiDisabled), deviceSync=\(deviceSyncConnected), subscription=\(subscriptionActive))")
                 BackgroundSyncLogger.logAIProcessing("Dispatch SKIPPED — canProcessAI=false (session=\(hasSession), consent=\(hasCompletedConsent), aiDisabled=\(aiDisabled), deviceSync=\(deviceSyncConnected), subscription=\(subscriptionActive)), clearing \(storage.count) jobs")
                 // Clear ephemeral queue — repopulateFromDatabase() re-discovers from GRDB
                 // when conditions change. Without this, items stuck in enqueued dedup set
@@ -430,7 +449,7 @@ actor ActiveAIQueue {
         guard !candidates.isEmpty else { return }
 
         let networkPath = NetworkMonitor.checkExpensive() ? "cellular" : "wifi"
-        print("[ActiveAI] Dispatching \(candidates.count) jobs (active: \(storage.activeJobs + candidates.count), queued: \(storage.pendingCount))")
+        activeAILog("[ActiveAI] Dispatching \(candidates.count) jobs (active: \(storage.activeJobs + candidates.count), queued: \(storage.pendingCount))")
         BackgroundSyncLogger.logAIProcessing("Dispatching \(candidates.count) jobs (active: \(storage.activeJobs + candidates.count), queued: \(storage.pendingCount), inFlight=\(inFlightTasks.count), net=\(networkPath))")
         for job in candidates {
             storage.incrementActiveJobs()
@@ -512,7 +531,7 @@ actor ActiveAIQueue {
             backoff[job] = Date().addingTimeInterval(delaySecs)
             backoffRetryCount[job] = backoffCount + 1
             let newCount = retryCount + 1
-            print("[ActiveAI] Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s, advisory=\(report))")
+            activeAILog("[ActiveAI] Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s, advisory=\(report))")
             BackgroundSyncLogger.logAIProcessing("Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s)")
 
             // Schedule a delayed re-dispatch for when backoff expires
@@ -673,7 +692,7 @@ actor ActiveAIQueue {
             enqueueBatch(items)
             return storage.pendingCount > 0
         } catch {
-            print("[ActiveAI] Drain-time repopulate failed: \(error)")
+            activeAILog("[ActiveAI] Drain-time repopulate failed: \(error)")
             return false
         }
     }
@@ -794,7 +813,7 @@ actor ActiveAIQueue {
             let ftsReason = await SearchIndex.shared.bodyTextDiagnostic(
                 contentKey: ContentKey(rawValue: job.headerId))
             let diag = "bodyComplete=\(message.bodyComplete), hasMessageBody=\(hasMessageBody), ftsReady=\(ftsDbReady), fts=\(ftsReason)"
-            print("[ActiveAI] No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
+            activeAILog("[ActiveAI] No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
             BackgroundSyncLogger.logAIProcessing("No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
             BackgroundSyncLogger.logError("No FTS body: \(diag)", source: "activeAI:\(Self.logId(job.headerId))")
             return .ordinary(retry: false)
@@ -1073,7 +1092,7 @@ actor ActiveAIQueue {
             )
 
             guard let blurb = summary.blurb, !blurb.isEmpty else {
-                print("[ActiveAI] No blurb returned for \(message.messageId)")
+                activeAILog("[ActiveAI] No blurb returned for \(message.messageId)")
                 NotificationCenter.default.post(name: .aiDidFailForMessage, object: job.headerId)
                 return false
             }
@@ -1120,7 +1139,7 @@ actor ActiveAIQueue {
             if storage.enqueue(actionJob) { scheduleDispatch() }
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            print("[ActiveAI] Summary failed for \(message.messageId): \(error)")
+            activeAILog("[ActiveAI] Summary failed for \(message.messageId): \(error)")
             BackgroundSyncLogger.logAIProcessing("Summary FAILED for \(Self.logId(job.headerId)) after \(elapsed)ms: \(error.localizedDescription)")
             if Self.isSubscriptionError(error) {
                 await AISubscriptionGate.shared.closeGate()
@@ -1209,17 +1228,17 @@ actor ActiveAIQueue {
                 }
                 let effectiveAction = written.effective
                 if effectiveAction != action {
-                    print("[ReplyDetect] ActiveAI action: reply→none for \(message.messageId)")
+                    activeAILog("[ReplyDetect] ActiveAI action: reply→none for \(message.messageId)")
                 }
                 NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                 let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                print("[ActiveAI] Action for \(message.messageId): \(effectiveAction.displayName) in \(elapsed)ms")
+                activeAILog("[ActiveAI] Action for \(message.messageId): \(effectiveAction.displayName) in \(elapsed)ms")
                 BackgroundSyncLogger.logAIProcessing("Action complete for \(Self.logId(job.headerId)) in \(elapsed)ms")
                 await AISubscriptionGate.shared.openGate()
             }
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            print("[ActiveAI] Action failed for \(message.messageId): \(error)")
+            activeAILog("[ActiveAI] Action failed for \(message.messageId): \(error)")
             BackgroundSyncLogger.logAIProcessing("Action FAILED for \(Self.logId(job.headerId)) after \(elapsed)ms: \(error.localizedDescription)")
             if Self.isSubscriptionError(error) {
                 await AISubscriptionGate.shared.closeGate()
@@ -1300,7 +1319,7 @@ actor ActiveAIQueue {
             }
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            print("[ActiveAI] Reply failed for \(message.messageId): \(error)")
+            activeAILog("[ActiveAI] Reply failed for \(message.messageId): \(error)")
             BackgroundSyncLogger.logAIProcessing("Reply FAILED for \(Self.logId(job.headerId)) after \(elapsed)ms: \(error.localizedDescription)")
             if Self.isSubscriptionError(error) {
                 await AISubscriptionGate.shared.closeGate()

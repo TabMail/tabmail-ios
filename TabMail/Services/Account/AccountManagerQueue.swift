@@ -22,6 +22,30 @@ struct ExecutedOperation: Sendable {
     static let allMembers = ExecutedOperation(provenMembers: nil, provenDestinations: [])
 }
 
+/// Debug-gated diagnostic log for this file (global `CLAUDE.md` development
+/// rule 12). `DebugModeManager.isLoggingEnabled()` is false for every ordinary
+/// user — it requires the ten-tap unlock AND an allowed account — so in a
+/// shipping build this is a no-op.
+///
+/// `@autoclosure` so the interpolation itself is skipped when the gate is off.
+/// These fire per drain pass, per claimed op and per executed member, and the
+/// string was previously built on every one of them. Same shape as
+/// `NotificationActionRouter.log` and `MessageContentStore.log`.
+///
+/// 🚨 THREE lines in this file are DELIBERATELY LEFT AS UNGATED `print` and
+/// must stay that way; each is marked `UNGATED BY DECISION` at its site. They
+/// are the only witness to a state that is NOT recoverable by a later sync or
+/// retry — a completed op that will re-execute, a partially-completed bundle
+/// requeued whole, and the F2b L4 terminal identity drop whose accepted cost
+/// `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 records as "bounded and VISIBLE".
+/// Gating them would make that visibility conditional on a debug unlock the
+/// affected user does not have, which is rule 12's own
+/// production-observability exception.
+private func queueLog(_ message: @autoclosure () -> String) {
+    guard DebugModeManager.isLoggingEnabled() else { return }
+    print(message())
+}
+
 extension AccountManager {
 
     // MARK: - Persistent Action Queue
@@ -274,16 +298,16 @@ extension AccountManager {
                     try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
                 })
             } catch {
-                print("[Queue] ERROR: Failed to fetch pending ops: \(error)")
+                queueLog("[Queue] ERROR: Failed to fetch pending ops: \(error)")
                 break
             }
             guard !ops.isEmpty else { break }
 
             if pass == 0 {
                 let summary = ops.map { "\($0.type.rawValue)(\($0.messageIds.count)msgs)" }.joined(separator: ", ")
-                print("[Queue] Draining \(ops.count) ops: \(summary)")
+                queueLog("[Queue] Draining \(ops.count) ops: \(summary)")
             } else {
-                print("[Queue] Drain pass \(pass + 1): \(ops.count) ops remaining/new")
+                queueLog("[Queue] Drain pass \(pass + 1): \(ops.count) ops remaining/new")
             }
 
             // Claim all valid ops (unchanged: failedAccounts / provider checks / atomic claim).
@@ -291,7 +315,7 @@ extension AccountManager {
             for op in ops {
                 if ctx.failedAccounts.contains(op.accountId) { continue }
                 guard providers[op.accountId] != nil else {
-                    print("[Queue] No provider for \(op.accountId) — skipping \(op.type.rawValue)")
+                    queueLog("[Queue] No provider for \(op.accountId) — skipping \(op.type.rawValue)")
                     continue
                 }
 
@@ -303,7 +327,7 @@ extension AccountManager {
                         }
                         if fetched.status == PendingStatus.cancelled.rawValue {
                             _ = try PendingOperation.deleteOne(db, key: fetched.id)
-                            print("[Queue] Op \(op.id.prefix(8)) cancelled by undo, deleted")
+                            queueLog("[Queue] Op \(op.id.prefix(8)) cancelled by undo, deleted")
                             return nil
                         }
                         if fetched.status == PendingStatus.inFlight.rawValue {
@@ -463,7 +487,7 @@ extension AccountManager {
                         return fetched
                     }
                 } catch {
-                    print("[Queue] ERROR: Failed to claim op \(op.id): \(error)")
+                    queueLog("[Queue] ERROR: Failed to claim op \(op.id): \(error)")
                     continue
                 }
                 guard let currentOp else { continue }
@@ -567,7 +591,7 @@ extension AccountManager {
 
         // Post-drain: sync destination folders so new UIDs are picked up immediately.
         if !ctx.foldersToSync.isEmpty {
-            print("[MoveTrace] post-drain sync — syncing \(ctx.foldersToSync.count) destination folders: \(ctx.foldersToSync)")
+            queueLog("[MoveTrace] post-drain sync — syncing \(ctx.foldersToSync.count) destination folders: \(ctx.foldersToSync)")
             for key in ctx.foldersToSync {
                 let parts = key.split(separator: "|", maxSplits: 1)
                 guard parts.count == 2 else { continue }
@@ -577,16 +601,16 @@ extension AccountManager {
                 guard let folder = try? await dbPool.read({ db in
                     try Folder.filter(Column("accountId") == accountId && Column("path") == folderPath).fetchOne(db)
                 }) else {
-                    print("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
+                    queueLog("[MoveTrace] post-drain sync — folder not found: \(accountId)|\(folderPath)")
                     continue
                 }
                 do {
                     try await queue.execute(priority: .userAction) {
                         try await self.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
                     }
-                    print("[MoveTrace] post-drain sync — completed for \(folder.name)")
+                    queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
                 } catch {
-                    print("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
+                    queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
                 }
             }
         }
@@ -688,7 +712,7 @@ extension AccountManager {
                         return infos
                     }
                 } catch {
-                    print("[Queue] WARNING: Failed to collect rfc822 info for \(currentOp.id): \(error)")
+                    queueLog("[Queue] WARNING: Failed to collect rfc822 info for \(currentOp.id): \(error)")
                 }
             }
 
@@ -728,6 +752,13 @@ extension AccountManager {
                     return (rekeys, collided)
                 }
             } catch {
+                // 🚨 UNGATED BY DECISION (rule 12's production-observability
+                // exception). A completed op that could not be deleted WILL run
+                // again on the next drain, so the wire effect it already applied
+                // can be applied twice. No sync pass or retry recovers a
+                // duplicate that has already been made; this line is its only
+                // witness, and gating it would hide it behind a debug unlock the
+                // affected user does not have.
                 print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
                 rekeyOutcome = ([], [])
             }
@@ -772,7 +803,7 @@ extension AccountManager {
                     // Batch op hit messageNotFound — one message is gone but others
                     // may still need processing. Split into individual single-message
                     // ops so each can succeed/fail independently.
-                    print("[Queue] Conflict in batch \(opType) (\(opMsgCount) msgs) — splitting into individual ops")
+                    queueLog("[Queue] Conflict in batch \(opType) (\(opMsgCount) msgs) — splitting into individual ops")
                     do {
                         try await dbPool.write { db in
                             for msgId in currentOp.messageIds {
@@ -816,7 +847,7 @@ extension AccountManager {
                             _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                         }
                     } catch {
-                        print("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
+                        queueLog("[Queue] Failed to split batch op \(currentOp.id): \(error) — batch will retry as-is")
                     }
                     context.executedAny = true
                     // Halt the lane rather than .proceed: the split singles are
@@ -830,7 +861,7 @@ extension AccountManager {
                     return .haltLane
                 }
                 // Single-message conflict — drop (server wins)
-                print("[Queue] Conflict: \(opType) — message not found, dropping")
+                queueLog("[Queue] Conflict: \(opType) — message not found, dropping")
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
@@ -853,7 +884,7 @@ extension AccountManager {
             // Permanently invalid operation — drop immediately (will never succeed on retry).
             // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
             if isPermanentlyInvalidError(error) {
-                print("[Queue] Permanently invalid \(opType): \(error) — dropping")
+                queueLog("[Queue] Permanently invalid \(opType): \(error) — dropping")
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
                 }
@@ -915,6 +946,13 @@ extension AccountManager {
                 // have (F2b L4). Terminal drop is the disposition v3 already shipped and
                 // keeps; the intention loss is bounded and visible, and adding a demote
                 // path is a separate change.
+                // 🚨 UNGATED BY DECISION (rule 12's production-observability
+                // exception). This is the F2b L4 TERMINAL DROP of a durable user
+                // intention. `KNOWN_ISSUES.md` `IOS-QUEUE-003` item 4 accepts
+                // that cost expressly because the loss is "bounded and VISIBLE";
+                // this print is the whole of that visibility, so gating it would
+                // silently convert an accepted, observable drop into an
+                // unobservable one and weaken a recorded decision.
                 print("[Queue] Identity refused in \(opType) (\(opMsgCount) id(s)): '\(refusedId)' is not a verifiable identity and never will be — dropping the op (the server-side object is untouched and remains visible for a re-issued gesture)")
                 try? await retryWrite(dbPool, label: "Queue") { db in
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
@@ -958,7 +996,7 @@ extension AccountManager {
             //    still terminates when nothing else advanced.
             if error is ProviderEvidenceUnavailable {
                 let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
-                print("[Queue] Evidence unavailable for \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — op stays queued, retries next drain; the rest of this account keeps draining")
+                queueLog("[Queue] Evidence unavailable for \(opType) (\(opMsgCount) msgs): \(error) (age \(String(format: "%.1f", ageHours))h) — op stays queued, retries next drain; the rest of this account keeps draining")
                 if !context.diagnosedOpIds.contains(currentOp.id) {
                     context.diagnosedOpIds.insert(currentOp.id)
                     await logStuckOpDiagnostic(currentOp, error: error)
@@ -977,7 +1015,7 @@ extension AccountManager {
             // Staleness is confirmed only by messageNotFound (server says gone).
             // failedAccounts prevents hammering within a single drain.
             let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
-            print("[Queue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
+            queueLog("[Queue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
             // Deep diagnostic on the failing op — fires once per (drain, opId) so a
             // stuck op that retries every drain doesn't fill the log. Dumps full op
             // fields, error structural unwrap, classifier results, and the DB rows
@@ -1060,7 +1098,7 @@ extension AccountManager {
         collidedOldHeaderIds: [String]
     ) async {
         if !applied.isEmpty {
-            print("[MoveTrace] executeSingleOp — re-keyed \(applied.count) moved row(s) to their COPYUID-proven destination address")
+            queueLog("[MoveTrace] executeSingleOp — re-keyed \(applied.count) moved row(s) to their COPYUID-proven destination address")
             // The undo stack names its members by the SAME primary key and UID
             // this re-key just changed, so it has to follow — otherwise
             // finishing the move would break undo rather than enable it.
@@ -1075,7 +1113,7 @@ extension AccountManager {
             })
         }
         if !collidedOldHeaderIds.isEmpty {
-            print("[MoveTrace] executeSingleOp — dropped \(collidedOldHeaderIds.count) FTS entry(s) whose re-key collided; the destination row is the survivor")
+            queueLog("[MoveTrace] executeSingleOp — dropped \(collidedOldHeaderIds.count) FTS entry(s) whose re-key collided; the destination row is the survivor")
             try? await SearchIndex.shared.removeMessages(
                 contentKeys: collidedOldHeaderIds.map { ContentKey(rawValue: $0) })
         }
@@ -1138,7 +1176,7 @@ extension AccountManager {
         provenDestinations: [ProvenDestinationAddress],
         context: DrainContext
     ) async {
-        print("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
+        queueLog("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
         // Same TOCTOU ordering as the whole-op success path: the sync-protection
         // entry for a retired member is recorded BEFORE its id leaves the row.
         var completedIds: [String] = provenMembers
@@ -1192,6 +1230,11 @@ extension AccountManager {
             // delete it: requeue the ORIGINAL bundle. A retry re-copies the
             // proven members — a duplicate at the destination, which this
             // codebase prefers over a dropped intention.
+            // 🚨 UNGATED BY DECISION (rule 12's production-observability
+            // exception). The requeued bundle re-copies members the provider
+            // already proved, so this names a duplicate that WILL be created at
+            // the destination. Same reasoning as the sibling CRITICAL above: a
+            // duplicate already made is not recovered by a later sync.
             print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — requeuing the whole bundle (may duplicate already-moved members)")
             try? await retryWrite(dbPool, label: "Queue") { db in
                 var queued = currentOp
@@ -1289,11 +1332,11 @@ extension AccountManager {
                 return (true, captured)
             }
         } catch {
-            print("[Gone] GRDB delete failed for \(headerId): \(error)")
+            queueLog("[Gone] GRDB delete failed for \(headerId): \(error)")
             return
         }
         guard existed else { return }
-        print("[Gone] Deleted header \(headerId) — reason=\(reason)")
+        queueLog("[Gone] Deleted header \(headerId) — reason=\(reason)")
         if let captured {
             await MessageContentStore.releaseUnowned(
                 captured.contentKey, scope: captured.scope,
@@ -1318,22 +1361,29 @@ extension AccountManager {
     ///       * Destination Folder row (accountId:destinationPath)
     ///       * All Folders with role=.trash for the account (sanity check role lookup)
     func logStuckOpDiagnostic(_ op: PendingOperation, error: Error) async {
+        // Log-only helper: gate the WHOLE body, not just the emission. Every
+        // `queueLog` below is individually gated too, but this guard is what
+        // skips the scoped DB read the dump exists to render — a read that in a
+        // shipping build could only ever feed a log nobody can see. The caller's
+        // `context.diagnosedOpIds` bookkeeping happens before this call, so
+        // returning early changes no control flow there.
+        guard DebugModeManager.isLoggingEnabled() else { return }
         let ageHours = Date().timeIntervalSince(op.createdAt) / 3600
-        print("[QueueDiag] === op=\(op.id) type=\(op.type.rawValue) ===")
-        print("[QueueDiag] op: accountId=\(op.accountId) folderPath=\(op.folderPath) destinationPath=\(op.destinationPath ?? "<nil>") tagValue=\(op.tagValue ?? "<nil>") userLabelId=\(op.userLabelId ?? "<nil>")")
-        print("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) uidResolutionRetryCount=\(op.uidResolutionRetryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
+        queueLog("[QueueDiag] === op=\(op.id) type=\(op.type.rawValue) ===")
+        queueLog("[QueueDiag] op: accountId=\(op.accountId) folderPath=\(op.folderPath) destinationPath=\(op.destinationPath ?? "<nil>") tagValue=\(op.tagValue ?? "<nil>") userLabelId=\(op.userLabelId ?? "<nil>")")
+        queueLog("[QueueDiag] op: messageIds=\(op.messageIds) retryCount=\(op.retryCount) uidResolutionRetryCount=\(op.uidResolutionRetryCount) status=\(op.status) ageHours=\(String(format: "%.2f", ageHours))")
 
         // Error structural unwrap — confirms whether classifiers should/shouldn't match
-        print("[QueueDiag] error.type=\(type(of: error)) error=\(error)")
+        queueLog("[QueueDiag] error.type=\(type(of: error)) error=\(error)")
         if case ProviderError.networkError(let underlying) = error {
-            print("[QueueDiag] underlying.type=\(type(of: underlying)) underlying=\(underlying)")
+            queueLog("[QueueDiag] underlying.type=\(type(of: underlying)) underlying=\(underlying)")
             if case HTTPError.networkError(let statusCode) = underlying {
-                print("[QueueDiag] HTTPError statusCode=\(statusCode)")
+                queueLog("[QueueDiag] HTTPError statusCode=\(statusCode)")
             }
             let ns = underlying as NSError
-            print("[QueueDiag] NSError domain=\(ns.domain) code=\(ns.code)")
+            queueLog("[QueueDiag] NSError domain=\(ns.domain) code=\(ns.code)")
         }
-        print("[QueueDiag] classifier: isMessageNotFoundError=\(isMessageNotFoundError(error)) isConfirmedGoneError=\(isConfirmedGoneError(error)) isPermanentlyInvalidError=\(isPermanentlyInvalidError(error))")
+        queueLog("[QueueDiag] classifier: isMessageNotFoundError=\(isMessageNotFoundError(error)) isConfirmedGoneError=\(isConfirmedGoneError(error)) isPermanentlyInvalidError=\(isPermanentlyInvalidError(error))")
 
         // Message-scoped DB dump — only rows relevant to this op + its folders.
         do {
@@ -1347,27 +1397,27 @@ extension AccountManager {
                         )
                         .fetchAll(db)
                     if headers.isEmpty {
-                        print("[QueueDiag] MessageHeader: NONE for msgId=\(msgId) normalized=\(normalized) account=\(op.accountId)")
+                        queueLog("[QueueDiag] MessageHeader: NONE for msgId=\(msgId) normalized=\(normalized) account=\(op.accountId)")
                     } else {
                         for h in headers {
-                            print("[QueueDiag] MessageHeader: id=\(h.id) folderId=\(h.folderId) folderPath=\(h.folderPath) messageId=\(h.messageId) rfc822=\(h.rfc822MessageId ?? "<nil>") isInInbox=\(h.isInInbox) isRead=\(h.isRead) actionTag=\(h.actionTag?.rawValue ?? "<nil>")")
+                            queueLog("[QueueDiag] MessageHeader: id=\(h.id) folderId=\(h.folderId) folderPath=\(h.folderPath) messageId=\(h.messageId) rfc822=\(h.rfc822MessageId ?? "<nil>") isInInbox=\(h.isInInbox) isRead=\(h.isRead) actionTag=\(h.actionTag?.rawValue ?? "<nil>")")
                         }
                     }
                 }
 
                 let srcId = "\(op.accountId):\(op.folderPath)"
                 if let src = try Folder.fetchOne(db, key: srcId) {
-                    print("[QueueDiag] Folder(source): id=\(src.id) name=\(src.name) path=\(src.path) role=\(src.role.rawValue)")
+                    queueLog("[QueueDiag] Folder(source): id=\(src.id) name=\(src.name) path=\(src.path) role=\(src.role.rawValue)")
                 } else {
-                    print("[QueueDiag] Folder(source): NONE for id=\(srcId)")
+                    queueLog("[QueueDiag] Folder(source): NONE for id=\(srcId)")
                 }
 
                 if let dest = op.destinationPath {
                     let destId = "\(op.accountId):\(dest)"
                     if let f = try Folder.fetchOne(db, key: destId) {
-                        print("[QueueDiag] Folder(destination): id=\(f.id) name=\(f.name) path=\(f.path) role=\(f.role.rawValue)")
+                        queueLog("[QueueDiag] Folder(destination): id=\(f.id) name=\(f.name) path=\(f.path) role=\(f.role.rawValue)")
                     } else {
-                        print("[QueueDiag] Folder(destination): NONE for id=\(destId)")
+                        queueLog("[QueueDiag] Folder(destination): NONE for id=\(destId)")
                     }
                 }
 
@@ -1375,17 +1425,17 @@ extension AccountManager {
                     .filter(Column("accountId") == op.accountId && Column("role") == FolderRole.trash.rawValue)
                     .fetchAll(db)
                 if trashFolders.isEmpty {
-                    print("[QueueDiag] Folder(role=trash): NONE for account=\(op.accountId)")
+                    queueLog("[QueueDiag] Folder(role=trash): NONE for account=\(op.accountId)")
                 } else {
                     for f in trashFolders {
-                        print("[QueueDiag] Folder(role=trash): id=\(f.id) name=\(f.name) path=\(f.path)")
+                        queueLog("[QueueDiag] Folder(role=trash): id=\(f.id) name=\(f.name) path=\(f.path)")
                     }
                 }
             }
         } catch {
-            print("[QueueDiag] ERROR: scoped DB read failed: \(error)")
+            queueLog("[QueueDiag] ERROR: scoped DB read failed: \(error)")
         }
-        print("[QueueDiag] === end op=\(op.id) ===")
+        queueLog("[QueueDiag] === end op=\(op.id) ===")
     }
 
     /// Returns true only when the provider's own response STRUCTURALLY PROVES the
@@ -1445,31 +1495,31 @@ extension AccountManager {
             return .allMembers
         case .move:
             guard let dest = op.destinationPath else {
-                print("[MoveTrace] ERROR: move op missing destinationPath")
+                queueLog("[MoveTrace] ERROR: move op missing destinationPath")
                 throw ProviderError.messageNotFound
             }
             // Self-move (source == dest) is a no-op — skip the provider call entirely.
             // This happens when archiving from All Mail on Gmail (source and dest both resolve
             // to __GMAIL_ALL_MAIL__). Treating as success lets the op be cleaned up normally.
             guard op.folderPath != dest else {
-                print("[MoveTrace] executeOperation.move — no-op (source==dest): \(op.folderPath)")
+                queueLog("[MoveTrace] executeOperation.move — no-op (source==dest): \(op.folderPath)")
                 return .allMembers
             }
             let opAgeMin = Date().timeIntervalSince(op.createdAt) / 60
-            print("[MoveTrace] executeOperation.move — msgIds=\(op.messageIds) from=\(op.folderPath) to=\(dest) provider=\(type(of: provider)) accountId=\(op.accountId) opId=\(op.id) retryCount=\(op.retryCount) ageMin=\(String(format: "%.1f", opAgeMin))")
+            queueLog("[MoveTrace] executeOperation.move — msgIds=\(op.messageIds) from=\(op.folderPath) to=\(dest) provider=\(type(of: provider)) accountId=\(op.accountId) opId=\(op.id) retryCount=\(op.retryCount) ageMin=\(String(format: "%.1f", opAgeMin))")
             if let imap = provider as? IMAPProvider,
                let admitted = op.observedUidValidity,
                let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
                 let outcome = try await imap.move(
                     ids: op.messageIds, from: op.folderPath, to: dest,
                     admittedUidValidity: admittedUInt)
-                print("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
+                queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
                 return ExecutedOperation(
                     provenMembers: outcome.provenIds,
                     provenDestinations: outcome.provenDestinations)
             }
             try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
-            print("[MoveTrace] executeOperation.move — completed successfully")
+            queueLog("[MoveTrace] executeOperation.move — completed successfully")
             return .allMembers
         case .markRead:
             if let imap = provider as? IMAPProvider,
@@ -1653,7 +1703,7 @@ extension AccountManager {
                 .filter(Column("status") == PendingStatus.inFlight.rawValue)
                 .fetchAll(db)
             if !staleOps.isEmpty {
-                print("[Queue] Crash recovery: resetting \(staleOps.count) inFlight ops to queued")
+                queueLog("[Queue] Crash recovery: resetting \(staleOps.count) inFlight ops to queued")
                 for op in staleOps {
                     var updated = op
                     updated.status = PendingStatus.queued.rawValue
@@ -1665,7 +1715,7 @@ extension AccountManager {
                 .filter(Column("status") == PendingStatus.cancelled.rawValue)
                 .deleteAll(db)
             if cancelledCount > 0 {
-                print("[Queue] Crash recovery: cleaned up \(cancelledCount) cancelled ops")
+                queueLog("[Queue] Crash recovery: cleaned up \(cancelledCount) cancelled ops")
             }
         }
         await drainPendingQueue()

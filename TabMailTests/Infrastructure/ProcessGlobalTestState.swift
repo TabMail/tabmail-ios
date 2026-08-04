@@ -4,6 +4,7 @@
 
 import Foundation
 import Testing
+@testable import TabMail
 
 /// Serializes each test that mutates TabMail's process-wide test state.
 ///
@@ -191,5 +192,53 @@ actor AsyncTestLock {
         currentOwnerToken = nextOwnerToken
         leaseCount = 1
         waiter.continuation.resume(returning: nextOwnerToken)
+    }
+}
+
+/// Scoped registration on the shared `AccountManager` provider registry — one of
+/// the process-global surfaces `ProcessGlobalTestStateTrait` above exists to
+/// serialize, which is why it lives in this file.
+///
+/// 🚨 **The unregister MUST be awaited on BOTH exits — never `defer { Task { … } }`.**
+/// `AccountManager` is an `actor`, so an unregister launched from a `defer` is an
+/// actor JOB that is merely ENQUEUED when the scope returns, not applied; the
+/// registry is NOT yet quiescent. A test that registers a SECOND time then has
+/// that stale first job still pending, and it runs at the next suspension —
+/// which is inside the second leg's very first `await`. It removes the provider
+/// the code under test is about to read, `providers[accountId]` comes back nil,
+/// and the code (e.g. `runUidValidityResetReaction`) silently early-returns at
+/// its provider guard, whose only witness is a
+/// `DebugModeManager.isLoggingEnabled()`-gated print (false under test). The
+/// second leg then looks exactly like "the reaction/purge/cleanup did nothing"
+/// when in truth it never started — precisely the misreading a non-vacuity check
+/// exists to prevent, and one `UidValidityResetPurgeCompanionTests`'
+/// `inboxRemovalMarkersArePurgedOnlyByAnInboxRoleReset` actually suffered.
+/// Awaiting on BOTH exits (normal and thrown) is what makes the teardown a
+/// contract rather than a hope: when this returns, the registry state is settled
+/// and no queued job from it can land inside a later leg.
+///
+/// This is the single definition of that contract. It was three byte-identical
+/// `private static func withRegisteredProvider` copies — in
+/// `PostSendServerDraftCleanupTests`, `UidValidityResetPurgeCompanionTests` and
+/// `UidValidityResetReactionTests` — consolidated here for `IOS-QUEUE-003`
+/// item 8. Bodies were identical; only the doc block's example phrasing
+/// differed, and all three phrasings are preserved above.
+enum TestProviderRegistry {
+    /// `@MainActor` so `body` stays in the CALLER's isolation domain: every
+    /// current caller is `@MainActor`, and a nonisolated helper would make the
+    /// closure a value sent across an isolation boundary (`sending value of
+    /// non-Sendable type '() async -> ()'`).
+    @MainActor
+    static func withRegisteredProvider(
+        accountId: String, provider: any EmailProvider, _ body: () async throws -> Void
+    ) async rethrows {
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        do {
+            try await body()
+        } catch {
+            await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+            throw error
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
     }
 }
