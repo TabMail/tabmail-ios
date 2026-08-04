@@ -581,6 +581,14 @@ struct RootView: View {
                 if !navigationStore.accounts.isEmpty {
                     syncScheduler.startForegroundPolling()
                 }
+                // IOS-OUTBOX-001: the launch `.task` above is reconciliation's
+                // only other trigger, so a send stranded `.sending`/`sentAt ==
+                // nil` stayed stranded for the whole session — the drain selects
+                // `.queued` only and the Outbox UI offers no gesture for a
+                // `sending` row. Foreground is the second trigger. The drain
+                // latch checked inside is what keeps the double-send firewall
+                // intact; see `reconcileOutboxOnForeground`.
+                Task { await AccountManager.shared.reconcileOutboxOnForeground() }
                 // Reconnect Device Sync if needed (e.g., returning from background)
                 DeviceSyncService.shared.reconnectIfNeeded()
                 // Check for overdue reminders that may have been missed while backgrounded

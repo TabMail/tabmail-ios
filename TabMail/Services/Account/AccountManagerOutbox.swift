@@ -407,11 +407,9 @@ extension AccountManager {
         // next natural drain trigger (foreground, sync, queueSend) handles it.
         let earliest: OutboxMessage?
         do {
+            let wakeNow = Date()
             earliest = try await dbPool.read { db in
-                try OutboxMessage
-                    .filter(Column("status") == OutboxStatus.queued.rawValue)
-                    .order(Column("holdUntil").asc)
-                    .fetchOne(db)
+                try Self.earliestFutureHoldWakeTarget(now: wakeNow, db: db)
             }
         } catch {
             earliest = nil
@@ -424,6 +422,36 @@ extension AccountManager {
                 await self?.drainOutbox()
             }
         }
+    }
+
+    /// The queued row a wake-up timer must be armed for: the EARLIEST row whose
+    /// `holdUntil` deadline has NOT yet elapsed.
+    ///
+    /// 🚨 THE FUTURE-HOLD PREDICATE IS THE WHOLE POINT (`IOS-OUTBOX-002`).
+    /// Ordering by `holdUntil ASC` alone returns a legacy-NULL or already-elapsed
+    /// hold FIRST — SQLite sorts NULL first under ASC, and a past instant sorts
+    /// before a future one — so the caller's `hold > Date()` re-check failed on
+    /// that shadowing row and NO timer was armed, even though a genuinely
+    /// future-held row existed behind it. Such a row was then reached only by a
+    /// later ordinary drain trigger (foreground, sync, another `queueSend`).
+    ///
+    /// This NARROWS the timer query; it widens nothing the drain acts on. Rows
+    /// with a NULL or elapsed hold are already handled by the drain loop that
+    /// runs above the timer, so excluding them from the *timer* removes no
+    /// intention. Only `.queued` is considered, exactly as before — `.failed`
+    /// still requires an explicit user Retry (Outbox Reliability Rule 8).
+    ///
+    /// `now` is a parameter, not `Date()` inside the query, so the caller's
+    /// single instant decides both this selection and its own re-check.
+    nonisolated static func earliestFutureHoldWakeTarget(
+        now: Date,
+        db: Database
+    ) throws -> OutboxMessage? {
+        try OutboxMessage
+            .filter(Column("status") == OutboxStatus.queued.rawValue)
+            .filter(Column("holdUntil") > now)
+            .order(Column("holdUntil").asc)
+            .fetchOne(db)
     }
 
     /// Atomic claim: re-read + status check + mark .sending + persist sentMessageId
@@ -1324,6 +1352,45 @@ extension AccountManager {
         }
         await cleanOrphanedAttachmentDirs()
         await drainOutbox()
+    }
+
+    /// Second trigger for `reconcileOutbox()`: foreground return.
+    ///
+    /// `IOS-OUTBOX-001` — reconciliation had exactly ONE trigger, `RootView`'s
+    /// launch `.task` (via `reconcilePendingOperations`). A row left `.sending`
+    /// with `sentAt == nil` — the crash-mid-send state, and the state reached
+    /// when the retrying status write in `sendSingleOutboxMessage` exhausts —
+    /// is invisible to `drainOutbox`, which selects `.queued` only, and
+    /// `OutboxView` offers the user NO gesture for it: Retry is gated on
+    /// `.failed` and Outbox Reliability Rule 10 forbids discarding a `sending`
+    /// row. So the user could foreground and background the app all day and the
+    /// message would never send and never fail — a dropped user intention by the
+    /// wedge corollary, recoverable only by a full process relaunch.
+    ///
+    /// 🚨 THE `isDrainingOutbox` GUARD IS WHAT KEEPS THE DOUBLE-SEND FIREWALL
+    /// INTACT — do not relax it. `drainOutbox` is serial, sets
+    /// `isDrainingOutbox` for the whole drain, and `await`s
+    /// `sendSingleOutboxMessage` INSIDE it; that loop is
+    /// `sendSingleOutboxMessage`'s only production caller (the sole other
+    /// reference is a `#if DEBUG` seam). Therefore `isDrainingOutbox == false`
+    /// ⇒ no provider send is in flight in this process, and reconciliation's
+    /// `.sending`/`sentAt == nil` → `.queued` reset cannot make a row the drain
+    /// can re-claim while its SMTP transaction is still on the wire. The NSE
+    /// never sends.
+    ///
+    /// The reconciliation itself is reused UNCHANGED, so the
+    /// `sentAt`-before-delete asymmetry (Outbox Reliability Rule 3) travels with
+    /// this trigger exactly as it does with the launch one: a row carrying
+    /// `sentAt` is finalized or left to Sent-append recovery, and is NEVER
+    /// re-queued. Only `sentAt == nil` rows are reset.
+    func reconcileOutboxOnForeground() async {
+        guard !isDrainingOutbox else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Outbox] Skipped foreground reconcile — a drain is already in flight")
+            }
+            return
+        }
+        await reconcileOutbox()
     }
 
     /// D2 — the ONE deletion decision the outbox orphan cleaner makes: an

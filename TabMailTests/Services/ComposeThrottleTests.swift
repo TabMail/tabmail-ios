@@ -811,15 +811,18 @@ struct DraftSurvivesDiscardTests {
 @Suite("Post-loop earliest-pending query (wake-up scheduling)")
 struct PostLoopWakeUpQueryTests {
 
-    /// Replicates the post-loop query in drainOutbox: earliest queued by
-    /// holdUntil. Returns the row (if any) that a wake-up Task should
-    /// target.
+    /// Calls the PRODUCTION wake-up query that `drainOutbox` uses, rather than a
+    /// copy of it.
+    ///
+    /// ⚠️ It used to be a copy — `.filter(status == queued).order(holdUntil.asc)
+    /// .fetchOne(db)` written out here — and that is precisely why this suite
+    /// stayed green while production shipped `IOS-OUTBOX-002`: a replica cannot
+    /// red on a defect in the original. Reaching through to
+    /// `AccountManager.earliestFutureHoldWakeTarget(now:db:)` makes every case
+    /// below an assertion about the app.
     private func runEarliestPendingQuery(_ db: DatabaseQueue) throws -> OutboxMessage? {
         try db.read { dbConn in
-            try OutboxMessage
-                .filter(Column("status") == OutboxStatus.queued.rawValue)
-                .order(Column("holdUntil").asc)
-                .fetchOne(dbConn)
+            try AccountManager.earliestFutureHoldWakeTarget(now: Date(), db: dbConn)
         }
     }
 
@@ -860,7 +863,19 @@ struct PostLoopWakeUpQueryTests {
         #expect(earliest?.id == "soon")
     }
 
-    @Test("Wake-up guard: schedule ONLY if holdUntil > now (don't schedule for past-hold)")
+    /// ⚠️ RE-SCOPED (`IOS-OUTBOX-002`). **Previous display name: "Wake-up guard:
+    /// schedule ONLY if holdUntil > now (don't schedule for past-hold)".** It
+    /// asserted `earliest?.id == "past"` and `shouldSchedule == false` with a
+    /// future-held row sitting in the same table — i.e. it ENCODED the defect as
+    /// the expected behaviour: the past-held row shadows the future one, no timer
+    /// is armed, and the future row is reached only by some later drain trigger.
+    /// It could only assert that because it ran against a replica of the query;
+    /// once `runEarliestPendingQuery` calls production, the old expectation reds.
+    /// The test was not deleted and none of its fixture changed — only the
+    /// expectation it encodes, from the shadowing behaviour to the invariant the
+    /// shadowing violated. Its second half (deleting the shadowing row and
+    /// re-querying) is kept as the ordering control it always was.
+    @Test("Wake-up target: a future-held row is selected even when a past-held row sorts ahead of it")
     func guardAgainstPastHold() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -874,16 +889,18 @@ struct PostLoopWakeUpQueryTests {
             try future.insert($0)
         }
 
+        // The past-held row sorts first under `holdUntil ASC` but is NOT a wake
+        // target — its deadline has already passed, so the ordinary drain loop
+        // owns it. The future-held row behind it is what needs a timer.
         let earliest = try runEarliestPendingQuery(db)
-        #expect(earliest?.id == "past")  // query returns it by ordering
+        #expect(earliest?.id == "future")
 
-        // The production code then gates with `let hold = earliest.holdUntil, hold > Date()`.
-        // A past-hold row fails this guard → no wake-up scheduled for it.
+        // …and the production re-check (`let hold = earliest.holdUntil, hold >
+        // Date()`) now passes, which is what actually arms the wake-up Task.
         let shouldSchedule = (earliest?.holdUntil ?? .distantPast) > Date()
-        #expect(shouldSchedule == false)
+        #expect(shouldSchedule == true)
 
-        // Drop the past-hold row (simulating drain claim or retry deferral),
-        // and re-query: now the future row is the wake-up target.
+        // Ordering control: with the shadowing row gone the answer is unchanged.
         try db.write { _ = try OutboxMessage.deleteOne($0, key: "past") }
         let earliest2 = try runEarliestPendingQuery(db)
         #expect(earliest2?.id == "future")
