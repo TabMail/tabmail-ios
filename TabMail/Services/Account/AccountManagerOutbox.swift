@@ -708,6 +708,19 @@ extension AccountManager {
     /// Transient errors keep the message as 'queued' indefinitely without incrementing retryCount.
     /// Permanent errors increment retryCount and mark as 'failed' after 3 attempts.
     nonisolated static func isTransientSendError(_ error: Error) -> Bool {
+        // IOS-TLS-002: a refused TLS floor is DETERMINISTIC and permanent — the
+        // server cannot negotiate TLS 1.2 and no number of retries changes that.
+        // Classified explicitly, and FIRST, because the substring heuristic at the
+        // bottom of this function decides on the error's RENDERED text — and that
+        // text is now a user-facing sentence, so a later copy edit introducing the
+        // word "connection" would silently flip this to transient and requeue the
+        // row forever, which is exactly the send-path half of `IOS-TLS-002`.
+        //
+        // Deliberately NOT `isFatalSendError`: the ordinary permanent path gives
+        // three bounded auto-retries before `.failed`, which is a cheap hedge if
+        // this ever misclassifies, and it still ends with the actionable message
+        // visible on the Outbox row rather than an infinite silent queue.
+        if error is IMAPTransportSecurityError { return false }
         // SMTPError cases
         if let smtpError = error as? SMTPError {
             switch smtpError {

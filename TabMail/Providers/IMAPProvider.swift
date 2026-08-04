@@ -33,10 +33,93 @@ struct UIDExistenceResult: Sendable {
     let uidValidity: UInt32
 }
 
+/// A transport-security refusal that TabMail can state in the user's own terms,
+/// because the user is the only one who can act on it.
+///
+/// `IOS-TLS-002` requires that a connection refused by the TLS floor surface as a
+/// *clear, actionable error naming the TLS floor*, never a silent or generic
+/// connection failure. What actually reached the UI was NIOSSL's bridged form —
+/// `"The operation couldn't be completed. (NIOSSL.NIOSSLError error 0.)"` —
+/// observed directly (see `IMAPTransportSecurityError.tlsProtocolVersionAlert`).
+/// That names nothing, suggests nothing, and describes a condition that is
+/// permanent: the server cannot speak the floor, so no retry will ever succeed.
+///
+/// `CustomStringConvertible` alongside `LocalizedError` is deliberate and it is
+/// SwiftMail's own `SMTPError` convention: the send path stores
+/// `String(describing: error)` into `outboxMessage.errorMessage`, which
+/// `OutboxView` renders verbatim for a `.failed` row, while the account-connect
+/// views render `error.userFacingDescription` (i.e. `localizedDescription`).
+/// Both must therefore be the same human sentence.
+enum IMAPTransportSecurityError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    /// The server would not negotiate the minimum TLS version TabMail requires.
+    case tlsFloorNotMet(host: String)
+
+    var description: String {
+        switch self {
+        case .tlsFloorNotMet(let host):
+            // ⚠️ The version named here is SwiftMail's `MailTLSMinimumVersion`
+            // default (`.tlsv12`), which is the floor TabMail's `IMAPServer` /
+            // `SMTPServer` are constructed with. If that default ever moves, this
+            // sentence moves with it. `IOS-TLS-001` is the owner's standing
+            // decision that the floor itself stays where it is.
+            return """
+                \(host) does not support TLS 1.2 or later. TabMail requires TLS 1.2 so your mail \
+                password cannot be read in transit, and will not fall back to an older version. \
+                Ask your mail provider to enable TLS 1.2.
+                """
+        }
+    }
+
+    var errorDescription: String? { description }
+}
+
 actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// IMAP `fetchMessages(limit:)` returns the highest UIDs (archive-time order,
     /// decorrelated from message date) → stale detection must use a UID window.
     nonisolated var staleWindowMode: StaleWindowMode { .uid }
+
+    // MARK: - Transport-security error mapping (IOS-TLS-002)
+
+    /// The BoringSSL reason token a below-floor server produces, **observed**, not
+    /// assumed (2026-08-04, iOS Simulator, this app's SwiftMail → NIOSSL stack,
+    /// against `openssl s_server`):
+    ///
+    /// - TLS 1.1-only server → `handshakeFailed(NIOSSL.BoringSSLError.sslError(
+    ///   [Error: 268436526 error:1000042e:SSL routines:OPENSSL_internal:
+    ///   TLSV1_ALERT_PROTOCOL_VERSION at …/tls_record.cc:484]))`
+    /// - TLS 1.0-only server → byte-identical signature.
+    ///
+    /// 🚨 THE OUTER SHAPE IS NOT THE DISCRIMINATOR. A TLS 1.3 server presenting an
+    /// untrusted certificate produced the SAME `handshakeFailed(…sslError…)`
+    /// wrapper with `CERTIFICATE_VERIFY_FAILED` inside, so matching on
+    /// `handshakeFailed` — or on the NIOSSL error domain — would tell a user whose
+    /// certificate expired that their server is too old. Only the reason token
+    /// separates them, which is why the match is on the token alone.
+    ///
+    /// It is matched in the RENDERED description rather than by importing NIOSSL
+    /// so a rethrow that re-wraps the error in a provider type (`SMTPError`
+    /// interpolates `"\(error)"`) still carries it — the same technique
+    /// `SyncEngine.isConnectionError` uses for NIO's error families.
+    static let tlsProtocolVersionAlert = "TLSV1_ALERT_PROTOCOL_VERSION"
+
+    /// Return an actionable transport-security error when — and ONLY when — the
+    /// failure was the server refusing the TLS version floor. Everything else is
+    /// returned UNCHANGED.
+    ///
+    /// Fail-to-generic is the safe direction and it is chosen on purpose. A shape
+    /// this function does not recognise stays whatever it already was, so it keeps
+    /// its existing transient/retryable classification and the user's send keeps
+    /// retrying. Recognising too much is the dangerous direction: it would label a
+    /// recoverable failure permanent and stop a send that would have gone through.
+    nonisolated static func mapTransportSecurityFailure(
+        _ error: Error,
+        host: String
+    ) -> Error {
+        guard String(describing: error).contains(tlsProtocolVersionAlert) else {
+            return error
+        }
+        return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
+    }
 
     private let host: String
     private let port: Int
@@ -848,7 +931,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             useTLS: useTLS,
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
-        try await server.connect()
+        do {
+            try await server.connect()
+        } catch {
+            // IOS-TLS-002: a server below the TLS floor otherwise arrives at the
+            // UI as "The operation couldn't be completed. (NIOSSL.NIOSSLError
+            // error 0.)" — permanent, actionable, and named nowhere.
+            throw Self.mapTransportSecurityFailure(error, host: host)
+        }
         try await server.login(username: username, password: password)
         // The oracle's birth mark — see `serverCreatedTestHook`.
         serverCreatedTestHook.withLock { $0 }?(server, diagSite)
@@ -4901,7 +4991,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
             print("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)")
             let smtpServer = SMTPServer(host: self.smtpHost, port: self.smtpPort)
-            try await smtpServer.connect()
+            do {
+                try await smtpServer.connect()
+            } catch {
+                // IOS-TLS-002, send path. Without this the row stays `.queued`
+                // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
+                // shapes as transient, so a message addressed to a server that can
+                // never accept it was retried indefinitely and the user was never
+                // given the Retry/Discard agency Outbox Rules 7/9 promise.
+                throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
+            }
             try await smtpServer.login(username: self.username, password: self.password)
 
             let email = Self.buildEmail(from: draft, senderEmail: self.senderEmail)
