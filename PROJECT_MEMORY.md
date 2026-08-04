@@ -134,6 +134,7 @@ These topics exist only on the mature pre-v3 line and are therefore not in `v1.6
 |---|---|---|
 | Historical | HISTORICAL — Intention journal + fold-at-drain (ADR-IOS-058, 2026-07-11; queue/Undo mechanics superseded by ADR-IOS-060) | [read in full](Companion/Memory/History/090-historical-intention-journal-fold-at-drain-adr-ios-058-2026-07-11-queue.md) |
 | Current | Intention queue V2 — authoritative current direction (ADR-IOS-060, 2026-07-13) | [read in full](Companion/Memory/Current/092-intention-queue-v2-authoritative-current-direction-adr-ios-060-2026-07-1.md) |
+| Current | ⚠️ The `FakeIMAPServer` wrong-message wire oracle (`wrongMessageViolations` / `expectMutation` / `expectedMutationRfcs`) is STRUCTURALLY BLIND to any C3 defect whose precondition is that target and bystander share one RFC 822 Message-ID — it discriminates by RFC-identity set membership, so such a mutation is declared correct and the assertion is vacuous while looking rigorous; pin on physical wire state + the `UID STORE`/`EXPUNGE` command log instead, and do NOT re-base the oracle on UID (2026-08-04, from the B1 draft-SEARCH fix `459786db1`) | [read in full](Companion/Memory/Current/093-the-wrong-message-wire-oracle-is-blind-to-shared-message-id-defects.md) |
 
 ---
 

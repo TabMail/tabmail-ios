@@ -282,7 +282,7 @@ by construction a removal candidate, so an **omission from this list is itself a
 | Sent-folder duplicate-APPEND guard (`appendToSentFolder` → `searchByMessageId`) | The only thing preventing a duplicate Sent copy when an append is retried after a partial finalize. Double-send prevention is non-negotiable. |
 | Pre-generated `sentMessageId` on the Outbox claim path | It is both the wire Message-ID and that dedup key. |
 | Draft RFC ≠ sent RFC in Outbox server-draft cleanup | Conflating them orphans the server draft. |
-| IMAP draft UID **discovery** | RFC is the search key used to *learn* the UID after a non-UIDPLUS APPEND. The **UID** remains the identity. |
+| ~~IMAP draft UID **discovery**~~ **RETIRED — this row was itself a D4 violation.** | It read: *"RFC is the search key used to learn the UID after a non-UIDPLUS APPEND; the UID remains the identity."* That is exactly the forbidden relationship, dressed as discovery: the learned UID became a **mutation address** that `DraftStore` persisted and `deleteDraftStrong` later `STORE \Deleted`-ed and, on UIDPLUS, **irreversibly UID-EXPUNGEd**. Exact-match and cardinality guards prove one message carries the Message-ID — never that it is the message we appended. Removed in "Refuse a draft address derived from a Message-ID SEARCH"; absence of `APPENDUID` now yields `.unaddressable`. **Do not restore this row.** |
 | AI cross-device cache probe (`MessageIdentity.aiCacheKey`) | ADR-IOS-026B / ADR-IOS-010; shared with the Thunderbird addon. A provider id is device-local. |
 | Threading / `References` / `In-Reply-To` | RFC 5322 threading is *defined* on Message-ID. |
 | The two-key sync filter (`PendingOperation.containsAnyKey`) | Explicitly preserved by D4's scope boundary. Do not tidy. |
@@ -294,7 +294,19 @@ by construction a removal candidate, so an **omission from this list is itself a
   `v1.6.38` already did. On the IMAP action queue the shipped release is **the less safe of the two
   designs**: the reference fails closed where the base fails open. D4 is the first design correct on
   that leg, because **it never produces a multi-match set at all** — there is no cardinality to
-  check, because nothing searches.
+  check, because the action queue's own path never searches.
+
+  ⚠️ **This bullet previously ended "because nothing searches", full stop. That was false and is
+  retracted.** `searchByMessageId` retains two live call sites, and a third — `saveDraft`'s
+  no-`APPENDUID` arm — was live when this sentence was written and did convert a SEARCH hit into a
+  draft mutation address (`IOS-IMAP-002`'s retraction; fixed separately). **The property D4 actually
+  guarantees is narrower and is the one that matters: no SEARCH result is ever a mutation target.**
+  State it that way, never as "nothing searches" — the blanket phrasing is what let the draft arm sit
+  inside a frozen ADR that forbids it. The two survivors are both non-mutation reads:
+  `appendToSentFolder` uses cardinality only, as an existence probe, and never converts a hit into an
+  address; `currentUIDs` / `messageExistsInFolder` feed the backfill body queue's re-key, which is a
+  **local** header address for a body fetch, not a wire mutation target — its multi-hit resolution is
+  registered as an open lead (`IOS-BACKFILL-002`).
 - UID keying is viable now only because C2/C4/C5 (ADR-IOS-069) removed the durability-across-reset
   requirement that forced RFC keying in the first place. It **deletes** code rather than adding it.
 - Graph ids are stable for a message *in place*, but Graph **reallocates the id on move**. That is
