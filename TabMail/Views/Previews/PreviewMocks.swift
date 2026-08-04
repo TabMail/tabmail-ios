@@ -135,18 +135,18 @@ enum PreviewMocks {
         // User-defined labels (Gmail labels / IMAP keywords), distinct from
         // TabMail's internal ActionTag. Mirrors what a real inbox looks like
         // after classification + user tagging.
-        let labels = [
-            UserLabel(id: "lbl_work", accountId: account.id, name: "Work", isSystem: false),
-            UserLabel(id: "lbl_personal", accountId: account.id, name: "Personal", isSystem: false),
-            UserLabel(id: "lbl_urgent", accountId: account.id, name: "Urgent", isSystem: false),
-        ]
+        let work = UserLabel(accountId: account.id, providerLabelId: "lbl_work", name: "Work", isSystem: false)
+        let personal = UserLabel(accountId: account.id, providerLabelId: "lbl_personal", name: "Personal", isSystem: false)
+        let urgent = UserLabel(accountId: account.id, providerLabelId: "lbl_urgent", name: "Urgent", isSystem: false)
+        let labels = [work, personal, urgent]
         // Row 0 → Work; row 1 → Work + Urgent; row 3 → Personal; row 4 → Work.
+        // The join FK is the label's SURROGATE id, not the bare provider value.
         let messageLabels: [MessageUserLabel] = [
-            MessageUserLabel(messageId: headers[0].id, userLabelId: "lbl_work"),
-            MessageUserLabel(messageId: headers[1].id, userLabelId: "lbl_work"),
-            MessageUserLabel(messageId: headers[1].id, userLabelId: "lbl_urgent"),
-            MessageUserLabel(messageId: headers[3].id, userLabelId: "lbl_personal"),
-            MessageUserLabel(messageId: headers[4].id, userLabelId: "lbl_work"),
+            MessageUserLabel(messageId: headers[0].id, userLabelId: work.id),
+            MessageUserLabel(messageId: headers[1].id, userLabelId: work.id),
+            MessageUserLabel(messageId: headers[1].id, userLabelId: urgent.id),
+            MessageUserLabel(messageId: headers[3].id, userLabelId: personal.id),
+            MessageUserLabel(messageId: headers[4].id, userLabelId: work.id),
         ]
 
         // Message bodies so MessageDetailView can render full content.

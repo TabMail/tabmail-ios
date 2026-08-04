@@ -159,11 +159,11 @@ struct UserLabelStoreTests {
         let msg1 = try TestDatabase.insertMessageHeader(db, messageId: "100")
         let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "200")
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L2").insert(db)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Personal", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: msg1.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, userLabelId: "acc1:L2").insert(db)
+            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L1").insert(db)
         }
         let result = try db.read { db in
             try UserLabelStore.loadLabels(for: [msg1.id, msg2.id], in: db)
@@ -179,10 +179,10 @@ struct UserLabelStoreTests {
         try TestDatabase.insertFolder(db)
         let msg = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "SYS", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "SYS").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "SYS", name: "STARRED", isSystem: true).insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:SYS").insert(db)
         }
         let result = try db.read { db in
             try UserLabelStore.loadLabels(for: [msg.id], in: db)
@@ -207,12 +207,12 @@ struct UserLabelStoreTests {
         try TestDatabase.insertFolder(db)
         let msg = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Zebra", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Alpha", isSystem: false).insert(db)
-            try UserLabel(id: "L3", accountId: "acc1", name: "Middle", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L2").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L3").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Zebra", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Alpha", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L3", name: "Middle", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:L2").insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:L3").insert(db)
         }
         let result = try db.read { db in
             try UserLabelStore.loadLabels(for: [msg.id], in: db)
@@ -228,12 +228,13 @@ struct UserLabelStoreTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
         }
         let found = try db.read { db in
             try UserLabelStore.findByName("work", accountId: "acc1", in: db)
         }
-        #expect(found?.id == "L1")
+        #expect(found?.id == "acc1:L1")
+        #expect(found?.providerLabelId == "L1")
     }
 
     @Test("findByName returns nil for non-existent label")
@@ -251,7 +252,7 @@ struct UserLabelStoreTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try db.write { db in
-            try UserLabel(id: "SYS", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "SYS", name: "STARRED", isSystem: true).insert(db)
         }
         let found = try db.read { db in
             try UserLabelStore.findByName("STARRED", accountId: "acc1", in: db)
@@ -264,9 +265,9 @@ struct UserLabelStoreTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Zebra", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Alpha", isSystem: false).insert(db)
-            try UserLabel(id: "SYS", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Zebra", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Alpha", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "SYS", name: "STARRED", isSystem: true).insert(db)
         }
         let labels = try db.read { db in
             try UserLabelStore.allLabels(accountId: "acc1", in: db)
@@ -283,11 +284,11 @@ struct UserLabelStoreTests {
         try TestDatabase.insertFolder(db)
         let msg = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Play", isSystem: false).insert(db)
-            try UserLabel(id: "SYS", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg.id, userLabelId: "SYS").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Play", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "SYS", name: "STARRED", isSystem: true).insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: msg.id, userLabelId: "acc1:SYS").insert(db)
         }
         let labels = try db.read { db in
             try UserLabelStore.labelsForMessage(msg.id, in: db)
@@ -307,16 +308,16 @@ struct UserLabelStoreTests {
         let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "200")
         let msg3 = try TestDatabase.insertMessageHeader(db, messageId: "300")
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
-            try UserLabel(id: "L3", accountId: "acc1", name: "Rare", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Personal", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L3", name: "Rare", isSystem: false).insert(db)
             // msg1 has "Work" (applied to target message)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, userLabelId: "acc1:L1").insert(db)
             // "Personal" appears on 2 inbox messages (higher frequency)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L2").insert(db)
-            try MessageUserLabel(messageId: msg3.id, userLabelId: "L2").insert(db)
+            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L2").insert(db)
+            try MessageUserLabel(messageId: msg3.id, userLabelId: "acc1:L2").insert(db)
             // "Rare" appears on 1 inbox message
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L3").insert(db)
+            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L3").insert(db)
         }
         let inboxFolderId = "acc1:INBOX"
         let sorted = try db.read { db in

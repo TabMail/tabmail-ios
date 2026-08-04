@@ -1071,7 +1071,7 @@ struct InboxComposeScenarioTests {
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
         let archivePath = "Archive"
         let now = Date()
-        let labelX = [UserLabel(id: "label-x", accountId: accountId, name: "Filtered", isSystem: false)]
+        let labelX = [UserLabel(accountId: accountId, providerLabelId: "label-x", name: "Filtered", isSystem: false)]
 
         // D — durable, already in the displayed folder.
         let dLabeled = SimHeader(
@@ -1122,7 +1122,9 @@ struct InboxComposeScenarioTests {
         )
 
         let query = InboxListQuery(
-            displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: ["label-x"],
+            // The filter names the label's SURROGATE id, which is what
+            // `snapshot.userLabels.map(\.id)` carries (D10 / `IOS-LABEL-001`).
+            displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: ["\(accountId):label-x"],
             mode: .normal, targetCount: 50, beforeDate: nil
         )
         let composed = InboxListComposer.compose(ComposeInputs(
@@ -1139,11 +1141,11 @@ struct InboxComposeScenarioTests {
         let stagedId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: "s-staged")
         #expect(!ids.contains(stagedId), "staged row (always userLabels == []) leaked through the active label filter")
         #expect(
-            composed.first { $0.id == dLabeled.id }?.userLabels.map(\.id) == ["label-x"],
+            composed.first { $0.id == dLabeled.id }?.userLabels.map(\.id) == ["\(accountId):label-x"],
             "userLabels not carried onto the composed durable row"
         )
         #expect(
-            composed.first { $0.id == pLabeled.id }?.userLabels.map(\.id) == ["label-x"],
+            composed.first { $0.id == pLabeled.id }?.userLabels.map(\.id) == ["\(accountId):label-x"],
             "userLabels not carried onto the composed pinned row"
         )
     }

@@ -256,12 +256,25 @@ final class UserLabelMenuModel {
                     folderPath: header.folderPath, db: db) else { return false }
                 try MessageUserLabel(messageId: header.id, userLabelId: label.id)
                     .insert(db, onConflict: .ignore)
+                // 🚨 `providerLabelId`, NEVER `id` — THIS VALUE GOES ON THE WIRE.
+                // The drain hands `PendingOperation.userLabelId` straight to the
+                // provider as a raw argument: Gmail `addLabelIds:`, IMAP
+                // `STORE +FLAGS (<keyword>)`. `UserLabel.id` is the
+                // account-prefixed surrogate (D10 / `IOS-LABEL-001`) and would be
+                // a value the server has never heard of. On IMAP that writes a
+                // bogus custom keyword to the real message — a wrong-value server
+                // mutation. On Gmail it is worse than a loud failure: the API
+                // replies `"Invalid label"`, which
+                // `GmailProvider.isAuthoritativeActionRejection` matches as a
+                // PROVIDER-AUTHORITATIVE no-op, so the op leaves the queue as if
+                // it had succeeded and the user's label action is silently
+                // discarded — the cardinal sin of this codebase.
                 let op = PendingOperation(
                     type: .addUserLabel,
                     messageIds: admission.providerIds,
                     accountId: header.accountId,
                     folderPath: header.folderPath,
-                    userLabelId: label.id,
+                    userLabelId: label.providerLabelId,
                     observedUidValidity: admission.observedUidValidity
                 )
                 try op.insert(db)
@@ -303,12 +316,16 @@ final class UserLabelMenuModel {
                 try MessageUserLabel
                     .filter(Column("messageId") == header.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
+                // 🚨 `providerLabelId`, NEVER `id` — see the identical comment in
+                // `applyLabel`, including the Gmail authoritative-rejection trap
+                // that turns a prefixed wire value into a SILENT drop of the
+                // user's intention rather than a visible failure.
                 let op = PendingOperation(
                     type: .removeUserLabel,
                     messageIds: admission.providerIds,
                     accountId: header.accountId,
                     folderPath: header.folderPath,
-                    userLabelId: label.id,
+                    userLabelId: label.providerLabelId,
                     observedUidValidity: admission.observedUidValidity
                 )
                 try op.insert(db)
@@ -376,21 +393,34 @@ final class UserLabelMenuModel {
                 return false
             }
 
+            // `labelId` is the BARE provider value — a Gmail label id from
+            // `createLabel`, or the lowercased IMAP keyword. The deterministic
+            // initializer mints the account-prefixed surrogate primary key from it
+            // (D10 / `IOS-LABEL-001`).
+            let newLabel = UserLabel(
+                accountId: accountId, providerLabelId: labelId,
+                name: name, isSystem: false
+            )
+
             // Insert locally
             try await AppDatabase.dbPool.write { db in
-                try UserLabel(id: labelId, accountId: accountId, name: name, isSystem: false)
-                    .save(db)
+                try newLabel.save(db)
             }
 
             // Apply to message
-            let newLabel = UserLabel(id: labelId, accountId: accountId, name: name, isSystem: false)
             let admitted = await applyLabel(newLabel)
             // Add to list — the label row itself was created above regardless, so it
             // belongs in the menu either way. Mark it APPLIED only if the write was
             // admitted: a refusal queued nothing and inserted no join row, and a
             // checkmark here would be the same phantom success `toggleLabel` closes.
+            //
+            // 🚨 `newLabel.id`, not `labelId`. `appliedIds` is compared against
+            // `label.id` by `toggleLabel` and rebuilt from `label.id` by
+            // `reconcileAppliedIdsFromDatabase`; inserting the BARE provider value
+            // here would put a member in the set that nothing else can ever match,
+            // so the freshly created label's checkmark would not draw.
             sortedLabels.insert(newLabel, at: 0)
-            if admitted { appliedIds.insert(labelId) }
+            if admitted { appliedIds.insert(newLabel.id) }
             return true
         } catch {
             print("[UserLabelMenu] Create label failed: \(error)")

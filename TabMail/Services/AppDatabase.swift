@@ -2349,6 +2349,169 @@ final class AppDatabase: Sendable {
                 WHERE actionTag IS NOT NULL
                 """, arguments: [Date()])
         }
+
+        // v82: account-scoped `userLabel` identity (D10 / `IOS-LABEL-001`).
+        //
+        // 🚨 THE DEFECT. `v33_userLabelSupport` made the PROVIDER's label id the primary
+        // key (`t.primaryKey("id", .text)`), but a provider label id is unique only
+        // WITHIN an account. Two accounts with a `Receipts` Gmail label, or two IMAP
+        // accounts using a `work` keyword, shared ONE row. Three verified consequences:
+        // (1) the row's owner FLAPPED — the Gmail arm upserts with `.save(db)` so the
+        // last account to sync overwrote `accountId`/`name`/`isSystem`, while the IMAP
+        // arms `insert(onConflict: .ignore)` so the FIRST writer won forever and later
+        // accounts silently bound to a row naming someone else's account; (2) a CASCADE
+        // CROSSED THE ACCOUNT BOUNDARY — the Gmail stale sweep's FILTER is account-scoped
+        // but the ROW was global, and `messageUserLabel.userLabelId` references this
+        // table `onDelete: .cascade`, so account A removing a label server-side deleted
+        // every association row for account B's messages; (3) the two display readers
+        // (`UserLabelStore.loadLabels` / `labelsForMessage`) join by id alone, so B's
+        // chips rendered A's name.
+        //
+        // 🚨 THE FIX — split identity from the wire value, completing the pattern
+        // `folder` and `messageHeader` already have. `id` becomes the deterministic
+        // surrogate `"<accountId>:<providerLabelId>"` (cf. `Folder.id`), and the BARE
+        // provider value moves to its own `providerLabelId` column (cf. `Folder.path`),
+        // which is what every wire path reads. A composite primary key `(accountId, id)`
+        // was considered and rejected: it forces an `accountId` column onto
+        // `messageUserLabel` and rewrites its foreign key — strictly more surgery — and
+        // it still leaves the wire paths with no clean bare value to read.
+        //
+        // ⚠️ NEVER split the surrogate back apart on ':' — a provider label id may itself
+        // contain a colon (this repo has a live defect from exactly that assumption).
+        // Read the account from `accountId`, the wire value from `providerLabelId`.
+        //
+        // CONVERGENCE (Data Integrity rule 5). A fresh install runs `v33` (old shape) and
+        // then this migration over EMPTY tables: the delete matches nothing, both
+        // snapshots are empty, all four inserts move zero rows, and only the schema
+        // changes. An existing database runs the same body over real rows and rewrites
+        // their ids. Both reach the identical schema and the identical id shape.
+        //
+        // FOREIGN KEYS / THE CASCADE. `foreignKeyChecks: .deferred` — spelled out rather
+        // than left to the wrapper's default because it is load-bearing here, exactly as
+        // in `v2_dropMessageHeaderFolderFK`. GRDB runs the whole body under
+        // `PRAGMA foreign_keys = OFF` and then a full `PRAGMA foreign_key_check` before
+        // commit. That makes consequence (2)'s cascade a STRUCTURAL no-op rather than an
+        // argued one: no FK action can fire while the body runs, so dropping and
+        // recreating `userLabel` cannot delete a single association row — and the final
+        // check proves every rebuilt reference resolves.
+        //
+        // BEST-EFFORT `name`. A row reconstructed for account B in step 3a inherits
+        // whatever `name`/`isSystem` the hijacked shared row was carrying, because that
+        // is the only evidence in the database. The SERVER is the source of truth and
+        // the next sync of that account overwrites both. No lookup is invented here.
+        migrator.registerTimedMigration(
+            "v82_accountScopedUserLabelIdentity", foreignKeyChecks: .deferred
+        ) { db in
+            // 1. An association whose owning message is gone cannot be re-pointed —
+            //    steps 3a and 5 need `messageHeader.accountId` to name the owner. Leaving
+            //    such a row would strand it on a bare id that no rebuilt `userLabel` row
+            //    carries, and the closing `foreign_key_check` would then fail the whole
+            //    migration (a launch brick). It renders nothing to the user, and the
+            //    server re-supplies the association on the next sync of that message.
+            //    Expected to match zero rows: `messageUserLabel.messageId` cascades from
+            //    `messageHeader`, and every migration on this line ends with a full
+            //    foreign-key check. Doing it explicitly makes step 5's totality a LOCAL
+            //    fact rather than an inherited cross-migration invariant.
+            try db.execute(sql: """
+                DELETE FROM messageUserLabel
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM messageHeader mh WHERE mh.id = messageUserLabel.messageId
+                )
+                """)
+
+            // 2. Snapshot both tables before touching either (the `v2` pattern). Step 3a
+            //    reads the associations to discover which accounts actually reference
+            //    each legacy label, so the associations must survive the rebuild of
+            //    `userLabel`.
+            try db.execute(sql: """
+                CREATE TABLE userLabel_v82_legacy AS
+                SELECT id, accountId, name, isSystem FROM userLabel
+                """)
+            try db.execute(sql: """
+                CREATE TABLE messageUserLabel_v82_legacy AS
+                SELECT messageId, userLabelId FROM messageUserLabel
+                """)
+
+            // 3. Rebuild `userLabel` in the new shape. Dependent table first, matching
+            //    `v2`. SQLite cannot add a NOT NULL column without a default nor change a
+            //    primary key in place, so recreate-and-copy is the only route.
+            try db.drop(table: "messageUserLabel")
+            try db.drop(table: "userLabel")
+            try db.create(table: "userLabel") { t in
+                t.primaryKey("id", .text)
+                t.column("accountId", .text).notNull()
+                    .references("account", onDelete: .cascade)
+                t.column("providerLabelId", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("isSystem", .integer).notNull().defaults(to: false)
+            }
+
+            // 3a. THE REPAIR FOR CONSEQUENCE (1). One row per (owning message's account,
+            //     legacy bare label id) pair the surviving associations reference. This is
+            //     what gives account B a B-OWNED row to point at instead of the row whose
+            //     `accountId` account A had hijacked. The `DISTINCT` runs first so the
+            //     name lookup joins the tiny pair set, not every association row.
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO userLabel (id, accountId, providerLabelId, name, isSystem)
+                SELECT p.accountId || ':' || p.labelId, p.accountId, p.labelId,
+                       COALESCE(l.name, p.labelId), COALESCE(l.isSystem, 0)
+                FROM (
+                    SELECT DISTINCT mh.accountId AS accountId, mul.userLabelId AS labelId
+                    FROM messageUserLabel_v82_legacy mul
+                    JOIN messageHeader mh ON mh.id = mul.messageId
+                ) p
+                LEFT JOIN userLabel_v82_legacy l ON l.id = p.labelId
+                """)
+
+            // 3b. …then every legacy row under its OWN recorded account, so a label the
+            //     user CREATED BUT NEVER APPLIED survives the rewrite. Dropping those
+            //     would destroy a label the user made — a dropped user intention. The
+            //     `OR IGNORE` can only skip a row 3a already inserted, and those two are
+            //     the same label: `accountId` is a colon-free UUID string (`Account.init`
+            //     / `DemoSeed.demoAccountId`), so `accountId || ':' || labelId` is
+            //     injective and equal ids force equal accounts AND equal provider ids.
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO userLabel (id, accountId, providerLabelId, name, isSystem)
+                SELECT l.accountId || ':' || l.id, l.accountId, l.id, l.name, l.isSystem
+                FROM userLabel_v82_legacy l
+                """)
+
+            // 4. Recreate the join table unchanged in shape (only its VALUES are rewritten).
+            try db.create(table: "messageUserLabel") { t in
+                t.column("messageId", .text).notNull()
+                    .references("messageHeader", onDelete: .cascade)
+                t.column("userLabelId", .text).notNull()
+                    .references("userLabel", onDelete: .cascade)
+                t.primaryKey(["messageId", "userLabelId"])
+            }
+            try db.create(
+                index: "idx_messageUserLabel_userLabelId",
+                on: "messageUserLabel",
+                columns: ["userLabelId"]
+            )
+
+            // 5. Re-point every surviving association at ITS OWN account's row, using the
+            //    same expression and the same join 3a inserted from — so every value
+            //    written here provably exists in the rebuilt `userLabel`. Inserting into
+            //    a fresh table rather than `UPDATE`-ing in place is deliberate: an
+            //    in-place update of a primary-key column can collide TRANSIENTLY with a
+            //    not-yet-rewritten sibling row (a keyword literally named
+            //    `"<accountId>:x"`), and that collision would abort the migration and
+            //    brick launch. A plain `INSERT` is provably conflict-free here: for one
+            //    message the account is a single value, and prefixing a fixed string is
+            //    injective, so distinct source rows stay distinct.
+            try db.execute(sql: """
+                INSERT INTO messageUserLabel (messageId, userLabelId)
+                SELECT mul.messageId, mh.accountId || ':' || mul.userLabelId
+                FROM messageUserLabel_v82_legacy mul
+                JOIN messageHeader mh ON mh.id = mul.messageId
+                """)
+
+            // 6. No legacy bare-id row survives — the rebuilt table was populated only
+            //    from steps 3a/3b, both of which write prefixed ids. Drop the snapshots.
+            try db.drop(table: "messageUserLabel_v82_legacy")
+            try db.drop(table: "userLabel_v82_legacy")
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

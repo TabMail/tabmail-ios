@@ -549,9 +549,11 @@ extension SyncEngine {
                             for labelId in info.userLabelIds {
                                 // Auto-create UserLabel if it doesn't exist (IMAP keywords, or Gmail labels
                                 // already synced via fetchFolders). INSERT OR IGNORE for idempotency.
-                                try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                                    .insert(db, onConflict: .ignore)
-                                try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                                let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                                try labelRow.insert(db, onConflict: .ignore)
+                                // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                                // the bare provider value (D10 / `IOS-LABEL-001`).
+                                try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                                     .insert(db, onConflict: .ignore)
                             }
 

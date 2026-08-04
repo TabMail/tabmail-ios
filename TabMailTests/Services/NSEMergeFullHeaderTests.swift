@@ -277,7 +277,7 @@ struct NSEMergeFullHeaderTests {
         let db = try makeDB()
         // Register an isSystem=true label. It should NOT appear in the junction.
         try db.write { db in
-            try UserLabel(id: "STARRED", accountId: "acc1", name: "Starred", isSystem: true).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "STARRED", name: "Starred", isSystem: true).insert(db)
         }
         let msg = staged(
             providerLabels: ["INBOX", "UNREAD", "STARRED", "CATEGORY_PROMOTIONS"]
@@ -308,10 +308,12 @@ struct NSEMergeFullHeaderTests {
                 WHERE messageId = ? ORDER BY userLabelId
                 """, arguments: [headerId])
         }.map { $0["userLabelId"] as String }
-        #expect(!junctionIds.contains("tm_reply"))
-        #expect(!junctionIds.contains("$Forwarded"))
+        // Junction ids are the account-prefixed SURROGATE `userLabel.id`
+        // (D10 / `IOS-LABEL-001`); the bare keyword lives in `providerLabelId`.
+        #expect(!junctionIds.contains("acc1:tm_reply"))
+        #expect(!junctionIds.contains("acc1:$Forwarded"))
         // `Important` and `work` should survive (if they aren't excluded).
-        #expect(junctionIds.contains("important") || junctionIds.contains("work"))
+        #expect(junctionIds.contains("acc1:important") || junctionIds.contains("acc1:work"))
     }
 
     @Test("Outlook merge inserts NO user-label rows (categories not yet surfaced)")
@@ -461,8 +463,8 @@ struct NSEMergeFullHeaderTests {
         let db = try makeDB()
         // Pre-register a user label + a system label (sync would do this).
         try db.write { db in
-            try UserLabel(id: "Label_work", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "Label_notes", accountId: "acc1", name: "Notes", isSystem: true).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_work", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_notes", name: "Notes", isSystem: true).insert(db)
         }
 
         let msg = staged(
@@ -476,7 +478,14 @@ struct NSEMergeFullHeaderTests {
                 SELECT userLabelId FROM messageUserLabel WHERE messageId = ?
                 """, arguments: [headerId])
         }.map { $0["userLabelId"] as String }
-        #expect(junctionIds == ["Label_work"])
+        // The junction FK is the surrogate; the bare provider id is what
+        // `filterUserLabels` matched on. Both are asserted.
+        #expect(junctionIds == ["acc1:Label_work"])
+        let providerIds = try db.read { db in
+            try String.fetchAll(db, sql: "SELECT providerLabelId FROM userLabel WHERE id = ?",
+                                arguments: ["acc1:Label_work"])
+        }
+        #expect(providerIds == ["Label_work"])
     }
 
     @Test("AI-completed staged row writes AI fields on the inserted header")

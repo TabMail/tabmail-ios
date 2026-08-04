@@ -725,12 +725,12 @@ struct InboxListBehaviorPinningTests {
         try await pool.writeWithoutTransaction { db in
             let l = labeled; try l.insert(db)
             let u = unlabeled; try u.insert(db)
-            try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "label-x", name: "Filtered", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: labeled.id, userLabelId: "acc1:label-x").insert(db)
         }
 
         let vm = InboxViewModel(folders: [inbox])
-        vm.filterLabelIds = ["label-x"]
+        vm.filterLabelIds = ["acc1:label-x"]
 
         // Mirror UndoService.undo()'s .move case for BOTH messages: overlay
         // registered before the deferred DB restore write.
@@ -746,7 +746,7 @@ struct InboxListBehaviorPinningTests {
         #expect(vm.loadedMessages.count == 1)
         guard vm.loadedMessages.count == 1 else { return }
         #expect(vm.loadedMessages[0].id == labeled.id)
-        #expect(vm.loadedMessages[0].userLabels.map(\.id) == ["label-x"])
+        #expect(vm.loadedMessages[0].userLabels.map(\.id) == ["acc1:label-x"])
         #expect(!vm.loadedMessages.contains { $0.id == unlabeled.id })
     }
 

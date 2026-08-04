@@ -57,9 +57,9 @@ struct UserLabelSyncTests {
 
             let labelIds = ["Label_Work", "Label_Personal"]
             for labelId in labelIds {
-                try UserLabel(id: labelId, accountId: "acc1", name: labelId, isSystem: false)
+                try UserLabel(accountId: "acc1", providerLabelId: labelId, name: labelId, isSystem: false)
                     .insert(db, onConflict: .ignore)
-                try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                try MessageUserLabel(messageId: header.id, userLabelId: "acc1:\(labelId)")
                     .insert(db, onConflict: .ignore)
             }
         }
@@ -83,15 +83,15 @@ struct UserLabelSyncTests {
 
         // Insert label twice
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false)
                 .insert(db, onConflict: .ignore)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1")
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L1")
                 .insert(db, onConflict: .ignore)
         }
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false)
                 .insert(db, onConflict: .ignore)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1")
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L1")
                 .insert(db, onConflict: .ignore)
         }
 
@@ -109,12 +109,12 @@ struct UserLabelSyncTests {
         let header = try TestDatabase.insertMessageHeader(db)
 
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
         }
 
         // Simulate applyUserLabel
         try db.write { db in
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1")
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L1")
                 .insert(db, onConflict: .ignore)
             let op = PendingOperation(
                 type: .addUserLabel,
@@ -146,14 +146,14 @@ struct UserLabelSyncTests {
 
         // Setup: label applied
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L1").insert(db)
         }
 
         // Simulate removeUserLabel
         try db.write { db in
             try MessageUserLabel
-                .filter(Column("messageId") == header.id && Column("userLabelId") == "L1")
+                .filter(Column("messageId") == header.id && Column("userLabelId") == "acc1:L1")
                 .deleteAll(db)
             let op = PendingOperation(
                 type: .removeUserLabel,
@@ -190,10 +190,10 @@ struct UserLabelSyncTests {
         let header = try TestDatabase.insertMessageHeader(db)
 
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Play", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "L2").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Play", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:L2").insert(db)
         }
 
         let snapshot = try db.read { db in
@@ -234,10 +234,10 @@ struct UserLabelSyncTests {
         let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "200")
 
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "L2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L2").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Personal", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: msg1.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L2").insert(db)
         }
 
         // Load labels for both messages (simulating thread union)
@@ -272,10 +272,10 @@ struct UserLabelSyncTests {
         let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "200")
 
         try db.write { db in
-            try UserLabel(id: "L1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
             // Both messages have the same label
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "L1").insert(db)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "L1").insert(db)
+            try MessageUserLabel(messageId: msg1.id, userLabelId: "acc1:L1").insert(db)
+            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L1").insert(db)
         }
 
         let allIds = [msg1.id, msg2.id]
@@ -334,18 +334,18 @@ struct UserLabelSyncTests {
 
     @Test("UserLabelDisplaySegment expands nested label into segments")
     func expandNestedSegments() {
-        let label = UserLabel(id: "Label_1", accountId: "acc1", name: "Work/Projects/Alpha", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work/Projects/Alpha", isSystem: false)
         let segments = UserLabelDisplaySegment.expand([label])
         let names = segments.map(\.displayName)
         #expect(names == ["Alpha", "Projects", "Work"]) // Alphabetical
         // All segments point to the same parent label
-        #expect(segments.allSatisfy { $0.parentLabel.id == "Label_1" })
+        #expect(segments.allSatisfy { $0.parentLabel.id == "acc1:Label_1" })
     }
 
     @Test("UserLabelDisplaySegment deduplicates shared segments across labels")
     func expandDeduplicates() {
-        let label1 = UserLabel(id: "L1", accountId: "acc1", name: "Work/Alpha", isSystem: false)
-        let label2 = UserLabel(id: "L2", accountId: "acc1", name: "Work/Beta", isSystem: false)
+        let label1 = UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work/Alpha", isSystem: false)
+        let label2 = UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Work/Beta", isSystem: false)
         let segments = UserLabelDisplaySegment.expand([label1, label2])
         let names = segments.map(\.displayName)
         #expect(names == ["Alpha", "Beta", "Work"]) // "Work" appears once, not twice
@@ -353,7 +353,7 @@ struct UserLabelSyncTests {
 
     @Test("UserLabelDisplaySegment handles non-nested labels")
     func expandNonNested() {
-        let label = UserLabel(id: "L1", accountId: "acc1", name: "Simple", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Simple", isSystem: false)
         let segments = UserLabelDisplaySegment.expand([label])
         #expect(segments.count == 1)
         #expect(segments[0].displayName == "Simple")

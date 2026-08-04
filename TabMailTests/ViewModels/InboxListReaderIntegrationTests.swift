@@ -263,17 +263,17 @@ struct InboxListReaderIntegrationTests {
         try await pool.writeWithoutTransaction { db in
             let l = labeled; try l.insert(db)
             let u = unlabeled; try u.insert(db)
-            try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "label-x", name: "Filtered", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: labeled.id, userLabelId: "acc1:label-x").insert(db)
         }
-        let q = query(folders: [inbox], filterLabelIds: ["label-x"])
+        let q = query(folders: [inbox], filterLabelIds: ["acc1:label-x"])
 
         let asyncResult = await InboxListReader.fetch(folders: [inbox], query: q)
         #expect(asyncResult.count == 1, "expected exactly the labeled row to survive the label filter (async)")
         guard asyncResult.count == 1 else { return }
         #expect(asyncResult.first?.id == labeled.id)
         #expect(
-            asyncResult.first?.userLabels.map(\.id) == ["label-x"],
+            asyncResult.first?.userLabels.map(\.id) == ["acc1:label-x"],
             "userLabels not populated on the surviving durable snapshot (async)"
         )
         #expect(!asyncResult.contains { $0.id == unlabeled.id }, "unlabeled durable sibling leaked through the label filter")
@@ -281,7 +281,7 @@ struct InboxListReaderIntegrationTests {
         let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
         #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the durable label filter")
         #expect(
-            syncResult.first?.userLabels.map(\.id) == ["label-x"],
+            syncResult.first?.userLabels.map(\.id) == ["acc1:label-x"],
             "userLabels not populated on the surviving durable snapshot (sync)"
         )
     }
@@ -303,8 +303,8 @@ struct InboxListReaderIntegrationTests {
         try await pool.writeWithoutTransaction { db in
             let l = labeled; try l.insert(db)
             let u = unlabeled; try u.insert(db)
-            try UserLabel(id: "label-x", accountId: "acc1", name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeled.id, userLabelId: "label-x").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "label-x", name: "Filtered", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: labeled.id, userLabelId: "acc1:label-x").insert(db)
         }
 
         // Mirror UndoService.undo()'s .move case for BOTH messages — overlay
@@ -316,7 +316,7 @@ struct InboxListReaderIntegrationTests {
         AccountManager.shared.registerMutation(id: unlabeled.id, mutation: .init(
             folderId: inbox.id, folderPath: inbox.path, isInInbox: true
         ))
-        let q = query(folders: [inbox], filterLabelIds: ["label-x"])
+        let q = query(folders: [inbox], filterLabelIds: ["acc1:label-x"])
 
         let asyncResult = await InboxListReader.fetch(folders: [inbox], query: q)
         #expect(asyncResult.count == 1, "expected exactly the labeled pinned row to survive the label filter (async)")
@@ -324,7 +324,7 @@ struct InboxListReaderIntegrationTests {
         #expect(asyncResult.first?.id == labeled.id)
         #expect(asyncResult.first?.isInInbox == true, "overlay isInInbox not applied to the surviving pinned row")
         #expect(
-            asyncResult.first?.userLabels.map(\.id) == ["label-x"],
+            asyncResult.first?.userLabels.map(\.id) == ["acc1:label-x"],
             "userLabels not populated on the surviving pinned snapshot (async)"
         )
         #expect(
@@ -335,7 +335,7 @@ struct InboxListReaderIntegrationTests {
         let syncResult = InboxListReader.fetchSync(folders: [inbox], query: q)
         #expect(syncResult == asyncResult, "fetch and fetchSync diverged for the pinned label filter")
         #expect(
-            syncResult.first?.userLabels.map(\.id) == ["label-x"],
+            syncResult.first?.userLabels.map(\.id) == ["acc1:label-x"],
             "userLabels not populated on the surviving pinned snapshot (sync)"
         )
     }

@@ -32,6 +32,15 @@ enum UserLabelStore {
     /// Unified check: should this label/keyword be hidden from user display?
     /// Works for IMAP keywords, Gmail label IDs, Gmail label names, and folder paths.
     /// Used at insert time (sync), display time (loadLabels), and creation time (isReservedName).
+    ///
+    /// 🚨 `id:` MEANS THE BARE PROVIDER VALUE — pass `UserLabel.providerLabelId`, NEVER
+    /// `UserLabel.id`. Every test in the `id` branch below (`excludedNames.contains`, the
+    /// `[imap]` / `[gmail]` / `category_` prefixes) is a statement about what the PROVIDER
+    /// called the label. `UserLabel.id` is the account-prefixed surrogate
+    /// `"<accountId>:<providerLabelId>"` (D10 / `IOS-LABEL-001`), so handing it here makes
+    /// every one of those tests silently stop matching and leaks system labels into the
+    /// chips. The parameter keeps its name because the other callers
+    /// (`isGmailSystemLabel`, the sync arms) already pass raw provider values.
     static func shouldExcludeLabel(id: String? = nil, name: String) -> Bool {
         let lower = name.lowercased()
         // Prefix patterns — catches entire families
@@ -101,6 +110,14 @@ enum UserLabelStore {
     /// Load labels for a batch of message IDs. Call from any message-loading code path.
     /// Returns a dictionary keyed by messageId, values are arrays of UserLabel (non-system only).
     /// Filters at display time using shouldExcludeLabel to catch keywords that slipped through at insert time.
+    ///
+    /// ⚑ NO `accountId` PREDICATE, AND IT MUST NOT GAIN ONE (D10 / `IOS-LABEL-001`). The
+    /// unified inbox batches messages from EVERY account into one call, so a single
+    /// `accountId` argument would be wrong here, not merely awkward. Account scoping is
+    /// instead carried by `userLabel.id` itself, which is `"<accountId>:<providerLabelId>"`
+    /// — a join through `messageUserLabel.userLabelId` can only reach the owning account's
+    /// row. That is stronger than a predicate: the predicate could be forgotten at a call
+    /// site, the key cannot.
     static func loadLabels(for messageIds: [String], in db: Database) throws -> [String: [UserLabel]] {
         guard !messageIds.isEmpty else { return [:] }
         let rows = try MessageUserLabel
@@ -112,7 +129,7 @@ enum UserLabelStore {
         return Dictionary(grouping: rows, by: \.messageId)
             .mapValues { rows in
                 rows.map(\.userLabel)
-                    .filter { !shouldExcludeLabel(id: $0.id, name: $0.name) }
+                    .filter { !shouldExcludeLabel(id: $0.providerLabelId, name: $0.name) }
                     .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             }
     }
@@ -134,10 +151,14 @@ enum UserLabelStore {
             .filter(Column("accountId") == accountId && Column("isSystem") == false)
             .order(Column("name").collating(.localizedCaseInsensitiveCompare))
             .fetchAll(db)
-            .filter { !shouldExcludeLabel(id: $0.id, name: $0.name) }
+            .filter { !shouldExcludeLabel(id: $0.providerLabelId, name: $0.name) }
     }
 
     /// Labels applied to a specific message (non-system only, excluded keywords filtered).
+    ///
+    /// ⚑ No `accountId` predicate, for the reason spelled out on `loadLabels` — the
+    /// surrogate `userLabel.id` carries the account, so the join cannot cross the
+    /// boundary (D10 / `IOS-LABEL-001`).
     static func labelsForMessage(_ messageId: String, in db: Database) throws -> [UserLabel] {
         let rows = try MessageUserLabel
             .filter(Column("messageId") == messageId)
@@ -146,7 +167,7 @@ enum UserLabelStore {
             .asRequest(of: MessageUserLabelWithUserLabel.self)
             .fetchAll(db)
         return rows.map(\.userLabel)
-            .filter { !shouldExcludeLabel(id: $0.id, name: $0.name) }
+            .filter { !shouldExcludeLabel(id: $0.providerLabelId, name: $0.name) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -166,7 +187,7 @@ enum UserLabelStore {
         let allLabels = try UserLabel
             .filter(Column("accountId") == accountId && Column("isSystem") == false)
             .fetchAll(db)
-            .filter { !shouldExcludeLabel(id: $0.id, name: $0.name) }
+            .filter { !shouldExcludeLabel(id: $0.providerLabelId, name: $0.name) }
 
         // Labels applied to this message
         let appliedIds = Set(

@@ -165,9 +165,21 @@ extension SyncEngine {
                     if UserLabelStore.isExcludedKeyword(info.name) { continue }
 
                     let isSystem = UserLabelStore.isGmailSystemLabel(id: labelId, name: info.name)
-                    try UserLabel(id: labelId, accountId: account.id, name: info.name, isSystem: isSystem)
-                        .save(db) // upsert
-                    seenLabelIds.insert(labelId)
+                    let row = UserLabel(
+                        accountId: account.id, providerLabelId: labelId,
+                        name: info.name, isSystem: isSystem
+                    )
+                    try row.save(db) // upsert
+                    // 🚨 THE SWEEP BELOW COMPARES DB IDS, SO THIS MUST BE THE DB ID.
+                    // `existingLabelIds` is read from `userLabel.id`, which is the
+                    // account-prefixed surrogate (D10 / `IOS-LABEL-001`). Recording the
+                    // BARE `labelId` here would make `staleLabelIds` the whole existing
+                    // set on every single sync — i.e. delete every label row this account
+                    // has, and (via `messageUserLabel`'s `onDelete: .cascade`) every
+                    // association with it. This is the most dangerous consumer of the
+                    // surrogate, which is why the row is bound to a local and its own id
+                    // reused rather than the mint being repeated.
+                    seenLabelIds.insert(row.id)
                 }
 
                 // Remove user labels that no longer exist on server
@@ -1531,9 +1543,11 @@ extension SyncEngine {
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     // Insert user label associations
                     for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(header)
@@ -1668,9 +1682,11 @@ extension SyncEngine {
                     if let body = deferredBody { try body.insert(db) }
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(header)
@@ -1767,9 +1783,11 @@ extension SyncEngine {
                     try orphaned.update(db)
                     // Update user label associations for reclaimed orphan
                     for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: orphaned.id, userLabelId: labelId)
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: orphaned.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(orphaned)
@@ -1794,9 +1812,11 @@ extension SyncEngine {
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     // Insert user label associations
                     for labelId in info.userLabelIds {
-                        try UserLabel(id: labelId, accountId: accountId, name: labelId, isSystem: false)
-                            .insert(db, onConflict: .ignore)
-                        try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
                     newHeaders.append(header)

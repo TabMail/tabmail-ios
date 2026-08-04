@@ -17,24 +17,37 @@ struct UserLabelTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
         }
-        let fetched = try db.read { try UserLabel.fetchOne($0, key: "Label_1") }
+        // The primary key is the account-prefixed SURROGATE, not the provider's
+        // own label id (D10 / `IOS-LABEL-001`).
+        let fetched = try db.read { try UserLabel.fetchOne($0, key: "acc1:Label_1") }
         #expect(fetched != nil)
         #expect(fetched?.name == "Work")
         #expect(fetched?.accountId == "acc1")
+        #expect(fetched?.providerLabelId == "Label_1")
         #expect(fetched?.isSystem == false)
     }
 
-    @Test("UserLabel round-trip preserves all fields")
+    /// ⚠️ RE-SCOPED, NOT DELETED (D10 / `IOS-LABEL-001`). Its previous display name
+    /// was **"UserLabel round-trip preserves all fields"** and its previous body
+    /// asserted `fetched?.id == "sys_starred"` after constructing the row with
+    /// `id: "sys_starred"` — i.e. it ENCODED the defect, pinning the bare provider
+    /// label id as the primary key. That identity is exactly what made two accounts
+    /// sharing a label name share one row. The round-trip property it was really
+    /// after is preserved below; only the id it expects has changed, and the new
+    /// name says which id that is.
+    @Test("UserLabel round-trip preserves all fields under the surrogate id")
     func userLabelRoundTrip() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try db.write { db in
-            try UserLabel(id: "sys_starred", accountId: "acc1", name: "STARRED", isSystem: true).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "sys_starred", name: "STARRED", isSystem: true).insert(db)
         }
-        let fetched = try db.read { try UserLabel.fetchOne($0, key: "sys_starred") }
-        #expect(fetched?.id == "sys_starred")
+        let fetched = try db.read { try UserLabel.fetchOne($0, key: "acc1:sys_starred") }
+        #expect(fetched?.id == "acc1:sys_starred")
+        #expect(fetched?.providerLabelId == "sys_starred")
+        #expect(fetched?.accountId == "acc1")
         #expect(fetched?.name == "STARRED")
         #expect(fetched?.isSystem == true)
     }
@@ -44,13 +57,13 @@ struct UserLabelTests {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
         }
         // Upsert with new name
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work Updated", isSystem: false).save(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work Updated", isSystem: false).save(db)
         }
-        let fetched = try db.read { try UserLabel.fetchOne($0, key: "Label_1") }
+        let fetched = try db.read { try UserLabel.fetchOne($0, key: "acc1:Label_1") }
         #expect(fetched?.name == "Work Updated")
         // Should still be only 1 record
         let count = try db.read { try UserLabel.fetchCount($0) }
@@ -66,13 +79,13 @@ struct UserLabelTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db)
         }
         let rows = try db.read { try MessageUserLabel.fetchAll($0) }
         #expect(rows.count == 1)
         #expect(rows[0].messageId == header.id)
-        #expect(rows[0].userLabelId == "Label_1")
+        #expect(rows[0].userLabelId == "acc1:Label_1")
     }
 
     @Test("MessageUserLabel composite PK prevents duplicates")
@@ -82,12 +95,12 @@ struct UserLabelTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db)
         }
         // Second insert with onConflict: .ignore should not throw
         try db.write { db in
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db, onConflict: .ignore)
         }
         let count = try db.read { try MessageUserLabel.fetchCount($0) }
         #expect(count == 1)
@@ -100,10 +113,10 @@ struct UserLabelTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(id: "Label_2", accountId: "acc1", name: "Personal", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_2").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_2", name: "Personal", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_2").insert(db)
         }
         let rows = try db.read { db in
             try MessageUserLabel
@@ -127,8 +140,8 @@ struct UserLabelTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db)
         }
         // Delete message header
         try db.write { db in
@@ -148,12 +161,12 @@ struct UserLabelTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db)
         }
         // Delete label
         try db.write { db in
-            _ = try UserLabel.deleteAll(db, keys: ["Label_1"])
+            _ = try UserLabel.deleteAll(db, keys: ["acc1:Label_1"])
         }
         let joinCount = try db.read { try MessageUserLabel.fetchCount($0) }
         #expect(joinCount == 0)
@@ -166,8 +179,8 @@ struct UserLabelTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db)
         try db.write { db in
-            try UserLabel(id: "Label_1", accountId: "acc1", name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: header.id, userLabelId: "Label_1").insert(db)
+            try UserLabel(accountId: "acc1", providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: header.id, userLabelId: "acc1:Label_1").insert(db)
         }
         // Delete account
         try db.write { db in

@@ -849,18 +849,18 @@ struct InboxEndToEndInvariantTests {
         try await world.apply(.pushArrives, "mLabeledDurable", vm: vm, stageTerminal: stageTerminalRow)
         let labeledId = try await world.currentId(forKey: "mLabeledDurable")
         try await fixture.pool.writeWithoutTransaction { db in
-            try UserLabel(id: "label-x", accountId: fixture.accountId, name: "Filtered", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: labeledId, userLabelId: "label-x").insert(db)
+            try UserLabel(accountId: fixture.accountId, providerLabelId: "label-x", name: "Filtered", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: labeledId, userLabelId: "\(fixture.accountId):label-x").insert(db)
         }
         world.publishStagedOnly("mUnlabeledStaged")
 
-        vm.filterLabelIds = ["label-x"]
+        vm.filterLabelIds = ["\(fixture.accountId):label-x"]
         vm.resetMessages()
 
         #expect(vm.loadedMessages.count == 1, "expected exactly the labeled durable row to survive, got ids=\(vm.loadedMessages.map(\.id))")
         #expect(containsIdentity(vm, world, "mLabeledDurable"), "labeled durable row dropped by the active label filter — positive path failed")
         #expect(!containsIdentity(vm, world, "mUnlabeledStaged"), "staged (unlabeled) row leaked through an active label filter — negative path failed")
-        #expect(vm.loadedMessages.first?.userLabels.map(\.id) == ["label-x"], "userLabels not carried onto the composed durable row")
+        #expect(vm.loadedMessages.first?.userLabels.map(\.id) == ["\(fixture.accountId):label-x"], "userLabels not carried onto the composed durable row")
     }
 
     @Test("triageOrder — REAL durable rows sort by tagSortOrder asc then date desc through the real VM in .triage mode")

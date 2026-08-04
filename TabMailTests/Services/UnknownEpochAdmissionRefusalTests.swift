@@ -472,7 +472,7 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "801")
-        let label = UserLabel(id: "lbl-work", accountId: "acc1", name: "Work", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-work", name: "Work", isSystem: false)
         try await pool.writeWithoutTransaction { db in
             try label.insert(db)
             try MessageUserLabel(messageId: msg.id, userLabelId: label.id).insert(db)
@@ -548,7 +548,7 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "901")
-        let label = UserLabel(id: "lbl-work", accountId: "acc1", name: "Work", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-work", name: "Work", isSystem: false)
         try await pool.writeWithoutTransaction { db in
             try label.insert(db)
             try MessageUserLabel(messageId: msg.id, userLabelId: label.id).insert(db)
@@ -594,7 +594,7 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "902")
-        let label = UserLabel(id: "lbl-later", accountId: "acc1", name: "Later", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-later", name: "Later", isSystem: false)
         try await pool.writeWithoutTransaction { db in
             try label.insert(db)
             try MessageUserLabel(messageId: msg.id, userLabelId: label.id).insert(db)
@@ -651,8 +651,8 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "903")
-        let toggled = UserLabel(id: "lbl-toggled", accountId: "acc1", name: "Toggled", isSystem: false)
-        let arrivedLater = UserLabel(id: "lbl-arrived", accountId: "acc1", name: "Arrived", isSystem: false)
+        let toggled = UserLabel(accountId: "acc1", providerLabelId: "lbl-toggled", name: "Toggled", isSystem: false)
+        let arrivedLater = UserLabel(accountId: "acc1", providerLabelId: "lbl-arrived", name: "Arrived", isSystem: false)
         try await pool.writeWithoutTransaction { db in
             try toggled.insert(db)
             try arrivedLater.insert(db)
@@ -710,8 +710,8 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "904")
-        let removed = UserLabel(id: "lbl-removed", accountId: "acc1", name: "Removed", isSystem: false)
-        let arrivedLater = UserLabel(id: "lbl-row-arrived", accountId: "acc1", name: "RowArrived", isSystem: false)
+        let removed = UserLabel(accountId: "acc1", providerLabelId: "lbl-removed", name: "Removed", isSystem: false)
+        let arrivedLater = UserLabel(accountId: "acc1", providerLabelId: "lbl-row-arrived", name: "RowArrived", isSystem: false)
         try await pool.writeWithoutTransaction { db in
             try removed.insert(db)
             try arrivedLater.insert(db)
@@ -785,7 +785,7 @@ struct UnknownEpochAdmissionRefusalTests {
         // The message lives in Archive, NOT the inbox — so "the folder the row is
         // in" and "INBOX" are distinguishable, which is the whole point.
         let msg = try insertMessage(pool, messageId: "910", folderPath: "Archive")
-        let label = UserLabel(id: "lbl-receipts", accountId: "acc1", name: "Receipts", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-receipts", name: "Receipts", isSystem: false)
         try await pool.writeWithoutTransaction { db in try label.insert(db) }
 
         let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
@@ -834,7 +834,7 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "911", folderPath: "Archive")
-        let label = UserLabel(id: "lbl-vendor", accountId: "acc1", name: "Vendor", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-vendor", name: "Vendor", isSystem: false)
         try await pool.writeWithoutTransaction { db in try label.insert(db) }
 
         let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
@@ -872,7 +872,7 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "912")
-        let label = UserLabel(id: "lbl-ledger", accountId: "acc1", name: "Ledger", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-ledger", name: "Ledger", isSystem: false)
         try await pool.writeWithoutTransaction { db in try label.insert(db) }
 
         let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))
@@ -907,7 +907,7 @@ struct UnknownEpochAdmissionRefusalTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let msg = try insertMessage(pool, messageId: "912")
-        let label = UserLabel(id: "lbl-ledger", accountId: "acc1", name: "Ledger", isSystem: false)
+        let label = UserLabel(accountId: "acc1", providerLabelId: "lbl-ledger", name: "Ledger", isSystem: false)
         try await pool.writeWithoutTransaction { db in try label.insert(db) }
 
         let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: msg))

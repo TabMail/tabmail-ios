@@ -332,9 +332,11 @@ extension SyncEngine {
 
                                 // Insert user label associations
                                 for labelId in info.userLabelIds {
-                                    try UserLabel(id: labelId, accountId: account.id, name: labelId, isSystem: false)
-                                        .insert(db, onConflict: .ignore)
-                                    try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                                    let labelRow = UserLabel(accountId: account.id, providerLabelId: labelId, name: labelId, isSystem: false)
+                                    try labelRow.insert(db, onConflict: .ignore)
+                                    // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                                    // the bare provider value (D10 / `IOS-LABEL-001`).
+                                    try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                                         .insert(db, onConflict: .ignore)
                                 }
 
@@ -689,9 +691,11 @@ extension SyncEngine {
 
                             // Insert user label associations (Exchange: empty for now)
                             for labelId in info.userLabelIds {
-                                try UserLabel(id: labelId, accountId: account.id, name: labelId, isSystem: false)
-                                    .insert(db, onConflict: .ignore)
-                                try MessageUserLabel(messageId: header.id, userLabelId: labelId)
+                                let labelRow = UserLabel(accountId: account.id, providerLabelId: labelId, name: labelId, isSystem: false)
+                                try labelRow.insert(db, onConflict: .ignore)
+                                // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                                // the bare provider value (D10 / `IOS-LABEL-001`).
+                                try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                                     .insert(db, onConflict: .ignore)
                             }
 

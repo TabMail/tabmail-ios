@@ -440,9 +440,8 @@ struct FinishTheMoveLocallyTests {
         try await f.pool.write { db in
             try threaded.update(db)
             try ThreadUtils.insertMessageReferences(for: threaded, db: db)
-            try UserLabel(
-                id: "work", accountId: f.accountId, name: "Work", isSystem: false).insert(db)
-            try MessageUserLabel(messageId: threaded.id, userLabelId: "work").insert(db)
+            try UserLabel(accountId: f.accountId, providerLabelId: "work", name: "Work", isSystem: false).insert(db)
+            try MessageUserLabel(messageId: threaded.id, userLabelId: "\(f.accountId):work").insert(db)
         }
 
         await AccountManager.shared.move([threaded], to: "Archive")
@@ -473,7 +472,7 @@ struct FinishTheMoveLocallyTests {
             Set(references) == [parent, root],
             "the move silently destroyed this message's threading references: \(references)")
         #expect(
-            labels == ["work"],
+            labels == ["\(f.accountId):work"],
             "the move silently destroyed a label the USER applied — nothing can rebuild it: \(labels)")
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()

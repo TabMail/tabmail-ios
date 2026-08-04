@@ -2820,12 +2820,26 @@ enum NSEDataBridge {
         case "gmail":
             // Query userLabel for known non-system user labels on this
             // account. A single `IN` query covers all staged labelIds.
+            //
+            // 🚨 MATCHES AND RETURNS `providerLabelId`, NOT `id` (D10 /
+            // `IOS-LABEL-001`). `rawLabels` are the provider's own label ids
+            // straight off the push payload, and `userLabel.id` is now the
+            // account-prefixed surrogate — matching against it would find
+            // nothing and silently strip every Gmail user label from every
+            // NSE-delivered message. This function's contract, on every
+            // provider arm, is "bare provider label ids in, bare provider
+            // label ids out"; the caller re-mints the surrogate.
+            //
+            // A6: `providerLabelId` is unindexed, so this is a scan of
+            // `userLabel` rather than the previous primary-key probe. That
+            // table holds a user's labels — tens of rows, one small page —
+            // and an index to serve one NSE-merge lookup is not justified.
             guard !rawLabels.isEmpty else { return [] }
             let placeholders = rawLabels.map { _ in "?" }.joined(separator: ",")
             let args: [DatabaseValueConvertible] = [accountId] + rawLabels
             let known = try String.fetchAll(db, sql: """
-                SELECT id FROM userLabel
-                WHERE accountId = ? AND isSystem = 0 AND id IN (\(placeholders))
+                SELECT providerLabelId FROM userLabel
+                WHERE accountId = ? AND isSystem = 0 AND providerLabelId IN (\(placeholders))
                 """, arguments: StatementArguments(args))
             let knownSet = Set(known)
             return rawLabels.filter { knownSet.contains($0) }
@@ -3578,11 +3592,16 @@ enum NSEDataBridge {
                 accountId: msg.accountId, db: db
             )
             for labelId in userLabelIds {
-                try UserLabel(
-                    id: labelId, accountId: msg.accountId,
+                // `labelId` is the BARE provider value (`filterUserLabels`'
+                // contract); the deterministic initializer mints the
+                // account-prefixed surrogate the join FK needs (D10 /
+                // `IOS-LABEL-001`).
+                let labelRow = UserLabel(
+                    accountId: msg.accountId, providerLabelId: labelId,
                     name: labelId, isSystem: false
-                ).insert(db, onConflict: .ignore)
-                try MessageUserLabel(messageId: newHeaderId, userLabelId: labelId)
+                )
+                try labelRow.insert(db, onConflict: .ignore)
+                try MessageUserLabel(messageId: newHeaderId, userLabelId: labelRow.id)
                     .insert(db, onConflict: .ignore)
             }
         }

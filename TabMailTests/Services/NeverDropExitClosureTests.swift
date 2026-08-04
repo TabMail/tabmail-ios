@@ -353,14 +353,14 @@ struct NeverDropExitClosureTests {
         let storedHeader = header
         try await f.pool.writeWithoutTransaction { db in
             try storedHeader.insert(db)
-            try UserLabel(id: "urgent", accountId: f.accountId, name: "Urgent", isSystem: false)
+            try UserLabel(accountId: f.accountId, providerLabelId: "urgent", name: "Urgent", isSystem: false)
                 .insert(db)
         }
 
         let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: storedHeader))
         model.supportsRemoteUserLabels = true
         let applied = await model.applyLabel(
-            UserLabel(id: "urgent", accountId: f.accountId, name: "Urgent", isSystem: false))
+            UserLabel(accountId: f.accountId, providerLabelId: "urgent", name: "Urgent", isSystem: false))
         #expect(applied, "the gesture must be admitted on a provider that supports remote labels")
 
         // `applyLabel` drains inline; drain again so a requeue would still land.

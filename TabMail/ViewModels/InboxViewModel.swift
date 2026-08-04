@@ -2236,12 +2236,22 @@ final class InboxViewModel {
                 try MessageUserLabel
                     .filter(Column("messageId") == snapshot.id && Column("userLabelId") == label.id)
                     .deleteAll(db)
+                // 🚨 `providerLabelId`, NEVER `id` — THIS VALUE GOES ON THE WIRE.
+                // The drain hands `PendingOperation.userLabelId` straight to the
+                // provider as a raw argument (Gmail `removeLabelIds:`, IMAP
+                // `STORE -FLAGS (<keyword>)`), and `UserLabel.id` is the
+                // account-prefixed surrogate (D10 / `IOS-LABEL-001`). See
+                // `UserLabelMenuModel.applyLabel` for why a prefixed value is not
+                // merely a failure on Gmail but a SILENT drop: `"Invalid label"`
+                // is matched by `GmailProvider.isAuthoritativeActionRejection` as a
+                // provider-authoritative no-op, so the op leaves the queue as if
+                // it had been performed.
                 let op = PendingOperation(
                     type: .removeUserLabel,
                     messageIds: admission.providerIds,
                     accountId: message.accountId,
                     folderPath: message.folderPath,
-                    userLabelId: label.id,
+                    userLabelId: label.providerLabelId,
                     observedUidValidity: admission.observedUidValidity
                 )
                 try op.insert(db)
