@@ -140,7 +140,6 @@ private actor AsyncTestActionProvider {
         var server = try await ensureServer()
 
         if !actionInUse {
-            let idle = Date().timeIntervalSince(lastUsed ?? .distantPast)
             actionInUse = true
             lastUsed = Date()
 

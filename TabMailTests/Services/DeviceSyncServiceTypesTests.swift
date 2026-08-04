@@ -241,7 +241,7 @@ struct DeviceSyncErrorRedactionTests {
             domain: NSURLErrorDomain,
             code: NSURLErrorCancelled,
             userInfo: [
-                NSURLErrorFailingURLStringErrorKey: leakyURL,
+                NSURLErrorFailingURLErrorKey: URL(string: leakyURL)!,
                 NSLocalizedDescriptionKey: "cancelled \(leakyURL)",
             ]
         )

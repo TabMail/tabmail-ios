@@ -340,7 +340,7 @@ struct AccountManagerQueueIntegrationTests {
     func drainPatternAtomicClaim() throws {
         let db = try TestDatabase.make()
 
-        var op = PendingOperation(
+        let op = PendingOperation(
             type: .markRead,
             messageIds: ["msg-1"],
             accountId: "acc1",
@@ -433,7 +433,7 @@ struct AccountManagerQueueIntegrationTests {
         op1.status = PendingStatus.inFlight.rawValue
         var op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
         op2.status = PendingStatus.inFlight.rawValue
-        var op3 = PendingOperation(type: .markRead, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
+        let op3 = PendingOperation(type: .markRead, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
         // op3 stays queued
 
         try db.write { dbConn in
@@ -467,7 +467,7 @@ struct AccountManagerQueueIntegrationTests {
 
         var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         op1.status = PendingStatus.cancelled.rawValue
-        var op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
+        let op2 = PendingOperation(type: .move, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX", destinationPath: "Trash")
         // op2 stays queued
 
         try db.write { dbConn in

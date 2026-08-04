@@ -336,7 +336,7 @@ struct OutboxParallelDrainTests {
         }
 
         // Discard the failed message
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try OutboxMessage.deleteOne(dbConn, key: failedMsg.id)
         }
 
@@ -375,7 +375,7 @@ struct OutboxParallelDrainTests {
         }
 
         // Finalize — delete
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try OutboxMessage.deleteOne(dbConn, key: msgId)
         }
 
@@ -585,7 +585,7 @@ struct OutboxParallelDrainTests {
         #expect(messages.count == 1)
 
         // Between fetch and re-read, message is discarded by another thread
-        try db.write { try OutboxMessage.deleteOne($0, key: msg.id) }
+        _ = try db.write { try OutboxMessage.deleteOne($0, key: msg.id) }
 
         // Re-read (as drainOutbox does) — message is gone
         let reRead = try db.read { try OutboxMessage.fetchOne($0, key: msg.id) }

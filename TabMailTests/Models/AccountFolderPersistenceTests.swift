@@ -16,7 +16,7 @@ struct AccountFolderPersistenceTests {
     @Test("Account insert and fetch by primary key")
     func accountInsertAndFetch() throws {
         let db = try TestDatabase.make()
-        let account = try TestDatabase.insertAccount(db, id: "acc1", email: "user@test.com", provider: .gmail)
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@test.com", provider: .gmail)
 
         let fetched = try db.read { try Account.fetchOne($0, key: "acc1") }
         #expect(fetched != nil)
@@ -354,7 +354,7 @@ struct AccountFolderPersistenceTests {
     func folderEquatableCompares() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, id: "acc1")
-        var f1 = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let f1 = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         var f2 = f1
 
         // Same values → equal

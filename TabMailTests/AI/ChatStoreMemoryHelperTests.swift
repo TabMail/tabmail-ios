@@ -216,7 +216,7 @@ struct ChatStoreMemoryHelperTests {
 
         // Seed 5 chatHistory turns with ascending timestamps.
         for i in 1...5 {
-            try await MainActor.run {
+            _ = try await MainActor.run {
                 try insertHistoryTurn(pool, id: "t\(i)", timestamp: Double(i * 1000), sessionId: "s")
             }
         }
@@ -237,7 +237,7 @@ struct ChatStoreMemoryHelperTests {
         defer { Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) } }
 
         for i in 1...3 {
-            try await MainActor.run {
+            _ = try await MainActor.run {
                 try insertHistoryTurn(pool, id: "t\(i)", timestamp: Double(i * 1000), sessionId: "s")
             }
         }

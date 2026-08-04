@@ -333,7 +333,7 @@ struct NavigationStoreCascadeDeleteTests {
         let foldersBefore = try db.read { try Folder.fetchCount($0) }
         #expect(foldersBefore == 1)
 
-        try db.write { try Account.deleteAll($0) }
+        _ = try db.write { try Account.deleteAll($0) }
 
         let foldersAfter = try db.read { try Folder.fetchCount($0) }
         #expect(foldersAfter == 0)
@@ -349,7 +349,7 @@ struct NavigationStoreCascadeDeleteTests {
         let headersBefore = try db.read { try MessageHeader.fetchCount($0) }
         #expect(headersBefore == 1)
 
-        try db.write { try Account.deleteAll($0) }
+        _ = try db.write { try Account.deleteAll($0) }
 
         let headersAfter = try db.read { try MessageHeader.fetchCount($0) }
         #expect(headersAfter == 0)

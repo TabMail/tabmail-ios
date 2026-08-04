@@ -47,7 +47,7 @@ struct UserLabelSyncTests {
 
         // Simulate what backfill does: insert header + labels in same transaction
         try db.write { db in
-            var header = MessageHeader(
+            let header = MessageHeader(
                 messageId: "100", subject: "Test", from: "Sender",
                 fromAddress: "sender@test.com", to: "to@test.com",
                 date: Date(), snippet: "", folderId: "acc1:INBOX",
@@ -116,7 +116,7 @@ struct UserLabelSyncTests {
         try db.write { db in
             try MessageUserLabel(messageId: header.id, userLabelId: "L1")
                 .insert(db, onConflict: .ignore)
-            var op = PendingOperation(
+            let op = PendingOperation(
                 type: .addUserLabel,
                 messageIds: [header.stableId],
                 accountId: header.accountId,
@@ -155,7 +155,7 @@ struct UserLabelSyncTests {
             try MessageUserLabel
                 .filter(Column("messageId") == header.id && Column("userLabelId") == "L1")
                 .deleteAll(db)
-            var op = PendingOperation(
+            let op = PendingOperation(
                 type: .removeUserLabel,
                 messageIds: [header.stableId],
                 accountId: header.accountId,

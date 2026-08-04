@@ -723,8 +723,8 @@ struct CalDAVMergePatchTests {
         #expect(merged.contains("RRULE:FREQ=DAILY;COUNT=5"))
         // Still well-formed: one BEGIN/END pair, RRULE inside.
         let lines = merged.components(separatedBy: "\r\n")
-        let rruleIdx = try? #require(lines.firstIndex { $0.hasPrefix("RRULE:") })
-        let endIdx = try? #require(lines.firstIndex(of: "END:VEVENT"))
+        let rruleIdx = lines.firstIndex { $0.hasPrefix("RRULE:") }
+        let endIdx = lines.firstIndex(of: "END:VEVENT")
         if let r = rruleIdx, let e = endIdx { #expect(r < e) }
     }
 }

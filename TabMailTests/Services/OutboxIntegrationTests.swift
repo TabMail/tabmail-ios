@@ -863,7 +863,7 @@ struct OutboxOptimisticReplyFlagTests {
 
         // Simulate queueSend transaction: insert outbox + optimistic flag
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "Re: Test", inReplyTo: "<orig@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -886,7 +886,7 @@ struct OutboxOptimisticReplyFlagTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "200", rfc822MessageId: "<fwd@example.com>")
 
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "Fwd: Test", inReplyTo: "<fwd@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -930,7 +930,7 @@ struct OutboxOptimisticReplyFlagTests {
 
         // Simulate queueSend with no replyToHeaderId
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "New message"),
                 originalMessageHeaderId: nil,
@@ -952,7 +952,7 @@ struct OutboxOptimisticReplyFlagTests {
 
         // Insert outbox referencing a non-existent message header
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "Re: Ghost", inReplyTo: "<ghost@example.com>"),
                 originalMessageHeaderId: "nonexistent-id",
@@ -976,7 +976,7 @@ struct OutboxOptimisticReplyFlagTests {
 
         // First reply
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["a@test.com"], subject: "Re: Multi", inReplyTo: "<multi@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -987,7 +987,7 @@ struct OutboxOptimisticReplyFlagTests {
         }
         // Second reply to same message
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["b@test.com"], subject: "Re: Re: Multi", inReplyTo: "<multi@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -1012,7 +1012,7 @@ struct OutboxOptimisticReplyFlagTests {
 
         // Reply
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["a@test.com"], subject: "Re: Both", inReplyTo: "<both@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -1023,7 +1023,7 @@ struct OutboxOptimisticReplyFlagTests {
         }
         // Forward same message
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["b@test.com"], subject: "Fwd: Both", inReplyTo: "<both@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -1098,7 +1098,7 @@ struct OutboxOptimisticReplyFlagTests {
         // Simulate transaction failure after flag update but before commit
         do {
             try db.write { dbConn in
-                var outbox = OutboxMessage(
+                let outbox = OutboxMessage(
                     accountId: "acc1",
                     draft: DraftMessage(to: ["to@test.com"], subject: "Re: Rollback", inReplyTo: "<rollback@example.com>"),
                     originalMessageHeaderId: header.id,
@@ -1131,7 +1131,7 @@ struct OutboxOptimisticReplyFlagTests {
         #expect(header.actionTag == .reply)
 
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "Re: Tag", inReplyTo: "<tag@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -1161,7 +1161,7 @@ struct OutboxOptimisticReplyFlagTests {
         )
 
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "Re: Keep", inReplyTo: "<keep@example.com>"),
                 originalMessageHeaderId: header.id,
@@ -1194,7 +1194,7 @@ struct OutboxOptimisticReplyFlagTests {
         )
 
         try db.write { dbConn in
-            var outbox = OutboxMessage(
+            let outbox = OutboxMessage(
                 accountId: "acc1",
                 draft: DraftMessage(to: ["to@test.com"], subject: "Fwd: Tag", inReplyTo: "<fwdtag@example.com>"),
                 originalMessageHeaderId: header.id,

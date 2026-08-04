@@ -128,7 +128,7 @@ struct SyncPreSyncReclaimTests {
 
         var incoming = makeSyncHeader(accountId: "acct-o", messageId: "m-1", folderPath: "AQMk-FOLDER")
 
-        try db.write { db in
+        _ = try db.write { db in
             try reclaim(
                 existing: preSync, incoming: &incoming,
                 accountId: "acct-o", folderPath: "AQMk-FOLDER", db: db
@@ -164,7 +164,7 @@ struct SyncPreSyncReclaimTests {
         try db.write { db in try preSync.insert(db) }
 
         var incoming = makeSyncHeader(accountId: "acct-o", messageId: "m-2", folderPath: "AQMk-FOLDER")
-        try db.write { db in
+        _ = try db.write { db in
             try reclaim(
                 existing: preSync, incoming: &incoming,
                 accountId: "acct-o", folderPath: "AQMk-FOLDER", db: db
@@ -262,7 +262,7 @@ struct SyncPreSyncReclaimTests {
         // Sync uses a DIFFERENT folderPath (simulating drift — this test
         // guards the general case). Reclaim must move the cache row.
         var incoming = makeSyncHeader(accountId: "acct-o", messageId: "m-3", folderPath: "DIFF-FOLDER")
-        try db.write { db in
+        _ = try db.write { db in
             try reclaim(
                 existing: preSync, incoming: &incoming,
                 accountId: "acct-o", folderPath: "DIFF-FOLDER", db: db

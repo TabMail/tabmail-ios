@@ -61,7 +61,7 @@ struct ReadUnreadPersistenceTests {
             acc.id = "acc1"
             try acc.insert(db)
 
-            var folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
             try folder.insert(db)
         }
         let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")

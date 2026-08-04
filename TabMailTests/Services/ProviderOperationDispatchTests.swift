@@ -62,7 +62,7 @@ struct OperationTypeDispatchTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.contains { $0.hasPrefix("markRead(") })
@@ -83,7 +83,7 @@ struct OperationTypeDispatchTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let unreads = await mock.markedUnreadIds
         #expect(unreads.count == 1)
@@ -102,7 +102,7 @@ struct OperationTypeDispatchTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let flagged = await mock.markedFlaggedIds
         #expect(flagged.count == 1)
@@ -122,7 +122,7 @@ struct OperationTypeDispatchTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let flagged = await mock.markedFlaggedIds
         #expect(flagged.count == 1)
@@ -143,7 +143,7 @@ struct OperationTypeDispatchTests {
             destinationPath: "Archive"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let moved = await mock.movedIds
         #expect(moved.count == 1)
@@ -163,7 +163,7 @@ struct OperationTypeDispatchTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "Legacy archive should not call any provider method")
@@ -180,7 +180,7 @@ struct OperationTypeDispatchTests {
             folderPath: "INBOX"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let log = await mock.callLog
         #expect(log.isEmpty, "Legacy delete should not call any provider method")
@@ -712,7 +712,7 @@ struct MoveEdgeCaseTests {
             destinationPath: "Archive"
         )
 
-        try await AccountManager.shared.executeOperation(op, provider: mock)
+        _ = try await AccountManager.shared.executeOperation(op, provider: mock)
 
         let moved = await mock.movedIds
         #expect(moved.isEmpty, "Self-move should be a no-op")
@@ -794,7 +794,7 @@ struct PendingOperationDispatchPersistenceTests {
         try db.write { try op.insert($0) }
 
         // Delete the account — PendingOperation has no FK to account table
-        try db.write { try Account.deleteAll($0, keys: ["acc1"]) }
+        _ = try db.write { try Account.deleteAll($0, keys: ["acc1"]) }
 
         // PendingOperation references accountId as plain text, not FK — survives deletion
         let remaining = try db.read { try PendingOperation.fetchAll($0) }

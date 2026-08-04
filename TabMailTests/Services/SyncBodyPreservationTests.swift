@@ -794,7 +794,7 @@ struct ActiveBodyQueueRaceTests {
 
         // Simulate: header exists when enqueued, but deleted before body write
         // (UID remap or stale detection happened)
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try MessageHeader.deleteOne(dbConn, key: headerId)
         }
 
@@ -838,7 +838,7 @@ struct OptimisticMoveBodyTests {
 
         // Simulate optimistic move (UPDATE folderId, folderPath, isInInbox)
         // This is how optimisticMoveToFolder works — it does NOT delete+re-insert
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try MessageHeader.filter(Column("id") == headerId).updateAll(dbConn,
                 Column("folderId").set(to: "acc1:Archive"),
                 Column("folderPath").set(to: "Archive"),
@@ -882,7 +882,7 @@ struct OptimisticMoveBodyTests {
         }
 
         // 2. Optimistic move to Archive (UPDATE, same PK)
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try MessageHeader.filter(Column("id") == "acc1:INBOX:inbox-uid-10").updateAll(dbConn,
                 Column("folderId").set(to: "acc1:Archive"),
                 Column("folderPath").set(to: "Archive"),

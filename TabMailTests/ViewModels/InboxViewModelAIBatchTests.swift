@@ -46,7 +46,7 @@ struct InboxViewModelAIBatchTests {
 
         let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         try pool.writeWithoutTransaction { db in
-            var f = folder
+            let f = folder
             try f.insert(db)
         }
 

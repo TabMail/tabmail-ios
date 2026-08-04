@@ -41,8 +41,8 @@ struct InboxViewModelInsertUndoneTests {
             acc.id = "acc1"
             try acc.insert(db)
 
-            var inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-            var archive = Folder(name: "Archive", path: "[Gmail]/All Mail", role: .archive, accountId: "acc1")
+            let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            let archive = Folder(name: "Archive", path: "[Gmail]/All Mail", role: .archive, accountId: "acc1")
             try inbox.insert(db)
             try archive.insert(db)
         }

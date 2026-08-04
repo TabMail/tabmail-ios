@@ -15,6 +15,7 @@ import UIKit
 /// - If the target is above the visible area, scroll up (decrease y) just enough.
 /// - If the target is below the visible area, scroll down just enough.
 /// - The resulting offset must stay within [-insets.top, contentSize.height + insets.bottom - boundsHeight].
+@MainActor
 @Suite("CaretAwareUIScrollView — contentOffsetThatShows")
 struct CaretAwareScrollViewTests {
 
@@ -244,6 +245,7 @@ struct CaretAwareRuntimeContractTests {
 
 /// Tests for the superview-walking helper used by `DisableAutoScrollToVisible`
 /// to locate the enclosing SwiftUI ScrollView's underlying UIScrollView.
+@MainActor
 @Suite("UIView.enclosingUIScrollView")
 struct EnclosingUIScrollViewTests {
 
@@ -448,7 +450,7 @@ struct CaretAwareDoesNotGateInputTests {
             window.isHidden = true
         }
 
-        let classBefore = object_getClass(textView)
+        let classBefore: AnyClass? = object_getClass(textView)
         // Off-screen rect, smaller than the visible area, so the early-return
         // path (focusRect already inside visibleRect) is bypassed AND the
         // caret-substitution path doesn't kick in. This is the exact code path
@@ -457,7 +459,7 @@ struct CaretAwareDoesNotGateInputTests {
             CGRect(x: 0, y: 800, width: 100, height: 20),
             animated: false
         )
-        let classAfter = object_getClass(textView)
+        let classAfter: AnyClass? = object_getClass(textView)
 
         #expect(
             classBefore == classAfter,

@@ -104,7 +104,7 @@ struct FolderEqualityTests {
     // so the icons/labels wouldn't update even though the DB was correct.
     @Test("Different role makes them unequal")
     func differentRole() {
-        var f1 = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
+        let f1 = Folder(name: "Trash", path: "Trash", role: .trash, accountId: "acc1")
         var f2 = Folder(name: "Trash", path: "Trash", role: .custom, accountId: "acc1")
         #expect(f1 != f2)
         f2.role = .trash

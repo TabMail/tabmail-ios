@@ -206,7 +206,7 @@ struct PendingOperationPersistenceTests {
     func filterByStatus() throws {
         let db = try TestDatabase.make()
 
-        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
         op2.status = PendingStatus.inFlight.rawValue
         var op3 = PendingOperation(type: .markFlagged, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")
@@ -395,7 +395,7 @@ struct PendingOperationPersistenceTests {
     func deleteAllByStatus() throws {
         let db = try TestDatabase.make()
 
-        var op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
+        let op1 = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: "acc1", folderPath: "INBOX")
         var op2 = PendingOperation(type: .markUnread, messageIds: ["msg-2"], accountId: "acc1", folderPath: "INBOX")
         op2.status = PendingStatus.cancelled.rawValue
         var op3 = PendingOperation(type: .markFlagged, messageIds: ["msg-3"], accountId: "acc1", folderPath: "INBOX")

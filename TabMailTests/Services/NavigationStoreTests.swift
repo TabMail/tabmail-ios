@@ -179,7 +179,7 @@ struct NavigationStoreRefreshTests {
 
     private static func insertFolders(_ db: Database, _ specs: [(String, String, FolderRole)], accountId: String) throws {
         for (name, path, role) in specs {
-            var f = Folder(name: name, path: path, role: role, accountId: accountId)
+            let f = Folder(name: name, path: path, role: role, accountId: accountId)
             try f.insert(db)
         }
     }

@@ -292,7 +292,7 @@ struct ProviderNativeActionAdmissionTests {
         try insert([source], into: f.pool)
 
         await AccountManager.shared.move([source], to: "Archive")
-        try await f.pool.writeWithoutTransaction { db in try PendingOperation.deleteAll(db) }
+        _ = try await f.pool.writeWithoutTransaction { db in try PendingOperation.deleteAll(db) }
         let moved = try #require(try stored(source, in: f.pool))
         #expect(moved.folderPath == "Archive")
         #expect(moved.observedUidValidity == nil)

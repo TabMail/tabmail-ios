@@ -566,7 +566,6 @@ struct ReplyTemplateEdgeCaseTests {
 
     @Test("Decoder defaults enabled to true when missing")
     func decoderDefaultEnabled() throws {
-        let json = #"{"id": "x", "name": "Y", "enabled": null}"#
         // enabled is Bool?, decodeIfPresent returns nil for null → defaults to true
         // Actually this will throw because Bool can't decode null — test with missing key
         let json2 = #"{"id": "x", "name": "Y"}"#

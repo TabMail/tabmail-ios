@@ -1096,17 +1096,6 @@ struct ChatIdTranslatorRemapTests {
     func toolOutputTranslation() async {
         let translator = ChatIdTranslator.createIsolated()
 
-        // Simulate inbox_read tool output with real IDs
-        let toolOutput = """
-        unique_id: acc1:INBOX:msg1
-        subject: Budget Review
-        from: alice@company.com
-
-        unique_id: acc1:INBOX:msg2
-        subject: Meeting Notes
-        from: bob@company.com
-        """
-
         // The tool output has real IDs in unique_id fields
         // But unique_id is handled by processToolOutputForLLM pattern (event_id etc.)
         // For email IDs, inbox_read tool already outputs numeric IDs (pre-translated)
@@ -1695,7 +1684,7 @@ struct ServerDraftComposeRoutingTests {
         try TestDatabase.insertAccount(db, id: "acc1")
         try TestDatabase.insertFolder(db, name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
 
-        var draft = MessageHeader(
+        let draft = MessageHeader(
             messageId: "draft5", subject: "New Message",
             from: "me@example.com", fromAddress: "me@example.com",
             to: "alice@company.com, Bob <bob@company.com>", date: Date(), snippet: "",

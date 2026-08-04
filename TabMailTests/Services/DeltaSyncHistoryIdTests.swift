@@ -222,7 +222,7 @@ struct DeltaSyncIdempotencyTests {
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
 
         // First insert
-        let header = try TestDatabase.insertMessageHeader(
+        try TestDatabase.insertMessageHeader(
             db, messageId: "msg1", subject: "Original", accountId: "acc1", isRead: false
         )
 

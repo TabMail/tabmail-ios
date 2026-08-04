@@ -107,7 +107,7 @@ struct SyncDeltaOrphanReclaimGuardTests {
             folderPath: "INBOX",
             rfc822MessageId: "orphan@example.com"
         )
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try MessageHeader.filter(Column("id") == pk).updateAll(
                 dbConn,
                 Column("folderId").set(to: "acc1:Archive"),

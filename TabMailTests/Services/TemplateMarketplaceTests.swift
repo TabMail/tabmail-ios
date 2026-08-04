@@ -222,9 +222,6 @@ struct TemplateMarketplaceCodableRoundTripTests {
 
     @Test("DownloadedTemplate encode-decode round-trip")
     func downloadedTemplateRoundTrip() throws {
-        let original = TemplateMarketplaceClient.DownloadedTemplate(
-            id: "dl-1", name: "Test", instructions: ["x"], exampleReply: "Hi", enabled: true
-        )
         // DownloadedTemplate is not directly constructible via init in actor context,
         // but we can test via JSON round-trip
         let json = """

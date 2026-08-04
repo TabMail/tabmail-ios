@@ -102,7 +102,7 @@ struct EmlParsingTests {
     @Test("parseNestedSection / nestedSection round-trip")
     func compoundSectionRoundTrip() {
         let encoded = EmlParsing.nestedSection(parent: "parent-att-id", index: 3)
-        let decoded = try? #require(EmlParsing.parseNestedSection(encoded))
+        let decoded = EmlParsing.parseNestedSection(encoded)
         #expect(decoded?.parent == "parent-att-id")
         #expect(decoded?.index == 3)
 

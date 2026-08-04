@@ -270,7 +270,7 @@ struct FolderSyncDeletionEdgeCaseTests {
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc2")
 
         // Delete all acc1 folders
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try Folder.filter(Column("accountId") == "acc1").deleteAll(dbConn)
         }
 
@@ -293,7 +293,7 @@ struct FolderSyncDeletionEdgeCaseTests {
         try db.write { try folder.update($0) }
 
         // Delete the folder
-        try db.write { dbConn in
+        _ = try db.write { dbConn in
             try Folder.filter(Column("id") == "acc1:Projects").deleteAll(dbConn)
         }
 

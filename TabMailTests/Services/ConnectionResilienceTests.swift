@@ -92,7 +92,6 @@ struct MidSyncRecoveryTests {
     @Test("Connection error during folder sync triggers disconnect-reconnect-retry sequence")
     func connectionErrorTriggersReconnect() async throws {
         // First fetchMessages throws connection error, second succeeds
-        var callCount = 0
         // Configure: first call throws, then clear for retry
         await provider.setFetchMessagesThrows(ProviderError.notConnected)
 

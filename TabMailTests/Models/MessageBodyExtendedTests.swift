@@ -427,7 +427,7 @@ struct MessageBodyPersistenceTests {
         let body = MessageBody( contentKey: ContentKey(rawValue: "acc1:INBOX:msg4"), htmlContent: "<p>Delete me</p>")
         try db.write { try body.insert($0) }
 
-        try db.write { try body.delete($0) }
+        _ = try db.write { try body.delete($0) }
 
         let fetched = try db.read { try MessageBody.fetchOne($0, key: "acc1:INBOX:msg4") }
         #expect(fetched == nil)
