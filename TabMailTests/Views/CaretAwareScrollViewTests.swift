@@ -321,6 +321,32 @@ struct EnclosingUIScrollViewTests {
 /// Serialized because this suite mutates the class-level
 /// `CaretAwareUIScrollView.currentKeyboardFrame` static, which is shared
 /// across all instances.
+///
+/// # WINDOW-DEPRECATION NOTE (`IOS-TEST-004`, the 9th warning pair)
+///
+/// `UIWindow.init(frame:)` is deprecated in iOS 26 in favour of
+/// `init(windowScene:)`, and this target's deployment target is 26.0, so every
+/// use warns. There is no test-safe replacement: `UIWindow()` carries the
+/// identical `API_DEPRECATED(..., ios(2.0, 26.0))` attribute, and
+/// `init(windowScene:)` requires a live `UIWindowScene` that a unit test has no
+/// guaranteed access to — obtaining one would change what these tests construct,
+/// which is the thing under test.
+///
+/// So the diagnostic is suppressed **locally and by declaration**, never by a
+/// project-wide flag (Swift has no per-group `-Wno`; `-suppress-warnings` would
+/// hide every other warning in the file, and warnings are errors here). Swift
+/// does not diagnose a deprecated API used from a context that is itself
+/// deprecated at the same version, so the `@available(iOS, deprecated: 26.0)`
+/// below marks exactly the declarations that participate in constructing the
+/// window and nothing else — the helper, and each `@Test` that calls it. Every
+/// other declaration in this file is still fully checked.
+///
+/// ⚠️ **These annotations do NOT mean the tests are obsolete.** They are
+/// suppression scope, and they must be removed the moment a non-deprecated
+/// window construction becomes available to a unit test. A suite-level
+/// annotation was rejected: Swift Testing refuses `@Suite`/`@Test` on a
+/// declaration marked `@available(..., deprecated:)`, and it would also silence
+/// unrelated future deprecations across the whole suite.
 @MainActor
 @Suite("CaretAwareUIScrollView — visibleAreaAboveKeyboard", .serialized)
 struct VisibleAreaAboveKeyboardTests {
@@ -328,6 +354,9 @@ struct VisibleAreaAboveKeyboardTests {
     /// Builds a scroll view hosted in a window, at a specific screen position.
     /// The window and scroll view are returned so the caller can keep them
     /// alive for the duration of a single test.
+    ///
+    /// Deprecation-suppression scope only — see the WINDOW-DEPRECATION NOTE above.
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     private func makeScrollViewInWindow(
         scrollViewFrame: CGRect,
         windowFrame: CGRect = CGRect(x: 0, y: 0, width: 400, height: 800)
@@ -338,6 +367,7 @@ struct VisibleAreaAboveKeyboardTests {
         return (window, scroll)
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("Returns full bounds minus insets when keyboard frame is .zero")
     func noKeyboardReturnsFullBounds() {
         CaretAwareUIScrollView.currentKeyboardFrame = .zero
@@ -362,6 +392,7 @@ struct VisibleAreaAboveKeyboardTests {
         CaretAwareUIScrollView.currentKeyboardFrame = .zero
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("Returns full bounds when the keyboard does not intersect the scroll view")
     func keyboardBelowScrollViewReturnsFullBounds() {
         // Scroll view is at window y=0..400. Keyboard is at window y=600..900
@@ -376,6 +407,7 @@ struct VisibleAreaAboveKeyboardTests {
         CaretAwareUIScrollView.currentKeyboardFrame = .zero
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("Shrinks visible rect to end at keyboard top when keyboard overlaps bottom")
     func keyboardOverlappingBottomShrinksVisible() {
         // Scroll view: window y=0..600. Keyboard: y=400..800 (overlaps bottom 200pt).
@@ -392,6 +424,7 @@ struct VisibleAreaAboveKeyboardTests {
         CaretAwareUIScrollView.currentKeyboardFrame = .zero
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("Visible rect is unaffected when keyboard is entirely above the scroll view")
     func keyboardAboveScrollViewReturnsFullBounds() {
         // Scroll view at window y=400..700. Keyboard at y=0..300 (entirely above).
@@ -426,6 +459,11 @@ struct CaretAwareDoesNotGateInputTests {
     /// in a key window, a UITextView taller than the scroll view as its
     /// child, and the text view as first responder. Returns everything so
     /// the caller can keep it alive for the duration of one test.
+    ///
+    /// Deprecation-suppression scope only — see the WINDOW-DEPRECATION NOTE on
+    /// `VisibleAreaAboveKeyboardTests` above for why `UIWindow.init(frame:)` has no
+    /// test-safe replacement and why the scope is per-declaration.
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     private func makeFirstResponderTextView()
         -> (UIWindow, CaretAwareUIScrollView, UITextView)
     {
@@ -442,6 +480,7 @@ struct CaretAwareDoesNotGateInputTests {
         return (window, scroll, textView)
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("scrollRectToVisible does not swap the focused UITextView's class")
     func doesNotSwapTextViewClass() {
         let (window, scroll, textView) = makeFirstResponderTextView()
@@ -467,6 +506,7 @@ struct CaretAwareDoesNotGateInputTests {
         )
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("Text input lands immediately after a scrollRectToVisible call")
     func textInputSurvivesScrollEvent() {
         let (window, scroll, textView) = makeFirstResponderTextView()
@@ -492,6 +532,7 @@ struct CaretAwareDoesNotGateInputTests {
         )
     }
 
+    @available(iOS, deprecated: 26.0, message: "Suppression scope for UIWindow.init(frame:) — see WINDOW-DEPRECATION NOTE. Not obsolete.")
     @Test("deleteBackward lands immediately after a scrollRectToVisible call")
     func deleteBackwardSurvivesScrollEvent() {
         let (window, scroll, textView) = makeFirstResponderTextView()

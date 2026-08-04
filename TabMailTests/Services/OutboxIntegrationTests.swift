@@ -945,26 +945,69 @@ struct OutboxOptimisticReplyFlagTests {
         #expect(updated?.isForwarded == false)
     }
 
-    @Test("Original message not found — no crash")
+    /// ⚠️ RE-SCOPED (`IOS-TEST-004`). **Previous display name: *"Original message not
+    /// found — no crash"*.** That name was the honest description of a test that
+    /// asserted nothing: the body contained **zero `#expect`s**, it named
+    /// `resolveOriginalMessage` only in a comment while hand-writing the raw SQL
+    /// itself, it read `SELECT changes()` **before** the `UPDATE` it was meant to
+    /// measure (the unused-`count` warning the compiler raised here), and it ended
+    /// with *"If we reach here, no crash — test passes"* — it could fail only by
+    /// throwing. "Does not crash" is not the property; **"mutates nothing"** is.
+    ///
+    /// It now drives the real production completion path,
+    /// `AccountManager.deleteCompletedSendAtomic`, whose FIRST act on a reply is
+    /// `resolveOriginalMessage(originalId:inReplyTo:accountId:db:)` — the function
+    /// the old body only mentioned. With an `originalMessageHeaderId` that names no
+    /// row, that resolve returns nil and the whole flag/tag block is skipped. The
+    /// assertions are the END STATE, not the mechanism: no message row anywhere is
+    /// touched, no durable `.markReplied` / `.setTag` op is queued, the disposition
+    /// reports no reply-detect target, and the completion still cleans up its own
+    /// outbox row rather than stranding it (Outbox rule 3 — `sentAt` is stamped, so
+    /// this row must not survive to be re-sent).
+    ///
+    /// The bystander header carries the SAME `inReplyTo` RFC id the outbox names, so
+    /// a resolver that ever fell back to an RFC search instead of the provider key
+    /// would land on it and this test would go red — which is `IOS-IMAP-002`'s
+    /// banned mechanism, pinned here as an end state.
+    @Test("A completion whose original cannot be resolved mutates no message row and queues no op")
     func originalNotFoundIsNoOp() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let bystander = try TestDatabase.insertMessageHeader(
+            db, messageId: "700", rfc822MessageId: "<ghost@example.com>")
 
-        // Insert outbox referencing a non-existent message header
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Re: Ghost", inReplyTo: "<ghost@example.com>"),
-                originalMessageHeaderId: "nonexistent-id",
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            // resolveOriginalMessage would return nil — UPDATE with nonexistent id is a no-op
-            let count = try Int.fetchOne(dbConn, sql: "SELECT changes()")
-            // No rows updated, no error
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: ["nonexistent-id"])
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(to: ["to@test.com"], subject: "Re: Ghost", inReplyTo: "<ghost@example.com>"),
+            originalMessageHeaderId: "nonexistent-id",
+            isForward: false
+        )
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        try db.write { try seeded.insert($0) }
+
+        let disposition = try db.write { dbConn in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
         }
-        // If we reach here, no crash — test passes
+
+        // Nothing was resolved, so nothing downstream of the resolve may have run.
+        #expect(disposition.replyDetectHeaderId == nil)
+
+        let after = try db.read { try MessageHeader.fetchOne($0, key: bystander.id) }
+        #expect(after?.isReplied == false)
+        #expect(after?.isForwarded == false)
+        #expect(after?.actionTag == nil)
+
+        let ops = try db.read { try PendingOperation.fetchAll($0) }
+        #expect(ops.isEmpty, "an unresolvable original may not produce a durable gesture: \(ops.map(\.type))")
+
+        // The completion still finishes: the row is gone, not stranded at `.sending`
+        // with `sentAt` set, which is the double-send shape Outbox rule 3 forbids.
+        let remaining = try db.read { try OutboxMessage.fetchOne($0, key: seeded.id) }
+        #expect(remaining == nil)
     }
 
     @Test("Multiple replies to same message — idempotent flag")

@@ -1132,10 +1132,25 @@ struct ICSBuilderBuildInvitationBodyCoverageTests {
             attendees: []
         )
         let html = ICSBuilder.buildInvitationBody(spec)
-        // Empty description should not produce a <p> tag
+        // ⚠️ `IOS-TEST-004` recorded this test as vacuous and then RETRACTED that:
+        // the `#expect` below calls production `buildInvitationBody` and genuinely
+        // fails if an empty-description paragraph is emitted between the When
+        // paragraph and the styled footer. Only `descCount` was defective — it was
+        // bound and never asserted (the unused-binding warning the compiler raised
+        // here), so the count half of the claim was a comment.
+        //
+        // Both assertions are kept because they fail on DIFFERENT defects:
+        //  - the adjacency check catches an empty `<p></p>` emitted between the two
+        //    real paragraphs, which is where the description is built;
+        //  - the count check catches a description paragraph emitted ANYWHERE else
+        //    in the body (after the footer, say), which adjacency cannot see.
+        // `components(separatedBy:)` yields N+1 parts for N separators, so the two
+        // expected paragraphs — When, and "Sent via TabMail" — give 3 components.
         let descCount = html.components(separatedBy: "</p>").count
-        // Only "Sent via TabMail" paragraph + the When paragraph
         #expect(!html.contains("</p><p>"))
+        #expect(
+            descCount == 3,
+            "expected exactly the When + footer paragraphs, got \(descCount - 1) paragraph(s): \(html)")
     }
 
     @Test("buildInvitationBody includes Sent via TabMail footer")

@@ -159,34 +159,67 @@ struct MessageHeaderInfoToMessageHeaderInsertTests {
         #expect(h.isInInbox == true)
     }
 
+    /// ⚠️ RE-SCOPED (`IOS-TEST-004`). **Previous display name: *"Action tags are only
+    /// applied for inbox messages"*** — kept, because it is the right claim; the body
+    /// was what did not meet it. It bound `let isInInbox = false` and then branched on
+    /// `if isInInbox`, so the tag-applying arm was unreachable **by construction**
+    /// (that is the source of its `will never be executed` diagnostic) and the whole
+    /// test degenerated to "a header inserted with no tag has no tag". A constant is
+    /// not the rule; it is a restatement of the answer.
+    ///
+    /// It is now TWO-SIDED and derives the gate the way production derives it —
+    /// `SyncEngineFullSync`'s `let isInInbox = folder.role == .inbox`, read off the
+    /// real `Folder` row this test inserted, feeding the same `if isInInbox` guard
+    /// that wraps `header.actionTag = info.actionTag`. The inbox cell makes that arm
+    /// execute (so the archive cell's `nil` is a refusal, not an absence), and the
+    /// archive cell pins the sentinel `tagSortOrder` 99 that `sweepStaleActionTags`
+    /// also restores.
     @Test("Action tags are only applied for inbox messages")
     func actionTagsOnlyForInbox() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        let archive = try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        let inbox = try TestDatabase.insertFolder(db, name: "Inbox", path: "INBOX", role: .inbox)
 
-        let isInInbox = false
-        var header = MessageHeader(
-            messageId: "100",
-            subject: "Test",
-            from: "Alice",
-            fromAddress: "alice@example.com",
-            to: "bob@example.com",
-            date: Date(),
-            snippet: "test",
-            folderId: "acc1:Archive",
-            accountId: "acc1",
-            folderPath: "Archive",
-            isInInbox: isInInbox
-        )
-        // Simulate the sync pattern: only apply actionTag if isInInbox
-        if isInInbox {
-            header.actionTag = .archive
-            header.tagSortOrder = ActionTag.archive.sortOrder
+        func insertTagged(into folder: Folder, messageId: String) throws -> MessageHeader {
+            // The production derivation, not a literal: inbox membership is a
+            // property of the FOLDER's role (`SyncEngineFullSync`).
+            let isInInbox = folder.role == .inbox
+            var header = MessageHeader(
+                messageId: messageId,
+                subject: "Test",
+                from: "Alice",
+                fromAddress: "alice@example.com",
+                to: "bob@example.com",
+                date: Date(),
+                snippet: "test",
+                folderId: folder.id,
+                accountId: "acc1",
+                folderPath: folder.path,
+                isInInbox: isInInbox
+            )
+            // The sync pattern under test: only apply actionTag if isInInbox.
+            if isInInbox {
+                header.actionTag = .archive
+                header.tagSortOrder = ActionTag.archive.sortOrder
+            }
+            try db.write { try header.insert($0) }
+            return header
         }
-        try db.write { try header.insert($0) }
 
-        let fetched = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        let archived = try insertTagged(into: archive, messageId: "100")
+        let inboxed = try insertTagged(into: inbox, messageId: "101")
+
+        // NON-VACUITY — the tag-applying arm is reachable and does run, so the
+        // archive row's `nil` below is the gate refusing rather than the branch
+        // being dead code.
+        let inboxFetched = try db.read { try MessageHeader.fetchOne($0, key: inboxed.id) }
+        #expect(inboxFetched?.isInInbox == true)
+        #expect(inboxFetched?.actionTag == .archive)
+        #expect(inboxFetched?.tagSortOrder == ActionTag.archive.sortOrder)
+
+        let fetched = try db.read { try MessageHeader.fetchOne($0, key: archived.id) }
+        #expect(fetched?.isInInbox == false)
         #expect(fetched?.actionTag == nil)
         #expect(fetched?.tagSortOrder == 99)
     }

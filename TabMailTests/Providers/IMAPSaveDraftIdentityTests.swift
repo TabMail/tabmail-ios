@@ -168,7 +168,18 @@ struct IMAPSaveDraftIdentityTests {
         #expect(!server.recordedCommands().contains { $0.contains("UID SEARCH") })
     }
 
-    @Test("Non-UIDPLUS APPEND with duplicate exact matches returns unaddressable")
+    /// ⚠️ RE-SCOPED (`IOS-TEST-005`). **Previous display name: *"Non-UIDPLUS APPEND
+    /// with duplicate exact matches returns unaddressable"*.** That name named
+    /// duplicate-match CARDINALITY as the operative condition, which stopped being
+    /// true at B1: absence of `APPENDUID` alone now produces `.unaddressable`, and
+    /// the match count no longer participates in the decision at all. The body has
+    /// carried a comment saying exactly that since B1; the display name did not, and
+    /// a name is what a later reader searches and cites. Same class as
+    /// `IOS-ROUND3-D5` and `IOS-TEST-004` — a name claiming more than its assertions
+    /// check. The sibling immediately above,
+    /// `noAppendUidRefusesTheUniqueExactMatch`, is the one-match cell of the same
+    /// closure; this is the duplicate-sibling cell.
+    @Test("Without APPENDUID no address is minted, and duplicate exact matches do not change that")
     func nonUidPlusDuplicateExactMatch() async throws {
         let fresh = "fresh-\(UUID().uuidString)@example.com"
         let server = FakeIMAPServer(

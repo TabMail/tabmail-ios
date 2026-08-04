@@ -19,12 +19,24 @@ import Testing
 /// These tests drive the durable state directly through the existing claim
 /// seam. They intentionally do not involve RootView, app-launch reconciliation,
 /// notifications, sleeps, or a copied drain implementation.
+///
+/// ⚠️ RENAMED (`IOS-TEST-002`, second half). **Previous type name:
+/// `OutboxStrandedClaimXfailTests`; previous file name:
+/// `OutboxStrandedClaimXfailTests.swift`.** "Xfail" announces an
+/// expected-failure test, and this file has never contained one — three `@Test`s,
+/// no `withKnownIssue` anywhere in it, then or now. The target's single expected
+/// failure lives in another file entirely, so a reader who came here looking for
+/// it (or who cited this suite as evidence that the stranded-claim window is a
+/// KNOWN failure rather than a FIXED one) was misled by the name alone. No test
+/// was added, removed, renamed or re-scoped: only the misleading type and file
+/// name changed. The `@Suite` display name — "Outbox post-claim provider loss" —
+/// was already accurate and is unchanged.
 @Suite(
     "Outbox post-claim provider loss",
     .serialized,
     .processGlobalState
 )
-struct OutboxStrandedClaimXfailTests {
+struct OutboxStrandedClaimTests {
     private func makeTestDB(accountId: String) throws -> (
         pool: DatabasePool,
         directory: URL,

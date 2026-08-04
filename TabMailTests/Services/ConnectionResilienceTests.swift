@@ -464,31 +464,70 @@ struct BackfillConnectionBackoffTests {
         #expect(log.count == 3)
     }
 
-    @Test("Success after failure resets consecutive failure count")
+    /// ⚠️ RE-SCOPED (`IOS-TEST-004`). **Previous display name: *"Success after
+    /// failure resets consecutive failure count"*.** That name claimed production
+    /// coverage the body did not have. The old body walked a literal `[Error?]`
+    /// array, incremented a LOCAL counter from it and asserted its own arithmetic —
+    /// it called no TabMail code at all, so no change to TabMail could ever have
+    /// made it red. The three unused-binding warnings the compiler raised here
+    /// (`provider`, `index`, `error`) were exactly that signal: the bindings were
+    /// unused because the body did no work.
+    ///
+    /// WHAT IT ASSERTS NOW, and the boundary of that claim, stated so the next
+    /// reader is not misled a second time. The streak variable production actually
+    /// keeps — `consecutiveConnectionFailures`, a `var` local to the per-folder walk
+    /// in `SyncEngineBackfillWalk` — has no seam, so no unit test can read it. What
+    /// IS production, and is what makes the reset correct, is the CLASSIFICATION
+    /// that feeds it: `SyncEngine.isConnectionError` decides which outcomes advance
+    /// the streak, and a fetch that returns normally is not one of them. So this
+    /// drives a real `MockEmailProvider` through fail → fail → SUCCEED → fail,
+    /// classifies every failure with the production predicate, and pins the
+    /// TRANSITION rather than the final number: 2 immediately before the successful
+    /// fetch, 0 immediately after it. The old `== 1` end-value assertion is equally
+    /// satisfied by a streak that never reached 2 — i.e. by the reset never
+    /// happening at all.
+    ///
+    /// The old `#expect(consecutiveFailures < maxConsecutiveFailures)` is NOT
+    /// carried over: production has no such cap. `SyncEngineBackfillWalk` backs off
+    /// exponentially (5s doubling to a 60s ceiling) and never aborts on a count, so
+    /// asserting a 3-failure abort would pin a rule the app does not have.
+    @Test("A fetch that succeeds resets the connection-failure streak, and the production classifier is what advances it")
     func successResetsFailureCount() async throws {
-        var consecutiveFailures = 0
-        let maxConsecutiveFailures = 3
         let provider = MockEmailProvider()
+        var consecutiveFailures = 0
+        var streakAfterEachAttempt: [Int] = []
 
-        // Two failures then a success
-        let results: [Error?] = [
-            ProviderError.notConnected,
-            ProviderError.notConnected,
-            nil, // success
-            ProviderError.notConnected, // failure after reset
-        ]
-
-        for (index, errorToThrow) in results.enumerated() {
-            if let error = errorToThrow {
-                consecutiveFailures += 1
-            } else {
+        // fail, fail, SUCCEED, fail — driven through the provider, not read off a
+        // literal. Each element configures the NEXT real `fetchMessages` call.
+        for shouldFail in [true, true, false, true] {
+            let scripted: Error? = shouldFail ? ProviderError.notConnected : nil
+            await provider.setFetchMessagesThrows(scripted)
+            do {
+                _ = try await provider.fetchMessages(folder: "Archive", limit: 50, offset: 0)
+                // The walk resets the streak on a normal return, before any
+                // classification runs (`SyncEngineBackfillWalk`: the assignment sits
+                // at the tail of the `do`, above the `catch`).
                 consecutiveFailures = 0
+            } catch {
+                // Production owns this decision, not the test.
+                #expect(
+                    SyncEngine.isConnectionError(error),
+                    "a dropped connection must classify as one, or the streak never advances at all")
+                consecutiveFailures += 1
             }
+            streakAfterEachAttempt.append(consecutiveFailures)
         }
 
-        // After the sequence: fail, fail, success (reset to 0), fail → count is 1
-        #expect(consecutiveFailures == 1)
-        #expect(consecutiveFailures < maxConsecutiveFailures)
+        // THE TRANSITION, not the end value: the streak reaches 2, the success
+        // knocks it to 0, and the next failure starts a fresh streak at 1.
+        #expect(
+            streakAfterEachAttempt == [1, 2, 0, 1],
+            "expected the streak to climb to 2, reset to 0 on the success, then restart at 1; got \(streakAfterEachAttempt)")
+
+        // NON-VACUITY: the sequence really reached the provider — four wire
+        // attempts, not four iterations of arithmetic.
+        let log = await provider.callLog
+        #expect(log.filter { $0.hasPrefix("fetchMessages(") }.count == 4)
     }
 
     @Test("Different folders fail independently — not cross-contaminated")

@@ -104,6 +104,29 @@ private actor MockQueue {
     func repopulateFromDatabase() async {
         await log.record("repopulate_\(name)")
         repopulated = true
+        // 🚨 `IOS-TEST-004`, found by the strengthened assertions on
+        // `budgetBusyExitsAtDeadline` / `cancelDuringBudgetDrain`. Repopulating puts
+        // work back in the queue, so a queue configured busy is busy AGAIN once its
+        // rows are re-read — exactly as production's `cancelAllInFlight` →
+        // `repopulateFromDatabase` pair leaves a queue with pending rows non-idle.
+        //
+        // Without this, `cancelAllInFlight`'s `_idle = true` (correct on its own:
+        // nothing is in flight straight after a cancel) survived repopulate, so
+        // EVERY "queues stay busy forever" test reported idle on its first check and
+        // took the `drain_check_idle` exit in ~40µs. Those two tests therefore never
+        // reached the deadline or the cancellation they are named for — a strictly
+        // worse vacuity than the discarded-evidence one the register row recorded,
+        // and invisible while the deadline assertion was guarded by `if hasPoll` and
+        // the cancellation assertion was never made at all.
+        //
+        // Re-arming is scoped to queues that asked to be busy (`idleAfterChecks > 0`);
+        // a queue configured with `setIdle(true)` is untouched, and a queue with a
+        // finite count still becomes idle after that many checks, so every test that
+        // asserts `drain_check_idle` still gets it.
+        if idleAfterChecks > 0 {
+            checksRemaining = idleAfterChecks
+            _idle = false
+        }
     }
 
     func awaitDrain() async {
@@ -571,6 +594,16 @@ struct SyncStartupDrainBudgetTests {
         #expect(hasIdle, "Should record drain_check_idle for early exit")
     }
 
+    /// ⚠️ STRENGTHENED (`IOS-TEST-004`). The display name is unchanged because it was
+    /// already accurate; the BODY was not. `elapsed` — the only evidence for the "at
+    /// deadline" half of the claim — was computed and thrown away (that is the
+    /// unused-binding warning the compiler raised here), and the sole deadline
+    /// assertion sat inside `if hasPoll`, so a run where the drain loop never polled
+    /// asserted nothing about the deadline whatsoever. It now asserts the end state
+    /// two-sidedly: the loop polled, it did NOT take the idle exit, it recorded the
+    /// deadline, and the wall clock is bounded on BOTH sides of the budget — the
+    /// lower bound proves it did not bail early, the upper bound proves it exited
+    /// rather than hanging.
     @Test("Budget with busy queues exits at deadline")
     func budgetBusyExitsAtDeadline() async {
         let log = EventLog()
@@ -595,14 +628,31 @@ struct SyncStartupDrainBudgetTests {
         let hasSkipped = await log.contains("drain_check_skipped")
         let hasPoll = await log.all(withPrefix: "drain_check_poll").count > 0
         let hasDeadline = await log.contains("drain_check_deadline")
+        let hasIdleExit = await log.contains("drain_check_idle")
 
         // With 5s budget and near-instant mock operations, drain MUST enter
         #expect(hasStart, "Drain loop must start with 5s budget")
         #expect(!hasSkipped, "Drain must not be skipped with 5s budget")
-        // With queues permanently busy, drain must poll until deadline
-        if hasPoll {
-            #expect(hasDeadline, "Should exit at deadline after polling")
-        }
+        // Queues configured for 99_999 idle checks can never report idle, so the
+        // loop is REQUIRED to poll. This was a precondition guarding the deadline
+        // assertion; it is now an assertion in its own right, because a run that
+        // did not poll is a broken run, not an excused one.
+        #expect(hasPoll, "permanently busy queues must force at least one poll")
+        #expect(!hasIdleExit, "queues that never report idle must not produce the early idle exit")
+        #expect(hasDeadline, "a busy drain must exit by recording the deadline")
+
+        // The wall clock IS the "at deadline" claim, and it is bounded on both
+        // sides. Lower: the drain deadline is `t0(inside syncStartup) + budget`, and
+        // this `t0` is captured BEFORE the call, so a loop that ran to the deadline
+        // cannot have taken less than the budget. Upper: after the deadline only a
+        // completed zero-delay `syncTask` and two log writes remain, so anything
+        // approaching the budget again means it did not exit when it said it did.
+        #expect(
+            elapsed >= budgetSeconds,
+            "drain exited before its own deadline — elapsed \(elapsed)s < budget \(budgetSeconds)s")
+        #expect(
+            elapsed < budgetSeconds + 3.0,
+            "drain did not exit at the deadline — elapsed \(elapsed)s for a \(budgetSeconds)s budget")
     }
 
     @Test("Budget with sync slower than budget — drain still runs full budget")
@@ -833,6 +883,14 @@ struct SyncStartupCancellationTests {
         #expect(hasRepop, "Repopulate should have run before cancellation")
     }
 
+    /// ⚠️ STRENGTHENED (`IOS-TEST-004`). The display name says "exits loop" — via
+    /// CANCELLATION — and the body read that exact evidence into `hasCancelled` and
+    /// then never asserted it (the unused-binding warning the compiler raised here).
+    /// Its one assertion, `drain_budget_done`, is emitted by the deadline path too,
+    /// so it could not distinguish "cancelled out of the loop" from "burned the whole
+    /// 30s budget". Both facts are now asserted, and the deadline marker is asserted
+    /// ABSENT — that is the half that makes the cancellation exit the only remaining
+    /// explanation.
     @Test("Task cancelled during budget drain — exits loop")
     func cancelDuringBudgetDrain() async {
         let log = EventLog()
@@ -854,9 +912,16 @@ struct SyncStartupCancellationTests {
 
         // Should have exited via cancellation, not deadline
         let hasCancelled = await log.contains("drain_check_cancelled")
+        let hasDeadline = await log.contains("drain_check_deadline")
         // The drain loop checks Task.isCancelled and will exit
         let events = await log.events
         let hasBudgetDone = events.contains("drain_budget_done")
+        #expect(
+            hasCancelled,
+            "the loop must record that it left on cancellation. Events: \(events)")
+        #expect(
+            !hasDeadline,
+            "a 30s budget cancelled at 300ms must not reach its deadline — that would mean the loop ignored cancellation. Events: \(events)")
         #expect(hasBudgetDone, "Should still complete budget drain flow after cancellation")
     }
 

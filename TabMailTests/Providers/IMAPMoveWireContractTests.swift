@@ -16,18 +16,35 @@ import Testing
 ///    separate `deleteActionSource`: the source delete leg IS the tail of `move`,
 ///    so the "delete-source" half of this property is covered by the same two
 ///    cases (UIDPLUS purges exactly the named UID; no-UIDPLUS purges nothing).
-///  - T3.4, as amended by audit round 3 — a source message is only ever
-///    soft-deleted or purged on evidence the server itself supplied, AT THE
-///    STRONGEST RESOLUTION THAT SERVER CAN EXPRESS. A server that advertises
-///    UIDPLUS is held to per-member `COPYUID`, so a member it did not name
-///    survives while its named sibling is cleaned, and a server that names none
-///    of them cleans nothing. A server that does NOT advertise UIDPLUS can
-///    never produce `COPYUID`, so its evidence is the COPY's own tagged OK
-///    (RFC 3501 §6.4.7 — an unsuccessful COPY MUST restore the destination),
-///    and its move completes. Refusing that class outright was a permanent
-///    wedge, not a safety property; see `nonUidPlusMoveCompletesWithoutAnyExpunge`.
-///    Stated as an end state (which messages exist where, and with which
-///    flags), never as "the provider read the response code".
+///  - T3.4, as amended by audit rounds 3 and 4 — a source message is only ever
+///    soft-deleted or purged on evidence the server itself supplied, and the two
+///    legs take DIFFERENT evidence because they cost different things.
+///    ⚠️ CORRECTED (`IOS-TEST-003`). This bullet used to read: *"A server that
+///    advertises UIDPLUS is held to per-member `COPYUID`, so a member it did not
+///    name survives while its named sibling is cleaned, and a server that names
+///    none of them cleans nothing."* That was accurate when round 3 landed and is
+///    the INVERSE of tip behaviour for the SOFT-DELETE leg on both halves:
+///    round 4 (`ede315ed8`) widened the tagged-OK arm to UIDPLUS servers too, so
+///    `IMAPProvider.move`'s authorization gate takes its `else` arm whenever
+///    `copyProvenUIDs.count != sourceUIDs.count`, calls `liveSourceUIDs` and sets
+///    `authorizedUIDs = live`. The corrected statement:
+///     • The IRREVERSIBLE purge is held to per-member `COPYUID` —
+///       `purgeAuthorizedUIDs = copyProvenUIDs ∩ live`, additionally gated on
+///       `serverSupportsUIDPlus` before `server.expunge(messages:)` — so a member
+///       the server did not name is never purged while its named sibling is, and a
+///       server that names none of them purges nothing.
+///     • The REVERSIBLE `\Deleted` STORE is authorized separately, by the COPY's
+///       own tagged OK (RFC 3501 §6.4.7 — an unsuccessful COPY MUST restore the
+///       destination) ANDed with per-member proof from `liveSourceUIDs` that the
+///       source still holds that member. So EVERY requested member the source
+///       still holds is soft-deleted whether `COPYUID` named it or not —
+///       including on a UIDPLUS server that named none of them.
+///    A server that does NOT advertise UIDPLUS can never produce `COPYUID`, so
+///    the tagged OK is its only evidence, it purges nothing, and its move
+///    completes. Refusing that class outright was a permanent wedge, not a safety
+///    property; see `nonUidPlusMoveCompletesWithoutAnyExpunge`. Stated as an end
+///    state (which messages exist where, and with which flags), never as "the
+///    provider read the response code".
 ///  - T3.1 — a UIDVALIDITY change observed between any two mutation steps
 ///    refuses the remaining steps instead of completing them against a
 ///    renumbered mailbox.

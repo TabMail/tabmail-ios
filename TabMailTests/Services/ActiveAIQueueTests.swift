@@ -895,7 +895,16 @@ struct AIWriteIdentityGuardTests {
     /// address. Note what this test does NOT say — it does not say "a nil stamp
     /// writes through". The very next test holds everything here fixed except the
     /// Message-ID, and requires a refusal.
-    @Test("An UNSTAMPED but UNREPLACED row still receives its AI result, and is not recomputed forever")
+    /// ⚠️ RE-SCOPED (`IOS-ROUND3-D5`). **Previous display name: *"An UNSTAMPED but
+    /// UNREPLACED row still receives its AI result, and is not recomputed
+    /// forever"*.** That name was universally quantified over unstamped rows, but the
+    /// case constructed and asserted below covers only the **RFC-BEARING** subset —
+    /// the row carries `<x@example.com>`, and the paragraph above says outright that
+    /// the RFC Message-ID is what makes admitting it safe. An RFC-LESS unstamped row
+    /// is `IOS-AI-002` and is NOT covered here. A universally-quantified name that
+    /// enumerates a subset reads to a later reader as a proof it is not — the same
+    /// hazard as `IOS-TEST-002` and the `ProviderNativeActionAdmissionTests` name.
+    @Test("An UNSTAMPED but UNREPLACED RFC-BEARING row still receives its AI result, and is not recomputed forever")
     func unstampedButUnreplacedRowStillWritesThrough() throws {
         // The folder has a live numbering; the row does not carry one. This is the
         // steady state after an optimistic move, a delta-sync re-key, a backfill
