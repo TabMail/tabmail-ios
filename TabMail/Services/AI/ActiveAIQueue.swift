@@ -72,6 +72,25 @@ actor ActiveAIQueue {
     /// Retry count for backoff calculation (separate from QueueStorage retry count).
     private var backoffRetryCount: [AIJob: Int] = [:]
 
+    /// `IOS-AI-002` / `IOS-AI-003` — jobs whose write-back target is STRUCTURALLY
+    /// unattributable (`WriteAdmission.structurallyRefused`). Held for the PROCESS
+    /// LIFETIME only.
+    ///
+    /// Why it has to exist: `.writeRefused` retires the job through
+    /// `abandonWithoutCompletion`, which deliberately sets no `recentlyCompleted`
+    /// marker, and the work-remaining query behind `repopulateOnDrain` still matches
+    /// the row (its `summaryBlurb`/`actionTag`/`cachedReply` are still nil, and they
+    /// never will not be). Without this memo, retiring the job turns the 30-second
+    /// backoff loop into an unthrottled repopulate→dispatch→refuse spin.
+    ///
+    /// Why it is process-lifetime and NOT durable: an AI summary is recomputable
+    /// derived content, so a row that later gains an epoch or an RFC 822 Message-ID
+    /// must become eligible again rather than be poisoned. `rearmUnattributableJobs()`
+    /// clears it on every launch, foreground return and AI re-enable — the exact
+    /// moments a sync may have stamped the folder or the row. Nothing about the
+    /// refusal is ever written to the database.
+    private var unattributableJobs: Set<AIJob> = []
+
 
     /// Cached config snapshot from last dispatchPending() call.
     /// Reused by launchCandidates() to avoid MainActor hop on every slot refill.
@@ -144,7 +163,7 @@ actor ActiveAIQueue {
             AIJob(headerId: headerId, accountId: accountId, jobType: .reply),
         ]
         var added = 0
-        for job in jobs {
+        for job in jobs where !unattributableJobs.contains(job) {
             if storage.enqueue(job) { added += 1 }
         }
         guard added > 0 else { return }
@@ -162,7 +181,7 @@ actor ActiveAIQueue {
             allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .reply))
             allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .action))
         }
-        let added = storage.enqueueBatch(allJobs)
+        let added = storage.enqueueBatch(allJobs.filter { !unattributableJobs.contains($0) })
         guard added > 0 else { return }
         print("[ActiveAI] Enqueued \(added) jobs for \(items.count) messages (total: \(storage.count))")
         BackgroundSyncLogger.logAIProcessing("Enqueued batch of \(added) jobs for \(items.count) messages (total: \(storage.count))")
@@ -184,6 +203,10 @@ actor ActiveAIQueue {
             try? await Task.sleep(for: .milliseconds(2000 - sinceCancelMs))
             guard !Task.isCancelled else { return }
         }
+        // Launch / foreground / AI re-enable: a sync may have stamped the folder or
+        // the row since the last refusal, so every structurally-refused job gets one
+        // more chance to be admitted. See `unattributableJobs`.
+        rearmUnattributableJobs()
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
             // Single indexed SQL query — no per-message FTS probes.
@@ -231,6 +254,7 @@ actor ActiveAIQueue {
         storage.cancelAllInFlight()
         backoff.removeAll()
         backoffRetryCount.removeAll()
+        rearmUnattributableJobs()
         cachedConfig = nil
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
@@ -239,6 +263,30 @@ actor ActiveAIQueue {
             BackgroundSyncLogger.logAIProcessing("Cancelled \(taskCount) in-flight AI tasks (suspension recovery) (activeJobs: \(activeJobsBefore)→0, depth=\(storage.count))")
         }
     }
+
+    /// Forget every structurally-refused job, so the next enqueue admits it again.
+    /// Called from the entry points that follow a possible sync — launch / foreground
+    /// / AI re-enable (`repopulateFromDatabase`) and suspension recovery
+    /// (`cancelAllInFlight`) — never from the drain-time self-repopulate, which is
+    /// the loop this memo exists to break. See `unattributableJobs`.
+    func rearmUnattributableJobs() {
+        guard !unattributableJobs.isEmpty else { return }
+        BackgroundSyncLogger.logAIProcessing(
+            "Re-arming \(unattributableJobs.count) structurally-refused AI jobs")
+        unattributableJobs.removeAll()
+    }
+
+    /// Test-only seam (ADR-IOS-056 precedent: `dbPoolPriorityForTesting`). Internal
+    /// rather than `#if DEBUG` for the same reason the other hoisted seams in this
+    /// file set are: the refusal memo is unreachable from a unit test otherwise,
+    /// because reaching it for real needs a dispatched job, a network round trip and
+    /// the app's own `AppDatabase.syncPool`.
+    func noteUnattributableForTesting(_ job: AIJob) {
+        unattributableJobs.insert(job)
+    }
+
+    /// Test-only seam — see `noteUnattributableForTesting`.
+    var unattributableJobCountForTesting: Int { unattributableJobs.count }
 
     /// Whether the queue has no pending items and no active jobs.
     var isIdle: Bool {
@@ -388,8 +436,8 @@ actor ActiveAIQueue {
             storage.incrementActiveJobs()
 
             let task = Task { [self] in
-                let shouldRetry = await executeJob(job, config: config)
-                await jobCompleted(job: job, shouldRetry: shouldRetry)
+                let report = await executeJob(job, config: config)
+                await jobCompleted(job: job, report: report)
             }
             inFlightTasks[job] = task
         }
@@ -405,7 +453,7 @@ actor ActiveAIQueue {
     /// removes the item from `inFlight` + `enqueued`; reading GRDB first and updating
     /// storage atomically afterward keeps state transitions linear. The whole thing
     /// runs inside the actor so there is no true race, but the order keeps it clean.
-    private func jobCompleted(job: AIJob, shouldRetry advisoryRetry: Bool) async {
+    private func jobCompleted(job: AIJob, report: ExecutorReport) async {
         // If this job is no longer tracked in inFlightTasks, it was already
         // cleaned up by cancelAllInFlight() (foreground return or BGAppRefresh).
         // Skip storage update — cancel already reset activeJobs to 0.
@@ -417,8 +465,18 @@ actor ActiveAIQueue {
         // Re-read GRDB to determine outcome. Three states:
         //  - target field present → verified success
         //  - header missing or not in inbox → scope exited
-        //  - otherwise → retry (regardless of `advisoryRetry`)
-        let outcome = await readJobOutcome(job)
+        //  - otherwise → retry (regardless of `report`'s advisory Bool)
+        //
+        // The ONE fact GRDB cannot express is the fourth: the executor never issued a
+        // model call because the result could not have been written back under ANY
+        // outcome (`IOS-AI-002` / `IOS-AI-003`). GRDB shows the field still nil, which
+        // is indistinguishable from an LLM failure — so the executor reports it.
+        let outcome: JobOutcome
+        if case .unattributable = report {
+            outcome = .writeRefused
+        } else {
+            outcome = await readJobOutcome(job)
+        }
         let retryCount = storage.retryCount(for: job)
         let shouldRetry: Bool
 
@@ -433,6 +491,19 @@ actor ActiveAIQueue {
             backoff.removeValue(forKey: job)
             backoffRetryCount.removeValue(forKey: job)
             shouldRetry = false
+        case .writeRefused:
+            // TERMINAL for this process, and deliberately NOT a completion: like
+            // `.scopeExited` it takes `abandonWithoutCompletion`, so no
+            // `recentlyCompleted` marker claims work was done. The memo — not the
+            // storage — is what keeps `repopulateOnDrain` from re-arming it, and the
+            // memo is cleared by `rearmUnattributableJobs()` on the next launch /
+            // foreground / AI re-enable.
+            _ = storage.abandonWithoutCompletion(job)
+            backoff.removeValue(forKey: job)
+            backoffRetryCount.removeValue(forKey: job)
+            unattributableJobs.insert(job)
+            BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) write target structurally unattributable — terminal for this session, no model call issued")
+            shouldRetry = false
         case .needsRetry:
             _ = storage.jobCompleted(job, shouldRetry: true, maxRetries: .max)
             // Exponential backoff: 1s, 2s, 4s, 8s, cap at 30s
@@ -441,7 +512,7 @@ actor ActiveAIQueue {
             backoff[job] = Date().addingTimeInterval(delaySecs)
             backoffRetryCount[job] = backoffCount + 1
             let newCount = retryCount + 1
-            print("[ActiveAI] Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s, advisory=\(advisoryRetry))")
+            print("[ActiveAI] Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s, advisory=\(report))")
             BackgroundSyncLogger.logAIProcessing("Retry \(newCount) for \(Self.logId(job.headerId)).\(job.jobType.rawValue) (backoff \(delaySecs)s)")
 
             // Schedule a delayed re-dispatch for when backoff expires
@@ -485,10 +556,78 @@ actor ActiveAIQueue {
     }
 
     /// Outcome of an AI job, determined by GRDB state rather than executor return value.
+    /// `writeRefused` is the one arm GRDB cannot decide — see `ExecutorReport`.
     private enum JobOutcome {
         case verifiedComplete
         case scopeExited
         case needsRetry
+        case writeRefused
+    }
+
+    /// What the executor observed, over and above what GRDB can show afterwards.
+    ///
+    /// GRDB stays the arbiter of success vs. failure: `retry` is the same advisory
+    /// Bool the executor has always returned and `jobCompleted` still ignores it.
+    /// The `unattributable` case carries the ONE fact a GRDB re-read cannot express
+    /// — that no model call was issued at all, because the job's write-back target
+    /// could not be established and a retry would establish it no better.
+    private enum ExecutorReport: Sendable {
+        /// Ordinary completion; `retry` is the pre-existing advisory Bool.
+        case ordinary(retry: Bool)
+        /// `WriteAdmission.structurallyRefused` at job start. No LLM call, no FTS
+        /// read, no NSE lease claim — the job stopped before spending anything.
+        case unattributable
+    }
+
+    /// Whether the AI result a job is about to compute could be WRITTEN BACK at all,
+    /// decided against the CURRENT database state.
+    ///
+    /// ⚠️ **Sound only for a target captured from the row it is being resolved
+    /// against, in the same read** — which is what `executeJob` does at the top of
+    /// EVERY attempt. That precondition is what makes the classification meaningful:
+    /// because the target is re-captured each attempt, this is exactly the answer the
+    /// NEXT retry would get, so `structurallyRefused` means running the model again
+    /// cannot change the outcome. Passing a target captured earlier would misread an
+    /// ordinary "the identity moved while the LLM was in flight" drop — which the
+    /// next fresh capture heals — as structural.
+    ///
+    /// Enumerated against `AIWriteTarget.resolveCurrentHeader`'s arms, for a FRESH
+    /// capture. Arms 1–3 (row gone / address drift / account or provider changed)
+    /// compare the row against fields copied out of that same row in the same
+    /// transaction, so they cannot fire. Arm 4 admits every stable-id provider. Arm 6
+    /// admits on the row's own non-empty RFC 822 Message-ID. That leaves exactly two
+    /// refusing shapes, and they are not the same kind of thing:
+    ///
+    ///  - **arm 5, `uidValidityResetPendingAt != nil` — TRANSIENT.** The folder is
+    ///    mid purge-and-resync; its own doc says so. The reaction ends, and the job
+    ///    must still be there when it does.
+    ///  - **arms 7 and 8 — STRUCTURAL.** The row carries no RFC 822 Message-ID and
+    ///    its folder's numbering is absent or unknown (7), or the row's own
+    ///    `observedUidValidity` is unset or disagrees with the folder's live epoch
+    ///    (8). Nothing the AI queue does moves either fact: only a sync pass can
+    ///    stamp a folder or a row, and for the `IOS-AI-003` population neither
+    ///    bootstrap door can run (`bootstrapFolderUidValidity` refuses a folder that
+    ///    already holds rows; `verifyAndBootstrapPrePopulatedFolderEpoch` samples only
+    ///    RFC-bearing rows and returns `.unobservable` when there are none).
+    ///
+    /// This is a classification of the REFUSAL's cost, never a relaxation of it. The
+    /// refusal itself is `resolveCurrentHeader`'s and is unchanged — admitting a write
+    /// here on weaker evidence would be the C3 misattribution `6b689890d` closed.
+    enum WriteAdmission: Sendable, Equatable {
+        case admissible
+        case transientlyRefused
+        case structurallyRefused
+    }
+
+    /// See `WriteAdmission`. `target` MUST have been captured from the current row in
+    /// this same read.
+    nonisolated static func writeAdmission(_ db: Database, target: AIWriteTarget) throws -> WriteAdmission {
+        if try target.resolveCurrentHeader(db: db) != nil { return .admissible }
+        if let folder = try Folder.fetchOne(db, key: target.folderId),
+           folder.uidValidityResetPendingAt != nil {
+            return .transientlyRefused
+        }
+        return .structurallyRefused
     }
 
     /// Re-read GRDB to decide whether the job succeeded. Ignores the executor Bool.
@@ -542,13 +681,13 @@ actor ActiveAIQueue {
     // MARK: - Job Execution
 
     /// Execute a single job. Routes to the appropriate handler by job type.
-    /// Returns true if the job should be retried.
-    private func executeJob(_ job: AIJob, config: DispatchConfig) async -> Bool {
+    /// Returns the executor's report — see `ExecutorReport`.
+    private func executeJob(_ job: AIJob, config: DispatchConfig) async -> ExecutorReport {
         let jobT0 = CFAbsoluteTimeGetCurrent()
         // Bail early if cancelled (e.g., foreground return cancelled frozen tasks)
         guard !Task.isCancelled else {
             BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) cancelled before start")
-            return false
+            return .ordinary(retry: false)
         }
 
         // Background grace period for in-flight writes — primarily the 1Hz AI lease
@@ -585,13 +724,18 @@ actor ActiveAIQueue {
         // performs re-resolves through it, so a UIDVALIDITY turnover during the
         // in-flight window can never bind this message's result onto whichever
         // physical message the new numbering put at the same address.
-        let captured: (message: MessageHeader, target: AIWriteTarget)? =
-            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget)? in
+        //
+        // The SAME read also classifies whether that captured identity can be written
+        // back to at all (`IOS-AI-002` / `IOS-AI-003`). It has to be this read: the
+        // classification is only sound for a target resolved against the row it was
+        // captured from, in one transaction. Zero extra round trips.
+        let captured: (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission)? =
+            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission)? in
                 guard let message = try MessageHeader.fetchOne(db, key: job.headerId),
                       let target = try AIWriteTarget.capture(message: message, db: db) else { return nil }
-                return (message, target)
+                return (message, target, try Self.writeAdmission(db, target: target))
             }) ?? nil
-        guard let captured else { return false }
+        guard let captured else { return .ordinary(retry: false) }
         let message = captured.message
         let target = captured.target
 
@@ -604,17 +748,33 @@ actor ActiveAIQueue {
                     .fetchCount(db)
                 return newerCount < SyncConfig.maxRecentEmails
             }) ?? true
-            if !isRecent { return false }
+            if !isRecent { return .ordinary(retry: false) }
         }
 
         // Check if this specific job type is already done
         switch job.jobType {
         case .summary:
-            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else { return false }
+            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else { return .ordinary(retry: false) }
         case .action:
-            guard message.actionTag == nil else { return false }
+            guard message.actionTag == nil else { return .ordinary(retry: false) }
         case .reply:
-            guard message.cachedReply == nil else { return false }
+            guard message.cachedReply == nil else { return .ordinary(retry: false) }
+        }
+
+        // `IOS-AI-002` / `IOS-AI-003`. The job genuinely still needs its field, and
+        // the guarded write-back that would deliver it CANNOT be admitted from this
+        // database state — and, because the target is re-captured every attempt, will
+        // not be admitted by any retry either. Everything below this line costs money
+        // (the model call), battery (FTS + HTTP) or a lease slot the NSE also wants,
+        // and every one of those costs would be spent on a result that is discarded at
+        // `aiGuardedHeaderWrite`. Stop here instead, and let `jobCompleted` retire the
+        // job for this session.
+        //
+        // NOT a relaxation of the refusal: nothing below would have been WRITTEN
+        // anyway. The only thing that changes is that it is no longer paid for.
+        if captured.admission == .structurallyRefused {
+            BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) skipped — write target structurally unattributable (no RFC 822 Message-ID and no proven numbering)")
+            return .unattributable
         }
 
         didLLMWorkSinceDrain = true
@@ -637,12 +797,12 @@ actor ActiveAIQueue {
             print("[ActiveAI] No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
             BackgroundSyncLogger.logAIProcessing("No FTS body for \(Self.logId(job.headerId)) — dropping (\(diag))")
             BackgroundSyncLogger.logError("No FTS body: \(diag)", source: "activeAI:\(Self.logId(job.headerId))")
-            return false
+            return .ordinary(retry: false)
         }
 
         guard let account = try? await dbPool.read({ db in
             try Account.fetchOne(db, key: job.accountId)
-        }) else { return false }
+        }) else { return .ordinary(retry: false) }
 
         // Device Sync probe: check if peer (TB addon) already computed this message's AI.
         // Runs ONCE per message (not per job) — writes peer summary/action/reply to GRDB so
@@ -714,12 +874,12 @@ actor ActiveAIQueue {
                     case .summary:
                         if updated.summaryBlurb != nil && !(updated.summaryBlurb?.isEmpty ?? true) {
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
-                            return false
+                            return .ordinary(retry: false)
                         }
                     case .action:
-                        if updated.actionTag != nil { return false }
+                        if updated.actionTag != nil { return .ordinary(retry: false) }
                     case .reply:
-                        if updated.cachedReply != nil { return false }
+                        if updated.cachedReply != nil { return .ordinary(retry: false) }
                     }
                 }
             }
@@ -755,12 +915,12 @@ actor ActiveAIQueue {
                         if updated.summaryBlurb != nil && !(updated.summaryBlurb?.isEmpty ?? true) {
                             BackgroundSyncLogger.logAIProcessing("NSE lease HIT (summary) for \(Self.logId(job.headerId))")
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
-                            return false
+                            return .ordinary(retry: false)
                         }
                     case .action:
                         if updated.actionTag != nil {
                             BackgroundSyncLogger.logAIProcessing("NSE lease HIT (action) for \(Self.logId(job.headerId))")
-                            return false
+                            return .ordinary(retry: false)
                         }
                     case .reply:
                         // NSE doesn't generate replies; fall through to claim+run.
@@ -779,7 +939,7 @@ actor ActiveAIQueue {
                AIOwnershipLease.isFresh(heartbeatMs: existing.heartbeatMs),
                !AIOwnershipLease.hasResult(db: nseDB, accountId: accountId, messageId: messageId) {
                 BackgroundSyncLogger.logAIProcessing("NSE actively computing \(Self.logId(job.headerId)).\(job.jobType.rawValue) — defer, no block (retry)")
-                return true // retry later — never block the queue slot on the NSE
+                return .ordinary(retry: true) // retry later — never block the queue slot on the NSE
             }
             // Phase 3 — claim for ourselves and start the heartbeat. Best-effort:
             // if the claim fails (rare — race with another fresh NSE wake), we
@@ -864,7 +1024,7 @@ actor ActiveAIQueue {
         if jobMs > 10000 {
             BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) total wall=\(jobMs)ms retry=\(result)")
         }
-        return result
+        return .ordinary(retry: result)
     }
 
     // MARK: - Summary Job
