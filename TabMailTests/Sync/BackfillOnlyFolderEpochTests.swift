@@ -207,45 +207,47 @@ struct BackfillOnlyFolderEpochTests {
         #expect(crawled.count == 1, "precondition: the crawl inserted the server's message")
         guard crawled.count == 1 else { return }
 
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: imap)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) } }
-        server.expectMutation(rfc822MessageId: crawledRfc)
-        await AccountManager.shared.markRead([crawled[0]])
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: imap
+        ) {
+            server.expectMutation(rfc822MessageId: crawledRfc)
+            await AccountManager.shared.markRead([crawled[0]])
 
-        // THE PROPERTY, part 1 — ADMITTED, asserted on the DURABLE effect rather
-        // than on the queue row. `PendingOperation` is transient: the drain loop
-        // deletes it on success, and it can do so before the assertion runs (it
-        // did, the moment this suite was run alongside another). The optimistic
-        // local mutation is not transient, and a REFUSED gesture provably does
-        // not perform it — that is exactly what `imapNilEpochRefusesMarkRead`
-        // pins from the other side.
-        let afterGesture = try #require(try Self.headers(pool, folderId: "\(accountId):Receipts").first)
-        #expect(afterGesture.isRead,
-                """
-                a gesture on a crawled custom folder is still refused after the crawl — \
-                the folder's mail is account-wide searchable and cannot be acted on
-                """)
+            // THE PROPERTY, part 1 — ADMITTED, asserted on the DURABLE effect rather
+            // than on the queue row. `PendingOperation` is transient: the drain loop
+            // deletes it on success, and it can do so before the assertion runs (it
+            // did, the moment this suite was run alongside another). The optimistic
+            // local mutation is not transient, and a REFUSED gesture provably does
+            // not perform it — that is exactly what `imapNilEpochRefusesMarkRead`
+            // pins from the other side.
+            let afterGesture = try #require(try Self.headers(pool, folderId: "\(accountId):Receipts").first)
+            #expect(afterGesture.isRead,
+                    """
+                    a gesture on a crawled custom folder is still refused after the crawl — \
+                    the folder's mail is account-wide searchable and cannot be acted on
+                    """)
 
-        // THE PROPERTY, part 2 — it reached the WIRE, on the RIGHT message. Both
-        // halves are needed: a refusal makes no provider call at all (so the
-        // STORE proves admission independently of the DB), and the oracle proves
-        // the call landed on the message the gesture named.
-        //
-        // Drained in a bounded loop rather than once: the queue drain is a single
-        // shared serialized loop, so a call made while another suite's drain is
-        // still running returns immediately without touching this op. The loop
-        // exits on the first STORE (one iteration, in practice) and cannot hang.
-        var stores: [String] = []
-        for _ in 0..<100 {
-            await AccountManager.shared.drainPendingQueue()
-            stores = server.recordedCommands().filter { $0.contains("STORE") }
-            if !stores.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(20))
+            // THE PROPERTY, part 2 — it reached the WIRE, on the RIGHT message. Both
+            // halves are needed: a refusal makes no provider call at all (so the
+            // STORE proves admission independently of the DB), and the oracle proves
+            // the call landed on the message the gesture named.
+            //
+            // Drained in a bounded loop rather than once: the queue drain is a single
+            // shared serialized loop, so a call made while another suite's drain is
+            // still running returns immediately without touching this op. The loop
+            // exits on the first STORE (one iteration, in practice) and cannot hang.
+            var stores: [String] = []
+            for _ in 0..<100 {
+                await AccountManager.shared.drainPendingQueue()
+                stores = server.recordedCommands().filter { $0.contains("STORE") }
+                if !stores.isEmpty { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(!stores.isEmpty,
+                    "the admitted gesture never reached the server: \(server.recordedCommands())")
+            #expect(server.wrongMessageViolations().isEmpty,
+                    "the admitted gesture mutated a message it never targeted: \(server.wrongMessageViolations())")
         }
-        #expect(!stores.isEmpty,
-                "the admitted gesture never reached the server: \(server.recordedCommands())")
-        #expect(server.wrongMessageViolations().isEmpty,
-                "the admitted gesture mutated a message it never targeted: \(server.wrongMessageViolations())")
     }
 
     @Test("The crawl never re-stamps a folder that HOLDS ROWS of the stored epoch")
@@ -386,11 +388,13 @@ struct BackfillOnlyFolderEpochTests {
 
         // THE WIRE INVARIANT. Declare the message the user is acting on; the
         // decoy now occupying UID 42 is declared by nobody.
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: imap)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) } }
-        server.expectMutation(rfc822MessageId: victimRfc)
-        await AccountManager.shared.markRead([victim])
-        await AccountManager.shared.drainPendingQueue()
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: imap
+        ) {
+            server.expectMutation(rfc822MessageId: victimRfc)
+            await AccountManager.shared.markRead([victim])
+            await AccountManager.shared.drainPendingQueue()
+        }
 
         #expect(server.wrongMessageViolations().isEmpty,
                 """
@@ -530,12 +534,14 @@ struct BackfillOnlyFolderEpochTests {
                 """)
 
         // …and the mail is actionable, which is the whole point of the stamp.
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: imap)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) } }
         guard let crawled = recovered.first else { return }
-        server.expectMutation(rfc822MessageId: replacementRfc)
-        await AccountManager.shared.markRead([crawled])
-        await AccountManager.shared.drainPendingQueue()
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: imap
+        ) {
+            server.expectMutation(rfc822MessageId: replacementRfc)
+            await AccountManager.shared.markRead([crawled])
+            await AccountManager.shared.drainPendingQueue()
+        }
 
         #expect(try Self.headers(pool, folderId: "\(accountId):Receipts").first?.isRead == true,
                 "a gesture on the recovered folder's mail is still refused — the folder is unusable")
@@ -1176,12 +1182,14 @@ struct BackfillOnlyFolderEpochTests {
         // …and the mail is actionable, on the right message. A nil stamp makes
         // `newGestureRefusedForUnknownEpoch` refuse, so this is the user-visible
         // half of the same invariant, checked against the wire oracle.
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: imap)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) } }
         guard let crawled = rows.first(where: { $0.rfc822MessageId == crawledRfc }) else { return }
-        server.expectMutation(rfc822MessageId: crawledRfc)
-        await AccountManager.shared.markRead([crawled])
-        await AccountManager.shared.drainPendingQueue()
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: imap
+        ) {
+            server.expectMutation(rfc822MessageId: crawledRfc)
+            await AccountManager.shared.markRead([crawled])
+            await AccountManager.shared.drainPendingQueue()
+        }
 
         #expect(try Self.headers(pool, folderId: folderId)
                     .first(where: { $0.rfc822MessageId == crawledRfc })?.isRead == true,

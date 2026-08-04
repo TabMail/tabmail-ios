@@ -199,69 +199,68 @@ struct OutboxStrandedClaimTests {
         defer { restore(pool: pool, directory: directory, previous: previous) }
 
         let provider = MockEmailProvider()
-        await AccountManager.shared.registerProviderForTesting(
-            accountId: accountId, provider: provider)
-        defer {
-            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+
+            var seeded = try seedOutbox(pool, accountId: accountId, id: outboxId)
+            // Point the row at an attachments directory that does not exist, so
+            // `loadAttachments()` throws and the send takes the branch under test.
+            // Outbox Rule 5 — never send an email with missing attachments.
+            seeded.attachmentsDirName = "missing-attachments-\(suffix)"
+            let message = seeded
+            try await pool.write { try message.update($0) }
+
+            let claimed = await AccountManager.shared.atomicClaimForTesting(message)
+            #expect(claimed)
+            let claimedRow = try #require(try row(pool, id: outboxId))
+            #expect(claimedRow.outboxStatus == .sending)
+
+            // Make the `.failed` transition — and only that transition — impossible.
+            try await pool.write { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER block_failed_transition
+                    BEFORE UPDATE OF status ON outboxMessage
+                    WHEN NEW.status = 'failed'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'simulated durable write failure');
+                    END;
+                    """)
+            }
+            defer { try? pool.write { db in try db.execute(sql: "DROP TRIGGER IF EXISTS block_failed_transition") } }
+
+            let messageId = try #require(claimedRow.sentMessageId)
+            await AccountManager.shared.sendClaimedOutboxMessageForTesting(
+                message, messageId: messageId)
+
+            let after = try #require(try row(pool, id: outboxId))
+            #expect(
+                after.outboxStatus != .sending,
+                "a row left at .sending with sentAt == nil is invisible to every drain — that is the dropped send Rule 2 exists to prevent"
+            )
+            #expect(after.outboxStatus == .queued)
+            #expect(after.sentAt == nil)
+            #expect(
+                await provider.sentDrafts.isEmpty,
+                "nothing may be sent: the attachments could not be loaded"
+            )
+
+            // NON-VACUITY, and the property that matters to the user: the recovered
+            // row is genuinely reachable again. Dropping the trigger models the
+            // transient write failure clearing; the ordinary drain then owns the row
+            // and completes the intention rather than leaving it stranded forever.
+            try await pool.write { db in try db.execute(sql: "DROP TRIGGER IF EXISTS block_failed_transition") }
+            try await pool.write { db in
+                try db.execute(
+                    sql: "UPDATE outboxMessage SET attachmentsDirName = NULL WHERE id = ?",
+                    arguments: [outboxId])
+            }
+            await AccountManager.shared.drainOutbox()
+            #expect(
+                await provider.sentDrafts.count == 1,
+                "the preserved intention must be drainable once the failure clears"
+            )
         }
-
-        var seeded = try seedOutbox(pool, accountId: accountId, id: outboxId)
-        // Point the row at an attachments directory that does not exist, so
-        // `loadAttachments()` throws and the send takes the branch under test.
-        // Outbox Rule 5 — never send an email with missing attachments.
-        seeded.attachmentsDirName = "missing-attachments-\(suffix)"
-        let message = seeded
-        try await pool.write { try message.update($0) }
-
-        let claimed = await AccountManager.shared.atomicClaimForTesting(message)
-        #expect(claimed)
-        let claimedRow = try #require(try row(pool, id: outboxId))
-        #expect(claimedRow.outboxStatus == .sending)
-
-        // Make the `.failed` transition — and only that transition — impossible.
-        try await pool.write { db in
-            try db.execute(sql: """
-                CREATE TRIGGER block_failed_transition
-                BEFORE UPDATE OF status ON outboxMessage
-                WHEN NEW.status = 'failed'
-                BEGIN
-                    SELECT RAISE(ABORT, 'simulated durable write failure');
-                END;
-                """)
-        }
-        defer { try? pool.write { db in try db.execute(sql: "DROP TRIGGER IF EXISTS block_failed_transition") } }
-
-        let messageId = try #require(claimedRow.sentMessageId)
-        await AccountManager.shared.sendClaimedOutboxMessageForTesting(
-            message, messageId: messageId)
-
-        let after = try #require(try row(pool, id: outboxId))
-        #expect(
-            after.outboxStatus != .sending,
-            "a row left at .sending with sentAt == nil is invisible to every drain — that is the dropped send Rule 2 exists to prevent"
-        )
-        #expect(after.outboxStatus == .queued)
-        #expect(after.sentAt == nil)
-        #expect(
-            await provider.sentDrafts.isEmpty,
-            "nothing may be sent: the attachments could not be loaded"
-        )
-
-        // NON-VACUITY, and the property that matters to the user: the recovered
-        // row is genuinely reachable again. Dropping the trigger models the
-        // transient write failure clearing; the ordinary drain then owns the row
-        // and completes the intention rather than leaving it stranded forever.
-        try await pool.write { db in try db.execute(sql: "DROP TRIGGER IF EXISTS block_failed_transition") }
-        try await pool.write { db in
-            try db.execute(
-                sql: "UPDATE outboxMessage SET attachmentsDirName = NULL WHERE id = ?",
-                arguments: [outboxId])
-        }
-        await AccountManager.shared.drainOutbox()
-        #expect(
-            await provider.sentDrafts.count == 1,
-            "the preserved intention must be drainable once the failure clears"
-        )
     }
 
     @Test("A stale rollback cannot clobber failed, sent, queued, or unrelated rows")

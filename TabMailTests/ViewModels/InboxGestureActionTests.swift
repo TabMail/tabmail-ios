@@ -1884,62 +1884,64 @@ struct InboxGestureActionTests {
         defer { http.close() }
         let gmail = GmailProvider(
             userEmail: "test@example.com", accessToken: { _ in "tok" }, session: http.session)
-        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: gmail)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1") } }
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: "acc1", provider: gmail
+        ) {
 
-        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
-        try await pool.writeWithoutTransaction { db in let d = drafts; try d.insert(db) }
+            let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+            try await pool.writeWithoutTransaction { db in let d = drafts; try d.insert(db) }
 
-        let draftId = Draft.draftKey(
-            replyTo: nil, isForward: false, newId: "t4d10-stale-\(UUID().uuidString)")
-        let liveEpoch = "E-live-\(UUID().uuidString)"
-        let staleEpoch = "E-stale-\(UUID().uuidString)"
-        let resourceId = "r-gmail-resource-1"
-        let draft = makePushedGmailDraft(id: draftId, epoch: liveEpoch, resourceId: resourceId)
-        try await pool.writeWithoutTransaction { db in let d = draft; try d.insert(db) }
+            let draftId = Draft.draftKey(
+                replyTo: nil, isForward: false, newId: "t4d10-stale-\(UUID().uuidString)")
+            let liveEpoch = "E-live-\(UUID().uuidString)"
+            let staleEpoch = "E-stale-\(UUID().uuidString)"
+            let resourceId = "r-gmail-resource-1"
+            let draft = makePushedGmailDraft(id: draftId, epoch: liveEpoch, resourceId: resourceId)
+            try await pool.writeWithoutTransaction { db in let d = draft; try d.insert(db) }
 
-        // The row still on screen is the placeholder minted under the PREVIOUS
-        // compose generation — the one `queueDraftSave` leaves behind. Built
-        // through the production helper so the fixture cannot drift from the id
-        // shape production actually mints.
-        let stalePlaceholderId = PendingOperation.draftPlaceholderMessageId(
-            draftId: draftId, instanceEpoch: staleEpoch)
-        let header = makeDraftsHeader(messageId: stalePlaceholderId)
-        try await pool.writeWithoutTransaction { db in let h = header; try h.insert(db) }
-        let headerId = header.id
+            // The row still on screen is the placeholder minted under the PREVIOUS
+            // compose generation — the one `queueDraftSave` leaves behind. Built
+            // through the production helper so the fixture cannot drift from the id
+            // shape production actually mints.
+            let stalePlaceholderId = PendingOperation.draftPlaceholderMessageId(
+                draftId: draftId, instanceEpoch: staleEpoch)
+            let header = makeDraftsHeader(messageId: stalePlaceholderId)
+            try await pool.writeWithoutTransaction { db in let h = header; try h.insert(db) }
+            let headerId = header.id
 
-        // Fixture guard: this scenario is only meaningful if the placeholder
-        // census really misses, i.e. the row's id is NOT the live generation's.
-        #expect(
-            stalePlaceholderId != PendingOperation.draftPlaceholderMessageId(
-                draftId: draftId, instanceEpoch: liveEpoch),
-            "fixture is vacuous — the on-screen placeholder matches the draft's live generation, so the owned-draft arm would handle it and the header-only arm is never reached")
+            // Fixture guard: this scenario is only meaningful if the placeholder
+            // census really misses, i.e. the row's id is NOT the live generation's.
+            #expect(
+                stalePlaceholderId != PendingOperation.draftPlaceholderMessageId(
+                    draftId: draftId, instanceEpoch: liveEpoch),
+                "fixture is vacuous — the on-screen placeholder matches the draft's live generation, so the owned-draft arm would handle it and the header-only arm is never reached")
 
-        let vm = InboxViewModel(folders: [inbox])
-        let acted = await vm.delete(headerId)
+            let vm = InboxViewModel(folders: [inbox])
+            let acted = await vm.delete(headerId)
 
-        // 1. The gesture is reported UNACTED, which is what makes the swipe
-        //    un-hide the row (`InboxView`'s dismissed-id contract) and keeps the
-        //    user's intention alive and repeatable.
-        #expect(acted == false, "the swipe reported success for a draft it could not address — the row stays hidden while the server copy survives, and the user has no way to retry")
+            // 1. The gesture is reported UNACTED, which is what makes the swipe
+            //    un-hide the row (`InboxView`'s dismissed-id contract) and keeps the
+            //    user's intention alive and repeatable.
+            #expect(acted == false, "the swipe reported success for a draft it could not address — the row stays hidden while the server copy survives, and the user has no way to retry")
 
-        // 2. Nothing was destroyed locally.
-        let survivingHeader = try await pool.read { db in
-            try MessageHeader.fetchOne(db, key: headerId)
+            // 2. Nothing was destroyed locally.
+            let survivingHeader = try await pool.read { db in
+                try MessageHeader.fetchOne(db, key: headerId)
+            }
+            #expect(survivingHeader != nil, "the tapped Drafts row was deleted locally even though no provider delete could be addressed — it vanishes from the list while the server copy re-syncs")
+            let survivingDraft = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
+            #expect(survivingDraft?.serverDraftId == resourceId, "the authored draft row and its Gmail resource address must be untouched by a refused delete")
+
+            // 3. No durable destructive op was admitted at all — in particular none
+            //    carrying the local placeholder as if it were a Gmail address.
+            let allOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            let deleteOps = allOps.filter { $0.type == .deleteDraft }
+            #expect(deleteOps.isEmpty, "a .deleteDraft op was admitted for an unaddressable row: \(deleteOps.map(\.messageIds))")
+
+            // 4. Wire oracle: nothing naming the local placeholder reached Gmail.
+            let placeholderTraffic = http.servedCallSequence().filter { $0.contains(stalePlaceholderId) }
+            #expect(placeholderTraffic.isEmpty, "a local placeholder id was sent to Gmail as a provider address: \(placeholderTraffic)")
         }
-        #expect(survivingHeader != nil, "the tapped Drafts row was deleted locally even though no provider delete could be addressed — it vanishes from the list while the server copy re-syncs")
-        let survivingDraft = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
-        #expect(survivingDraft?.serverDraftId == resourceId, "the authored draft row and its Gmail resource address must be untouched by a refused delete")
-
-        // 3. No durable destructive op was admitted at all — in particular none
-        //    carrying the local placeholder as if it were a Gmail address.
-        let allOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        let deleteOps = allOps.filter { $0.type == .deleteDraft }
-        #expect(deleteOps.isEmpty, "a .deleteDraft op was admitted for an unaddressable row: \(deleteOps.map(\.messageIds))")
-
-        // 4. Wire oracle: nothing naming the local placeholder reached Gmail.
-        let placeholderTraffic = http.servedCallSequence().filter { $0.contains(stalePlaceholderId) }
-        #expect(placeholderTraffic.isEmpty, "a local placeholder id was sent to Gmail as a provider address: \(placeholderTraffic)")
     }
 
     @Test("A real Gmail Drafts row is queued for deletion under the tapped row's own byte-exact message id, not a same-account local draft's")
@@ -1956,53 +1958,55 @@ struct InboxGestureActionTests {
         defer { http.close() }
         let gmail = GmailProvider(
             userEmail: "test@example.com", accessToken: { _ in "tok" }, session: http.session)
-        await AccountManager.shared.registerProviderForTesting(accountId: "acc1", provider: gmail)
-        defer { Task { await AccountManager.shared.unregisterProviderForTesting(accountId: "acc1") } }
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: "acc1", provider: gmail
+        ) {
 
-        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
-        try await pool.writeWithoutTransaction { db in let d = drafts; try d.insert(db) }
+            let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+            try await pool.writeWithoutTransaction { db in let d = drafts; try d.insert(db) }
 
-        // A DECOY: an unrelated local draft on the SAME account, carrying its own
-        // Gmail resource id. Nothing about the tapped row may resolve to it.
-        let decoyId = Draft.draftKey(
-            replyTo: nil, isForward: false, newId: "t4d10-decoy-\(UUID().uuidString)")
-        let decoy = makePushedGmailDraft(
-            id: decoyId, epoch: "E-decoy-\(UUID().uuidString)", resourceId: "r-gmail-decoy")
-        try await pool.writeWithoutTransaction { db in let d = decoy; try d.insert(db) }
+            // A DECOY: an unrelated local draft on the SAME account, carrying its own
+            // Gmail resource id. Nothing about the tapped row may resolve to it.
+            let decoyId = Draft.draftKey(
+                replyTo: nil, isForward: false, newId: "t4d10-decoy-\(UUID().uuidString)")
+            let decoy = makePushedGmailDraft(
+                id: decoyId, epoch: "E-decoy-\(UUID().uuidString)", resourceId: "r-gmail-decoy")
+            try await pool.writeWithoutTransaction { db in let d = decoy; try d.insert(db) }
 
-        // The tapped row: a genuine Gmail Drafts header with a real, byte-exact
-        // provider message id and no local Draft of its own.
-        let tappedProviderId = "18f0c9d2e4b6a1c3"
-        let header = makeDraftsHeader(messageId: tappedProviderId)
-        try await pool.writeWithoutTransaction { db in let h = header; try h.insert(db) }
-        let headerId = header.id
+            // The tapped row: a genuine Gmail Drafts header with a real, byte-exact
+            // provider message id and no local Draft of its own.
+            let tappedProviderId = "18f0c9d2e4b6a1c3"
+            let header = makeDraftsHeader(messageId: tappedProviderId)
+            try await pool.writeWithoutTransaction { db in let h = header; try h.insert(db) }
+            let headerId = header.id
 
-        let vm = InboxViewModel(folders: [inbox])
-        let acted = await vm.delete(headerId)
+            let vm = InboxViewModel(folders: [inbox])
+            let acted = await vm.delete(headerId)
 
-        // NON-VACUITY: the addressable case must still delete. A "fix" that
-        // refuses every header-only Drafts delete fails right here.
-        #expect(acted == true, "an addressable Gmail Drafts row was refused — the fail-closed guard is over-refusing and the user can no longer delete drafts at all")
+            // NON-VACUITY: the addressable case must still delete. A "fix" that
+            // refuses every header-only Drafts delete fails right here.
+            #expect(acted == true, "an addressable Gmail Drafts row was refused — the fail-closed guard is over-refusing and the user can no longer delete drafts at all")
 
-        let deletedHeader = try await pool.read { db in
-            try MessageHeader.fetchOne(db, key: headerId)
+            let deletedHeader = try await pool.read { db in
+                try MessageHeader.fetchOne(db, key: headerId)
+            }
+            #expect(deletedHeader == nil, "the tapped row is still on screen after an admitted delete")
+
+            let allOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            let deleteOps = allOps.filter { $0.type == .deleteDraft }
+            #expect(deleteOps.count == 1, "expected exactly one queued draft delete, got \(deleteOps.count)")
+            guard deleteOps.count == 1 else { return }
+            let op = deleteOps[0]
+            // The address handed to Gmail is the TAPPED row's own id, byte for byte —
+            // never the decoy's resource id, and never a normalized/trimmed variant.
+            #expect(op.messageIds == [tappedProviderId], "the queued delete names \(op.messageIds) instead of the tapped row's own provider id")
+            #expect(op.draftDeleteAddressKind == DraftDeleteAddressKind.gmailContainedMessage.rawValue, "a Drafts-folder header carries Gmail's contained MESSAGE id, never a draft RESOURCE id — mistyping the namespace sends it to the wrong Gmail route")
+            #expect(op.accountId == "acc1")
+            #expect(op.folderPath == "Drafts")
+
+            // The decoy is untouched: sharing an account never donates authority.
+            let survivingDecoy = try await pool.read { db in try Draft.fetchOne(db, key: decoyId) }
+            #expect(survivingDecoy?.serverDraftId == "r-gmail-decoy", "an unrelated same-account draft was consumed by another row's delete")
         }
-        #expect(deletedHeader == nil, "the tapped row is still on screen after an admitted delete")
-
-        let allOps = try await pool.read { db in try PendingOperation.fetchAll(db) }
-        let deleteOps = allOps.filter { $0.type == .deleteDraft }
-        #expect(deleteOps.count == 1, "expected exactly one queued draft delete, got \(deleteOps.count)")
-        guard deleteOps.count == 1 else { return }
-        let op = deleteOps[0]
-        // The address handed to Gmail is the TAPPED row's own id, byte for byte —
-        // never the decoy's resource id, and never a normalized/trimmed variant.
-        #expect(op.messageIds == [tappedProviderId], "the queued delete names \(op.messageIds) instead of the tapped row's own provider id")
-        #expect(op.draftDeleteAddressKind == DraftDeleteAddressKind.gmailContainedMessage.rawValue, "a Drafts-folder header carries Gmail's contained MESSAGE id, never a draft RESOURCE id — mistyping the namespace sends it to the wrong Gmail route")
-        #expect(op.accountId == "acc1")
-        #expect(op.folderPath == "Drafts")
-
-        // The decoy is untouched: sharing an account never donates authority.
-        let survivingDecoy = try await pool.read { db in try Draft.fetchOne(db, key: decoyId) }
-        #expect(survivingDecoy?.serverDraftId == "r-gmail-decoy", "an unrelated same-account draft was consumed by another row's delete")
     }
 }

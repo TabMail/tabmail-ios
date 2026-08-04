@@ -266,114 +266,114 @@ struct AccountManagerQueueDrainTests {
     func drainPendingQueueRealEndToEndExecutesLanesInCreatedAtOrder() async throws {
         let (pool, dir, previous) = try makeTestDB()
         let accountId = "acc-gap3-lanes"
-        defer {
-            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
-            restoreTestDB(pool: pool, previous: previous, dir: dir)
-        }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
-        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
 
-        // Dynamic (repo rule: no hardcoded dates); whole-second so the GRDB
-        // date round-trip compares exactly.
-        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
-        // Lane 1: two ops sharing "msg-1" (buildLanes connected-component) — must run in createdAt order.
-        var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-        opA.createdAt = t0
-        var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-        opB.createdAt = t0.addingTimeInterval(1)
-        // Lane 2: a different message id — a separate connected component, runs concurrently.
-        var opC = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: accountId, folderPath: "INBOX")
-        opC.createdAt = t0
-        try insertOp(opA, pool: pool)
-        try insertOp(opB, pool: pool)
-        try insertOp(opC, pool: pool)
+            // Dynamic (repo rule: no hardcoded dates); whole-second so the GRDB
+            // date round-trip compares exactly.
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            // Lane 1: two ops sharing "msg-1" (buildLanes connected-component) — must run in createdAt order.
+            var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+            opA.createdAt = t0
+            var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+            opB.createdAt = t0.addingTimeInterval(1)
+            // Lane 2: a different message id — a separate connected component, runs concurrently.
+            var opC = PendingOperation(type: .markRead, messageIds: ["msg-2"], accountId: accountId, folderPath: "INBOX")
+            opC.createdAt = t0
+            try insertOp(opA, pool: pool)
+            try insertOp(opB, pool: pool)
+            try insertOp(opC, pool: pool)
 
-        await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.drainPendingQueue()
 
-        let remaining = try await pool.read { db in
-            try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+            let remaining = try await pool.read { db in
+                try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+            }
+            #expect(remaining.isEmpty, "all ops executed (deleted)")
+
+            let callLog = await provider.callLog
+            let readIdx = callLog.firstIndex { $0.contains("markRead") && $0.contains("msg-1") }
+            let flagIdx = callLog.firstIndex { $0.contains("markFlagged") && $0.contains("msg-1") }
+            #expect(readIdx != nil && flagIdx != nil, "both lane-1 ops must have reached the provider")
+            if let readIdx, let flagIdx {
+                #expect(readIdx < flagIdx, "same-lane ops (sharing msg-1) execute in createdAt order")
+            }
+            let readCalls = await provider.markedReadIds
+            #expect(readCalls.contains { $0.ids == ["msg-2"] }, "lane 2's op also executed")
         }
-        #expect(remaining.isEmpty, "all ops executed (deleted)")
-
-        let callLog = await provider.callLog
-        let readIdx = callLog.firstIndex { $0.contains("markRead") && $0.contains("msg-1") }
-        let flagIdx = callLog.firstIndex { $0.contains("markFlagged") && $0.contains("msg-1") }
-        #expect(readIdx != nil && flagIdx != nil, "both lane-1 ops must have reached the provider")
-        if let readIdx, let flagIdx {
-            #expect(readIdx < flagIdx, "same-lane ops (sharing msg-1) execute in createdAt order")
-        }
-        let readCalls = await provider.markedReadIds
-        #expect(readCalls.contains { $0.ids == ["msg-2"] }, "lane 2's op also executed")
     }
 
     @Test("drainPendingQueue() (real): a generic connection error on the first same-lane op gates the rest of the lane — all remaining ops in that lane are requeued, none execute")
     func drainPendingQueueRealFirstOpFailureGatesRestOfLane() async throws {
         let (pool, dir, previous) = try makeTestDB()
         let accountId = "acc-gap3-failure"
-        defer {
-            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
-            restoreTestDB(pool: pool, previous: previous, dir: dir)
-        }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.notConnected)
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
-        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
 
-        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
-        var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-        opA.createdAt = t0
-        var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
-        opB.createdAt = t0.addingTimeInterval(1)
-        try insertOp(opA, pool: pool)
-        try insertOp(opB, pool: pool)
+            let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded() - 3600)
+            var opA = PendingOperation(type: .markRead, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+            opA.createdAt = t0
+            var opB = PendingOperation(type: .markFlagged, messageIds: ["msg-1"], accountId: accountId, folderPath: "INBOX")
+            opB.createdAt = t0.addingTimeInterval(1)
+            try insertOp(opA, pool: pool)
+            try insertOp(opB, pool: pool)
 
-        await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.drainPendingQueue()
 
-        let remaining = try await pool.read { db in
-            try PendingOperation.filter(Column("accountId") == accountId).order(Column("createdAt").asc).fetchAll(db)
+            let remaining = try await pool.read { db in
+                try PendingOperation.filter(Column("accountId") == accountId).order(Column("createdAt").asc).fetchAll(db)
+            }
+            #expect(remaining.count == 2, "both ops must still exist — requeued, not executed or dropped")
+            guard remaining.count == 2 else { return }
+            #expect(remaining.allSatisfy { $0.status == PendingStatus.queued.rawValue })
+            let everyClaimIsConservative = remaining.allSatisfy(\.everAttempted)
+            #expect(everyClaimIsConservative,
+                    "every row claimed in the drain snapshot must be durably conservative before any scheduled provider I/O; a later lane halt does not erase that evidence")
+
+            let flagged = await provider.markedFlaggedIds
+            #expect(flagged.isEmpty, "the later same-lane op must never have reached the provider — failedAccounts gates the rest of the lane")
         }
-        #expect(remaining.count == 2, "both ops must still exist — requeued, not executed or dropped")
-        guard remaining.count == 2 else { return }
-        #expect(remaining.allSatisfy { $0.status == PendingStatus.queued.rawValue })
-        let everyClaimIsConservative = remaining.allSatisfy(\.everAttempted)
-        #expect(everyClaimIsConservative,
-                "every row claimed in the drain snapshot must be durably conservative before any scheduled provider I/O; a later lane halt does not erase that evidence")
-
-        let flagged = await provider.markedFlaggedIds
-        #expect(flagged.isEmpty, "the later same-lane op must never have reached the provider — failedAccounts gates the rest of the lane")
     }
 
     @Test("drainPendingQueue() (real): two concurrent calls are safe — the isDraining/needsRedrain guard serializes them, the op executes exactly once (no duplication, no crash)")
     func drainPendingQueueRealConcurrentCallsExecuteOpsExactlyOnce() async throws {
         let (pool, dir, previous) = try makeTestDB()
         let accountId = "acc-gap3-reentrant"
-        defer {
-            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
-            restoreTestDB(pool: pool, previous: previous, dir: dir)
-        }
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
 
         let provider = MockEmailProvider()
-        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
-        try insertStableProviderFixture(accountId: accountId, pool: pool)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
 
-        let op = PendingOperation(type: .markRead, messageIds: ["msg-reentrant"], accountId: accountId, folderPath: "INBOX")
-        try insertOp(op, pool: pool)
+            let op = PendingOperation(type: .markRead, messageIds: ["msg-reentrant"], accountId: accountId, folderPath: "INBOX")
+            try insertOp(op, pool: pool)
 
-        async let first: Void = AccountManager.shared.drainPendingQueue()
-        async let second: Void = AccountManager.shared.drainPendingQueue()
-        await first
-        await second
+            async let first: Void = AccountManager.shared.drainPendingQueue()
+            async let second: Void = AccountManager.shared.drainPendingQueue()
+            await first
+            await second
 
-        let remaining = try await pool.read { db in
-            try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+            let remaining = try await pool.read { db in
+                try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db)
+            }
+            #expect(remaining.isEmpty, "the op executed (deleted)")
+
+            let readCalls = await provider.markedReadIds
+            #expect(readCalls.count == 1, "the op must execute EXACTLY ONCE despite two concurrent drain calls")
         }
-        #expect(remaining.isEmpty, "the op executed (deleted)")
-
-        let readCalls = await provider.markedReadIds
-        #expect(readCalls.count == 1, "the op must execute EXACTLY ONCE despite two concurrent drain calls")
     }
 
     // MARK: - T3.5 / T4.H1 coupling — a body-preserving Gmail action 400 is still terminal

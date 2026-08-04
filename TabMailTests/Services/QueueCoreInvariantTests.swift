@@ -71,9 +71,15 @@ struct QueueCoreInvariantTests {
     /// Mirrors `AccountManagerQueueDrainTests`' teardown: the drain paths driven
     /// here fire unstructured background Tasks that can outlive the test body,
     /// so no earlier boundary can safely close the pool.
+    ///
+    /// It no longer unregisters the provider. It used to, through a bare
+    /// un-awaited `Task { … }` — an actor job merely ENQUEUED when this
+    /// synchronous helper returned, so the registry could still hold this
+    /// fixture's provider when the next suite started (`IOS-TEST-008`). Every
+    /// test here that registers one now scopes it through
+    /// `TestProviderRegistry.withRegisteredProvider`, which awaits the
+    /// unregister on both exits before the test body ends.
     private func finish(_ fixture: Fixture) {
-        let accountId = fixture.accountId
-        Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
         InstalledTestDatabaseLifetime.finish(
             previous: fixture.previous, pool: fixture.pool, directory: fixture.directory)
     }
@@ -162,40 +168,42 @@ struct QueueCoreInvariantTests {
         let provider = MockEmailProvider()
         // Only the move refuses. The bystander's markRead is untouched.
         await provider.setMoveThrows(TestEvidenceUnavailable.noProofFromServer)
-        await AccountManager.shared.registerProviderForTesting(
-            accountId: fixture.accountId, provider: provider)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: fixture.accountId, provider: provider
+        ) {
 
-        let t0 = baseTimestamp()
-        var wedged = PendingOperation(
-            type: .move, messageIds: ["77"], accountId: fixture.accountId,
-            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
-        wedged.createdAt = t0
-        // The BYSTANDER: same UID number, different mailbox, therefore a
-        // different physical message that shares nothing with the op above.
-        var bystander = PendingOperation(
-            type: .markRead, messageIds: ["77"], accountId: fixture.accountId,
-            folderPath: "Archive", observedUidValidity: 42)
-        bystander.createdAt = t0.addingTimeInterval(1)
-        try insertOp(wedged, fixture)
-        try insertOp(bystander, fixture)
+            let t0 = baseTimestamp()
+            var wedged = PendingOperation(
+                type: .move, messageIds: ["77"], accountId: fixture.accountId,
+                folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+            wedged.createdAt = t0
+            // The BYSTANDER: same UID number, different mailbox, therefore a
+            // different physical message that shares nothing with the op above.
+            var bystander = PendingOperation(
+                type: .markRead, messageIds: ["77"], accountId: fixture.accountId,
+                folderPath: "Archive", observedUidValidity: 42)
+            bystander.createdAt = t0.addingTimeInterval(1)
+            try insertOp(wedged, fixture)
+            try insertOp(bystander, fixture)
 
-        await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.drainPendingQueue()
 
-        // THE PROPERTY: the bystander's intention executed.
-        let reads = await provider.markedReadIds
-        #expect(
-            reads.contains { $0.ids == ["77"] && $0.folder == "Archive" },
-            """
-            a message in Archive was starved by an unrelated op wedged on the same UID number in \
-            INBOX — the two are different physical messages and share no lane: \(reads)
-            """)
-        #expect(try fetchOp(bystander.id, fixture) == nil, "the bystander's op retired on success")
+            // THE PROPERTY: the bystander's intention executed.
+            let reads = await provider.markedReadIds
+            #expect(
+                reads.contains { $0.ids == ["77"] && $0.folder == "Archive" },
+                """
+                a message in Archive was starved by an unrelated op wedged on the same UID number in \
+                INBOX — the two are different physical messages and share no lane: \(reads)
+                """)
+            #expect(try fetchOp(bystander.id, fixture) == nil, "the bystander's op retired on success")
 
-        // NON-VACUITY, and the never-drop half: the refused op is preserved,
-        // not dropped, and not executed.
-        let refused = try fetchOp(wedged.id, fixture)
-        #expect(refused != nil, "an evidence refusal is an absence of evidence — never an exit")
-        #expect(refused?.status == PendingStatus.queued.rawValue)
+            // NON-VACUITY, and the never-drop half: the refused op is preserved,
+            // not dropped, and not executed.
+            let refused = try fetchOp(wedged.id, fixture)
+            #expect(refused != nil, "an evidence refusal is an absence of evidence — never an exit")
+            #expect(refused?.status == PendingStatus.queued.rawValue)
+        }
     }
 
     @Test("two ops on the SAME (account, folder, UID) still serialize — the lane split is per address, not per op")
@@ -205,34 +213,36 @@ struct QueueCoreInvariantTests {
 
         let provider = MockEmailProvider()
         await provider.setMoveThrows(TestEvidenceUnavailable.noProofFromServer)
-        await AccountManager.shared.registerProviderForTesting(
-            accountId: fixture.accountId, provider: provider)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: fixture.accountId, provider: provider
+        ) {
 
-        let t0 = baseTimestamp()
-        var wedged = PendingOperation(
-            type: .move, messageIds: ["77"], accountId: fixture.accountId,
-            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
-        wedged.createdAt = t0
-        // Same account, same folder, same UID — the SAME physical message.
-        var successor = PendingOperation(
-            type: .markRead, messageIds: ["77"], accountId: fixture.accountId,
-            folderPath: "INBOX", observedUidValidity: 42)
-        successor.createdAt = t0.addingTimeInterval(1)
-        try insertOp(wedged, fixture)
-        try insertOp(successor, fixture)
+            let t0 = baseTimestamp()
+            var wedged = PendingOperation(
+                type: .move, messageIds: ["77"], accountId: fixture.accountId,
+                folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+            wedged.createdAt = t0
+            // Same account, same folder, same UID — the SAME physical message.
+            var successor = PendingOperation(
+                type: .markRead, messageIds: ["77"], accountId: fixture.accountId,
+                folderPath: "INBOX", observedUidValidity: 42)
+            successor.createdAt = t0.addingTimeInterval(1)
+            try insertOp(wedged, fixture)
+            try insertOp(successor, fixture)
 
-        await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.drainPendingQueue()
 
-        // THE CONTROL for the test above: adding the folder to the key must not
-        // de-serialize two gestures on ONE message. A later op sharing an
-        // address with an unresolved predecessor must never run ahead of it.
-        let reads = await provider.markedReadIds
-        #expect(
-            reads.isEmpty,
-            "a later op on the SAME address ran ahead of its unresolved predecessor: \(reads)")
-        let successorAfter = try fetchOp(successor.id, fixture)
-        #expect(successorAfter != nil, "held, not dropped")
-        #expect(successorAfter?.status == PendingStatus.queued.rawValue)
+            // THE CONTROL for the test above: adding the folder to the key must not
+            // de-serialize two gestures on ONE message. A later op sharing an
+            // address with an unresolved predecessor must never run ahead of it.
+            let reads = await provider.markedReadIds
+            #expect(
+                reads.isEmpty,
+                "a later op on the SAME address ran ahead of its unresolved predecessor: \(reads)")
+            let successorAfter = try fetchOp(successor.id, fixture)
+            #expect(successorAfter != nil, "held, not dropped")
+            #expect(successorAfter?.status == PendingStatus.queued.rawValue)
+        }
     }
 
     // MARK: - IOS-QUEUE-002 — checkpoint A's draft/reset arm
@@ -265,30 +275,32 @@ struct QueueCoreInvariantTests {
         // The predecessor fails transiently, so the lane halts and the op under
         // test is requeued instead of being executed and retired.
         await provider.setMarkReadThrows(ProviderError.notConnected)
-        await AccountManager.shared.registerProviderForTesting(
-            accountId: fixture.accountId, provider: provider)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: fixture.accountId, provider: provider
+        ) {
 
-        let t0 = baseTimestamp()
-        var predecessor = PendingOperation(
-            type: .markRead, messageIds: ["draft-1"], accountId: fixture.accountId,
-            folderPath: "Drafts")
-        predecessor.createdAt = t0
-        // `.setTag` is outside checkpoint A's provider-address set, so it is
-        // judged by the draft/reset arm under test.
-        var subject = PendingOperation(
-            type: .setTag, messageIds: ["draft-1"], accountId: fixture.accountId,
-            folderPath: "Drafts", tagValue: "archive", observedUidValidity: 0)
-        subject.createdAt = t0.addingTimeInterval(1)
-        try insertOp(predecessor, fixture)
-        try insertOp(subject, fixture)
+            let t0 = baseTimestamp()
+            var predecessor = PendingOperation(
+                type: .markRead, messageIds: ["draft-1"], accountId: fixture.accountId,
+                folderPath: "Drafts")
+            predecessor.createdAt = t0
+            // `.setTag` is outside checkpoint A's provider-address set, so it is
+            // judged by the draft/reset arm under test.
+            var subject = PendingOperation(
+                type: .setTag, messageIds: ["draft-1"], accountId: fixture.accountId,
+                folderPath: "Drafts", tagValue: "archive", observedUidValidity: 0)
+            subject.createdAt = t0.addingTimeInterval(1)
+            try insertOp(predecessor, fixture)
+            try insertOp(subject, fixture)
 
-        await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.drainPendingQueue()
 
-        let after = try fetchOp(subject.id, fixture)
-        #expect(
-            after != nil,
-            "a zero epoch is an ABSENCE of evidence — retiring on it drops a user intention on an unknown")
-        #expect(after?.status == PendingStatus.queued.rawValue)
+            let after = try fetchOp(subject.id, fixture)
+            #expect(
+                after != nil,
+                "a zero epoch is an ABSENCE of evidence — retiring on it drops a user intention on an unknown")
+            #expect(after?.status == PendingStatus.queued.rawValue)
+        }
     }
 
     @Test("checkpoint A still retires an op whose source folder PROVABLY turned over — exit 4 is unchanged")
@@ -300,32 +312,34 @@ struct QueueCoreInvariantTests {
 
         let provider = MockEmailProvider()
         await provider.setMarkReadThrows(ProviderError.notConnected)
-        await AccountManager.shared.registerProviderForTesting(
-            accountId: fixture.accountId, provider: provider)
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: fixture.accountId, provider: provider
+        ) {
 
-        let t0 = baseTimestamp()
-        var predecessor = PendingOperation(
-            type: .markRead, messageIds: ["draft-1"], accountId: fixture.accountId,
-            folderPath: "Drafts")
-        predecessor.createdAt = t0
-        // Both epochs REAL and disagreeing: a proven reset in this op's own
-        // address space. This is the one arm of the checkpoint that may delete.
-        var subject = PendingOperation(
-            type: .setTag, messageIds: ["draft-1"], accountId: fixture.accountId,
-            folderPath: "Drafts", tagValue: "archive", observedUidValidity: 4)
-        subject.createdAt = t0.addingTimeInterval(1)
-        try insertOp(predecessor, fixture)
-        try insertOp(subject, fixture)
+            let t0 = baseTimestamp()
+            var predecessor = PendingOperation(
+                type: .markRead, messageIds: ["draft-1"], accountId: fixture.accountId,
+                folderPath: "Drafts")
+            predecessor.createdAt = t0
+            // Both epochs REAL and disagreeing: a proven reset in this op's own
+            // address space. This is the one arm of the checkpoint that may delete.
+            var subject = PendingOperation(
+                type: .setTag, messageIds: ["draft-1"], accountId: fixture.accountId,
+                folderPath: "Drafts", tagValue: "archive", observedUidValidity: 4)
+            subject.createdAt = t0.addingTimeInterval(1)
+            try insertOp(predecessor, fixture)
+            try insertOp(subject, fixture)
 
-        await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.drainPendingQueue()
 
-        // THE CONTROL: if the non-zero guards had been written as an
-        // unconditional refusal to compare, the pair would stop distinguishing
-        // anything and a proven turnover would execute under numbering the op
-        // never observed (C3).
-        #expect(
-            try fetchOp(subject.id, fixture) == nil,
-            "a proven epoch turnover must still retire the op before any provider I/O")
+            // THE CONTROL: if the non-zero guards had been written as an
+            // unconditional refusal to compare, the pair would stop distinguishing
+            // anything and a proven turnover would execute under numbering the op
+            // never observed (C3).
+            #expect(
+                try fetchOp(subject.id, fixture) == nil,
+                "a proven epoch turnover must still retire the op before any provider I/O")
+        }
     }
 
     // MARK: - IOS-QUEUE-005 — the narrowing pass finishes the move it retires

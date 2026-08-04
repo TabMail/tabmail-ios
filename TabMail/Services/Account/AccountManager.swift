@@ -506,6 +506,29 @@ actor AccountManager {
         return Date() < expiresAt
     }
 
+    /// Test seam: drop every protection entry, expired or not.
+    ///
+    /// `recentlyCompleted` is process-global and keyed by a BARE message id,
+    /// which on IMAP is a per-folder UID — so a "1"/"2"/"3" recorded by one test
+    /// protects the "1"/"2"/"3" of an unrelated test's folder for the whole
+    /// 30 s TTL, and a stale sweep that must delete them silently keeps them
+    /// (`IOS-TEST-006`). Production keeps the unscoped key deliberately: the
+    /// map's OTHER leg is the RFC 822 Message-ID, which is folder-agnostic by
+    /// construction and is what protects an optimistically-moved row at its
+    /// destination, and every consumer uses the map only to SKIP a delete or an
+    /// overwrite — so an over-broad match costs at most one sync pass and never
+    /// removes protection. Scoping the key would narrow it, which is the
+    /// dangerous direction. The leak is therefore closed in the test harness:
+    /// `ProcessGlobalTestState.withLock` calls this on entry to every scoped
+    /// test, which is the only boundary that composes across suites
+    /// (`.serialized` does not).
+    ///
+    /// Mirrors the `…ForTesting()` convention
+    /// (`clearUidValidityReactionInFlightForTesting`).
+    func clearRecentlyCompletedForTesting() {
+        recentlyCompleted.removeAll()
+    }
+
     // MARK: - Optimistic Overlay
 
     /// Pending mutations registered by user actions before their DB writes commit.

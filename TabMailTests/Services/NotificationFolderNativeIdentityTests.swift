@@ -317,31 +317,30 @@ struct NotificationActionFolderNativeIdentityTests {
             username: server.username, password: server.password,
             smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
         try await provider.connect()
-        await AccountManager.shared.registerProviderForTesting(
-            accountId: accountId, provider: provider)
-        defer {
-            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+        try await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+
+            await NotificationActionRouter.execute(
+                actionId: "MARK_READ", messageId: "7", accountId: accountId)
+
+            // C3 is unchanged: the impostor the user never tapped is untouched.
+            let finalImpostor = try await env.pool.read { db in
+                try MessageHeader.fetchOne(db, key: impostor.id)
+            }
+            #expect(finalImpostor?.isRead == false)
+
+            await AccountManager.shared.drainPendingQueue()
+
+            #expect(
+                server.flags(in: "INBOX", uid: 7).contains("\\Seen"),
+                "the cold intention must EXECUTE, not merely exist: \(server.flags(in: "INBOX", uid: 7))"
+            )
+            #expect(server.wrongMessageViolations().isEmpty)
+            let ops = try await env.pool.read { db in try PendingOperation.fetchAll(db) }
+            #expect(ops.isEmpty, "a completed op is retired by provider success")
+            try? await provider.disconnect()
         }
-
-        await NotificationActionRouter.execute(
-            actionId: "MARK_READ", messageId: "7", accountId: accountId)
-
-        // C3 is unchanged: the impostor the user never tapped is untouched.
-        let finalImpostor = try await env.pool.read { db in
-            try MessageHeader.fetchOne(db, key: impostor.id)
-        }
-        #expect(finalImpostor?.isRead == false)
-
-        await AccountManager.shared.drainPendingQueue()
-
-        #expect(
-            server.flags(in: "INBOX", uid: 7).contains("\\Seen"),
-            "the cold intention must EXECUTE, not merely exist: \(server.flags(in: "INBOX", uid: 7))"
-        )
-        #expect(server.wrongMessageViolations().isEmpty)
-        let ops = try await env.pool.read { db in try PendingOperation.fetchAll(db) }
-        #expect(ops.isEmpty, "a completed op is retired by provider success")
-        try? await provider.disconnect()
     }
 }
 

@@ -62,6 +62,17 @@ enum ProcessGlobalTestState {
             ownerToken: ownerToken,
             queuedObserver: queuedObserver
         ) { acquiredOwnerToken in
+            // 🚨 INSIDE the critical section, never before acquiring it.
+            // `AccountManager.recentlyCompleted` is process-global sync-protection
+            // state keyed by a BARE message id — an IMAP UID — so ids one suite
+            // completes (`FakeIMAPServer`'s COPY hands out 1/2/3 for an empty
+            // destination) protect the identically numbered rows of an unrelated
+            // suite's folder for the whole 30 s TTL, and the stale sweep that must
+            // delete them keeps them instead. `IOS-TEST-006`. `.serialized` only
+            // orders tests inside ONE suite, so this scope is the only boundary
+            // that composes across suites. Clearing it BEFORE acquiring would let
+            // a queued test wipe the entries the RUNNING test just recorded.
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
             try await $ownerToken.withValue(acquiredOwnerToken) {
                 try await function()
             }
@@ -224,12 +235,16 @@ actor AsyncTestLock {
 /// item 8. Bodies were identical; only the doc block's example phrasing
 /// differed, and all three phrasings are preserved above.
 enum TestProviderRegistry {
-    /// `@MainActor` so `body` stays in the CALLER's isolation domain: every
-    /// current caller is `@MainActor`, and a nonisolated helper would make the
-    /// closure a value sent across an isolation boundary (`sending value of
-    /// non-Sendable type '() async -> ()'`).
-    @MainActor
+    /// `isolation:` (SE-0420) so `body` stays in the CALLER's isolation domain
+    /// WHATEVER that domain is: a nonisolated helper would make the closure a
+    /// value sent across an isolation boundary (`sending value of non-Sendable
+    /// type '() async -> ()'`), and a hard `@MainActor` would force every
+    /// caller onto the main actor — a real behavioural change for the
+    /// nonisolated suites adopted for `IOS-TEST-008`. `#isolation` resolves to
+    /// `MainActor.shared` for the `@MainActor` callers this helper was written
+    /// for, so their behaviour is unchanged.
     static func withRegisteredProvider(
+        isolation: isolated (any Actor)? = #isolation,
         accountId: String, provider: any EmailProvider, _ body: () async throws -> Void
     ) async rethrows {
         await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
