@@ -146,6 +146,37 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// downstream can detect the swap from the parsed mapping alone — the
         /// app must refuse the ORDERING. `false` for every pre-existing test.
         var copyUidDestinationsDescending = false
+        /// B1 (ADR-IOS-068/D4) — mailboxes whose APPEND is accepted, assigned a
+        /// UID and acknowledged normally, but whose tagged OK omits the
+        /// `APPENDUID` response code even though this server advertises UIDPLUS.
+        /// The exact `COPYUID` twin of `copyUidWithheldSourceUIDs`: RFC 4315 §3
+        /// covers both codes with one SHOULD "with limited exceptions", and those
+        /// exceptions (a mailbox the client may APPEND to but not SELECT/EXAMINE;
+        /// a `UIDNOTSTICKY` mail store) are properties of the MAILBOX, not of the
+        /// server or of the attempt — so a fully UIDPLUS-advertising server that
+        /// never names an appended message is CONFORMANT. This is the only way to
+        /// model "no attempt-correlated identity" while UID EXPUNGE is still
+        /// available, which is the combination that makes a wrong address
+        /// irreversible. Empty for every pre-existing test.
+        var appendUidWithheldMailboxes: Set<String> = []
+        /// B1 (ADR-IOS-068/D4) — mailboxes where the appended copy is REMOVED
+        /// immediately after the APPEND's tagged OK, modelling a CONCURRENT IMAP
+        /// actor (a second TabMail instance, the Thunderbird addon, any other
+        /// client) that moves or expunges it in the window between that OK and
+        /// this client's next command. **Not a nonconforming server:** RFC 3501
+        /// gives a client no exclusivity over a mailbox between two commands, so
+        /// every other client's COPY/MOVE/EXPUNGE there is legal. What this makes
+        /// deterministic is the RACE, not an illegal response. Empty for every
+        /// pre-existing test.
+        var vanishAppendedMailboxes: Set<String> = []
+        /// Highest UID this server has ever handed to an APPEND that then
+        /// vanished, per mailbox. RFC 3501 §2.3.1.1 requires UIDs to ascend
+        /// strictly and never be reused within a UIDVALIDITY generation, and a
+        /// vanished message is no longer in `messagesByMailbox` to raise the max —
+        /// so without this high-water mark a later APPEND would reuse its UID.
+        /// Consulted ONLY for mailboxes in `vanishAppendedMailboxes`, so UID
+        /// assignment is byte-identical for every pre-existing test.
+        var vanishedAppendUidHighWater: [String: Int] = [:]
         /// Audit round 5 — per-mailbox UIDs whose FETCH records omit the `UID`
         /// data item entirely (`suppressFetchUid(in:uids:)`). RFC 3501 §6.4.8
         /// makes that item MANDATORY in any FETCH response caused by a UID
@@ -667,6 +698,49 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// to reach the wire rather than the parsed value.
     func reportCopyUIDDestinationsDescending() {
         withState { $0.copyUidDestinationsDescending = true }
+    }
+
+    /// Test seam (B1, ADR-IOS-068/D4): APPEND into `mailbox` still stores the
+    /// message and still assigns it the next UID, but the tagged OK omits the
+    /// `APPENDUID` response code — even though this server advertises UIDPLUS.
+    ///
+    /// The direct twin of `withholdCopyUID(forSourceUIDs:)`, and conformant for
+    /// the same reason: RFC 4315 §3 makes both response codes a SHOULD "with
+    /// limited exceptions", and it names those exceptions as properties of the
+    /// MAILBOX — a mailbox the client may APPEND to but not SELECT/EXAMINE
+    /// ("SHOULD NOT send ... as it would disclose information about the
+    /// mailbox"), and a `UIDNOTSTICKY` mail store ("MAY omit ... as it is not
+    /// meaningful"). For such a mailbox "the next attempt" never brings the code.
+    ///
+    /// It exists because dropping UIDPLUS from `capabilities` conflates two
+    /// independent things: whether the server can NAME the appended copy
+    /// (`APPENDUID`) and whether it can DELETE one precisely (`UID EXPUNGE`).
+    /// Only the combination "cannot name, can irreversibly delete" shows what a
+    /// wrongly-adopted address costs.
+    func withholdAppendUID(in mailbox: String) {
+        withState { state in _ = state.appendUidWithheldMailboxes.insert(mailbox) }
+    }
+
+    /// Test seam (B1, ADR-IOS-068/D4): APPEND into `mailbox` is accepted,
+    /// assigned the next UID and acknowledged exactly as a conformant server
+    /// would — and the appended copy is then GONE before this client's next
+    /// command, modelling a concurrent IMAP actor (a second TabMail instance, the
+    /// Thunderbird addon, any other client) that moves or expunges it in that
+    /// window.
+    ///
+    /// ⚠ Unlike `suppressSelectUidValidity(for:)` / `suppressFetchUid(in:uids:)`,
+    /// this does NOT model a nonconforming server. RFC 3501 gives a client no
+    /// exclusivity over a mailbox between two commands; another client's
+    /// COPY/MOVE/EXPUNGE there is entirely legal. What the seam makes
+    /// deterministic is the RACE, not an illegal response.
+    ///
+    /// This is the ONLY wire shape that produces "the appended copy is absent
+    /// while exactly one same-Message-ID sibling remains" — the state in which
+    /// every cardinality and exact-verify guard passes on a message the client
+    /// never appended. The consumed UID is never reused
+    /// (`vanishedAppendUidHighWater`, RFC 3501 §2.3.1.1).
+    func vanishAppendedMessages(in mailbox: String) {
+        withState { state in _ = state.vanishAppendedMailboxes.insert(mailbox) }
     }
 
     /// Test seam (audit round 5): these messages' FETCH records OMIT the `UID`
@@ -1510,13 +1584,30 @@ final class FakeIMAPServer: @unchecked Sendable {
             .replacingOccurrences(of: "\\\"", with: "\"")
             .replacingOccurrences(of: "\\\\", with: "\\")
 
-        let (newUID, uidvalidity) = withState { state -> (Int, Int) in
+        let (newUID, uidvalidity, appendUidWithheld) = withState { state -> (Int, Int, Bool) in
             let existing = state.messagesByMailbox[mailbox] ?? []
+            if state.vanishAppendedMailboxes.contains(mailbox) {
+                // The APPEND itself is fully honoured — the UID is consumed and
+                // never reused (RFC 3501 §2.3.1.1) — and a concurrent actor then
+                // removes the copy before this client's next command, so it is
+                // simply never observable in `messagesByMailbox`.
+                let nextUID = max(
+                    existing.map(\.uid).max() ?? 0,
+                    state.vanishedAppendUidHighWater[mailbox] ?? 0) + 1
+                state.vanishedAppendUidHighWater[mailbox] = nextUID
+                return (
+                    nextUID,
+                    state.uidValidityByMailbox[mailbox] ?? 1,
+                    state.appendUidWithheldMailboxes.contains(mailbox))
+            }
             let nextUID = (existing.map(\.uid).max() ?? 0) + 1
             let message = Self.makeMessage(uid: nextUID, rfc822Text: raw)
             state.messagesByMailbox[mailbox, default: []].append(message)
             if !flags.isEmpty { state.flagsByMailbox[mailbox, default: [:]][nextUID] = flags }
-            return (nextUID, state.uidValidityByMailbox[mailbox] ?? 1)
+            return (
+                nextUID,
+                state.uidValidityByMailbox[mailbox] ?? 1,
+                state.appendUidWithheldMailboxes.contains(mailbox))
         }
 
         // RFC 4315 UIDPLUS — the APPENDUID response code is only advertisable
@@ -1528,6 +1619,11 @@ final class FakeIMAPServer: @unchecked Sendable {
         // forces IMAPProvider's saveDraft into its no-APPENDUID search-verify
         // fallback arm instead of silently still handing it APPENDUID.
         guard capabilities.contains("UIDPLUS") else {
+            return "\(tag) OK APPEND completed\r\n"
+        }
+        // B1 — `withholdAppendUID(in:)`. RFC 4315 §3's mailbox-scoped exceptions
+        // let a UIDPLUS server omit the code while UID EXPUNGE stays available.
+        guard !appendUidWithheld else {
             return "\(tag) OK APPEND completed\r\n"
         }
         return "\(tag) OK [APPENDUID \(uidvalidity) \(newUID)] APPEND completed\r\n"

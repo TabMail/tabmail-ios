@@ -128,8 +128,21 @@ struct IMAPSaveDraftIdentityTests {
         #expect(!server.recordedCommands().contains { $0.contains("UID SEARCH") })
     }
 
-    @Test("Non-UIDPLUS APPEND exact-verifies one fresh match and returns its typed IMAP address")
-    func nonUidPlusUniqueExactMatch() async throws {
+    /// ⚠️ RE-SCOPED (B1, ADR-IOS-068/D4). Previous display name:
+    /// *"Non-UIDPLUS APPEND exact-verifies one fresh match and returns its typed
+    /// IMAP address"*. It asserted the opposite of what D4 requires — that the
+    /// sole exact `SEARCH` survivor's UID becomes this draft's mutation address —
+    /// and so BLESSED the defect this test now pins. The fixture is unchanged
+    /// (uid 31 is a substring decoy the exact-verify used to reject, uid 32 the
+    /// appended copy); only the expected outcome moved, because no `SEARCH`
+    /// result may become a mutation target however well verified.
+    ///
+    /// This is the "the guards would all have passed" cell: the appended copy IS
+    /// present and IS the unique exact match, so cardinality, exact-verify and a
+    /// positive epoch all succeed — and the address is still refused, because
+    /// nothing correlates any hit with THIS attempt.
+    @Test("Without APPENDUID no address is minted, even when exactly one exact match would verify")
+    func noAppendUidRefusesTheUniqueExactMatch() async throws {
         let fresh = "fresh-\(UUID().uuidString)@example.com"
         let epoch = 73_001
         let server = FakeIMAPServer(
@@ -144,17 +157,15 @@ struct IMAPSaveDraftIdentityTests {
 
         let outcome = try await provider.saveDraft(
             Self.draft(fresh), existingIdentity: nil, draftsFolderPath: "Drafts")
-        guard case .created(.imap(let folder, let validity, let uid)) = outcome else {
-            Issue.record("expected typed IMAP address")
-            return
-        }
-        #expect(folder == "Drafts")
-        #expect(validity == epoch)
-        #expect(uid == 32)
+
+        #expect(outcome == .unaddressable)
+        // The user's content still reached the server — failing closed withholds
+        // the ADDRESS, never the draft.
         #expect(server.snapshotMessagesWithFlags(in: "Drafts").contains {
-            $0.message.uid == uid && $0.message.messageID == "<\(fresh)>"
+            $0.message.uid == 32 && $0.message.messageID == "<\(fresh)>"
         })
-        #expect(server.recordedCommands().contains { $0.contains("UID SEARCH") })
+        // D4's stated property, asserted on the wire: nothing searches.
+        #expect(!server.recordedCommands().contains { $0.contains("UID SEARCH") })
     }
 
     @Test("Non-UIDPLUS APPEND with duplicate exact matches returns unaddressable")
@@ -172,7 +183,73 @@ struct IMAPSaveDraftIdentityTests {
 
         let outcome = try await provider.saveDraft(
             Self.draft(fresh), existingIdentity: nil, draftsFolderPath: "Drafts")
+        // B1 — this outcome is now UNCONDITIONAL on the no-APPENDUID arm; the
+        // match count no longer participates in it. Kept as the duplicate-sibling
+        // cell of that closure, not as evidence that cardinality is what decides.
         #expect(outcome == .unaddressable)
         #expect(server.messageIDs(in: "Drafts").filter { $0 == "<\(fresh)>" }.count == 2)
+    }
+
+    /// **The C3 pin (B1, ADR-IOS-068/D4).** The invariant: *no mutation may land
+    /// on a message whose identity differs from the one this attempt created.*
+    ///
+    /// The reachable wrong-message path, on a CONFORMANT server: the mailbox is
+    /// one RFC 4315 §3 exempts from `APPENDUID` (`UIDNOTSTICKY`, or
+    /// APPEND-but-not-SELECT) while UIDPLUS — and therefore `UID EXPUNGE` — stays
+    /// available. Between the APPEND's tagged OK and the next command another
+    /// IMAP actor removes the appended copy, leaving exactly one same-Message-ID
+    /// sibling. Every guard the old arm relied on then passes ON THE SIBLING:
+    /// one `SEARCH` candidate, one exact Message-ID match, a positive epoch, a
+    /// positive UID. Its address is minted as this draft's, and production's very
+    /// next step on a draft address — `deleteDraft` → `deleteDraftStrong` →
+    /// STORE `\Deleted` → `expungeScopedToTargets` → `UID EXPUNGE` — destroys it.
+    /// That is the one delete in this app that is not a move to Trash.
+    ///
+    /// ⚠️ The RFC-keyed `wrongMessageViolations()` oracle is STRUCTURALLY BLIND
+    /// here and is asserted only as a non-regression: the bystander and the draft
+    /// share one Message-ID by construction (that IS the defect), so an oracle
+    /// that discriminates by Message-ID cannot tell them apart. The load-bearing
+    /// assertions are therefore the physical wire state and the command log.
+    @Test("A same-Message-ID bystander is never adopted or mutated when APPENDUID is withheld")
+    func withheldAppendUidNeverAdoptsASameMessageIdBystander() async throws {
+        let shared = "shared-\(UUID().uuidString)@example.com"
+        let epoch = 75_001
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(51, shared)]])
+        server.setUidValidity(epoch, for: "Drafts")
+        server.withholdAppendUID(in: "Drafts")
+        server.vanishAppendedMessages(in: "Drafts")
+        server.expectMutation(rfc822MessageId: shared)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let outcome = try await provider.saveDraft(
+            Self.draft(shared), existingIdentity: nil, draftsFolderPath: "Drafts")
+
+        // 1. No identity is minted from anything this attempt did not create.
+        #expect(outcome == .unaddressable)
+
+        // 2. If one ever is again, make the cost visible rather than latent:
+        //    drive the exact next call production makes on a draft address.
+        if case .created(.imap(let folder, let validity, let uid)) = outcome {
+            try? await provider.deleteDraft(
+                identity: .imap(folder: folder, uidValidity: validity, uid: uid))
+        }
+
+        // 3. The bystander is untouched ON THE WIRE — present, and not even
+        //    soft-deleted.
+        let survivors = server.snapshotMessagesWithFlags(in: "Drafts")
+        #expect(survivors.contains { $0.message.uid == 51 })
+        #expect(survivors.first { $0.message.uid == 51 }?.flags.contains("\\Deleted") != true)
+
+        // 4. No command capable of mutating it was ever issued, and nothing
+        //    searched for it in the first place.
+        let commands = server.recordedCommands()
+        #expect(!commands.contains { $0.contains("UID SEARCH") })
+        #expect(!commands.contains { $0.contains("UID STORE") })
+        #expect(!commands.contains { $0.contains("EXPUNGE") })
+        #expect(server.wrongMessageViolations().isEmpty)
     }
 }

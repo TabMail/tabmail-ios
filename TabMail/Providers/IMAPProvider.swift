@@ -4947,8 +4947,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         existingIdentity: DraftDeleteIdentity?,
         draftsFolderPath: String
     ) async throws -> DraftSaveOutcome {
-        // Guard: Message-ID is required for IMAP draft tracking (find UID after APPEND).
+        // Guard: the appended copy must carry the exact RFC 822 Message-ID the
+        // durable `Draft` row recorded, because the Outbox's post-send server-draft
+        // cleanup and the server-draft open path both correlate on it.
         // DraftStore.pushDraftToServer generates rfc822MessageId before calling this.
+        // It is CORROBORATING METADATA ONLY — ADR-IOS-068/D4 forbids it from ever
+        // selecting or authorizing a mutation target (see the no-APPENDUID arm below).
         guard let messageId = draft.messageId, !messageId.isEmpty else {
             print("[IMAP] saveDraft: no messageId — cannot track draft UID reliably")
             throw NSError(domain: "IMAPProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "Draft must have a Message-ID for IMAP tracking"])
@@ -5003,24 +5007,41 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     uid: Int(appendedUid.value)))
             }
 
-            // Without APPENDUID, raw SEARCH results are only candidates: RFC 3501
-            // header search may substring-match. Fetch and exact-verify every hit,
-            // then accept only one match under this action selection's positive epoch.
-            let found = try await self.searchByMessageId(messageId, server: server)
-            let verified = try await self.exactMessageIdMatches(
-                found, expectedRawMessageId: messageId, server: server)
-            let mintedEpoch = selection.uidValidity.value
-            if verified.count == 1,
-               let uid = verified.ranges.first?.lowerBound,
-               uid > 0,
-               mintedEpoch != 0 {
-                print("[IMAP] Saved draft to \(draftsFolderPath), uid=\(uid) (immediate verified exactly-one search)")
-                return .created(.imap(
-                    folder: draftsFolderPath,
-                    uidValidity: Int(mintedEpoch),
-                    uid: uid))
-            }
-            print("[IMAP] saveDraft: APPEND succeeded without an exact positive identity (verified=\(verified.count), candidates=\(found.count), uidValidity=\(mintedEpoch))")
+            // NO APPENDUID ⇒ NO ADDRESS. ADR-IOS-068/D4, clause 3: mutating UIDSets
+            // are built ONLY from UIDs that passed the discharge checklist, so **no
+            // SEARCH result is ever a mutation target** — on any path, however well
+            // verified. This arm used to run a Message-ID SEARCH, exact-verify the
+            // hits, and return the sole survivor's UID as this draft's address.
+            //
+            // Cardinality and exact-match verification cannot rescue that. They
+            // prove "exactly one message in this mailbox carries this Message-ID";
+            // they cannot prove "this is the message we just appended", because
+            // nothing correlates a SEARCH hit with THIS attempt. RFC 3501 gives a
+            // client no exclusivity over a mailbox between two commands: after the
+            // APPEND of X and before the SEARCH, another IMAP actor (a second
+            // TabMail instance, the Thunderbird addon, any other client) can move or
+            // expunge the appended copy while a same-Message-ID sibling Y remains.
+            // Every guard then passes on Y, Y's UID is persisted as X's address, and
+            // the next `deleteDraft` runs `deleteDraftStrong` → STORE `\Deleted` →
+            // `expungeScopedToTargets` → `UID EXPUNGE` against Y. That is C3 —
+            // and it is the one delete in this app that is NOT a move to Trash, so
+            // it destroys a draft the user still has. It is exactly the shape of
+            // `IOS-IMAP-002`, where "but we verified the hit" reasoning mutated
+            // every copy sharing a Message-ID.
+            //
+            // APPENDUID (RFC 4315 §3) is the ONLY attempt-correlated authority for a
+            // newly appended message. Without it this attempt has no address, so it
+            // reports one — `.unaddressable`, which is terminal for this attempt and
+            // clears the linkage rather than dropping the user's draft.
+            //
+            // ⚠️ ACCEPTED COST: a draft appended to a server that withholds
+            // APPENDUID (RFC 4315 §3 makes it a SHOULD "with limited exceptions",
+            // and those exceptions are properties of the MAILBOX) has no server
+            // address, so the app can no longer update or delete that server-side
+            // copy — the user may see a stray duplicate draft to remove by hand.
+            // That is recoverable by one ordinary gesture; expunging the wrong
+            // draft is not. Failing closed is correct here.
+            print("[IMAP] saveDraft: APPEND to \(draftsFolderPath) succeeded WITHOUT APPENDUID for '\(messageId)' (uidValidity=\(selection.uidValidity.value)) — no attempt-correlated address exists; NOT searching by Message-ID (ADR-IOS-068/D4: a SEARCH result is never a mutation target)")
             return .unaddressable
         }
     }
