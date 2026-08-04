@@ -5137,9 +5137,35 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // APPENDUID (RFC 4315 §3 makes it a SHOULD "with limited exceptions",
             // and those exceptions are properties of the MAILBOX) has no server
             // address, so the app can no longer update or delete that server-side
-            // copy — the user may see a stray duplicate draft to remove by hand.
-            // That is recoverable by one ordinary gesture; expunging the wrong
-            // draft is not. Failing closed is correct here.
+            // copy.
+            //
+            // ⚠️ THE COST IS **K STRAYS FOR K SAVES**, NOT ONE. This comment used
+            // to read "the user may see a stray duplicate draft to remove by
+            // hand" — SINGULAR — which understates it by an unbounded factor, in
+            // the one place an implementer touching this arm will read. The
+            // arithmetic: `.unaddressable` makes `DraftStore.applyPushCompletion`
+            // null `serverDraftId` / `serverDraftUidValidity` /
+            // `serverDraftFolderPath` / `serverPushStatus`, so
+            // `DraftStore.priorIdentity` returns nil on the NEXT save of the same
+            // draft, the old-copy delete is skipped, and each subsequent save
+            // APPENDs another copy. A user who edits a draft repeatedly
+            // accumulates one stray server copy PER SAVE.
+            //
+            // THE BOUND, and it is what makes K acceptable rather than an
+            // unbounded write loop: K is bounded by explicit user gestures and
+            // nothing else. The only `.saveDraft` `PendingOperation` producer is
+            // the user-gesture site in `AccountManagerActions`, and NO sweeper
+            // re-enqueues on `serverPushStatus` — so there is no autonomous
+            // APPEND loop and K cannot grow while the user is not saving.
+            //
+            // Every stray is recoverable by an ordinary gesture: the strays are
+            // ordinary messages in the Drafts folder, synced with real server
+            // UIDs by `SyncEngine`, so the ordinary message-delete path addresses
+            // them by their own synced UID and never needs APPENDUID —
+            // `.unaddressable` is a property of the APPEND RESPONSE, not of the
+            // mailbox's ability to report UIDs on FETCH/SELECT. Expunging the
+            // wrong draft is NOT recoverable. Failing closed is correct here.
+            // Registered as `KNOWN_ISSUES.md` `IOS-DRAFT-011`.
             print("[IMAP] saveDraft: APPEND to \(draftsFolderPath) succeeded WITHOUT APPENDUID for '\(messageId)' (uidValidity=\(selection.uidValidity.value)) — no attempt-correlated address exists; NOT searching by Message-ID (ADR-IOS-068/D4: a SEARCH result is never a mutation target)")
             return .unaddressable
         }
