@@ -124,8 +124,11 @@ extension AccountManager {
         throw ProviderError.notConnected // unreachable, satisfies compiler
     }
 
-    /// Fetch older messages for infinite scroll. Returns the number of new messages loaded.
-    func fetchOlderMessages(folders: [Folder]) async throws -> Int {
+    /// Fetch older messages for infinite scroll. Returns the number of new rows
+    /// materialised and the scroller's continuation signal — see
+    /// `SyncEngine.fetchOlderMessages` for what `mayHaveMore` means and why it is
+    /// NOT derived from `inserted`.
+    func fetchOlderMessages(folders: [Folder]) async throws -> (inserted: Int, mayHaveMore: Bool) {
         return try await syncEngine.fetchOlderMessages(folders: folders)
     }
 

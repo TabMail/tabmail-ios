@@ -232,6 +232,13 @@ enum SyncConfig {
     static let sqlChunkSize = 500
     /// Page size for inbox list pagination (per folder).
     static let inboxPageSize = 50
+    /// Per-folder page size the infinite scroller asks the SERVER for
+    /// (`SyncEngine.fetchOlderMessages`). Deliberately distinct from
+    /// `inboxPageSize`, which sizes the LOCAL list page: this is the number of
+    /// records we requested, so it — and never `inboxPageSize` — is the yardstick
+    /// for "the server handed back a FULL page, so it may hold older mail beyond
+    /// it". Was a bare `25` at three provider call sites.
+    static let infiniteScrollFetchLimit = 25
     /// Body fetch chunk — how many bodies to fetch at a time during background sync.
     static let bodyFetchChunkSize = 20
     /// HTTP body fetch concurrency (Gmail/Exchange) — ActiveBodyQueue concurrent fetches.

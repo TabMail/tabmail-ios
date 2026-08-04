@@ -146,6 +146,15 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// downstream can detect the swap from the parsed mapping alone — the
         /// app must refuse the ORDERING. `false` for every pre-existing test.
         var copyUidDestinationsDescending = false
+        /// Whether UID SEARCH honours the RFC 3501 §6.4.4 `SINCE` / `BEFORE` date
+        /// keys. `false` for every pre-existing test: this fake has always answered
+        /// UID SEARCH with the WHOLE mailbox regardless of the window asked for, and
+        /// the fixtures that page by date window (`1970 → now`) get the same answer
+        /// either way, so flipping the default would be a suite-wide behaviour edit
+        /// disguised as a test-infrastructure fix. A fixture whose SUBJECT is the
+        /// window — infinite-scroll paging, whose cursor IS the window — opts in via
+        /// `honorSearchDateCriteria()`.
+        var honorsSearchDateCriteria = false
         /// B1 (ADR-IOS-068/D4) — mailboxes whose APPEND is accepted, assigned a
         /// UID and acknowledged normally, but whose tagged OK omits the
         /// `APPENDUID` response code even though this server advertises UIDPLUS.
@@ -680,6 +689,62 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// UIDPLUS always does.
     func withholdCopyUID(forSourceUIDs uids: Set<Int>) {
         withState { $0.copyUidWithheldSourceUIDs = uids }
+    }
+
+    /// Test seam: make UID SEARCH answer only with the messages whose
+    /// INTERNALDATE satisfies the `SINCE` / `BEFORE` keys of the search, instead
+    /// of the whole mailbox. Required by any fixture that pages BY DATE WINDOW —
+    /// the infinite scroller re-asks with a window derived from the oldest row it
+    /// already has, so a server that ignores the window can only ever hand back
+    /// the same page and no continuation is observable. Off by default; see
+    /// `State.honorsSearchDateCriteria`.
+    func honorSearchDateCriteria() {
+        withState { $0.honorsSearchDateCriteria = true }
+    }
+
+    /// RFC 3501 §6.4.4 at DAY granularity, which is all the wire form carries
+    /// (`date-day "-" date-month "-" date-year`, written unpadded by NIO IMAP as
+    /// e.g. `4-Aug-2026`): `SINCE d` matches an INTERNALDATE **on or after** `d`,
+    /// `BEFORE d` one **strictly earlier** than `d`. Keys this fake does not model
+    /// are ignored, exactly as the un-filtered path ignores all of them.
+    private static func matchesSearchDateCriteria(_ message: Message, args: String) -> Bool {
+        let tokens = args.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" }).map(String.init)
+        guard let messageDay = searchDay(fromInternalDate: message.internalDate) else { return true }
+        var matches = true
+        for (index, token) in tokens.enumerated() {
+            let key = token.uppercased()
+            guard key == "SINCE" || key == "BEFORE", index + 1 < tokens.count,
+                  let bound = searchDay(fromCriterion: tokens[index + 1]) else { continue }
+            if key == "SINCE" {
+                matches = matches && messageDay >= bound
+            } else {
+                matches = matches && messageDay < bound
+            }
+        }
+        return matches
+    }
+
+    /// The UTC day-start of an `INTERNALDATE` value (`dd-MMM-yyyy HH:mm:ss Z`).
+    private static func searchDay(fromInternalDate value: String) -> Date? {
+        let parser = DateFormatter()
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        parser.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+        guard let parsed = parser.date(from: value) else { return nil }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        return utc.startOfDay(for: parsed)
+    }
+
+    /// The UTC day-start of a search key's date argument. `d-MMM-yyyy` accepts
+    /// both the unpadded form NIO IMAP writes and the zero-padded form other
+    /// clients write; surrounding quotes are optional per the grammar.
+    private static func searchDay(fromCriterion value: String) -> Date? {
+        let bare = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        let parser = DateFormatter()
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        parser.timeZone = TimeZone(identifier: "UTC")
+        parser.dateFormat = "d-MMM-yyyy"
+        return parser.date(from: bare)
     }
 
     /// Test seam (G1): the copies still land exactly where this fake put them,
@@ -1658,7 +1723,12 @@ final class FakeIMAPServer: @unchecked Sendable {
                     .map { String($0.uid) }
                 return "* SEARCH \(matched.joined(separator: " "))\r\n\(tag) OK UID SEARCH completed\r\n"
             }
-            let uids = withState { $0.messagesByMailbox[mailbox] ?? [] }
+            let all = withState { $0.messagesByMailbox[mailbox] ?? [] }
+            let honorsDates = withState { $0.honorsSearchDateCriteria }
+            let dateFiltered = honorsDates
+                ? all.filter { Self.matchesSearchDateCriteria($0, args: subargs) }
+                : all
+            let uids = dateFiltered
                 .map { String($0.uid) }
                 .joined(separator: " ")
             return "* SEARCH \(uids)\r\n\(tag) OK UID SEARCH completed\r\n"

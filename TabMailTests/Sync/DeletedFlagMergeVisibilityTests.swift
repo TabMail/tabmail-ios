@@ -115,6 +115,27 @@ struct DeletedFlagMergeVisibilityTests {
         """)
     }
 
+    /// The same fixture dated explicitly. Paging windows are DATE windows, so a
+    /// scenario about continuing past a page needs distinct dates; they are
+    /// computed from `Date()` at the call site rather than written down.
+    private static func message(_ uid: Int, _ id: String, date: Date) -> FakeIMAPServer.Message {
+        let rfc2822 = DateFormatter()
+        rfc2822.locale = Locale(identifier: "en_US_POSIX")
+        rfc2822.timeZone = TimeZone(identifier: "UTC")
+        rfc2822.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        return FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: deleted-flag paging fixture\r
+        Date: \(rfc2822.string(from: date))\r
+        Message-ID: <\(id)>\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        body\r
+
+        """)
+    }
+
     private static func provider(_ server: FakeIMAPServer) -> IMAPProvider {
         IMAPProvider(
             host: "127.0.0.1", port: server.port,
@@ -597,6 +618,125 @@ struct DeletedFlagMergeVisibilityTests {
                 """)
         #expect(listed.contains("51"),
                 "non-vacuity: the co-resident undeleted message must still be paged in")
+        #expect(Self.mutatingCommands(server.recordedCommands()).isEmpty)
+        #expect(Self.bareExpunges(server).isEmpty)
+    }
+
+    /// 🚨 **THE PAGING INVARIANT, asserted at the STORE: paging is never declared
+    /// exhausted while an older, non-`\Deleted` message is still reachable on the
+    /// server.** The test above pins that a soft-deleted record is not
+    /// materialised; it uses two records, so it cannot exercise what happens to
+    /// everything BEHIND one.
+    ///
+    /// The regression the skip introduced (`45ad66d38`) is that the scroller
+    /// measured "end of folder" with the count of rows it MATERIALISED.
+    /// `IMAPProvider.fetchOlderMessagesWithObservedEpoch` takes its
+    /// `Array(sorted.prefix(limit))` before any flag is known, so a `\Deleted`
+    /// record CONSUMES a slot in the page; skipping it then made a full page look
+    /// short, `hasMoreMessages` went false, and every message older than it became
+    /// unreachable by scrolling. One such record in one full page was enough —
+    /// and `IMAPProvider.searchDateRange` issues its `SINCE`/`BEFORE` search with
+    /// no `NOT DELETED` term, so the filter is live on exactly the mail paging
+    /// walks into: on a server without UIDPLUS, soft-deleted move sources
+    /// accumulate in older mail.
+    ///
+    /// The fixture is the smallest one that can show it: a page of exactly
+    /// `SyncConfig.infiniteScrollFetchLimit` records with the newest `\Deleted`,
+    /// and ONE further visible message older than the whole page. The assertion is
+    /// that the deeper message ends up in the store — not that any counter has a
+    /// particular value, which is the version of this test that would stay green
+    /// on a re-broken system.
+    ///
+    /// The loop consumes the production continuation signal rather than
+    /// re-deciding it, and is bounded so a non-terminating scroller fails here
+    /// instead of hanging: `paging must still stop at a genuinely empty folder` is
+    /// asserted on the same run.
+    ///
+    /// ## A1 — shipped `v1.6.38`
+    ///
+    /// `git show 07a4bb703:TabMail/ViewModels/InboxViewModel.swift`,
+    /// `loadMoreMessages` phase 2, is byte-identical to the pre-fix v3 sequence:
+    /// `let newCount = try await manager.fetchOlderMessages(folders: folders)` /
+    /// `if newCount == 0 { hasMoreMessages = false }` / `else { … hasMoreMessages =
+    /// freshPage.count >= SyncConfig.inboxPageSize }`, and shipped
+    /// `SyncEngine.fetchOlderMessages` returns a bare `Int` with zero occurrences
+    /// of `isDeletedOnServer`. Shipped therefore had NO separate exhaustion signal
+    /// to restore — it was correct only because it materialised every record the
+    /// server returned, so its insert count and the server's coverage were the same
+    /// number. The shipped architecture for THIS problem is NONEXISTENT and
+    /// authoring is the correct A1 branch.
+    @Test("Paging does not stop at a full page whose slots a \\Deleted record consumed — the message behind it stays reachable")
+    func pagingContinuesPastAFullPageContainingASoftDeletedRecord() async throws {
+        let limit = SyncConfig.infiniteScrollFetchLimit
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        // Dynamic dates (never hardcoded — a fixed date silently ages into a
+        // different relationship with `Date()`): one message per day, midday UTC
+        // so no timezone can shift one across a day boundary, newest yesterday.
+        // The IMAP date keys are day-granular, which is why one day of spacing is
+        // the unit here.
+        let noonYesterday = utc.date(byAdding: .hour, value: 12, to: utc.startOfDay(for: Date()))!
+            .addingTimeInterval(-86_400)
+        let deletedUID = 100 + limit + 1                    // newest, and \Deleted
+        let deepestUID = deletedUID - limit                 // strictly older than the whole page
+        let messages: [FakeIMAPServer.Message] = (0...limit).map { index in
+            Self.message(
+                deletedUID - index, "d3-paging-\(deletedUID - index)@example.com",
+                date: noonYesterday.addingTimeInterval(-86_400 * Double(index)))
+        }
+        let server = FakeIMAPServer(
+            capabilities: Self.nonUidplusCapabilities, mailboxes: ["Archive": messages])
+        // The scroller's cursor IS the search window, so a server that answered
+        // every window with the whole mailbox could not show a continuation at all.
+        server.honorSearchDateCriteria()
+        server.setUidValidity(Int(Self.epoch), for: "Archive")
+        server.setFlags(["\\Deleted"], in: "Archive", uid: deletedUID)
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let accountId = "d3-paging"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            totalCount: messages.count, lastKnownUidValidity: Int(Self.epoch))
+        let folder = try #require(try FolderEpochTestFixture.readFolder(
+            accountId: accountId, path: "Archive", pool: pool))
+
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let engine = await Self.engine(accountId: accountId, provider: provider)
+
+        // Scroll to the end of the folder exactly as the inbox does: pull, and
+        // pull again for as long as the pull itself says the server may hold more.
+        let maxPulls = 8
+        var pulls = 1
+        var pull = try await engine.fetchOlderMessages(folders: [folder])
+        while pull.mayHaveMore && pulls < maxPulls {
+            pull = try await engine.fetchOlderMessages(folders: [folder])
+            pulls += 1
+        }
+
+        let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(listed.contains(String(deepestUID)), """
+                a message OLDER than a full page containing one \\Deleted record is unreachable by \
+                scrolling. The server covered a full page, one slot of which held a record we \
+                correctly refuse to materialise; measuring exhaustion by what we materialised \
+                turned that into "end of folder" and stranded the rest of the folder \
+                (IOS-IMAP-001 / D3 regression)
+                """)
+        #expect(listed == Set((deepestUID..<deletedUID).map { String($0) }), """
+                paging did not surface exactly the visible mail: every non-\\Deleted message must \
+                be reachable and the \\Deleted one must not be present — listed=\(listed.count)
+                """)
+        #expect(!listed.contains(String(deletedUID)),
+                "the D3 filter was weakened: paging materialised the record the server reports as \\Deleted")
+        #expect(!pull.mayHaveMore && pulls < maxPulls,
+                "paging never terminated on a folder the server had fully shown — the scroller would spin forever")
         #expect(Self.mutatingCommands(server.recordedCommands()).isEmpty)
         #expect(Self.bareExpunges(server).isEmpty)
     }

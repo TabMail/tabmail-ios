@@ -1128,19 +1128,27 @@ final class InboxViewModel {
         Task { @MainActor in
             defer { isLoadingOlder = false }
             do {
-                let newCount = try await manager.fetchOlderMessages(folders: folders)
-                if newCount == 0 {
-                    hasMoreMessages = false
-                } else {
+                let pull = try await manager.fetchOlderMessages(folders: folders)
+                if pull.inserted > 0 {
                     // Network fetch added messages to GRDB; now load them locally
                     let freshPage = fetchPage(before: lastDate)
                     for msg in freshPage { loadedIds.insert(msg.id) }
                     loadedMessages.append(contentsOf: freshPage)
                     targetWindowSize += SyncConfig.inboxPageSize
-                    hasMoreMessages = freshPage.count >= SyncConfig.inboxPageSize
                     rebuildDisplayGroups()
                     scheduleEvictionIfNeeded()
                 }
+                // 🚨 EXHAUSTION IS A STATEMENT ABOUT SERVER COVERAGE, NEVER ABOUT
+                // HOW MANY ROWS WE MATERIALISED. Both signals this used to read —
+                // `newCount == 0` and `freshPage.count >= inboxPageSize` — count
+                // ROWS WE INSERTED, and a record the server reports `\Deleted`
+                // occupies a slot in the page and is deliberately never inserted
+                // (IOS-IMAP-001 / D3). One such record in a full page made the page
+                // look short, flipped this false, and left every older message in
+                // the folder unreachable by scrolling. The pull itself now reports
+                // what the SERVER covered; see `SyncEngine.fetchOlderMessages` for
+                // the coverage-AND-progress rule that also guarantees termination.
+                hasMoreMessages = pull.mayHaveMore
             } catch is CancellationError {
                 // Task cancelled (e.g., view disappeared) — not user-facing
             } catch {

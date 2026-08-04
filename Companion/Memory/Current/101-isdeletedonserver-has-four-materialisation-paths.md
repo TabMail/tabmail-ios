@@ -48,6 +48,53 @@ UID.**
    crawl**. Any future filter added on this path must preserve that: a filter that reduced `found`
    would turn a skipped message into a stalled walk.
 
+### 🚨 The fourth path had NO such signal, and `45ad66d38` therefore regressed it (found 2026-08-04)
+
+Boundary 2 above was stated for the CRAWL and was true there. **`SyncEngine.fetchOlderMessages` —
+the scroller — had no `found`/`inserted` split at all**: it returned a bare `Int` of rows it
+INSERTED, and `InboxViewModel.loadMoreMessages` decided "end of folder" from it twice
+(`if newCount == 0 { hasMoreMessages = false }`, then
+`hasMoreMessages = freshPage.count >= SyncConfig.inboxPageSize` off a DB re-query). Adding the
+`\Deleted` skip made *inserted < returned* possible on that path for the first time, so:
+
+- `IMAPProvider.fetchOlderMessagesWithObservedEpoch` takes `Array(sorted.prefix(limit))` **before any
+  flag is known**, so a `\Deleted` record CONSUMES a page slot;
+- one such record in a full page made the page look short;
+- `hasMoreMessages` went false and **every message older than it became unreachable by scrolling.**
+
+It is live, not theoretical: `IMAPProvider.searchDateRange` issues its `SINCE`/`BEFORE` search with
+**no `NOT DELETED` term**, and on a server without UIDPLUS soft-deleted move sources accumulate in
+exactly the older mail paging walks into.
+
+**The closure (state the invariant, not the instance): exhaustion is a statement about SERVER
+COVERAGE, never about how many rows we chose to materialise.** `fetchOlderMessages` now returns
+`(inserted: Int, mayHaveMore: Bool)` and owns the decision, because it owns the cursor; the view
+model just assigns `hasMoreMessages = pull.mayHaveMore`. `mayHaveMore` needs BOTH halves, per folder:
+**coverage** (`found >= SyncConfig.infiniteScrollFetchLimit` — the server handed back a page as large
+as the one we asked for) **and progress** (that folder inserted ≥1 row). The progress half is not a
+relapse into counting materialised rows: this pull's cursor IS the folder's oldest LOCAL row, so a
+round that inserts nothing re-asks the identical window forever — requiring an insert makes every
+continuing round strictly grow the local folder, which is finite. A full page in which nothing could
+be materialised therefore stops paging (fail closed, and recoverable: the deep crawl advances by date
+window independently of insertion, so that mail still lands locally and the next reset re-arms the
+scroller).
+
+Pinned by `DeletedFlagMergeVisibilityTests.pagingContinuesPastAFullPageContainingASoftDeletedRecord`,
+which asserts at the STORE that the message BEHIND a full `\Deleted`-bearing page is reachable — a
+test on any counter would stay green on a re-broken system. It needed `FakeIMAPServer` to honour
+`SINCE`/`BEFORE` (`honorSearchDateCriteria()`, opt-in — the fake answers every window with the whole
+mailbox by default and dozens of fixtures depend on that), because the scroller's cursor IS the
+window and a server that ignores the window can show no continuation at all.
+
+**Two adjacent facts, confirmed and deliberately NOT changed.** (a) In
+`insertBackfillBatchGuardable` the `\Deleted` `continue` sits ABOVE the `existingIds.contains`
+branch, so an already-present row whose server copy is `\Deleted` no longer gets the one-shot v10
+cc/bcc backfill (`ccBccBackfillDone` is a one-way latch) — correct as is; moving it below would spend
+a write on a row the merge is about to delete. (b) Phase 1 of `loadMoreMessages` still ends paging on
+`nextPage.count >= SyncConfig.inboxPageSize` (LOCAL rows), which is shipped `v1.6.38` behaviour,
+untouched by this row, and the reason phase 2 is only reached when a local page comes back exactly
+empty.
+
 🚨 **And the flag must stay OUT of the WINDOW.** Taking it into the window instead of into presence
 would raise the UID floor or trip the complete-knowledge branch and stale-delete rows the fetch never
 returned — the ADR-IOS-042 / `MIS-IOS-002` Archive mass-deletion shape. Sync windowing stays on

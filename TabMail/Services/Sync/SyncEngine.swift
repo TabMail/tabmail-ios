@@ -534,9 +534,38 @@ actor SyncEngine {
     // MARK: - Infinite Scroll (Fetch Older Messages)
 
     /// Fetch older messages for the given folders (infinite scroll).
-    /// Returns the number of new messages loaded across all folders.
-    func fetchOlderMessages(folders: [Folder]) async throws -> Int {
+    ///
+    /// - Returns: `inserted` — new rows materialised across all folders — and
+    ///   `mayHaveMore`, the scroller's continuation signal.
+    ///
+    /// 🚨 **`mayHaveMore` IS A STATEMENT ABOUT SERVER COVERAGE, NEVER ABOUT HOW
+    /// MANY ROWS WE CHOSE TO MATERIALISE.** A record the server reports `\Deleted`
+    /// consumes a slot in the page (`IMAPProvider.fetchOlderMessagesWithObservedEpoch`
+    /// takes its `prefix(limit)` before any flag is known) and is then deliberately
+    /// NOT inserted below (IOS-IMAP-001 / D3), so `inserted < found` is routine and
+    /// says nothing about whether the folder is exhausted. Deriving exhaustion from
+    /// `inserted` strands every message older than the first soft-deleted one.
+    /// `deepBackfillFolder` makes the same distinction — it terminates on
+    /// `found == 0` and never on `inserted == 0`, with a comment at that site
+    /// recording why — and this is the same rule for the paging pull.
+    ///
+    /// **TERMINATION.** Continuing requires BOTH halves, per folder:
+    /// 1. *coverage* — the server returned a page as large as the one we asked for
+    ///    (`found >= SyncConfig.infiniteScrollFetchLimit`), so older mail may exist
+    ///    beyond it; a short page means the server showed us everything it had; and
+    /// 2. *progress* — that folder materialised at least one new row. This pull's
+    ///    cursor IS the folder's oldest local row (`oldestDate` below), so a round
+    ///    that inserts nothing would re-ask the identical window forever. Requiring
+    ///    an insert makes every continuing round strictly grow the local folder,
+    ///    which is bounded by the server's finite message count.
+    ///
+    /// A full page in which nothing could be materialised therefore stops paging
+    /// (fail closed). That is recoverable without any user gesture: the deep
+    /// backfill crawl advances by DATE WINDOW independently of insertion, so the
+    /// mail beyond it still arrives locally and the next reset re-arms the scroller.
+    func fetchOlderMessages(folders: [Folder]) async throws -> (inserted: Int, mayHaveMore: Bool) {
         var totalNew = 0
+        var mayHaveMore = false
         for folder in folders {
             guard let queue = workQueues[folder.accountId] else { continue }
             let provider = queue.provider
@@ -550,17 +579,18 @@ actor SyncEngine {
                     .fetchOne(db)?.date ?? Date()
             }
 
+            let pageLimit = SyncConfig.infiniteScrollFetchLimit
             let fetched: (headers: [MessageHeaderInfo], observedEpoch: UInt32?)
             do {
                 fetched = try await queue.execute(priority: .userAction) {
                     if let imapProvider = provider as? IMAPProvider {
                         let result = try await imapProvider.fetchOlderMessagesWithObservedEpoch(
-                            folder: folder.path, before: oldestDate, limit: 25)
+                            folder: folder.path, before: oldestDate, limit: pageLimit)
                         return (result.messages, result.observedEpoch)
                     } else if let gmailProvider = provider as? GmailProvider {
-                        return (try await gmailProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25), nil)
+                        return (try await gmailProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: pageLimit), nil)
                     } else if let exchangeProvider = provider as? ExchangeProvider {
-                        return (try await exchangeProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: 25), nil)
+                        return (try await exchangeProvider.fetchOlderMessages(folder: folder.path, before: oldestDate, limit: pageLimit), nil)
                     }
                     return ([], nil)
                 }
@@ -573,6 +603,11 @@ actor SyncEngine {
                 throw error
             }
             let headers = fetched.headers
+            // COVERAGE — what the SERVER returned for the window we asked about.
+            // The `\Deleted` records the insert loop below deliberately skips are
+            // still counted here, exactly as `backfillWindow`'s `found` counts the
+            // records its own dedupe skips. Never narrow this to the insert count.
+            let found = headers.count
             let sourceBoundEpoch = fetched.observedEpoch.flatMap { epoch in
                 epoch > 0 ? Int(exactly: epoch) : nil
             }
@@ -668,11 +703,21 @@ actor SyncEngine {
 
             if !newHeaders.isEmpty {
                 await indexHeadersForFTS(newHeaders)
-                print("[InfiniteScroll] \(folder.name): +\(newHeaders.count) older messages")
+                print("[InfiniteScroll] \(folder.name): +\(newHeaders.count) of \(found) older messages")
+            } else if found > 0, DebugModeManager.isLoggingEnabled() {
+                print("[InfiniteScroll] \(folder.name): server returned \(found) records, none materialised — this pull's cursor cannot advance, so paging stops")
             }
             totalNew += newHeaders.count
+
+            // COVERAGE (`found` — what the server returned, including the
+            // `\Deleted` records the loop above deliberately skipped) AND PROGRESS
+            // (this folder materialised something, so the cursor moves). See the
+            // termination note on this function; neither half alone is sound.
+            if found >= pageLimit && !newHeaders.isEmpty {
+                mayHaveMore = true
+            }
         }
-        return totalNew
+        return (totalNew, mayHaveMore)
     }
 
     /// Apply snippet updates directly to GRDB — no background queue needed.
