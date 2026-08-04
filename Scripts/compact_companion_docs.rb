@@ -706,7 +706,7 @@ def verify_repository_companion_references
     next unless relative_path.match?(/\.(?:md|swift|html|rb|sh|ya?ml)\z/)
 
     body = File.binread(path)
-    body.scan(%r{Companion/(?:Memory|Decisions|Process|Rules)/[^\s`'"\])>]+\.md}).uniq.each do |target|
+    body.scan(%r{Companion/(?:Memory|Decisions|Process|Rules|Mistakes)/[^\s`'"\])>]+\.md}).uniq.each do |target|
       checked += 1
       missing << "#{relative_path}: #{target}" unless File.file?(File.join(ROOT, target))
     end
@@ -714,6 +714,78 @@ def verify_repository_companion_references
   abort("broken repository companion references:\n#{missing.join("\n")}") unless missing.empty?
 
   puts "repository companion references: #{checked} routed pointers checked, all targets exist"
+end
+
+# Per-file budgets in BYTES for the mandatory-load files. These are the same numbers as
+# `.claude/skills/companion-compact/measure.sh`; that script lives outside this repository, so the
+# budgets are duplicated here deliberately and `verify_indexes_are_indexes` runs it when present.
+INDEX_BUDGETS = {
+  "CLAUDE.md" => 30_000,
+  "PROJECT_STRUCTURE.md" => 8_000,
+  "PROJECT_MEMORY.md" => 25_000,
+  "DECISIONS.md" => 25_000,
+  "MISTAKES.md" => 12_000
+}.freeze
+INDEX_SCOPE_BUDGET = 100_000
+# A routed body at least this large, found verbatim in a mandatory-load file, is an un-routed
+# duplicate. Shorter fragments (a bare section heading, a two-line table) can legitimately appear
+# in both the index and its routed detail.
+INLINE_DUPLICATE_MIN_BYTES = 1_000
+MEASURE_SCRIPT = "../.claude/skills/companion-compact/measure.sh"
+
+# The failure this check exists for: the `v1.6.38` compaction extracted every fragment into
+# `Companion/` but never replaced the mandatory-load files with indexes, so both copies existed for
+# two months. `verify` could not see it: it reconstructs fragments against `SOURCE_REV` and never
+# looks at the working-tree index. This check looks at the working tree.
+def verify_indexes_are_indexes
+  violations = []
+  indexes = {}
+  scope_bytes = 0
+  INDEX_BUDGETS.each do |name, budget|
+    path = File.join(ROOT, name)
+    next unless File.exist?(path)
+
+    body = File.binread(path)
+    indexes[name] = body
+    scope_bytes += body.bytesize
+    next unless body.bytesize > budget
+
+    violations << format(
+      "%s is %d B, over its %d B budget by %d%%",
+      name, body.bytesize, budget, (body.bytesize - budget) * 100 / budget
+    )
+  end
+  if scope_bytes > INDEX_SCOPE_BUDGET
+    violations << format("scope total is %d B, over the %d B budget", scope_bytes, INDEX_SCOPE_BUDGET)
+  end
+
+  duplicates = 0
+  Dir.glob(File.join(COMPANION_ROOT, "**", "*.md")).sort.each do |fragment_path|
+    body = exact_body(File.binread(fragment_path))
+    next if body.bytesize < INLINE_DUPLICATE_MIN_BYTES
+
+    relative = fragment_path.delete_prefix(ROOT + "/")
+    indexes.each do |name, index_body|
+      next unless index_body.include?(body)
+
+      duplicates += 1
+      violations << "#{name} holds the verbatim body of #{relative} (#{body.bytesize} B): route it and leave a linked index row"
+    end
+  end
+
+  measure = File.expand_path(MEASURE_SCRIPT, ROOT)
+  if File.executable?(measure)
+    output, = Open3.capture2e(measure, File.basename(ROOT), chdir: File.dirname(ROOT))
+    output.lines.grep(/OVER|VERDICT|scope total|\[scope total\]/).each { |line| puts "  measure.sh | #{line.rstrip}" }
+  else
+    puts "  measure.sh | not present at #{MEASURE_SCRIPT} (private tooling); budgets checked natively"
+  end
+
+  unless violations.empty?
+    abort("mandatory-load files are not indexes (#{duplicates} un-routed duplicate bodies):\n- #{violations.join("\n- ")}")
+  end
+
+  puts "index discipline: #{indexes.length} mandatory-load files within budget (#{scope_bytes} B total), no routed body duplicated inline"
 end
 
 command = ARGV.fetch(0, "verify")
@@ -741,6 +813,9 @@ when "verify"
   verify_ported_memory
   verify_markdown_links
   verify_repository_companion_references
+  verify_indexes_are_indexes
+when "verify-indexes"
+  verify_indexes_are_indexes
 else
-  abort("usage: #{File.basename($PROGRAM_NAME)} [generate|verify]")
+  abort("usage: #{File.basename($PROGRAM_NAME)} [generate|verify|verify-indexes]")
 end
