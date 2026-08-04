@@ -1042,17 +1042,20 @@ actor ExchangeProvider: EmailProvider {
     /// Graph resource IDs are opaque. Encode them as one strict RFC 3986 path
     /// segment before composing any resource URL so `/`, `?`, `#`, `+`, and `=`
     /// cannot alter the route selected by the server.
-    private static let graphPathSegmentAllowed = CharacterSet(
-        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-    )
-
+    ///
+    /// The allowed set and the encoding itself now live once, in
+    /// `GraphAPI.encodedGraphPathSegment` — `Shared` is linked by both the app
+    /// and the notification-service extension, so the NSE's own Graph URLs
+    /// compose through the identical set. This wrapper survives only to keep
+    /// the failure in THIS target's error domain: `ProviderError` is declared in
+    /// `TabMail/Providers/EmailProvider.swift` and is not visible from `Shared`,
+    /// and every `ExchangeProvider` caller's disposition on an unencodable id is
+    /// unchanged by the move.
     private static func encodedGraphPathSegment(
         _ value: String,
         context: String
     ) throws -> String {
-        guard let encoded = value.addingPercentEncoding(
-            withAllowedCharacters: graphPathSegmentAllowed
-        ) else {
+        guard let encoded = GraphAPI.encodedGraphPathSegment(value) else {
             throw ProviderError.invalidURL(context)
         }
         return encoded

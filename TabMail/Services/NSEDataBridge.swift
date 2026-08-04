@@ -2810,8 +2810,11 @@ enum NSEDataBridge {
     /// **IMAP** — plain custom-keyword names. Strip `tm_*` and every
     /// exclusion `UserLabelStore.isExcludedKeyword` knows about.
     ///
-    /// **Outlook** — Graph categories aren't surfaced as user labels yet
-    /// (see `ExchangeProvider.parseGraphMessage` → `userLabelIds: []`).
+    /// **Outlook** — a Graph message `category` IS Outlook's user label. Keep
+    /// every category except the reserved `tm_*` namespace, through the SAME
+    /// predicate `ExchangeProvider.parseGraphMessage` filters with and
+    /// `stripLegacyCategories` DELETES with (ADR-IOS-036: action tags are
+    /// local-only). Names are kept VERBATIM, unlike IMAP's lowercasing.
     fileprivate static func filterUserLabels(
         provider: String, rawLabels: [String],
         accountId: String, db: GRDB.Database
@@ -2848,9 +2851,24 @@ enum NSEDataBridge {
             return rawLabels.filter { !UserLabelStore.isExcludedKeyword($0) }
                 .map { $0.lowercased() }  // Matches IMAPProvider's lowercase normalization.
         case "outlook":
-            // Graph user labels aren't supported yet — ExchangeProvider
-            // returns `userLabelIds: []` in parseGraphMessage. Match that.
-            return []
+            // Parity with `ExchangeProvider.parseGraphMessage`, which maps
+            // `categories` straight into `userLabelIds` through this same
+            // predicate (`e265428ff`). Before that commit both sides returned
+            // `[]` and this arm was correct; afterwards it was the only path
+            // still dropping them, so an NSE-delivered Outlook message carried
+            // no label rows until the next main-app sync.
+            //
+            // ONE predicate, not a second copy: `isLegacyActionTagCategory` is
+            // also what `stripLegacyCategories` uses to DELETE `tm_*`
+            // categories from the server, so a category that path erases can
+            // never be surfaced here as a label the user owns.
+            //
+            // 🚨 VERBATIM — do NOT lowercase. The IMAP arm above lowercases
+            // because RFC 3501 keywords are case-INsensitive; Graph category
+            // names are case-SENSITIVE display strings, and the main-app read
+            // and write paths both keep them unchanged. Lowercasing here would
+            // mint a second `UserLabel.id` for one category.
+            return rawLabels.filter { !ExchangeProvider.isLegacyActionTagCategory($0) }
         default:
             return []
         }
@@ -3589,8 +3607,8 @@ enum NSEDataBridge {
             // labels don't pollute the Labels UI. See `filterUserLabels`
             // for the per-provider contract. Gmail uses a main-GRDB
             // userLabel lookup (Path A); IMAP uses UserLabelStore
-            // exclusions; Outlook stays empty (categories not surfaced
-            // as user labels yet — matches ExchangeProvider).
+            // exclusions; Outlook keeps every Graph category except the
+            // reserved `tm_*` namespace (matches ExchangeProvider).
             //
             // For any id we keep, upsert a placeholder `UserLabel` row so
             // the junction's foreign key holds (mirror of SyncEngineFullSync:

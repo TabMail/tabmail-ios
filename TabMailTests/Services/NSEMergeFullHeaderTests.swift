@@ -316,18 +316,54 @@ struct NSEMergeFullHeaderTests {
         #expect(junctionIds.contains("acc1:important") || junctionIds.contains("acc1:work"))
     }
 
-    @Test("Outlook merge inserts NO user-label rows (categories not yet surfaced)")
-    func outlookNoUserLabels() throws {
+    /// RE-SCOPED, not deleted. Previous display name:
+    /// **"Outlook merge inserts NO user-label rows (categories not yet surfaced)"**
+    /// (`func outlookNoUserLabels`), which asserted `count == 0`. That test
+    /// BLESSED the defect: `e265428ff` made `ExchangeProvider.parseGraphMessage`
+    /// map Graph `categories` into `userLabelIds`, and from then on
+    /// `filterUserLabels`' `"outlook"` arm was the only path still dropping
+    /// them, so an NSE-delivered Outlook message carried no label rows at all
+    /// until the next main-app sync. Its premise — "categories not yet
+    /// surfaced" — is simply no longer true.
+    ///
+    /// The invariant now pinned is the merge-path PARITY contract this whole
+    /// function exists for: **what the NSE merge materializes for an Outlook
+    /// message must equal what the main-app read path derives from the same
+    /// `categories` array** — real categories kept VERBATIM, the reserved
+    /// `tm_*` namespace dropped (case-insensitively, since
+    /// `ExchangeProvider.stripLegacyCategories` DELETES those from the server).
+    @Test("Outlook merge keeps Graph categories verbatim and drops only tm_*")
+    func outlookCategoriesBecomeUserLabels() throws {
         let db = try makeDB()
         let msg = staged(
             provider: "outlook",
-            providerLabels: ["tm_reply", "Important"]
+            // `tm_reply` and `TM_Reply` are both reserved (the predicate
+            // lowercases before testing the prefix); `Important` and `Receipts`
+            // are ordinary user categories, and their capitals must survive —
+            // Graph category names are case-SENSITIVE display strings, so a
+            // lowercasing arm would mint a second `UserLabel.id` per category.
+            providerLabels: ["tm_reply", "TM_Reply", "Important", "Receipts"]
         )
         let (_, headerId) = try insert(msg, into: db)
-        let count = try db.read { try Int.fetchOne($0, sql: """
-            SELECT COUNT(*) FROM messageUserLabel WHERE messageId = ?
-            """, arguments: [headerId]) } ?? -1
-        #expect(count == 0)
+
+        let junctionIds = try db.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT userLabelId FROM messageUserLabel
+                WHERE messageId = ? ORDER BY userLabelId
+                """, arguments: [headerId])
+        }.map { $0["userLabelId"] as String }
+        // Junction ids are the account-prefixed SURROGATE `userLabel.id`
+        // (D10 / `IOS-LABEL-001`); the bare category lives in `providerLabelId`.
+        #expect(junctionIds == ["acc1:Important", "acc1:Receipts"])
+
+        let providerIds = try db.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT providerLabelId FROM userLabel
+                WHERE accountId = ? ORDER BY providerLabelId
+                """, arguments: ["acc1"])
+        }
+        // Bare, verbatim, and no `tm_*` row was minted on the way through.
+        #expect(providerIds == ["Important", "Receipts"])
     }
 
     // MARK: - Idempotence

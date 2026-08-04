@@ -62,6 +62,38 @@ enum GraphAPI {
     /// message full fetches (main-app `fetchMessage`, NSE `messageFull`).
     static let fullSelectFields = "\(headerOnlyFields),body,parentFolderId"
 
+    // MARK: - Path-segment encoding (single source of truth for BOTH targets)
+
+    /// The RFC 3986 **unreserved** set — the only characters that may appear
+    /// literally in a Graph path segment.
+    ///
+    /// Graph resource ids (message ids, attachment ids, folder ids) are opaque
+    /// server-minted strings. Interpolating one raw into a URL lets `/`, `?`,
+    /// `#`, `+` or `=` inside it change which **route** the server selects, so
+    /// every id is encoded as exactly one path segment before composition.
+    ///
+    /// This set was authored on the main-app side (`ExchangeProvider`) and is
+    /// **moved** here, not copied: `Shared` is linked by the app AND the
+    /// notification-service extension, and a second copy is precisely how the
+    /// `$select` field lists above drifted apart before they were consolidated.
+    static let graphPathSegmentAllowed = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+
+    /// Percent-encode `value` as one strict path segment, or `nil` if it cannot
+    /// be encoded.
+    ///
+    /// **Returns an optional rather than throwing, deliberately.** The main app
+    /// surfaces this failure as `ProviderError.invalidURL(context)`, and
+    /// `ProviderError` is declared in the main-app target
+    /// (`TabMail/Providers/EmailProvider.swift`) — it is not visible from
+    /// `Shared`, which the NSE also links. Handing each caller the `nil` lets
+    /// both keep their own error domain unchanged while the allowed set and the
+    /// encoding call itself exist exactly once.
+    static func encodedGraphPathSegment(_ value: String) -> String? {
+        value.addingPercentEncoding(withAllowedCharacters: graphPathSegmentAllowed)
+    }
+
     /// Walk a `$delta` pagination chain starting from `deltaLink` (or fresh
     /// delta endpoint on first sync) until the final page (carrying
     /// `@odata.deltaLink` = new cursor). Collapses all intermediate pages into
@@ -131,7 +163,10 @@ enum GraphAPI {
     /// Fetch a single message's metadata. Graph returns header fields inline on
     /// `/messages/{id}` (no `format=metadata` equivalent needed).
     static func messageMetadata(http: AuthedHTTP, id: String) async throws -> MessageMetadata {
-        let url = "\(baseURL)/messages/\(id)?$select=\(metadataSelectFields)"
+        guard let encodedId = encodedGraphPathSegment(id) else {
+            throw HTTPError.invalidURL("Graph message id")
+        }
+        let url = "\(baseURL)/messages/\(encodedId)?$select=\(metadataSelectFields)"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let metadata = GraphParse.parseMessage(json) else {
@@ -151,7 +186,10 @@ enum GraphAPI {
         attachmentFetcher: BodyRenderer.AttachmentFetcher? = nil,
         icsRenderer: BodyRenderer.ICSRenderer? = nil
     ) async throws -> (MessageMetadata, RenderedBody) {
-        let url = "\(baseURL)/messages/\(id)?$select=\(fullSelectFields)&$expand=attachments"
+        guard let encodedId = encodedGraphPathSegment(id) else {
+            throw HTTPError.invalidURL("Graph message id")
+        }
+        let url = "\(baseURL)/messages/\(encodedId)?$select=\(fullSelectFields)&$expand=attachments"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let metadata = GraphParse.parseMessage(json) else {
@@ -189,7 +227,13 @@ enum GraphAPI {
 
     /// Fetch raw attachment bytes by attachment id.
     static func attachment(http: AuthedHTTP, messageId: String, attachmentId: String) async throws -> Data {
-        let url = "\(baseURL)/messages/\(messageId)/attachments/\(attachmentId)"
+        guard let encodedMessageId = encodedGraphPathSegment(messageId) else {
+            throw HTTPError.invalidURL("Graph message id")
+        }
+        guard let encodedAttachmentId = encodedGraphPathSegment(attachmentId) else {
+            throw HTTPError.invalidURL("Graph attachment id")
+        }
+        let url = "\(baseURL)/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let b64 = json["contentBytes"] as? String,
@@ -199,16 +243,18 @@ enum GraphAPI {
         return bytes
     }
 
-    /// PATCH a message — used for isRead flip, category add/remove, flag set.
-    static func patch(http: AuthedHTTP, messageId: String, body: [String: Any]) async throws {
-        let data = try JSONSerialization.data(withJSONObject: body)
-        _ = try await http.patch("\(baseURL)/messages/\(messageId)", body: data)
-    }
-
-    /// Move a message to a different folder.
-    static func move(http: AuthedHTTP, messageId: String, destinationFolderId: String) async throws {
-        let body: [String: Any] = ["destinationId": destinationFolderId]
-        let data = try JSONSerialization.data(withJSONObject: body)
-        _ = try await http.post("\(baseURL)/messages/\(messageId)/move", body: data)
-    }
+    // NOTE — THIS SURFACE IS DELIBERATELY READ-ONLY. It used to carry `patch`
+    // (isRead / categories / flag) and `move`. Both had ZERO callers on every
+    // target, and they were DELETED rather than encoded, because the NSE has no
+    // business mutating the user's mailbox: it enriches a delivered
+    // notification, and every provider mutation in this app goes through the
+    // durable `PendingOperation` queue in the main app, which the extension
+    // process cannot drain. The KEEP banner at the top of this file asks whether
+    // a phase-B NSE consumer will need a method before removing it — for these
+    // two the answer is no, permanently, and their absence is now what makes
+    // "read-only" true rather than merely intended.
+    //
+    // If a Graph mutation is ever genuinely needed from shared code, it must be
+    // reintroduced with `encodedGraphPathSegment` applied to every id, as the
+    // read helpers above do.
 }
