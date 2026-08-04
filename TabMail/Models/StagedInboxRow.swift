@@ -30,6 +30,28 @@ struct StagedInboxRow: Sendable, Equatable {
     let isForwarded: Bool
     let actionTag: String?
     let summaryBlurb: String?
+    /// The UIDVALIDITY the NSE's OWN live SELECT observed when it staged this
+    /// row — the epoch under which `messageId` (a mailbox-local UID on IMAP) is
+    /// a meaningful address. `nil` for Gmail/Graph (stable ids, no epoch), for
+    /// rows staged before `nse_processed_message.observedUidValidity` existed,
+    /// and for anything the projection could not prove.
+    ///
+    /// **A PROVEN VALUE OR NIL — never the `0` sentinel.** RFC 3501 §2.3.1.1
+    /// types UIDVALIDITY as `nz-number`, so `0` can only mean "not reported";
+    /// `NSEDataBridge.StagedMessage.toInboxRow()` normalizes through
+    /// `SyncEngine.knownUidValidity` so a `0` arrives here as `nil` rather than
+    /// as a false trust claim. Carried onto `MessageHeader.observedUidValidity`
+    /// by `toMessageHeader()` so a gesture on a just-pushed row is adjudicated
+    /// by `AccountManager.admittedOrdinaryActionTargets` on the evidence the
+    /// NSE actually had — admitted when it equals the folder's live epoch,
+    /// refused (terminally) when it positively disagrees.
+    ///
+    /// `var` with a default rather than `let`: a `let` with a default is
+    /// EXCLUDED from the synthesized memberwise initializer entirely, whereas a
+    /// `var` with one participates with that default — so every pre-existing
+    /// `StagedInboxRow(...)` construction site compiles unchanged. Same
+    /// rationale as `NSEDataBridge.StagedMessage.observedUidValidity`.
+    var observedUidValidity: Int? = nil
 
     /// Matches the eventual GRDB `MessageHeader.id` for this message.
     var headerId: String {
@@ -69,6 +91,14 @@ struct StagedInboxRow: Sendable, Equatable {
         h.actionTag = actionTag.flatMap { ActionTag(rawValue: $0) }
         h.tagSortOrder = h.actionTag?.sortOrder ?? 99
         h.summaryBlurb = summaryBlurb
+        // The epoch is TRUST (ADR-IOS-061: UID = address, RFC = identity, epoch
+        // = trust). Dropping it here made a positively-proven address enter the
+        // action path as "unknown", so the gesture the user was just shown was
+        // refused by the very guard the epoch exists to satisfy. Carrying it is
+        // fail-SAFE: `admittedOrdinaryActionTargets` admits only on EQUALITY
+        // with the folder's live epoch, so a moved epoch can only ever cause a
+        // refusal, never a wrong admission (`IOS-NSE-001`).
+        h.observedUidValidity = observedUidValidity
         h.headerComplete = true
         return h
     }

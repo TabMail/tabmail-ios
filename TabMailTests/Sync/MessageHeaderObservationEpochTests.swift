@@ -285,8 +285,15 @@ struct MessageHeaderObservationEpochTests {
         }
     }
 
-    @Test("NSE staged-only headers remain epochless until staged-row epoch validation lands")
-    func stagedHeaderIsEpochless() {
+    /// RE-SCOPED (`IOS-NSE-001`). Previous display name: *"NSE staged-only
+    /// headers remain epochless until staged-row epoch validation lands"* —
+    /// that name blessed the defect, because the projection dropped a
+    /// POSITIVELY-PROVEN epoch too, not just an absent one. The carry has now
+    /// landed (`NSEStagedEpochCarryTests` covers the proven half), so what
+    /// remains true — and is the two-sided control that an absence of evidence
+    /// is never upgraded to proof — is only the UNSTAMPED half asserted here.
+    @Test("An unstamped NSE staged row still projects an epochless header")
+    func unstampedStagedHeaderIsEpochless() {
         let staged = StagedInboxRow(accountId: "a", folderPath: "INBOX", messageId: "16", rfc822MessageId: nil, threadId: nil, inReplyTo: nil, references: [], subject: "staged", senderName: "Sender", senderAddress: "sender@example.com", to: "r@example.com", snippet: "staged", date: .distantPast, isRead: false, isFlagged: false, hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil, summaryBlurb: nil)
         #expect(staged.toMessageHeader().observedUidValidity == nil)
     }

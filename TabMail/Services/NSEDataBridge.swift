@@ -3471,6 +3471,17 @@ enum NSEDataBridge {
             isInInbox: true
         )
         header.rfc822MessageId = msg.rfc822MessageId
+        // The epoch under which the NSE's own live SELECT observed this UID.
+        // Both epoch ARMs have already run before a row reaches here — ARM 1
+        // (`detectOldEpochStagedRows` → `applyOldEpochStagingCleanup`) DELETES a
+        // staged row whose epoch positively disagrees with a settled folder
+        // epoch, and ARM 2 keeps a quarantined row for retry instead of merging
+        // it — so no positively-stale value can be written by this line. Writing
+        // nil where a proven value exists was the only one of the three options
+        // that manufactured a false "unknown" (`IOS-NSE-001`). Normalized
+        // through `SyncEngine.knownUidValidity` so the `0` sentinel never
+        // reaches a column other readers test only for non-nil.
+        header.observedUidValidity = SyncEngine.knownUidValidity(msg.observedUidValidity)
         header.inReplyTo = msg.inReplyTo
         header.referencesJSON = MessageHeader.encodeReferences(msg.references)
         header.cc = msg.cc
@@ -3828,7 +3839,13 @@ extension NSEDataBridge.StagedMessage {
             isReplied: isReplied,
             isForwarded: isForwarded,
             actionTag: actionTag,
-            summaryBlurb: summaryBlurb
+            summaryBlurb: summaryBlurb,
+            // Carry the epoch the NSE's own SELECT proved — do NOT re-derive it
+            // here. `SyncEngine.knownUidValidity` is the tree's single
+            // "is this an epoch at all" normalizer and rejects BOTH nil and the
+            // `0` sentinel (RFC 3501 §2.3.1.1 `nz-number`), so an unreported
+            // epoch stays unknown rather than becoming a false trust claim.
+            observedUidValidity: SyncEngine.knownUidValidity(observedUidValidity)
         )
     }
 
