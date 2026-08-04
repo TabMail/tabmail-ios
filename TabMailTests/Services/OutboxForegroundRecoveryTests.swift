@@ -95,6 +95,12 @@ struct OutboxForegroundRecoveryTests {
         try pool.read { try OutboxMessage.fetchOne($0, key: id) }
     }
 
+    /// The production wake query, read synchronously. Kept as a helper so an
+    /// `async` case cannot accidentally bind GRDB's async `read` overload.
+    private func wakeTarget(_ pool: DatabasePool, at instant: Date) throws -> OutboxMessage? {
+        try pool.read { try AccountManager.earliestFutureHoldWakeTarget(now: instant, db: $0) }
+    }
+
     // MARK: - IOS-OUTBOX-001
 
     /// **The property: the user's send is live again without relaunching the app.**
@@ -262,5 +268,112 @@ struct OutboxForegroundRecoveryTests {
             try AccountManager.earliestFutureHoldWakeTarget(now: now, db: $0)
         }
         #expect(target == nil)
+    }
+
+    // MARK: - The wake HANDOFF: selection and re-check read the clock twice
+
+    /// **THE INVARIANT: every queued, unsent row is, when its hold expires, either
+    /// claimed by the current drain or covered by an autonomous future drain —
+    /// never left depending solely on an unrelated external trigger.**
+    ///
+    /// The two rows above pin the SELECTION. This pins the HANDOFF from that
+    /// selection to the timer, which is a second decision at a SECOND instant:
+    /// `drainOutbox` captures `wakeNow`, awaits a `dbPool.read` whose predicate is
+    /// `holdUntil > wakeNow`, and then re-checks the answer against a FRESH
+    /// `Date()`. If the deadline elapses during that read the row was future when
+    /// selected and past when re-checked — and the drain loop has already
+    /// finished. The old `hold > Date()` re-check simply fell through there, so NO
+    /// timer was armed for a row nothing else was going to look at.
+    ///
+    /// Asserted as coverage — *a drain is scheduled, and not after the deadline* —
+    /// never as "the interval is zero". A zero-interval assertion pins the fix's
+    /// mechanism and would stay green on a system re-broken a different way.
+    ///
+    /// The blessing gap this closes, stated plainly: `futureHeldRowIsNotShadowed`
+    /// above and `ComposeThrottleTests.PostLoopWakeUpQueryTests.guardAgainstPastHold`
+    /// both check the selected row is STILL future at a later instant, using
+    /// comfortable 300 s / 5 s deadlines. Neither exercises the boundary, so both
+    /// bless the two-instant shape as sufficient. They remain correct and untouched.
+    @Test("A deadline that elapses while the wake query is in flight still gets an autonomous drain")
+    func anElapsedWakeDeadlineStillSchedulesAnAutonomousDrain() throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restore(pool: pool, dir: dir, previous: previous) }
+
+        let wakeNow = Date()
+        let hold = wakeNow.addingTimeInterval(5)
+        try seedOutbox(pool, id: "elapsing", status: .queued, sentAt: nil, holdUntil: hold)
+
+        // Instant 1 — the production selection, exactly as `drainOutbox` runs it.
+        let target = try pool.read {
+            try AccountManager.earliestFutureHoldWakeTarget(now: wakeNow, db: $0)
+        }
+        #expect(target?.id == "elapsing", "precondition: the wake query selected the row")
+
+        // Instant 2 — the re-check, after a read that outlived the deadline. The
+        // row is unchanged; only the clock moved.
+        let reCheck = hold.addingTimeInterval(1)
+        let delay = AccountManager.wakeUpDelay(for: target, at: reCheck)
+
+        #expect(delay != nil, """
+            no autonomous drain was scheduled for a queued, unsent row whose hold had already \
+            expired. The drain loop finished before this point, so the row now sits `.queued` \
+            until some unrelated external trigger — a foreground return, a sync, another \
+            `queueSend` — happens along. The user's send waits on an event that may never come
+            """)
+        guard let delay else { return }
+        #expect(reCheck.addingTimeInterval(delay) <= max(hold, reCheck),
+                "the drain was scheduled AFTER the deadline it exists to honour")
+        #expect(delay >= 0, """
+            a negative interval TRAPS at `UInt64(interval * 1_000_000_000)` — converting a \
+            negative Double to UInt64 is a runtime crash, not a saturating conversion
+            """)
+    }
+
+    /// The other half of the invariant, and the proof that the re-drive the clause
+    /// above schedules is neither a no-op nor a loop.
+    ///
+    /// Once a deadline has passed the row leaves the WAKE query's predicate
+    /// (`holdUntil > now`), so no second timer can be armed for it — the re-drive
+    /// terminates. And the real send gate ADMITS it, so the pass that re-drive
+    /// starts claims the row instead of falling through again. Coverage is
+    /// therefore handed from the timer to the drain loop, with no gap.
+    @Test("The re-drive an elapsed deadline schedules terminates and claims the row")
+    func theReDriveTerminatesAndClaimsTheElapsedRow() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restore(pool: pool, dir: dir, previous: previous) }
+
+        let elapsed = try seedOutbox(pool, id: "elapsed", status: .queued, sentAt: nil,
+                                     holdUntil: Date().addingTimeInterval(-1))
+
+        // Termination: an elapsed row is not a wake target, so the re-drive cannot
+        // arm another timer for it. (Read through a synchronous helper: inside an
+        // `async` case, `pool.read { }` would resolve to GRDB's async overload.)
+        let target = try wakeTarget(pool, at: Date())
+        #expect(target == nil, "an elapsed deadline re-armed a timer instead of being drained")
+
+        // Non-vacuity: it is not "covered" by being invisible. The gate every send
+        // passes through admits it, so the re-drive's pass transmits the message.
+        #expect(await AccountManager.shared.atomicClaimForTesting(elapsed) == true,
+                "the row the timer handed to the drain loop is refused by the send gate — it is stranded")
+    }
+
+    /// Control: the ordinary path is unchanged. A deadline still in the future
+    /// schedules the drain at exactly that deadline — not earlier (which would
+    /// spin) and not later (which would delay the user's send).
+    @Test("Control: a still-future deadline schedules the drain exactly at that deadline")
+    func aFutureDeadlineSchedulesTheDrainAtTheDeadline() throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restore(pool: pool, dir: dir, previous: previous) }
+
+        let now = Date()
+        let hold = now.addingTimeInterval(300)
+        try seedOutbox(pool, id: "future", status: .queued, sentAt: nil, holdUntil: hold)
+
+        let target = try pool.read {
+            try AccountManager.earliestFutureHoldWakeTarget(now: now, db: $0)
+        }
+        let delay = try #require(AccountManager.wakeUpDelay(for: target, at: now))
+        #expect(abs(now.addingTimeInterval(delay).timeIntervalSince(hold)) < 0.001,
+                "the clamp changed the ordinary path — a future deadline must be honoured exactly")
     }
 }

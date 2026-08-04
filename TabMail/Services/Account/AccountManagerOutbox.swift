@@ -414,8 +414,7 @@ extension AccountManager {
         } catch {
             earliest = nil
         }
-        if let earliest, let hold = earliest.holdUntil, hold > Date() {
-            let interval = hold.timeIntervalSinceNow
+        if let interval = Self.wakeUpDelay(for: earliest, at: Date()) {
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 guard !Task.isCancelled else { return }
@@ -452,6 +451,43 @@ extension AccountManager {
             .filter(Column("holdUntil") > now)
             .order(Column("holdUntil").asc)
             .fetchOne(db)
+    }
+
+    /// How long the wake-up timer must sleep before the next autonomous drain,
+    /// given the row `earliestFutureHoldWakeTarget` selected and the instant of
+    /// the caller's re-check. `nil` ONLY when there is no such row at all.
+    ///
+    /// 🚨 AN ALREADY-ELAPSED DEADLINE MEANS "DRAIN NOW", NEVER "DO NOTHING".
+    /// The selection and this re-check read the clock at two different instants
+    /// with an `await dbPool.read` between them, and the query's predicate is
+    /// `holdUntil > now`. A row that was future when the query ran can therefore
+    /// be past by the time the caller re-checks — and the drain loop above has
+    /// already finished. A `hold > Date()` guard that simply fell through in
+    /// that case armed NO timer at all and left the row `.queued` until some
+    /// unrelated external trigger (foreground, sync, another `queueSend`)
+    /// happened along. Clamping at zero schedules an immediate re-drain instead.
+    ///
+    /// **The re-drive terminates, and it claims the row.** The drain loop's own
+    /// admission filter is `(holdUntil ?? .distantPast) <= Date()`, so a row
+    /// whose deadline has passed is admitted by the very next pass rather than
+    /// falling through again; and `earliestFutureHoldWakeTarget` filters
+    /// `holdUntil > now`, so that same row is no longer a wake target and no
+    /// second timer can be armed for it. There is no loop to spin.
+    ///
+    /// The clamp is also what keeps the caller's
+    /// `UInt64(interval * 1_000_000_000)` from TRAPPING: converting a negative
+    /// `Double` to `UInt64` is a runtime crash, not a saturating conversion.
+    ///
+    /// A still-future deadline is unaffected — `max(0, positive) == positive` —
+    /// so the ordinary path is byte-identical to before.
+    ///
+    /// `instant` is a parameter for exactly the reason
+    /// `earliestFutureHoldWakeTarget` takes `now`: the decision must be
+    /// evaluable at a chosen instant, not only at whatever the wall clock
+    /// happens to read while a test is running.
+    nonisolated static func wakeUpDelay(for target: OutboxMessage?, at instant: Date) -> TimeInterval? {
+        guard let hold = target?.holdUntil else { return nil }
+        return max(0, hold.timeIntervalSince(instant))
     }
 
     /// Atomic claim: re-read + status check + mark .sending + persist sentMessageId
