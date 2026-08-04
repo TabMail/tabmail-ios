@@ -172,16 +172,65 @@ struct MessageHeaderObservationEpochTests {
         #expect(moved?.observedUidValidity == nil)
     }
 
+    /// 🚨 RE-SCOPED (2026-08-03). Prior display name, recorded because the
+    /// assertion is unchanged and only the setup is: *"Undo leaves the restored
+    /// row epochless until sync proves its address"* — same name, kept.
+    ///
+    /// **This test was VACUOUS and passed on `nil == nil`.** Its `snapshot` was
+    /// never inserted, so `undoMove`'s member authentication
+    /// (`MessageHeader.fetchOne(db, key: member.originalHeaderId)`) found no row
+    /// and refused the whole command before writing anything. The read then
+    /// returned `nil`, and `restored?.observedUidValidity` on a `nil` row is
+    /// `nil`, so the expectation held no matter what production did — inverting
+    /// the epoch rule could not turn it red.
+    ///
+    /// It also predated `59423bb7d`/`f7c3354c5`. Post-O2, undo of a DRAINED
+    /// IMAP move is an ordinary reverse move, and "epochless" is specifically
+    /// the QUEUED IMAP INVERSE arm: `restoreSourceEpoch = annihilate || !isIMAP`
+    /// in `AccountManager.undoMove`. An annihilated (never-attempted) move and a
+    /// stable-id provider both RESTORE the captured source epoch, so a fixture
+    /// whose forward op is still queued-and-unattempted would pin the opposite
+    /// rule. The forward op is therefore already gone from the queue here (the
+    /// drain completed it), which is exactly the state the drain leaves behind.
+    ///
+    /// THE SETUP MODELS THE DRAIN, not a shortcut around it. The row carries the
+    /// DESTINATION address `COPYUID` proved — `MessageHeaderRekey.finishMove`
+    /// re-keys the primary key and `messageId` to the destination UID and stamps
+    /// the destination epoch — and the stacked `UndoMember` follows it via
+    /// `UndoService.applyRekeys`, which moves ONLY the two address fields and
+    /// leaves every source field describing where the message came from. That is
+    /// why the snapshot's `id`/`messageId` name the Archive address while its
+    /// `folderPath`/`observedUidValidity` still name INBOX and epoch 101.
+    ///
+    /// NON-VACUITY IS ASSERTED, not assumed: the row must EXIST and must have
+    /// moved back to INBOX. Both are properties of production having actually
+    /// run; a refusal leaves the row in Archive and fails the test.
     @Test("Undo leaves the restored row epochless until sync proves its address")
     func undoClearsEpoch() async throws {
         let (pool, dir, previous, folder) = try Self.fixture(folderEpoch: 101)
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try FolderEpochTestFixture.insertFolder(accountId: folder.accountId, path: "Archive", role: .archive, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: folder.accountId, path: "Archive", role: .archive, pool: pool,
+            lastKnownUidValidity: 202)
+        let destinationId = "\(folder.accountId):Archive:205"
+        // The row as the drain leaves it: seated at the destination address
+        // COPYUID proved, stamped with the destination folder's epoch.
+        try await pool.write { db in
+            var row = MessageHeader(messageId: "205", subject: "undo", from: "Sender", fromAddress: "sender@example.com", to: "r@example.com", date: .distantPast, snippet: "undo", folderId: "\(folder.accountId):Archive", accountId: folder.accountId, folderPath: "Archive", isInInbox: false)
+            row.id = destinationId
+            row.observedUidValidity = 202
+            try row.insert(db)
+        }
+        // The stacked member as `UndoService.applyRekeys` leaves it: the two
+        // ADDRESS fields follow the re-key, every source field does not.
         var snapshot = MessageHeader(messageId: "10", subject: "undo", from: "Sender", fromAddress: "sender@example.com", to: "r@example.com", date: .distantPast, snippet: "undo", folderId: folder.id, accountId: folder.accountId, folderPath: folder.path, isInInbox: true)
         snapshot.observedUidValidity = 101
+        snapshot.id = destinationId
+        snapshot.messageId = "205"
         await AccountManager.shared.undoDestructiveAction([snapshot], accountId: folder.accountId, originalOpType: .move, fromFolderPath: "Archive", toFolderPath: "INBOX", toFolderId: folder.id)
-        let restored = try await Self.stored(pool, id: snapshot.id)
-        #expect(restored?.observedUidValidity == nil)
+        let restored = try #require(try await Self.stored(pool, id: destinationId))
+        #expect(restored.folderPath == "INBOX", "the undo must have actually run — a refusal leaves the row in Archive")
+        #expect(restored.observedUidValidity == nil)
     }
 
     @Test("An unbound body-queue UID rekey clears the epoch")
