@@ -470,6 +470,62 @@ struct AIWriteIdentityGuardTests {
         }
     }
 
+    /// The MULTI-FIELD guarded mutation, shaped like production site 5
+    /// (`AccountManagerAI.processMessage`): one AI job stamps the summary, the action
+    /// tag, the precomputed reply and the `notified` flag through the same choke
+    /// point. The misattribution pins use it because the invariant is *no AI field of
+    /// X lands on Y*, not *one particular field did not*.
+    private func attemptFullAIWrite(
+        _ db: DatabaseQueue, target: AIWriteTarget, blurb: String
+    ) throws -> AIWriteOutcome {
+        try db.write { db in
+            try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                msg.summaryBlurb = blurb
+                msg.setActionTag(.reply)
+                msg.cachedReply = "X's precomputed reply"
+                msg.notified = true
+                try msg.save(db)
+            }
+        }
+    }
+
+    /// NON-VACUITY, at value level: run the EXACT pre-guard expression every one of
+    /// the nine sites used before T4.V7 — a bare `MessageHeader.fetchOne` + mutate +
+    /// save — prove it LANDS, then undo it. Without this a `.dropped` could just as
+    /// well mean the row was absent, locked or otherwise unwritable.
+    private func proveBareWriteLandsThenUndo(_ db: DatabaseQueue, headerId: String) throws {
+        let landed: Bool = try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: headerId) else { return false }
+            bare.summaryBlurb = "pre-guard control write"
+            try bare.save(db)
+            return true
+        }
+        #expect(landed, "the row must be present and writable, else the drop proves nothing")
+        #expect(try blurb(db, headerId) == "pre-guard control write")
+        try db.write { db in
+            guard var bare = try MessageHeader.fetchOne(db, key: headerId) else { return }
+            bare.summaryBlurb = nil
+            try bare.save(db)
+        }
+    }
+
+    /// The END STATE the C3 invariant names: the row now at the captured address is
+    /// the OTHER message, and it carries **no** AI field produced for X. Asserted on
+    /// the database rather than on any guard's return value, so it stays true of the
+    /// system rather than of one mechanism.
+    private func expectNoAIFieldOfXLandedOn(
+        _ db: DatabaseQueue, headerId: String, subject: String, rfc822: String?
+    ) throws {
+        let after = try db.read { try MessageHeader.fetchOne($0, key: headerId) }
+        #expect(after != nil, "the replacement row must still be present")
+        #expect(after?.subject == subject, "the row at X's address must still be the replacement")
+        #expect(after?.rfc822MessageId == rfc822, "the row at X's address must still be the replacement")
+        #expect(after?.summaryBlurb == nil, "X's summary landed on another message — misattribution (C3)")
+        #expect(after?.actionTag == nil, "X's action tag landed on another message — misattribution (C3)")
+        #expect(after?.cachedReply == nil, "X's precomputed reply landed on another message — misattribution (C3)")
+        #expect(after?.notified == false, "X's notified stamp landed on another message — misattribution (C3)")
+    }
+
     // MARK: The hazard — a proven UIDVALIDITY turnover
 
     @Test("A UIDVALIDITY turnover means X's AI summary never lands on the message now at X's address")
@@ -586,12 +642,23 @@ struct AIWriteIdentityGuardTests {
         #expect(after == "X's summary", "the ordinary healthy write must land — this is the whole product")
     }
 
-    @Test("An rfc-less message with no epoch anywhere is still captured and still written")
-    func rfcLessMessageIsStillWritten() throws {
-        // The exact shape `v2final`'s `AIWriteTarget.capture` REFUSES
-        // (`normalizedRfc == nil && observedUidValidity == nil`). On v3 that shape is
-        // the demo account, the ScreenshotMode folders and the whole first-sync
-        // window, so refusing would disable AI for them permanently and silently.
+    /// 🚨 AUDIT ROUND 4 / `IOS-ROUND3-D6` — **RE-SCOPED, NOT DELETED.** Its previous
+    /// display name was *"An rfc-less message with no epoch anywhere is still
+    /// captured and still written"* and it asserted `.written`, which BLESSED arm 7's
+    /// fail-open admit: with no content witness and no numbering anywhere, nothing
+    /// established that the row in front of the write was still the row that was
+    /// captured, and the old arm returned it anyway.
+    ///
+    /// The half of it that was always right is kept verbatim in behaviour: **capture
+    /// stays unconditional** (`v2final` refuses to capture this shape, which makes
+    /// the whole AI job a permanent no-op; v3 does not). What changed is the WRITE,
+    /// and the second half of this test is what keeps the change from being a
+    /// blackout: once the next sync observes the folder's numbering and stamps the
+    /// row, the very same rfc-less message DOES receive its AI result — through arm
+    /// 8's positive three-way agreement, on the fresh capture the queue's arbiter
+    /// re-drives (`summaryBlurb` is still nil, so the job was never retired).
+    @Test("An rfc-less row with no numbering anywhere is captured, refused, and lands once its epoch is observed")
+    func rfcLessMessageIsRefusedUntilItsNumberingIsObserved() throws {
         let db = try makeFixture(folderEpoch: nil)
         let original = makeHeader(subject: "No RFC", rfc822: nil, observedEpoch: nil)
         try db.write { try original.insert($0) }
@@ -600,14 +667,62 @@ struct AIWriteIdentityGuardTests {
         #expect(target != nil, "capture must NOT refuse an rfc-less row with no epoch baseline")
         guard let target else { return }
 
-        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
-        #expect(outcome == .written)
-        let after = try blurb(db, Self.headerId)
-        #expect(after == "X's summary", "an rfc-less message must not be permanently un-writable by AI")
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let refused = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(refused == .dropped,
+                """
+                An AI result was written against a row with NO content witness and NO numbering \
+                anywhere — nothing positively established that this is still the captured message, \
+                and a WRITE needs positive evidence (C3).
+                """)
+        #expect(try blurb(db, Self.headerId) == nil)
+        // The job was NOT retired, so the arbiter re-drives it — this is the
+        // mechanism by which the refusal is recoverable rather than permanent.
+        let stillNeedsSummary = try db.read { db -> Bool in
+            guard let header = try MessageHeader.fetchOne(db, key: Self.headerId) else { return false }
+            return header.summaryBlurb == nil || header.summaryBlurb?.isEmpty == true
+        }
+        #expect(stillNeedsSummary, "a refused write must leave the job re-drivable")
+
+        // The next sync pass: `runSyncMessages` stamps the folder from the SELECT that
+        // served its fetch, and the rows it merges carry that same observation.
+        try db.write { db in
+            guard var folder = try Folder.fetchOne(db, key: Self.folderId) else { return }
+            folder.lastKnownUidValidity = 111
+            try folder.update(db)
+            guard var header = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            header.observedUidValidity = 111
+            try header.save(db)
+        }
+
+        // The arbiter re-drives the job, and capture reads the CURRENT row — which is
+        // how production captures (`processOpenedMessage`, `ActiveAIQueue.executeJob`).
+        let recaptured = try db.read { db -> AIWriteTarget? in
+            guard let current = try MessageHeader.fetchOne(db, key: Self.headerId) else { return nil }
+            return try AIWriteTarget.capture(message: current, db: db)
+        }
+        guard let recaptured else {
+            #expect(Bool(false), "re-capture must succeed")
+            return
+        }
+        let landed = try attemptSummaryWrite(db, target: recaptured, blurb: "X's summary")
+        #expect(landed == .written,
+                "an rfc-less message must not be permanently un-writable by AI — arm 8 must carry it")
+        #expect(try blurb(db, Self.headerId) == "X's summary")
     }
 
-    @Test("An unknown folder epoch is an absence of evidence, not a mismatch — the write lands")
-    func unknownFolderEpochStillWrites() throws {
+    /// 🚨 AUDIT ROUND 4 / `IOS-ROUND3-D6` — **RE-SCOPED, NOT DELETED.** Previous
+    /// display name: *"An unknown folder epoch is an absence of evidence, not a
+    /// mismatch — the write lands"*. That name is universally quantified and, after
+    /// arm 7 was amended, FALSE in general: an unknown folder epoch now refuses
+    /// every row it cannot otherwise identify. The case this test actually
+    /// constructs is the RFC-BEARING one, and it stays green because **arm 6's
+    /// content witness — not arm 7 — is what carries it.** (Same hazard class as
+    /// `IOS-ROUND3-D5`: a universally-quantified name that enumerates a subset reads
+    /// to a later reader as a proof it is not.)
+    @Test("An unknown folder epoch does not refuse a row its Message-ID still identifies")
+    func unknownFolderEpochStillWritesOnTheContentWitness() throws {
         let db = try makeFixture(folderEpoch: nil)
         let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
         try db.write { try original.insert($0) }
@@ -621,7 +736,8 @@ struct AIWriteIdentityGuardTests {
         let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
         #expect(outcome == .written)
         let after = try blurb(db, Self.headerId)
-        #expect(after == "X's summary", "T1.3 first-sync / demo / screenshot state must not disable AI")
+        #expect(after == "X's summary",
+                "the T1.3 first-sync window must not disable AI for a row whose content is still identifiable")
     }
 
     /// 🚨 AUDIT ROUND 1 / C-1. This test previously asserted the OPPOSITE
@@ -887,11 +1003,19 @@ struct AIWriteIdentityGuardTests {
 
     /// The state where NOTHING has ever been observed — the folder was never
     /// selected either (first sync, `ScreenshotMode`'s raw-SQL folders). Distinct
-    /// from the tests above, where the folder's numbering IS known, and reachable
-    /// only through the epoch arms because such a row may have no RFC id at all.
-    /// Without this the fix would be free to read as "refuse whenever a stamp is
-    /// missing", which silently disables AI for every account's first sync.
-    @Test("An unstamped row in a never-observed folder still writes through")
+    /// from the tests above, where the folder's numbering IS known. Without this the
+    /// fix would be free to read as "refuse whenever a stamp is missing", which
+    /// silently disables AI for every account's first sync.
+    ///
+    /// 🚨 AUDIT ROUND 4 / `IOS-ROUND3-D6` — **RE-SCOPED, NOT DELETED.** Previous
+    /// display name: *"An unstamped row in a never-observed folder still writes
+    /// through"*, and its comment claimed the case was *"reachable only through the
+    /// epoch arms because such a row may have no RFC id at all"*. It never was: the
+    /// row it constructs carries `<x@example.com>`, so **arm 6 carries it**, and it
+    /// stays green for that reason after arm 7 was amended. The genuinely
+    /// witnessless variant it appeared to cover is
+    /// `rfcLessMessageIsRefusedUntilItsNumberingIsObserved` above, which now refuses.
+    @Test("An unstamped row in a never-observed folder still writes through on its content witness")
     func unstampedHeaderInNeverObservedFolderStillWrites() throws {
         let db = try makeFixture(folderEpoch: nil)
         let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
@@ -951,5 +1075,284 @@ struct AIWriteIdentityGuardTests {
         #expect(outcome == .written)
         let after = try blurb(db, Self.headerId)
         #expect(after == "gmail summary", "a stable-provider message must never be epoch-refused")
+    }
+
+    // MARK: - IOS-ROUND3-D6 — an ABSENT or UNPROVEN folder epoch may not authorize a write
+    //
+    // The invariant these pin is the one `resolveCurrentHeader`'s own doc comment
+    // states and arm 7 used to violate: **a WRITE needs positive evidence, and an
+    // unknown epoch must never authorize a mutation.** It is the OPPOSITE direction
+    // from the durable `PendingOperation` rule, where an unknown epoch must never
+    // retire the user's intention — deliberately, because an AI write is
+    // recomputable and a misattribution is not.
+    //
+    // The old arm was `guard let liveEpoch = folder?.lastKnownUidValidity else
+    // { return header }` — an ADMIT that optional-chaining made a MISSING folder
+    // satisfy exactly as readily as a never-observed one.
+
+    /// Invariant: **a header that outlived its `Folder` row is not thereby
+    /// authorized.** This is the structural half of the chain — migration
+    /// `v2_dropMessageHeaderFolderFK` rebuilt `messageHeader` with `folderId` as a
+    /// plain column and NO foreign key (only `accountId` cascades), so
+    /// `SyncEngine.fullSync`'s vanished-folder cleanup deletes the folder row and
+    /// leaves its headers orphaned — its own comment says so. `TestDatabase.make()`
+    /// enables foreign keys, so the surviving row below is evidence of the absent
+    /// cascade rather than an assumption about it.
+    @Test("An orphaned RFC-less header whose Folder row is gone receives no AI write")
+    func absentFolderRefusesTheWriteForAWitnesslessRow() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: nil, observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed — capture is unconditional by design")
+        guard let target else { return }
+
+        try db.write { db in _ = try Folder.deleteOne(db, key: Self.folderId) }
+        let orphan = try db.read { try MessageHeader.fetchOne($0, key: Self.headerId) }
+        let folderAfter = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(folderAfter == nil, "the folder row must be gone")
+        #expect(orphan != nil, "the header must SURVIVE its folder — nothing cascades it (migration v2)")
+
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, Self.headerId) == nil,
+                """
+                An AI result was written against a header whose folder row does not exist. \
+                "We could not look" is not "nothing has happened here" — it is the absence of \
+                evidence, and a write needs positive evidence (C3).
+                """)
+    }
+
+    /// Invariant: **a folder whose numbering was never observed does not authorize a
+    /// write it cannot otherwise identify.** The row here IS stamped; the folder is
+    /// not, so no three-way agreement is obtainable and there is no content witness.
+    /// This is the same posture the durable-gesture path already takes on the same
+    /// state — `AccountManager.newGestureRefusedForUnknownEpoch` refuses on a nil
+    /// `lastKnownUidValidity` (`IOS-EPOCH-001`).
+    @Test("A never-observed folder epoch does not authorize an AI write for a witnessless row")
+    func nilFolderEpochRefusesTheWriteForAWitnesslessRow() throws {
+        let db = try makeFixture(folderEpoch: nil)
+        let original = makeHeader(subject: "Original X", rfc822: nil, observedEpoch: 111)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        let folderBefore = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(folderBefore?.lastKnownUidValidity == nil, "the folder must be present and unstamped")
+
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+        #expect(try blurb(db, Self.headerId) == nil,
+                """
+                An AI result was written under a folder epoch nobody has ever observed. Nothing \
+                established that this UID still names the captured message, and a write needs \
+                positive evidence (C3).
+                """)
+    }
+
+    /// 🚨 THE MISATTRIBUTION PIN — the whole reachable chain, replayed, asserted on
+    /// the END STATE. Each step is a real production behaviour, cited where it lives:
+    ///
+    ///  1. X is an RFC-less IMAP header in folder F at epoch 111.
+    ///  2. F vanishes server-side. `SyncEngine.fullSync` deletes the `Folder` row and
+    ///     X survives as an orphan (no FK since migration `v2`).
+    ///  3. F returns at epoch 222. The re-created row takes the deterministic
+    ///     `"\(accountId):\(path)"` id, re-adopting the orphan — and it is NOT
+    ///     stamped, because `uidValidityBootstrapWrite(observed:stored:
+    ///     folderHoldsRows:)` refuses to stamp a folder that already holds rows. The
+    ///     production decision function is called here rather than restated, so this
+    ///     step cannot drift from it.
+    ///  4. `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch` cannot sample an
+    ///     all-RFC-less population (its statement excludes rows with no
+    ///     `rfc822MessageId`), returns `.unobservable`, and does NOT quarantine.
+    ///  5. The merge seats a DIFFERENT message at X's canonical address:
+    ///     `SyncEngine.providerAddressOwnershipProven` admits the canonical-PK hit
+    ///     (`row.id == canonicalId`), so X's row becomes Y in place and is stamped
+    ///     222.
+    ///
+    /// Then one AI job for X returns. The property: **no AI field computed for X may
+    /// appear on Y.** RED before the fix — arms 1–3 pass on the identical composite
+    /// address, arm 6 has no witness on either side, and the old arm 7 returned Y
+    /// because the folder's epoch is still nil.
+    @Test("No AI field computed for X lands on the message a re-created folder seated at X's address")
+    func witnesslessReplacementInARecreatedFolderReceivesNoAIFieldOfX() throws {
+        // 1 — X, RFC-less, at UID 42 under epoch 111.
+        let db = try makeFixture(folderEpoch: 111)
+        let x = makeHeader(subject: "Original X", rfc822: nil, observedEpoch: 111)
+        try db.write { try x.insert($0) }
+
+        let target = try capture(db, x)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        // 2 + 3 — the folder vanishes and returns at epoch 222, re-adopting the orphan.
+        let holdsRows: Bool = try db.write { db in
+            _ = try Folder.deleteOne(db, key: Self.folderId)
+            let holds = try MessageHeader
+                .filter(Column("folderId") == Self.folderId).fetchCount(db) > 0
+            var recreated = Folder(
+                name: "INBOX", path: Self.folderPath, role: .inbox, accountId: Self.accountId)
+            recreated.lastKnownUidValidity = SyncEngine.uidValidityBootstrapWrite(
+                observed: 222, stored: nil, folderHoldsRows: holds)
+            try recreated.insert(db)
+            return holds
+        }
+        #expect(holdsRows, "the orphaned header must survive the folder deletion — no FK cascades it")
+        let recreatedFolder = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(recreatedFolder?.lastKnownUidValidity == nil,
+                "a folder that already holds rows must NOT be stamped by assertion (T4.S6b)")
+        #expect(recreatedFolder?.uidValidityResetPendingAt == nil,
+                "step 4 does not quarantine — `.unobservable` does nothing, by the anti-brick rule")
+
+        // 4 — the verified door cannot help: no row here carries an rfc822 to sample.
+        let sampled = try db.read { db in
+            try SyncEngine.sampleUidsForEpochVerification(
+                db, folderId: Self.folderId, highCount: 8, lowCount: 8)
+        }
+        #expect(sampled.isEmpty,
+                "an all-RFC-less population yields no sample, so the epoch stays unknown (.unobservable)")
+
+        // 5 — the merge seats Y at X's canonical address and stamps it with the new epoch.
+        let canonicallyOwned = SyncEngine.providerAddressOwnershipProven(
+            row: x, accountId: Self.accountId, folderPath: Self.folderPath,
+            folderId: Self.folderId, messageId: Self.uid, canonicalId: Self.headerId,
+            windowMode: .uid, sourceBoundEpoch: 222)
+        #expect(canonicallyOwned, "the canonical-PK hit is what lets the merge overwrite this row in place")
+        try db.write { db in
+            guard var seated = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            seated.subject = "Impostor Y"
+            seated.from = "Other <other@example.com>"
+            seated.fromAddress = "other@example.com"
+            seated.rfc822MessageId = nil
+            seated.observedUidValidity = 222
+            try seated.save(db)
+        }
+
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let outcome = try attemptFullAIWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+        try expectNoAIFieldOfXLandedOn(db, headerId: Self.headerId, subject: "Impostor Y", rfc822: nil)
+    }
+
+    /// The sharper sub-case of the same hole, and the one that is least defensible:
+    /// the captured Message-ID is PRESENT and the row now at that address carries a
+    /// DIFFERENT one. That is not missing evidence — it is a **positive
+    /// disagreement**, precisely the replacement arm 6 exists to catch, and the old
+    /// arm 7 admitted it whenever the folder happened to be unstamped.
+    @Test("A positive Message-ID disagreement is refused even when the folder was never observed")
+    func positiveRfcDisagreementInANeverObservedFolderIsRefused() throws {
+        let db = try makeFixture(folderEpoch: nil)
+        let x = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: 111)
+        try db.write { try x.insert($0) }
+
+        let target = try capture(db, x)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        try db.write { db in
+            guard var seated = try MessageHeader.fetchOne(db, key: Self.headerId) else { return }
+            seated.subject = "Impostor Y"
+            seated.rfc822MessageId = "<y@example.com>"
+            seated.observedUidValidity = nil
+            try seated.save(db)
+        }
+        let folderAfter = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(folderAfter?.lastKnownUidValidity == nil, "the folder must still be unobserved")
+
+        try proveBareWriteLandsThenUndo(db, headerId: Self.headerId)
+
+        let outcome = try attemptFullAIWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .dropped)
+        try expectNoAIFieldOfXLandedOn(
+            db, headerId: Self.headerId, subject: "Impostor Y", rfc822: "<y@example.com>")
+    }
+
+    /// NON-VACUITY, the other side: **arm 6 was not weakened.** The folder row is
+    /// ABSENT — the strongest form of "no numbering evidence" — and the write still
+    /// lands, because the RFC 2822 Message-ID names the CONTENT rather than the
+    /// address, and an AI summary is derived content. Without this control the fix
+    /// would be free to degrade into "refuse whenever the folder is not stamped",
+    /// which is a blanket refusal wearing a guard's clothes.
+    @Test("The RFC content witness still carries a row whose Folder row is gone")
+    func contentWitnessStillCarriesARowWithNoFolder() throws {
+        let db = try makeFixture(folderEpoch: 111)
+        let original = makeHeader(subject: "Original X", rfc822: "<x@example.com>", observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        try db.write { db in _ = try Folder.deleteOne(db, key: Self.folderId) }
+        let folderAfter = try db.read { try Folder.fetchOne($0, key: Self.folderId) }
+        #expect(folderAfter == nil, "the folder row must be gone, so only the content witness can carry this")
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "X's summary")
+        #expect(outcome == .written)
+        #expect(try blurb(db, Self.headerId) == "X's summary",
+                """
+                The content witness was weakened along with arm 7. An RFC 2822 Message-ID that still \
+                agrees identifies the MESSAGE regardless of what its folder metadata says, and derived \
+                content is exactly what it is the correct instrument for (ADR-IOS-068 §7, ADR-IOS-072).
+                """)
+    }
+
+    /// Arm 4's early return, swept over EVERY non-epoch-addressed provider rather
+    /// than the two that happened to have a test. Their id spaces are never
+    /// renumbered, so the address IS the identity and no folder or epoch state may
+    /// influence the decision — asserted here in the harshest state the fix creates:
+    /// no folder row at all, no stamp anywhere, no content witness.
+    @Test("A provider whose ids are never renumbered is unaffected by any folder-epoch state",
+          arguments: [AccountProvider.gmail, AccountProvider.outlook, AccountProvider.caldav])
+    func nonEpochAddressedProvidersAreUnaffected(provider: AccountProvider) throws {
+        let db = try makeFixture(folderEpoch: nil, provider: provider)
+        let original = makeHeader(subject: "X", rfc822: nil, observedEpoch: nil)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        try db.write { db in _ = try Folder.deleteOne(db, key: Self.folderId) }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "\(provider.rawValue) summary")
+        #expect(outcome == .written)
+        #expect(try blurb(db, Self.headerId) == "\(provider.rawValue) summary",
+                "\(provider.rawValue) ids are never renumbered — arm 4 must return before any epoch arm")
+    }
+
+    /// The demo account is IMAP-shaped and served by `DemoProvider`, so nothing can
+    /// ever stamp it. It is excluded BY ID at arm 4; this pins the exclusion in the
+    /// state the fix would otherwise black out permanently — no folder row, no
+    /// content witness, no stamp.
+    @Test("The demo account writes through with no folder row, no witness and no stamp")
+    func demoAccountIsUnaffectedByTheFolderEpochRequirement() throws {
+        let db = try makeFixture(folderEpoch: nil, accountId: DemoSeed.demoAccountId, provider: .imap)
+        let original = makeHeader(
+            subject: "Demo", rfc822: nil, observedEpoch: nil, accountId: DemoSeed.demoAccountId)
+        try db.write { try original.insert($0) }
+
+        let target = try capture(db, original)
+        #expect(target != nil, "capture must succeed")
+        guard let target else { return }
+
+        try db.write { db in
+            _ = try Folder.deleteOne(
+                db, key: MessageIdentity.folderId(
+                    accountId: DemoSeed.demoAccountId, folderPath: Self.folderPath))
+        }
+
+        let outcome = try attemptSummaryWrite(db, target: target, blurb: "demo summary")
+        #expect(outcome == .written)
+        #expect(try blurb(db, original.id) == "demo summary",
+                "Demo Mode has no server and can never stamp an epoch — it must never be epoch-refused")
     }
 }

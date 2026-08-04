@@ -61,6 +61,14 @@ enum AIWriteOutcome: Sendable, Equatable { case written, dropped }
 ///    admits on a positive RFC agreement, and rows without one fall through to the
 ///    epoch arms instead of being refused outright.
 ///
+///    ⚠ AUDIT ROUND 4 (`IOS-ROUND3-D6`): that is a statement about CAPTURE, which
+///    stays unconditional, and it must not be read as a promise about the WRITE.
+///    The epoch arms a witnessless row falls through to now demand POSITIVE
+///    evidence (arm 7 as amended), so such a row is carried only while its
+///    folder's numbering is known. Two of the three states enumerated just above
+///    never reach those arms at all: the demo account, and `ScreenshotMode`'s only
+///    account that is given messages (`.gmail`), both exit at arm 4.
+///
 ///    ⚠ AUDIT ROUND 2 restored the field after round 1 had dropped it entirely.
 ///    Dropping it left the guard with epoch evidence only, and an epoch proves
 ///    NUMBERING, not IDENTITY — there was then no instrument at all that could tell
@@ -189,14 +197,57 @@ struct AIWriteTarget: Sendable, Equatable {
     ///     provider ids key the ACTION queue because actions must distinguish
     ///     physical copies. A replacement is a different email and therefore
     ///     carries a different Message-ID, so this witness cannot admit one.
-    ///  7. **`lastKnownUidValidity == nil`** ⇒ PROCEED. The FOLDER has never been
-    ///     observed at all: the T1.3 first-sync window and `ScreenshotMode`'s
-    ///     raw-SQL folders (which insert without the column). No SELECT has ever
+    ///  7. **NO CONTENT WITNESS ⇒ the folder must be PRESENT and its numbering
+    ///     POSITIVELY OBSERVED.** An ABSENT `Folder` row ⇒ `nil`; a present one
+    ///     whose `lastKnownUidValidity` is nil ⇒ `nil`. Both are the ABSENCE of a
+    ///     numbering proof, and the governing rule at the head of this comment
+    ///     says an unknown epoch must never authorize a mutation.
+    ///
+    ///     ⚠ THIS ARM USED TO BE `guard let liveEpoch = folder?
+    ///     .lastKnownUidValidity else { return header }` — an ADMIT, and
+    ///     optional-chaining made a MISSING folder satisfy it as readily as a
+    ///     never-observed one (the `uidValidityResetPendingAt` arm above is
+    ///     likewise vacuous on a missing row). Its premise — *"no SELECT has ever
     ///     reported an epoch here, so no turnover can have been observed either,
-    ///     and there is nothing this address could have been re-seated FROM.
-    ///     Dropping on it would permanently disable AI for those states (see the
-    ///     SUBTRACT note above) — including rows with no RFC id at all, which is
-    ///     why this arm must survive arm 6 rather than be replaced by it.
+    ///     and there is nothing this address could have been re-seated FROM"* —
+    ///     is sound for a folder row that EXISTS with a nil column and FALSE for
+    ///     an ABSENT one, where nothing was looked up at all. It is also false for
+    ///     the present-but-nil row once arm 6 has failed by POSITIVE
+    ///     DISAGREEMENT (both RFC ids present and different), which is precisely
+    ///     the replacement this guard exists to catch. Registered as
+    ///     `IOS-ROUND3-D6`.
+    ///
+    ///     The reachable chain, each step verified in code: an RFC-less header
+    ///     survives its folder's deletion — `SyncEngine.fullSync`'s
+    ///     vanished-folder cleanup deletes the `Folder` row and migration
+    ///     `v2_dropMessageHeaderFolderFK` left `messageHeader.folderId` a plain
+    ///     column with NO foreign key, so only `accountId` cascades; the path
+    ///     re-appears at a new epoch and re-adopts those orphans under the
+    ///     deterministic `"\(accountId):\(path)"` id with a NIL stamp, because
+    ///     `uidValidityBootstrapWrite(observed:stored:folderHoldsRows:)` refuses
+    ///     to stamp a folder that already holds rows and
+    ///     `SyncEngine.verifyAndBootstrapPrePopulatedFolderEpoch` returns
+    ///     `.unobservable` on an all-RFC-less population; and the merge then
+    ///     seats a DIFFERENT message at the same canonical address, which
+    ///     `SyncEngine.providerAddressOwnershipProven` admits on the canonical-PK
+    ///     hit. Arm 7 then bound X's summary / action tag / reply / `notified`
+    ///     stamp onto Y — misattribution, which C3 forbids as squarely as a
+    ///     wrong-message mutation.
+    ///
+    ///     **The cost, stated plainly, because it is real and is why the arm
+    ///     existed:** an epoch-addressed row with no content witness gets no AI
+    ///     write until its folder's numbering is observed. That is exactly the
+    ///     posture the durable-gesture path already takes on the SAME two states —
+    ///     `AccountManager.newGestureRefusedForUnknownEpoch` refuses on both an
+    ///     absent `Folder` row and a nil `lastKnownUidValidity` (`IOS-EPOCH-001`) —
+    ///     so the two consumers of one question now agree instead of answering it
+    ///     in opposite directions. It is recoverable: `runSyncMessages` stamps a
+    ///     folder inside the same write transaction that first populates it, a
+    ///     folder that is already populated earns its epoch through the verified
+    ///     door, and a refused AI write leaves `summaryBlurb` nil so the queue's
+    ///     own arbiter re-drives the job. `ScreenshotMode` is NOT affected — the
+    ///     only account it gives messages to is `.gmail`, so arm 4 returns first —
+    ///     and neither is the demo account, Outlook or CalDAV.
     ///  8. **NUMBERING PROOF — the fallback when there is no content witness.**
     ///     Requires all three of: a non-nil CAPTURED stamp, the CURRENT ROW's own
     ///     stamp equal to it, and the folder's live epoch equal to it. Anything
@@ -238,10 +289,14 @@ struct AIWriteTarget: Sendable, Equatable {
            capturedRfc == header.rfc822MessageId {
             return header
         }
-        // 7 — the folder's numbering was never observed at all.
-        guard let liveEpoch = folder?.lastKnownUidValidity else { return header }
-        // 8 — NUMBERING PROOF. All three must agree.
-        guard let capturedEpoch = observedUidValidity else { return nil }
+        // 7 — no content witness ⇒ the folder must be PRESENT and OBSERVED.
+        //     Absent folder, or a present folder whose numbering was never
+        //     observed, is an ABSENCE of evidence — and this is a write.
+        guard let folder,
+              let liveEpoch = SyncEngine.knownUidValidity(folder.lastKnownUidValidity)
+        else { return nil }
+        // 8 — NUMBERING PROOF. All three must agree, and all must be positive.
+        guard let capturedEpoch = SyncEngine.knownUidValidity(observedUidValidity) else { return nil }
         guard header.observedUidValidity == capturedEpoch else { return nil }
         guard capturedEpoch == liveEpoch else { return nil }
         return header
