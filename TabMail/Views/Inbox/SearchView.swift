@@ -30,6 +30,10 @@ struct SearchView: View {
     /// Lets a scope toggle re-run the remote search instead of requiring a re-submit.
     @State private var hasSubmittedRemote = false
     @State private var navigationPath = NavigationPath()
+    /// Raised when a tapped LOCAL result's captured content witness no longer
+    /// matches the row at its address, so `openResult` navigated nowhere. Without
+    /// it the fail-closed refusal is an invisible dead tap.
+    @State private var showStaleResultAlert = false
     @FocusState private var isFieldFocused: Bool
 
     private let manager = AccountManager.shared
@@ -90,6 +94,11 @@ struct SearchView: View {
         }
         .background(Palette.previewPaneBg)
         .interactiveDismissDisabled()
+        .alert("Result no longer available", isPresented: $showStaleResultAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This message is no longer where the search found it. Search again to see what's there now.")
+        }
         .onAppear {
             if ScreenshotMode.isActive {
                 seedScreenshotSearchResults()
@@ -262,10 +271,100 @@ struct SearchView: View {
         return try request.fetchOne(db)?.id
     }
 
+    /// Resolve a LOCAL search result to the headerId it may be opened at — or `nil`
+    /// when the row now living at that address is provably NOT the message the
+    /// tapped row rendered.
+    ///
+    /// 🚨 WHY THIS EXISTS, AND WHY THE REMOTE HELPER ABOVE COULD NOT BE REUSED.
+    /// `resolveRemoteResultHeaderId` filters `messageId == … && accountId == …`
+    /// (+ `folderPath`) and returns the matched row's `.id` — but `MessageHeader.id`
+    /// IS that same composite `accountId:folderPath:messageId`. It therefore
+    /// resolves *by* an address and returns *that same address*: it establishes
+    /// EXISTENCE, not IDENTITY, and against a re-seated address it hands back
+    /// exactly the wrong row a bare `navigationPath.append(result.headerId!)`
+    /// would. Routing the local branch through it would look like a C3 closure
+    /// while closing nothing. The missing instrument is a CONTENT witness, which
+    /// only a local result can carry (`SearchResult.capturedRfc822MessageId`).
+    ///
+    /// THE PREDICATE IS A PORT, NOT AN INVENTION. It is `AIWriteTarget
+    /// .resolveCurrentHeader` **arm 6** (`AccountManagerAI.swift`) — "captured
+    /// `rfc822MessageId` non-empty and EQUAL to the current row's ⇒ this is still
+    /// the same physical message" — applied to the other consumer of the identical
+    /// question: *is the row at this captured address still the same message?* The
+    /// normalizer is the tree's single identity-COMPARISON normalizer,
+    /// `MessageIdentity.comparableRfc822Identity`; no second one is minted here.
+    /// (Arm 6 compares the column raw because both of its sides are read from the
+    /// same column moments apart. Here the captured side has been sitting in a
+    /// SwiftUI `@State` array across an arbitrary user pause, so it is normalized —
+    /// which also classifies an unusable/garbage value as "no witness" instead of
+    /// letting it fail the comparison and refuse a legitimate open.)
+    ///
+    /// ⚑ NOT AN ADR-IOS-068 / D4 VIOLATION — the direction is the opposite one. D4
+    /// forbids an RFC 822 Message-ID SELECTING or AUTHORIZING a mutation target
+    /// (and forbids a `SEARCH` result being one). Here the target is selected by
+    /// the durable composite address exactly as before; the RFC id can only REFUSE
+    /// that target, never widen it or nominate a different one. Using RFC identity
+    /// as a content witness is the same architecturally-correct use the AI
+    /// write-back, `MessageAICache`, the FTS/body stores and threading already make.
+    ///
+    /// Arms, in evaluation order:
+    ///  1. **no usable captured witness** ⇒ return `headerId` unchanged. RFC-less
+    ///     IMAP mail keeps today's behaviour exactly; it is the same population
+    ///     `IOS-EPOCH-001` and `IOS-AI-003` already carry, and a
+    ///     `(fromAddress, subject, date)` substitute is BANNED — that witness was
+    ///     authored in `94fac3e79` and reverted in `3bd9f0bac` as unsound in both
+    ///     directions.
+    ///  2. **row gone** ⇒ `nil`. Fail closed. Recoverable by one ordinary gesture:
+    ///     re-running the search rebuilds `results` from live rows.
+    ///  3. **witnesses disagree** ⇒ `nil`. This is the C3 case: a different
+    ///     physical message occupies the captured address. A row's
+    ///     `rfc822MessageId` is never nulled once set (unlike `observedUidValidity`,
+    ///     which 15 production sites clear), so a captured-present/current-absent
+    ///     pair is a genuine disagreement, not an ordinary absence.
+    ///
+    /// `nonisolated static` for the same reason as the remote helper: it touches no
+    /// `@State` and needs no view, so a test can call it with a bare `Database`.
+    nonisolated static func resolveLocalResultHeaderId(
+        headerId: String, capturedRfc822MessageId: String?, db: Database
+    ) throws -> String? {
+        // 1 — no content witness: today's behaviour, and no read at all.
+        guard let captured = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) else {
+            return headerId
+        }
+        // 2 — the address no longer names a row.
+        guard let current = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
+        // 3 — CONTENT PROOF. Same non-empty Message-ID at the same address ⇒ same
+        //     email, whatever numbering seated it.
+        guard MessageIdentity.comparableRfc822Identity(current.rfc822MessageId) == captured else {
+            return nil
+        }
+        return headerId
+    }
+
     private func openResult(_ result: SearchResult) {
-        // Local result with headerId — navigate directly
+        // Local result with headerId — the address is cached in an in-memory
+        // `results` array that predates any re-seat, so prove the row still there
+        // is the message this row RENDERED before opening (and durably marking) it.
+        //
+        // A6 (DB-performance lens): one `MessageHeader` fetch BY PRIMARY KEY, one
+        // row, no scan — the same synchronous `dbPool.read` at the same call site
+        // the remote branch below has always taken, and only on a tap.
         if let headerId = result.headerId {
-            navigationPath.append(headerId)
+            // A thrown read is not a verdict, but it is also not evidence, and this
+            // navigation ends in a durable mark-read. Fail closed and let the user
+            // re-tap; nothing is queued, so no intention is dropped.
+            let resolved = try? dbPool.read { db in
+                try Self.resolveLocalResultHeaderId(
+                    headerId: headerId,
+                    capturedRfc822MessageId: result.capturedRfc822MessageId,
+                    db: db
+                )
+            }
+            if let opened = resolved {
+                navigationPath.append(opened)
+            } else {
+                showStaleResultAlert = true
+            }
             return
         }
         // Remote result: resolve folder-scoped; never a cross-folder/-account guess.
@@ -499,7 +598,12 @@ struct SearchView: View {
                                 messageId: result.messageId, folderPath: result.folderPath,
                                 subject: result.subject, from: result.from,
                                 fromAddress: result.fromAddress, date: result.date, snippet: snippet,
-                                isRead: result.isRead, isFlagged: result.isFlagged, headerId: result.headerId)
+                                isRead: result.isRead, isFlagged: result.isFlagged, headerId: result.headerId,
+                                // Field-for-field rebuild: carry the content
+                                // witness too. Nil for every result reaching here
+                                // today (all remote), but a rebuild that silently
+                                // drops a field is how a guard loses its evidence.
+                                capturedRfc822MessageId: result.capturedRfc822MessageId)
                         }
                         var merged = results
                         // Replace only the prior rows that are the SAME message (account +
@@ -628,7 +732,11 @@ struct SearchView: View {
                 snippet: ftsResult.snippet.isEmpty ? header.snippet : ftsResult.snippet,
                 isRead: header.isRead,
                 isFlagged: header.isFlagged,
-                headerId: header.id
+                headerId: header.id,
+                // Content witness from the row this result is rendered FROM — the
+                // same row `subject`/`from`/`date`/`isRead`/`isFlagged` above come
+                // from, so zero extra I/O. `openResult` re-proves it at tap time.
+                capturedRfc822MessageId: header.rfc822MessageId
             )
         }
 
@@ -707,7 +815,9 @@ struct SearchView: View {
                     snippet: msg.snippet,
                     isRead: msg.isRead,
                     isFlagged: msg.isFlagged,
-                    headerId: msg.id
+                    headerId: msg.id,
+                    // Same row every other field above comes from — zero extra I/O.
+                    capturedRfc822MessageId: msg.rfc822MessageId
                 )
             }
     }
@@ -861,6 +971,31 @@ struct SearchResult: Identifiable {
     let isFlagged: Bool
     /// GRDB header ID (available for local results)
     let headerId: String?
+    /// 🚨 THE CONTENT WITNESS — the RFC 2822 Message-ID of the row this result was
+    /// RENDERED FROM, captured at search time. `nil` for remote results (there is
+    /// no local row to capture from) and for `ScreenshotMode`'s seeded rows.
+    ///
+    /// `headerId` is an ADDRESS — `accountId:folderPath:messageId`, and on IMAP
+    /// `messageId` IS the per-folder UID. An address can be RE-SEATED onto a
+    /// different physical message (a `UIDVALIDITY` turnover purges and resyncs the
+    /// folder, so UIDs restarting is the EXPECTED outcome; a sync merge can
+    /// overwrite the row at a canonical address too). `results` is an in-memory
+    /// array rendered BEFORE that happens, so a tap afterwards navigates to
+    /// whatever now occupies the address — and `MessageDetailViewModel
+    /// .markReadOnOpenIfNeeded` durably marks THAT row read. The user is shown X's
+    /// subject/sender/snippet and Y is silently mutated: misattribution, which C3
+    /// forbids as squarely as a wrong-message mutation.
+    ///
+    /// This field is what `resolveLocalResultHeaderId` compares against the row now
+    /// living at `headerId`. It is populated from the header row the local search
+    /// ALREADY reads (`ftsResultsToSearchResults`, `legacyLocalSearch` — both take
+    /// `subject`/`from`/`date`/`isRead`/`isFlagged` from that same row), so it costs
+    /// zero extra I/O.
+    ///
+    /// Declared last, and `var` with a default, so the synthesized memberwise
+    /// initializer carries it as a trailing defaulted parameter — every existing
+    /// `SearchResult(...)` call site stays byte-identical.
+    var capturedRfc822MessageId: String? = nil
 }
 
 // MARK: - Search Result Row
