@@ -92,9 +92,39 @@ extension AccountManager {
     }
 
     /// Groups claimed pending operations into serialized "lanes" via connected-
-    /// component grouping over shared message ids (scoped per account). Two ops
-    /// that share ANY member message id land in the same lane — and transitively,
-    /// any op sharing an id with either of those joins too (union-find).
+    /// component grouping over shared message ADDRESSES (scoped per account AND
+    /// per folder). Two ops that name ANY member at the same address land in the
+    /// same lane — and transitively, any op sharing an address with either of
+    /// those joins too (union-find).
+    ///
+    /// 🚨 THE FOLDER IS PART OF THE ADDRESS, AND OMITTING IT WAS A NEVER-DROP
+    /// BUG (`IOS-QUEUE-001`). On IMAP a UID is mailbox-local: UID 77 in `INBOX`
+    /// and UID 77 in `Archive` are DIFFERENT PHYSICAL MESSAGES, and every id an
+    /// ordinary IMAP gesture enqueues is a bare UID
+    /// (`admittedOrdinaryActionTargets` requires `messageId == String(uid)`).
+    /// The lane key used to be `"accountId:msgId"`, so those two unrelated
+    /// messages shared a lane. Delay was the benign half. The harmful half is
+    /// the WEDGE COROLLARY WITH A BYSTANDER: `executeSingleOp`'s
+    /// `ProviderEvidenceUnavailable` arm returns `.haltLane` and requeues, and a
+    /// server that stops reporting `UIDVALIDITY` on SELECT reproduces that
+    /// refusal identically on every drain, forever. With the folder-less key
+    /// that permanent halt propagated to a message in a DIFFERENT FOLDER that
+    /// merely shared the UID number — and its owner could neither see nor clear
+    /// it, because no UI lists `PendingOperation` rows. An op that stays queued
+    /// but prevents other intentions executing has not been preserved.
+    ///
+    /// The op already CARRIES the folder (`PendingOperation.folderPath`, used by
+    /// checkpoint A, by `retirePartiallyCompletedOp` and by the executor), so
+    /// this reads information that was present and discarded rather than
+    /// reconstructing one. Every producer takes that path from the same source —
+    /// a `Folder.path` or a `MessageHeader.folderPath`, never a literal — and
+    /// the batch-split site in `executeSingleOp` copies `currentOp.folderPath`,
+    /// so two ops on the SAME message still key identically and still serialize.
+    ///
+    /// The key is a plain colon join, exactly like `MessageIdentity.folderId`.
+    /// A folder path containing a colon can only make two distinct addresses
+    /// collide, which OVER-merges — the conservative direction, and precisely
+    /// the behaviour that shipped before this change.
     ///
     /// WHY this matters: `drainPendingQueue` runs one Task per lane CONCURRENTLY,
     /// each drawing from `ProviderWorkQueue` (bounded concurrency > 1 — separate
@@ -113,7 +143,7 @@ extension AccountManager {
     /// Ops with empty `messageIds` (no id to key on) fall back to a singleton lane,
     /// matching the pre-existing fallback (`messageIds.first ?? op.id`).
     nonisolated static func buildLanes(_ ops: [PendingOperation]) -> [[PendingOperation]] {
-        // Union-Find over "accountId:msgId" keys, with path compression.
+        // Union-Find over "accountId:folderPath:msgId" keys, with path compression.
         var parent: [String: String] = [:]
 
         func find(_ x: String) -> String {
@@ -138,7 +168,7 @@ extension AccountManager {
         for op in ops {
             let ids = op.messageIds
             guard !ids.isEmpty else { continue }
-            let keys = ids.map { "\(op.accountId):\($0)" }
+            let keys = ids.map { "\(op.accountId):\(op.folderPath):\($0)" }
             for key in keys where parent[key] == nil {
                 parent[key] = key
             }
@@ -156,7 +186,7 @@ extension AccountManager {
                 lanes.append([op])
                 continue
             }
-            let root = find("\(op.accountId):\(firstId)")
+            let root = find("\(op.accountId):\(op.folderPath):\(firstId)")
             if let idx = laneIndexForRoot[root] {
                 lanes[idx].append(op)
             } else {
@@ -360,12 +390,26 @@ extension AccountManager {
                                     return nil
                                 }
                             }
-                        } else if let stamped = fetched.observedUidValidity,
-                                  let live = sourceFolder?.lastKnownUidValidity,
+                        } else if let stamped = SyncEngine.knownUidValidity(fetched.observedUidValidity),
+                                  let live = SyncEngine.knownUidValidity(
+                                    sourceFolder?.lastKnownUidValidity),
                                   live != stamped {
                             // Preserve the already-landed draft/reset safeguard.
                             // Draft operations remain outside generic checkpoint A
                             // and continue through their typed execution gates.
+                            //
+                            // 🚨 BOTH EPOCHS MUST BE REAL BEFORE A DISAGREEMENT
+                            // MEANS ANYTHING (`IOS-QUEUE-002`). This arm used to
+                            // compare on bare inequality, so a ZERO on either
+                            // side read as a POSITIVE mismatch and took the
+                            // DELETE direction — turning an absence of evidence
+                            // into exit 4. `SyncEngine.knownUidValidity` is the
+                            // same normalizer the IMAP arm ten lines up already
+                            // requires (`stampedUInt > 0` / `liveUInt > 0`), and
+                            // exists because `Mailbox.Selection.uidValidity`
+                            // DEFAULTS to `UIDValidity(0)` rather than being
+                            // absent. Zero is "we were told nothing", and an
+                            // unknown epoch stays retryable forever.
                             _ = try PendingOperation.deleteOne(db, key: fetched.id)
                             BackgroundSyncLogger.log("[Queue] UIDVALIDITY changed under op \(fetched.id.prefix(8)) (\(fetched.type.rawValue), \(fetched.folderPath)): recorded under \(stamped), folder now \(live) — dropped without executing (C5)")
                             return nil
@@ -568,7 +612,7 @@ extension AccountManager {
                 let remaining = currentOp.messageIds.filter { !provenMembers.contains($0) }
                 await retirePartiallyCompletedOp(
                     currentOp, provenMembers: provenMembers, remaining: remaining,
-                    context: context)
+                    provenDestinations: executed.provenDestinations, context: context)
                 return .haltLane
             }
             // TOCTOU fix: record recentActions BEFORE deleting PendingOp.
@@ -634,33 +678,22 @@ extension AccountManager {
             // for the four guards) closes that, and makes undo-after-drain an
             // ordinary reverse move. Sharing this transaction with the op's
             // deletion keeps the crash window exactly where it already was.
-            let appliedRekeys: [HeaderRekeyRecord]
+            let rekeyOutcome: (applied: [HeaderRekeyRecord], collided: [String])
             do {
-                appliedRekeys = try await retryWrite(dbPool, label: "Queue") { db -> [HeaderRekeyRecord] in
+                rekeyOutcome = try await retryWrite(dbPool, label: "Queue") {
+                    db -> (applied: [HeaderRekeyRecord], collided: [String]) in
+                    var collided: [String] = []
                     let rekeys = try MessageHeaderRekey.finishMove(
-                        currentOp, destinations: executed.provenDestinations, db: db)
+                        currentOp, destinations: executed.provenDestinations, db: db,
+                        onCollidedRekey: { collided.append($0) })
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    return rekeys
+                    return (rekeys, collided)
                 }
             } catch {
                 print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
-                appliedRekeys = []
+                rekeyOutcome = ([], [])
             }
-            if !appliedRekeys.isEmpty {
-                print("[MoveTrace] executeSingleOp — re-keyed \(appliedRekeys.count) moved row(s) to their COPYUID-proven destination address")
-                // The FTS index is a SEPARATE database, so its re-key is
-                // two-phase — outside the GRDB write — exactly as the sync
-                // path does it. The entry MOVES; it is never removed.
-                try? await SearchIndex.shared.rekeyHeaders(appliedRekeys.map {
-                    (oldKey: ContentKey(rawValue: $0.oldHeaderId),
-                     newKey: ContentKey(rawValue: $0.newHeaderId),
-                     newMessageId: $0.newProviderMessageId)
-                })
-                // The undo stack names its members by the SAME primary key and
-                // UID this re-key just changed, so it has to follow — otherwise
-                // finishing the move would break undo rather than enable it.
-                await UndoService.shared.applyRekeys(appliedRekeys)
-            }
+            await publishRekeys(rekeyOutcome.applied, collidedOldHeaderIds: rekeyOutcome.collided)
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
             }
@@ -952,6 +985,64 @@ extension AccountManager {
         }
     }
 
+    /// Mirror a COMMITTED re-key into the two stores that key by
+    /// `messageHeader.id` but do not live in the GRDB database — the in-memory
+    /// undo stack and the FTS index. Shared by the whole-op success path and by
+    /// the narrowing pass, so the two cannot drift.
+    ///
+    /// 🚨 THE UNDO STACK IS PUBLISHED FIRST, AND THE ORDER IS THE FIX
+    /// (`IOS-UNDO-002`). `SearchIndex` is a SEPARATE SQLite pool, so its re-key
+    /// is a real cross-database round trip. Running it first left the undo stack
+    /// naming the STALE `originalHeaderId` for the whole of that suspension: an
+    /// `Undo` landing inside it popped an entry `AccountManager.undoMove`
+    /// authenticates with `MessageHeader.fetchOne(db, key: originalHeaderId)`,
+    /// which is now nil, so the WHOLE command was refused — and the later
+    /// publication could not repair an entry already popped off the stack.
+    /// Publishing to the undo stack first removes the cross-database trip from
+    /// that window entirely, leaving only the `@MainActor` hop every publication
+    /// in this app already has. Nothing else about the ordering moves: both
+    /// stores are still updated AFTER the GRDB commit, which is the two-phase
+    /// shape the sync path uses.
+    ///
+    /// ⚠ ACCEPTED RESIDUAL: an undo landing inside that single `@MainActor` hop
+    /// is still refused whole. It is fail-closed — the message is correctly at
+    /// the destination, nothing mutates the wrong message, no queued op is
+    /// dropped — and the user recovers by moving it back with one ordinary
+    /// gesture.
+    ///
+    /// 🚨 A COLLIDED RE-KEY LEAVES NO HEADER BEHIND (`IOS-SEARCH-002`), so its
+    /// FTS entry is removed rather than moved. `MessageHeaderRekey.apply`
+    /// deletes the old row before its collision return, so the old id names
+    /// nothing; leaving its index entry in place produces the *indexed but
+    /// unfindable* class — a search hit whose header is gone, at a composite id
+    /// a later message can re-occupy. The sync caller already compensates by
+    /// routing the id down its `staleIds` path; this is the drain's equivalent.
+    func publishRekeys(
+        _ applied: [HeaderRekeyRecord],
+        collidedOldHeaderIds: [String]
+    ) async {
+        if !applied.isEmpty {
+            print("[MoveTrace] executeSingleOp — re-keyed \(applied.count) moved row(s) to their COPYUID-proven destination address")
+            // The undo stack names its members by the SAME primary key and UID
+            // this re-key just changed, so it has to follow — otherwise
+            // finishing the move would break undo rather than enable it.
+            await UndoService.shared.applyRekeys(applied)
+            // The FTS index is a SEPARATE database, so its re-key is two-phase —
+            // outside the GRDB write — exactly as the sync path does it. The
+            // entry MOVES; it is never removed.
+            try? await SearchIndex.shared.rekeyHeaders(applied.map {
+                (oldKey: ContentKey(rawValue: $0.oldHeaderId),
+                 newKey: ContentKey(rawValue: $0.newHeaderId),
+                 newMessageId: $0.newProviderMessageId)
+            })
+        }
+        if !collidedOldHeaderIds.isEmpty {
+            print("[MoveTrace] executeSingleOp — dropped \(collidedOldHeaderIds.count) FTS entry(s) whose re-key collided; the destination row is the survivor")
+            try? await SearchIndex.shared.removeMessages(
+                contentKeys: collidedOldHeaderIds.map { ContentKey(rawValue: $0) })
+        }
+    }
+
     /// Retire ONLY the members a provider positively proved it completed, and
     /// leave the remainder durably queued.
     ///
@@ -986,10 +1077,27 @@ extension AccountManager {
     /// undetermined remainder for this to narrow to — which is also why the
     /// re-copy cost above can no longer be incurred. It is retained as the
     /// drain's contract for any provider that returns a strict subset.
-    private func retirePartiallyCompletedOp(
+    ///
+    /// 🚨 A RETIRED MEMBER IS FINISHED LOCALLY HERE TOO (`IOS-QUEUE-005`). This
+    /// leg used to return before any re-key, so a member retired in a narrowing
+    /// pass kept its SOURCE address while its copy lived at the destination —
+    /// exactly the state `MessageHeaderRekey.finishMove` exists to close, in
+    /// which `admittedOrdinaryActionTargets` refuses the row and the user's next
+    /// gesture on it is a silent dead no-op until a sync repairs it. A standing
+    /// contract that silently loses the destination address the server itself
+    /// named is a trap laid for the future provider that first returns a strict
+    /// subset. The re-key runs in the SAME write that narrows the row, which is
+    /// the transaction shape the whole-op success path already uses, and it is
+    /// scoped to `provenMembers` so an unproven member is never re-keyed.
+    ///
+    /// `internal` (not `private`) so tests can drive it directly, the same
+    /// reason `executeSingleOp` and `DrainContext` are: no production provider
+    /// returns a strict subset, so a test IS this path's only reachability.
+    func retirePartiallyCompletedOp(
         _ currentOp: PendingOperation,
         provenMembers: [String],
         remaining: [String],
+        provenDestinations: [ProvenDestinationAddress],
         context: DrainContext
     ) async {
         print("[Queue] Partial \(currentOp.type.rawValue): provider proved \(provenMembers.count) of \(currentOp.messageIds.count) member(s) — retiring those and keeping \(remaining.count) queued")
@@ -1017,13 +1125,29 @@ extension AccountManager {
         }
         recordRecentlyCompleted(messageIds: completedIds)
 
+        // The retired members only — an unproven member has no server-named
+        // destination and must keep its source address.
+        let frozenRetiredOp: PendingOperation = {
+            var op = currentOp
+            op.messageIds = provenMembers
+            return op
+        }()
         do {
-            try await retryWrite(dbPool, label: "Queue") { db in
-                guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else { return }
+            let rekeyOutcome = try await retryWrite(dbPool, label: "Queue") {
+                db -> (applied: [HeaderRekeyRecord], collided: [String]) in
+                var collided: [String] = []
+                let rekeys = try MessageHeaderRekey.finishMove(
+                    frozenRetiredOp, destinations: provenDestinations, db: db,
+                    onCollidedRekey: { collided.append($0) })
+                guard var fresh = try PendingOperation.fetchOne(db, key: currentOp.id) else {
+                    return (rekeys, collided)
+                }
                 fresh.messageIds = remaining
                 fresh.status = PendingStatus.queued.rawValue
                 try fresh.save(db)
+                return (rekeys, collided)
             }
+            await publishRekeys(rekeyOutcome.applied, collidedOldHeaderIds: rekeyOutcome.collided)
         } catch {
             // The narrowing write failed. NEVER leave the row `inFlight` (it
             // would only unstick at the next launch's crash recovery) and never

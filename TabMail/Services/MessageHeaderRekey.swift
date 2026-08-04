@@ -169,12 +169,23 @@ enum MessageHeaderRekey {
     /// addressable, and an unnamed member simply keeps today's behaviour (the
     /// remnant survives until sync repairs it).
     ///
+    /// - Parameter onCollidedRekey: called with the OLD header id of each member
+    ///   whose re-key hit the collision return of `apply(from:to:db:)` — the old
+    ///   row is gone and nothing was re-keyed to take its place. A caller that
+    ///   mirrors this table into a store keyed by `messageHeader.id` MUST drop
+    ///   that id there, or the store keeps an entry with no header behind it
+    ///   (the *indexed but unfindable* class). The sync path already does this
+    ///   via its own `staleIds` disposition; the drain does it through this
+    ///   channel, so both callers converge on one outcome. Defaulted because it
+    ///   is auxiliary: a caller that keeps no store outside this database has
+    ///   nothing to compensate, and the applied records alone describe it.
     /// - Returns: the re-keys actually applied, for the callers that must
     ///   mirror them into stores outside this database.
     static func finishMove(
         _ op: PendingOperation,
         destinations: [ProvenDestinationAddress],
-        db: Database
+        db: Database,
+        onCollidedRekey: (String) -> Void = { _ in }
     ) throws -> [HeaderRekeyRecord] {
         guard op.type == .move, !destinations.isEmpty,
               let destinationPath = op.destinationPath,
@@ -221,7 +232,14 @@ enum MessageHeaderRekey {
                 ? Int(destination.destinationUidValidity)
                 : nil
 
-            guard try apply(from: row, to: migrated, db: db) else { continue }
+            guard try apply(from: row, to: migrated, db: db) else {
+                // The new id was already occupied, so `apply` deleted the old
+                // row and inserted nothing. `oldId` now names no header at all
+                // — report it so the caller can drop it from the stores that
+                // key by header id and live outside this database.
+                onCollidedRekey(oldId)
+                continue
+            }
             applied.append(HeaderRekeyRecord(
                 oldHeaderId: oldId, newHeaderId: newId,
                 newProviderMessageId: newMessageId))
