@@ -138,6 +138,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// entirely — the shape a non-UIDPLUS server always produces. Empty for
         /// every pre-existing test.
         var copyUidWithheldSourceUIDs: Set<Int> = []
+        /// G1 — this server writes the DESTINATION half of its `COPYUID`
+        /// response code in DESCENDING order while the source half stays
+        /// ascending, i.e. it states a correspondence that positional pairing
+        /// gets exactly backwards. `CopyUID.init(nio:)` zips the two expanded
+        /// lists POSITIONALLY and checks only their cardinality, so nothing
+        /// downstream can detect the swap from the parsed mapping alone — the
+        /// app must refuse the ORDERING. `false` for every pre-existing test.
+        var copyUidDestinationsDescending = false
         /// Audit round 5 — per-mailbox UIDs whose FETCH records omit the `UID`
         /// data item entirely (`suppressFetchUid(in:uids:)`). RFC 3501 §6.4.8
         /// makes that item MANDATORY in any FETCH response caused by a UID
@@ -641,6 +649,24 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// UIDPLUS always does.
     func withholdCopyUID(forSourceUIDs uids: Set<Int>) {
         withState { $0.copyUidWithheldSourceUIDs = uids }
+    }
+
+    /// Test seam (G1): the copies still land exactly where this fake put them,
+    /// but the `COPYUID` response code LISTS the destination UIDs in DESCENDING
+    /// order — so reading the two lists positionally pairs every member with
+    /// somebody else's destination.
+    ///
+    /// ⚠ **THIS MODELS A NONCONFORMING SERVER, and that is the point.** RFC 3501
+    /// §2.3.1.1 assigns UIDs *"in a strictly ascending fashion"*, so a
+    /// conforming `UID COPY` cannot produce this. It exists because
+    /// `CopyUID.init(nio:)` builds its mapping with `zip(...)` over the two
+    /// expanded lists and validates only their CARDINALITY: from the parsed
+    /// mapping alone, a mispairing is indistinguishable from a correct one. The
+    /// only place the difference is still visible is the ORDER the server wrote,
+    /// which is why the app's guard is an ordering check and why this seam has
+    /// to reach the wire rather than the parsed value.
+    func reportCopyUIDDestinationsDescending() {
+        withState { $0.copyUidDestinationsDescending = true }
     }
 
     /// Test seam (audit round 5): these messages' FETCH records OMIT the `UID`
@@ -1637,8 +1663,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             guard components.count == 2 else { return "\(tag) BAD Invalid UID COPY\r\n" }
             let uids = Set(parseUIDSet(components[0], in: mailbox))
             let destination = components[1].trimmingCharacters(in: .init(charactersIn: "\""))
-            let (copied, destinationUidValidity, withheld) = withState {
-                state -> ([(source: Int, destination: Int)], Int, Set<Int>) in
+            let (copied, destinationUidValidity, withheld, descending) = withState {
+                state -> ([(source: Int, destination: Int)], Int, Set<Int>, Bool) in
                 recordOracleCheck(command: "UID COPY", mailbox: mailbox, uids: uids, state: &state)
                 let sourceMessages = state.messagesByMailbox[mailbox] ?? []
                 let copying = sourceMessages.filter { uids.contains($0.uid) }
@@ -1658,7 +1684,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 return (
                     pairs,
                     state.uidValidityByMailbox[destination] ?? 1,
-                    state.copyUidWithheldSourceUIDs
+                    state.copyUidWithheldSourceUIDs,
+                    state.copyUidDestinationsDescending
                 )
             }
             // RFC 4315 §3 — `COPYUID`. Mirrors the `APPENDUID` branch in
@@ -1676,7 +1703,12 @@ final class FakeIMAPServer: @unchecked Sendable {
                 return "\(tag) OK UID COPY completed\r\n"
             }
             let sourceSet = reported.map { String($0.source) }.joined(separator: ",")
-            let destinationSet = reported.map { String($0.destination) }.joined(separator: ",")
+            // G1 seam — the copies landed exactly as recorded above; only the
+            // ORDER this line states them in changes.
+            let destinationValues = descending
+                ? reported.map(\.destination).sorted(by: >)
+                : reported.map(\.destination)
+            let destinationSet = destinationValues.map(String.init).joined(separator: ",")
             return "\(tag) OK [COPYUID \(destinationUidValidity) \(sourceSet) \(destinationSet)] UID COPY completed\r\n"
         default:
             return "\(tag) BAD Unknown UID subcommand\r\n"

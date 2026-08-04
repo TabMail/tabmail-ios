@@ -221,7 +221,7 @@ struct IMAPMoveWireContractTests {
         defer { Task { try? await provider.disconnect() } }
 
         let proven = try await provider.move(
-            ids: ["22"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
+            ids: ["22"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch).provenIds
 
         // The member is reported complete, so the drain retires it and releases
         // its lane. The queue-level partner is
@@ -319,7 +319,7 @@ struct IMAPMoveWireContractTests {
         defer { Task { try? await provider.disconnect() } }
 
         let proven = try await provider.move(
-            ids: ["92"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+            ids: ["92"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch).provenIds
 
         // The member is reported complete, so the drain retires it and releases
         // its lane. The queue-level partner is
@@ -385,7 +385,7 @@ struct IMAPMoveWireContractTests {
 
         let proven = try await provider.move(
             ids: ["101", "102"], from: "Work", to: "Archive",
-            admittedUidValidity: Self.epoch)
+            admittedUidValidity: Self.epoch).provenIds
 
         // Both members were dispositioned, so neither is left for a later pass
         // to re-copy.
@@ -457,7 +457,7 @@ struct IMAPMoveWireContractTests {
         // UID 23 was in INBOX when the user swiped and is not there now.
         let proven = try await provider.move(
             ids: ["22", "23"], from: "INBOX", to: "Archive",
-            admittedUidValidity: Self.epoch)
+            admittedUidValidity: Self.epoch).provenIds
 
         // Both members leave the queue: 22 because it moved, 23 because the
         // server itself says it is not in the source folder (exit 2).
@@ -514,7 +514,7 @@ struct IMAPMoveWireContractTests {
         defer { Task { try? await provider.disconnect() } }
 
         let proven = try await provider.move(
-            ids: ["23"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
+            ids: ["23"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch).provenIds
 
         #expect(proven == ["23"])
         #expect(Self.deletedStores(server).isEmpty)
@@ -643,7 +643,7 @@ struct IMAPMoveWireContractTests {
 
         let ids = (1...Self.oversizedRequestCount).map(String.init)
         let proven = try await provider.move(
-            ids: ids, from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+            ids: ids, from: "Work", to: "Archive", admittedUidValidity: Self.epoch).provenIds
 
         // NON-VACUITY: the move really ran and really reached the probe arm —
         // one COPY, and the members the source held really landed.
@@ -717,7 +717,7 @@ struct IMAPMoveWireContractTests {
 
         let ids = (1...Self.oversizedRequestCount).map(String.init)
         let proven = try await provider.move(
-            ids: ids, from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
+            ids: ids, from: "Work", to: "Archive", admittedUidValidity: Self.epoch).provenIds
 
         // EVERY member reached an exit — none is left for a later drain to
         // re-attempt, which is what makes the re-COPY unreachable.

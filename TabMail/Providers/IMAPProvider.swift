@@ -3842,6 +3842,75 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return UIDSet(proven)
     }
 
+    /// The DESTINATION half of the same `COPYUID` (RFC 4315 §3) —
+    /// `copyProvenSourceUIDs` dereferences `pair.destination` only to validate
+    /// it and then throws it away, which is THE ADDRESS PROBLEM at its source.
+    /// This returns it, so the drain can finish the move locally instead of
+    /// leaving every moved row to be repaired later by sync on weaker evidence.
+    ///
+    /// 🚨 **G1 — PAIRING IS A C3 GUARD. Do not skip it.** `CopyUID.init(nio:)`
+    /// in the pinned SwiftMail fork builds its mapping as
+    /// `zip(expand(sourceUIDs), expand(destinationUIDs))` — POSITIONAL, after
+    /// `expand(_:)` preserves the server-emitted range order — and it checks
+    /// CARDINALITY and not ORDERING. While the destination half was only
+    /// sanity-checked, a mis-pairing was harmless. Promoting it to a MUTATION
+    /// address makes it C3-critical: a row seated at the wrong destination UID
+    /// would be CONFIRMED by later syncs rather than caught, and every
+    /// subsequent gesture on it would address a message the user never
+    /// selected.
+    ///
+    /// So the whole response is admitted only when BOTH expanded lists are
+    /// STRICTLY ASCENDING. That is what a conforming server produces: RFC 3501
+    /// §2.3.1.1 requires UIDs to be assigned *"in a strictly ascending
+    /// fashion"*, so the copies a single `UID COPY` creates take ascending
+    /// destination UIDs in the order it processed the (ascending) source set. A
+    /// single-member move passes trivially. Anything else yields NO destinations
+    /// at all — which leaves TODAY'S behaviour exactly as it was: the copy still
+    /// completed, the source cleanup is untouched, and sync repairs the row.
+    /// Failing closed here costs a stale local address; failing open costs a
+    /// wrong-message mutation.
+    ///
+    /// Every other leg is fail-CLOSED in the same shape as
+    /// `copyProvenSourceUIDs`: no evidence, a zero destination epoch, a zero
+    /// destination UID, or a source UID this call never requested all yield
+    /// nothing. Filtering against `requested` is the same C3 guard — a `COPYUID`
+    /// naming a source UID this call never asked for must never re-key a row the
+    /// user's gesture never selected.
+    private static func copyProvenDestinations(
+        _ evidence: CopyUID?, requested: UIDSet
+    ) -> [ProvenDestinationAddress] {
+        guard let evidence else { return [] }
+        let epoch = evidence.destinationUIDValidity.value
+        // A zero destination UIDVALIDITY is not an epoch (RFC 3501 §2.3.1.1
+        // types it as `nz-number`), so a response carrying one proves nothing
+        // about where the copies landed.
+        guard epoch > 0 else { return [] }
+        guard Self.isStrictlyAscending(evidence.mapping.map(\.source.value)),
+              Self.isStrictlyAscending(evidence.mapping.map(\.destination.value)) else {
+            print("[IMAP] COPYUID pairing REFUSED — the response's source/destination lists are not both strictly ascending, so the positional zip that produced this mapping cannot be trusted to have paired them correctly; no local re-key is admitted (fail closed; the move itself is unaffected and sync repairs the row)")
+            return []
+        }
+        let requestedValues = Set(requested.toArray().map(\.value))
+        var proven: [ProvenDestinationAddress] = []
+        for pair in evidence.mapping {
+            guard pair.destination.value > 0,
+                  requestedValues.contains(pair.source.value) else { continue }
+            proven.append(ProvenDestinationAddress(
+                sourceProviderId: String(pair.source.value),
+                destinationUid: pair.destination.value,
+                destinationUidValidity: epoch))
+        }
+        return proven
+    }
+
+    /// Strictly ascending — equal neighbours are REJECTED. A repeated UID in
+    /// either list means the server described a correspondence that cannot be
+    /// a bijection, which is exactly the shape the positional zip mispairs.
+    private static func isStrictlyAscending(_ values: [UInt32]) -> Bool {
+        guard values.count > 1 else { return true }
+        return zip(values, values.dropFirst()).allSatisfy { $0 < $1 }
+    }
+
     /// 🚨 AUDIT ROUND 4 — ⚑ NO REFERENCE — INVENTED. The subset of `requested`
     /// the SOURCE mailbox still contains, read from the server itself.
     ///
@@ -4318,16 +4387,31 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// A whole-op no-op — a LIST-confirmed absent source or destination — also
     /// returns `ids`, because that too IS provider authority that nothing
     /// remains to do.
+    ///
+    /// IT ALSO RETURNS WHERE THE COPIES LANDED. `provenDestinations` is the
+    /// destination half of the same `COPYUID` that authorizes the source purge
+    /// — the address the caller needs to finish the move LOCALLY. It is empty
+    /// whenever the server furnished no usable evidence, and a caller that
+    /// ignores it gets exactly the previous behaviour.
+    struct MoveOutcome: Sendable {
+        /// The subset of `ids` this attempt DISPOSITIONED (per-member
+        /// retirement, B-2).
+        let provenIds: [String]
+        /// Per-member destination addresses the server itself named, after G1.
+        /// Never a superset of `provenIds`; frequently empty.
+        let provenDestinations: [ProvenDestinationAddress]
+    }
+
     @discardableResult
     func move(
         ids: [String],
         from source: String,
         to destination: String,
         admittedUidValidity: UInt32
-    ) async throws -> [String] {
+    ) async throws -> MoveOutcome {
         let sourceUIDs = try nativeUIDSet(ids)
         do {
-            return try await withActionConnectionSelection(folder: source) { server, wrapperSelection -> [String] in
+            return try await withActionConnectionSelection(folder: source) { server, wrapperSelection -> MoveOutcome in
                 // A1 — the wrapper's own SELECT of the source.
                 try self.requireUidValidity(
                     wrapperSelection, expected: admittedUidValidity, folder: source)
@@ -4591,6 +4675,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // the epoch immediately before the STORE that mutates them.
                 let copyProvenUIDs = Self.copyProvenSourceUIDs(
                     copyEvidence, requested: sourceUIDs)
+                // The same evidence, read for the address rather than for the
+                // authorization. Purely additive: nothing below consults it,
+                // and it changes no gate. G1 lives inside it.
+                let provenDestinations = Self.copyProvenDestinations(
+                    copyEvidence, requested: sourceUIDs)
                 let authorizedUIDs: UIDSet
                 let purgeAuthorizedUIDs: UIDSet
                 if copyProvenUIDs.count == sourceUIDs.count {
@@ -4731,7 +4820,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): no UID EXPUNGE (uidPlus=\(serverSupportsUIDPlus), copyuid-proven-and-live=\(purgeAuthorizedUIDs.count)) — the tagged-OK COPY plus source liveness authorized the soft delete, so the source is copied and marked \\Deleted; the mailbox-wide EXPUNGE is skipped to avoid a wrong-delete (IOS-IMAP-001) and the move COMPLETES")
                     }
                 }
-                return provenIds
+                return MoveOutcome(
+                    provenIds: provenIds, provenDestinations: provenDestinations)
             }
         } catch is IMAPActionMailboxAbsent {
             // Source or destination CONFIRMED gone (LIST probe, T3.3) — the op
@@ -4740,7 +4830,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // absent destination the message is untouched in the source and
             // sync reconciles the user's view. This IS provider authority, so
             // every member is reported complete and the whole op retires.
-            return ids
+            //
+            // No destination address: nothing was copied anywhere, so there is
+            // nothing to re-key.
+            return MoveOutcome(provenIds: ids, provenDestinations: [])
         }
     }
 

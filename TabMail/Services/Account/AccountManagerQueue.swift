@@ -6,6 +6,22 @@ import Foundation
 import GRDB
 import Synchronization
 
+/// What one dispatched operation PROVED, as reported by `executeOperation` to
+/// `executeSingleOp`.
+struct ExecutedOperation: Sendable {
+    /// The subset of `op.messageIds` the provider POSITIVELY DISPOSITIONED, or
+    /// `nil` for "all of them". Retirement is per MEMBER, never per batch.
+    let provenMembers: [String]?
+    /// For a `.move` the server itself proved, the destination address each
+    /// member's copy landed on (`COPYUID`, RFC 4315 §3). Empty for every other
+    /// op type, for every provider that does not address by epoch-scoped UID,
+    /// and whenever the server furnished no usable evidence.
+    let provenDestinations: [ProvenDestinationAddress]
+
+    /// Every member dispositioned, nothing re-keyable.
+    static let allMembers = ExecutedOperation(provenMembers: nil, provenDestinations: [])
+}
+
 extension AccountManager {
 
     // MARK: - Persistent Action Queue
@@ -536,11 +552,12 @@ extension AccountManager {
         let opMsgCount = currentOp.messageIds.count
 
         do {
-            let provenMembers = try await withTimeout(
+            let executed = try await withTimeout(
                 seconds: SyncConfig.pendingOperationTimeoutSeconds
-            ) { () -> [String]? in
+            ) { () -> ExecutedOperation in
                 try await self.executeOperation(currentOp, provider: provider)
             }
+            let provenMembers = executed.provenMembers
             // 🚨 RETIREMENT IS PER MEMBER, NEVER PER BATCH. A provider that
             // proves only SOME members completed has told us nothing about the
             // rest — they were never mutated, and retiring the whole row would
@@ -606,12 +623,39 @@ extension AccountManager {
 
             // Step 3: Delete PendingOp. MUST succeed — remote op already completed.
             // If we don't delete, it re-executes on next drain (idempotent but wasteful).
+            //
+            // 🚨 THE MOVE IS ALSO FINISHED LOCALLY HERE, IN THIS SAME WRITE.
+            // `optimisticMoveToFolder` left the row's primary key and
+            // `messageId` at their SOURCE values with a NIL epoch, so until it
+            // is re-keyed the row is refused by `admittedOrdinaryActionTargets`
+            // and the user's NEXT gesture on a just-moved message is a silent
+            // dead no-op. Re-keying it to the address the server itself named
+            // in `COPYUID` (already in hand — see `MessageHeaderRekey.finishMove`
+            // for the four guards) closes that, and makes undo-after-drain an
+            // ordinary reverse move. Sharing this transaction with the op's
+            // deletion keeps the crash window exactly where it already was.
+            let appliedRekeys: [HeaderRekeyRecord]
             do {
-                try await retryWrite(dbPool, label: "Queue") { db in
+                appliedRekeys = try await retryWrite(dbPool, label: "Queue") { db -> [HeaderRekeyRecord] in
+                    let rekeys = try MessageHeaderRekey.finishMove(
+                        currentOp, destinations: executed.provenDestinations, db: db)
                     _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    return rekeys
                 }
             } catch {
                 print("[Queue] CRITICAL: Failed to delete completed PendingOperation \(currentOp.id) after retries — will re-execute on next drain")
+                appliedRekeys = []
+            }
+            if !appliedRekeys.isEmpty {
+                print("[MoveTrace] executeSingleOp — re-keyed \(appliedRekeys.count) moved row(s) to their COPYUID-proven destination address")
+                // The FTS index is a SEPARATE database, so its re-key is
+                // two-phase — outside the GRDB write — exactly as the sync
+                // path does it. The entry MOVES; it is never removed.
+                try? await SearchIndex.shared.rekeyHeaders(appliedRekeys.map {
+                    (oldKey: ContentKey(rawValue: $0.oldHeaderId),
+                     newKey: ContentKey(rawValue: $0.newHeaderId),
+                     newMessageId: $0.newProviderMessageId)
+                })
             }
             if [.archive, .delete, .move].contains(currentOp.type), let dest = currentOp.destinationPath {
                 context.foldersToSync.insert("\(currentOp.accountId)|\(dest)")
@@ -1228,11 +1272,11 @@ extension AccountManager {
     /// left undetermined for this arm to preserve. The narrowing path below is
     /// kept as the drain's standing contract for any provider that does return a
     /// strict subset; it is not dead code, it has no current producer.
-    func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> [String]? {
+    func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
         switch op.type {
         case .archive, .delete:
             // Legacy enum cases — all new ops use .move. No-op for any stale rows.
-            return nil
+            return .allMembers
         case .move:
             guard let dest = op.destinationPath else {
                 print("[MoveTrace] ERROR: move op missing destinationPath")
@@ -1243,22 +1287,24 @@ extension AccountManager {
             // to __GMAIL_ALL_MAIL__). Treating as success lets the op be cleaned up normally.
             guard op.folderPath != dest else {
                 print("[MoveTrace] executeOperation.move — no-op (source==dest): \(op.folderPath)")
-                return nil
+                return .allMembers
             }
             let opAgeMin = Date().timeIntervalSince(op.createdAt) / 60
             print("[MoveTrace] executeOperation.move — msgIds=\(op.messageIds) from=\(op.folderPath) to=\(dest) provider=\(type(of: provider)) accountId=\(op.accountId) opId=\(op.id) retryCount=\(op.retryCount) ageMin=\(String(format: "%.1f", opAgeMin))")
             if let imap = provider as? IMAPProvider,
                let admitted = op.observedUidValidity,
                let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                let proven = try await imap.move(
+                let outcome = try await imap.move(
                     ids: op.messageIds, from: op.folderPath, to: dest,
                     admittedUidValidity: admittedUInt)
-                print("[MoveTrace] executeOperation.move — completed for \(proven.count)/\(op.messageIds.count) member(s)")
-                return proven
+                print("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
+                return ExecutedOperation(
+                    provenMembers: outcome.provenIds,
+                    provenDestinations: outcome.provenDestinations)
             }
             try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
             print("[MoveTrace] executeOperation.move — completed successfully")
-            return nil
+            return .allMembers
         case .markRead:
             if let imap = provider as? IMAPProvider,
                let admitted = op.observedUidValidity,
@@ -1330,7 +1376,7 @@ extension AccountManager {
         case .saveDraft:
             guard let draftId = op.draftId ?? op.messageIds.first,
                   let instanceEpoch = op.instanceEpoch,
-                  !instanceEpoch.isEmpty else { return nil }
+                  !instanceEpoch.isEmpty else { return .allMembers }
             let disposition = try await DraftStore.shared.pushDraftToServer(
                 draftId: draftId,
                 expectedInstanceEpoch: instanceEpoch,
@@ -1342,7 +1388,7 @@ extension AccountManager {
                 print("[DraftQueue] Retiring save producer \(op.id) with disposition \(disposition)")
             }
         case .deleteDraft:
-            guard let encodedId = op.messageIds.first else { return nil }
+            guard let encodedId = op.messageIds.first else { return .allMembers }
             let runtimeKind = Self.draftRuntimeIdentityKind(for: provider)
             let addressKind = op.draftDeleteAddressKind.flatMap(DraftDeleteAddressKind.init(rawValue:))
             let identity: DraftDeleteIdentity
@@ -1377,7 +1423,7 @@ extension AccountManager {
             }
             try await provider.deleteDraft(identity: identity)
         case .addUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return nil }
+            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return .allMembers }
             if let gmail = provider as? GmailProvider {
                 try await gmail.modifyMessage(id: msgId, addLabelIds: [labelId])
             } else if provider is ExchangeProvider {
@@ -1392,7 +1438,7 @@ extension AccountManager {
                     folder: op.folderPath, admittedUidValidity: admittedUInt)
             }
         case .removeUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return nil }
+            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return .allMembers }
             if let gmail = provider as? GmailProvider {
                 try await gmail.modifyMessage(id: msgId, removeLabelIds: [labelId])
             } else if provider is ExchangeProvider {
@@ -1405,7 +1451,7 @@ extension AccountManager {
                     folder: op.folderPath, admittedUidValidity: admittedUInt)
             }
         }
-        return nil
+        return .allMembers
     }
 
     /// On app launch, recover from any crash during the previous session.

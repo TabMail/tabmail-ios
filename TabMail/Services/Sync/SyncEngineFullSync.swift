@@ -1175,16 +1175,6 @@ extension SyncEngine {
                 let newMsgId = match.messageId
                 let newId = "\(accountId):\(folderPath):\(newMsgId)"
                 print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
-                // Fetch the body BEFORE deleting the header, then delete its row
-                // EXPLICITLY: the FK cascade that used to do that is gone as of
-                // Stage D, and the copy re-inserted under the new id below would
-                // otherwise leave the old row behind — a duplicate plus a leak.
-                // Both statements must precede EVERY exit from this iteration,
-                // including the `continue` guard below, or the leg that skips the
-                // re-insert still leaves the orphan.
-                let oldBody = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId))
-                try staleMsg.delete(db)
-                _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
                 var migrated = staleMsg
                 migrated.id = newId
                 migrated.messageId = newMsgId
@@ -1201,18 +1191,19 @@ extension SyncEngine {
                     migrated.isFlagged = match.isFlagged
                     migrated.date = match.date
                 }
-                // Defensive — if a concurrent path already inserted this id, skip
-                // instead of throwing UNIQUE. The migrated row's PK was just
-                // rewritten; a prior upsert iteration for the same (accountId,
-                // folderPath, newMsgId) could have beaten us to it.
-                guard try MessageHeader.fetchOne(db, key: newId) == nil else {
+                // SHARED WITH THE DRAIN. `MessageHeaderRekey.apply` is this
+                // block's own sequence, extracted verbatim so the drain can run
+                // the IDENTICAL re-key earlier on the server's `COPYUID`
+                // (`MessageHeaderRekey.finishMove`) instead of leaving every
+                // moved row to be repaired here on weaker RFC 822 evidence. It
+                // owns the body carry-forward, the two explicit deletes that
+                // must precede every exit, the already-present collision skip,
+                // and the two FK-cascading child tables (`messageReference`
+                // rebuilt, `messageUserLabel` carried) this block used to
+                // destroy silently.
+                guard try MessageHeaderRekey.apply(from: staleMsg, to: migrated, db: db) else {
                     print("[Sync] UID remap: SKIPPING migrate-insert for \(newId) — already present")
                     continue
-                }
-                try migrated.insert(db)
-                if var body = oldBody {
-                    body.id = ContentKey(rawValue: newId)
-                    try body.insert(db)
                 }
                 // Move the FTS entry to the new id IN PLACE (preserves the
                 // indexed body text + the messages_vec embedding). Previously
