@@ -877,4 +877,203 @@ struct ContentOwnershipSweepTests {
             accountId: accountId,
             keys: [liveKey, quarantinedKey, deadKey, unscopedKey])
     }
+    // MARK: - Batched release (2026-08-05 N+1 fix)
+
+    /// An ISOLATED pool, so the two cases that have to break the schema (drop an
+    /// index the ownership probe pins) cannot leave the shared production pool in
+    /// that state for a peer suite.
+    private struct IsolatedPool {
+        let pool: DatabasePool
+        let directory: URL
+    }
+
+    private func makeIsolatedPool() throws -> IsolatedPool {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        try AppDatabase.runMigrations(on: pool)
+        return IsolatedPool(pool: pool, directory: directory)
+    }
+
+    /// ⚑ THE PLAN, NOT THE TIMING. `owners` runs once per key inside sweeps that
+    /// hand it whole pages, and its predicate used to be
+    /// `folderId = ? AND (rfc822MessageId = ? OR messageId = ?)` — whose plan
+    /// collapses to a WALK OF THE WHOLE FOLDER when `sqlite_stat1` is empty, which
+    /// is the ordinary state of a fresh install (`ANALYZE` has only ever run inside
+    /// migration bodies, against an empty `messageHeader`). The invariant is that
+    /// every arm probes on its OWN tail column, in whatever statistics regime: a
+    /// plan step that constrains only `folderId=?`, or that SCANs, is the defect.
+    ///
+    /// Asserted against `MessageContentStore.ownersSQL` — the string the production
+    /// path executes — so a rewrite that drops the hints cannot leave this green.
+    @Test("The ownership probe is index-anchored on its tail column, with empty statistics")
+    func ownershipProbePlanIsIndexAnchoredWithEmptyStatistics() async throws {
+        let fixture = try makeIsolatedPool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+
+        let plan: [String] = try await fixture.pool.write { db in
+            // The regime the fix is about: no statistics at all, so the planner has
+            // nothing but the schema to go on.
+            if try db.tableExists("sqlite_stat1") {
+                try db.execute(sql: "DELETE FROM sqlite_stat1")
+            }
+            return try Row.fetchAll(
+                db, sql: "EXPLAIN QUERY PLAN " + MessageContentStore.ownersSQL,
+                arguments: ["acc:INBOX", "42", "42", "acc:INBOX"]
+            ).map { $0["detail"] as String }
+        }
+
+        let steps = plan.filter { $0.contains("messageHeader") }
+        #expect(steps.count == 2, "both arms must appear as their own step; got \(plan)")
+        #expect(!plan.contains { $0.contains("SCAN") }, "no arm may scan the table; got \(plan)")
+        #expect(
+            steps.contains { $0.contains("messageId=?") },
+            "the provider-id arm must probe on messageId; got \(plan)")
+        #expect(
+            steps.contains { $0.contains("rfc822MessageId=?") },
+            "the RFC arm must probe on rfc822MessageId; got \(plan)")
+        #expect(
+            !steps.contains { step in
+                step.contains("(folderId=?)") && !step.contains("messageId=?")
+            },
+            "an arm constrained only by folderId is a whole-folder walk; got \(plan)")
+    }
+
+    /// The batching must decide NOTHING collectively. One key in the page is still
+    /// minted by a live header; the other two are not. The owned one must survive
+    /// with its indexed body AND its cached body intact, and the other two must
+    /// still be reclaimed in the same call.
+    @Test("A batch releases the unowned keys and keeps the one a live header still mints")
+    func batchReleasesTheUnownedAndKeepsTheOwned() async throws {
+        let accountId = "batch-mixed-\(UUID().uuidString.prefix(8))"
+        let folderPath = "INBOX"
+        let folderId = try await seedScope(accountId: accountId, folderPath: folderPath, provider: .gmail)
+
+        // Owned: a live header mints this key.
+        let owned = try await seedHeader(accountId: accountId, folderPath: folderPath, messageId: "500")
+        let ownedKey = ContentKey(rawValue: owned.id)
+        // Unowned: FTS + body rows whose headers are already gone.
+        let deadA = ContentKey(rawValue: "\(folderId):600")
+        let deadB = ContentKey(rawValue: "\(folderId):601")
+
+        for (key, body) in [(ownedKey, "owned body"), (deadA, "dead body A"), (deadB, "dead body B")] {
+            try await seedFTSRow(key: key, messageId: String(key.rawValue.split(separator: ":").last!),
+                                 folderId: folderId, body: body)
+            try await seedBody(key: key, html: "<p>\(body)</p>", ageHours: 0)
+        }
+
+        let released = await MessageContentStore.releaseUnowned(
+            [ownedKey, deadA, deadB], stores: [.searchIndex, .body])
+
+        #expect(released == 2, "exactly the two unowned keys are released; got \(released)")
+        #expect(await ftsBody(ownedKey) != nil, "a key a live header still mints must keep its indexed body")
+        #expect(await bodyHTML(ownedKey) != nil, "a key a live header still mints must keep its cached body")
+        #expect(await ftsBody(deadA) == nil, "an unowned key in the same batch must still be reclaimed")
+        #expect(await ftsBody(deadB) == nil, "an unowned key in the same batch must still be reclaimed")
+        #expect(await bodyHTML(deadA) == nil, "an unowned key's cached body must be reclaimed too")
+        #expect(await bodyHTML(deadB) == nil, "an unowned key's cached body must be reclaimed too")
+
+        await cleanup(accountId: accountId, keys: [ownedKey, deadA, deadB])
+    }
+
+    /// 🚨 `undetermined` IS NOT `unowned`, and batching must not blur that. The
+    /// ownership probe pins two indexes BY NAME, so dropping one is a reachable way
+    /// to make the probe throw; the verdict is then "could not decide", which KEEPS
+    /// — which is also the statement that the `INDEXED BY` hints fail SAFE rather
+    /// than silently degrading. The per-key semantics here are unchanged by the
+    /// batch rewrite; this pins that they survived it. The seam the rewrite DID
+    /// change is the roster read — see the sibling test below.
+    @Test("A batch whose ownership probe cannot answer keeps every key")
+    func batchKeepsEverythingWhenOwnershipCannotBeDecided() async throws {
+        let fixture = try makeIsolatedPool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let pool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let accountId = "batch-undetermined"
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX")
+        let dead = ContentKey(rawValue: "\(folderId):700")
+
+        try await fixture.pool.write { db in
+            var account = Account(
+                emailAddress: "\(accountId)@example.com", displayName: "T", provider: .gmail)
+            account.id = accountId
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            try folder.insert(db)
+            try db.execute(sql: """
+                INSERT INTO messageBody (id, htmlContent, attachmentsJSON, fetchedAt, icsText)
+                VALUES (?, '<p>keep me</p>', NULL, ?, NULL)
+                """, arguments: [dead.rawValue, Date()])
+            // Make the ownership probe unanswerable: it pins this index by name.
+            try db.execute(sql: "DROP INDEX messageHeader_rfc822MessageId")
+        }
+
+        let released = await MessageContentStore.releaseUnowned([dead], stores: .body, pool: pool)
+        #expect(released == 0, "an undecidable batch must release nothing; got \(released)")
+        let survived = try await fixture.pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageBody WHERE id = ?",
+                arguments: [dead.rawValue]) ?? 0
+        }
+        #expect(survived == 1, "content must be KEPT when ownership could not be decided")
+
+        // And the obligation is not consumed: once the probe can answer again, the
+        // same key is reclaimed.
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: "CREATE INDEX messageHeader_rfc822MessageId ON messageHeader(rfc822MessageId)")
+        }
+        let releasedAfter = await MessageContentStore.releaseUnowned([dead], stores: .body, pool: pool)
+        #expect(releasedAfter == 1, "a decidable pass must still reclaim it; got \(releasedAfter)")
+    }
+    /// ⚑ THE SEAM THE BATCH REWRITE ACTUALLY CHANGED, and the one place it is not
+    /// behaviour-preserving. The old array overload read the folder roster as
+    /// `(try? await pool.read { try Self.roster(db) }) ?? []`. An EMPTY roster makes
+    /// every key resolve to "no folder claims this key", which is the branch that
+    /// releases UNCONDITIONALLY — so a thrown roster read (a suspended or damaged
+    /// database) deleted the whole page's content without ever asking the ownership
+    /// question. That conflates *"nothing owns it"* with *"we could not ask"*, the
+    /// exact distinction `Ownership` exists to keep. It now keeps, and keeping is
+    /// recoverable: the sweeps re-run and reclaim on a later pass.
+    ///
+    /// The fault is injected at the roster read itself (`Folder.fetchAll`), not at
+    /// the per-key probe, because that is the read whose failure handling changed.
+    @Test("A batch whose folder-roster read fails keeps every key, rather than releasing all")
+    func batchKeepsEverythingWhenTheRosterReadFails() async throws {
+        let fixture = try makeIsolatedPool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let pool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let accountId = "batch-roster-throw"
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX")
+        let dead = ContentKey(rawValue: "\(folderId):800")
+
+        try await fixture.pool.write { db in
+            var account = Account(
+                emailAddress: "\(accountId)@example.com", displayName: "T", provider: .gmail)
+            account.id = accountId
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            try folder.insert(db)
+            try db.execute(sql: """
+                INSERT INTO messageBody (id, htmlContent, attachmentsJSON, fetchedAt, icsText)
+                VALUES (?, '<p>keep me</p>', NULL, ?, NULL)
+                """, arguments: [dead.rawValue, Date()])
+            // Make the ROSTER read itself unanswerable.
+            try db.execute(sql: "DROP TABLE messageHeader")
+            try db.execute(sql: "DROP TABLE folder")
+        }
+
+        let released = await MessageContentStore.releaseUnowned([dead], stores: .body, pool: pool)
+        #expect(released == 0, "a page whose roster could not be read must release nothing; got \(released)")
+        let survived = try await fixture.pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM messageBody WHERE id = ?",
+                arguments: [dead.rawValue]) ?? 0
+        }
+        #expect(survived == 1, "content must be KEPT when the roster could not be read")
+    }
 }

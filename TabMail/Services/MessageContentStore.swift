@@ -166,6 +166,21 @@ enum MessageContentStore {
         case undetermined(reason: String)
     }
 
+    /// The ownership superset statement `owners(of:scope:db:)` runs. Named — rather
+    /// than inlined at its one call site — so the PLAN invariant can be asserted
+    /// against the statement the production path actually executes, instead of
+    /// against a copy in a test that would silently drift away from it. See
+    /// `owners(of:scope:db:)` for why the shape is a hinted `UNION ALL`.
+    static let ownersSQL = """
+        SELECT id, accountId, folderPath, messageId, rfc822MessageId
+        FROM messageHeader INDEXED BY messageHeader_folderId_messageId
+        WHERE folderId = ? AND messageId = ?
+        UNION ALL
+        SELECT id, accountId, folderPath, messageId, rfc822MessageId
+        FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND folderId = ?
+        """
+
     /// The `messageHeader.id`s that currently mint `contentKey` inside `scope`.
     ///
     /// ⚑ **Returns a COLLECTION from day one**, even though today it is always 0 or
@@ -176,11 +191,9 @@ enum MessageContentStore {
     ///
     /// Two passes, deliberately:
     ///
-    /// 1. An **index-backed SUPERSET** in SQL —
-    ///    `folderId = ? AND (rfc822MessageId = ? OR messageId = ?)`. `folderId` is
-    ///    the leading column of the `messageHeader_folderId*` composite indexes, and
-    ///    the `OR` covers the tail under BOTH key spaces without the planner having
-    ///    to reason about which one is live.
+    /// 1. An **index-anchored SUPERSET** in SQL — a `UNION ALL` of one arm per key
+    ///    space, each pinned to the index that covers ITS tail column, so the tail
+    ///    is always an equality probe.
     /// 2. **Exact recomputation in Swift** — each candidate's key is re-minted
     ///    through `ContentKey.forHeader` and compared. The superset admits rows that
     ///    do NOT mint this key (e.g. a header whose `rfc822MessageId` equals the
@@ -190,18 +203,59 @@ enum MessageContentStore {
     /// A single clever SQL predicate was deliberately NOT written: it would either
     /// stop being index-backed or would encode the mint's rules a second time, where
     /// they could drift from `ContentKey.forHeader`.
+    ///
+    /// 🚨 WHY `UNION ALL` AND NOT `folderId = ? AND (rfc822MessageId = ? OR
+    /// messageId = ?)`, WHICH IS WHAT THIS USED TO BE. That predicate's plan depends
+    /// on `sqlite_stat1`, and this probe runs in sweeps of hundreds of keys.
+    /// Measured with `EXPLAIN QUERY PLAN` on the v83 schema at 300k headers /
+    /// 100k per folder (SQLite 3.51.0):
+    ///
+    /// ```
+    /// OR form, EMPTY sqlite_stat1:
+    ///   SEARCH messageHeader USING INDEX messageHeader_folderId_uidInt (folderId=?)
+    /// OR form, post-ANALYZE:
+    ///   MULTI-INDEX OR
+    ///     INDEX 1: SEARCH … USING INDEX messageHeader_rfc822MessageId_date (rfc822MessageId=?)
+    ///     INDEX 2: SEARCH … USING INDEX messageHeader_folderId_messageId (folderId=? AND messageId=?)
+    /// ```
+    ///
+    /// The empty-statistics plan is a **walk of the whole folder, per key** — and
+    /// empty statistics are the ordinary state of a fresh install, because `ANALYZE`
+    /// has only ever run inside migration bodies, against an empty `messageHeader`.
+    /// Independently measured at 500 missing-key probes in **11.9 s** with empty
+    /// stats vs **<0.001 s** after `ANALYZE`, and ~16 ms vs ~0.2 ms per call at 100k
+    /// rows (Mac numbers, system SQLite — the ratio is the finding, not the
+    /// absolutes). Both arms below plan identically in BOTH regimes:
+    ///
+    /// ```
+    /// COMPOUND QUERY
+    ///   LEFT-MOST SUBQUERY: SEARCH … USING INDEX messageHeader_folderId_messageId (folderId=? AND messageId=?)
+    ///   UNION ALL:          SEARCH … USING INDEX messageHeader_rfc822MessageId (rfc822MessageId=?)
+    /// ```
+    ///
+    /// ⚠️ THE TWO INDEX NAMES ARE LOAD-BEARING, AND THE `INDEXED BY` HINTS ARE NOT
+    /// DECORATION: without the hint on the second arm SQLite picks
+    /// `messageHeader_folderId_uidInt (folderId=?)` under empty statistics and walks
+    /// the folder anyway — the hint is what removes the stats dependency, not the
+    /// `UNION ALL` by itself. A migration that renames or drops either index makes
+    /// this statement throw, which `ownership(of:scope:db:)` turns into
+    /// `.undetermined` — so every deletion path KEEPS its content. That is loud and
+    /// fail-safe, never a wrong delete.
     static func owners(of contentKey: ContentKey, scope: ContentKeyScope, db: Database) throws -> [String] {
         guard let tail = scope.tail(of: contentKey) else { return [] }
         let candidates = try Row.fetchAll(
-            db,
-            sql: """
-                SELECT id, accountId, folderPath, messageId, rfc822MessageId
-                FROM messageHeader
-                WHERE folderId = ? AND (rfc822MessageId = ? OR messageId = ?)
-                """,
-            arguments: [scope.folderId, tail, tail]
+            db, sql: ownersSQL,
+            arguments: [scope.folderId, tail, tail, scope.folderId]
         )
-        return candidates.compactMap { row -> String? in
+        // `UNION ALL`, not `UNION`: a plain `UNION` dedupes by sorting the whole
+        // compound result, which is exactly the cost this rewrite removes. The one
+        // row that can appear on both arms is a header whose provider message id AND
+        // whose RFC 822 Message-ID are both the tail, so dedupe by id here.
+        var seen = Set<String>()
+        var owners: [String] = []
+        for row in candidates {
+            let id = row["id"] as String
+            guard seen.insert(id).inserted else { continue }
             let minted = ContentKey.forHeader(
                 accountId: row["accountId"] as String,
                 folderPath: row["folderPath"] as String,
@@ -209,8 +263,9 @@ enum MessageContentStore {
                 rfc822MessageId: row["rfc822MessageId"] as String?,
                 space: scope.space
             )
-            return minted == contentKey ? (row["id"] as String) : nil
+            if minted == contentKey { owners.append(id) }
         }
+        return owners
     }
 
     /// `owners`, wrapped in the verdict the deletion paths actually consume.
@@ -471,6 +526,33 @@ enum MessageContentStore {
     /// mint a key outside every folder's prefix, so there is no ownership question
     /// to ask, and refusing there would instead strand a search hit that renders
     /// without subject/sender and cannot be opened.
+    ///
+    /// 🚨 ONE READ, ONE BODY-DELETE TRANSACTION, ONE FTS TRANSACTION — this used to
+    /// be N+1 in the worst way. It looped the keys and called the single-key
+    /// overload, which does THREE round trips each: a `pool.read` ownership probe, a
+    /// `pool.write` body delete, and a one-key `SearchIndex.removeMessages`
+    /// transaction. Callers hand it whole pages (`SyncConfig.deletionReconcileChunkSize`
+    /// is 500, and `removeHeadersFromFTS` passes a full delta), so that was up to
+    /// 1,500 serialized transactions per page on the MAIN pool — and the shipped
+    /// implementation did ONE batched FTS transaction, letting `ON DELETE CASCADE`
+    /// reclaim the body (`v70` removed that cascade, which is why the body delete is
+    /// explicit here now).
+    ///
+    /// ⚠️ THE OWNERSHIP GUARD IS UNCHANGED AND STAYS PER KEY. Batching decides
+    /// nothing collectively: each key still gets its own `ownership` verdict, and
+    /// only `.unowned` releases. `.owned` and `.undetermined` KEEP — a batch
+    /// containing one still-owned key releases the others and keeps that one. The
+    /// mirror-image failure this must never become is a batch-wide verdict in either
+    /// direction.
+    ///
+    /// ⚠️ A FAILED READ NOW KEEPS EVERYTHING, WHICH IS A DELIBERATE CHANGE. The
+    /// previous line was `(try? await pool.read { try Self.roster(db) }) ?? []`, and
+    /// an empty roster makes every key resolve to "no folder claims it" — i.e. a
+    /// thrown read (a suspended or unreadable database) fell through to an
+    /// UNCONDITIONAL release of the whole page. That conflates *"nothing owns it"*
+    /// with *"we could not ask"*, which is the exact distinction `Ownership` exists
+    /// to keep. Keeping is recoverable: the sweeps re-run and reclaim the content on
+    /// a later pass.
     @discardableResult
     static func releaseUnowned(
         _ contentKeys: [ContentKey],
@@ -478,19 +560,25 @@ enum MessageContentStore {
         pool: PrioritizedDatabase = AppDatabase.dbPool
     ) async -> Int {
         guard !contentKeys.isEmpty else { return 0 }
-        let roster = (try? await pool.read { db in try Self.roster(db) }) ?? []
-        var released = 0
-        for key in contentKeys {
-            guard let scope = resolveScope(for: key, in: roster) else {
-                await release(key, stores: stores, pool: pool)
-                released += 1
-                continue
+        let releasable: [ContentKey]
+        do {
+            releasable = try await pool.read { db -> [ContentKey] in
+                let roster = try Self.roster(db)
+                return contentKeys.filter { key in
+                    guard let scope = resolveScope(for: key, in: roster) else { return true }
+                    switch ownership(of: key, scope: scope, db: db) {
+                    case .unowned: return true
+                    case .owned, .undetermined: return false
+                    }
+                }
             }
-            if await releaseUnowned(key, scope: scope, stores: stores, pool: pool) {
-                released += 1
-            }
+        } catch {
+            log("releaseUnowned: batch read failed — KEEPING all \(contentKeys.count) key(s): \(error)")
+            return 0
         }
-        return released
+        guard !releasable.isEmpty else { return 0 }
+        await release(releasable, stores: stores, pool: pool)
+        return releasable.count
     }
 
     /// The unconditional delete, in ONE place so no caller hand-rolls a second one.
@@ -504,25 +592,49 @@ enum MessageContentStore {
         stores: ContentStores,
         pool: PrioritizedDatabase = AppDatabase.dbPool
     ) async {
+        await release([contentKey], stores: stores, pool: pool)
+    }
+
+    /// The batched form of the unconditional delete. The single-key overload routes
+    /// here so the two can never drift: one write transaction for the bodies (chunked
+    /// under SQLite's bound-variable limit), one `SearchIndex.removeMessages` — which
+    /// is already a single transaction over the whole array — and the per-key asset
+    /// sweep, which is file I/O with no transaction to batch.
+    ///
+    /// Each store is independently `do`/`catch`ed exactly as before: a failure in one
+    /// must not skip the others, and none of them is a user intention that could be
+    /// dropped — the content is derived and re-fetchable.
+    static func release(
+        _ contentKeys: [ContentKey],
+        stores: ContentStores,
+        pool: PrioritizedDatabase = AppDatabase.dbPool
+    ) async {
+        guard !contentKeys.isEmpty else { return }
         if stores.contains(.body) {
             do {
-                try await pool.write { db in
-                    try db.execute(
-                        sql: "DELETE FROM messageBody WHERE id = ?", arguments: [contentKey])
+                try await pool.write(label: "MessageContentStore.releaseBodies") { db in
+                    for chunk in contentKeys.chunked(into: SyncConfig.sqlChunkSize) {
+                        let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+                        try db.execute(
+                            sql: "DELETE FROM messageBody WHERE id IN (\(placeholders))",
+                            arguments: StatementArguments(chunk))
+                    }
                 }
             } catch {
-                print("[MessageContentStore] body release failed for \(contentKey): \(error)")
+                print("[MessageContentStore] body release failed for \(contentKeys.count) key(s): \(error)")
             }
         }
         if stores.contains(.searchIndex) {
             do {
-                try await SearchIndex.shared.removeMessages(contentKeys: [contentKey])
+                try await SearchIndex.shared.removeMessages(contentKeys: contentKeys)
             } catch {
-                print("[MessageContentStore] search-index release failed for \(contentKey): \(error)")
+                print("[MessageContentStore] search-index release failed for \(contentKeys.count) key(s): \(error)")
             }
         }
         if stores.contains(.assets) {
-            _ = BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
+            for contentKey in contentKeys {
+                _ = BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
+            }
         }
     }
 
