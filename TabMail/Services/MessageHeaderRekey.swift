@@ -8,7 +8,7 @@ import GRDB
 // MARK: - The destination address the wire already gave us
 
 /// One member's destination address, exactly as the server itself named it in
-/// the `COPYUID` response code (RFC 4315 §3).
+/// its answer to the move THIS operation issued.
 ///
 /// THE ADDRESS PROBLEM, closed where it is created. A `PendingOperation` names
 /// its members by their address in the SOURCE folder, and on IMAP an address is
@@ -18,18 +18,56 @@ import GRDB
 /// carried to the drain so the move can be finished LOCALLY instead of being
 /// repaired later by sync on weaker (RFC 822) evidence.
 ///
+/// 🚨 **PROVIDER-NEUTRAL, because the discard was never IMAP-specific.** The
+/// identical sentence is true of Microsoft Graph: `POST /messages/{id}/move`
+/// answers with the moved message **carrying its new `id`**, Graph ids churn on
+/// every folder move by default (no `Prefer: IdType="ImmutableId"` is sent
+/// anywhere in this app), and `ExchangeProvider.moveMessage` bound that response
+/// to `_`. The two address spaces differ only in what an address IS — a UID
+/// inside an epoch on IMAP, an opaque resource id with NO epoch space on Graph —
+/// so the id is a `String` and the epoch is OPTIONAL. `KNOWN_ISSUES.md`
+/// `IOS-GRAPH-002`, `MIS-IOS-003` instance 5, `MIS-006` instance 5.
+///
 /// ⚠ NOT an rfc822 Message-ID, and never derived from one. ADR-IOS-068 / D4
 /// forbids the Message-ID as mutation authority and forbids a `SEARCH` result
 /// from ever being a mutation target. The authority here is the wire's own
-/// answer to the copy THIS operation issued — attempt-correlated by
+/// answer to the move THIS operation issued — attempt-correlated by
 /// construction, and strictly stronger than any identity probe.
 struct ProvenDestinationAddress: Sendable, Equatable {
-    /// The provider id the operation named — the SOURCE UID, as a string.
+    /// The provider id the operation named — the SOURCE UID as a string on
+    /// IMAP, the source Graph resource id on Exchange.
     let sourceProviderId: String
-    /// The UID the server assigned to the copy it created in the destination.
-    let destinationUid: UInt32
-    /// The destination mailbox's UIDVALIDITY, stamped on the same `COPYUID`.
-    let destinationUidValidity: UInt32
+    /// The provider id the server assigned to the copy it created in the
+    /// destination — the destination UID as a string on IMAP, the `id` of the
+    /// message resource Graph returned from `/move` on Exchange.
+    let destinationProviderId: String
+    /// The destination address space's epoch, when the provider HAS one: the
+    /// destination mailbox's UIDVALIDITY, stamped on the same `COPYUID`.
+    ///
+    /// **`nil` means the provider has no epoch space at all** (Graph), NOT that
+    /// an epoch was expected and went missing — `IMAPProvider.move` refuses
+    /// before any wire mutation when a destination epoch is unreadable, so it
+    /// never reaches this type unset. `finishMove`'s G2 leaves the row's stamp
+    /// unread for a `nil` epoch, which is both the correct value and the safe
+    /// one (see G2).
+    let destinationUidValidity: UInt32?
+}
+
+/// What one provider move attempt DISPOSITIONED, and where the server said the
+/// copies landed.
+///
+/// Top-level rather than nested in `IMAPProvider` because it has TWO producers:
+/// `IMAPProvider.move(ids:from:to:admittedUidValidity:)` and
+/// `ExchangeProvider.moveProvingDestinations(ids:from:to:)`. Both feed the same
+/// consumer — `AccountManagerQueue.executeOperation`'s `.move` case — so one
+/// type keeps the two arms from drifting.
+struct MoveOutcome: Sendable {
+    /// The subset of the requested ids this attempt DISPOSITIONED (per-member
+    /// retirement, B-2).
+    let provenIds: [String]
+    /// Per-member destination addresses the server itself named. Never a
+    /// superset of `provenIds`; frequently empty.
+    let provenDestinations: [ProvenDestinationAddress]
 }
 
 /// One applied re-key. The local row that used to live at `oldHeaderId` now
@@ -157,6 +195,13 @@ enum MessageHeaderRekey {
     /// the bug this function fixes. A nil stamp is `.retainedForRetry`, which is
     /// recoverable by the next sync of that folder.
     ///
+    /// **A provider with NO epoch space takes the same nil arm, and for the same
+    /// reason.** Graph has no UIDVALIDITY, so `destinationUidValidity` is `nil`
+    /// and the stamp is left unread. That is not a degraded case: an invented
+    /// stamp on an Exchange row would be a *positive* disagreement with the
+    /// folder's own `nil`, i.e. the terminal arm again. Nil is both the true
+    /// value and the safe one.
+    ///
     /// **G3 — collision and TOCTOU.** The row must still be the one THIS
     /// operation moved (same account, same provider id, still sitting in this
     /// op's destination folder); a vanished or already-repaired row is a
@@ -207,7 +252,7 @@ enum MessageHeaderRekey {
             let oldId = MessageIdentity.headerId(
                 accountId: op.accountId, folderPath: op.folderPath,
                 messageId: destination.sourceProviderId)
-            let newMessageId = String(destination.destinationUid)
+            let newMessageId = destination.destinationProviderId
             let newId = MessageIdentity.headerId(
                 accountId: op.accountId, folderPath: destinationPath,
                 messageId: newMessageId)
@@ -226,11 +271,14 @@ enum MessageHeaderRekey {
             migrated.id = newId
             migrated.messageId = newMessageId
             // G2 — see the discussion above. Fresher-than-the-folder is worse
-            // than unknown, because only the former is terminal.
-            migrated.observedUidValidity =
-                folderEpoch == Int(destination.destinationUidValidity)
-                ? Int(destination.destinationUidValidity)
-                : nil
+            // than unknown, because only the former is terminal. A provider
+            // with no epoch space reports `nil` and takes the same arm.
+            if let provenEpoch = destination.destinationUidValidity,
+               folderEpoch == Int(provenEpoch) {
+                migrated.observedUidValidity = Int(provenEpoch)
+            } else {
+                migrated.observedUidValidity = nil
+            }
 
             guard try apply(from: row, to: migrated, db: db) else {
                 // The new id was already occupied, so `apply` deleted the old

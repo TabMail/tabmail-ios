@@ -366,7 +366,7 @@ struct FinishTheMoveLocallyTests {
             let records = try MessageHeaderRekey.finishMove(
                 op,
                 destinations: [ProvenDestinationAddress(
-                    sourceProviderId: "77", destinationUid: 1,
+                    sourceProviderId: "77", destinationProviderId: "1",
                     destinationUidValidity: 20_260_803)],
                 db: db)
             _ = try PendingOperation.deleteOne(db, key: op.id)

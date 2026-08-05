@@ -13,9 +13,11 @@ struct ExecutedOperation: Sendable {
     /// `nil` for "all of them". Retirement is per MEMBER, never per batch.
     let provenMembers: [String]?
     /// For a `.move` the server itself proved, the destination address each
-    /// member's copy landed on (`COPYUID`, RFC 4315 §3). Empty for every other
-    /// op type, for every provider that does not address by epoch-scoped UID,
-    /// and whenever the server furnished no usable evidence.
+    /// member's copy landed on — IMAP's `COPYUID` (RFC 4315 §3) or the `id` on
+    /// the message resource Graph returns from `/messages/{id}/move`. Empty for
+    /// every other op type, for a provider whose move does not change the
+    /// address at all (Gmail's `messages.modify` only adds/removes labels), and
+    /// whenever the server furnished no usable evidence.
     let provenDestinations: [ProvenDestinationAddress]
 
     /// Every member dispositioned, nothing re-keyable.
@@ -1147,12 +1149,18 @@ extension AccountManager {
     /// and again on every later drain until the server proves or denies them.
     /// Duplicated mail is recoverable; a dropped intention is not.
     ///
-    /// ⚠ AUDIT ROUND 4 — THIS PATH HAS NO CURRENT PRODUCER. `IMAPProvider.move`
-    /// was the only one, and it now dispositions every member positively before
+    /// ⚠ AUDIT ROUND 4, CORRECTED (`IOS-GRAPH-002`). `IMAPProvider.move` is no
+    /// longer a producer — it dispositions every member positively before
     /// returning (see `executeOperation`'s return-value note), so there is no
-    /// undetermined remainder for this to narrow to — which is also why the
-    /// re-copy cost above can no longer be incurred. It is retained as the
-    /// drain's contract for any provider that returns a strict subset.
+    /// undetermined remainder for this to narrow to on that arm, and the
+    /// re-copy cost above cannot be incurred there. But this path is NOT
+    /// producerless: `ExchangeProvider.moveProvingDestinations` returns the
+    /// prefix it proved when a batch fails partway, so the members Graph
+    /// already moved are retired and RE-KEYED to the ids its `/move` responses
+    /// named, instead of having those addresses discarded with the error. The
+    /// re-copy hazard described above does not arise on that arm either: the
+    /// unproven remainder was never mutated, because each Graph move is its own
+    /// request rather than one command over the whole set.
     ///
     /// 🚨 A RETIRED MEMBER IS FINISHED LOCALLY HERE TOO (`IOS-QUEUE-005`). This
     /// leg used to return before any re-key, so a member retired in a narrowing
@@ -1477,17 +1485,23 @@ extension AccountManager {
     /// exactly those members and leaves the rest durably queued — retirement is
     /// per MEMBER, never per batch.
     ///
-    /// ⚠ AUDIT ROUND 4 — NO PROVIDER CURRENTLY RETURNS A STRICT SUBSET, and that
-    /// is a strengthening rather than a simplification. `IMAPProvider.move` was
-    /// the only producer: it returned the members the server's own `COPYUID`
-    /// named, leaving members it did not name queued on the absence of evidence
-    /// about them. It now determines EVERY member positively before returning —
-    /// moved (COPYUID, or the COPY's tagged OK plus proof the member was in the
-    /// source when that COPY ran), or no longer in the source folder at all,
-    /// which is the provider saying there is nothing left to do. So no member is
-    /// left undetermined for this arm to preserve. The narrowing path below is
-    /// kept as the drain's standing contract for any provider that does return a
-    /// strict subset; it is not dead code, it has no current producer.
+    /// ⚠ AUDIT ROUND 4 — `IMAPProvider.move` NEVER RETURNS A STRICT SUBSET, and
+    /// that is a strengthening rather than a simplification. It used to: it
+    /// returned the members the server's own `COPYUID` named, leaving members it
+    /// did not name queued on the absence of evidence about them. It now
+    /// determines EVERY member positively before returning — moved (COPYUID, or
+    /// the COPY's tagged OK plus proof the member was in the source when that
+    /// COPY ran), or no longer in the source folder at all, which is the
+    /// provider saying there is nothing left to do. So no member is left
+    /// undetermined for that arm to preserve.
+    ///
+    /// ⚠ CORRECTED (`IOS-GRAPH-002`) — this note used to end "NO PROVIDER
+    /// CURRENTLY RETURNS A STRICT SUBSET", and the narrowing path was described
+    /// as having no producer. `ExchangeProvider.moveProvingDestinations` IS one:
+    /// a Graph move that fails partway through a batch returns the prefix it
+    /// proved, because each of those members has already had its `id` churned
+    /// and throwing the attempt away would discard the very addresses the wire
+    /// just supplied. So the narrowing path is live, not merely contractual.
     func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
         switch op.type {
         case .archive, .delete:
@@ -1513,6 +1527,30 @@ extension AccountManager {
                 let outcome = try await imap.move(
                     ids: op.messageIds, from: op.folderPath, to: dest,
                     admittedUidValidity: admittedUInt)
+                queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
+                return ExecutedOperation(
+                    provenMembers: outcome.provenIds,
+                    provenDestinations: outcome.provenDestinations)
+            }
+            // 🚨 THE SIBLING ARM THE `COPYUID` CENSUS NEVER REACHED
+            // (`IOS-GRAPH-002`, `MIS-006` instance 5). Graph reallocates a
+            // message's `id` on every folder move, and this arm used to drop
+            // through to the `Void`-returning protocol call — so the address
+            // the wire had just handed us was thrown away, the local row kept
+            // an id the app itself had invalidated, and the user's NEXT gesture
+            // on that message 404'd and had its `PendingOperation` deleted as
+            // though the provider had said the work was done.
+            //
+            // NO EPOCH GUARD, deliberately and for the same reason
+            // `.addUserLabel` has none: Graph ids are provider-stable resource
+            // ids rather than numbers in a UIDVALIDITY space, so
+            // `admittedOrdinaryActionTargets` records `nil` for Exchange and a
+            // guard modelled on IMAP's would refuse every Outlook move forever.
+            // What replaces it is that the address is re-learned from the
+            // mutation's own response instead of being assumed to survive.
+            if let exchange = provider as? ExchangeProvider {
+                let outcome = try await exchange.moveProvingDestinations(
+                    ids: op.messageIds, from: op.folderPath, to: dest)
                 queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
                 return ExecutedOperation(
                     provenMembers: outcome.provenIds,

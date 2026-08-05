@@ -568,23 +568,105 @@ actor ExchangeProvider: EmailProvider {
         }
     }
 
+    /// `EmailProvider` conformance. The protocol returns `Void`, so it has no
+    /// channel for the destination addresses Graph hands back — this wrapper
+    /// therefore discards them **because its caller asked for a shape that
+    /// cannot carry them**, which is not the same thing as the discard
+    /// `IOS-GRAPH-002` was about (a `_ =` on the only path that had them).
+    /// The action queue calls `moveProvingDestinations` instead; nothing in
+    /// production reaches this overload for a `.move` operation.
     func move(ids: [String], from source: String, to destination: String) async throws {
+        _ = try await moveProvingDestinations(ids: ids, from: source, to: destination)
+    }
+
+    /// Move each member and RE-LEARN the address the move gave it.
+    ///
+    /// 🚨 **THE ADDRESS PROBLEM in the Graph id space** (`IOS-GRAPH-002`,
+    /// `MIS-IOS-003` instance 5). Graph ids are not stable across a folder move
+    /// — `POST /messages/{id}/move` answers with the moved message carrying its
+    /// **new `id`**, and this app sends no `Prefer: IdType="ImmutableId"`
+    /// anywhere, so the default mutable scheme is what every Outlook account
+    /// runs on. That response was bound to `_`, nothing re-learned the id, and
+    /// the user's NEXT gesture on the same message named an address the app
+    /// itself had invalidated. Graph answered `404 ErrorItemNotFound` — a
+    /// truthful answer to *"is there a message with this id?"*, which is NOT
+    /// the question *"is the queued operation already done?"* — and the drain
+    /// read it as exit 2 and deleted the `PendingOperation`. Re-learning the id
+    /// here is what makes that impossible; it is the same closure
+    /// `59423bb7d` applied to IMAP's `COPYUID`, in the second address space
+    /// where the identical sentence was true.
+    ///
+    /// **AUTHORITY.** The id comes from the server's own answer to the mutation
+    /// THIS call issued, so it is attempt-correlated by construction — no
+    /// rfc822 Message-ID is consulted and no `SEARCH` result is promoted to a
+    /// mutation target (ADR-IOS-068 / D4). Pairing needs no guard here at all:
+    /// Graph's `/move` is one message per request, so a response cannot be
+    /// mis-zipped against a sibling the way a positionally-paired `COPYUID` can
+    /// (`copyProvenDestinations`' `isStrictlyAscending` refusal). That IMAP
+    /// guard has no Graph analogue because it has no Graph hazard, which is
+    /// stated rather than silently omitted.
+    ///
+    /// **NO EPOCH IS INVENTED.** `destinationUidValidity` is `nil` — Graph has
+    /// no UIDVALIDITY space — and `MessageHeaderRekey.finishMove`'s G2 leaves
+    /// the row's stamp unread for it. A fabricated stamp would be a *positive*
+    /// disagreement with the folder's own `nil`, which
+    /// `roleMoveRejectDispositions` treats as `.terminalStale`: the mirror
+    /// image of the bug this closes.
+    ///
+    /// **PARTIAL BATCHES RETURN WHAT THEY PROVED.** A member that moved before
+    /// a later member failed has ALREADY had its id churned; throwing the whole
+    /// attempt away would discard that address and leave exactly the state this
+    /// method exists to prevent, one mid-batch failure later. Returning the
+    /// proven prefix routes it through
+    /// `AccountManagerQueue.retirePartiallyCompletedOp`, which retires and
+    /// re-keys those members and leaves the remainder durably queued — the
+    /// drain's standing contract for a provider that returns a strict subset,
+    /// which this arm is now the producer for. The error is re-thrown whenever
+    /// NOTHING was proven, so a whole-batch failure keeps its exact previous
+    /// classification (404 split, permanent-invalid, account-wide failure).
+    func moveProvingDestinations(
+        ids: [String], from source: String, to destination: String
+    ) async throws -> MoveOutcome {
         print("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
-        for id in ids {
-            // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
-            // tm_* Graph categories so pre-ADR pollution fades naturally as
-            // the user triages. Best-effort — a strip failure must NOT
-            // block the move.
-            if source == inboxFolderId {
-                do {
-                    try await stripLegacyCategories(id: id)
-                } catch {
-                    print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)")
+        var provenIds: [String] = []
+        var provenDestinations: [ProvenDestinationAddress] = []
+        do {
+            for id in ids {
+                // Legacy-label decay (ADR-IOS-036): on inbox-exit, strip residual
+                // tm_* Graph categories so pre-ADR pollution fades naturally as
+                // the user triages. Best-effort — a strip failure must NOT
+                // block the move.
+                if source == inboxFolderId {
+                    do {
+                        try await stripLegacyCategories(id: id)
+                    } catch {
+                        print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)")
+                    }
                 }
+                let movedId = try await moveMessage(id: id, destinationId: destination)
+                provenIds.append(id)
+                if let movedId {
+                    provenDestinations.append(ProvenDestinationAddress(
+                        sourceProviderId: id,
+                        destinationProviderId: movedId,
+                        destinationUidValidity: nil))
+                }
+                print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
             }
-            try await moveMessage(id: id, destinationId: destination)
-            print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
+        } catch {
+            // A cancelled Task has NOT proved anything about the members it
+            // never reached, and `withTimeout` discards an abandoned Task's
+            // return value anyway — so cancellation is re-thrown whole rather
+            // than dressed up as a partial success.
+            if error is CancellationError { throw error }
+            guard !provenIds.isEmpty else { throw error }
+            if DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] ExchangeProvider.move — \(provenIds.count)/\(ids.count) member(s) moved before \(error); returning the proven prefix so their re-learned addresses are not discarded")
+            }
+            return MoveOutcome(
+                provenIds: provenIds, provenDestinations: provenDestinations)
         }
+        return MoveOutcome(provenIds: ids, provenDestinations: provenDestinations)
     }
 
     /// Remove any residual `tm_*` categories from a message. PATCH replaces
@@ -1113,11 +1195,34 @@ actor ExchangeProvider: EmailProvider {
         let _ = try await request(path: "/messages/\(encodedId)", method: "PATCH", body: jsonData)
     }
 
-    private func moveMessage(id: String, destinationId: String) async throws {
+    /// - Returns: the `id` Graph assigned to the moved message, or `nil` when
+    ///   the response carried no usable one.
+    ///
+    /// 🚨 THE RESPONSE IS THE POINT. `POST /messages/{id}/move` returns the
+    /// moved **message resource**, and on the default mutable-id scheme its
+    /// `id` differs from the one addressed — that value used to be discarded
+    /// (`IOS-GRAPH-002`). `GraphMessageRef` is reused rather than
+    /// `GraphMessage`: only the id is wanted, and a narrower decode cannot fail
+    /// on a field this call never needs.
+    ///
+    /// `nil` is the WITHHELD-EVIDENCE arm, byte-for-byte the shape IMAP already
+    /// has when a server furnishes no `COPYUID`: the move itself SUCCEEDED (a
+    /// non-2xx would have thrown from `request`), we simply cannot say where it
+    /// landed, so no address is invented and the row keeps today's behaviour
+    /// until sync repairs it. It is not a fallback — nothing is substituted.
+    private func moveMessage(id: String, destinationId: String) async throws -> String? {
         let body = ["destinationId": destinationId]
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-        let _ = try await request(path: "/messages/\(encodedId)/move", method: "POST", body: jsonData)
+        let data = try await request(path: "/messages/\(encodedId)/move", method: "POST", body: jsonData)
+        guard let moved = try? JSONDecoder().decode(GraphMessageRef.self, from: data),
+              !moved.id.isEmpty else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[MoveTrace] ExchangeProvider.moveMessage — Graph accepted the move of \(id) but its response named no message id, so the destination address is UNKNOWN (no re-key; sync repairs the row)")
+            }
+            return nil
+        }
+        return moved.id
     }
 
 

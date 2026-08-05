@@ -91,8 +91,18 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
 
     let http = FakeHTTP.Scenario()
     private let state: StateBox
+    /// Whether `/move` REALLOCATES the resource id, which is what Graph does on
+    /// the default mutable-id scheme and therefore the default here.
+    ///
+    /// `false` models the other real tenant configuration — an id that survives
+    /// the move — and exists so a test can prove that an assertion about the
+    /// churning case is not passing for a reason unrelated to the churn
+    /// (two-sided non-vacuity). Both arms still answer `/move` with the moved
+    /// message resource, because Graph does; only the `id` on it differs.
+    private let churnsIdOnMove: Bool
 
-    init(messages: [Seed]) {
+    init(messages: [Seed], churnsIdOnMove: Bool = true) {
+        self.churnsIdOnMove = churnsIdOnMove
         state = StateBox(State(messagesByProviderId: Dictionary(
             uniqueKeysWithValues: messages.map {
                 ($0.providerMessageId, Message(
@@ -340,7 +350,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             }
             return removed ? .status(204) : .status(404)
         }
-        http.register(path: "/messages/", method: "POST") { [state] request in
+        http.register(path: "/messages/", method: "POST") { [state, churnsIdOnMove] request in
             guard !Self.consumeMutationFailure(state) else { return .status(503) }
             guard let providerId = Self.messageId(from: request.url, move: true) else {
                 return .status(404)
@@ -356,7 +366,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 guard let prior = model.messagesByProviderId.removeValue(forKey: providerId) else {
                     return nil
                 }
-                let movedId = "graph/moved+\(model.nextMoveGeneration)="
+                let movedId = churnsIdOnMove
+                    ? "graph/moved+\(model.nextMoveGeneration)="
+                    : prior.providerMessageId
                 model.nextMoveGeneration += 1
                 let next = Message(
                     rfc822MessageId: prior.rfc822MessageId,

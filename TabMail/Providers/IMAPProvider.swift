@@ -4043,7 +4043,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                   requestedValues.contains(pair.source.value) else { continue }
             proven.append(ProvenDestinationAddress(
                 sourceProviderId: String(pair.source.value),
-                destinationUid: pair.destination.value,
+                // A UID IS this provider's address, so the provider-neutral id
+                // is its decimal string — the same value `finishMove` has
+                // always written into `MessageHeader.messageId` here.
+                destinationProviderId: String(pair.destination.value),
                 destinationUidValidity: epoch))
         }
         return proven
@@ -4541,15 +4544,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// — the address the caller needs to finish the move LOCALLY. It is empty
     /// whenever the server furnished no usable evidence, and a caller that
     /// ignores it gets exactly the previous behaviour.
-    struct MoveOutcome: Sendable {
-        /// The subset of `ids` this attempt DISPOSITIONED (per-member
-        /// retirement, B-2).
-        let provenIds: [String]
-        /// Per-member destination addresses the server itself named, after G1.
-        /// Never a superset of `provenIds`; frequently empty.
-        let provenDestinations: [ProvenDestinationAddress]
-    }
-
+    ///
+    /// `MoveOutcome` itself now lives at top level in
+    /// `TabMail/Services/MessageHeaderRekey.swift`, beside
+    /// `ProvenDestinationAddress`: `ExchangeProvider.moveProvingDestinations`
+    /// produces the same shape from Graph's `/move` response, and one type is
+    /// what stops the two arms drifting. Nothing about THIS method's contract
+    /// changed with the move — the G1 pairing note above still describes what
+    /// `provenDestinations` means on this arm.
     @discardableResult
     func move(
         ids: [String],

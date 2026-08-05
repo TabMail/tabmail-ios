@@ -379,7 +379,7 @@ struct QueueCoreInvariantTests {
         await AccountManager.shared.retirePartiallyCompletedOp(
             op, provenMembers: ["77"], remaining: ["88"],
             provenDestinations: [ProvenDestinationAddress(
-                sourceProviderId: "77", destinationUid: 5, destinationUidValidity: 42)],
+                sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
             context: AccountManager.DrainContext())
 
         let destinationId = MessageIdentity.headerId(
@@ -581,7 +581,7 @@ struct QueueCoreInvariantTests {
             var collided: [String] = []
             let applied = try MessageHeaderRekey.finishMove(
                 op, destinations: [ProvenDestinationAddress(
-                    sourceProviderId: "77", destinationUid: 5, destinationUidValidity: 42)],
+                    sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
                 db: db, onCollidedRekey: { collided.append($0) })
             return (applied, collided)
         }
