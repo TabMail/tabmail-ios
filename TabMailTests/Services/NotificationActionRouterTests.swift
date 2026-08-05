@@ -396,4 +396,101 @@ struct NotificationActionRouterTests {
         #expect(ops[0].messageIds == ["m-thrown-markread"])
         #expect(NotificationActionRouter.durableLookupAttemptsForTesting == 2)
     }
+
+    // MARK: - (7) C3 — the notification tap carries a content witness
+
+    /// Pins the SYSTEM PROPERTY, not the mechanism: **no mutation dispatched by a
+    /// notification-action tap may land on a message whose identity differs from
+    /// the one the router resolved.** Deliberately NOT written as "the router
+    /// passes `expectedIdentities`" — a mechanism-pinning assertion stays green
+    /// on a system that re-broke some other way (global Testing rule 12,
+    /// `MIS-015`).
+    ///
+    /// The window under test is the one `performCoordinatedRoleMove`'s SECOND
+    /// identity pass exists for: the FIFO write queue can hold an unbounded
+    /// amount of other work between the pre-resolve and the write, which is wide
+    /// enough for a UIDVALIDITY turnover to purge the row and re-seat a
+    /// different physical message under the same composite address. The epoch
+    /// guards cannot see it — the impostor's epoch is fresh too — so the content
+    /// witness is the only thing that can refuse.
+    ///
+    /// RED before the fix: with `expectedIdentities` omitted at the ARCHIVE call
+    /// site, both refusals were witness-gated and therefore inert, and the
+    /// impostor was moved to Archive. Registered as `IOS-NOTIFY-001`.
+    @Test("""
+    C3 — a UIDVALIDITY turnover re-seats the tapped address onto a DIFFERENT message after \
+    the router resolved it and before the coordinated write runs: the ARCHIVE tap moves \
+    nothing and queues no durable operation
+    """)
+    func notificationArchiveRefusesAReseatedAddress() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); resetStagedGlobal() }
+        resetStagedGlobal()
+
+        // `let` bindings, not `var`: these are captured by the @Sendable write
+        // closures below, and Swift 6 rejects a captured `var`.
+        let captured: MessageHeader = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-c3-reseat")
+            h.rfc822MessageId = "<captured-notify@example.com>"
+            return h
+        }()
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+
+        // Hold the FIFO write queue so the coordinated closure cannot run until
+        // the address has been re-seated. Safe to block a process-wide queue
+        // here because `.processGlobalState` excludes every other suite that
+        // touches `AccountManager.shared`.
+        let gate = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            for await _ in gate.stream { break }
+        }
+
+        let tap = Task {
+            await NotificationActionRouter.execute(
+                actionId: "ARCHIVE", messageId: "m-c3-reseat", accountId: "acc1")
+        }
+
+        // The overlay entry appears after the pre-resolve and before the
+        // enqueue, so it is the observable "pass 1 admitted this id" edge.
+        var admittedByPassOne = false
+        for _ in 0..<400 {
+            if AccountManager.shared.snapshotOverlay()[id] != nil { admittedByPassOne = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(admittedByPassOne, """
+            pass 1 never admitted the id, so this test would pass for the wrong reason — \
+            it must exercise the window AFTER a successful pre-resolve.
+            """)
+
+        // The turnover: same composite address and primary key, different email.
+        let impostor: MessageHeader = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-c3-reseat")
+            h.rfc822MessageId = "<impostor-notify@example.com>"
+            return h
+        }()
+        #expect(impostor.id == id, "fixture must re-seat the SAME address, or nothing is being tested")
+        try await pool.writeWithoutTransaction { db in
+            try captured.delete(db)
+            try impostor.insert(db)
+        }
+
+        gate.continuation.finish()
+        await tap.value
+
+        // The system end state, which is what actually matters.
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.rfc822MessageId == "<impostor-notify@example.com>",
+                "non-vacuity: the impostor really is the row sitting at that address")
+        #expect(final?.folderId == inbox.id,
+                "a message the notification was never about must not be archived")
+        #expect(final?.folderPath == inbox.path)
+        #expect(final?.folderId != archive.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "a refused notification archive must queue no durable operation at all")
+
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded")
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
+    }
 }

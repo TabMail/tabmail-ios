@@ -325,8 +325,20 @@ enum NotificationActionRouter {
                 // three dispositions distinctly so a refused or rolled-back tap
                 // is diagnosable from a device log instead of reading like a
                 // completed archive.
+                // C3 CONTENT WITNESS — the header resolved microseconds ago by
+                // `resolveAfterMerge` above IS the producer's snapshot, so the
+                // witness costs zero I/O here exactly as it does in
+                // `EmailArchiveTool`/`EmailDeleteTool`. It is NOT vacuous: both
+                // of the callee's `partition` passes run strictly later than
+                // this capture — pass 1 after its own re-resolve, pass 2 after
+                // the FIFO write queue has taken an unbounded amount of other
+                // work — which is precisely the window a UIDVALIDITY turnover
+                // can purge this row and re-seat a different message under the
+                // same composite id. See the bound on the OTHER interval (push
+                // delivery → this tap) in `KNOWN_ISSUES.md` `IOS-NOTIFY-001`.
                 let archiveOutcome = await AccountManager.shared.performCoordinatedRoleMove(
-                    ids: [header.id], role: .archive)
+                    ids: [header.id], role: .archive,
+                    expectedIdentities: ExpectedMessageIdentity.map([header]))
                 if archiveOutcome.admittedIds.contains(header.id) {
                     log("[NotificationActionRouter] archive durably admitted for \(messageId)")
                 } else if archiveOutcome.pendingIds.contains(header.id) {
@@ -335,8 +347,13 @@ enum NotificationActionRouter {
                     log("[NotificationActionRouter] archive terminal-stale for \(messageId)")
                 }
             case "DELETE":
+                // C3 CONTENT WITNESS — same reasoning as the ARCHIVE arm above,
+                // stated rather than cross-referenced because a sibling that
+                // says "same as above" is how the first of these two lost its
+                // guard in the port.
                 let deleteOutcome = await AccountManager.shared.performCoordinatedRoleMove(
-                    ids: [header.id], role: .trash)
+                    ids: [header.id], role: .trash,
+                    expectedIdentities: ExpectedMessageIdentity.map([header]))
                 if deleteOutcome.admittedIds.contains(header.id) {
                     log("[NotificationActionRouter] delete durably admitted for \(messageId)")
                 } else if deleteOutcome.pendingIds.contains(header.id) {

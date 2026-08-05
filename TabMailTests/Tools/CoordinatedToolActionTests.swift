@@ -116,7 +116,7 @@ struct CoordinatedToolActionTests {
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
         let id = header.id
 
-        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
 
         let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
         #expect(final?.folderId == archive.id)
@@ -166,7 +166,7 @@ struct CoordinatedToolActionTests {
         // so it re-resolves fresh row truth (Trash) both for the overlay lookup
         // AND inside the queued write closure — there is no stale snapshot to
         // corrupt the resulting PendingOperation's source folderPath.
-        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
 
         let ops = try await pool.read { db in
             try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
@@ -233,7 +233,7 @@ struct CoordinatedToolActionTests {
         // this returns, BOTH closures have run in FIFO order (strict serial
         // drain — the coordinated write executes strictly after the cycle's).
         gate.finish()
-        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
 
         await drainWriteQueue()
 
@@ -283,7 +283,7 @@ struct CoordinatedToolActionTests {
         let h2 = makeDurableHeader(folder: inbox2, messageId: "m-xacct-2")
         try await pool.writeWithoutTransaction { db in try h1.insert(db); try h2.insert(db) }
 
-        await AccountManager.shared.performCoordinatedRoleMove(ids: [h1.id, h2.id], role: .archive)
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [h1.id, h2.id], role: .archive, expectedIdentities: [:])
 
         let f1 = try await pool.read { db in try MessageHeader.fetchOne(db, key: h1.id) }
         let f2 = try await pool.read { db in try MessageHeader.fetchOne(db, key: h2.id) }
@@ -331,7 +331,7 @@ struct CoordinatedToolActionTests {
         let h2 = makeDurableHeader(folder: inbox2, messageId: "m-missing-role-2")
         try await pool.writeWithoutTransaction { db in try h1.insert(db); try h2.insert(db) }
 
-        await AccountManager.shared.performCoordinatedRoleMove(ids: [h1.id, h2.id], role: .archive)
+        await AccountManager.shared.performCoordinatedRoleMove(ids: [h1.id, h2.id], role: .archive, expectedIdentities: [:])
 
         let f1 = try await pool.read { db in try MessageHeader.fetchOne(db, key: h1.id) }
         #expect(f1?.folderId == archive.id, "acc1's row must still archive normally")
@@ -412,7 +412,7 @@ struct CoordinatedToolActionTests {
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
         let id = header.id
 
-        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
 
         #expect(admission.admittedIds == [id], "a landed archive must be reported as durably admitted")
         #expect(admission.pendingIds.isEmpty, "completed work must never be reported as pending")
@@ -438,7 +438,7 @@ struct CoordinatedToolActionTests {
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
         let id = header.id
 
-        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
 
         #expect(admission.pendingIds == [id], "an unknown folder epoch is retryable — it must land in the pending bucket")
         #expect(admission.admittedIds.isEmpty, "nothing reached the provider, so nothing may be reported as admitted")
@@ -468,7 +468,7 @@ struct CoordinatedToolActionTests {
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
         let id = header.id
 
-        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive)
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
 
         #expect(admission.failedIds == [id], "a proven epoch turnover is terminal — C3 fail-closed")
         #expect(admission.admittedIds.isEmpty, "a refused admission must never be reported as admitted")
@@ -486,7 +486,7 @@ struct CoordinatedToolActionTests {
 
         let ghostId = "acc1:INBOX:m-v8-ghost-\(UUID().uuidString)"
 
-        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [ghostId], role: .archive)
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(ids: [ghostId], role: .archive, expectedIdentities: [:])
 
         #expect(admission.failedIds == [ghostId], "a clean read that finds no row anywhere is proven absence")
         #expect(admission.admittedIds.isEmpty, "nothing reached the provider")

@@ -1149,8 +1149,21 @@ extension AccountManager {
     /// captured headers before an unbounded wait therefore hands them in here
     /// (`ExpectedMessageIdentity.map`, zero extra I/O — the headers are already in
     /// hand for the confirmation card), and BOTH resolve points refuse any id whose
-    /// row is provably a different message now. Default empty ⇒ today's exact
-    /// behaviour for callers with nothing to check against.
+    /// row is provably a different message now.
+    ///
+    /// 🚨 **NO DEFAULT VALUE, DELIBERATELY.** This parameter used to be
+    /// `= [:]`, which made the C3 protection **fail-OPEN and SILENT**: omitting
+    /// it read as an ordinary optional argument, and both of this function's
+    /// refusals (`preRefusedIds`, `freshRefusedIds`) are witness-gated, so a
+    /// caller that omitted it disabled them with nothing at the call site
+    /// saying so. Exactly that happened — the two notification-action call
+    /// sites in `AppDelegate` omitted it while the two agent-tool call sites
+    /// passed it, so a notification tap ran with both C3 checks inert. Passing
+    /// an EMPTY map is still allowed and still means "no refusal", but it is
+    /// now a decision a reader can see. Do not restore the default.
+    /// (Reference `v2final:AccountManager.recordRoleMove` did not need one: it
+    /// takes `headers: [MessageHeader]` and derives the witness itself, so
+    /// there was no seam to omit.)
     ///
     /// APPLIED TWICE ON PURPOSE, exactly as the reference does
     /// (`v2final:recordRoleMove` + `filterMembersAgainstExpectedIdentity`): the
@@ -1166,7 +1179,7 @@ extension AccountManager {
     func performCoordinatedRoleMove(
         ids: [String],
         role: FolderRole,
-        expectedIdentities: [String: ExpectedMessageIdentity] = [:]
+        expectedIdentities: [String: ExpectedMessageIdentity]
     ) async -> RoleMoveAdmission {
         guard !ids.isEmpty else { return .empty }
         var outcome = RoleMoveAdmission()
