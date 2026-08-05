@@ -627,7 +627,9 @@ actor ExchangeProvider: EmailProvider {
     func moveProvingDestinations(
         ids: [String], from source: String, to destination: String
     ) async throws -> MoveOutcome {
-        print("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
+        }
         var provenIds: [String] = []
         var provenDestinations: [ProvenDestinationAddress] = []
         do {
@@ -644,6 +646,33 @@ actor ExchangeProvider: EmailProvider {
                     }
                 }
                 let movedId = try await moveMessage(id: id, destinationId: destination)
+                // ⚑ THE ASYMMETRY IS DELIBERATE, AND IT ANSWERS TWO DIFFERENT
+                // QUESTIONS. `provenIds` answers *"did the work happen?"*;
+                // `provenDestinations` answers *"where did it land?"*. A 2xx
+                // settles the first on its own — `moveMessage` throws on any
+                // non-2xx, so reaching this line means Graph performed the move
+                // — while only a decodable `id` settles the second.
+                //
+                // So `provenIds.append` is UNCONDITIONAL by decision, not by
+                // oversight: the op retires on exit 1 (provider success), which
+                // is the truth. WITHHOLDING it would be the mirror image of the
+                // bug this method exists to close — the member would stay
+                // queued, its retry would re-address the OLD id that Graph has
+                // just invalidated, and that retry 404s into the
+                // `isMessageNotFoundError` arm which DELETES the
+                // `PendingOperation`. Fail-closed here does not preserve the
+                // intention; it launders a completed operation into a silent
+                // drop (or, if the classification were also changed, into the
+                // lane wedge `IOS-GRAPH-002`'s brief names as MIRROR-IMAGE TRAP
+                // 1 — the re-key is what makes a retry TERMINATE).
+                //
+                // The unnamed destination is WITHHELD EVIDENCE, not a fallback
+                // (repo rule 4): nothing is substituted or guessed, the row
+                // keeps its old address, and sync repairs it — byte-for-byte
+                // the shape the IMAP arm takes when a server furnishes no
+                // `COPYUID`. Graph's documented contract for `/move` returns the
+                // moved resource, so this arm is not reachable through it at
+                // all; it exists because a decode is not a promise.
                 provenIds.append(id)
                 if let movedId {
                     provenDestinations.append(ProvenDestinationAddress(
@@ -651,7 +680,9 @@ actor ExchangeProvider: EmailProvider {
                         destinationProviderId: movedId,
                         destinationUidValidity: nil))
                 }
-                print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
+                }
             }
         } catch {
             // A cancelled Task has NOT proved anything about the members it
