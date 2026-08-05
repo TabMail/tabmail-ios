@@ -242,8 +242,31 @@ struct DraftGenerationSafetyTests {
         #expect(live?.instanceEpoch == (mutation == .edit ? "E1" : "E2"))
     }
 
-    @Test("A provider throw terminalizes unconfirmed and a later authored edit admits one fresh push")
-    func providerThrowThenAuthoredEdit() async throws {
+    /// **THE INVARIANT: a provider throw is reported AS a throw, and the draft it
+    /// left behind is immediately pushable again — with or without an intervening
+    /// authored edit.**
+    ///
+    /// ⚠️ THIS TEST REPLACES A BLESSING TEST (MIS-014). Its predecessor,
+    /// `providerThrowThenAuthoredEdit`, asserted `first == .terminalUnconfirmed`
+    /// and `serverPushStatus == "unconfirmed"` — i.e. it asserted that swallowing
+    /// the throw into a NORMAL RETURN was correct. That normal return is what let
+    /// `AccountManagerQueue.executeSingleOp`'s success path retire the durable
+    /// `.saveDraft` producer after one network failure. Its premise was the defect,
+    /// so it is rewritten rather than repaired.
+    ///
+    /// What is asserted here is the SYSTEM PROPERTY, not the mechanism (MIS-015):
+    /// the call throws; the authored content and the prior provider linkage are
+    /// intact; and the very next push — with NO edit in between, which is the case
+    /// the old test could not express because pre-fix the row was inadmissible —
+    /// reaches the provider and completes. The "later authored edit still wins"
+    /// half of the old test is kept as the second leg, because that is a genuine
+    /// second property and not a restatement of the first.
+    ///
+    /// The queue-level half of this invariant (the durable `PendingOperation` row
+    /// survives the throw) is pinned in
+    /// `NeverDropExitClosureTests.aThrownDraftAppendKeepsItsSaveProducerAndTheNextDrainLandsIt`.
+    @Test("A provider throw is rethrown and leaves the draft immediately pushable again")
+    func providerThrowRethrowsAndLeavesTheDraftPushable() async throws {
         let fixture = try install()
         defer { finish(fixture) }
         let initial = draft(serverId: "old-resource")
@@ -253,26 +276,44 @@ struct DraftGenerationSafetyTests {
             saveDraftThrows: ProviderError.networkError(
                 underlying: NSError(domain: "test", code: 1)))
 
-        let first = try await DraftStore.shared.pushDraftToServer(
-            draftId: initial.id, expectedInstanceEpoch: "E1", provider: failingProvider,
-            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        var rethrown = false
+        do {
+            _ = try await DraftStore.shared.pushDraftToServer(
+                draftId: initial.id, expectedInstanceEpoch: "E1", provider: failingProvider,
+                runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        } catch { rethrown = true }
+        #expect(
+            rethrown,
+            "the provider threw and `pushDraftToServer` returned normally — the caller reads a normal return as a completed op and retires the user's Save intention")
 
         var live = try await fixture.0.read { try Draft.fetchOne($0, key: initial.id) }
-        #expect(first == .terminalUnconfirmed)
-        #expect(live?.serverPushStatus == "unconfirmed")
-        #expect(live?.serverDraftId == "old-resource")
+        #expect(live?.serverDraftId == "old-resource", "the prior provider linkage was destroyed by a failed attempt")
         let failingCalls = await failingProvider.callLog
         #expect(failingCalls.filter { $0.hasPrefix("saveDraft") }.count == 1)
 
+        // LEG 1 — a straight retry, with NO authored edit, reaches the provider.
+        let retryProvider = MockEmailProvider(
+            saveDraftResult: .created(.outlook(graphId: "retry-resource")))
+        let retry = try await DraftStore.shared.pushDraftToServer(
+            draftId: initial.id, expectedInstanceEpoch: "E1", provider: retryProvider,
+            runtimeKind: .outlook, draftsFolderPath: "Drafts")
+        #expect(retry == .completed)
+        let retryCalls = await retryProvider.callLog
+        #expect(
+            retryCalls.filter { $0.hasPrefix("saveDraft") }.count == 1,
+            "the retry never reached the provider — the failed attempt left the row inadmissible, which is a wedge, not a fix: \(retryCalls)")
+        live = try await fixture.0.read { try Draft.fetchOne($0, key: initial.id) }
+        #expect(live?.serverDraftId == "retry-resource")
+        #expect(live?.body == "body", "the retry clobbered the authored body")
+
+        // LEG 2 — a later authored edit still wins the CAS and still admits exactly
+        // one fresh push carrying the newer content.
         try await fixture.0.write { db in
             guard var edited = try Draft.fetchOne(db, key: initial.id) else { return }
             edited.body = "fresh edit"
             edited.updatedAt += 1
             _ = try DraftStore.applySave(edited, db: db)
         }
-        live = try await fixture.0.read { try Draft.fetchOne($0, key: initial.id) }
-        #expect(live?.serverPushStatus == "dirty")
-
         let succeedingProvider = MockEmailProvider(
             saveDraftResult: .created(.outlook(graphId: "new-resource")))
         let result = try await DraftStore.shared.pushDraftToServer(

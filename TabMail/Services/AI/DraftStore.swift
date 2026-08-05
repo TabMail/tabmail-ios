@@ -15,11 +15,14 @@ actor DraftStore {
         case notApplied
     }
 
+    /// ⚑ THERE IS NO "the provider threw" DISPOSITION, DELIBERATELY. A thrown
+    /// provider call does not RETURN from `pushDraftToServer` at all — it is
+    /// rethrown, so the caller's queue requeues the durable producer. See
+    /// `restorePushableAfterProviderThrow`. The removed `.terminalUnconfirmed`
+    /// case existed only to report a never-drop violation to a caller that then
+    /// retired the op on it.
     enum PushDisposition: Sendable, Equatable {
         case completed
-        /// The provider threw after Stage A, so the attempt may have landed.
-        /// The producer is deliberately retired once; sync reconciles.
-        case terminalUnconfirmed
         /// A replacement/edit won the exact Stage A/B CAS. This producer is stale.
         case notApplied
     }
@@ -149,6 +152,11 @@ actor DraftStore {
         merged.updatedAt = draft.updatedAt
         merged.attachmentsDirName = draft.attachmentsDirName
         merged.pushAttemptVersion = current.pushAttemptVersion + 1
+        // `"unconfirmed"` is NO LONGER WRITTEN by any code path — the provider-throw
+        // arm now restores `"dirty"` and rethrows — but the remap is KEPT so a dev
+        // database that already carries that value from the pre-fix candidate still
+        // recovers on the next authored edit instead of being permanently
+        // inadmissible to `pushDraftToServer`'s entry guard.
         if current.serverPushStatus == "pushed" || current.serverPushStatus == "pushing"
             || current.serverPushStatus == "unconfirmed" {
             merged.serverPushStatus = "dirty"
@@ -417,13 +425,53 @@ actor DraftStore {
         }
     }
 
-    /// SUBTRACT — no v2final recovery/ghost/redrive machinery. A provider throw
-    /// is terminalized only when the exact Stage A attempt still owns the row.
-    /// Authored fields and the prior provider-native linkage stay untouched;
-    /// `unconfirmed` grants no new mutation authority and a later authored save
-    /// moves it to `dirty` for a fresh producer.
+    /// 🚨 A THROWN PROVIDER SAVE IS AN **UNKNOWN**, AND UNKNOWN IS RETRYABLE.
+    ///
+    /// This used to stamp `serverPushStatus = "unconfirmed"` and let
+    /// `pushDraftToServer` RETURN `.terminalUnconfirmed` — a normal return — so
+    /// `AccountManagerQueue.executeSingleOp`'s SUCCESS path ran
+    /// `PendingOperation.deleteOne` and the user's Save intention was retired
+    /// after ONE attempt, on an ordinary mobile network drop. Nothing re-enqueues
+    /// on `serverPushStatus` (`IOS-DRAFT-011` states that outright), so only a
+    /// later authored edit could create a fresh producer. That is outside the four
+    /// exits: a thrown call is none of (1) provider success, (2) a provider-
+    /// AUTHORITATIVE stale/no-op verdict, (3) inverse annihilation, (4) a proven
+    /// id reset — `CLAUDE.md` clause 2 names a thrown read as retryable, never
+    /// authoritative. Shipped `07a4bb703` awaited the throwing call directly, so
+    /// the error reached the queue's retry arm and the durable op survived; the
+    /// candidate was a REGRESSION FROM SHIPPED and this restores it.
+    ///
+    /// `IOS-DRAFT-011`'s "K is bounded by explicit user gestures / no sweeper
+    /// re-enqueues" accounting argues for the retired behaviour — but it was
+    /// written about `.unaddressable`, a provider-AUTHORITATIVE "I cannot give you
+    /// an address" (exit 2). A network throw is an absence of evidence. Never-drop
+    /// clause 2 and Outbox Reliability Rule 4 ("Duplicate email >> lost email")
+    /// both put it on the retry side.
+    ///
+    /// ⚠️ THE FIX IS **BOTH HALVES**, and neither alone. The row is restored to
+    /// `"dirty"` — the only non-nil value `pushDraftToServer`'s entry guard admits
+    /// — AND the caller rethrows. Keeping the op queued while leaving the row
+    /// `"unconfirmed"` would make every retry fall out of that entry guard with
+    /// `.notApplied` forever: a permanent lane wedge, which is in the
+    /// NON-recoverable set. Restoring the row without rethrowing would retire the
+    /// op exactly as before.
+    ///
+    /// SUBTRACT — still no `v2final` recovery/ghost/redrive machinery, and none is
+    /// needed: restoring shipped behaviour requires no sweeper, no reconciler and
+    /// no RFC redrive. The exact-ownership guard below is UNCHANGED, so a losing
+    /// racer — an authored edit or a generation replacement that won the Stage A/B
+    /// CAS while the provider call was in flight — still no-ops here and its newer
+    /// state is never clobbered. Authored fields and the prior provider-native
+    /// linkage stay untouched.
+    ///
+    /// ⚠️ ACCEPTED RESIDUAL, registered as `IOS-DRAFT-015`: an attempt that
+    /// actually committed on the server before its response was lost leaves one
+    /// stray server draft, because the retry still carries the pre-attempt
+    /// `previousIdentity`. Strays are ordinary Drafts-folder messages, synced with
+    /// real UIDs and deletable by the ordinary path — the exact accounting
+    /// `IOS-DRAFT-011` already accepts for the same reason.
     @discardableResult
-    private static func applyTerminalPushFailure(
+    private static func restorePushableAfterProviderThrow(
         context: StageAContext,
         db: Database
     ) throws -> Bool {
@@ -435,7 +483,7 @@ actor DraftStore {
               draft.rfc822MessageId == context.freshRfc else {
             return false
         }
-        draft.serverPushStatus = "unconfirmed"
+        draft.serverPushStatus = "dirty"
         try draft.update(db)
         return true
     }
@@ -528,10 +576,19 @@ actor DraftStore {
                 existingIdentity: context.previousIdentity,
                 draftsFolderPath: draftsFolderPath)
         } catch {
-            let terminalized = try await AppDatabase.dbPool.write { db in
-                try Self.applyTerminalPushFailure(context: context, db: db)
+            // Re-admit the row FIRST, then RETHROW. Both halves are load-bearing —
+            // see `restorePushableAfterProviderThrow`. Rethrowing is what keeps the
+            // durable `.saveDraft` producer queued: the error reaches
+            // `AccountManagerQueue.executeSingleOp`'s classifier, which requeues it
+            // exactly as it does for every other provider throw. If the restore
+            // WRITE itself throws, that error propagates instead and the op still
+            // requeues (the generic arm) — the row is then left `"pushing"` until an
+            // authored edit remaps it, an accepted cost recoverable by one ordinary
+            // gesture, and the same exposure the pre-fix code already had.
+            try await AppDatabase.dbPool.write { db in
+                _ = try Self.restorePushableAfterProviderThrow(context: context, db: db)
             }
-            return terminalized ? .terminalUnconfirmed : .notApplied
+            throw error
         }
 
         let completion = try await AppDatabase.dbPool.write { db in

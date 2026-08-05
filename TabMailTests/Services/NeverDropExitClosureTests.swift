@@ -1643,4 +1643,120 @@ struct NeverDropExitClosureTests {
         try? await provider.disconnect()
         await finish(f)
     }
+
+    // MARK: - Round-5 M1 — a THROWN draft save must not retire its Save producer
+
+    /// **THE INVARIANT: a provider throw on `.saveDraft` leaves the user's Save
+    /// intention durably queued AND leaves the draft admissible, so the next drain
+    /// actually re-attempts the push and completes it on the wire.**
+    ///
+    /// Both halves are load-bearing and neither alone is the fix (MIS-005). Before
+    /// the round-5 fix, `DraftStore.pushDraftToServer` CAUGHT the provider throw,
+    /// stamped `serverPushStatus = "unconfirmed"` and **returned normally**
+    /// (`.terminalUnconfirmed`); a normal return is what `executeSingleOp`'s success
+    /// path reads as completion, so it ran `PendingOperation.deleteOne` and the
+    /// user's Save intention was retired after ONE ordinary network failure.
+    /// Nothing re-enqueues on `serverPushStatus` (`IOS-DRAFT-011` says so outright),
+    /// so only a later authored edit could ever mint a fresh producer. A thrown
+    /// provider call is an ABSENCE OF EVIDENCE — none of the four exits — and
+    /// shipped `07a4bb703` awaited the throwing call directly and let the queue
+    /// retry it. The mirror image, "keep the op queued but leave the row
+    /// `unconfirmed`", is a permanent WEDGE: the push entry guard admits only
+    /// `nil`/`dirty`, so every retry would return `.notApplied` forever. Only a
+    /// drain that REACHES THE WIRE distinguishes the fix from that wedge, which is
+    /// why the second drain is asserted on `APPEND` commands and on the mailbox.
+    ///
+    /// **ASSERTED ON THE WIRE, deliberately.** The load-bearing assertions are the
+    /// count of `APPEND` commands across the two drains and the Drafts mailbox's
+    /// contents — not `serverPushStatus`, and not the disposition enum. A test that
+    /// pinned the status would pin the fix's MECHANISM (MIS-015) and would stay
+    /// green on any re-implementation that re-admitted the row another way while
+    /// still dropping the op.
+    ///
+    /// Accepted residual (`IOS-DRAFT-015`): a throw whose APPEND had actually
+    /// committed leaves one stray server draft. Not exercised here — this fake
+    /// server refuses the command outright, so the first attempt lands nothing,
+    /// which is why the mailbox holds exactly one copy at the end.
+    ///
+    /// RED PROOF (recorded): against the pre-fix `DraftStore` this fails on the
+    /// first assertion — `operations(f.pool)` is empty after the failing drain,
+    /// i.e. the durable producer was retired by a thrown call.
+    @Test("A thrown draft APPEND never retires the Save producer, and the next drain lands it")
+    @MainActor
+    func aThrownDraftAppendKeepsItsSaveProducerAndTheNextDrainLandsIt() async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Drafts": []])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Drafts")
+        // Exactly ONE injected failure: the first APPEND is refused, every later
+        // one is served normally. That is what makes "did the retry reach the
+        // wire?" a decidable question rather than a tautology.
+        server.failNextCommand(containing: "APPEND", message: "Injected APPEND failure")
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-draft-append",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        let draftId = "draft-append-1"
+        try await f.pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: f.accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "closure draft", body: "draft body", replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+                serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        var save = PendingOperation(
+            type: .saveDraft, messageIds: [draftId], accountId: f.accountId,
+            folderPath: "Drafts", instanceEpoch: "E1", draftId: draftId)
+        save.createdAt = Date().addingTimeInterval(-60)
+        try insert([save], into: f.pool)
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // HALF 1 — the intention survived the throw.
+        let afterFailedDrain = try operations(f.pool)
+        #expect(
+            afterFailedDrain.map(\.id) == [save.id],
+            """
+            the Save producer was retired by a THROWN provider call — an unknown outcome retired a \
+            durable user intention, which is none of the four exits — remaining ops: \
+            \(afterFailedDrain.map(\.type))
+            """)
+        let draftsAfterFailure = server.messageIDs(in: "Drafts")
+        #expect(
+            draftsAfterFailure.isEmpty,
+            "the refused APPEND must have landed nothing: \(draftsAfterFailure)")
+
+        await AccountManager.shared.drainPendingQueue()
+
+        // HALF 2 — and it was actually re-attemptable: the retry reached the wire.
+        let appends = server.recordedCommands().filter { $0.uppercased().contains("APPEND") }
+        #expect(
+            appends.count == 2,
+            """
+            the second drain never issued an APPEND, so the failed attempt left the draft in a \
+            state the push entry guard refuses — the op is wedged rather than retryable, and a \
+            wedge never recovers by sync — APPEND commands: \(appends)
+            """)
+        let draftsAfterRetry = server.messageIDs(in: "Drafts")
+        #expect(
+            draftsAfterRetry.count == 1,
+            """
+            the retry did not land exactly one copy of the draft in the Drafts mailbox: \
+            \(draftsAfterRetry)
+            """)
+        let afterRetryDrain = try operations(f.pool)
+        #expect(
+            afterRetryDrain.isEmpty,
+            "the producer did not retire after the push actually completed: \(afterRetryDrain.map(\.type))")
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
 }

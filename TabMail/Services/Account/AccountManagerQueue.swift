@@ -1679,6 +1679,15 @@ extension AccountManager {
             guard let draftId = op.draftId ?? op.messageIds.first,
                   let instanceEpoch = op.instanceEpoch,
                   !instanceEpoch.isEmpty else { return .allMembers }
+            // 🚨 EVERY DISPOSITION THAT REACHES THIS LINE IS A RETIREMENT, so
+            // `pushDraftToServer` must only RETURN for an outcome that is one of the
+            // four exits. It returns `.completed` (exit 1) and `.notApplied` (exit 3
+            // — a newer authored edit or generation replacement won the Stage A/B
+            // CAS, so this producer is genuinely stale). A THROWN provider call is
+            // none of them, and it now propagates from here into the classifier
+            // below, which requeues the op — restoring shipped `07a4bb703`. It used
+            // to be swallowed into a `.terminalUnconfirmed` return, which retired the
+            // user's Save intention after one network failure (`IOS-DRAFT-015`).
             let disposition = try await DraftStore.shared.pushDraftToServer(
                 draftId: draftId,
                 expectedInstanceEpoch: instanceEpoch,
