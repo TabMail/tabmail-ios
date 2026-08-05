@@ -69,7 +69,7 @@ queues, optimistic UI, retries, reconciliation, Undo, Outbox, drafts, or notific
 | ADR-IOS-027 | Active | Ever-Rolling FIFO Queues — Leave Only on Confirmed Success or Confirmed Stale | [read in full](Companion/Decisions/Active/adr-ios-027.md) |
 | ADR-IOS-026B | Superseded on v3 by the native-provider-id keying rule (D4); preserved for history | PendingOperation Uses Stable IDs (rfc822MessageId) | [read in full](Companion/Decisions/Superseded/adr-ios-026b.md) |
 | ADR-IOS-028 | Active | Background Execution Budget — Lightweight Refresh, Heavy Processing | [read in full](Companion/Decisions/Active/adr-ios-028.md) |
-| ADR-IOS-029 | Active | Database Index Management — Purpose-Built Indexes, Drop What's Superseded | [read in full](Companion/Decisions/Active/adr-ios-029.md) |
+| ADR-IOS-029 | Active; rule 5 TIMING amended 2026-08-05, requirement unchanged | Database Index Management — Purpose-Built Indexes, Drop What's Superseded. `ANALYZE` moved OFF migration bodies to `SyncEngine.runRefreshPlannerStatisticsIfStale`, re-armed by `PRAGMA schema_version`, run from background WAL maintenance | [read in full](Companion/Decisions/Active/adr-ios-029.md) |
 | ADR-IOS-030 | Active compose FIFO; delivery amended by 053 | Agent Compose Tool FIFO Queue | [read in full](Companion/Decisions/Active/adr-ios-030.md) |
 | ADR-IOS-031 | Active | Background Tasks Touching GRDB MUST Use `.medium` Priority (Never `.low` / `.utility` / `.background`) | [read in full](Companion/Decisions/Active/adr-ios-031.md) |
 | ADR-IOS-032 | Partially superseded by 034; Swift stack retained, session-document model replaced | Memory Search Reuses iOS Swift Hybrid FTS Stack (No Rust FFI) | [read in full](Companion/Decisions/Active/adr-ios-032.md) |

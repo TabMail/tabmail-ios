@@ -65,8 +65,11 @@ struct DatabaseIndexTests {
     /// `id`, so SQLite satisfied the WHERE from an index and then SORTED the whole
     /// remaining unread set once per 50-row page. Measured on a production-shaped
     /// 360k-row database carrying the statistics a shipped device actually has
-    /// (`sqlite_stat1` says `messageHeader` is empty, because `ANALYZE` runs only
-    /// inside migration bodies and a fresh install runs them against an empty table):
+    /// (`sqlite_stat1` says `messageHeader` is empty, because in every shipped build
+    /// `ANALYZE` ran only inside migration bodies and a fresh install runs them
+    /// against an empty table — the ADR-IOS-029 2026-08-05 amendment adds a
+    /// background refresh, which makes the stale regime recoverable but does not
+    /// change what this test pins):
     /// 100,000 unread swept in **199,425 ms** without this index and **6,300 ms**
     /// with it. So `USE TEMP B-TREE FOR ORDER BY` is the thing that must stay absent,
     /// and it is what these expectations pin.

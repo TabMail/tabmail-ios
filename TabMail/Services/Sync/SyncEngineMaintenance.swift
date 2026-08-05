@@ -536,3 +536,105 @@ extension SyncEngine {
         }
     }
 }
+
+    // MARK: - Query-planner statistics (ADR-IOS-029 rule 5, deferred timing)
+
+    /// What one call to `runRefreshPlannerStatisticsIfStale` did. Returned so the
+    /// invariant — *statistics are refreshed after a schema change and not
+    /// otherwise, and an aborted pass does not consume the obligation* — is
+    /// observable without reaching into the marker or into SQLite internals.
+    enum PlannerStatisticsRefresh: Equatable, Sendable {
+        /// The schema has not changed since the last completed `ANALYZE`.
+        case alreadyFresh
+        /// `ANALYZE` completed and the marker advanced to the settled schema version.
+        case refreshed
+        /// The pass could not read the schema version, or `ANALYZE` failed / was
+        /// aborted. The marker is UNCHANGED, so the next pass retries.
+        case abandoned
+    }
+
+    /// `UserDefaults` key holding the SQLite `schema_version` in force when the last
+    /// whole-database `ANALYZE` COMPLETED. `StartupMigrations` is the precedent for
+    /// using `UserDefaults` as a durable one-shot latch here.
+    nonisolated static let plannerStatisticsSchemaVersionKey = "didAnalyzeAtSchemaVersion_v1"
+
+    /// Whole-database `ANALYZE`, moved OFF the blocking migration path and run here
+    /// at most once per schema change (ADR-IOS-029, 2026-08-05 amendment; owner
+    /// directive *"startup migrations should really have only things that are
+    /// absolutely necessary and blocking"*). `v83_markAllAsReadUnreadSweepIndex` used
+    /// to carry it inline and measured ~850 ms at 360k rows and 8,522 ms at 500k,
+    /// before any UI appeared.
+    ///
+    /// ⚠️ WHY IT IS ON THIS SIDE OF THE MAINTENANCE SPLIT. `ANALYZE` rewrites
+    /// `sqlite_stat1` — an ordinary WAL write on the MAIN database, which at the
+    /// suspension instant throws a benign `SQLITE_ABORT`. The other half,
+    /// `runBodyAssetMaintenance`, reads a NON-WAL App-Group `DatabaseQueue` whose
+    /// read lock cannot be aborted and is the `0xdead10cc` shape (ADR-IOS-046).
+    /// Putting a main-DB write there would be a new bug, not a fix.
+    ///
+    /// THE LATCH, AND EXACTLY WHAT RE-ARMS IT. The marker is the SQLite
+    /// `schema_version` in force when the last `ANALYZE` completed. SQLite bumps
+    /// `schema_version` on every DDL statement, so ANY migration that creates, drops
+    /// or alters a table or an index re-arms this **automatically** — there is no
+    /// hand-maintained constant to forget, which is the failure mode a
+    /// "bump me when you add an index" counter would have. ⚠️ WHAT DOES **NOT**
+    /// re-arm it, stated because it is the mirror-image mistake: ordinary
+    /// `INSERT`/`UPDATE`/`DELETE` traffic, however far the row counts move. That is
+    /// deliberate. A per-poll `ANALYZE` would cost the 8.5 s above on every
+    /// foreground poll and would be a far worse defect than the one this fixes.
+    ///
+    /// DURABLE. `UserDefaults` survives app kill, crash and reboot, so a device that
+    /// dies between the migration and this pass still refreshes on a later launch;
+    /// and a device that dies *during* the `ANALYZE` finds the old marker and
+    /// retries. The marker is written only after `ANALYZE` returns, so a partial run
+    /// never records a success it did not achieve.
+    ///
+    /// FAILS SAFE. If this is skipped, cancelled or aborted, the only consequence is
+    /// that statistics stay stale — which is the ALREADY-SHIPPED regime: `ANALYZE`
+    /// has only ever run inside migration bodies, and on a fresh install those
+    /// bodies record statistics for an EMPTY `messageHeader`. So the exposure window
+    /// between an upgrade launch and the first maintenance pass is no worse than
+    /// every shipped release, and strictly better once the pass runs.
+    ///
+    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers, on
+    /// the caller's pool tier (`.background` from the foreground poll). It runs once
+    /// per schema change, never on the launch path, and never on a `.priority` write.
+    @discardableResult
+    nonisolated static func runRefreshPlannerStatisticsIfStale(
+        dbPool: PrioritizedDatabase,
+        defaults: UserDefaults = .standard,
+        markerKey: String = plannerStatisticsSchemaVersionKey
+    ) -> PlannerStatisticsRefresh {
+        guard let currentVersion = try? dbPool.read({ db in
+            try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0
+        }) else {
+            // Could not read the schema version ⇒ nothing is determined. Leave the
+            // marker alone and retry next pass.
+            return .abandoned
+        }
+        // `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
+        // has NO stored value, and `integer(forKey:)` cannot tell that apart from a
+        // stored 0 — which is a legal `schema_version`.
+        if let analyzed = defaults.object(forKey: markerKey) as? Int,
+           analyzed == currentVersion {
+            return .alreadyFresh
+        }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        do {
+            let settled: Int = try dbPool.write { db in
+                try db.execute(sql: "ANALYZE")
+                // Read AFTER, inside the same transaction. The FIRST `ANALYZE` on a
+                // database CREATES `sqlite_stat1`, which is itself DDL and bumps
+                // `schema_version`; storing the version read BEFORE would record a
+                // value the analysis had already invalidated and this pass would
+                // re-fire forever.
+                return try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? currentVersion
+            }
+            defaults.set(settled, forKey: markerKey)
+            print("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
+            return .refreshed
+        } catch {
+            print("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
+            return .abandoned
+        }
+    }

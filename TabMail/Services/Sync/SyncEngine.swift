@@ -220,10 +220,20 @@ actor SyncEngine {
             runEvictChatSessions(dbPool: dbPool)
         }
         let t4 = CFAbsoluteTimeGetCurrent()
+        // LAST on purpose. It is the only step here that can cost seconds, it runs at
+        // most once per schema change, and nothing above depends on it — so putting it
+        // last means a suspension mid-`ANALYZE` costs the cheap reclaim steps nothing.
+        // It is on THIS side of the maintenance split because `ANALYZE` is a main-DB
+        // WAL write (see `runRefreshPlannerStatisticsIfStale`, and ADR-IOS-046 for why
+        // the `runBodyAssetMaintenance` side would be a `0xdead10cc` bug).
+        if shouldRun() {
+            runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
+        }
+        let t5 = CFAbsoluteTimeGetCurrent()
         if includePrune {
-            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms")
+            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms analyze=\(Int((t5-t4)*1000))ms")
         } else {
-            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms")
+            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t4-t3)*1000))ms analyze=\(Int((t5-t4)*1000))ms")
         }
     }
 

@@ -1360,3 +1360,216 @@ struct SyncMaintenanceEdgeCaseTests {
         #expect(acc2Bodies == 2)
     }
 }
+
+// MARK: - Query-planner statistics refresh (ADR-IOS-029, 2026-08-05 amendment)
+
+/// Pins the INVARIANT the ADR-IOS-029 timing amendment states, never the latch that
+/// implements it (`MIS-015`): **whole-database statistics are recomputed after a
+/// schema change and NOT after ordinary row traffic, the obligation is durable
+/// beyond the object that recorded it, and a pass that does not complete does not
+/// consume it.**
+///
+/// The oracle is `sqlite_stat1` itself — the planner's actual input — rather than the
+/// function's return value or the marker: `ANALYZE` records each table's row count
+/// there, so "did this pass do the work?" is answered by whether that recorded count
+/// moved. A different latch (a table, `PRAGMA user_version`, a generation counter)
+/// would have to satisfy exactly these assertions.
+@Suite("Query-planner statistics refresh — ADR-IOS-029 deferred timing", .serialized)
+struct PlannerStatisticsRefreshTests {
+
+    private struct Fixture {
+        let pool: DatabasePool
+        let directory: URL
+        let path: String
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("test.sqlite").path
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: path, configuration: configuration)
+        try AppDatabase.runMigrations(on: pool)
+        return Fixture(pool: pool, directory: directory, path: path)
+    }
+
+    /// The row count `ANALYZE` last recorded for `table`, read out of `sqlite_stat1`.
+    /// `nil` when statistics have never been computed (the table does not exist yet)
+    /// or when they do not cover this table.
+    private func recordedRowCount(_ pool: DatabasePool, table: String) throws -> Int? {
+        try pool.read { db in
+            guard try db.tableExists("sqlite_stat1") else { return nil }
+            let stat = try String.fetchOne(
+                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ? LIMIT 1", arguments: [table])
+            guard let leading = stat?.split(separator: " ").first else { return nil }
+            return Int(leading)
+        }
+    }
+
+    private func insertHeaders(_ pool: DatabasePool, accountId: String, count: Int, from: Int) throws {
+        try pool.write { db in
+            for i in from..<(from + count) {
+                var header = MessageHeader(
+                    messageId: "\(i)",
+                    subject: "s",
+                    from: "a@example.com",
+                    fromAddress: "a@example.com",
+                    to: "b@example.com",
+                    date: Date(timeIntervalSince1970: 1_000_000 + Double(i)),
+                    snippet: "",
+                    folderId: "\(accountId):INBOX",
+                    accountId: accountId,
+                    folderPath: "INBOX",
+                    isInInbox: true
+                )
+                header.id = "\(accountId):INBOX:\(i)"
+                try header.insert(db)
+            }
+        }
+    }
+
+    /// A schema change is what makes statistics stale; row traffic is not. Both
+    /// halves are asserted, because a latch that fires on row traffic would be a far
+    /// more expensive defect than the one the amendment removed.
+    @Test("A schema change re-arms the refresh; ordinary row traffic does not")
+    func schemaChangeRearmsButRowTrafficDoesNot() throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+
+        try fixture.pool.write { db in
+            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
+            account.id = "acc1"
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            try folder.insert(db)
+        }
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 5, from: 0)
+
+        // ⚠️ THE PRE-STATE IS NOT "no statistics" — it is WRONG statistics, and that
+        // is the regime ADR-IOS-029's timing amendment describes. Five older
+        // index-changing migrations still carry their own `ANALYZE`, and on a fresh
+        // install they run it against an EMPTY `messageHeader`, so the planner is
+        // handed "this table has zero rows" and, before this amendment, carried that
+        // forever — the device that later syncs 100k messages never re-analyzed.
+        let beforeFirstPass = try recordedRowCount(fixture.pool, table: "messageHeader")
+        #expect(
+            beforeFirstPass == 0,
+            "a fresh install's migration-time ANALYZE should have recorded an EMPTY messageHeader; got \(String(describing: beforeFirstPass))")
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 5)
+
+        // Row traffic only — the planner's recorded count MUST stay stale, and the
+        // pass MUST do nothing. This is the expensive mirror image of the fix.
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 40, from: 5)
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 5)
+
+        // A schema change — exactly what an index-changing migration does — re-arms
+        // it, and one pass brings the planner's input back in line with reality.
+        try fixture.pool.write { db in
+            try db.execute(sql: "CREATE INDEX planner_stats_probe ON messageHeader(snippet)")
+        }
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 45)
+        let coversNewIndex = try fixture.pool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = 'planner_stats_probe'") ?? 0
+        }
+        #expect(coversNewIndex == 1)
+    }
+
+    /// The obligation must not live in the process. A second `UserDefaults` object
+    /// over the same suite reads the same persisted store — the closest in-process
+    /// analogue of a relaunch — and must see the work as already done.
+    @Test("The completed refresh is durable beyond the object that recorded it")
+    func markerIsDurableAcrossObjectLifetime() throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let suiteName = "PlannerStatsSuite-\(UUID().uuidString)"
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        let first = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            first.removeObject(forKey: key)
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+
+        try fixture.pool.write { db in
+            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
+            account.id = "acc1"
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            try folder.insert(db)
+        }
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 3, from: 0)
+
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: first, markerKey: key) == .refreshed)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 3)
+
+        // A different object over the same persisted store — no in-memory state
+        // carries across — and rows have moved since, so a latch that lived in the
+        // process (or one keyed on row counts) would redo the work here.
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 20, from: 3)
+        let afterRelaunch = try #require(UserDefaults(suiteName: suiteName))
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: afterRelaunch, markerKey: key) == .alreadyFresh)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 3)
+    }
+
+    /// A pass that cannot complete must leave the obligation outstanding. Driven by a
+    /// REAL failure — a read-only connection, so `ANALYZE` genuinely cannot write —
+    /// rather than by an injected seam.
+    @Test("A pass that cannot complete leaves the obligation outstanding")
+    func abandonedPassDoesNotConsumeTheObligation() throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+
+        try fixture.pool.write { db in
+            var account = Account(emailAddress: "a@example.com", displayName: "T", provider: .gmail)
+            account.id = "acc1"
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+            try folder.insert(db)
+        }
+        try insertHeaders(fixture.pool, accountId: "acc1", count: 4, from: 0)
+        // Checkpoint so the read-only connection below sees the committed rows
+        // without needing to write the WAL.
+        _ = try fixture.pool.writeWithoutTransaction { db in
+            try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+        }
+
+        var readOnlyConfiguration = Configuration()
+        readOnlyConfiguration.readonly = true
+        let readOnly = try DatabasePool(path: fixture.path, configuration: readOnlyConfiguration)
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: PrioritizedDatabase(pool: readOnly, priority: .background),
+            defaults: defaults, markerKey: key) == .abandoned)
+        #expect(defaults.object(forKey: key) == nil)
+        // Unchanged from the fresh-install pre-state: the abandoned pass wrote
+        // nothing, so the planner still holds the empty-table statistics a
+        // migration-time `ANALYZE` left behind (see the sibling test above).
+        let afterAbandoned = try recordedRowCount(fixture.pool, table: "messageHeader")
+        #expect(
+            afterAbandoned == 0,
+            "an abandoned pass must leave statistics exactly as it found them; got \(String(describing: afterAbandoned))")
+
+        // The obligation survived: a later, writable pass still does the work.
+        #expect(SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background),
+            defaults: defaults, markerKey: key) == .refreshed)
+        #expect(try recordedRowCount(fixture.pool, table: "messageHeader") == 4)
+    }
+}

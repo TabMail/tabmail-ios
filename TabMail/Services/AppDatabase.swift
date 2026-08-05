@@ -2012,7 +2012,8 @@ final class AppDatabase: Sendable {
         //     `DROP TABLE` performs under enforced FKs cascades to nothing.
         //   • v81 — `UPDATE messageHeader SET actionTagSetAt = …`.
         //     `messageHeader` IS a parent, but see that migration's own note.
-        //   • v83 — `CREATE INDEX` + `ANALYZE`; changes no row.
+        //   • v83 — `CREATE INDEX`; changes no row. (Its `ANALYZE` moved to the
+        //     background maintenance pass — ADR-IOS-029, 2026-08-05 amendment.)
         // `v71` and `v82` stay `.deferred`, each for a different reason — read
         // their own comments before changing either.
         migrator.registerTimedMigration(
@@ -2729,12 +2730,18 @@ final class AppDatabase: Sendable {
         // pages. No read-side index can touch that. This removes the quadratic; it
         // does not make a 100k-message sweep fast in absolute terms.
         //
-        // STALE IS THE SHIPPED REGIME. `ANALYZE` runs only inside migration bodies,
-        // never periodically — and on a FRESH INSTALL a migration's `ANALYZE` records
-        // stats for an EMPTY `messageHeader`, which IS the stale regime. A device that
-        // then syncs 100k messages carries "table is empty" statistics forever. So the
-        // index, not `ANALYZE`, is the load-bearing fix; the 1.0× "fresh" row above is
-        // the number you get if you measure on a database no user has.
+        // STALE IS THE SHIPPED REGIME — this is a statement about the SHIPPED
+        // release, and it is why the measurement above was taken that way. In every
+        // shipped build `ANALYZE` ran only inside migration bodies, never
+        // periodically, and on a FRESH INSTALL a migration's `ANALYZE` records stats
+        // for an EMPTY `messageHeader`, so a device that then syncs 100k messages
+        // carries "table is empty" statistics forever. So the index, not `ANALYZE`,
+        // is the load-bearing fix; the 1.0× "fresh" row above is the number you get
+        // if you measure on a database no user has. (As of the ADR-IOS-029
+        // 2026-08-05 amendment the background pass does refresh statistics — see
+        // `SyncEngine.runRefreshPlannerStatisticsIfStale` — which makes the "fresh"
+        // row reachable for the first time. It does not change the conclusion: the
+        // partial index is what removes the quadratic, in both regimes.)
         //
         // PARTIAL, not `(folderId, isRead, id)` — measured both:
         //   • plan: partial serves all THREE statements with no temp B-tree
@@ -2751,17 +2758,63 @@ final class AppDatabase: Sendable {
         // differs). The index therefore matches the queries' explicit `COLLATE BINARY`
         // without needing one of its own.
         //
-        // `ANALYZE` per ADR-IOS-029 rule 5 — KEPT DELIBERATELY, THOUGH THE MEASUREMENT
-        // ARGUED AGAINST IT, so nobody reads its cost as an oversight. Measured
-        // launch-time cost on a 360k-row database: `CREATE INDEX` 119 ms + `ANALYZE`
-        // ~850 ms ≈ 1.0 s, ONE TIME, on the upgrade launch only (a fresh install pays
-        // neither — empty table). It buys this fix nothing: the plan above is chosen
-        // identically WITH and WITHOUT statistics, which is the whole reason the
-        // partial form was preferred. It is kept because rule 5 is the project's
-        // standing decision and the v38/v40/v50/v51 bodies all do it; deviating from a
-        // recorded ADR is an architecture change that belongs in an ADR, not in an
-        // audit fix round. Same shape as
-        // `v51_headerIncompletePartialIndex`, which is also the partial-index
+        // THERE IS NO `ANALYZE` IN THIS BODY, AND THAT IS A DECISION — not an
+        // oversight, and not a violation of ADR-IOS-029 rule 5. Rule 5's
+        // REQUIREMENT survives in full: an index-changing migration still causes a
+        // whole-database `ANALYZE`. Only its TIMING moved off the blocking launch
+        // path, to `SyncEngine.runRefreshPlannerStatisticsIfStale`, which the
+        // background WAL maintenance pass runs once per schema change. Owner
+        // directive, 2026-08-05: *"startup migrations should really have only
+        // things that are absolutely necessary and blocking. Other things should
+        // happen durably in the heal/sync/background queues."* Recorded as the
+        // 2026-08-05 amendment to ADR-IOS-029; read it before adding one back.
+        //
+        // WHY THIS BODY IS WHERE IT MATTERED. Measured launch cost on a 360k-row
+        // database: `CREATE INDEX` 119 ms + `ANALYZE` ~850 ms. Harness-measured at
+        // profile H (500k headers / 3.4 GB, `scratchpad/MIGRATION_COST`) across two
+        // separate runs the whole migration was **8,522 ms** and **6,688 ms**, of
+        // which the bare `ANALYZE` alone was **5,259.6 ms** in the second — the
+        // single most expensive statement in the whole `v68…v83` chain, paid before
+        // any UI appears. With it removed the same migration measures **2,015 ms
+        // total / 296.5 ms body**. (The two totals differ because this is a
+        // timing-dependent measurement on a 3.4 GB file; read the SHAPE — one
+        // statement dominating the chain — not the integer.) It also buys THIS
+        // migration nothing: the plan quoted above is chosen identically with and
+        // without statistics, which is the whole reason the partial form was
+        // preferred.
+        //
+        // ⚠️ NEGATIVE CASE — STATISTICS THEMSELVES ARE NOT OPTIONAL, so "just delete
+        // the `ANALYZE`" would have been the wrong change. Measured on a synthetic
+        // 120k-row / 3-account / 8-folder database, the drain's per-member header
+        // lookup in `AccountManagerQueue` plans as `SEARCH messageHeader USING INDEX
+        // messageHeader_accountId (accountId=?)` — an account-wide scan — with an
+        // empty `sqlite_stat1`, and as a `MULTI-INDEX OR` over
+        // `messageHeader_messageId_accountId` + `messageHeader_rfc822MessageId_date`
+        // — two seeks — after `ANALYZE`. Statistics demonstrably change plans on at
+        // least one hot path. What moved is WHEN they are computed, never WHETHER.
+        //
+        // ⚠️ SCOPE, stated so the next reader does not "finish the job". FIVE older
+        // migrations still carry their own in-body `ANALYZE` — `v38`, `v39`, `v40`,
+        // `v50` and `v51` — and they are DELIBERATELY UNTOUCHED, because a
+        // registered migration is immutable once any database has run it (Data
+        // Integrity rule 5) and every shipped install ran all five long ago. They
+        // are also cheap where they sit for the reason that makes them useless: on
+        // a fresh install they run against an EMPTY database, and on an upgrade
+        // they were paid years ago. Their real legacy is the pre-state the
+        // background pass now corrects — a fresh install's `sqlite_stat1` records
+        // `messageHeader` as having ZERO rows, and before this amendment the device
+        // that later synced 100k messages carried that estimate forever. That exact
+        // pre-state is pinned by `SyncMaintenanceTests`'
+        // `schemaChangeRearmsButRowTrafficDoesNot`.
+        //
+        // ⚠️ SECOND NEGATIVE CASE, because this is the sentence a future migration
+        // will quote: this is NOT licence to move arbitrary work out of a migration.
+        // Anything the schema's CORRECTNESS depends on — a column, an index a query
+        // is written against, a data repair a reader assumes — stays blocking. Only
+        // work whose omission degrades PERFORMANCE and nothing else may be deferred,
+        // and only to something durable that re-arms itself.
+        //
+        // Same partial-index shape as `v51_headerIncompletePartialIndex`, the
         // precedent in this file (`messageHeader_headerIncomplete`, and see also
         // `messageHeader_aiIncomplete` / `messageHeader_embeddingIncomplete` /
         // `messageHeader_reminderLookup` — all raw-SQL partials).
@@ -2777,7 +2830,6 @@ final class AppDatabase: Sendable {
                 ON messageHeader(folderId, id)
                 WHERE isRead = 0
             """)
-            try db.execute(sql: "ANALYZE")
         }
     }
 
