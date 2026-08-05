@@ -2695,7 +2695,13 @@ enum NSEDataBridge {
         // every key would read as owned, and the release would be a no-op anyway.
         if !releasedContentKeys.isEmpty {
             let keys = releasedContentKeys
-            Task.detached(priority: .utility) {
+            // 🚨 ADR-IOS-031 — `.medium` is the FLOOR for anything touching GRDB, and
+            // `releaseUnowned` touches the MAIN pool: one `pool.read` for the folder
+            // roster, then a `pool.read` (ownership) plus a `pool.write` (delete) per
+            // key, all on `AppDatabase.dbPool`. At `.utility` (QoS 17) this holds
+            // reader/writer slots 8 QoS levels below MainActor's `.userInitiated`
+            // (25) — the exact gap that stalls the render thread. Never lower this.
+            Task.detached(priority: .medium) {
                 await MessageContentStore.releaseUnowned(keys, stores: .body)
             }
         }
