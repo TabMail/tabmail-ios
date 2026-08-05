@@ -633,15 +633,42 @@ actor DraftStore {
         // the exposure from [snapshot .. commit] down to [this row's own check ..
         // commit]. A `register` that lands after this row has already been examined
         // still misses, because the row is by then deleted inside the open
-        // transaction. That remnant is microseconds of straight-line code rather than
-        // the whole sweep, and it is the direction the mantra tolerates: the compose
-        // holds the draft in memory and its next save re-inserts the row. The
-        // attachment directory is the one part that is not re-derivable, and it is
-        // deleted only after the transaction commits (see the loop at the end).
+        // transaction.
+        //
+        // ⚠️ CORRECTED AGAIN 2026-08-05 — the justification that used to sit here
+        // ("the compose holds the draft in memory and its next save re-inserts the
+        // row") is FALSE for the case that actually matters. `ComposeView` calls
+        // `DraftSessionRegistry.shared.register(draftId)` and only THEN kicks off
+        // `Task { await loadDraftOrPrepopulate() }`, so in the failing interleaving
+        // the compose is still OPENING: it holds nothing in memory, its load queues
+        // behind this writer and observes the committed deletion. What is lost is
+        // the draft row, its authored compose chat turns and its attachment
+        // directory — authored user bytes, and for a local-only draft nothing
+        // re-derives them.
+        //
+        // THE BOUND: this function records `DraftSessionRegistry`'s registration
+        // generation before opening the transaction and re-reads it as the LAST
+        // statement inside it. Any compose that registered anywhere in between —
+        // before the snapshot's window, between two rows, or after the final row —
+        // makes the two readings differ, and the whole eviction is rolled back by
+        // throwing. Nothing is deleted, the caller sees zero evicted, and the next
+        // maintenance pass tries again against a registry that now includes the new
+        // compose. The attachment directories, which are the one part that is not
+        // re-derivable, are deleted only AFTER a successful commit, so the rollback
+        // path must not reach that loop — see the early return below.
+        //
+        // The irreducible remainder is a `register` landing between that final read
+        // and the commit itself (`IOS-DRAFT-012`). It is not closable without a
+        // lock held across a DB write, which is forbidden here.
         let activeDraftIds = DraftSessionRegistry.shared.snapshot()
         let activeComposeSessions = Set(activeDraftIds.flatMap { ["compose:\($0)", "demo:compose:\($0)"] })
+        let registrationsAtStart = DraftSessionRegistry.shared.registrationGeneration()
 
-        let evictedCount: Int = try dbPool.write { db in
+        let evictedCount: Int
+        do {
+        // (The transaction body below keeps its original indentation so this
+        // change reads as the guard it is, not as a reformat.)
+        evictedCount = try dbPool.write { db in
             // Also clean orphaned compose sessions (chatTurn with no matching draft)
             let orphanedSessions = try Row.fetchAll(db, sql: """
                 SELECT DISTINCT ct.sessionId
@@ -752,7 +779,29 @@ actor DraftStore {
             if evicted > 0 {
                 print("[DraftStore] Evicted \(evicted) drafts (limit=\(limit))")
             }
+
+            // THE LAST STATEMENT INSIDE THE TRANSACTION, deliberately. Everything
+            // above has already been decided; this asks the one question a per-row
+            // `isActive` check cannot answer — did ANY compose open while this
+            // sweep was running? Throwing here makes GRDB roll the whole
+            // transaction back, so a compose that is still loading finds its draft
+            // exactly where it left it.
+            guard DraftSessionRegistry.shared.registrationGeneration() == registrationsAtStart else {
+                throw ComposeRegisteredDuringEviction()
+            }
             return evicted + orphanEvicted
+        }
+        } catch is ComposeRegisteredDuringEviction {
+            // Rolled back — nothing was deleted, so nothing may be reclaimed. In
+            // particular this must return BEFORE the attachment loop: the local
+            // `attachmentDirsToDelete` array keeps the appends made inside the
+            // transaction even though the transaction itself was discarded, and
+            // those directories are the one part of a draft that no re-save
+            // rebuilds.
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftStore] Eviction rolled back — a compose registered while the sweep was in flight; retrying on the next pass")
+            }
+            return 0
         }
 
         // Delete attachment files outside DB transaction
@@ -763,3 +812,9 @@ actor DraftStore {
         return evictedCount
     }
 }
+
+/// Thrown as the last statement of `DraftStore.evictImpl`'s write transaction when
+/// a compose registered while the sweep was running, so GRDB rolls the eviction
+/// back. Private on purpose: it is a control-flow signal for exactly one `catch`,
+/// never an error any caller should see or handle.
+private struct ComposeRegisteredDuringEviction: Error {}

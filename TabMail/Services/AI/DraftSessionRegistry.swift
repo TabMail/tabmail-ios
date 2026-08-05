@@ -62,32 +62,63 @@ final class DraftSessionRegistry: Sendable {
     static let shared = DraftSessionRegistry()
     private init() {}
 
-    /// draftId → open-view count. An id is "active" while its count > 0.
-    private let active = Mutex<[String: Int]>([:])
+    private struct State {
+        /// draftId → open-view count. An id is "active" while its count > 0.
+        var counts: [String: Int] = [:]
+        /// Monotonic count of `register` calls, for deletion sites that need to ask
+        /// *"did ANY compose open while I was working?"* rather than *"is this
+        /// particular id open?"*. It lives in the same `Mutex` payload as `counts`
+        /// so a registration and its generation bump are one atomic event — a
+        /// reader can never observe the bump without the count, or vice versa.
+        ///
+        /// 🚨 **ONLY `register` BUMPS IT.** Not `unregister`, not any read. That is
+        /// the difference between a bounded check and eviction starvation: a
+        /// compose that is already open and untouched must not keep tripping later
+        /// sweeps, or drafts accumulate without bound while any compose is on
+        /// screen. `&+` because wrapping after 2^64 registrations is still a
+        /// CHANGE, which is all the check tests for.
+        var registrations: UInt64 = 0
+    }
+
+    private let active = Mutex<State>(State())
 
     /// A compose opened. Increments the refcount.
     func register(_ draftId: String) {
-        active.withLock { $0[draftId, default: 0] += 1 }
+        active.withLock {
+            $0.counts[draftId, default: 0] += 1
+            $0.registrations &+= 1
+        }
     }
 
     /// A compose closed. Decrements the refcount; drops the id at zero. A spurious
     /// unregister for an id at zero is a no-op (never goes negative).
     func unregister(_ draftId: String) {
-        active.withLock { dict in
-            guard let count = dict[draftId] else { return }
-            if count <= 1 { dict[draftId] = nil } else { dict[draftId] = count - 1 }
+        active.withLock { state in
+            guard let count = state.counts[draftId] else { return }
+            if count <= 1 { state.counts[draftId] = nil } else { state.counts[draftId] = count - 1 }
         }
     }
 
     /// Whether the user currently has this draftId open in any ComposeView.
     func isActive(_ draftId: String) -> Bool {
-        active.withLock { ($0[draftId] ?? 0) > 0 }
+        active.withLock { ($0.counts[draftId] ?? 0) > 0 }
     }
 
     /// Snapshot of the active draftIds (used by the DraftStore eviction row-loop /
     /// orphan-session cleanup).
     func snapshot() -> Set<String> {
-        active.withLock { Set($0.keys) }
+        active.withLock { Set($0.counts.keys) }
+    }
+
+    /// How many composes have EVER registered. Compare two readings: an unchanged
+    /// value proves no compose opened in between, which is the only question a
+    /// deletion site can still get wrong after it has re-asked `isActive` per row —
+    /// a compose that registers AFTER its own row was examined is invisible to a
+    /// per-row check, and a compose that is still OPENING has nothing in memory to
+    /// re-save, so what it loses is authored bytes. A nonisolated synchronous
+    /// `Mutex` read, cheap enough for the last statement inside a write transaction.
+    func registrationGeneration() -> UInt64 {
+        active.withLock { $0.registrations }
     }
 
     /// The `chatTurn` / `chatHistory` sessionId forms for every active compose
@@ -95,7 +126,8 @@ final class DraftSessionRegistry: Sendable {
     /// `demo:compose:<id>` variants the eviction SQL / loops match. Used by the
     /// ChatStore eviction sites to exempt active compose sessions.
     func activeComposeSessionIds() -> Set<String> {
-        active.withLock { dict in
+        active.withLock { state in
+            let dict = state.counts
             var out = Set<String>()
             out.reserveCapacity(dict.count * 2)
             for id in dict.keys {

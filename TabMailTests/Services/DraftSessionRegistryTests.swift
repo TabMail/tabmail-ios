@@ -19,24 +19,57 @@ import Testing
 /// It is armed explicitly, so the fixture's own `chatTurn` inserts (which run on
 /// the same traced connections) cannot trip it early, and it fires at most once.
 private final class LateComposeRegistrationHook: Sendable {
+    /// WHICH window inside the transaction the registration lands in. Both are
+    /// real and they are NOT interchangeable — the earlier one is caught by the
+    /// per-row live `isActive` re-check, the later one is not, and a hook armed
+    /// only at the earlier point makes a test green against a system that still
+    /// loses the draft (`MIS-015`: the mechanism was pinned, not the invariant).
+    enum Trigger: Sendable {
+        /// `evictImpl`'s FIRST statement inside its write transaction is the
+        /// orphaned-compose-session SELECT over `chatTurn`, so matching that puts
+        /// the registration inside the transaction and AHEAD of the draft row loop
+        /// — the window the per-row `isActive` re-check already closes.
+        case firstChatTurnStatement
+        /// The draft-row loop's own `DELETE FROM draft`. By the time this fires the
+        /// victim row's live `isActive` check has ALREADY passed (it was not open)
+        /// and its deletion is staged inside the open transaction, so no per-row
+        /// check can ever see this registration. This is the window the stated
+        /// invariant is actually about, and the one the generation guard closes.
+        case draftRowDelete
+    }
+
     private let armed = Mutex<Bool>(false)
     private let fired = Mutex<Bool>(false)
     private let draftId: String
+    private let trigger: Trigger
 
-    init(draftId: String) { self.draftId = draftId }
+    init(draftId: String, trigger: Trigger = .firstChatTurnStatement) {
+        self.draftId = draftId
+        self.trigger = trigger
+    }
 
     /// Arm after fixture setup, immediately before the sweep.
     func arm() { armed.withLock { $0 = true } }
+
+    /// Disarm, so a second sweep in the same test runs without the interleaving.
+    func disarm() { armed.withLock { $0 = false } }
 
     /// True once the registration actually landed — the test asserts this so a
     /// hook that silently never fired cannot make the invariant pass vacuously.
     var didFire: Bool { fired.withLock { $0 } }
 
-    /// `evictImpl`'s FIRST statement inside its write transaction is the
-    /// orphaned-compose-session SELECT over `chatTurn`, so matching that puts the
-    /// registration inside the transaction and ahead of the draft row loop.
     func observe(_ sql: String) {
-        guard sql.contains("chatTurn") else { return }
+        let matches: Bool
+        switch trigger {
+        case .firstChatTurnStatement:
+            matches = sql.contains("chatTurn")
+        case .draftRowDelete:
+            // `DELETE FROM "draft" WHERE "id" = …`. The row loop's sibling
+            // `DELETE FROM "chatTurn" …` and the orphan sweep's SELECT (which does
+            // mention `draft` in its LEFT JOIN) are both excluded by the pair.
+            matches = sql.contains("DELETE") && sql.contains("draft")
+        }
+        guard matches else { return }
         let shouldFire = armed.withLock { flag -> Bool in
             guard flag else { return false }
             flag = false
@@ -319,9 +352,129 @@ struct DraftSessionRegistryTests {
         #expect(state.victimTurn?.userMessage == "Typed while the sweep was running")
         // Recency still holds for the untouched newest draft…
         #expect(state.newest != nil)
-        // …and the never-opened control is still evicted, so the guard above is not
-        // vacuous and the fix did not simply disable eviction.
-        #expect(state.control == nil)
-        #expect(state.controlTurn == nil)
+        // …and so does the control, because a registration anywhere inside the
+        // transaction now ROLLS THE WHOLE SWEEP BACK rather than deleting around the
+        // new compose. That is deliberate: the sweep's decisions were all taken
+        // against a registry reading that is no longer current, and re-running is
+        // free. Non-vacuity for this direction is carried below, by re-running the
+        // sweep once the interleaving is over.
+        #expect(state.control != nil)
+        #expect(state.controlTurn != nil)
+
+        // THE MIRROR IMAGE — a rollback-on-registration must not starve eviction.
+        // The victim compose is STILL OPEN and untouched; only `register` bumps the
+        // generation, so this second sweep observes an unchanged reading and
+        // completes normally.
+        hook.disarm()
+        let secondPass = try DraftStore.shared.evictSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), limit: 1)
+        let after = try fixture.pool.read { db in
+            (victim: try Draft.fetchOne(db, key: victimId),
+             control: try Draft.fetchOne(db, key: controlId),
+             newest: try Draft.fetchOne(db, key: newestId))
+        }
+        #expect(secondPass > 0,
+                """
+                eviction never completed while a compose was open — the generation guard is \
+                tripping on steady state, so drafts accumulate without bound for as long as the \
+                user has any compose on screen. That is strictly worse than the bug it replaces
+                """)
+        #expect(after.victim != nil, "the open compose's draft is still exempt on the second pass")
+        #expect(after.newest != nil)
+        #expect(after.control == nil, "the never-opened control is reclaimed once the sweep can run")
+    }
+
+    /// The SAME invariant as above, at the window the earlier hook point cannot
+    /// reach: the registration lands AFTER this row's own live `isActive` check has
+    /// already passed and its deletion has been staged. No per-row check can see it,
+    /// which is why the check has to be a whole-transaction one.
+    ///
+    /// This is the case the previous regression test claimed to cover and did not:
+    /// it hooked the FIRST `chatTurn` statement, ahead of the entire draft-row loop,
+    /// so it exercised "after snapshot, before row check" — a window round 2's
+    /// per-row re-ask already closed — and stayed green on a system that still lost
+    /// drafts registered later.
+    @Test("A compose that opens after its own row was already examined keeps its draft")
+    func composeRegisteredAfterItsRowWasExaminedKeepsItsDraft() throws {
+        let victimId = "new:opens-after-its-own-row"
+        let controlId = "new:oldest-never-opened"
+        let newestId = "new:newest-holds-the-slot-late"
+
+        let hook = LateComposeRegistrationHook(draftId: victimId, trigger: .draftRowDelete)
+        let fixture = try makeHookedPool(hook: hook)
+        defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
+        defer { DraftSessionRegistry.shared.unregister(victimId) }
+
+        let now = Date().timeIntervalSince1970
+        // `evictImpl` orders by the MONOTONIC `lastTouchedSeq` DESC, which follows
+        // save order — so saving control → victim → newest makes the victim the
+        // FIRST row past the keep-limit, and therefore the first `DELETE FROM draft`
+        // the trace sees. The registration then lands strictly after the victim's
+        // own exemption check.
+        try fixture.pool.write { db in
+            _ = try DraftStore.applySave(draft(id: controlId, updatedAt: now - 300), db: db)
+            _ = try DraftStore.applySave(draft(id: victimId, updatedAt: now - 200), db: db)
+            _ = try DraftStore.applySave(draft(id: newestId, updatedAt: now - 100), db: db)
+            try turn(
+                id: "late-victim-turn", sessionId: "compose:\(victimId)",
+                text: "Opened after the sweep had already passed this row").insert(db)
+        }
+
+        #expect(!DraftSessionRegistry.shared.isActive(victimId),
+                "precondition: not open when the sweep begins, and not open when its row is examined")
+        hook.arm()
+
+        let evicted = try DraftStore.shared.evictSync(
+            dbPool: PrioritizedDatabase(pool: fixture.pool), limit: 1)
+
+        #expect(hook.didFire, "harness non-vacuity: the interleaving must actually have happened")
+        #expect(DraftSessionRegistry.shared.isActive(victimId))
+
+        let state = try fixture.pool.read { db in
+            (victim: try Draft.fetchOne(db, key: victimId),
+             control: try Draft.fetchOne(db, key: controlId),
+             newest: try Draft.fetchOne(db, key: newestId),
+             victimTurn: try ChatTurn.fetchOne(db, key: "late-victim-turn"))
+        }
+        #expect(state.victim != nil,
+                """
+                the draft of a compose that was still OPENING was deleted — it had registered but \
+                not yet loaded, so it holds nothing in memory to re-save and, for a local-only \
+                draft, nothing re-derives the row, its authored chat turns, or its attachments
+                """)
+        #expect(state.victimTurn?.userMessage == "Opened after the sweep had already passed this row",
+                "the authored compose chat turns must roll back with the draft row")
+        #expect(state.newest != nil)
+        #expect(state.control != nil,
+                "the whole transaction rolls back, so the control's eviction is undone too")
+        #expect(evicted == 0, "a rolled-back sweep must report that it evicted nothing")
+    }
+
+    // MARK: - The generation counter's own contract
+
+    /// The starvation guard, asserted directly on the counter rather than only
+    /// through a sweep: **only `register` moves it.** If `unregister` or any read
+    /// bumped it, a steady state with one compose open would trip every eviction
+    /// forever.
+    @Test("Only register advances the registration generation")
+    func onlyRegisterAdvancesTheGeneration() {
+        let registry = DraftSessionRegistry.shared
+        let draftId = "new:generation-probe-\(UUID().uuidString)"
+
+        let start = registry.registrationGeneration()
+        _ = registry.isActive(draftId)
+        _ = registry.snapshot()
+        _ = registry.activeComposeSessionIds()
+        registry.unregister(draftId)          // spurious, id not present
+        #expect(registry.registrationGeneration() == start,
+                "reads and unregisters must not advance the generation, or eviction starves")
+
+        registry.register(draftId)
+        let afterRegister = registry.registrationGeneration()
+        #expect(afterRegister != start, "a compose opening must be observable to an in-flight sweep")
+
+        registry.unregister(draftId)
+        #expect(registry.registrationGeneration() == afterRegister,
+                "closing a compose must not advance the generation")
     }
 }
